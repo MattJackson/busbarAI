@@ -38,9 +38,8 @@ impl AuthMiddleware {
             "token" => AuthMode::Token,
             "passthrough" => AuthMode::Passthrough,
             "none" => AuthMode::None,
-            _ => panic!(
-                "invalid auth mode '{}': must be 'token', 'passthrough', or 'none'",
-                cfg.mode
+            other => panic!(
+                "invalid auth mode '{other}': must be 'token', 'passthrough', or 'none'"
             ),
         };
 
