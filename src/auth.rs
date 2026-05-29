@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
+#![allow(dead_code, private_interfaces)]
+
 use std::sync::Arc;
 
 use axum::{
@@ -26,21 +28,22 @@ pub(crate) enum AuthMode {
 }
 
 /// AuthMiddleware holds the resolved auth mode and token allowlist.
+#[allow(dead_code)]
 #[derive(Debug)]
-pub(crate) struct AuthMiddleware {
-    pub(crate) mode: AuthMode,
-    pub(crate) client_tokens: Vec<String>,
+pub struct AuthMiddleware {
+    pub mode: AuthMode,
+    pub client_tokens: Vec<String>,
 }
 
 impl AuthMiddleware {
-    pub(crate) fn new(cfg: &AuthCfg) -> Self {
+    pub fn new(cfg: &AuthCfg) -> Self {
         let mode = match cfg.mode.as_str() {
             "token" => AuthMode::Token,
             "passthrough" => AuthMode::Passthrough,
             "none" => AuthMode::None,
-            other => panic!(
-                "invalid auth mode '{other}': must be 'token', 'passthrough', or 'none'"
-            ),
+            other => {
+                panic!("invalid auth mode '{other}': must be 'token', 'passthrough', or 'none'")
+            }
         };
 
         // Expand env vars in client_tokens (B-102 interpolation pass)
@@ -112,6 +115,7 @@ impl AuthMiddleware {
 }
 
 /// Axum middleware layer that validates auth before routing.
+#[allow(dead_code)] // used at runtime, not in tests
 pub(crate) async fn auth_middleware(
     State(app): State<Arc<App>>,
     req: Request<Body>,

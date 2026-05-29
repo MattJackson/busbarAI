@@ -18,6 +18,12 @@ serde_json = "1"
 serde_yaml = "0.9"
 futures = "0.3"
 
+[dev-dependencies]
+axum = { version = "0.7", features = ["http1"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+tests-support = { path = "tests/support" }
+
 [profile.release]
 opt-level = 2
 lto = false

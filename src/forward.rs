@@ -44,7 +44,7 @@ async fn pick_among(app: &Arc<App>, cands: &[usize]) -> Option<(usize, OwnedSema
 
 use axum::body::Bytes;
 
-pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Response {
+pub async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Response {
     let mut v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
+#![allow(dead_code, private_interfaces)]
+
 use std::collections::HashMap;
 
 use serde::Deserialize;
@@ -36,25 +38,25 @@ pub(crate) fn interpolate_env(s: &str) -> Result<String, String> {
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // fields parsed but not wired (B-4xx routing)
-pub(crate) struct RootCfg {
+pub struct RootCfg {
     #[serde(default = "default_listen")]
-    pub(crate) listen: String,
-    pub(crate) auth: Option<AuthCfg>,
-    pub(crate) providers: HashMap<String, ProviderCfg>,
-    pub(crate) models: HashMap<String, ModelCfg>,
-    pub(crate) pools: HashMap<String, PoolCfg>,
+    pub listen: String,
+    pub auth: Option<AuthCfg>,
+    pub providers: HashMap<String, ProviderCfg>,
+    pub models: HashMap<String, ModelCfg>,
+    pub pools: HashMap<String, PoolCfg>,
 }
 
 #[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
 #[derive(Debug, Deserialize, Clone)]
-pub(crate) struct AuthCfg {
+pub struct AuthCfg {
     #[serde(default = "default_auth_mode")]
-    pub(crate) mode: String,
+    pub mode: String,
     #[deprecated(since = "0.1.0", note = "use client_tokens allowlist instead")]
     #[serde(rename = "token", default)]
-    pub(crate) _legacy_token: Option<String>,
+    pub _legacy_token: Option<String>,
     #[serde(default)]
-    pub(crate) client_tokens: Vec<String>,
+    pub client_tokens: Vec<String>,
 }
 
 impl AuthCfg {
@@ -72,7 +74,7 @@ impl AuthCfg {
 
     /// Create a default AuthCfg for initialization.
     #[allow(deprecated)] // accessing deprecated field in constructor
-    pub(crate) fn default_none() -> Self {
+    pub fn default_none() -> Self {
         Self {
             mode: "none".to_string(),
             _legacy_token: None,
@@ -85,9 +87,9 @@ fn default_auth_mode() -> String {
     "none".to_string()
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
+#[allow(dead_code, private_interfaces)] // v1 schema fields defined but not yet wired (B-4xx routing)
 #[derive(Debug, Deserialize)]
-pub(crate) struct ProviderCfg {
+pub struct ProviderCfg {
     #[serde(default = "default_protocol")]
     pub(crate) protocol: String,
     pub(crate) base_url: String,
@@ -122,9 +124,9 @@ fn neg1() -> i64 {
     -1
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
+#[allow(dead_code, private_interfaces)] // v1 schema fields defined but not yet wired (B-4xx routing)
 #[derive(Debug, Deserialize)]
-pub(crate) struct PoolCfg {
+pub struct PoolCfg {
     #[serde(default)]
     pub(crate) members: Vec<PoolMember>,
     #[serde(default)]

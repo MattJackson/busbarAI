@@ -102,6 +102,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tests-support",
  "tokio",
 ]
 
@@ -1048,6 +1049,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tests-support"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
