@@ -12,7 +12,7 @@ use futures::Stream;
 use reqwest::StatusCode;
 use serde_json::Value;
 
-use crate::breaker::{classify as classify_disposition, Disposition};
+use crate::breaker::{classify as classify_disposition, normalize_raw_error, Disposition};
 use crate::proto::{convert_headers, StatusClass};
 use crate::state::App;
 use crate::store::{now, Permit};
@@ -158,7 +158,8 @@ fn find_matching_brace(chunk: &[u8]) -> Option<usize> {
                     return Some(i + 1);
                 }
             }
-            _ => {}
+            // All other byte values don't affect brace matching
+            _other => {}
         }
     }
     None
@@ -449,9 +450,11 @@ pub(crate) async fn forward(
                         return rb.body(Body::from(bytes)).unwrap();
                     }
 
-                    // Two-stage pipeline: Stage 1 (proto.classify) → CanonicalSignal with typed StatusClass
+                    // Two-stage pipeline: Stage 1a (proto.extract_error) → RawUpstreamError
+                    //                     Stage 1b (normalize_raw_error + error_map) → CanonicalSignal
                     //                     Stage 2 (breaker::classify_disposition) → Disposition
-                    let sig = proto.classify(status, &bytes);
+                    let raw = app.lanes[i].protocol.extract_error(status, &bytes);
+                    let sig = normalize_raw_error(&raw, &app.lanes[i].error_map);
                     let disposition = classify_disposition(&sig);
 
                     // Exhaustive match on Disposition - NO _ => allowed per B-301 requirements
@@ -468,7 +471,7 @@ pub(crate) async fn forward(
                         }
                         Disposition::TransientUpstream => {
                             // Transient upstream failure → cooldown + err counter
-                            // Record based on specific error type
+                            // Record based on specific error type (exhaustive over remaining variants)
                             if matches!(sig.class, StatusClass::RateLimit) {
                                 app.store.record_rate_limit(i, now(), sig.retry_after);
                             } else {
@@ -477,7 +480,14 @@ pub(crate) async fn forward(
                                     StatusClass::Timeout => "timeout",
                                     StatusClass::Network => "network",
                                     StatusClass::Overloaded => "overloaded",
-                                    _ => "transient",
+                                    // Exhaustive: these variants cannot reach HardDown or ClientFault arms
+                                    StatusClass::Auth => unreachable!(),
+                                    StatusClass::Billing => unreachable!(),
+                                    StatusClass::ClientError => unreachable!(),
+                                    StatusClass::RateLimit => {
+                                        // Should have been handled above but Rust needs exhaustive match
+                                        "rate_limit"
+                                    }
                                 };
                                 app.store.record_transient(i, what);
                             }
@@ -486,17 +496,26 @@ pub(crate) async fn forward(
                         }
                         Disposition::HardDown => {
                             // Hard down → permanent dead state (with probe recovery per B-303)
+                            // Only Billing and Auth reach this arm per breaker::classify
                             let reason = match sig.class {
-                                StatusClass::Billing => "billing / insufficient balance",
-                                StatusClass::Auth => {
-                                    &format!("auth rejected (HTTP {})", status.as_u16())
+                                StatusClass::Billing => {
+                                    "billing / insufficient balance".to_string()
                                 }
-                                _ => "hard down",
+                                StatusClass::Auth => {
+                                    format!("auth rejected (HTTP {})", status.as_u16())
+                                }
+                                // Exhaustive: these variants cannot reach HardDown arm
+                                StatusClass::RateLimit => unreachable!(),
+                                StatusClass::Overloaded => unreachable!(),
+                                StatusClass::ServerError => unreachable!(),
+                                StatusClass::Timeout => unreachable!(),
+                                StatusClass::Network => unreachable!(),
+                                StatusClass::ClientError => unreachable!(),
                             };
-                            app.store.record_hard_down(i, reason);
+                            app.store.record_hard_down(i, &reason);
                             drop(permit);
 
-                            // For auth failures in Token/None mode: return error to caller
+                            // For auth failures: return error to caller
                             if matches!(sig.class, StatusClass::Auth) {
                                 use axum::body::Body;
                                 let mut rb = Response::builder().status(status);
@@ -506,7 +525,7 @@ pub(crate) async fn forward(
                                 return rb.body(Body::from(bytes)).unwrap();
                             }
 
-                            // For billing/other hard downs: continue to next lane (failover)
+                            // For billing hard downs: continue to next lane (failover)
                             continue;
                         }
                     }

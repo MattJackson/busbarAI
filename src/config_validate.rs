@@ -36,6 +36,26 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
+    // Rule 4: Validate error_map on every provider (REQUIRED, no silent default)
+    for (provider_name, provider_cfg) in &cfg.providers {
+        if provider_cfg.error_map.is_empty() {
+            errors.push(format!(
+                "provider '{}' is missing required 'error_map' config — add per-provider error code mappings",
+                provider_name
+            ));
+        } else {
+            // Validate each value in error_map is a known StatusClass name
+            for (code, mapped_class) in &provider_cfg.error_map {
+                if crate::config::status_class_from_str(mapped_class).is_none() {
+                    errors.push(format!(
+                        "provider '{}' error_map code '{}': invalid StatusClass '{}', must be one of: rate_limit, overloaded, server_error, timeout, network, auth, billing, client_error",
+                        provider_name, code, mapped_class
+                    ));
+                }
+            }
+        }
+    }
+
     // Rule 2 & 3: Validate each pool's members
     for (pool_name, pool_cfg) in &cfg.pools {
         let mut member_protocols: HashSet<&str> = HashSet::new();
@@ -94,12 +114,18 @@ mod tests {
         }
     }
 
+  #[allow(dead_code)] // Helper function for tests
     fn make_provider(protocol: &str, base_url: &str, api_key_env: &str) -> config::ProviderCfg {
+        // Provide a minimal valid error_map to satisfy validation
+        let mut error_map = std::collections::HashMap::new();
+        error_map.insert("400".to_string(), "client_error".to_string());
+
         config::ProviderCfg {
             protocol: protocol.into(),
             base_url: base_url.into(),
             api_key_env: api_key_env.into(),
             health: None,
+            error_map,
             _legacy_api_key: None,
         }
     }
@@ -133,9 +159,20 @@ mod tests {
     #[test]
     fn test_validate_rejects_pool_name_equals_provider_name() {
         let mut providers = HashMap::new();
+        // Add minimal error_map to avoid extra validation error
+        let mut pm_error_map = std::collections::HashMap::new();
+        pm_error_map.insert("400".to_string(), "client_error".to_string());
+
         providers.insert(
             "myprovider".to_string(),
-            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+            config::ProviderCfg {
+                protocol: "anthropic".into(),
+                base_url: "https://api.example.com".into(),
+                api_key_env: "API_KEY".into(),
+                health: None,
+                error_map: pm_error_map,
+                _legacy_api_key: None,
+            },
         );
 
         let mut models = HashMap::new();
@@ -160,9 +197,20 @@ mod tests {
     #[test]
     fn test_validate_rejects_unknown_member_ref() {
         let mut providers = HashMap::new();
+        // Add minimal error_map to avoid extra validation error
+        let mut mp_error_map = std::collections::HashMap::new();
+        mp_error_map.insert("400".to_string(), "client_error".to_string());
+
         providers.insert(
             "myprovider".to_string(),
-            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+            config::ProviderCfg {
+                protocol: "anthropic".into(),
+                base_url: "https://api.example.com".into(),
+                api_key_env: "API_KEY".into(),
+                health: None,
+                error_map: mp_error_map,
+                _legacy_api_key: None,
+            },
         );
 
         let models = HashMap::new();
@@ -186,9 +234,20 @@ mod tests {
     #[test]
     fn test_validate_collects_all_errors() {
         let mut providers = HashMap::new();
+        // Add minimal error_map to avoid extra validation error
+        let mut cm_error_map = std::collections::HashMap::new();
+        cm_error_map.insert("400".to_string(), "client_error".to_string());
+
         providers.insert(
             "conflict_provider".to_string(),
-            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+            config::ProviderCfg {
+                protocol: "anthropic".into(),
+                base_url: "https://api.example.com".into(),
+                api_key_env: "API_KEY".into(),
+                health: None,
+                error_map: cm_error_map,
+                _legacy_api_key: None,
+            },
         );
 
         let mut models = HashMap::new();
@@ -223,14 +282,34 @@ mod tests {
     #[test]
     fn test_validate_heterogeneous_pool_is_ok() {
         let mut providers = HashMap::new();
-        // Two different protocols
+        // Two different protocols with minimal error_maps
+        let mut anthropic_error_map = std::collections::HashMap::new();
+        anthropic_error_map.insert("400".to_string(), "client_error".to_string());
+
+        let mut openai_error_map = std::collections::HashMap::new();
+        openai_error_map.insert("400".to_string(), "client_error".to_string());
+
         providers.insert(
             "anthropic_provider".to_string(),
-            make_provider("anthropic", "https://api.anthropic.com", "ANTHROPIC_KEY"),
+            config::ProviderCfg {
+                protocol: "anthropic".into(),
+                base_url: "https://api.anthropic.com".into(),
+                api_key_env: "ANTHROPIC_KEY".into(),
+                health: None,
+                error_map: anthropic_error_map,
+                _legacy_api_key: None,
+            },
         );
         providers.insert(
             "openai_provider".to_string(),
-            make_provider("openai", "https://api.openai.com", "OPENAI_KEY"),
+            config::ProviderCfg {
+                protocol: "openai".into(),
+                base_url: "https://api.openai.com".into(),
+                api_key_env: "OPENAI_KEY".into(),
+                health: None,
+                error_map: openai_error_map,
+                _legacy_api_key: None,
+            },
         );
 
         let mut models = HashMap::new();
@@ -263,9 +342,20 @@ mod tests {
     #[test]
     fn test_validate_valid_config_succeeds() {
         let mut providers = HashMap::new();
+        // Add minimal error_map to avoid validation errors
+        let mut pm_error_map = std::collections::HashMap::new();
+        pm_error_map.insert("400".to_string(), "client_error".to_string());
+
         providers.insert(
             "myprovider".to_string(),
-            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+            config::ProviderCfg {
+                protocol: "anthropic".into(),
+                base_url: "https://api.example.com".into(),
+                api_key_env: "API_KEY".into(),
+                health: None,
+                error_map: pm_error_map,
+                _legacy_api_key: None,
+            },
         );
 
         let mut models = HashMap::new();
@@ -285,7 +375,8 @@ mod tests {
 
     #[test]
     fn test_validate_model_without_provider_error() {
-        let providers = HashMap::new(); // No providers defined
+        // No providers defined - should error on orphan model reference
+        let providers = HashMap::new();
 
         let mut models = HashMap::new();
         models.insert(
@@ -300,6 +391,7 @@ mod tests {
 
         assert!(result.is_err());
         let errs = result.unwrap_err();
+        // Should have exactly 1 error (orphan model), no error_map errors since providers is empty
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("orphan_model"));
         assert!(errs[0].contains("references unknown provider"));

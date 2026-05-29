@@ -19,6 +19,8 @@ pub(crate) struct Lane {
     pub(crate) api_key: String,
     pub(crate) protocol: ProtocolKind,
     pub(crate) max: usize,
+    // error_map cloned into each lane at startup for Stage 1b normalization
+    pub(crate) error_map: Arc<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -48,6 +50,7 @@ impl ProtocolKind {
         }
     }
 
+    #[allow(dead_code)] // classify retained for future extensibility (currently using normalize_raw_error path)
     pub(crate) fn classify(
         &self,
         status: axum::http::StatusCode,
@@ -55,6 +58,16 @@ impl ProtocolKind {
     ) -> crate::proto::CanonicalSignal {
         match self {
             ProtocolKind::Anthropic(p) => p.classify(status, body),
+        }
+    }
+
+    pub(crate) fn extract_error(
+        &self,
+        status: axum::http::StatusCode,
+        body: &[u8],
+    ) -> crate::breaker::RawUpstreamError {
+        match self {
+            ProtocolKind::Anthropic(p) => p.extract_error(status, body),
         }
     }
 }

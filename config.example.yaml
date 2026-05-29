@@ -15,10 +15,16 @@ providers:
     protocol: anthropic
     base_url: https://api.z.ai/api/anthropic
     api_key_env: ZAI_KEY
+    # Per-provider error code mappings (REQUIRED) — codes refine HTTP status classification
+    error_map:
+      "1113": billing
+      "1302": rate_limit
   anthropic:
     protocol: anthropic
     base_url: https://api.anthropic.com
     api_key_env: ANTHROPIC_KEY
+    # Anthropic uses HTTP status codes primarily; empty map is valid but must be present
+    error_map: {}
 
 models:
   glm-4.5:

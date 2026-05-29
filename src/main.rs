@@ -135,6 +135,7 @@ async fn main() {
             api_key: std::env::var(&provider_cfg.api_key_env).unwrap_or_default(),
             protocol: proto,
             max: ld.max,
+            error_map: Arc::new(provider_cfg.error_map.clone()),
         });
     }
 

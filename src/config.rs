@@ -5,6 +5,9 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
+// Re-export status_class_from_str for config validation
+pub(crate) use crate::breaker::status_class_from_str;
+
 /// Expand ${VAR} tokens from environment. Unset var → error (fail loud).
 pub(crate) fn interpolate_env(s: &str) -> Result<String, String> {
     let mut result = String::with_capacity(s.len());
@@ -94,6 +97,8 @@ pub(crate) struct ProviderCfg {
     pub(crate) api_key_env: String,
     #[serde(default)]
     pub(crate) health: Option<HealthCfg>,
+    // error_map is REQUIRED on every provider — NO default (fail loud if missing)
+    pub(crate) error_map: HashMap<String, String>,
     // Future fields (parse and be inert):
     #[serde(default, rename = "api_key")]
     pub(crate) _legacy_api_key: Option<String>,

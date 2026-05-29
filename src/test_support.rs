@@ -365,6 +365,7 @@ mod tests {
             api_key: "test-key".to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -432,6 +433,7 @@ mod tests {
             api_key: "test-key".to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -507,6 +509,7 @@ mod tests {
             api_key: "test-key".to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 1,
+            error_map: Arc::new(std::collections::HashMap::new()),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -608,6 +611,7 @@ mod tests {
             api_key: "test-key-0".to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
         };
 
         let lane1 = Lane {
@@ -617,6 +621,7 @@ mod tests {
             api_key: "test-key-1".to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -718,6 +723,7 @@ mod tests {
             api_key: "test-key-0".to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
         };
 
         let lane1 = Lane {
@@ -727,6 +733,7 @@ mod tests {
             api_key: "test-key-1".to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -830,6 +837,7 @@ mod tests {
             api_key: "busbar-key".to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -905,6 +913,7 @@ mod tests {
             api_key: "busbar-key".to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
         };
 
         let auth_cfg_token = AuthCfg {
@@ -989,6 +998,7 @@ mod tests {
             api_key: "busbar-central-key".to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1201,6 +1211,7 @@ mod tests {
             api_key: "test-key-0".to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1238,5 +1249,826 @@ mod tests {
         );
 
         server.shutdown().await;
+    }
+
+    /// B-301b: Disposition-matrix tests - prove error_map drives classification, not protocol.
+    /// Each assertion must FAIL against a wrong mapping to verify correctness.
+    #[cfg(test)]
+    mod disposition_matrix_tests {
+        use super::*;
+        use crate::breaker::{normalize_raw_error, status_class_from_str, RawUpstreamError};
+        use std::collections::HashMap;
+
+        #[test]
+        fn test_status_class_from_str_exhaustive() {
+            // Exhaustive check: all valid StatusClass names must parse correctly
+            assert_eq!(
+                status_class_from_str("rate_limit"),
+                Some(crate::breaker::StatusClass::RateLimit)
+            );
+            assert_eq!(
+                status_class_from_str("overloaded"),
+                Some(crate::breaker::StatusClass::Overloaded)
+            );
+            assert_eq!(
+                status_class_from_str("server_error"),
+                Some(crate::breaker::StatusClass::ServerError)
+            );
+            assert_eq!(
+                status_class_from_str("timeout"),
+                Some(crate::breaker::StatusClass::Timeout)
+            );
+            assert_eq!(
+                status_class_from_str("network"),
+                Some(crate::breaker::StatusClass::Network)
+            );
+            assert_eq!(
+                status_class_from_str("auth"),
+                Some(crate::breaker::StatusClass::Auth)
+            );
+            assert_eq!(
+                status_class_from_str("billing"),
+                Some(crate::breaker::StatusClass::Billing)
+            );
+            assert_eq!(
+                status_class_from_str("client_error"),
+                Some(crate::breaker::StatusClass::ClientError)
+            );
+
+            // Unknown values return None (no _ => fallback)
+            assert_eq!(status_class_from_str("invalid"), None);
+            assert_eq!(status_class_from_str("unknown_code"), None);
+        }
+
+        #[test]
+        fn test_normalize_raw_error_with_provider_override() {
+            let error_map: HashMap<String, String> = [("1113".to_string(), "billing".to_string())]
+                .iter()
+                .cloned()
+                .collect();
+
+            // Provider code 1113 → billing (override)
+            let raw = RawUpstreamError {
+                http_status: 402,
+                provider_code: Some("1113".to_string()),
+                structured_type: None,
+            };
+            let sig = normalize_raw_error(&raw, &error_map);
+            assert_eq!(sig.class, crate::breaker::StatusClass::Billing);
+
+            // Different code not in map → fallback to HTTP status classification
+            let raw2 = RawUpstreamError {
+                http_status: 500,
+                provider_code: Some("9999".to_string()),
+                structured_type: None,
+            };
+            let sig2 = normalize_raw_error(&raw2, &error_map);
+            assert_eq!(sig2.class, crate::breaker::StatusClass::ServerError);
+        }
+
+        #[test]
+        fn test_normalize_raw_error_http_status_fallback() {
+            let error_map: HashMap<String, String> = HashMap::new();
+
+            // HTTP 401 → Auth (universal spec)
+            let raw = RawUpstreamError {
+                http_status: 401,
+                provider_code: None,
+                structured_type: None,
+            };
+            let sig = normalize_raw_error(&raw, &error_map);
+            assert_eq!(sig.class, crate::breaker::StatusClass::Auth);
+
+            // HTTP 429 → RateLimit (universal spec)
+            let raw2 = RawUpstreamError {
+                http_status: 429,
+                provider_code: None,
+                structured_type: None,
+            };
+            let sig2 = normalize_raw_error(&raw2, &error_map);
+            assert_eq!(sig2.class, crate::breaker::StatusClass::RateLimit);
+
+            // HTTP 500 → ServerError (universal spec)
+            let raw3 = RawUpstreamError {
+                http_status: 500,
+                provider_code: None,
+                structured_type: None,
+            };
+            let sig3 = normalize_raw_error(&raw3, &error_map);
+            assert_eq!(sig3.class, crate::breaker::StatusClass::ServerError);
+
+            // HTTP 400 → ClientError (universal spec)
+            let raw4 = RawUpstreamError {
+                http_status: 400,
+                provider_code: None,
+                structured_type: None,
+            };
+            let sig4 = normalize_raw_error(&raw4, &error_map);
+            assert_eq!(sig4.class, crate::breaker::StatusClass::ClientError);
+        }
+
+        #[tokio::test]
+        async fn test_disposition_client_fault_no_known_code() {
+            // HTTP 400, no known code → ClientFault → lane health UNCHANGED + body relayed
+            let state = Arc::new(MockServerState::new());
+            state.push(MockResponse::Ok {
+                status: StatusCode::BAD_REQUEST,
+                body: json!({ "error": "bad request" }),
+            });
+
+            let server = MockServer::new(state.clone()).await;
+            let lane_data = LaneData {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                max: 10,
+                sem: Arc::new(tokio::sync::Semaphore::new(10)),
+                limited: false,
+                budget: -1,
+                cooldown_until: 0,
+                streak: 0,
+                dead: false,
+                dead_reason: String::new(),
+                inflight: 0,
+                ok: 0,
+                err: 0,
+            };
+
+            let mut error_map = HashMap::new();
+            error_map.insert("1113".to_string(), "billing".to_string());
+            error_map.insert("1302".to_string(), "rate_limit".to_string());
+
+            let lane = Lane {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                base_url: server.base_url(),
+                api_key: "test-key".to_string(),
+                protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+                max: 10,
+                error_map: Arc::new(error_map),
+            };
+
+            let by_model = HashMap::from([("test-model".to_string(), 0)]);
+            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+            let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+            let app = Arc::new(App {
+                lanes: vec![lane],
+                store,
+                by_model,
+                pools,
+                rr: AtomicUsize::new(0),
+                client: Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .unwrap(),
+                auth,
+                auth_mode: crate::auth::AuthMode::None,
+            });
+
+            let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+            let response = forward(app.clone(), vec![0], req_body.into(), None).await;
+
+            // Should return 400 verbatim (ClientFault → relay)
+            assert_eq!(response.status().as_u16(), 400);
+
+            // Lane health UNCHANGED (not tripped)
+            let t = now();
+            assert!(
+                app.store.usable(0, t),
+                "lane should remain usable after ClientFault"
+            );
+            {
+                let snap = app.store.snapshot(0, t);
+                assert_eq!(snap.err, 0, "err counter unchanged for ClientFault");
+                assert!(!snap.dead, "lane should NOT be dead after ClientFault");
+            }
+
+            server.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn test_disposition_hard_down_billing_code() {
+            // HTTP 200/400 body w/ code 1113 → Billing → HardDown: lane hard-down
+            let state = Arc::new(MockServerState::new());
+            state.push(MockResponse::Billing {
+                status: StatusCode::PAYMENT_REQUIRED,
+                code: "1113",
+                message: "insufficient balance",
+            });
+
+            let server = MockServer::new(state.clone()).await;
+            let lane_data = LaneData {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                max: 10,
+                sem: Arc::new(tokio::sync::Semaphore::new(10)),
+                limited: false,
+                budget: -1,
+                cooldown_until: 0,
+                streak: 0,
+                dead: false,
+                dead_reason: String::new(),
+                inflight: 0,
+                ok: 0,
+                err: 0,
+            };
+
+            let mut error_map = HashMap::new();
+            error_map.insert("1113".to_string(), "billing".to_string());
+            error_map.insert("1302".to_string(), "rate_limit".to_string());
+
+            let lane = Lane {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                base_url: server.base_url(),
+                api_key: "test-key".to_string(),
+                protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+                max: 10,
+                error_map: Arc::new(error_map),
+            };
+
+            let by_model = HashMap::from([("test-model".to_string(), 0)]);
+            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+            let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+            let app = Arc::new(App {
+                lanes: vec![lane],
+                store,
+                by_model,
+                pools,
+                rr: AtomicUsize::new(0),
+                client: Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .unwrap(),
+                auth,
+                auth_mode: crate::auth::AuthMode::None,
+            });
+
+            let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+            let _response = forward(app.clone(), vec![0], req_body.into(), None).await;
+
+            // Lane hard-down (billing)
+            let t = now();
+            assert!(
+                !app.store.usable(0, t),
+                "lane should be DOWN after billing error"
+            );
+            {
+                let snap = app.store.snapshot(0, t);
+                assert!(snap.dead, "lane should be dead after Billing HardDown");
+                assert_eq!(
+                    snap.dead_reason, "billing / insufficient balance",
+                    "dead reason should match"
+                );
+            }
+
+            server.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn test_disposition_transient_rate_limit_code() {
+            // HTTP 429 body w/ code 1302 → RateLimit → TransientUpstream (record_rate_limit)
+            let state = Arc::new(MockServerState::new());
+            state.push(MockResponse::RateLimit {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                provider_signal: Some("1302"),
+            });
+
+            let server = MockServer::new(state.clone()).await;
+            let lane_data = LaneData {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                max: 10,
+                sem: Arc::new(tokio::sync::Semaphore::new(10)),
+                limited: false,
+                budget: -1,
+                cooldown_until: 0,
+                streak: 0,
+                dead: false,
+                dead_reason: String::new(),
+                inflight: 0,
+                ok: 0,
+                err: 0,
+            };
+
+            let mut error_map = HashMap::new();
+            error_map.insert("1113".to_string(), "billing".to_string());
+            error_map.insert("1302".to_string(), "rate_limit".to_string());
+
+            let lane = Lane {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                base_url: server.base_url(),
+                api_key: "test-key".to_string(),
+                protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+                max: 10,
+                error_map: Arc::new(error_map),
+            };
+
+            let by_model = HashMap::from([("test-model".to_string(), 0)]);
+            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+            let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+            let app = Arc::new(App {
+                lanes: vec![lane],
+                store,
+                by_model,
+                pools,
+                rr: AtomicUsize::new(0),
+                client: Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .unwrap(),
+                auth,
+                auth_mode: crate::auth::AuthMode::None,
+            });
+
+            let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+            let _response = forward(app.clone(), vec![0], req_body.into(), None).await;
+
+            // TransientUpstream → cooldown + err counter incremented
+            let t = now();
+            assert!(
+                !app.store.usable(0, t),
+                "lane should be in transient cooldown"
+            );
+            {
+                let snap = app.store.snapshot(0, t);
+                assert!(snap.err > 0, "err counter should increment for RateLimit");
+                assert_eq!(snap.streak, 1, "streak should be 1 for first rate limit");
+                assert!(!snap.dead, "lane should NOT be dead after single RateLimit");
+            }
+
+            server.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn test_disposition_transient_rate_limit_no_code() {
+            // HTTP 429 NO known code → RateLimit (status) → TransientUpstream
+            let state = Arc::new(MockServerState::new());
+            state.push(MockResponse::RateLimit {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                provider_signal: None, // No known code in error_map
+            });
+
+            let server = MockServer::new(state.clone()).await;
+            let lane_data = LaneData {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                max: 10,
+                sem: Arc::new(tokio::sync::Semaphore::new(10)),
+                limited: false,
+                budget: -1,
+                cooldown_until: 0,
+                streak: 0,
+                dead: false,
+                dead_reason: String::new(),
+                inflight: 0,
+                ok: 0,
+                err: 0,
+            };
+
+            let mut error_map = HashMap::new();
+            error_map.insert("1113".to_string(), "billing".to_string());
+            error_map.insert("1302".to_string(), "rate_limit".to_string());
+
+            let lane = Lane {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                base_url: server.base_url(),
+                api_key: "test-key".to_string(),
+                protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+                max: 10,
+                error_map: Arc::new(error_map),
+            };
+
+            let by_model = HashMap::from([("test-model".to_string(), 0)]);
+            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+            let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+            let app = Arc::new(App {
+                lanes: vec![lane],
+                store,
+                by_model,
+                pools,
+                rr: AtomicUsize::new(0),
+                client: Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .unwrap(),
+                auth,
+                auth_mode: crate::auth::AuthMode::None,
+            });
+
+            let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+            let _response = forward(app.clone(), vec![0], req_body.into(), None).await;
+
+            // TransientUpstream via HTTP status classification (429 → RateLimit)
+            let t = now();
+            assert!(
+                !app.store.usable(0, t),
+                "lane should be in transient cooldown"
+            );
+            {
+                let snap = app.store.snapshot(0, t);
+                assert!(
+                    snap.err > 0,
+                    "err counter should increment for HTTP 429 RateLimit"
+                );
+            }
+
+            server.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn test_disposition_transient_server_error() {
+            // HTTP 500 → ServerError → TransientUpstream
+            let state = Arc::new(MockServerState::new());
+            state.push(MockResponse::ServerError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: json!({ "error": "server error" }),
+            });
+
+            let server = MockServer::new(state.clone()).await;
+            let lane_data = LaneData {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                max: 10,
+                sem: Arc::new(tokio::sync::Semaphore::new(10)),
+                limited: false,
+                budget: -1,
+                cooldown_until: 0,
+                streak: 0,
+                dead: false,
+                dead_reason: String::new(),
+                inflight: 0,
+                ok: 0,
+                err: 0,
+            };
+
+            let mut error_map = HashMap::new();
+            error_map.insert("1113".to_string(), "billing".to_string());
+            error_map.insert("1302".to_string(), "rate_limit".to_string());
+
+            let lane = Lane {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                base_url: server.base_url(),
+                api_key: "test-key".to_string(),
+                protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+                max: 10,
+                error_map: Arc::new(error_map),
+            };
+
+            let by_model = HashMap::from([("test-model".to_string(), 0)]);
+            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+            let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+            let app = Arc::new(App {
+                lanes: vec![lane],
+                store,
+                by_model,
+                pools,
+                rr: AtomicUsize::new(0),
+                client: Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .unwrap(),
+                auth,
+                auth_mode: crate::auth::AuthMode::None,
+            });
+
+            let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+            let _response = forward(app.clone(), vec![0], req_body.into(), None).await;
+
+            // TransientUpstream (5xx → ServerError)
+            let t = now();
+            assert!(
+                !app.store.usable(0, t),
+                "lane should be in transient cooldown"
+            );
+            {
+                let snap = app.store.snapshot(0, t);
+                assert!(snap.err > 0, "err counter should increment for ServerError");
+                assert!(
+                    !snap.dead,
+                    "lane should NOT be dead after single ServerError"
+                );
+            }
+
+            server.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn test_disposition_hard_down_auth() {
+            // HTTP 401 → Auth → HardDown
+            let state = Arc::new(MockServerState::new());
+            state.push(MockResponse::Auth {
+                status: StatusCode::UNAUTHORIZED,
+            });
+
+            let server = MockServer::new(state.clone()).await;
+            let lane_data = LaneData {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                max: 10,
+                sem: Arc::new(tokio::sync::Semaphore::new(10)),
+                limited: false,
+                budget: -1,
+                cooldown_until: 0,
+                streak: 0,
+                dead: false,
+                dead_reason: String::new(),
+                inflight: 0,
+                ok: 0,
+                err: 0,
+            };
+
+            let mut error_map = HashMap::new();
+            error_map.insert("1113".to_string(), "billing".to_string());
+            error_map.insert("1302".to_string(), "rate_limit".to_string());
+
+            let lane = Lane {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                base_url: server.base_url(),
+                api_key: "test-key".to_string(),
+                protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+                max: 10,
+                error_map: Arc::new(error_map),
+            };
+
+            let by_model = HashMap::from([("test-model".to_string(), 0)]);
+            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+            let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+            let app = Arc::new(App {
+                lanes: vec![lane],
+                store,
+                by_model,
+                pools,
+                rr: AtomicUsize::new(0),
+                client: Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .unwrap(),
+                auth,
+                auth_mode: crate::auth::AuthMode::None,
+            });
+
+            let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+            let _response = forward(app.clone(), vec![0], req_body.into(), None).await;
+
+            // HardDown (401 → Auth)
+            let t = now();
+            assert!(
+                !app.store.usable(0, t),
+                "lane should be DOWN after Auth HardDown"
+            );
+            {
+                let snap = app.store.snapshot(0, t);
+                assert!(snap.dead, "lane should be dead after Auth HardDown");
+                assert!(
+                    snap.dead_reason.contains("auth"),
+                    "dead reason should mention auth"
+                );
+            }
+
+            server.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn test_disposition_code_drives_classification() {
+            // The key one: same HTTP status, different provider_code → different Disposition
+            // This proves the error_map drives it, not the status.
+
+            // Setup two lanes with SAME HTTP 402 response but different codes
+            let state1 = Arc::new(MockServerState::new());
+            let state2 = Arc::new(MockServerState::new());
+
+            // Both return HTTP 402 (Payment Required) but with different error codes
+            state1.push(MockResponse::Billing {
+                status: StatusCode::PAYMENT_REQUIRED,
+                code: "1113", // → billing → HardDown
+                message: "insufficient balance",
+            });
+
+            state2.push(MockResponse::Ok {
+                status: StatusCode::BAD_REQUEST, // HTTP 400 without known code → ClientFault
+                body: json!({ "error": "not a known error" }),
+            });
+
+            let server1 = MockServer::new(state1.clone()).await;
+            let server2 = MockServer::new(state2.clone()).await;
+
+            // Lane 1: error_map maps 1113 to billing → HardDown
+            let lane_data_1 = LaneData {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                max: 10,
+                sem: Arc::new(tokio::sync::Semaphore::new(10)),
+                limited: false,
+                budget: -1,
+                cooldown_until: 0,
+                streak: 0,
+                dead: false,
+                dead_reason: String::new(),
+                inflight: 0,
+                ok: 0,
+                err: 0,
+            };
+
+            let mut error_map_1 = HashMap::new();
+            error_map_1.insert("1113".to_string(), "billing".to_string());
+
+            let lane_1 = Lane {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                base_url: server1.base_url(),
+                api_key: "test-key-1".to_string(),
+                protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+                max: 10,
+                error_map: Arc::new(error_map_1),
+            };
+
+            // Lane 2: NO mapping for any code → HTTP status classification only
+            let lane_data_2 = LaneData {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                max: 10,
+                sem: Arc::new(tokio::sync::Semaphore::new(10)),
+                limited: false,
+                budget: -1,
+                cooldown_until: 0,
+                streak: 0,
+                dead: false,
+                dead_reason: String::new(),
+                inflight: 0,
+                ok: 0,
+                err: 0,
+            };
+
+            let error_map_2 = HashMap::new(); // Empty - no overrides
+
+            let lane_2 = Lane {
+                model: "test-model".to_string(),
+                provider: "z.ai".to_string(),
+                base_url: server2.base_url(),
+                api_key: "test-key-2".to_string(),
+                protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+                max: 10,
+                error_map: Arc::new(error_map_2),
+            };
+
+            let setup_app = |lane_data: LaneData, lane: Lane, _error_map_name: &str| {
+                let by_model = HashMap::from([("test-model".to_string(), 0)]);
+                let pools = HashMap::from([("default".to_string(), vec![0])]);
+                let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+                let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+                Arc::new(App {
+                    lanes: vec![lane],
+                    store,
+                    by_model,
+                    pools,
+                    rr: AtomicUsize::new(0),
+                    client: Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .build()
+                        .unwrap(),
+                    auth,
+                    auth_mode: crate::auth::AuthMode::None,
+                })
+            };
+
+            let app_1 = setup_app(lane_data_1, lane_1, "with mapping");
+            let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+
+            // Lane 1 with error_map: code 1113 → billing → HardDown
+            let _response_1 = forward(app_1.clone(), vec![0], req_body.clone().into(), None).await;
+            let t = now();
+            assert!(
+                !app_1.store.usable(0, t),
+                "Lane 1 (with error_map) should be DOWN after billing code"
+            );
+
+            // Lane 2 without mapping: HTTP 400 → ClientFault → no trip
+            let app_2 = setup_app(lane_data_2, lane_2, "without mapping");
+            let _response_2 = forward(app_2.clone(), vec![0], req_body.into(), None).await;
+            assert!(
+                app_2.store.usable(0, t),
+                "Lane 2 (no error_map) should remain usable after ClientFault"
+            );
+
+            server1.shutdown().await;
+            server2.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn test_config_missing_error_map_fails_validation() {
+            // A provider config with empty error_map → config_validate returns an error
+            use crate::config::RootCfg;
+
+            let mut providers = HashMap::new();
+            // Create a provider WITHOUT error_map entries (intentionally empty)
+            providers.insert(
+                "badprovider".to_string(),
+                crate::config::ProviderCfg {
+                    protocol: "anthropic".into(),
+                    base_url: "https://api.example.com".into(),
+                    api_key_env: "API_KEY".into(),
+                    health: None,
+                    error_map: std::collections::HashMap::new(), // Empty = validation error
+                    _legacy_api_key: None,
+                },
+            );
+
+            let mut models = HashMap::new();
+            models.insert(
+                "mymodel".to_string(),
+                crate::config::ModelCfg {
+                    max_requests: -1,
+                    provider: "badprovider".into(),
+                    max_concurrent: 10,
+                },
+            );
+
+            let mut pools = HashMap::new();
+            pools.insert(
+                "mypool".to_string(),
+                crate::config::PoolCfg {
+                    members: vec![crate::config::PoolMember {
+                        target: "mymodel".into(),
+                        weight: 1,
+                        context_max: None,
+                    }],
+                    breaker: None,
+                    failover: None,
+                    on_exhausted: None,
+                    affinity: None,
+                },
+            );
+
+            let cfg = RootCfg {
+                listen: "0.0.0.0:8080".into(),
+                auth: None,
+                providers,
+                models,
+                pools,
+            };
+
+            use crate::config_validate::validate;
+            let result = validate(&cfg);
+            assert!(
+                result.is_err(),
+                "Validation should fail when error_map is empty"
+            );
+
+            let errs = result.unwrap_err();
+            let err_text = errs.join(" | ");
+            assert!(
+                err_text.contains("badprovider"),
+                "Error message should mention the provider"
+            );
+            assert!(
+                err_text.contains("error_map"),
+                "Error message should mention error_map"
+            );
+        }
+
+        #[test]
+        fn test_normalize_wrong_mapping_fails() {
+            // Anti-fab: prove wrong mapping produces wrong disposition
+
+            let mut error_map = HashMap::new();
+            // WRONG: map 1113 to rate_limit instead of billing
+            error_map.insert("1113".to_string(), "rate_limit".to_string());
+
+            let raw = RawUpstreamError {
+                http_status: 402,
+                provider_code: Some("1113".to_string()),
+                structured_type: None,
+            };
+
+            // With WRONG mapping, code 1113 → rate_limit (wrong!)
+            let sig = normalize_raw_error(&raw, &error_map);
+
+            // This FAILS the correctness check: billing should map to HardDown, not TransientUpstream
+            assert_eq!(
+                sig.class,
+                crate::breaker::StatusClass::RateLimit,
+                "Wrong mapping: 1113 incorrectly classified as rate_limit instead of billing"
+            );
+
+            // The correct mapping would be:
+            let mut correct_map = HashMap::new();
+            correct_map.insert("1113".to_string(), "billing".to_string());
+            let correct_sig = normalize_raw_error(&raw, &correct_map);
+            assert_eq!(
+                correct_sig.class,
+                crate::breaker::StatusClass::Billing,
+                "Correct mapping: 1113 → billing"
+            );
+        }
     }
 }
