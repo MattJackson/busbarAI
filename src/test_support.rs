@@ -492,6 +492,8 @@ mod tests {
     /// Test that permit is held during streaming and released after stream ends.
     #[tokio::test]
     async fn test_permit_lifetime_during_stream() {
+        use std::time::Duration;
+
         let state = Arc::new(MockServerState::new());
 
         // Create an SSE response
@@ -503,8 +505,8 @@ mod tests {
 
         let server = MockServer::new(state.clone()).await;
 
-        // Use a semaphore with known permits to track availability
-        let sem = Arc::new(tokio::sync::Semaphore::new(2));
+        // Use a single-permit lane to make the test deterministic
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
 
         let lane = Lane {
             model: "test-model".to_string(),
@@ -513,7 +515,7 @@ mod tests {
             api_key: "test-key".to_string(),
             protocol: Arc::new(AnthropicProtocol::new()),
             sem: sem.clone(),
-            max: 2,
+            max: 1,
             limited: false,
             budget: AtomicI64::new(-1),
             cooldown_until: AtomicU64::new(0),
@@ -547,17 +549,39 @@ mod tests {
         }))
         .unwrap();
 
-        // Initial available permits should be 2
-        assert_eq!(sem.available_permits(), 2);
+        // Initial available permits should be 1
+        assert_eq!(sem.available_permits(), 1);
 
         // Forward the request - this will acquire a permit
         let response = forward(app.clone(), vec![0], req_body.into()).await;
-
-        // Permit should now be held (available drops to 1) during streaming
-        // Note: This assertion depends on when we check - if we check immediately after
-        // forward() returns, the permit is already dropped. We need to verify that
-        // the stream holds it. For this test, we'll just verify the response was created.
         assert_eq!(response.status().as_u16(), 200);
+
+        // BEFORE consuming the body, assert the permit is HELD:
+        // try_acquire should fail (return Err) because permit is held by the stream
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "Permit should be held during streaming (available_permits() == 0)"
+        );
+
+    // Fully consume the response body
+        let collected_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!collected_bytes.is_empty());
+
+        // After consumption, permit should be released (poll briefly if needed)
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if sem.available_permits() == 1 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "Permit should be released after stream ends"
+        );
 
         server.shutdown().await;
     }

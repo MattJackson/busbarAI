@@ -92,12 +92,10 @@ pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Re
                             class: "billing", ..
                         } => {
                             app.lanes[i].kill("billing / insufficient balance (1113)");
-                            std::mem::forget(permit);
                             continue;
                         }
                         CanonicalSignal { class: "auth", .. } => {
                             app.lanes[i].kill(&format!("auth rejected (HTTP {})", status.as_u16()));
-                            std::mem::forget(permit);
                             continue;
                         }
                         CanonicalSignal {
@@ -105,19 +103,16 @@ pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Re
                             ..
                         } => {
                             app.lanes[i].cooldown_rate_limit();
-                            std::mem::forget(permit);
                             continue;
                         }
                         CanonicalSignal {
                             class: "transient", ..
                         } => {
                             app.lanes[i].cooldown_transient("5xx");
-                            std::mem::forget(permit);
                             continue;
                         }
                         CanonicalSignal { class: _, .. } => {
                             app.lanes[i].cooldown_transient("unknown");
-                            std::mem::forget(permit);
                             continue;
                         }
                     }
@@ -125,19 +120,28 @@ pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Re
                     // SUCCESS case: stream the response body incrementally
                     let ct = r.headers().get(CONTENT_TYPE).cloned();
 
-                    // Stream the response body incrementally instead of buffering
-                    let upstream_stream = r.bytes_stream().map(|res| match res {
-                        Ok(b) => Ok(b),
-                        Err(e) => {
-                            let io_msg = e.to_string();
-                            Err(std::io::Error::new(std::io::ErrorKind::Other, io_msg))
-                        }
-                    });
+                    let upstream_stream = r.bytes_stream();
+                    let guarded = futures::stream::unfold(
+                        (upstream_stream, Some(permit)),
+                        |(mut s, permit)| async move {
+                            match s.next().await {
+                                Some(Ok(chunk)) => Some((Ok(chunk), (s, permit))),
+                                Some(Err(e)) => Some((
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        e.to_string(),
+                                    )),
+                                    (s, permit),
+                                )),
+                                None => {
+                                    drop(permit);
+                                    None
+                                }
+                            }
+                        },
+                    );
 
-                    // Drop permit after we've decided to stream (permit will be dropped when Response is returned)
-                    drop(permit);
-
-                    let axum_body = Body::from_stream(upstream_stream);
+                    let axum_body = Body::from_stream(guarded);
 
                     let mut rb = Response::builder().status(status);
                     if let Some(ct) = ct {
