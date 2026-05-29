@@ -20,7 +20,6 @@ futures = "0.3"
 bytes = "1"
 http-body-util = "0.1"
 http-body = "1"
-memchr = "2.7"
 
 [dev-dependencies]
 # In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.

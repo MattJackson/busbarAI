@@ -12,8 +12,6 @@ use futures::Stream;
 use reqwest::StatusCode;
 use serde_json::Value;
 
-use memchr::memmem;
-
 use crate::proto::{convert_headers, CanonicalSignal};
 use crate::state::App;
 use crate::store::{now, Permit};
@@ -198,7 +196,7 @@ impl SseCarryBuffer {
         }
 
         // Look for complete SSE frame (double newline separator)
-        if let Some(start_pos) = memmem::find(&self.buffer, b"\n\n") {
+        if let Some(start_pos) = self.buffer.windows(2).position(|w| w == b"\n\n") {
             // Extract the complete frame including separators
             let end_pos = start_pos + 2;
             let frame_bytes = self.buffer[..end_pos].to_vec();
