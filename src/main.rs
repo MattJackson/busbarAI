@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use axum::{routing::get, routing::post, Router};
 
-use config::Cfg;
+use config::RootCfg;
 use proto::Protocol;
 use state::App;
 
@@ -52,7 +52,7 @@ async fn main() {
     let raw_content = std::fs::read_to_string(&path).expect("read BUSBAR_CONFIG");
     let interpolated =
         config::interpolate_env(&raw_content).expect("expand ${ENV} variables in config");
-    let cfg: Cfg = serde_yaml::from_str(&interpolated).expect("parse config YAML");
+    let cfg: RootCfg = serde_yaml::from_str(&interpolated).expect("parse config YAML");
 
     // Validate protocol against registered implementations
     let registered_protocols: &[&str] = &["anthropic"];
@@ -112,7 +112,8 @@ async fn main() {
     }
 
     let mut pools = HashMap::new();
-    for (name, members) in cfg.pools {
+    for (name, pool) in cfg.pools {
+        let members: Vec<String> = pool.members.iter().map(|m| m.target.clone()).collect();
         let idx: Vec<usize> = members
             .iter()
             .map(|m| {

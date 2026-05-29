@@ -26,16 +26,18 @@ models:
 
 pools:
   glm:
-    - target: glm-5.1
-      weight: 1
-    - target: glm-4.6
-      weight: 1
-    - target: glm-4.5
-      weight: 1
+    members:
+      - target: glm-5.1
+        weight: 1
+      - target: glm-4.6
+        weight: 1
+      - target: glm-4.5
+        weight: 1
   hindsight:
-    - target: glm-5.1
-      weight: 1
-    - target: glm-4.6
-      weight: 1
-    - target: glm-4.5
-      weight: 1
+    members:
+      - target: glm-5.1
+        weight: 1
+      - target: glm-4.6
+        weight: 1
+      - target: glm-4.5
+        weight: 1

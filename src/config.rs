@@ -35,7 +35,7 @@ pub(crate) fn interpolate_env(s: &str) -> Result<String, String> {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
+#[allow(dead_code)] // fields parsed but not wired (B-4xx routing)
 pub(crate) struct RootCfg {
     #[serde(default = "default_listen")]
     pub(crate) listen: String,
@@ -181,16 +181,6 @@ pub(crate) struct AffinityCfg {
 
 fn default_affinity_mode() -> String {
     "session".to_string()
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct Cfg {
-    #[serde(default = "default_listen")]
-    pub(crate) listen: String,
-    pub(crate) providers: HashMap<String, ProviderCfg>,
-    pub(crate) models: HashMap<String, ModelCfg>,
-    #[serde(default)]
-    pub(crate) pools: HashMap<String, Vec<String>>,
 }
 
 fn default_listen() -> String {
