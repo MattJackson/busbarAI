@@ -44,7 +44,7 @@ pub(crate) enum MockResponse {
     },
     Sse {
         events: Vec<String>,
-        abort_after: Option<usize>,
+        abort_at_index: Option<usize>,
     },
 }
 
@@ -161,16 +161,37 @@ async fn mock_handler(
             .unwrap(),
         MockResponse::Sse {
             events,
-            abort_after,
+            abort_at_index,
         } => {
-            let stream_events = if let Some(n) = abort_after {
-                events.into_iter().take(n).collect::<Vec<_>>()
+            let stream_events: Vec<String> = if let Some(idx) = abort_at_index {
+                // Mid-stream abort: send idx events then add SSE error event before ending (no [DONE])
+                let mut result: Vec<String> = events
+                    .iter()
+                    .take(idx)
+                    .map(|d| format!("data: {d}\n\n"))
+                    .collect();
+                // Add SSE error event to notify client of upstream failure
+                let err_json = serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "message": "upstream abort",
+                        "source": "upstream"
+                    }
+                });
+                result.push(format!("event: error\ndata: {}\n\n", err_json));
+                result
             } else {
-                events
+                // Normal completion with [DONE]
+                let mut result: Vec<String> = events
+                    .into_iter()
+                    .map(|d| format!("data: {d}\n\n"))
+                    .collect();
+                result.push("[DONE]\n\n".to_string());
+                result
             };
+
             let s: Pin<Box<dyn Stream<Item = String> + Send>> =
-                Box::pin(stream::iter(stream_events).map(|d| format!("data: {d}\n\n")));
-            let s = s.chain(stream::once(async move { "[DONE]\n\n".to_string() }));
+                Box::pin(stream::iter(stream_events));
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/event-stream")
@@ -193,7 +214,7 @@ mod tests {
     use reqwest::Client;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -346,7 +367,7 @@ mod tests {
         }
         state.push(MockResponse::Sse {
             events,
-            abort_after: None,
+            abort_at_index: None,
         });
 
         let server = MockServer::new(state.clone()).await;
@@ -411,7 +432,7 @@ mod tests {
         let events: Vec<String> = (0..5).map(|i| format!("data-{i}")).collect();
         state.push(MockResponse::Sse {
             events,
-            abort_after: None,
+            abort_at_index: None,
         });
 
         let server = MockServer::new(state.clone()).await;
@@ -483,7 +504,7 @@ mod tests {
         ];
         state.push(MockResponse::Sse {
             events,
-            abort_after: None,
+            abort_at_index: None,
         });
         state.push(MockResponse::ServerError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -556,6 +577,162 @@ mod tests {
             !app.lanes[0].usable(t),
             "lane 0 should be in transient cooldown"
         );
+        server.shutdown().await;
+    }
+
+    /// B-202b: Mid-stream abort records lane breaker failure and does NOT failover.
+    #[tokio::test]
+    async fn test_midstream_abort_records_and_no_failover() {
+        let state = Arc::new(MockServerState::new());
+
+        // LIFO order: push lane 1 success first, then lane 0 mid-stream abort
+        // Lane 1: would return success if used (should NOT be used)
+        let events_lane1 = vec!["data: lane1-ok".to_string()];
+        state.push(MockResponse::Sse {
+            events: events_lane1,
+            abort_at_index: None,
+        });
+
+        // Lane 0: sends 1 event then abruptly ends (no [DONE]) to simulate mid-stream abort
+        let events = vec![
+            "data: event-0".to_string(),
+            "data: event-1".to_string(),
+            "data: event-2".to_string(),
+            "data: event-3".to_string(),
+            "data: event-4".to_string(),
+        ];
+        state.push(MockResponse::Sse {
+            events,
+            abort_at_index: Some(1), // send only index 0 (1 event) then end abruptly
+        });
+
+        let server = MockServer::new(state.clone()).await;
+
+        let err0_before = 0u64;
+        let _cooldown0_before = 0u64;
+        let inflight0_before = 0i64;
+        let ok0_before = 0u64;
+
+        let lane0 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key-0".to_string(),
+            protocol: Arc::new(AnthropicProtocol::new()),
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            max: 10,
+            limited: false,
+            budget: AtomicI64::new(-1),
+            cooldown_until: AtomicU64::new(0),
+            streak: AtomicU32::new(0),
+            dead: AtomicBool::new(false),
+            dead_reason: std::sync::Mutex::new(String::new()),
+            inflight: AtomicI64::new(inflight0_before),
+            ok: AtomicU64::new(ok0_before),
+            err: AtomicU64::new(err0_before),
+        };
+
+        let err1_before = 0u64;
+        let inflight1_before = 0i64;
+        let ok1_before = 0u64;
+
+        let lane1 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key-1".to_string(),
+            protocol: Arc::new(AnthropicProtocol::new()),
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            max: 10,
+            limited: false,
+            budget: AtomicI64::new(-1),
+            cooldown_until: AtomicU64::new(0),
+            streak: AtomicU32::new(0),
+            dead: AtomicBool::new(false),
+            dead_reason: std::sync::Mutex::new(String::new()),
+            inflight: AtomicI64::new(inflight1_before),
+            ok: AtomicU64::new(ok1_before),
+            err: AtomicU64::new(err1_before),
+        };
+
+        let by_model = HashMap::from([("test-model".to_string(), 0)]);
+        let pools = HashMap::from([("default".to_string(), vec![0, 1])]);
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let app = Arc::new(App {
+            lanes: vec![lane0, lane1],
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+        });
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+
+        // Consume response body fully
+        let response = forward(app.clone(), vec![0, 1], req_body.into()).await;
+        assert_eq!(response.status().as_u16(), 200);
+
+        use http_body_util::BodyExt as _;
+        let collected_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&collected_bytes);
+
+        // (a) Assert: the collected body contains `event: error` (SSE error emitted)
+        assert!(
+            text.contains("event: error"),
+            "Expected SSE error event in response, got: {text}"
+        );
+
+        let t = now();
+        let err0_after = app.lanes[0].err.load(Ordering::Relaxed);
+        let cooldown0_after = app.lanes[0].cooldown_until.load(Ordering::Relaxed);
+        let _inflight0_after = app.lanes[0].inflight.load(Ordering::Relaxed);
+        let _ok0_after = app.lanes[0].ok.load(Ordering::Relaxed);
+
+        // (b) Assert: lanes[0].err increased AND cooldown_until > now (failure recorded)
+        assert!(
+            err0_after > err0_before,
+            "lane 0 err should have increased after mid-stream abort, before={before}, after={after}",
+            before = err0_before,
+            after = err0_after
+        );
+        assert!(
+            cooldown0_after > t,
+            "lane 0 cooldown_until should be set after mid-stream abort, now={now}, cooldown={cooldown}",
+            now = t,
+            cooldown = cooldown0_after
+        );
+
+        // (c) Assert: lane 1 was NOT used — inflight/ok untouched (no failover after first byte)
+        let err1_after = app.lanes[1].err.load(Ordering::Relaxed);
+        let inflight1_after = app.lanes[1].inflight.load(Ordering::Relaxed);
+        let ok1_after = app.lanes[1].ok.load(Ordering::Relaxed);
+
+        assert_eq!(
+            err1_after,
+            err1_before,
+            "lane 1 err should be unchanged (no failover), before={before}, after={after}",
+            before = err1_before,
+            after = err1_after
+        );
+        assert_eq!(
+            inflight1_after,
+            inflight1_before,
+            "lane 1 inflight should be unchanged (no failover), before={before}, after={after}",
+            before = inflight1_before,
+            after = inflight1_after
+        );
+        assert_eq!(
+            ok1_after,
+            ok1_before,
+            "lane 1 ok should be unchanged (no failover), before={before}, after={after}",
+            before = ok1_before,
+            after = ok1_after
+        );
+
         server.shutdown().await;
     }
 }

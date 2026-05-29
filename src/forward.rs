@@ -24,18 +24,22 @@ struct FirstByteBody<S, P> {
     first_byte_sent: Arc<AtomicBool>,
     is_sse: bool,
     permit: Option<P>,
+    app: Option<Arc<App>>,
+    lane_idx: usize,
 }
 
 impl<S, P> FirstByteBody<S, P>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
-    fn new(inner: S, is_sse: bool, permit: P) -> Self {
+    fn new(inner: S, is_sse: bool, permit: P, app: Arc<App>, lane_idx: usize) -> Self {
         Self {
             inner,
             first_byte_sent: Arc::new(AtomicBool::new(false)),
             is_sse,
             permit: Some(permit),
+            app: Some(app),
+            lane_idx,
         }
     }
 }
@@ -59,7 +63,10 @@ where
             Poll::Ready(Some(Err(e))) => {
                 let had_first = this.first_byte_sent.load(Ordering::Relaxed);
                 if had_first && this.is_sse {
-                    // Mid-stream failure after first byte in SSE mode: emit SSE error event
+                    // Mid-stream failure after first byte in SSE mode: record breaker failure then emit SSE error event
+                    if let Some(ref app) = this.app {
+                        app.lanes[this.lane_idx].cooldown_transient("mid-stream");
+                    }
                     let err_json = serde_json::json!({
                         "type": "error",
                         "error": {
@@ -77,8 +84,14 @@ where
                     ))))
                 }
             }
+
             Poll::Ready(None) => {
-                // Stream ended normally - drop permit to release the semaphore
+                // Stream ended - for SSE streams that sent at least one byte, record the failure
+                if this.is_sse && this.first_byte_sent.load(Ordering::Relaxed) {
+                    if let Some(ref app) = this.app {
+                        app.lanes[this.lane_idx].cooldown_transient("mid-stream-end");
+                    }
+                }
                 drop(this.permit.take());
                 Poll::Ready(None)
             }
@@ -229,7 +242,8 @@ pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Re
 
                 // B-202: Use FirstByteBody wrapper to track first byte and emit SSE error events on mid-stream failures
                 let upstream_stream = r.bytes_stream();
-                let guarded_body = FirstByteBody::new(upstream_stream, is_sse, permit);
+                let guarded_body =
+                    FirstByteBody::new(upstream_stream, is_sse, permit, app.clone(), i);
                 let axum_body = guarded_body.into_body();
 
                 let mut rb = Response::builder().status(status);
