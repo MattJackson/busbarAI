@@ -139,10 +139,6 @@ async fn mock_handler(
     }
 
     let response = state.next_response();
-    eprintln!(
-        "[DEBUG mock] Returning: {:?}",
-        response.as_ref().map(|r| format!("{:?}", r))
-    );
     let response = response.unwrap_or_default();
     match response {
         MockResponse::Ok { status, body } => Response::builder()
@@ -242,11 +238,12 @@ mod tests {
     use crate::config::AuthCfg;
     use crate::forward::forward;
     use crate::proto::AnthropicProtocol;
-    use crate::state::{now, App, Lane};
+    use crate::state::{now, App, Lane, ProtocolKind};
+    use crate::store::{InMemoryStore, LaneData};
     use reqwest::Client;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -345,30 +342,38 @@ mod tests {
         });
         let server = MockServer::new(state.clone()).await;
 
+        let lane_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+        };
+
         let lane = Lane {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key".to_string(),
-            protocol: Arc::new(AnthropicProtocol::new()),
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
-            limited: false,
-            budget: AtomicI64::new(-1),
-            cooldown_until: AtomicU64::new(0),
-            streak: AtomicU32::new(0),
-            dead: AtomicBool::new(false),
-            dead_reason: std::sync::Mutex::new(String::new()),
-            inflight: AtomicI64::new(0),
-            ok: AtomicU64::new(0),
-            err: AtomicU64::new(0),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
         let pools = HashMap::from([("default".to_string(), vec![0])]);
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
         let app = Arc::new(App {
             lanes: vec![lane],
+            store,
             by_model,
             pools,
             rr: AtomicUsize::new(0),
@@ -380,10 +385,6 @@ mod tests {
             auth_mode: crate::auth::AuthMode::None,
         });
 
-        eprintln!(
-            "[DEBUG] Scenario B: responses before body={}",
-            state.responses.lock().unwrap().len()
-        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward(app.clone(), vec![0], req_body.into(), None).await;
         assert_eq!(response.status().as_u16(), 200);
@@ -408,30 +409,38 @@ mod tests {
         });
 
         let server = MockServer::new(state.clone()).await;
+        let lane_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+        };
+
         let lane = Lane {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key".to_string(),
-            protocol: Arc::new(AnthropicProtocol::new()),
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
-            limited: false,
-            budget: AtomicI64::new(-1),
-            cooldown_until: AtomicU64::new(0),
-            streak: AtomicU32::new(0),
-            dead: AtomicBool::new(false),
-            dead_reason: std::sync::Mutex::new(String::new()),
-            inflight: AtomicI64::new(0),
-            ok: AtomicU64::new(0),
-            err: AtomicU64::new(0),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
         let pools = HashMap::from([("default".to_string(), vec![0])]);
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
         let app = Arc::new(App {
             lanes: vec![lane],
+            store,
             by_model,
             pools,
             rr: AtomicUsize::new(0),
@@ -443,10 +452,6 @@ mod tests {
             auth_mode: crate::auth::AuthMode::None,
         });
 
-        eprintln!(
-            "[DEBUG] Scenario B: responses before body={}",
-            state.responses.lock().unwrap().len()
-        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward(app.clone(), vec![0], req_body.into(), None).await;
         assert_eq!(response.status().as_u16(), 200);
@@ -479,30 +484,38 @@ mod tests {
 
         let server = MockServer::new(state.clone()).await;
         let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let lane_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 1,
+            sem: sem.clone(),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+        };
+
         let lane = Lane {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key".to_string(),
-            protocol: Arc::new(AnthropicProtocol::new()),
-            sem: sem.clone(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 1,
-            limited: false,
-            budget: AtomicI64::new(-1),
-            cooldown_until: AtomicU64::new(0),
-            streak: AtomicU32::new(0),
-            dead: AtomicBool::new(false),
-            dead_reason: std::sync::Mutex::new(String::new()),
-            inflight: AtomicI64::new(0),
-            ok: AtomicU64::new(0),
-            err: AtomicU64::new(0),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
         let pools = HashMap::from([("default".to_string(), vec![0])]);
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
         let app = Arc::new(App {
             lanes: vec![lane],
+            store,
             by_model,
             pools,
             rr: AtomicUsize::new(0),
@@ -514,10 +527,6 @@ mod tests {
             auth_mode: crate::auth::AuthMode::None,
         });
 
-        eprintln!(
-            "[DEBUG] Scenario B: responses before body={}",
-            state.responses.lock().unwrap().len()
-        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         assert_eq!(sem.available_permits(), 1);
         let response = forward(app.clone(), vec![0], req_body.into(), None).await;
@@ -560,23 +569,45 @@ mod tests {
 
         let server = MockServer::new(state.clone()).await;
 
+        let lane0_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+        };
+
+        let lane1_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+        };
+
         let lane0 = Lane {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: Arc::new(AnthropicProtocol::new()),
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
-            limited: false,
-            budget: AtomicI64::new(-1),
-            cooldown_until: AtomicU64::new(0),
-            streak: AtomicU32::new(0),
-            dead: AtomicBool::new(false),
-            dead_reason: std::sync::Mutex::new(String::new()),
-            inflight: AtomicI64::new(0),
-            ok: AtomicU64::new(0),
-            err: AtomicU64::new(0),
         };
 
         let lane1 = Lane {
@@ -584,25 +615,17 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-1".to_string(),
-            protocol: Arc::new(AnthropicProtocol::new()),
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
-            limited: false,
-            budget: AtomicI64::new(-1),
-            cooldown_until: AtomicU64::new(0),
-            streak: AtomicU32::new(0),
-            dead: AtomicBool::new(false),
-            dead_reason: std::sync::Mutex::new(String::new()),
-            inflight: AtomicI64::new(0),
-            ok: AtomicU64::new(0),
-            err: AtomicU64::new(0),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
         let pools = HashMap::from([("default".to_string(), vec![0, 1])]);
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane0_data, lane1_data]));
         let app = Arc::new(App {
             lanes: vec![lane0, lane1],
+            store,
             by_model,
             pools,
             rr: AtomicUsize::new(0),
@@ -614,10 +637,6 @@ mod tests {
             auth_mode: crate::auth::AuthMode::None,
         });
 
-        eprintln!(
-            "[DEBUG] Scenario B: responses before body={}",
-            state.responses.lock().unwrap().len()
-        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
         // Should failover from lane 0 (error) to lane 1 (success)
@@ -626,7 +645,7 @@ mod tests {
 
         let t = now();
         assert!(
-            !app.lanes[0].usable(t),
+            !app.store.usable(0, t),
             "lane 0 should be in transient cooldown"
         );
         server.shutdown().await;
@@ -660,58 +679,63 @@ mod tests {
 
         let server = MockServer::new(state.clone()).await;
 
-        let err0_before = 0u64;
-        let _cooldown0_before = 0u64;
-        let inflight0_before = 0i64;
-        let ok0_before = 0u64;
+        let lane0_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+        };
+
+        let lane1_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+        };
 
         let lane0 = Lane {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: Arc::new(AnthropicProtocol::new()),
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
-            limited: false,
-            budget: AtomicI64::new(-1),
-            cooldown_until: AtomicU64::new(0),
-            streak: AtomicU32::new(0),
-            dead: AtomicBool::new(false),
-            dead_reason: std::sync::Mutex::new(String::new()),
-            inflight: AtomicI64::new(inflight0_before),
-            ok: AtomicU64::new(ok0_before),
-            err: AtomicU64::new(err0_before),
         };
-
-        let err1_before = 0u64;
-        let inflight1_before = 0i64;
-        let ok1_before = 0u64;
 
         let lane1 = Lane {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-1".to_string(),
-            protocol: Arc::new(AnthropicProtocol::new()),
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
-            limited: false,
-            budget: AtomicI64::new(-1),
-            cooldown_until: AtomicU64::new(0),
-            streak: AtomicU32::new(0),
-            dead: AtomicBool::new(false),
-            dead_reason: std::sync::Mutex::new(String::new()),
-            inflight: AtomicI64::new(inflight1_before),
-            ok: AtomicU64::new(ok1_before),
-            err: AtomicU64::new(err1_before),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
         let pools = HashMap::from([("default".to_string(), vec![0, 1])]);
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane0_data, lane1_data]));
         let app = Arc::new(App {
             lanes: vec![lane0, lane1],
+            store,
             by_model,
             pools,
             rr: AtomicUsize::new(0),
@@ -723,10 +747,6 @@ mod tests {
             auth_mode: crate::auth::AuthMode::None,
         });
 
-        eprintln!(
-            "[DEBUG] Scenario B: responses before body={}",
-            state.responses.lock().unwrap().len()
-        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
         // Consume response body fully
@@ -744,50 +764,26 @@ mod tests {
         );
 
         let t = now();
-        let err0_after = app.lanes[0].err.load(Ordering::Relaxed);
-        let cooldown0_after = app.lanes[0].cooldown_until.load(Ordering::Relaxed);
-        let _inflight0_after = app.lanes[0].inflight.load(Ordering::Relaxed);
-        let _ok0_after = app.lanes[0].ok.load(Ordering::Relaxed);
+        let snap0 = app.store.snapshot(0, t);
+        let err0_before = 0u64;
+        let err0_after = snap0.err;
 
         // (b) Assert: lanes[0].err increased AND cooldown_until > now (failure recorded)
         assert!(
             err0_after > err0_before,
-            "lane 0 err should have increased after mid-stream abort, before={before}, after={after}",
-            before = err0_before,
-            after = err0_after
+            "lane 0 err should have increased after mid-stream abort"
         );
+        let cooldown_remaining = app.store.cooldown_remaining(0, t);
         assert!(
-            cooldown0_after > t,
-            "lane 0 cooldown_until should be set after mid-stream abort, now={now}, cooldown={cooldown}",
-            now = t,
-            cooldown = cooldown0_after
+            cooldown_remaining > 0,
+            "lane 0 should be in cooldown after mid-stream abort"
         );
 
-        // (c) Assert: lane 1 was NOT used — inflight/ok untouched (no failover after first byte)
-        let err1_after = app.lanes[1].err.load(Ordering::Relaxed);
-        let inflight1_after = app.lanes[1].inflight.load(Ordering::Relaxed);
-        let ok1_after = app.lanes[1].ok.load(Ordering::Relaxed);
-
+        // (c) Assert: lane 1 was NOT used — err unchanged (no failover after first byte)
+        let snap1 = app.store.snapshot(1, t);
         assert_eq!(
-            err1_after,
-            err1_before,
-            "lane 1 err should be unchanged (no failover), before={before}, after={after}",
-            before = err1_before,
-            after = err1_after
-        );
-        assert_eq!(
-            inflight1_after,
-            inflight1_before,
-            "lane 1 inflight should be unchanged (no failover), before={before}, after={after}",
-            before = inflight1_before,
-            after = inflight1_after
-        );
-        assert_eq!(
-            ok1_after,
-            ok1_before,
-            "lane 1 ok should be unchanged (no failover), before={before}, after={after}",
-            before = ok1_before,
-            after = ok1_after
+            snap1.err, 0u64,
+            "lane 1 err should be unchanged (no failover)"
         );
 
         server.shutdown().await;
@@ -801,45 +797,39 @@ mod tests {
         // Mock returns 401 for both scenarios
         // Push responses in LIFO order (last pushed comes out first)
         // First push is for scenario A (passthrough), second push is for scenario B (token mode)
-        eprintln!(
-            "[DEBUG test] Before pushes, responses: {}",
-            state.responses.lock().unwrap().len()
-        );
         state.push(MockResponse::Auth {
             status: StatusCode::UNAUTHORIZED,
         }); // Scenario A response - consumed first
-        eprintln!(
-            "[DEBUG test] After push A, responses: {}",
-            state.responses.lock().unwrap().len()
-        );
         state.push(MockResponse::Auth {
             status: StatusCode::UNAUTHORIZED,
         }); // Scenario B response - consumed second
-        eprintln!(
-            "[DEBUG test] After push B, responses: {}",
-            state.responses.lock().unwrap().len()
-        );
 
         let server = MockServer::new(state.clone()).await;
 
         // Scenario A: Passthrough mode — lane should NOT be tripped
-        let lane_passthrough = Lane {
+        let lane_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+        };
+
+        let lane = Lane {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "busbar-key".to_string(),
-            protocol: Arc::new(AnthropicProtocol::new()),
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
-            limited: false,
-            budget: AtomicI64::new(-1),
-            cooldown_until: AtomicU64::new(0),
-            streak: AtomicU32::new(0),
-            dead: AtomicBool::new(false),
-            dead_reason: std::sync::Mutex::new(String::new()),
-            inflight: AtomicI64::new(0),
-            ok: AtomicU64::new(0),
-            err: AtomicU64::new(0),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -850,8 +840,10 @@ mod tests {
             _legacy_token: None,
         };
         let auth_mw_passthrough = Arc::new(AuthMiddleware::new(&auth_cfg_passthrough));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
         let app_passthrough = Arc::new(App {
-            lanes: vec![lane_passthrough],
+            lanes: vec![lane],
+            store,
             by_model: by_model.clone(),
             pools: pools.clone(),
             rr: AtomicUsize::new(0),
@@ -863,10 +855,6 @@ mod tests {
             auth_mode: crate::auth::AuthMode::Passthrough,
         });
 
-        eprintln!(
-            "[DEBUG] Scenario B: responses before body={}",
-            state.responses.lock().unwrap().len()
-        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward(app_passthrough.clone(), vec![0], req_body.into(), None).await;
         assert_eq!(
@@ -878,23 +866,15 @@ mod tests {
         // Assert: lane state UNCHANGED in passthrough mode
         let t = now();
         assert!(
-            app_passthrough.lanes[0].usable(t),
+            app_passthrough.store.usable(0, t),
             "lane should remain usable after passthrough-401 (no trip)"
         );
-        assert_eq!(
-            0,
-            app_passthrough.lanes[0].err.load(Ordering::Relaxed),
-            "err counter unchanged in passthrough mode"
-        );
-        assert_eq!(
-            0,
-            app_passthrough.lanes[0].streak.load(Ordering::Relaxed),
-            "streak unchanged in passthrough mode"
-        );
-        assert!(
-            !app_passthrough.lanes[0].dead.load(Ordering::Relaxed),
-            "lane should NOT be dead after passthrough-401"
-        );
+        {
+            let snap = app_passthrough.store.snapshot(0, t);
+            assert_eq!(snap.err, 0, "err counter unchanged in passthrough mode");
+            assert_eq!(snap.streak, 0, "streak unchanged in passthrough mode");
+            assert!(!snap.dead, "lane should NOT be dead after passthrough-401");
+        }
 
         // Scenario B: Token mode — lane SHOULD be tripped (busbar's key failed)
         state.clear_auth_header();
@@ -902,23 +882,29 @@ mod tests {
             status: StatusCode::UNAUTHORIZED,
         });
 
+        let lane_data_token = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+        };
+
         let lane_token = Lane {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "busbar-key".to_string(),
-            protocol: Arc::new(AnthropicProtocol::new()),
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
-            limited: false,
-            budget: AtomicI64::new(-1),
-            cooldown_until: AtomicU64::new(0),
-            streak: AtomicU32::new(0),
-            dead: AtomicBool::new(false),
-            dead_reason: std::sync::Mutex::new(String::new()),
-            inflight: AtomicI64::new(0),
-            ok: AtomicU64::new(0),
-            err: AtomicU64::new(0),
         };
 
         let auth_cfg_token = AuthCfg {
@@ -927,8 +913,10 @@ mod tests {
             _legacy_token: None,
         };
         let auth_mw_token = Arc::new(AuthMiddleware::new(&auth_cfg_token));
+        let store_token = Arc::new(InMemoryStore::new(vec![lane_data_token]));
         let app_token = Arc::new(App {
             lanes: vec![lane_token],
+            store: store_token,
             by_model,
             pools,
             rr: AtomicUsize::new(0),
@@ -940,26 +928,8 @@ mod tests {
             auth_mode: crate::auth::AuthMode::Token,
         });
 
-        eprintln!(
-            "[DEBUG] Scenario B: responses before body={}",
-            state.responses.lock().unwrap().len()
-        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-        eprintln!(
-            "[DEBUG test] About to call forward for scenario B, lanes[0].dead={}, responses={}",
-            app_token.lanes[0].dead.load(Ordering::Relaxed),
-            state.responses.lock().unwrap().len()
-        );
-        eprintln!("[DEBUG test] About to call forward for scenario B");
         let response = forward(app_token.clone(), vec![0], req_body.into(), None).await;
-        eprintln!(
-            "[DEBUG test] forward returned with status: {}",
-            response.status().as_u16()
-        );
-        eprintln!(
-            "[DEBUG test] After scenario B forward, responses: {}",
-            state.responses.lock().unwrap().len()
-        );
         assert_eq!(
             response.status().as_u16(),
             401,
@@ -969,13 +939,16 @@ mod tests {
         // Assert: lane IS tripped in token mode (busbar's stored credential failed)
         let t = now();
         assert!(
-            !app_token.lanes[0].usable(t),
+            !app_token.store.usable(0, t),
             "lane should be DOWN after token-mode-401"
         );
-        assert!(
-            app_token.lanes[0].dead.load(Ordering::Relaxed),
-            "lane should be dead after token-mode-401 (busbar's key)"
-        );
+        {
+            let snap = app_token.store.snapshot(0, t);
+            assert!(
+                snap.dead,
+                "lane should be dead after token-mode-401 (busbar's key)"
+            );
+        }
 
         server.shutdown().await;
     }
@@ -993,23 +966,29 @@ mod tests {
 
         let server = MockServer::new(state.clone()).await;
 
+        let lane_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+        };
+
         let lane = Lane {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "busbar-central-key".to_string(),
-            protocol: Arc::new(AnthropicProtocol::new()),
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
-            limited: false,
-            budget: AtomicI64::new(-1),
-            cooldown_until: AtomicU64::new(0),
-            streak: AtomicU32::new(0),
-            dead: AtomicBool::new(false),
-            dead_reason: std::sync::Mutex::new(String::new()),
-            inflight: AtomicI64::new(0),
-            ok: AtomicU64::new(0),
-            err: AtomicU64::new(0),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1020,8 +999,10 @@ mod tests {
             _legacy_token: None,
         };
         let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg_passthrough));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
         let app = Arc::new(App {
             lanes: vec![lane],
+            store,
             by_model,
             pools,
             rr: AtomicUsize::new(0),
@@ -1035,10 +1016,6 @@ mod tests {
 
         // Caller's Bearer token (NOT busbar's key)
         let caller_bearer_token = "caller-specific-token-abc123";
-        eprintln!(
-            "[DEBUG] Scenario B: responses before body={}",
-            state.responses.lock().unwrap().len()
-        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
         // Forward with caller's token (simulating what auth middleware would extract)
@@ -1201,30 +1178,38 @@ mod tests {
 
         let server = MockServer::new(state.clone()).await;
 
-        let lane0 = Lane {
+        let lane_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+        };
+
+        let lane = Lane {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: Arc::new(AnthropicProtocol::new()),
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
-            limited: false,
-            budget: AtomicI64::new(-1),
-            cooldown_until: AtomicU64::new(0),
-            streak: AtomicU32::new(0),
-            dead: AtomicBool::new(false),
-            dead_reason: std::sync::Mutex::new(String::new()),
-            inflight: AtomicI64::new(0),
-            ok: AtomicU64::new(0),
-            err: AtomicU64::new(0),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
         let pools = HashMap::from([("default".to_string(), vec![0])]);
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
         let app = Arc::new(App {
-            lanes: vec![lane0],
+            lanes: vec![lane],
+            store,
             by_model,
             pools,
             rr: AtomicUsize::new(0),
@@ -1236,10 +1221,6 @@ mod tests {
             auth_mode: crate::auth::AuthMode::None,
         });
 
-        eprintln!(
-            "[DEBUG] Scenario B: responses before body={}",
-            state.responses.lock().unwrap().len()
-        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
         // Forward request (tap integrated in FirstByteBody)

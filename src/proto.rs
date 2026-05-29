@@ -44,6 +44,7 @@ pub(crate) trait Protocol: Send + Sync {
 /// Anthropic protocol implementation.
 /// Reproduces TODAY's exact behavior: path `/v1/messages`, auth headers, model rewrite,
 /// and classification logic per A3 (status + structured error type first).
+#[derive(Clone)]
 pub(crate) struct AnthropicProtocol;
 
 impl AnthropicProtocol {

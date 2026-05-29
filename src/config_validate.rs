@@ -157,7 +157,7 @@ mod tests {
         assert!(errs[0].contains("pool name") && errs[0].contains("conflicts with provider name"));
     }
 
-  #[test]
+    #[test]
     fn test_validate_rejects_unknown_member_ref() {
         let mut providers = HashMap::new();
         providers.insert(

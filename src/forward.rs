@@ -11,12 +11,12 @@ use bytes::Bytes;
 use futures::Stream;
 use reqwest::StatusCode;
 use serde_json::Value;
-use tokio::sync::OwnedSemaphorePermit;
 
 use memchr::memmem;
 
 use crate::proto::{convert_headers, CanonicalSignal};
-use crate::state::{now, App};
+use crate::state::App;
+use crate::store::{now, Permit};
 
 /// B-203: Non-buffering stream inspection tap for Anthropic SSE usage parsing.
 ///
@@ -285,7 +285,7 @@ where
                 if had_first && this.is_sse {
                     // Mid-stream failure after first byte in SSE mode: record breaker failure then emit SSE error event
                     if let Some(ref app) = this.app {
-                        app.lanes[this.lane_idx].cooldown_transient("mid-stream");
+                        app.store.record_transient(this.lane_idx, "mid-stream");
                     }
                     let err_json = serde_json::json!({
                         "type": "error",
@@ -309,7 +309,7 @@ where
                 // Stream ended - for SSE streams that sent at least one byte, record the failure
                 if this.is_sse && this.first_byte_sent.load(Ordering::Relaxed) {
                     if let Some(ref app) = this.app {
-                        app.lanes[this.lane_idx].cooldown_transient("mid-stream-end");
+                        app.store.record_transient(this.lane_idx, "mid-stream-end");
                     }
                 }
                 drop(this.permit.take());
@@ -330,12 +330,12 @@ impl<S, P> FirstByteBody<S, P> {
     }
 }
 
-async fn pick_among(app: &Arc<App>, cands: &[usize]) -> Option<(usize, OwnedSemaphorePermit)> {
+async fn pick_among(app: &Arc<App>, cands: &[usize]) -> Option<(usize, Permit)> {
     let t = now();
     let usable: Vec<usize> = cands
         .iter()
         .copied()
-        .filter(|&i| app.lanes[i].usable(t))
+        .filter(|&i| app.store.usable(i, t))
         .collect();
     if usable.is_empty() {
         return None;
@@ -345,15 +345,22 @@ async fn pick_among(app: &Arc<App>, cands: &[usize]) -> Option<(usize, OwnedSema
         .map(|k| usable[(start + k) % usable.len()])
         .collect();
     for &i in &order {
-        if let Ok(p) = app.lanes[i].sem.clone().try_acquire_owned() {
+        if let Some(p) = app.store.try_acquire(i) {
             return Some((i, p));
         }
     }
     let futs: Vec<_> = order
         .iter()
         .map(|&i| {
-            let sem = app.lanes[i].sem.clone();
-            Box::pin(async move { (i, sem.acquire_owned().await.unwrap()) })
+            let store = app.store.clone();
+            Box::pin(async move {
+                loop {
+                    if let Some(p) = store.try_acquire(i) {
+                        return (i, p);
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                }
+            })
         })
         .collect();
     let ((i, p), _, _) = futures::future::select_all(futs).await;
@@ -390,7 +397,7 @@ pub(crate) async fn forward(
             }
         };
 
-        let proto = app.lanes[i].protocol.as_ref();
+        let proto = &app.lanes[i].protocol;
         proto.rewrite_model(&mut v, &app.lanes[i].model);
         let payload = serde_json::to_vec(&v).unwrap();
         let base = &app.lanes[i].base_url;
@@ -401,8 +408,6 @@ pub(crate) async fn forward(
             crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
         };
 
-        app.lanes[i].inflight.fetch_add(1, Ordering::Relaxed);
-
         let res = app
             .client
             .post(format!("{base}{}", proto.upstream_path()))
@@ -412,13 +417,11 @@ pub(crate) async fn forward(
             .send()
             .await;
 
-        app.lanes[i].inflight.fetch_sub(1, Ordering::Relaxed);
-
         match res {
             Err(e) => {
                 // Pre-response error: classify and potentially failover
                 let err_type = if e.is_timeout() { "timeout" } else { "connect" };
-                app.lanes[i].cooldown_transient(err_type);
+                app.store.record_transient(i, err_type);
                 drop(permit);
                 continue;
             }
@@ -451,14 +454,18 @@ pub(crate) async fn forward(
                         CanonicalSignal {
                             class: "billing", ..
                         } => {
-                            app.lanes[i].kill("billing / insufficient balance (1113)");
+                            app.store
+                                .record_hard_down(i, "billing / insufficient balance (1113)");
                             drop(permit);
                             continue;
                         }
                         CanonicalSignal { class: "auth", .. } => {
                             // In Token/None mode: busbar's key failed → kill lane and return error
                             // In Passthrough mode: already handled above (early return)
-                            app.lanes[i].kill(&format!("auth rejected (HTTP {})", status.as_u16()));
+                            app.store.record_hard_down(
+                                i,
+                                &format!("auth rejected (HTTP {})", status.as_u16()),
+                            );
                             drop(permit);
 
                             // Return the 401/403 response to caller instead of continuing
@@ -473,19 +480,19 @@ pub(crate) async fn forward(
                             class: "rate_limit",
                             ..
                         } => {
-                            app.lanes[i].cooldown_rate_limit();
+                            app.store.record_rate_limit(i, now(), None);
                             drop(permit);
                             continue;
                         }
                         CanonicalSignal {
                             class: "transient", ..
                         } => {
-                            app.lanes[i].cooldown_transient("5xx");
+                            app.store.record_transient(i, "5xx");
                             drop(permit);
                             continue;
                         }
                         CanonicalSignal { class, .. } => {
-                            app.lanes[i].cooldown_transient(&format!("unknown-{class}"));
+                            app.store.record_transient(i, &format!("unknown-{class}"));
                             drop(permit);
                             continue;
                         }

@@ -35,11 +35,12 @@ mod handlers;
 mod proto;
 mod route;
 mod state;
+mod store;
 #[cfg(test)]
 mod test_support;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,8 +48,8 @@ use axum::{routing::get, routing::post, Router};
 
 use auth::AuthMiddleware;
 use config::RootCfg;
-use proto::Protocol;
-use state::App;
+use state::{App, Lane, ProtocolKind};
+use store::{InMemoryStore, LaneData};
 
 #[tokio::main]
 async fn main() {
@@ -72,47 +73,67 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let mut lanes = Vec::new();
+    let mut lanes_data = Vec::new();
     let mut by_model = HashMap::new();
     for (model, mc) in cfg.models {
-        let p = cfg
+        let provider_cfg = cfg
             .providers
             .get(&mc.provider)
             .unwrap_or_else(|| panic!("model {model} -> unknown provider {}", mc.provider));
-        let key = std::env::var(&p.api_key_env).unwrap_or_default();
+        let key = std::env::var(&provider_cfg.api_key_env).unwrap_or_default();
         if key.is_empty() {
             eprintln!(
                 "[warn] provider {} key env {} empty",
-                mc.provider, p.api_key_env
+                mc.provider, provider_cfg.api_key_env
             );
         }
         let limited = mc.max_requests >= 0;
-        let proto: Arc<dyn Protocol> = if p.protocol == "anthropic" {
-            Arc::new(proto::AnthropicProtocol::new())
+        by_model.insert(model.clone(), lanes_data.len());
+        lanes_data.push(LaneData {
+            model: model.clone(),
+            provider: mc.provider.clone(),
+            max: mc.max_concurrent,
+            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(mc.max_concurrent)),
+            limited,
+            budget: if limited { mc.max_requests } else { -1 },
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+        });
+
+        eprintln!(
+            "  model {} via {} ({}) max {}",
+            model,
+            mc.provider,
+            provider_cfg.base_url.trim_end_matches('/'),
+            mc.max_concurrent
+        );
+    }
+
+    let mut lanes = Vec::new();
+    for ld in &lanes_data {
+        let proto = if ld.provider == "anthropic" {
+            ProtocolKind::Anthropic(crate::proto::AnthropicProtocol::new())
         } else {
             panic!(
                 "unknown protocol '{}' for provider {}",
-                p.protocol, mc.provider
+                ld.provider,
+                cfg.providers.get(&ld.provider).unwrap().protocol
             );
         };
-        by_model.insert(model.clone(), lanes.len());
-        lanes.push(state::Lane {
-            model,
-            provider: mc.provider,
-            base_url: p.base_url.trim_end_matches('/').to_string(),
-            api_key: key,
+
+        let provider_cfg = cfg.providers.get(&ld.provider).unwrap();
+        lanes.push(Lane {
+            model: ld.model.clone(),
+            provider: ld.provider.clone(),
+            base_url: provider_cfg.base_url.trim_end_matches('/').to_string(),
+            api_key: std::env::var(&provider_cfg.api_key_env).unwrap_or_default(),
             protocol: proto,
-            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(mc.max_concurrent)),
-            max: mc.max_concurrent,
-            limited,
-            budget: AtomicI64::new(if limited { mc.max_requests } else { -1 }),
-            cooldown_until: AtomicU64::new(0),
-            streak: AtomicU32::new(0),
-            dead: AtomicBool::new(false),
-            dead_reason: std::sync::Mutex::new(String::new()),
-            inflight: AtomicI64::new(0),
-            ok: AtomicU64::new(0),
-            err: AtomicU64::new(0),
+            max: ld.max,
         });
     }
 
@@ -131,12 +152,6 @@ async fn main() {
     }
 
     eprintln!("busbar: {} models, {} pools", lanes.len(), pools.len());
-    for l in &lanes {
-        eprintln!(
-            "  model {} via {} ({}) max {}",
-            l.model, l.provider, l.base_url, l.max
-        );
-    }
     for (n, idx) in &pools {
         let agg: usize = idx.iter().map(|&i| lanes[i].max).sum();
         eprintln!(
@@ -161,9 +176,11 @@ async fn main() {
     }
 
     let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg));
+    let store = Arc::new(InMemoryStore::new(lanes_data.clone()));
 
     let app = Arc::new(App {
         lanes,
+        store,
         by_model,
         pools,
         rr: AtomicUsize::new(0),

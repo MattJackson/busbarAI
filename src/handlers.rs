@@ -13,20 +13,29 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::state::{now, App};
-use std::sync::atomic::Ordering;
 
 pub(crate) async fn stats(State(app): State<Arc<App>>) -> Response {
     let t = now();
-    let lanes: Vec<Value> = app.lanes.iter().map(|l| json!({
-        "model": l.model, "provider": l.provider, "max_concurrent": l.max,
-        "inflight": l.inflight.load(Ordering::Relaxed), "free_slots": l.sem.available_permits(),
-        "ok": l.ok.load(Ordering::Relaxed), "err": l.err.load(Ordering::Relaxed),
-        "usable": l.usable(t), "dead": l.dead.load(Ordering::Relaxed),
-        "dead_reason": *l.dead_reason.lock().unwrap(),
-        "cooldown_remaining_s": l.cooldown_until.load(Ordering::Relaxed).saturating_sub(t),
-        "streak": l.streak.load(Ordering::Relaxed),
-        "budget": if l.limited { l.budget.load(Ordering::Relaxed) } else { -1 },
-    })).collect();
+    let lanes: Vec<Value> = (0..app.lanes.len())
+        .map(|i| {
+            let snap = app.store.snapshot(i, t);
+            json!({
+                "model": snap.model,
+                "provider": snap.provider,
+                "max_concurrent": snap.max_concurrent,
+                "inflight": snap.inflight,
+                "free_slots": snap.free_slots,
+                "ok": snap.ok,
+                "err": snap.err,
+                "usable": snap.usable,
+                "dead": snap.dead,
+                "dead_reason": snap.dead_reason,
+                "cooldown_remaining_s": snap.cooldown_remaining_s,
+                "streak": snap.streak,
+                "budget": snap.budget,
+            })
+        })
+        .collect();
     let pools: HashMap<&String, Vec<&str>> = app
         .pools
         .iter()
@@ -42,7 +51,7 @@ pub(crate) async fn stats(State(app): State<Arc<App>>) -> Response {
 
 pub(crate) async fn healthz(State(app): State<Arc<App>>) -> Response {
     let t = now();
-    if app.lanes.iter().any(|l| l.usable(t)) {
+    if (0..app.lanes.len()).any(|i| app.store.usable(i, t)) {
         (StatusCode::OK, "ok").into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "no usable lanes").into_response()
