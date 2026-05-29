@@ -28,6 +28,7 @@
 // <-> OpenAI translation; not handled here. All v1 lanes are Anthropic-format.
 
 mod auth;
+mod breaker;
 mod config;
 mod config_validate;
 mod forward;

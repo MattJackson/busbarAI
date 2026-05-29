@@ -12,7 +12,8 @@ use futures::Stream;
 use reqwest::StatusCode;
 use serde_json::Value;
 
-use crate::proto::{convert_headers, CanonicalSignal};
+use crate::breaker::{classify as classify_disposition, Disposition};
+use crate::proto::{convert_headers, StatusClass};
 use crate::state::App;
 use crate::store::{now, Permit};
 
@@ -448,25 +449,16 @@ pub(crate) async fn forward(
                         return rb.body(Body::from(bytes)).unwrap();
                     }
 
-                    match proto.classify(status, &bytes) {
-                        CanonicalSignal {
-                            class: "billing", ..
-                        } => {
-                            app.store
-                                .record_hard_down(i, "billing / insufficient balance (1113)");
-                            drop(permit);
-                            continue;
-                        }
-                        CanonicalSignal { class: "auth", .. } => {
-                            // In Token/None mode: busbar's key failed → kill lane and return error
-                            // In Passthrough mode: already handled above (early return)
-                            app.store.record_hard_down(
-                                i,
-                                &format!("auth rejected (HTTP {})", status.as_u16()),
-                            );
-                            drop(permit);
+                    // Two-stage pipeline: Stage 1 (proto.classify) → CanonicalSignal with typed StatusClass
+                    //                     Stage 2 (breaker::classify_disposition) → Disposition
+                    let sig = proto.classify(status, &bytes);
+                    let disposition = classify_disposition(&sig);
 
-                            // Return the 401/403 response to caller instead of continuing
+                    // Exhaustive match on Disposition - NO _ => allowed per B-301 requirements
+                    match disposition {
+                        Disposition::ClientFault => {
+                            // ADR-0002: Client fault (caller's bad input) → relay verbatim, record NOTHING
+                            // The core differentiator: a healthy member must NOT trip on caller bad input
                             use axum::body::Body;
                             let mut rb = Response::builder().status(status);
                             if let Some(ct) = ct {
@@ -474,24 +466,47 @@ pub(crate) async fn forward(
                             }
                             return rb.body(Body::from(bytes)).unwrap();
                         }
-                        CanonicalSignal {
-                            class: "rate_limit",
-                            ..
-                        } => {
-                            app.store.record_rate_limit(i, now(), None);
+                        Disposition::TransientUpstream => {
+                            // Transient upstream failure → cooldown + err counter
+                            // Record based on specific error type
+                            if matches!(sig.class, StatusClass::RateLimit) {
+                                app.store.record_rate_limit(i, now(), sig.retry_after);
+                            } else {
+                                let what = match sig.class {
+                                    StatusClass::ServerError => "5xx",
+                                    StatusClass::Timeout => "timeout",
+                                    StatusClass::Network => "network",
+                                    StatusClass::Overloaded => "overloaded",
+                                    _ => "transient",
+                                };
+                                app.store.record_transient(i, what);
+                            }
                             drop(permit);
                             continue;
                         }
-                        CanonicalSignal {
-                            class: "transient", ..
-                        } => {
-                            app.store.record_transient(i, "5xx");
+                        Disposition::HardDown => {
+                            // Hard down → permanent dead state (with probe recovery per B-303)
+                            let reason = match sig.class {
+                                StatusClass::Billing => "billing / insufficient balance",
+                                StatusClass::Auth => {
+                                    &format!("auth rejected (HTTP {})", status.as_u16())
+                                }
+                                _ => "hard down",
+                            };
+                            app.store.record_hard_down(i, reason);
                             drop(permit);
-                            continue;
-                        }
-                        CanonicalSignal { class, .. } => {
-                            app.store.record_transient(i, &format!("unknown-{class}"));
-                            drop(permit);
+
+                            // For auth failures in Token/None mode: return error to caller
+                            if matches!(sig.class, StatusClass::Auth) {
+                                use axum::body::Body;
+                                let mut rb = Response::builder().status(status);
+                                if let Some(ct) = ct {
+                                    rb = rb.header(CONTENT_TYPE, ct);
+                                }
+                                return rb.body(Body::from(bytes)).unwrap();
+                            }
+
+                            // For billing/other hard downs: continue to next lane (failover)
                             continue;
                         }
                     }

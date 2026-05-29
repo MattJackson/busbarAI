@@ -7,17 +7,9 @@
 
 use axum::http::{header::HeaderValue, HeaderName, StatusCode};
 
-/// Canonical signal emitted by a protocol when classifying an error response.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used for future extensibility (B-301, ADR-0005)
-pub(crate) struct CanonicalSignal {
-    /// Class of the signal (e.g., "billing", "auth", "rate_limit", "transient").
-    pub(crate) class: &'static str,
-    /// Provider-specific signal code or description.
-    pub(crate) provider_signal: Option<&'static str>,
-    /// Optional retry-after seconds for rate-limiting scenarios.
-    pub(crate) retry_after: Option<u64>,
-}
+// StatusClass and CanonicalSignal are defined in breaker.rs and re-exported here for compatibility
+pub(crate) use crate::breaker::CanonicalSignal;
+pub(crate) use crate::breaker::StatusClass;
 
 /// Protocol abstraction for upstream LLM providers (Anthropic, OpenAI, etc.).
 /// Per ADR-0006, the agnostic core calls this trait instead of naming wire-format literals.
@@ -95,50 +87,121 @@ impl Protocol for AnthropicProtocol {
         let text = String::from_utf8_lossy(body);
 
         // A3: prefer HTTP status first, then structured error codes, then substrings as fallback.
+        // IMPORTANT: Never match free-text like "rate limit" that could appear in user prompts.
+        // Only match known provider-specific codes (1113, 1302) or structured JSON fields.
 
-        // Billing (1113 / insufficient balance) — provider-specific code takes precedence
-        if body.windows(4).any(|w| w == b"1113") || text.contains("nsufficient balance") {
-            return CanonicalSignal {
-                class: "billing",
-                provider_signal: Some("1113"),
-                retry_after: None,
-            };
+        // Try to parse structured error from JSON body for known provider codes
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
+            // Check for structured error code first (z.ai style codes)
+            if let Some(code_val) = json.get("error").and_then(|e| e.get("code")) {
+                if let Some(code_str) = code_val.as_str() {
+                    match code_str {
+                        // z.ai 1113: insufficient balance → HARD DOWN (Billing)
+                        "1113" => {
+                            return CanonicalSignal {
+                                class: StatusClass::Billing,
+                                provider_signal: Some("1113"),
+                                retry_after: None,
+                            };
+                        }
+                        // z.ai 1302: rate_limit → TRANSIENT (RateLimit)
+                        "1302" => {
+                            return CanonicalSignal {
+                                class: StatusClass::RateLimit,
+                                provider_signal: Some("1302"),
+                                retry_after: None,
+                            };
+                        }
+                        // Client error codes → CLIENT FAULT (use static strings)
+                        "400" | "422" => {
+                            return CanonicalSignal {
+                                class: StatusClass::ClientError,
+                                provider_signal: Some("client_error"),
+                                retry_after: None,
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Check for structured message patterns as fallback (known codes only)
+                if let Some(msg_val) = json.get("error").and_then(|e| e.get("message")) {
+                    if let Some(msg_str) = msg_val.as_str() {
+                        // Billing: "insufficient balance" text pattern (fallback for 1113)
+                        if msg_str.contains("nsufficient balance") {
+                            return CanonicalSignal {
+                                class: StatusClass::Billing,
+                                provider_signal: Some("billing"),
+                                retry_after: None,
+                            };
+                        }
+
+                        // Auth errors in message (fallback)
+                        if msg_str.contains("unauthorized") || msg_str.contains("invalid token") {
+                            return CanonicalSignal {
+                                class: StatusClass::Auth,
+                                provider_signal: Some("auth"),
+                                retry_after: None,
+                            };
+                        }
+                    }
+                }
+            }
         }
 
-        // Auth (401/403)
+        // HTTP status-based classification (primary decision path)
+
+        // Auth failures (401/403) → HARD DOWN for busbar's own key failure
         if status.as_u16() == 401 || status.as_u16() == 403 {
             return CanonicalSignal {
-                class: "auth",
+                class: StatusClass::Auth,
                 provider_signal: None,
                 retry_after: None,
             };
         }
 
-        // Rate limit (429 / z.ai 1302 / rate_limit strings)
-        if status.as_u16() == 429
-            || body.windows(4).any(|w| w == b"1302")
-            || text.contains("rate_limit")
-            || text.contains("Rate limit")
-        {
+        // Rate limit (429) — distinguish quota-exhausted vs slow-down via body analysis
+        if status.as_u16() == 429 {
+            // Check for quota exhaustion indicators in body
+            // "quota" + "exhausted" or similar patterns indicate HARD DOWN
+            if text.contains("quota") && text.contains("exhausted") {
+                return CanonicalSignal {
+                    class: StatusClass::Billing,
+                    provider_signal: Some("429-quota-exhausted"),
+                    retry_after: None,
+                };
+            }
+
+            // Standard 429 slow-down → TRANSIENT (RateLimit)
             return CanonicalSignal {
-                class: "rate_limit",
-                provider_signal: None,
+                class: StatusClass::RateLimit,
+                provider_signal: Some("429-slowdown"),
                 retry_after: None,
             };
         }
 
-        // 5xx transient
+        // Server errors (5xx) → TRANSIENT UPSTREAM
         if status.as_u16() >= 500 {
             return CanonicalSignal {
-                class: "transient",
+                class: StatusClass::ServerError,
                 provider_signal: Some("5xx"),
                 retry_after: None,
             };
         }
 
-        // Default: relay (2xx, 4xx non-problematic)
+        // Client errors (4xx other than 401/403) → CLIENT FAULT, do not penalize lane
+        if status.is_client_error() {
+            return CanonicalSignal {
+                class: StatusClass::ClientError,
+                provider_signal: None,
+                retry_after: None,
+            };
+        }
+
+        // Default for non-error cases (2xx) — should be handled before classification
+        // Return ClientError as a safe default that won't trip the breaker
         CanonicalSignal {
-            class: "relay",
+            class: StatusClass::ClientError,
             provider_signal: None,
             retry_after: None,
         }
