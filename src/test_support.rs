@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::{stream, Stream, StreamExt};
 
 use axum::{
@@ -731,6 +732,196 @@ mod tests {
             "lane 1 ok should be unchanged (no failover), before={before}, after={after}",
             before = ok1_before,
             after = ok1_after
+        );
+
+        server.shutdown().await;
+    }
+
+    /// B-203: Stream inspection tap test for Anthropic SSE usage parsing.
+    ///
+    /// Tests that the tap:
+    /// (a) forwards byte-identical stream to client
+    /// (b) extracts parsed usage from message_delta/message_stop events
+    /// (c) maintains bounded memory via carry buffer cap
+    #[tokio::test]
+    async fn test_b203_stream_inspection_tap_usage_parsing() {
+        use crate::forward::{SseCarryBuffer, UsageTap};
+
+        // Test 1: UsageTap extracts usage from Anthropic-style events
+        let mut tap = UsageTap::new();
+
+        // Feed a message_delta event with usage object
+        let delta_json = serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "end_turn"
+            },
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 2,
+                "cache_read_input_tokens": 3
+            }
+        });
+        let delta_str = serde_json::to_string(&delta_json).unwrap();
+        tap.feed(&Bytes::from(delta_str));
+
+        // Assert: all four usage fields extracted correctly
+        assert_eq!(tap.input_tokens, Some(10), "input_tokens should be 10");
+        assert_eq!(tap.output_tokens, Some(5), "output_tokens should be 5");
+        assert_eq!(
+            tap.cache_creation_input_tokens,
+            Some(2),
+            "cache_creation_input_tokens should be 2"
+        );
+        assert_eq!(
+            tap.cache_read_input_tokens,
+            Some(3),
+            "cache_read_input_tokens should be 3"
+        );
+        assert!(tap.has_usage(), "tap should have usage data");
+
+        // Test 2: message_stop as fallback (when delta missing)
+        let mut tap2 = UsageTap::new();
+        let stop_json = serde_json::json!({
+            "type": "message_stop",
+            "usage": {
+                "input_tokens": 15,
+                "output_tokens": 8
+            }
+        });
+        let stop_str = serde_json::to_string(&stop_json).unwrap();
+        tap2.feed(&Bytes::from(stop_str));
+
+        assert_eq!(
+            tap2.input_tokens,
+            Some(15),
+            "input_tokens from message_stop should be 15"
+        );
+        assert_eq!(
+            tap2.output_tokens,
+            Some(8),
+            "output_tokens from message_stop should be 8"
+        );
+
+        // Test 3: Carry buffer boundedness (hard cap test)
+        let mut carry = SseCarryBuffer::new();
+
+        // Feed a chunk larger than max carry bytes
+        let large_chunk = vec![b'x'; 10000];
+        carry.feed(&Bytes::from(large_chunk));
+
+        // Assert: carry buffer respects MAX_CARRY_BYTES cap (4KB)
+        assert!(
+            carry.len() <= 4096,
+            "carry buffer should be bounded by max_bytes"
+        );
+
+        // Test 4: SSE frame reassembly across chunk boundaries
+        let mut carry2 = SseCarryBuffer::new();
+
+        // Split a complete SSE event across two chunks
+        let event1 = "data: {\"type\": \"message_start\"}\n\n";
+
+        // Feed first part (incomplete)
+        let split_point = event1.len() / 2;
+        carry2.feed(&Bytes::from(&event1.as_bytes()[..split_point]));
+
+        // Assert: no complete frame yet
+        assert!(
+            carry2.feed(&Bytes::new()).is_none(),
+            "should not have complete frame after first chunk"
+        );
+
+        // Feed remainder (completes the frame)
+        let remaining = &event1.as_bytes()[split_point..];
+        if let Some(frame) = carry2.feed(&Bytes::from(remaining)) {
+            let frame_str = String::from_utf8_lossy(&frame);
+            assert!(
+                frame_str.contains("message_start"),
+                "should contain first message"
+            );
+        } else {
+            panic!("Expected complete frame after second chunk");
+        }
+
+        // Test 5: Byte-identical stream forwarding (integration test with mock)
+        let state = Arc::new(MockServerState::new());
+
+        // Create Anthropic-style SSE events including message_delta and message_stop
+        // These are raw strings that will be prefixed with "data: " by MockResponse::Sse
+        // Push in reverse order (LIFO) so first event comes out first
+        let usage_events = vec![
+            r#"{"type":"message_start"}"#.to_string(),
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#.to_string(),
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#.to_string(),
+            r#"{"type":"message_delta","usage":{"input_tokens":10,"output_tokens":5}}"#.to_string(),
+            r#"{"type":"message_stop"}"#.to_string(),
+        ];
+
+        // MockResponse::Sse adds [DONE] at the end when abort_at_index is None
+        let mut expected_text: String = usage_events
+            .iter()
+            .map(|e| format!("data: {}\n\n", e))
+            .collect();
+        expected_text.push_str("[DONE]\n\n");
+
+        // Push events in reverse order (LIFO means last pushed comes out first)
+        state.push(MockResponse::Sse {
+            events: usage_events,
+            abort_at_index: None,
+        });
+
+        let server = MockServer::new(state.clone()).await;
+
+        let lane0 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key-0".to_string(),
+            protocol: Arc::new(AnthropicProtocol::new()),
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            max: 10,
+            limited: false,
+            budget: AtomicI64::new(-1),
+            cooldown_until: AtomicU64::new(0),
+            streak: AtomicU32::new(0),
+            dead: AtomicBool::new(false),
+            dead_reason: std::sync::Mutex::new(String::new()),
+            inflight: AtomicI64::new(0),
+            ok: AtomicU64::new(0),
+            err: AtomicU64::new(0),
+        };
+
+        let by_model = HashMap::from([("test-model".to_string(), 0)]);
+        let pools = HashMap::from([("default".to_string(), vec![0])]);
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let app = Arc::new(App {
+            lanes: vec![lane0],
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+        });
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+
+        // Forward request (tap integrated in FirstByteBody)
+        let response = forward(app.clone(), vec![0], req_body.into()).await;
+        assert_eq!(response.status().as_u16(), 200);
+
+        use http_body_util::BodyExt as _;
+        let collected_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let actual_text = String::from_utf8_lossy(&collected_bytes).to_string();
+
+        // Assert (a): client receives byte-identical stream
+        assert_eq!(
+            actual_text, expected_text,
+            "client should receive byte-identical stream"
         );
 
         server.shutdown().await;

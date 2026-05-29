@@ -101,6 +101,7 @@ dependencies = [
  "futures",
  "http-body",
  "http-body-util",
+ "memchr",
  "reqwest",
  "serde",
  "serde_json",
