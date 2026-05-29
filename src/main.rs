@@ -34,6 +34,8 @@ mod handlers;
 mod proto;
 mod route;
 mod state;
+#[cfg(test)]
+mod test_support;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize};

@@ -14,7 +14,11 @@ use crate::forward::forward;
 use crate::state::App;
 
 // POST /<name>/v1/messages   — name resolves to a pool (round-robin) or a single model
-pub async fn named(State(app): State<Arc<App>>, Path(name): Path<String>, body: Bytes) -> Response {
+pub(crate) async fn named(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
     if let Some(cands) = app.pools.get(&name) {
         return forward(app.clone(), cands.clone(), body).await;
     }
@@ -29,7 +33,7 @@ pub async fn named(State(app): State<Arc<App>>, Path(name): Path<String>, body: 
 }
 
 // POST /<provider>/<model>/v1/messages — ad-hoc direct
-pub async fn adhoc(
+pub(crate) async fn adhoc(
     State(app): State<Arc<App>>,
     Path((provider, model)): Path<(String, String)>,
     body: Bytes,

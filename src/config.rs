@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-#![allow(dead_code, private_interfaces)]
-
 use std::collections::HashMap;
 
 use serde::Deserialize;
@@ -38,25 +36,25 @@ pub(crate) fn interpolate_env(s: &str) -> Result<String, String> {
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // fields parsed but not wired (B-4xx routing)
-pub struct RootCfg {
+pub(crate) struct RootCfg {
     #[serde(default = "default_listen")]
-    pub listen: String,
-    pub auth: Option<AuthCfg>,
-    pub providers: HashMap<String, ProviderCfg>,
-    pub models: HashMap<String, ModelCfg>,
-    pub pools: HashMap<String, PoolCfg>,
+    pub(crate) listen: String,
+    pub(crate) auth: Option<AuthCfg>,
+    pub(crate) providers: HashMap<String, ProviderCfg>,
+    pub(crate) models: HashMap<String, ModelCfg>,
+    pub(crate) pools: HashMap<String, PoolCfg>,
 }
 
 #[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
 #[derive(Debug, Deserialize, Clone)]
-pub struct AuthCfg {
+pub(crate) struct AuthCfg {
     #[serde(default = "default_auth_mode")]
-    pub mode: String,
+    pub(crate) mode: String,
     #[deprecated(since = "0.1.0", note = "use client_tokens allowlist instead")]
     #[serde(rename = "token", default)]
-    pub _legacy_token: Option<String>,
+    pub(crate) _legacy_token: Option<String>,
     #[serde(default)]
-    pub client_tokens: Vec<String>,
+    pub(crate) client_tokens: Vec<String>,
 }
 
 impl AuthCfg {
@@ -74,7 +72,7 @@ impl AuthCfg {
 
     /// Create a default AuthCfg for initialization.
     #[allow(deprecated)] // accessing deprecated field in constructor
-    pub fn default_none() -> Self {
+    pub(crate) fn default_none() -> Self {
         Self {
             mode: "none".to_string(),
             _legacy_token: None,
@@ -87,9 +85,9 @@ fn default_auth_mode() -> String {
     "none".to_string()
 }
 
-#[allow(dead_code, private_interfaces)] // v1 schema fields defined but not yet wired (B-4xx routing)
+#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
 #[derive(Debug, Deserialize)]
-pub struct ProviderCfg {
+pub(crate) struct ProviderCfg {
     #[serde(default = "default_protocol")]
     pub(crate) protocol: String,
     pub(crate) base_url: String,
@@ -124,9 +122,9 @@ fn neg1() -> i64 {
     -1
 }
 
-#[allow(dead_code, private_interfaces)] // v1 schema fields defined but not yet wired (B-4xx routing)
+#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
 #[derive(Debug, Deserialize)]
-pub struct PoolCfg {
+pub(crate) struct PoolCfg {
     #[serde(default)]
     pub(crate) members: Vec<PoolMember>,
     #[serde(default)]
@@ -221,28 +219,32 @@ fn default_listen() -> String {
 mod tests {
     use super::*;
 
+    // NOTE: env vars are process-global; tests run in parallel. Use UNIQUE per-test var
+    // names so they cannot race each other (the old shared HOST/USER raced + USER even
+    // collided with the real shell var). Do not reintroduce shared names.
     #[test]
     fn test_interpolate_env_simple() {
-        let input = "https://${HOST}/api";
-        std::env::set_var("HOST", "example.com");
+        let input = "https://${BUSBAR_T_SIMPLE_HOST}/api";
+        std::env::set_var("BUSBAR_T_SIMPLE_HOST", "example.com");
         let result = interpolate_env(input).unwrap();
         assert_eq!(result, "https://example.com/api");
-        std::env::remove_var("HOST");
+        std::env::remove_var("BUSBAR_T_SIMPLE_HOST");
     }
 
     #[test]
     fn test_interpolate_env_multiple() {
-        let input = "${PROTO}://${USER}@${HOST}:${PORT}/";
-        std::env::set_var("PROTO", "https");
-        std::env::set_var("USER", "admin");
-        std::env::set_var("HOST", "localhost");
-        std::env::set_var("PORT", "8080");
+        let input =
+            "${BUSBAR_T_MULTI_PROTO}://${BUSBAR_T_MULTI_USER}@${BUSBAR_T_MULTI_HOST}:${BUSBAR_T_MULTI_PORT}/";
+        std::env::set_var("BUSBAR_T_MULTI_PROTO", "https");
+        std::env::set_var("BUSBAR_T_MULTI_USER", "admin");
+        std::env::set_var("BUSBAR_T_MULTI_HOST", "localhost");
+        std::env::set_var("BUSBAR_T_MULTI_PORT", "8080");
         let result = interpolate_env(input).unwrap();
         assert_eq!(result, "https://admin@localhost:8080/");
-        std::env::remove_var("PROTO");
-        std::env::remove_var("USER");
-        std::env::remove_var("HOST");
-        std::env::remove_var("PORT");
+        std::env::remove_var("BUSBAR_T_MULTI_PROTO");
+        std::env::remove_var("BUSBAR_T_MULTI_USER");
+        std::env::remove_var("BUSBAR_T_MULTI_HOST");
+        std::env::remove_var("BUSBAR_T_MULTI_PORT");
     }
 
     #[test]

@@ -24,26 +24,26 @@ pub(crate) fn now() -> u64 {
 }
 
 // ---------- lane (one per model) ----------
-pub struct Lane {
-    pub model: String,
-    pub provider: String,
-    pub base_url: String,
-    pub api_key: String,
-    pub protocol: Arc<dyn Protocol>,
-    pub sem: Arc<Semaphore>,
-    pub max: usize,
-    pub limited: bool,
-    pub budget: AtomicI64,
-    pub cooldown_until: AtomicU64,
-    pub streak: AtomicU32,
-    pub dead: AtomicBool,
-    pub dead_reason: std::sync::Mutex<String>,
-    pub inflight: AtomicI64,
-    pub ok: AtomicU64,
-    pub err: AtomicU64,
+pub(crate) struct Lane {
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    pub(crate) base_url: String,
+    pub(crate) api_key: String,
+    pub(crate) protocol: Arc<dyn Protocol>,
+    pub(crate) sem: Arc<Semaphore>,
+    pub(crate) max: usize,
+    pub(crate) limited: bool,
+    pub(crate) budget: AtomicI64,
+    pub(crate) cooldown_until: AtomicU64,
+    pub(crate) streak: AtomicU32,
+    pub(crate) dead: AtomicBool,
+    pub(crate) dead_reason: std::sync::Mutex<String>,
+    pub(crate) inflight: AtomicI64,
+    pub(crate) ok: AtomicU64,
+    pub(crate) err: AtomicU64,
 }
 impl Lane {
-    pub fn usable(&self, t: u64) -> bool {
+    pub(crate) fn usable(&self, t: u64) -> bool {
         if self.dead.load(Ordering::Relaxed) {
             return false;
         }
@@ -52,12 +52,12 @@ impl Lane {
         }
         t >= self.cooldown_until.load(Ordering::Relaxed)
     }
-    pub fn kill(&self, reason: &str) {
+    pub(crate) fn kill(&self, reason: &str) {
         self.dead.store(true, Ordering::Relaxed);
         *self.dead_reason.lock().unwrap() = reason.to_string();
         eprintln!("[{}] STOPPED permanently: {}", self.model, reason);
     }
-    pub fn cooldown_rate_limit(&self) {
+    pub(crate) fn cooldown_rate_limit(&self) {
         let s = self.streak.fetch_add(1, Ordering::Relaxed) + 1;
         let secs = (COOLDOWN_BASE_SECS * s as u64).min(COOLDOWN_MAX_SECS);
         self.cooldown_until.store(now() + secs, Ordering::Relaxed);
@@ -67,7 +67,7 @@ impl Lane {
             self.model, s, secs
         );
     }
-    pub fn cooldown_transient(&self, what: &str) {
+    pub(crate) fn cooldown_transient(&self, what: &str) {
         self.cooldown_until
             .store(now() + COOLDOWN_TRANSIENT_SECS, Ordering::Relaxed);
         self.err.fetch_add(1, Ordering::Relaxed);
@@ -76,7 +76,7 @@ impl Lane {
             self.model, what, COOLDOWN_TRANSIENT_SECS
         );
     }
-    pub fn success(&self) {
+    pub(crate) fn success(&self) {
         self.streak.store(0, Ordering::Relaxed);
         self.ok.fetch_add(1, Ordering::Relaxed);
         if self.limited && self.budget.fetch_sub(1, Ordering::Relaxed) - 1 <= 0 {
@@ -85,11 +85,11 @@ impl Lane {
     }
 }
 
-pub struct App {
-    pub lanes: Vec<Lane>,
-    pub by_model: HashMap<String, usize>,
-    pub pools: HashMap<String, Vec<usize>>,
-    pub rr: AtomicUsize,
-    pub client: reqwest::Client,
-    pub auth: Arc<crate::auth::AuthMiddleware>,
+pub(crate) struct App {
+    pub(crate) lanes: Vec<Lane>,
+    pub(crate) by_model: HashMap<String, usize>,
+    pub(crate) pools: HashMap<String, Vec<usize>>,
+    pub(crate) rr: AtomicUsize,
+    pub(crate) client: reqwest::Client,
+    pub(crate) auth: Arc<crate::auth::AuthMiddleware>,
 }

@@ -19,10 +19,9 @@ serde_yaml = "0.9"
 futures = "0.3"
 
 [dev-dependencies]
-axum = { version = "0.7", features = ["http1"] }
-tokio = { version = "1", features = ["full"] }
+# In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
-tests-support = { path = "tests/support" }
+axum = { version = "0.7", features = ["http1"] }
 
 [profile.release]
 opt-level = 2

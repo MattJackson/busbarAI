@@ -10,19 +10,19 @@ use axum::http::{header::HeaderValue, HeaderName, StatusCode};
 /// Canonical signal emitted by a protocol when classifying an error response.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields used for future extensibility (B-301, ADR-0005)
-pub struct CanonicalSignal {
+pub(crate) struct CanonicalSignal {
     /// Class of the signal (e.g., "billing", "auth", "rate_limit", "transient").
-    pub class: &'static str,
+    pub(crate) class: &'static str,
     /// Provider-specific signal code or description.
-    pub provider_signal: Option<&'static str>,
+    pub(crate) provider_signal: Option<&'static str>,
     /// Optional retry-after seconds for rate-limiting scenarios.
-    pub retry_after: Option<u64>,
+    pub(crate) retry_after: Option<u64>,
 }
 
 /// Protocol abstraction for upstream LLM providers (Anthropic, OpenAI, etc.).
 /// Per ADR-0006, the agnostic core calls this trait instead of naming wire-format literals.
 #[allow(dead_code)] // name() reserved for future extensibility
-pub trait Protocol: Send + Sync {
+pub(crate) trait Protocol: Send + Sync {
     /// Returns the protocol name ("anthropic", "openai", etc.).
     fn name(&self) -> &str;
 
@@ -44,10 +44,10 @@ pub trait Protocol: Send + Sync {
 /// Anthropic protocol implementation.
 /// Reproduces TODAY's exact behavior: path `/v1/messages`, auth headers, model rewrite,
 /// and classification logic per A3 (status + structured error type first).
-pub struct AnthropicProtocol;
+pub(crate) struct AnthropicProtocol;
 
 impl AnthropicProtocol {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self
     }
 }

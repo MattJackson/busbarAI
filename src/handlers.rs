@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use crate::state::{now, App};
 use std::sync::atomic::Ordering;
 
-pub async fn stats(State(app): State<Arc<App>>) -> Response {
+pub(crate) async fn stats(State(app): State<Arc<App>>) -> Response {
     let t = now();
     let lanes: Vec<Value> = app.lanes.iter().map(|l| json!({
         "model": l.model, "provider": l.provider, "max_concurrent": l.max,
@@ -40,7 +40,7 @@ pub async fn stats(State(app): State<Arc<App>>) -> Response {
     Json(json!({ "pools": pools, "lanes": lanes })).into_response()
 }
 
-pub async fn healthz(State(app): State<Arc<App>>) -> Response {
+pub(crate) async fn healthz(State(app): State<Arc<App>>) -> Response {
     let t = now();
     if app.lanes.iter().any(|l| l.usable(t)) {
         (StatusCode::OK, "ok").into_response()
