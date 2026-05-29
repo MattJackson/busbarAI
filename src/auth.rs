@@ -38,9 +38,9 @@ impl AuthMiddleware {
             "token" => AuthMode::Token,
             "passthrough" => AuthMode::Passthrough,
             "none" => AuthMode::None,
-            other => panic!(
-                "invalid auth mode '{other}': must be 'token', 'passthrough', or 'none'"
-            ),
+            other => {
+                panic!("invalid auth mode '{other}': must be 'token', 'passthrough', or 'none'")
+            }
         };
 
         // Expand env vars in client_tokens (B-102 interpolation pass)
