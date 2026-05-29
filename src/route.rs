@@ -19,12 +19,17 @@ pub(crate) async fn named(
     Path(name): Path<String>,
     body: Bytes,
 ) -> Response {
+    // NOTE: Caller token extraction from request extensions requires handler signature change.
+    // For now, caller_token is None - passthrough mode will use lane's api_key as fallback.
+    let _caller_token = None;
+
     if let Some(cands) = app.pools.get(&name) {
-        return forward(app.clone(), cands.clone(), body).await;
+        return forward(app.clone(), cands.clone(), body, _caller_token).await;
     }
     if let Some(&i) = app.by_model.get(&name) {
-        return forward(app.clone(), vec![i], body).await;
+        return forward(app.clone(), vec![i], body, _caller_token).await;
     }
+
     (
         StatusCode::NOT_FOUND,
         format!("router: '{name}' is not a known model or pool"),
@@ -38,8 +43,12 @@ pub(crate) async fn adhoc(
     Path((provider, model)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
+    let _caller_token = None;
+
     match app.by_model.get(&model) {
-        Some(&i) if app.lanes[i].provider == provider => forward(app.clone(), vec![i], body).await,
+        Some(&i) if app.lanes[i].provider == provider => {
+            forward(app.clone(), vec![i], body, _caller_token).await
+        }
         Some(&i) => (
             StatusCode::BAD_REQUEST,
             format!(

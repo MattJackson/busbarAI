@@ -114,7 +114,7 @@ impl AuthMiddleware {
 /// Axum middleware layer that validates auth before routing.
 pub(crate) async fn auth_middleware(
     State(app): State<Arc<App>>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, (StatusCode, &'static str)> {
     let auth_header = req
@@ -131,6 +131,14 @@ pub(crate) async fn auth_middleware(
     // /stats requires auth by default (per spec decision).
     if !app.auth.validate_token(auth_header) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+
+    // Thread the caller's Bearer token into request extensions for passthrough forwarding
+    if let Some(bearer_token) =
+        auth_header.and_then(|h| h.strip_prefix("Bearer ").map(String::from))
+    {
+        use axum::extract::Extension;
+        req.extensions_mut().insert(Extension(bearer_token));
     }
 
     Ok(next.run(req).await)

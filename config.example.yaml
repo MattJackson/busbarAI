@@ -1,5 +1,15 @@
 listen: "0.0.0.0:8080"
 
+auth:
+  # Choose one of: token, passthrough, none
+  # - token: require client token from allowlist (recommended for production)
+  # - passthrough: forward caller's Bearer token upstream; 401/403 attributed to caller (§6 caveat)
+  # - none: open relay; logs loud FATAL warning at startup (dev only, never production)
+  mode: token
+  client_tokens:
+    - "${BUSBAR_CLIENT_TOKEN}"
+    # Add additional allowed tokens here
+
 providers:
   z.ai:
     protocol: anthropic

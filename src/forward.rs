@@ -360,7 +360,17 @@ async fn pick_among(app: &Arc<App>, cands: &[usize]) -> Option<(usize, OwnedSema
     Some((i, p))
 }
 
-pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Response {
+pub(crate) async fn forward(
+    app: Arc<App>,
+    cands: Vec<usize>,
+    body: Bytes,
+    caller_token: Option<&str>,
+) -> Response {
+    eprintln!(
+        "[DEBUG forward START] cands={:?}, caller_token={:?}",
+        cands,
+        caller_token.is_some()
+    );
     let mut v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -377,7 +387,12 @@ pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Re
     // The client must restart the request itself after receiving the error event.
 
     let attempts = cands.len() + 2;
-    for _attempt in 0..attempts {
+    eprintln!(
+        "[DEBUG forward] Starting loop, attempts={} cands={:?}",
+        attempts, cands
+    );
+    for attempt in 0..attempts {
+        eprintln!("[DEBUG forward] Attempt {}", attempt);
         let (i, permit) = match pick_among(&app, &cands).await {
             Some(x) => x,
             None => {
@@ -389,7 +404,13 @@ pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Re
         proto.rewrite_model(&mut v, &app.lanes[i].model);
         let payload = serde_json::to_vec(&v).unwrap();
         let base = &app.lanes[i].base_url;
-        let key = &app.lanes[i].api_key;
+
+        // Mode-aware key selection: passthrough uses caller token, others use lane's api_key
+        let key = match app.auth_mode {
+            crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(&app.lanes[i].api_key),
+            crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
+        };
+
         app.lanes[i].inflight.fetch_add(1, Ordering::Relaxed);
 
         let res = app
@@ -416,7 +437,34 @@ pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Re
 
                 // For non-2xx responses, read the body to classify (failover allowed)
                 if !status.is_success() {
+                    // §6 caveat: passthrough 401/403 is caller's key failing, not busbar's
+                    // Do NOT trip breaker / change member health; relay verbatim to caller
+                    let auth_mode = app.auth_mode;
+                    eprintln!(
+                        "[DEBUG forward] status={}, auth_mode={:?}, is_passthrough_40x={}",
+                        status.as_u16(),
+                        auth_mode,
+                        auth_mode == crate::auth::AuthMode::Passthrough
+                            && (status == StatusCode::UNAUTHORIZED
+                                || status == StatusCode::FORBIDDEN)
+                    );
+                    let is_passthrough_40x = auth_mode == crate::auth::AuthMode::Passthrough
+                        && (status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN);
+
+                    // Clone headers before consuming r with bytes()
+                    let ct = r.headers().get(CONTENT_TYPE).cloned();
                     let bytes = r.bytes().await.unwrap_or_default();
+
+                    if is_passthrough_40x {
+                        use axum::body::Body;
+                        let mut rb = Response::builder().status(status);
+                        if let Some(ct) = ct {
+                            rb = rb.header(CONTENT_TYPE, ct);
+                        }
+                        // Re-create response from bytes for passthrough relay
+                        return rb.body(Body::from(bytes)).unwrap();
+                    }
+
                     match proto.classify(status, &bytes) {
                         CanonicalSignal {
                             class: "billing", ..
@@ -426,9 +474,18 @@ pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Re
                             continue;
                         }
                         CanonicalSignal { class: "auth", .. } => {
+                            // In Token/None mode: busbar's key failed → kill lane and return error
+                            // In Passthrough mode: already handled above (early return)
                             app.lanes[i].kill(&format!("auth rejected (HTTP {})", status.as_u16()));
                             drop(permit);
-                            continue;
+
+                            // Return the 401/403 response to caller instead of continuing
+                            use axum::body::Body;
+                            let mut rb = Response::builder().status(status);
+                            if let Some(ct) = ct {
+                                rb = rb.header(CONTENT_TYPE, ct);
+                            }
+                            return rb.body(Body::from(bytes)).unwrap();
                         }
                         CanonicalSignal {
                             class: "rate_limit",
@@ -475,6 +532,7 @@ pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Re
         }
     }
 
+    eprintln!("[DEBUG forward] All attempts exhausted");
     (
         StatusCode::SERVICE_UNAVAILABLE,
         "router: all lanes exhausted",

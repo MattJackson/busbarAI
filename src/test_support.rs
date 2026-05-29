@@ -61,6 +61,7 @@ impl Default for MockResponse {
 #[derive(Debug, Default)]
 pub(crate) struct MockServerState {
     responses: Mutex<Vec<MockResponse>>,
+    last_auth_header: std::sync::Mutex<Option<String>>,
 }
 
 impl MockServerState {
@@ -72,6 +73,21 @@ impl MockServerState {
     }
     fn next_response(&self) -> Option<MockResponse> {
         self.responses.lock().unwrap().pop()
+    }
+
+    /// Record the last seen Authorization header for testing passthrough token forwarding
+    pub(crate) fn record_auth_header(&self, header: &str) {
+        *self.last_auth_header.lock().unwrap() = Some(header.to_string());
+    }
+
+    /// Get the recorded Authorization header (for assertions in tests)
+    pub(crate) fn get_last_auth_header(&self) -> Option<String> {
+        self.last_auth_header.lock().unwrap().clone()
+    }
+
+    /// Clear the recorded Authorization header
+    pub(crate) fn clear_auth_header(&self) {
+        *self.last_auth_header.lock().unwrap() = None;
     }
 }
 
@@ -111,9 +127,23 @@ impl MockServer {
 
 async fn mock_handler(
     State(state): State<std::sync::Arc<MockServerState>>,
-    _request: Request<Body>,
+    request: Request<Body>,
 ) -> Response<Body> {
-    let response = state.next_response().unwrap_or_default();
+    // Record the Authorization header for passthrough token forwarding tests
+    if let Some(auth_header) = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        state.record_auth_header(auth_header);
+    }
+
+    let response = state.next_response();
+    eprintln!(
+        "[DEBUG mock] Returning: {:?}",
+        response.as_ref().map(|r| format!("{:?}", r))
+    );
+    let response = response.unwrap_or_default();
     match response {
         MockResponse::Ok { status, body } => Response::builder()
             .status(status)
@@ -204,6 +234,7 @@ async fn mock_handler(
     }
 }
 
+#[allow(deprecated)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,10 +377,15 @@ mod tests {
                 .build()
                 .unwrap(),
             auth,
+            auth_mode: crate::auth::AuthMode::None,
         });
 
+        eprintln!(
+            "[DEBUG] Scenario B: responses before body={}",
+            state.responses.lock().unwrap().len()
+        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-        let response = forward(app.clone(), vec![0], req_body.into()).await;
+        let response = forward(app.clone(), vec![0], req_body.into(), None).await;
         assert_eq!(response.status().as_u16(), 200);
 
         use http_body_util::BodyExt as _;
@@ -404,10 +440,15 @@ mod tests {
                 .build()
                 .unwrap(),
             auth,
+            auth_mode: crate::auth::AuthMode::None,
         });
 
+        eprintln!(
+            "[DEBUG] Scenario B: responses before body={}",
+            state.responses.lock().unwrap().len()
+        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-        let response = forward(app.clone(), vec![0], req_body.into()).await;
+        let response = forward(app.clone(), vec![0], req_body.into(), None).await;
         assert_eq!(response.status().as_u16(), 200);
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -470,11 +511,16 @@ mod tests {
                 .build()
                 .unwrap(),
             auth,
+            auth_mode: crate::auth::AuthMode::None,
         });
 
+        eprintln!(
+            "[DEBUG] Scenario B: responses before body={}",
+            state.responses.lock().unwrap().len()
+        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         assert_eq!(sem.available_permits(), 1);
-        let response = forward(app.clone(), vec![0], req_body.into()).await;
+        let response = forward(app.clone(), vec![0], req_body.into(), None).await;
         assert_eq!(response.status().as_u16(), 200);
         assert!(sem.clone().try_acquire_owned().is_err());
 
@@ -565,12 +611,17 @@ mod tests {
                 .build()
                 .unwrap(),
             auth,
+            auth_mode: crate::auth::AuthMode::None,
         });
 
+        eprintln!(
+            "[DEBUG] Scenario B: responses before body={}",
+            state.responses.lock().unwrap().len()
+        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
         // Should failover from lane 0 (error) to lane 1 (success)
-        let response = forward(app.clone(), vec![0, 1], req_body.into()).await;
+        let response = forward(app.clone(), vec![0, 1], req_body.into(), None).await;
         assert_eq!(response.status().as_u16(), 200);
 
         let t = now();
@@ -669,12 +720,17 @@ mod tests {
                 .build()
                 .unwrap(),
             auth,
+            auth_mode: crate::auth::AuthMode::None,
         });
 
+        eprintln!(
+            "[DEBUG] Scenario B: responses before body={}",
+            state.responses.lock().unwrap().len()
+        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
         // Consume response body fully
-        let response = forward(app.clone(), vec![0, 1], req_body.into()).await;
+        let response = forward(app.clone(), vec![0, 1], req_body.into(), None).await;
         assert_eq!(response.status().as_u16(), 200);
 
         use http_body_util::BodyExt as _;
@@ -732,6 +788,277 @@ mod tests {
             "lane 1 ok should be unchanged (no failover), before={before}, after={after}",
             before = ok1_before,
             after = ok1_after
+        );
+
+        server.shutdown().await;
+    }
+
+    /// §6 Caveat: passthrough 401 does NOT trip breaker; token mode 401 DOES.
+    #[tokio::test]
+    async fn test_section6_passthrough_401_no_trip_vs_token_mode() {
+        let state = Arc::new(MockServerState::new());
+
+        // Mock returns 401 for both scenarios
+        // Push responses in LIFO order (last pushed comes out first)
+        // First push is for scenario A (passthrough), second push is for scenario B (token mode)
+        eprintln!(
+            "[DEBUG test] Before pushes, responses: {}",
+            state.responses.lock().unwrap().len()
+        );
+        state.push(MockResponse::Auth {
+            status: StatusCode::UNAUTHORIZED,
+        }); // Scenario A response - consumed first
+        eprintln!(
+            "[DEBUG test] After push A, responses: {}",
+            state.responses.lock().unwrap().len()
+        );
+        state.push(MockResponse::Auth {
+            status: StatusCode::UNAUTHORIZED,
+        }); // Scenario B response - consumed second
+        eprintln!(
+            "[DEBUG test] After push B, responses: {}",
+            state.responses.lock().unwrap().len()
+        );
+
+        let server = MockServer::new(state.clone()).await;
+
+        // Scenario A: Passthrough mode — lane should NOT be tripped
+        let lane_passthrough = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "busbar-key".to_string(),
+            protocol: Arc::new(AnthropicProtocol::new()),
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            max: 10,
+            limited: false,
+            budget: AtomicI64::new(-1),
+            cooldown_until: AtomicU64::new(0),
+            streak: AtomicU32::new(0),
+            dead: AtomicBool::new(false),
+            dead_reason: std::sync::Mutex::new(String::new()),
+            inflight: AtomicI64::new(0),
+            ok: AtomicU64::new(0),
+            err: AtomicU64::new(0),
+        };
+
+        let by_model = HashMap::from([("test-model".to_string(), 0)]);
+        let pools = HashMap::from([("default".to_string(), vec![0])]);
+        let auth_cfg_passthrough = AuthCfg {
+            mode: "passthrough".to_string(),
+            client_tokens: vec![],
+            _legacy_token: None,
+        };
+        let auth_mw_passthrough = Arc::new(AuthMiddleware::new(&auth_cfg_passthrough));
+        let app_passthrough = Arc::new(App {
+            lanes: vec![lane_passthrough],
+            by_model: by_model.clone(),
+            pools: pools.clone(),
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth: auth_mw_passthrough,
+            auth_mode: crate::auth::AuthMode::Passthrough,
+        });
+
+        eprintln!(
+            "[DEBUG] Scenario B: responses before body={}",
+            state.responses.lock().unwrap().len()
+        );
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+        let response = forward(app_passthrough.clone(), vec![0], req_body.into(), None).await;
+        assert_eq!(
+            response.status().as_u16(),
+            401,
+            "Passthrough should return upstream 401 to caller"
+        );
+
+        // Assert: lane state UNCHANGED in passthrough mode
+        let t = now();
+        assert!(
+            app_passthrough.lanes[0].usable(t),
+            "lane should remain usable after passthrough-401 (no trip)"
+        );
+        assert_eq!(
+            0,
+            app_passthrough.lanes[0].err.load(Ordering::Relaxed),
+            "err counter unchanged in passthrough mode"
+        );
+        assert_eq!(
+            0,
+            app_passthrough.lanes[0].streak.load(Ordering::Relaxed),
+            "streak unchanged in passthrough mode"
+        );
+        assert!(
+            !app_passthrough.lanes[0].dead.load(Ordering::Relaxed),
+            "lane should NOT be dead after passthrough-401"
+        );
+
+        // Scenario B: Token mode — lane SHOULD be tripped (busbar's key failed)
+        state.clear_auth_header();
+        state.push(MockResponse::Auth {
+            status: StatusCode::UNAUTHORIZED,
+        });
+
+        let lane_token = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "busbar-key".to_string(),
+            protocol: Arc::new(AnthropicProtocol::new()),
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            max: 10,
+            limited: false,
+            budget: AtomicI64::new(-1),
+            cooldown_until: AtomicU64::new(0),
+            streak: AtomicU32::new(0),
+            dead: AtomicBool::new(false),
+            dead_reason: std::sync::Mutex::new(String::new()),
+            inflight: AtomicI64::new(0),
+            ok: AtomicU64::new(0),
+            err: AtomicU64::new(0),
+        };
+
+        let auth_cfg_token = AuthCfg {
+            mode: "token".to_string(),
+            client_tokens: vec!["caller-token-123".to_string()],
+            _legacy_token: None,
+        };
+        let auth_mw_token = Arc::new(AuthMiddleware::new(&auth_cfg_token));
+        let app_token = Arc::new(App {
+            lanes: vec![lane_token],
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth: auth_mw_token,
+            auth_mode: crate::auth::AuthMode::Token,
+        });
+
+        eprintln!(
+            "[DEBUG] Scenario B: responses before body={}",
+            state.responses.lock().unwrap().len()
+        );
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+        eprintln!(
+            "[DEBUG test] About to call forward for scenario B, lanes[0].dead={}, responses={}",
+            app_token.lanes[0].dead.load(Ordering::Relaxed),
+            state.responses.lock().unwrap().len()
+        );
+        eprintln!("[DEBUG test] About to call forward for scenario B");
+        let response = forward(app_token.clone(), vec![0], req_body.into(), None).await;
+        eprintln!(
+            "[DEBUG test] forward returned with status: {}",
+            response.status().as_u16()
+        );
+        eprintln!(
+            "[DEBUG test] After scenario B forward, responses: {}",
+            state.responses.lock().unwrap().len()
+        );
+        assert_eq!(
+            response.status().as_u16(),
+            401,
+            "Token mode should return upstream 401"
+        );
+
+        // Assert: lane IS tripped in token mode (busbar's stored credential failed)
+        let t = now();
+        assert!(
+            !app_token.lanes[0].usable(t),
+            "lane should be DOWN after token-mode-401"
+        );
+        assert!(
+            app_token.lanes[0].dead.load(Ordering::Relaxed),
+            "lane should be dead after token-mode-401 (busbar's key)"
+        );
+
+        server.shutdown().await;
+    }
+
+    /// Passthrough forwards the CALLER's bearer token, not busbar's api_key.
+    #[tokio::test]
+    async fn test_passthrough_forwards_caller_token() {
+        let state = Arc::new(MockServerState::new());
+
+        // Mock returns 200 so we can inspect what auth header it received
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({ "content": ["ok"], "model": "test", "stop": [] }),
+        });
+
+        let server = MockServer::new(state.clone()).await;
+
+        let lane = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "busbar-central-key".to_string(),
+            protocol: Arc::new(AnthropicProtocol::new()),
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            max: 10,
+            limited: false,
+            budget: AtomicI64::new(-1),
+            cooldown_until: AtomicU64::new(0),
+            streak: AtomicU32::new(0),
+            dead: AtomicBool::new(false),
+            dead_reason: std::sync::Mutex::new(String::new()),
+            inflight: AtomicI64::new(0),
+            ok: AtomicU64::new(0),
+            err: AtomicU64::new(0),
+        };
+
+        let by_model = HashMap::from([("test-model".to_string(), 0)]);
+        let pools = HashMap::from([("default".to_string(), vec![0])]);
+        let auth_cfg_passthrough = AuthCfg {
+            mode: "passthrough".to_string(),
+            client_tokens: vec![],
+            _legacy_token: None,
+        };
+        let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg_passthrough));
+        let app = Arc::new(App {
+            lanes: vec![lane],
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth: auth_mw,
+            auth_mode: crate::auth::AuthMode::Passthrough,
+        });
+
+        // Caller's Bearer token (NOT busbar's key)
+        let caller_bearer_token = "caller-specific-token-abc123";
+        eprintln!(
+            "[DEBUG] Scenario B: responses before body={}",
+            state.responses.lock().unwrap().len()
+        );
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+
+        // Forward with caller's token (simulating what auth middleware would extract)
+        let response = forward(
+            app.clone(),
+            vec![0],
+            req_body.into(),
+            Some(caller_bearer_token),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200);
+
+        // Assert: mock upstream received the caller's token, NOT busbar's key
+        let recorded_auth = state
+            .get_last_auth_header()
+            .expect("mock should have recorded Authorization header");
+        assert_eq!(
+            recorded_auth,
+            format!("Bearer {}", caller_bearer_token),
+            "upstream should receive caller's Bearer token in passthrough mode"
         );
 
         server.shutdown().await;
@@ -906,12 +1233,17 @@ mod tests {
                 .build()
                 .unwrap(),
             auth,
+            auth_mode: crate::auth::AuthMode::None,
         });
 
+        eprintln!(
+            "[DEBUG] Scenario B: responses before body={}",
+            state.responses.lock().unwrap().len()
+        );
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
         // Forward request (tap integrated in FirstByteBody)
-        let response = forward(app.clone(), vec![0], req_body.into()).await;
+        let response = forward(app.clone(), vec![0], req_body.into(), None).await;
         assert_eq!(response.status().as_u16(), 200);
 
         use http_body_util::BodyExt as _;

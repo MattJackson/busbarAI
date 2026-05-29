@@ -155,6 +155,15 @@ async fn main() {
     }
 
     let listen = cfg.listen.clone();
+
+    // Loud warning for auth.mode=none (open relay)
+    if let Some(ref acfg) = cfg.auth {
+        let normalized = acfg.clone().normalize();
+        if normalized.mode == "none" {
+            eprintln!("[FATAL] AUTH DISABLED — open relay; this is a security risk in production");
+        }
+    }
+
     let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg));
 
     let app = Arc::new(App {
@@ -167,7 +176,8 @@ async fn main() {
             .pool_max_idle_per_host(64)
             .build()
             .unwrap(),
-        auth: auth_mw,
+        auth: auth_mw.clone(),
+        auth_mode: auth_mw.mode,
     });
 
     let router = Router::new()

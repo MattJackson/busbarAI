@@ -93,4 +93,5 @@ pub(crate) struct App {
     pub(crate) rr: AtomicUsize,
     pub(crate) client: reqwest::Client,
     pub(crate) auth: Arc<crate::auth::AuthMiddleware>,
+    pub(crate) auth_mode: crate::auth::AuthMode,
 }
