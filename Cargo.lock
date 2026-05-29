@@ -97,7 +97,10 @@ name = "busbar"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "futures",
+ "http-body",
+ "http-body-util",
  "reqwest",
  "serde",
  "serde_json",

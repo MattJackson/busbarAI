@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::{body::Body, http::header::CONTENT_TYPE, response::IntoResponse, response::Response};
+use futures::StreamExt;
 use reqwest::StatusCode;
 use serde_json::Value;
 use tokio::sync::OwnedSemaphorePermit;
@@ -82,51 +83,67 @@ pub(crate) async fn forward(app: Arc<App>, cands: Vec<usize>, body: Bytes) -> Re
             }
             Ok(r) => {
                 let status = r.status();
-                let ct = r.headers().get(CONTENT_TYPE).cloned();
-                let bytes = r.bytes().await.unwrap_or_default();
-                match proto.classify(status, &bytes) {
-                    CanonicalSignal {
-                        class: "billing", ..
-                    } => {
-                        app.lanes[i].kill("billing / insufficient balance (1113)");
-                        drop(permit);
-                        continue;
-                    }
-                    CanonicalSignal { class: "auth", .. } => {
-                        app.lanes[i].kill(&format!("auth rejected (HTTP {})", status.as_u16()));
-                        drop(permit);
-                        continue;
-                    }
-                    CanonicalSignal {
-                        class: "rate_limit",
-                        ..
-                    } => {
-                        app.lanes[i].cooldown_rate_limit();
-                        drop(permit);
-                        continue;
-                    }
-                    CanonicalSignal {
-                        class: "transient", ..
-                    } => {
-                        app.lanes[i].cooldown_transient("5xx");
-                        drop(permit);
-                        continue;
-                    }
-                    CanonicalSignal { class: "relay", .. } => {
-                        if status.is_success() {
-                            app.lanes[i].success();
+
+                // For non-2xx responses, read the body to classify (as before)
+                if !status.is_success() {
+                    let bytes = r.bytes().await.unwrap_or_default();
+                    match proto.classify(status, &bytes) {
+                        CanonicalSignal {
+                            class: "billing", ..
+                        } => {
+                            app.lanes[i].kill("billing / insufficient balance (1113)");
+                            std::mem::forget(permit);
+                            continue;
                         }
-                        let mut rb = Response::builder().status(status);
-                        if let Some(ct) = ct {
-                            rb = rb.header(CONTENT_TYPE, ct);
+                        CanonicalSignal { class: "auth", .. } => {
+                            app.lanes[i].kill(&format!("auth rejected (HTTP {})", status.as_u16()));
+                            std::mem::forget(permit);
+                            continue;
                         }
-                        return rb.body(Body::from(bytes)).unwrap();
+                        CanonicalSignal {
+                            class: "rate_limit",
+                            ..
+                        } => {
+                            app.lanes[i].cooldown_rate_limit();
+                            std::mem::forget(permit);
+                            continue;
+                        }
+                        CanonicalSignal {
+                            class: "transient", ..
+                        } => {
+                            app.lanes[i].cooldown_transient("5xx");
+                            std::mem::forget(permit);
+                            continue;
+                        }
+                        CanonicalSignal { class: _, .. } => {
+                            app.lanes[i].cooldown_transient("unknown");
+                            std::mem::forget(permit);
+                            continue;
+                        }
                     }
-                    CanonicalSignal { class: _, .. } => {
-                        app.lanes[i].cooldown_transient("unknown");
-                        drop(permit);
-                        continue;
+                } else {
+                    // SUCCESS case: stream the response body incrementally
+                    let ct = r.headers().get(CONTENT_TYPE).cloned();
+
+                    // Stream the response body incrementally instead of buffering
+                    let upstream_stream = r.bytes_stream().map(|res| match res {
+                        Ok(b) => Ok(b),
+                        Err(e) => {
+                            let io_msg = e.to_string();
+                            Err(std::io::Error::new(std::io::ErrorKind::Other, io_msg))
+                        }
+                    });
+
+                    // Drop permit after we've decided to stream (permit will be dropped when Response is returned)
+                    drop(permit);
+
+                    let axum_body = Body::from_stream(upstream_stream);
+
+                    let mut rb = Response::builder().status(status);
+                    if let Some(ct) = ct {
+                        rb = rb.header(CONTENT_TYPE, ct);
                     }
+                    return rb.body(axum_body).unwrap();
                 }
             }
         }

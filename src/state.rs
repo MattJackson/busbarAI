@@ -76,6 +76,7 @@ impl Lane {
             self.model, what, COOLDOWN_TRANSIENT_SECS
         );
     }
+    #[allow(dead_code)] // Used by forward() when streaming - permit held until stream end
     pub(crate) fn success(&self) {
         self.streak.store(0, Ordering::Relaxed);
         self.ok.fetch_add(1, Ordering::Relaxed);
