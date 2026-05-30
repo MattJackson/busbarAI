@@ -62,6 +62,7 @@ impl Default for MockResponse {
 pub(crate) struct MockServerState {
     responses: Mutex<Vec<MockResponse>>,
     last_auth_header: std::sync::Mutex<Option<String>>,
+    last_request_body: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 impl MockServerState {
@@ -88,6 +89,16 @@ impl MockServerState {
     /// Clear the recorded Authorization header
     pub(crate) fn clear_auth_header(&self) {
         *self.last_auth_header.lock().unwrap() = None;
+    }
+
+    /// Record the last received request body (for translation / on-the-wire assertions).
+    pub(crate) fn record_request_body(&self, body: &[u8]) {
+        *self.last_request_body.lock().unwrap() = Some(body.to_vec());
+    }
+
+    /// Get the last received request body bytes (for assertions in tests).
+    pub(crate) fn get_last_request_body(&self) -> Option<Vec<u8>> {
+        self.last_request_body.lock().unwrap().clone()
     }
 }
 
@@ -129,14 +140,22 @@ async fn mock_handler(
     State(state): State<std::sync::Arc<MockServerState>>,
     request: Request<Body>,
 ) -> Response<Body> {
+    let (parts, body) = request.into_parts();
+
     // Record the Authorization header for passthrough token forwarding tests
-    if let Some(auth_header) = request
-        .headers()
+    if let Some(auth_header) = parts
+        .headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
     {
         state.record_auth_header(auth_header);
     }
+
+    // Record the received request body for translation / on-the-wire assertions (B-503a).
+    let body_bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .unwrap_or_default();
+    state.record_request_body(&body_bytes);
 
     let response = state.next_response();
     let response = response.unwrap_or_default();
@@ -4297,6 +4316,27 @@ mod tests {
         .await;
 
         assert_eq!(response.status().as_u16(), 200);
+
+        // The REAL proof (not just status): the upstream received a TRANSLATED, Anthropic-shaped
+        // body — top-level `system` extracted out of `messages`, and `messages` no longer carrying
+        // the system role. A status-only assert would pass even if translation never ran.
+        let received = state
+            .get_last_request_body()
+            .expect("mock should have recorded the upstream request body");
+        let got: serde_json::Value = serde_json::from_slice(&received).expect("upstream body is JSON");
+        assert!(
+            got.get("system").is_some(),
+            "translated body must have top-level `system` (Anthropic shape); got: {got}"
+        );
+        let msgs = got.get("messages").and_then(|m| m.as_array()).expect("messages array");
+        assert!(
+            !msgs.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("system")),
+            "system must be lifted OUT of messages on translation; got: {got}"
+        );
+        assert!(
+            msgs.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("user")),
+            "user message must survive translation; got: {got}"
+        );
 
         server.shutdown().await;
     }
