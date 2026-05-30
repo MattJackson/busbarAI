@@ -48,6 +48,7 @@ use std::time::Duration;
 use axum::{routing::get, routing::post, Router};
 
 use auth::AuthMiddleware;
+use proto::Protocol;
 use state::{App, Lane, ProtocolKind, WeightedLane};
 use store::{InMemoryStore, LaneData};
 
@@ -134,7 +135,7 @@ async fn main() {
     for ld in &lanes_data {
         let provider_cfg = cfg.providers.get(&ld.provider).unwrap();
         let proto = if provider_cfg.protocol == "anthropic" {
-            ProtocolKind::Anthropic(crate::proto::AnthropicProtocol::new())
+            ProtocolKind::Anthropic(Protocol::anthropic())
         } else {
             panic!(
                 "unknown protocol '{}' for provider {}",

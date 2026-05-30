@@ -25,13 +25,13 @@ pub(crate) struct Lane {
 
 #[derive(Clone)]
 pub(crate) enum ProtocolKind {
-    Anthropic(crate::proto::AnthropicProtocol),
+    Anthropic(Protocol),
 }
 
 impl ProtocolKind {
     pub(crate) fn upstream_path(&self) -> &str {
         match self {
-            ProtocolKind::Anthropic(p) => p.upstream_path(),
+            ProtocolKind::Anthropic(p) => p.writer().upstream_path(),
         }
     }
 
@@ -40,13 +40,13 @@ impl ProtocolKind {
         key: &str,
     ) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
         match self {
-            ProtocolKind::Anthropic(p) => p.auth_headers(key),
+            ProtocolKind::Anthropic(p) => p.writer().auth_headers(key),
         }
     }
 
     pub(crate) fn rewrite_model(&self, body: &mut serde_json::Value, model: &str) {
         match self {
-            ProtocolKind::Anthropic(p) => p.rewrite_model(body, model),
+            ProtocolKind::Anthropic(p) => p.writer().rewrite_model(body, model),
         }
     }
 
@@ -57,7 +57,7 @@ impl ProtocolKind {
         body: &[u8],
     ) -> crate::proto::CanonicalSignal {
         match self {
-            ProtocolKind::Anthropic(p) => p.classify(status, body),
+            ProtocolKind::Anthropic(p) => p.reader().classify(status, body),
         }
     }
 
@@ -67,7 +67,7 @@ impl ProtocolKind {
         body: &[u8],
     ) -> crate::breaker::RawUpstreamError {
         match self {
-            ProtocolKind::Anthropic(p) => p.extract_error(status, body),
+            ProtocolKind::Anthropic(p) => p.reader().extract_error(status, body),
         }
     }
 }
