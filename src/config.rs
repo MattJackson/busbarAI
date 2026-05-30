@@ -156,13 +156,71 @@ fn default_weight() -> u32 {
     1
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)
+/// Trip mode for breaker configuration.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BreakerTripMode {
+    #[default]
+    ErrorRate,
+    Consecutive,
+}
+
+/// Trip configuration parameters (ADR-0002 defaults).
+#[derive(Debug, Deserialize, Clone, Default)]
+#[allow(dead_code)] // Fields defined for config, used by FSM logic
+pub(crate) struct BreakerTripConfig {
+    #[serde(default = "default_trip_mode")]
+    pub mode: BreakerTripMode,
+    #[serde(default = "default_window_s")]
+    pub window_s: u64,
+    #[serde(default = "default_threshold")]
+    pub threshold: f64,
+    #[serde(default = "default_min_requests")]
+    pub min_requests: usize,
+    #[serde(default = "default_consecutive_n")]
+    pub n: u32,
+}
+
+fn default_trip_mode() -> BreakerTripMode {
+    BreakerTripMode::ErrorRate
+}
+
+fn default_window_s() -> u64 {
+    30
+}
+
+fn default_threshold() -> f64 {
+    0.5
+}
+
+fn default_min_requests() -> usize {
+    5
+}
+
+fn default_consecutive_n() -> u32 {
+    3
+}
+
+/// Breaker configuration per pool with full trip settings (ADR-0002).
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)] // Fields defined for config, used by FSM logic
 pub(crate) struct BreakerCfg {
     #[serde(default = "default_cooldown")]
-    pub(crate) base_cooldown_secs: u64,
+    pub base_cooldown_secs: u64,
     #[serde(default = "default_max_cooldown")]
-    pub(crate) max_cooldown_secs: u64,
+    pub max_cooldown_secs: u64,
+    #[serde(default)]
+    pub trip: Option<BreakerTripConfig>,
+}
+
+impl Default for BreakerCfg {
+    fn default() -> Self {
+        Self {
+            base_cooldown_secs: 15,
+            max_cooldown_secs: 120,
+            trip: Some(BreakerTripConfig::default()),
+        }
+    }
 }
 
 fn default_cooldown() -> u64 {
