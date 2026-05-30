@@ -4323,18 +4323,25 @@ mod tests {
         let received = state
             .get_last_request_body()
             .expect("mock should have recorded the upstream request body");
-        let got: serde_json::Value = serde_json::from_slice(&received).expect("upstream body is JSON");
+        let got: serde_json::Value =
+            serde_json::from_slice(&received).expect("upstream body is JSON");
         assert!(
             got.get("system").is_some(),
             "translated body must have top-level `system` (Anthropic shape); got: {got}"
         );
-        let msgs = got.get("messages").and_then(|m| m.as_array()).expect("messages array");
+        let msgs = got
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .expect("messages array");
         assert!(
-            !msgs.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("system")),
+            !msgs
+                .iter()
+                .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("system")),
             "system must be lifted OUT of messages on translation; got: {got}"
         );
         assert!(
-            msgs.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("user")),
+            msgs.iter()
+                .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("user")),
             "user message must survive translation; got: {got}"
         );
 
