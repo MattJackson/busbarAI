@@ -68,6 +68,13 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// Returns the upstream path suffix (e.g., "/v1/messages").
     fn upstream_path(&self) -> &str;
 
+    /// B-510c: the upstream path for a specific model. Most protocols ignore the model and
+    /// return a fixed path (the default); Gemini's path embeds the model
+    /// (`/v1beta/models/{model}:generateContent`). `forward` uses this to build the URL.
+    fn upstream_path_for(&self, _model: &str) -> String {
+        self.upstream_path().to_string()
+    }
+
     /// Returns auth headers given an API key.
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)>;
 
@@ -2962,9 +2969,15 @@ pub(crate) struct GeminiWriter;
 
 impl ProtocolWriter for GeminiWriter {
     fn upstream_path(&self) -> &str {
-        // B-510 NOTE: Gemini's real path is model-dependent (/v1beta/models/{model}:generateContent)
-        // and URL/auth integration is a later cycle — this cycle is request R/W only.
-        "/v1beta"
+        // Model-independent fallback; the real per-request path comes from upstream_path_for().
+        "/v1beta/models"
+    }
+
+    /// B-510c: Gemini's URL embeds the model. Non-streaming uses `:generateContent`.
+    /// (Streaming via `:streamGenerateContent?alt=sse` is a later refinement; today a streaming
+    /// request to a Gemini egress lane is served as a non-streamed response.)
+    fn upstream_path_for(&self, model: &str) -> String {
+        format!("/v1beta/models/{model}:generateContent")
     }
 
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
@@ -3291,6 +3304,7 @@ impl ProtocolRegistry {
         let mut map = std::collections::HashMap::new();
         map.insert("anthropic".to_string(), Arc::new(Protocol::anthropic()));
         map.insert("openai".to_string(), Arc::new(Protocol::openai()));
+        map.insert("gemini".to_string(), Arc::new(Protocol::gemini()));
         Self { map }
     }
 
@@ -5706,8 +5720,13 @@ mod stream_translate_tests {
         let output = writer.write_request(&ir);
         assert!(output.as_object().unwrap().contains_key("contents"));
 
-        // Verify other protocol methods
-        assert_eq!(writer.upstream_path(), "/v1beta");
+        // Verify other protocol methods. B-510c: the real per-request path embeds the model via
+        // upstream_path_for(); upstream_path() is just the model-independent base.
+        assert_eq!(writer.upstream_path(), "/v1beta/models");
+        assert_eq!(
+            writer.upstream_path_for("gemini-pro"),
+            "/v1beta/models/gemini-pro:generateContent"
+        );
         let headers = writer.auth_headers("test-key");
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0.as_str(), "x-goog-api-key");
@@ -6106,5 +6125,43 @@ mod context_length_tests {
             retry_after: None,
         };
         assert_eq!(classify(&sig), Disposition::ContextLength);
+    }
+}
+
+#[cfg(test)]
+mod gemini_integration_tests {
+    use super::*;
+
+    // B-510c: Gemini's URL embeds the model; non-Gemini protocols keep their fixed path.
+    #[test]
+    fn test_gemini_upstream_path_for_embeds_model() {
+        assert_eq!(
+            GeminiWriter.upstream_path_for("gemini-1.5-pro"),
+            "/v1beta/models/gemini-1.5-pro:generateContent"
+        );
+        // Default (non-Gemini) ignores the model.
+        assert_eq!(
+            AnthropicWriter.upstream_path_for("anything"),
+            "/v1/messages"
+        );
+        assert_eq!(
+            OpenAiWriter.upstream_path_for("anything"),
+            "/v1/chat/completions"
+        );
+    }
+
+    // B-510c: gemini is now a registered, buildable protocol.
+    #[test]
+    fn test_gemini_registered_in_builtins() {
+        let reg = ProtocolRegistry::with_builtins();
+        let g = reg.get("gemini").expect("gemini should be registered");
+        assert_eq!(g.name(), "gemini");
+        assert_eq!(
+            g.writer().upstream_path_for("m"),
+            "/v1beta/models/m:generateContent"
+        );
+        // x-goog-api-key auth header.
+        let headers = g.writer().auth_headers("k");
+        assert!(headers.iter().any(|(n, _)| n.as_str() == "x-goog-api-key"));
     }
 }

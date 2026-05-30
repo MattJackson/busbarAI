@@ -620,7 +620,10 @@ pub(crate) async fn forward_with_pool(
             .client
             .post(format!(
                 "{base}{}",
-                app.lanes[i].protocol.writer().upstream_path()
+                app.lanes[i]
+                    .protocol
+                    .writer()
+                    .upstream_path_for(&app.lanes[i].model)
             ))
             .headers(convert_headers(
                 app.lanes[i].protocol.writer().auth_headers(key),
@@ -954,7 +957,10 @@ async fn forward_once(
         .client
         .post(format!(
             "{base}{}",
-            app.lanes[i].protocol.writer().upstream_path()
+            app.lanes[i]
+                .protocol
+                .writer()
+                .upstream_path_for(&app.lanes[i].model)
         ))
         .headers(convert_headers(
             app.lanes[i].protocol.writer().auth_headers(key),

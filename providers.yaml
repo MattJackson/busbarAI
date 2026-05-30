@@ -23,3 +23,12 @@ openai:
   error_map:
     insufficient_quota: billing
     rate_limit_exceeded: rate_limit
+
+# Google Gemini (generateContent). The path embeds the model and auth uses x-goog-api-key,
+# both handled by the gemini protocol. Cross-protocol: an Anthropic/OpenAI-format client can
+# target a gemini lane and busbar translates losslessly through the superset IR.
+gemini:
+  protocol: gemini
+  base_url: https://generativelanguage.googleapis.com
+  error_map:
+    RESOURCE_EXHAUSTED: rate_limit
