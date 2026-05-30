@@ -460,8 +460,9 @@ pub(crate) async fn forward(
                     // Exhaustive match on Disposition - NO _ => allowed per B-301 requirements
                     match disposition {
                         Disposition::ClientFault => {
-                            // ADR-0002: Client fault (caller's bad input) → relay verbatim, record NOTHING
-                            // The core differentiator: a healthy member must NOT trip on caller bad input
+                            // ADR-0002: Client fault (caller's bad input) → relay verbatim, no penalty
+                            // Track client_fault separately from upstream err (B-603)
+                            app.store.record_client_fault(i);
                             use axum::body::Body;
                             let mut rb = Response::builder().status(status);
                             if let Some(ct) = ct {

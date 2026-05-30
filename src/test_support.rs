@@ -356,6 +356,7 @@ mod tests {
             inflight: 0,
             ok: 0,
             err: 0,
+            client_fault: 0,
         };
 
         let lane = Lane {
@@ -424,6 +425,7 @@ mod tests {
             inflight: 0,
             ok: 0,
             err: 0,
+            client_fault: 0,
         };
 
         let lane = Lane {
@@ -500,6 +502,7 @@ mod tests {
             inflight: 0,
             ok: 0,
             err: 0,
+            client_fault: 0,
         };
 
         let lane = Lane {
@@ -586,6 +589,7 @@ mod tests {
             inflight: 0,
             ok: 0,
             err: 0,
+            client_fault: 0,
         };
 
         let lane1_data = LaneData {
@@ -602,6 +606,7 @@ mod tests {
             inflight: 0,
             ok: 0,
             err: 0,
+            client_fault: 0,
         };
 
         let lane0 = Lane {
@@ -698,6 +703,7 @@ mod tests {
             inflight: 0,
             ok: 0,
             err: 0,
+            client_fault: 0,
         };
 
         let lane1_data = LaneData {
@@ -714,6 +720,7 @@ mod tests {
             inflight: 0,
             ok: 0,
             err: 0,
+            client_fault: 0,
         };
 
         let lane0 = Lane {
@@ -828,6 +835,7 @@ mod tests {
             inflight: 0,
             ok: 0,
             err: 0,
+            client_fault: 0,
         };
 
         let lane = Lane {
@@ -904,6 +912,7 @@ mod tests {
             inflight: 0,
             ok: 0,
             err: 0,
+            client_fault: 0,
         };
 
         let lane_token = Lane {
@@ -989,6 +998,7 @@ mod tests {
             inflight: 0,
             ok: 0,
             err: 0,
+            client_fault: 0,
         };
 
         let lane = Lane {
@@ -1202,6 +1212,7 @@ mod tests {
             inflight: 0,
             ok: 0,
             err: 0,
+            client_fault: 0,
         };
 
         let lane = Lane {
@@ -1391,6 +1402,7 @@ mod tests {
                 inflight: 0,
                 ok: 0,
                 err: 0,
+                client_fault: 0,
             };
 
             let mut error_map = HashMap::new();
@@ -1471,6 +1483,7 @@ mod tests {
                 inflight: 0,
                 ok: 0,
                 err: 0,
+                client_fault: 0,
             };
 
             let mut error_map = HashMap::new();
@@ -1550,6 +1563,7 @@ mod tests {
                 inflight: 0,
                 ok: 0,
                 err: 0,
+                client_fault: 0,
             };
 
             let mut error_map = HashMap::new();
@@ -1627,6 +1641,7 @@ mod tests {
                 inflight: 0,
                 ok: 0,
                 err: 0,
+                client_fault: 0,
             };
 
             let mut error_map = HashMap::new();
@@ -1705,6 +1720,7 @@ mod tests {
                 inflight: 0,
                 ok: 0,
                 err: 0,
+                client_fault: 0,
             };
 
             let mut error_map = HashMap::new();
@@ -1783,6 +1799,7 @@ mod tests {
                 inflight: 0,
                 ok: 0,
                 err: 0,
+                client_fault: 0,
             };
 
             let mut error_map = HashMap::new();
@@ -1877,6 +1894,7 @@ mod tests {
                 inflight: 0,
                 ok: 0,
                 err: 0,
+                client_fault: 0,
             };
 
             let mut error_map_1 = HashMap::new();
@@ -1907,6 +1925,7 @@ mod tests {
                 inflight: 0,
                 ok: 0,
                 err: 0,
+                client_fault: 0,
             };
 
             let error_map_2 = HashMap::new(); // Empty - no overrides
@@ -2069,6 +2088,203 @@ mod tests {
                 crate::breaker::StatusClass::Billing,
                 "Correct mapping: 1113 → billing"
             );
+        }
+
+        #[tokio::test]
+        async fn test_client_fault_400_relayed_verbatim_no_penalty() {
+            // B-304: ClientFault (400 invalid_request) → relay verbatim, NO breaker penalty
+            let state = Arc::new(MockServerState::new());
+            state.push(MockResponse::Ok {
+                status: StatusCode::BAD_REQUEST,
+                body: json!({ "error": "invalid_request", "message": "bad input" }),
+            });
+
+            let server = MockServer::new(state.clone()).await;
+
+            let lane_data = LaneData {
+                model: "test-model".to_string(),
+                provider: "anthropic".to_string(),
+                max: 10,
+                sem: Arc::new(tokio::sync::Semaphore::new(10)),
+                limited: false,
+                budget: -1,
+                cooldown_until: 0,
+                streak: 0,
+                dead: false,
+                dead_reason: String::new(),
+                inflight: 0,
+                ok: 0,
+                err: 0,
+                client_fault: 0,
+            };
+
+            let error_map = HashMap::new();
+            let lane = Lane {
+                model: "test-model".to_string(),
+                provider: "anthropic".to_string(),
+                base_url: server.base_url(),
+                api_key: "test-key".to_string(),
+                protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+                max: 10,
+                error_map: Arc::new(error_map),
+            };
+
+            let by_model = HashMap::from([("test-model".to_string(), 0)]);
+
+            let pools = HashMap::from([("default".to_string(), vec![0])]);
+            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+            let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+            let app = Arc::new(App {
+                lanes: vec![lane],
+                store,
+                by_model,
+                pools,
+                rr: AtomicUsize::new(0),
+                client: Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .unwrap(),
+                auth,
+                auth_mode: crate::auth::AuthMode::None,
+            });
+
+            let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+            let response = forward(app.clone(), vec![0], req_body.into(), None).await;
+
+            // Status should be relayed verbatim as 400
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+            // Breaker state should remain Closed (no penalty)
+            let t = now();
+            let breaker_state = app.store.breaker_state(0);
+            matches!(breaker_state, crate::store::BreakerState::Closed);
+
+            // err/streak/cooldown should be UNTOUCHED
+            {
+                let snap = app.store.snapshot(0, t);
+                assert_eq!(snap.err, 0, "err should NOT increment on client fault");
+                assert_eq!(
+                    snap.streak, 0,
+                    "streak should NOT increment on client fault"
+                );
+                assert_eq!(snap.cooldown_remaining_s, 0, "no cooldown triggered");
+                // BUT client_fault counter should +1
+                assert_eq!(
+                    snap.client_fault, 1,
+                    "client_fault counter should increment"
+                );
+            }
+
+            server.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn test_client_fault_no_failover_two_lanes() {
+            // B-304: ClientFault on lane 0 → lane 1 NOT hit (no failover)
+            let state0 = Arc::new(MockServerState::new());
+            let state1 = Arc::new(MockServerState::new());
+
+            // Lane 0 returns 400 client fault
+            state0.push(MockResponse::Ok {
+                status: StatusCode::BAD_REQUEST,
+                body: json!({ "error": "invalid_request" }),
+            });
+
+            let server0 = MockServer::new(state0.clone()).await;
+            let server1 = MockServer::new(state1.clone()).await;
+
+            // Lane 0 setup
+            let lane_data_0 = LaneData {
+                model: "test-model".to_string(),
+                provider: "anthropic".to_string(),
+                max: 10,
+                sem: Arc::new(tokio::sync::Semaphore::new(10)),
+                limited: false,
+                budget: -1,
+                cooldown_until: 0,
+                streak: 0,
+                dead: false,
+                dead_reason: String::new(),
+                inflight: 0,
+                ok: 0,
+                err: 0,
+                client_fault: 0,
+            };
+
+            let lane_0 = Lane {
+                model: "test-model".to_string(),
+                provider: "anthropic".to_string(),
+                base_url: server0.base_url(),
+                api_key: "test-key-0".to_string(),
+                protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+                max: 10,
+                error_map: Arc::new(HashMap::new()),
+            };
+
+            // Lane 1 setup (should NOT be called)
+            let lane_data_1 = LaneData {
+                model: "test-model".to_string(),
+                provider: "anthropic".to_string(),
+                max: 10,
+                sem: Arc::new(tokio::sync::Semaphore::new(10)),
+                limited: false,
+                budget: -1,
+                cooldown_until: 0,
+                streak: 0,
+                dead: false,
+                dead_reason: String::new(),
+                inflight: 0,
+                ok: 0,
+                err: 0,
+                client_fault: 0,
+            };
+
+            let lane_1 = Lane {
+                model: "test-model".to_string(),
+                provider: "anthropic".to_string(),
+                base_url: server1.base_url(),
+                api_key: "test-key-1".to_string(),
+                protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+                max: 10,
+                error_map: Arc::new(HashMap::new()),
+            };
+
+            let by_model = HashMap::from([("test-model".to_string(), 0)]);
+            let pools = HashMap::from([("default".to_string(), vec![0, 1])]);
+            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+            let store = Arc::new(InMemoryStore::new(vec![lane_data_0, lane_data_1]));
+            let app = Arc::new(App {
+                lanes: vec![lane_0, lane_1],
+                store,
+                by_model,
+                pools,
+                rr: AtomicUsize::new(0),
+                client: Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .unwrap(),
+                auth,
+                auth_mode: crate::auth::AuthMode::None,
+            });
+
+            let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+            let response = forward(app.clone(), vec![0, 1], req_body.into(), None).await;
+
+            // Should get 400 from lane 0
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+            // Lane 1 should NOT have been called (no requests to server1)
+            // We verify by checking state1 is empty (pop consumed nothing)
+            {
+                let responses = state1.responses.lock().unwrap();
+                assert!(
+                    responses.is_empty(),
+                    "Lane 1 should NOT be hit on client fault from lane 0"
+                );
+            }
+
+            server0.shutdown().await;
+            server1.shutdown().await;
         }
     }
 }

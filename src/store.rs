@@ -78,6 +78,8 @@ pub(crate) struct LaneSnapshot {
     pub free_slots: usize,
     pub ok: u64,
     pub err: u64,
+    #[allow(dead_code)] // Tracked for B-603 /stats expansion (client fault vs upstream fault)
+    pub client_fault: u64,
     pub usable: bool,
     pub dead: bool,
     pub dead_reason: String,
@@ -98,6 +100,7 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     // outcome recording (the breaker's write path)
     #[allow(dead_code)] // Used for future success tracking
     fn record_success(&self, lane: usize);
+    fn record_client_fault(&self, lane: usize);
     fn record_transient(&self, lane: usize, what: &str);
     fn record_rate_limit(&self, lane: usize, now: u64, retry_after: Option<u64>);
     fn record_hard_down(&self, lane: usize, reason: &str);
@@ -170,6 +173,7 @@ struct LaneState {
     inflight: AtomicI64,
     ok: AtomicU64,
     err: AtomicU64,
+    client_fault: AtomicU64,
     // FSM state per lane
     breaker_state: AtomicU64, // 0=Closed, 1=Open, 2=HalfOpen (stored as u64 for CAS)
     probe_in_flight: AtomicBool,
@@ -195,6 +199,7 @@ impl InMemoryStore {
                     inflight: AtomicI64::new(ld.inflight),
                     ok: AtomicU64::new(ld.ok),
                     err: AtomicU64::new(ld.err),
+                    client_fault: AtomicU64::new(ld.client_fault),
                     breaker_state: AtomicU64::new(0), // Closed
                     probe_in_flight: AtomicBool::new(false),
                     outcome_window: std::sync::Mutex::new(OutcomeWindow::new(1024)),
@@ -345,6 +350,7 @@ pub(crate) struct LaneData {
     pub inflight: i64,
     pub ok: u64,
     pub err: u64,
+    pub client_fault: u64,
 }
 
 /// Breaker configuration per pool.
@@ -494,6 +500,13 @@ impl StateStore for InMemoryStore {
         ls.ok.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_client_fault(&self, lane: usize) {
+        let ls = self.get_lane(lane);
+        // Client faults do NOT increment err, streak, or trigger cooldowns.
+        // They are tracked separately for observability (B-603).
+        ls.client_fault.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_transient(&self, lane: usize, _what: &str) {
         let ls = self.get_lane(lane);
 
@@ -621,6 +634,7 @@ impl StateStore for InMemoryStore {
             free_slots: ls.sem.available_permits(),
             ok: ls.ok.load(Ordering::Relaxed),
             err: ls.err.load(Ordering::Relaxed),
+            client_fault: ls.client_fault.load(Ordering::Relaxed),
             usable: self.usable(lane, t),
             dead: ls.dead.load(Ordering::Relaxed),
             dead_reason: ls.dead_reason.lock().unwrap().clone(),
@@ -683,6 +697,7 @@ mod tests {
             inflight: 0,
             ok: 0,
             err: 0,
+            client_fault: 0,
         }
     }
 
@@ -783,12 +798,22 @@ mod tests {
             "hard-down must NOT set dead — it is recoverable"
         );
         // Open state with a LONG sticky cooldown (record uses HARD_DOWN_COOLDOWN_SECS).
-        assert_eq!(ls.breaker_state.load(Ordering::Relaxed), 1, "hard-down → Open");
+        assert_eq!(
+            ls.breaker_state.load(Ordering::Relaxed),
+            1,
+            "hard-down → Open"
+        );
         // (Test around the ACTUAL `until` — the #[cfg(test)] global clock races across
         // parallel tests, so an absolute `now+1800` assert would be flaky; this is robust.)
-        assert!(until > COOLDOWN_TRANSIENT_SECS, "sticky cooldown, not a short transient");
+        assert!(
+            until > COOLDOWN_TRANSIENT_SECS,
+            "sticky cooldown, not a short transient"
+        );
         // Down during the sticky cooldown; recovers via the half-open probe after it.
-        assert!(!store.usable(0, until - 1), "should be down during the sticky cooldown");
+        assert!(
+            !store.usable(0, until - 1),
+            "should be down during the sticky cooldown"
+        );
         assert!(
             store.usable(0, until + 1),
             "hard-down lane must recover via the half-open probe once the long cooldown expires"
@@ -1076,5 +1101,60 @@ mod tests {
             until2 > until1,
             "second cooldown should be longer than first"
         );
+    }
+
+    #[test]
+    fn test_client_fault_counter_increments_separately() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+
+        set_now_for_test(1000);
+
+        // Record client faults - should NOT increment err or streak
+        for _ in 0..5 {
+            store.record_client_fault(0);
+        }
+
+        let snap = store.snapshot(0, 1000);
+        assert_eq!(
+            snap.client_fault, 5,
+            "client_fault counter should increment"
+        );
+        assert_eq!(
+            snap.err, 0,
+            "err should NOT be incremented by client faults"
+        );
+        assert_eq!(
+            snap.streak, 0,
+            "streak should NOT be incremented by client faults"
+        );
+
+        // Should still be usable (no penalty)
+        assert!(
+            store.usable(0, 1000),
+            "lane should remain usable after client faults"
+        );
+    }
+
+    #[test]
+    fn test_client_fault_does_not_affect_breaker_state() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+
+        set_now_for_test(1000);
+
+        // Record many client faults
+        for _ in 0..100 {
+            store.record_client_fault(0);
+        }
+
+        let state = store.breaker_state(0);
+        assert_eq!(
+            state,
+            BreakerState::Closed,
+            "breaker should remain Closed after client faults"
+        );
+
+        let snap = store.snapshot(0, 1000);
+        assert_eq!(snap.client_fault, 100);
+        assert_eq!(snap.err, 0);
     }
 }

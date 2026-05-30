@@ -118,6 +118,7 @@ async fn main() {
             inflight: 0,
             ok: 0,
             err: 0,
+            client_fault: 0,
         });
 
         eprintln!(
