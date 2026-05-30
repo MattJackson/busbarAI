@@ -159,6 +159,12 @@ impl Protocol {
     pub(crate) fn openai() -> Self {
         Self::new("openai", OpenAiReader, OpenAiWriter)
     }
+
+    /// Construct a Gemini protocol instance.
+    #[allow(dead_code)] // Reserved for B-510 integration (later cycle)
+    pub(crate) fn gemini() -> Self {
+        Self::new("gemini", GeminiReader, GeminiWriter)
+    }
 }
 
 /// Resolve a built-in Protocol by name (for ingress translation). Cheap (unit structs).
@@ -167,6 +173,8 @@ pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
     match name {
         "anthropic" => Some(Protocol::anthropic()),
         "openai" => Some(Protocol::openai()),
+        #[allow(dead_code)] // Reserved for B-510 integration (later cycle)
+        "gemini" => Some(Protocol::gemini()),
         _ => None,
     }
 }
@@ -2366,6 +2374,526 @@ impl ProtocolWriter for OpenAiWriter {
         obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
 
         serde_json::Value::Object(obj)
+    }
+}
+
+/// Gemini reader implementation.
+#[derive(Clone)]
+pub(crate) struct GeminiReader;
+
+impl ProtocolReader for GeminiReader {
+    fn extract_error(&self, status: StatusCode, body: &[u8]) -> crate::breaker::RawUpstreamError {
+        let provider_code = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
+            json.get("error")
+                .and_then(|e| e.as_object())
+                .and_then(|e_obj| e_obj.get("code"))
+                .and_then(|c| c.as_str())
+                .map(String::from)
+                .or_else(|| {
+                    json.get("error")
+                        .and_then(|e| e.as_object())
+                        .and_then(|e_obj| e_obj.get("status"))
+                        .and_then(|s| s.as_str())
+                        .map(String::from)
+                })
+        } else {
+            None
+        };
+
+        let structured_type = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
+            json.get("error")
+                .and_then(|e| e.as_object())
+                .and_then(|e_obj| e_obj.get("status"))
+                .and_then(|t| t.as_str())
+                .map(String::from)
+        } else {
+            None
+        };
+
+        crate::breaker::RawUpstreamError {
+            http_status: status.as_u16(),
+            provider_code,
+            structured_type,
+        }
+    }
+
+    fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal {
+        let text = String::from_utf8_lossy(body);
+        let lower = text.to_lowercase();
+
+        // B-504: context-length-exceeded via message pattern
+        if lower.contains("input is longer than the maximum number of tokens")
+            || (lower.contains("maximum-tokens") && lower.contains("requested"))
+        {
+            return CanonicalSignal {
+                class: StatusClass::ContextLength,
+                provider_signal: Some("context_length_exceeded".to_string()),
+                retry_after: None,
+            };
+        }
+
+        // 429 → RateLimit
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return CanonicalSignal {
+                class: StatusClass::RateLimit,
+                provider_signal: Some("429".to_string()),
+                retry_after: None,
+            };
+        }
+
+        // 401/403 → Auth
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return CanonicalSignal {
+                class: StatusClass::Auth,
+                provider_signal: Some("auth".to_string()),
+                retry_after: None,
+            };
+        }
+
+        // 5xx → ServerError
+        if status.is_server_error() {
+            return CanonicalSignal {
+                class: StatusClass::ServerError,
+                provider_signal: Some("5xx".to_string()),
+                retry_after: None,
+            };
+        }
+
+        // 4xx (other) → ClientError
+        if status.is_client_error() {
+            return CanonicalSignal {
+                class: StatusClass::ClientError,
+                provider_signal: Some(format!("{}", status.as_u16())),
+                retry_after: None,
+            };
+        }
+
+        CanonicalSignal {
+            class: StatusClass::ClientError,
+            provider_signal: None,
+            retry_after: None,
+        }
+    }
+
+    fn read_request(&self, body: &serde_json::Value) -> Result<crate::ir::IrRequest, IrError> {
+        let obj = body.as_object().ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".to_string()),
+            retry_after: None,
+        })?;
+
+        let mut extra = serde_json::Map::new();
+        let mut system_blocks: Vec<crate::ir::IrBlock> = Vec::new();
+
+        // Handle systemInstruction (Gemini uses this for system content)
+        if let Some(sys_instr) = obj.get("systemInstruction") {
+            if let Some(parts_arr) = sys_instr.get("parts").and_then(|p| p.as_array()) {
+                for part in parts_arr {
+                    if let Some(text_val) = part.get("text").and_then(|t| t.as_str()) {
+                        system_blocks.push(crate::ir::IrBlock::Text {
+                            text: text_val.to_string(),
+                            cache_control: None,
+                            citations: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Handle contents array (messages)
+        let mut messages: Vec<crate::ir::IrMessage> = Vec::new();
+        if let Some(contents_arr) = obj.get("contents").and_then(|c| c.as_array()) {
+            for content_val in contents_arr {
+                let role_str = content_val
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("");
+                let role = match role_str {
+                    "user" => crate::ir::IrRole::User,
+                    "model" => crate::ir::IrRole::Assistant,
+                    _ => {
+                        return Err(IrError {
+                            class: StatusClass::ClientError,
+                            provider_signal: Some("ir_parse".to_string()),
+                            retry_after: None,
+                        })
+                    }
+                };
+
+                let mut msg_content = Vec::new();
+                if let Some(parts_arr) = content_val.get("parts").and_then(|p| p.as_array()) {
+                    for part in parts_arr {
+                        // Text part
+                        if let Some(text_val) = part.get("text").and_then(|t| t.as_str()) {
+                            msg_content.push(crate::ir::IrBlock::Text {
+                                text: text_val.to_string(),
+                                cache_control: None,
+                                citations: Vec::new(),
+                            });
+                        }
+                        // FunctionCall (ToolUse)
+                        else if let Some(func_call) = part.get("functionCall") {
+                            let name = func_call
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let args = func_call
+                                .get("args")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            msg_content.push(crate::ir::IrBlock::ToolUse {
+                                id: String::new(),
+                                name,
+                                input: args,
+                            });
+                        }
+                        // FunctionResponse (ToolResult)
+                        else if let Some(func_resp) = part.get("functionResponse") {
+                            let name = func_resp
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let response_val = func_resp
+                                .get("response")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            // Convert response to string representation for content
+                            let response_text = serde_json::to_string(&response_val)
+                                .unwrap_or_else(|_| "unknown".to_string());
+                            msg_content.push(crate::ir::IrBlock::ToolResult {
+                                tool_use_id: name,
+                                content: vec![crate::ir::IrBlock::Text {
+                                    text: response_text,
+                                    cache_control: None,
+                                    citations: Vec::new(),
+                                }],
+                                is_error: false,
+                            });
+                        }
+                        // InlineData (Image)
+                        else if let Some(inline_data) = part.get("inlineData") {
+                            let mime_type = inline_data
+                                .get("mimeType")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let data = inline_data
+                                .get("data")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            msg_content.push(crate::ir::IrBlock::Image {
+                                media_type: mime_type,
+                                data,
+                            });
+                        }
+                    }
+                }
+
+                messages.push(crate::ir::IrMessage {
+                    role,
+                    content: msg_content,
+                });
+            }
+        }
+
+        // Handle tools array (functionDeclarations)
+        let mut tools: Vec<crate::ir::IrTool> = Vec::new();
+        if let Some(tools_arr) = obj.get("tools").and_then(|t| t.as_array()) {
+            for tool_val in tools_arr {
+                // Gemini has functionDeclarations inside tools
+                if let Some(func_decls) = tool_val
+                    .get("functionDeclarations")
+                    .and_then(|f| f.as_array())
+                {
+                    for func_decl in func_decls {
+                        let name = func_decl
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let description = func_decl
+                            .get("description")
+                            .and_then(|d| d.as_str().map(String::from));
+                        let parameters = func_decl
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+
+                        tools.push(crate::ir::IrTool {
+                            name,
+                            description,
+                            input_schema: parameters,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Extract scalar fields and extra
+        let max_tokens = obj
+            .get("generationConfig")
+            .and_then(|gc| gc.get("maxOutputTokens"))
+            .and_then(|v| v.as_i64())
+            .filter(|&v| v > 0)
+            .map(|v| v as u32);
+        let temperature = obj
+            .get("generationConfig")
+            .and_then(|gc| gc.get("temperature"))
+            .and_then(|v| v.as_f64());
+        let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // Collect unmodeled top-level keys into extra (excluding modeled ones)
+        let modeled_keys: std::collections::HashSet<&str> = [
+            "contents",
+            "tools",
+            "systemInstruction",
+            "generationConfig",
+            "stream",
+            "tool_config",
+        ]
+        .iter()
+        .cloned()
+        .collect();
+
+        // model is modeled but we preserve it in extra for round-trip identity
+        if let Some(model_val) = obj.get("model") {
+            extra.insert("model".to_string(), model_val.clone());
+        }
+
+        for (key, value) in obj.iter() {
+            if !modeled_keys.contains(key.as_str()) {
+                extra.insert(key.clone(), value.clone());
+            }
+        }
+
+        Ok(crate::ir::IrRequest {
+            system: system_blocks,
+            messages,
+            tools,
+            max_tokens,
+            temperature,
+            stream,
+            extra,
+        })
+    }
+
+    fn read_response_event(
+        &self,
+        _event_type: &str,
+        _data: &serde_json::Value,
+    ) -> Option<IrStreamEvent> {
+        // STUB: Gemini streaming not implemented this cycle
+        None
+    }
+
+    fn read_response_events(
+        &self,
+        _event_type: &str,
+        _data: &serde_json::Value,
+        _state: &mut crate::ir::StreamDecodeState,
+    ) -> Vec<IrStreamEvent> {
+        // STUB: Returns empty vec (inert this cycle)
+        Vec::new()
+    }
+
+    fn read_response(&self, _body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError> {
+        // STUB: Return error indicating unimplemented
+        Err(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("gemini_response_unimpl".into()),
+            retry_after: None,
+        })
+    }
+
+    fn clone_box(&self) -> Box<dyn ProtocolReader> {
+        Box::new(self.clone())
+    }
+}
+
+/// Gemini writer implementation.
+#[derive(Clone)]
+pub(crate) struct GeminiWriter;
+
+impl ProtocolWriter for GeminiWriter {
+    fn upstream_path(&self) -> &str {
+        // B-510 NOTE: Gemini's real path is model-dependent (/v1beta/models/{model}:generateContent)
+        // and URL/auth integration is a later cycle — this cycle is request R/W only.
+        "/v1beta"
+    }
+
+    fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
+        vec![(
+            HeaderName::from_static("x-goog-api-key"),
+            HeaderValue::from_str(key).expect("api key is valid"),
+        )]
+    }
+
+    fn rewrite_model(&self, body: &mut serde_json::Value, model: &str) {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("model".to_string(), serde_json::json!(model));
+        }
+    }
+
+    fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
+        let mut out = serde_json::Map::new();
+
+        // systemInstruction.parts[] from IrRequest.system
+        if !req.system.is_empty() {
+            let parts: Vec<_> = req
+                .system
+                .iter()
+                .filter_map(|block| match block {
+                    crate::ir::IrBlock::Text { text, .. } => {
+                        Some(serde_json::json!({ "text": text }))
+                    }
+                    _ => None, // Only Text blocks in systemInstruction (Gemini limitation)
+                })
+                .collect();
+            if !parts.is_empty() {
+                out.insert(
+                    "systemInstruction".to_string(),
+                    serde_json::json!({ "parts": parts }),
+                );
+            }
+        }
+
+        // messages → contents (Assistant→"model", User→"user")
+        let mut contents_arr: Vec<serde_json::Value> = Vec::new();
+        for msg in &req.messages {
+            let role_str = match msg.role {
+                crate::ir::IrRole::User => "user",
+                crate::ir::IrRole::Assistant | crate::ir::IrRole::Tool => "model",
+                crate::ir::IrRole::System => continue, // Already in systemInstruction
+            };
+
+            let mut parts_arr: Vec<serde_json::Value> = Vec::new();
+            for block in &msg.content {
+                match block {
+                    crate::ir::IrBlock::Text { text, .. } => {
+                        parts_arr.push(serde_json::json!({ "text": text }))
+                    }
+                    crate::ir::IrBlock::ToolUse { id: _, name, input } => {
+                        // ToolUse → functionCall{name, args}
+                        let args_val = if input.is_object() || input.is_array() {
+                            input.clone()
+                        } else {
+                            // If it's a string, parse or wrap as object
+                            serde_json::from_str(input.as_str().unwrap_or("{}"))
+                                .unwrap_or_else(|_| input.clone())
+                        };
+                        parts_arr.push(serde_json::json!({
+                            "functionCall": { "name": name, "args": args_val }
+                        }))
+                    }
+                    crate::ir::IrBlock::ToolResult {
+                        tool_use_id: name,
+                        content,
+                        is_error: _,
+                    } => {
+                        // ToolResult → functionResponse{name, response}
+                        let response_text = content
+                            .iter()
+                            .filter_map(|b| match b {
+                                crate::ir::IrBlock::Text { text, .. } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let response_val: serde_json::Value =
+                            serde_json::from_str(&response_text).unwrap_or(serde_json::json!({}));
+                        parts_arr.push(serde_json::json!({
+                            "functionResponse": { "name": name, "response": response_val }
+                        }))
+                    }
+                    crate::ir::IrBlock::Image { media_type, data } => {
+                        // Image → inlineData{mimeType, data}
+                        parts_arr.push(serde_json::json!({
+                            "inlineData": { "mimeType": media_type, "data": data }
+                        }))
+                    }
+                    _ => {} // Drop unsupported blocks (thinking, etc.)
+                }
+            }
+
+            if !parts_arr.is_empty() {
+                let mut content_obj = serde_json::Map::new();
+                content_obj.insert("role".to_string(), serde_json::json!(role_str));
+                content_obj.insert("parts".to_string(), serde_json::Value::Array(parts_arr));
+                contents_arr.push(serde_json::Value::Object(content_obj));
+            }
+        }
+
+        // Write contents to output after building all messages
+        if !contents_arr.is_empty() {
+            out.insert(
+                "contents".to_string(),
+                serde_json::Value::Array(contents_arr),
+            );
+        }
+
+        // tools → tools[0].functionDeclarations[]
+        if !req.tools.is_empty() {
+            let func_decls: Vec<_> = req
+                .tools
+                .iter()
+                .map(|tool| {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("name".to_string(), serde_json::json!(tool.name));
+                    if let Some(desc) = &tool.description {
+                        obj.insert("description".to_string(), serde_json::json!(desc));
+                    }
+                    obj.insert("parameters".to_string(), tool.input_schema.clone());
+                    serde_json::Value::Object(obj)
+                })
+                .collect();
+            out.insert(
+                "tools".to_string(),
+                serde_json::json!([{"functionDeclarations": func_decls}]),
+            );
+        }
+
+        // generationConfig{maxOutputTokens, temperature}
+        let mut gen_config = serde_json::Map::new();
+        if let Some(max_tokens) = req.max_tokens {
+            gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(max_tokens));
+        }
+        if let Some(temperature) = req.temperature {
+            gen_config.insert("temperature".to_string(), serde_json::json!(temperature));
+        }
+        if !gen_config.is_empty() {
+            out.insert(
+                "generationConfig".to_string(),
+                serde_json::Value::Object(gen_config),
+            );
+        }
+
+        // stream flag
+        out.insert("stream".to_string(), serde_json::json!(req.stream));
+
+        // Merge extra fields (may override, but that's expected behavior)
+        for (key, value) in &req.extra {
+            out.insert(key.clone(), value.clone());
+        }
+
+        serde_json::Value::Object(out)
+    }
+
+    fn write_response_event(&self, _ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
+        // STUB: Returns None (inert this cycle)
+        None
+    }
+
+    #[allow(dead_code)] // Used by B-502b/B-503 tests
+    fn write_response(&self, _resp: &crate::ir::IrResponse) -> serde_json::Value {
+        // STUB: Return empty object (inert this cycle)
+        serde_json::json!({})
+    }
+
+    fn clone_box(&self) -> Box<dyn ProtocolWriter> {
+        Box::new(self.clone())
     }
 }
 
@@ -4620,6 +5148,197 @@ mod stream_translate_tests {
 
         // Decode IR must be identical (ground truth for anti-fab)
         assert_eq!(ir1, ir2, "decoded IR must be identical after round-trip");
+    }
+
+    // B-510a: Gemini decode test - systemInstruction + contents with mixed blocks + tools
+    #[test]
+    fn test_gemini_decode() {
+        let j = serde_json::json!({
+            "systemInstruction": {
+                "parts": [{"text": "You are a helpful assistant."}]
+            },
+            "contents": [
+                {"role": "user", "parts": [
+                    {"text": "What is the weather?"},
+                    {"inlineData": {"mimeType": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"}}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "get_weather", "args": {"location": "San Francisco"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "get_weather", "response": {"temperature": 72, "units": "F"}}}
+                ]}
+            ],
+            "tools": [{
+                "functionDeclarations": [
+                    {
+                        "name": "get_weather",
+                        "description": "Get weather for a location",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"]
+                        }
+                    }
+                ]
+            }],
+            "generationConfig": {
+                "maxOutputTokens": 4096,
+                "temperature": 0.7
+            },
+            "stream": true
+        });
+
+        let reader = GeminiReader;
+        let ir = reader
+            .read_request(&j)
+            .expect("read_request should succeed");
+
+        // Assert system Text block
+        assert_eq!(ir.system.len(), 1);
+        if let crate::ir::IrBlock::Text {
+            text,
+            cache_control: _,
+            citations: _,
+        } = &ir.system[0]
+        {
+            assert_eq!(text, "You are a helpful assistant.");
+        } else {
+            panic!("expected Text block in system");
+        }
+
+        // Assert messages roles and content
+        assert_eq!(ir.messages.len(), 3);
+
+        // First message: User with text + image
+        assert_eq!(ir.messages[0].role, crate::ir::IrRole::User);
+        assert_eq!(ir.messages[0].content.len(), 2);
+        if let crate::ir::IrBlock::Text { text, .. } = &ir.messages[0].content[0] {
+            assert_eq!(text, "What is the weather?");
+        } else {
+            panic!("expected Text block in first message");
+        }
+        if let crate::ir::IrBlock::Image { media_type, data } = &ir.messages[0].content[1] {
+            assert_eq!(media_type, "image/png");
+            assert_eq!(data, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ");
+        } else {
+            panic!("expected Image block in first message");
+        }
+
+        // Second message: Assistant with functionCall (ToolUse)
+        assert_eq!(ir.messages[1].role, crate::ir::IrRole::Assistant);
+        assert_eq!(ir.messages[1].content.len(), 1);
+        if let crate::ir::IrBlock::ToolUse { id: _, name, input } = &ir.messages[1].content[0] {
+            assert_eq!(name, "get_weather");
+            assert_eq!(
+                input.get("location").and_then(|v| v.as_str()),
+                Some("San Francisco")
+            );
+        } else {
+            panic!("expected ToolUse block in second message");
+        }
+
+        // Third message: User with functionResponse (ToolResult)
+        assert_eq!(ir.messages[2].role, crate::ir::IrRole::User);
+        assert_eq!(ir.messages[2].content.len(), 1);
+        if let crate::ir::IrBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } = &ir.messages[2].content[0]
+        {
+            assert_eq!(tool_use_id, "get_weather");
+            assert!(!is_error);
+            assert_eq!(content.len(), 1);
+            if let crate::ir::IrBlock::Text { text, .. } = &content[0] {
+                // Response serialized as JSON string
+                assert!(text.contains("72") || text.contains("temperature"));
+            } else {
+                panic!("expected Text block in tool result");
+            }
+        } else {
+            panic!("expected ToolResult block in third message");
+        }
+
+        // Assert tools
+        assert_eq!(ir.tools.len(), 1);
+        let crate::ir::IrTool {
+            name,
+            description,
+            input_schema,
+        } = &ir.tools[0];
+        {
+            assert_eq!(name, "get_weather");
+            assert_eq!(description.as_deref(), Some("Get weather for a location"));
+            assert!(!input_schema.is_null());
+        }
+
+        // Assert generationConfig fields
+        assert_eq!(ir.max_tokens, Some(4096));
+        assert_eq!(ir.temperature, Some(0.7));
+        assert!(ir.stream);
+    }
+
+    // B-510a: Gemini round-trip test - write_request(read_request(j)) == j for canonical fixture
+    #[test]
+    fn test_gemini_roundtrip_identity() {
+        let j = serde_json::json!({
+            "model": "gemini-pro",
+            "systemInstruction": {"parts": [{"text": "You are a helpful assistant."}]},
+            "contents": [
+                {"role": "user", "parts": [{"text": "Hello"}]},
+                {"role": "model", "parts": [{"text": "Hi there!"}]}
+            ],
+            "generationConfig": {"maxOutputTokens": 100, "temperature": 0.5},
+            "stream": false
+        });
+
+        let reader = GeminiReader;
+        let writer = GeminiWriter;
+
+        // Canonical form: minimal fixture that round-trips exactly
+        let ir = reader
+            .read_request(&j)
+            .expect("read_request should succeed");
+        let roundtrip = writer.write_request(&ir);
+
+        // Compare as Value - exact identity on representable subset
+        assert_eq!(roundtrip, j, "round-trip must be byte-identical");
+    }
+
+    // B-510a: Protocol::gemini() resolves correctly with working reader/writer
+    #[test]
+    fn test_gemini_protocol_resolves() {
+        let proto = Protocol::gemini();
+        assert_eq!(proto.name(), "gemini");
+
+        let reader = proto.reader();
+        let writer = proto.writer();
+
+        // Verify reader methods work
+        let j = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "test"}]}]
+        });
+        let ir = reader.read_request(&j).expect("reader should parse");
+        assert_eq!(ir.messages.len(), 1);
+
+        // Verify writer methods work
+        let output = writer.write_request(&ir);
+        assert!(output.as_object().unwrap().contains_key("contents"));
+
+        // Verify other protocol methods
+        assert_eq!(writer.upstream_path(), "/v1beta");
+        let headers = writer.auth_headers("test-key");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0.as_str(), "x-goog-api-key");
+
+        // Verify error handling methods
+        let status_code = StatusCode::TOO_MANY_REQUESTS;
+        let signal = reader.classify(status_code, b"{}");
+        assert_eq!(signal.class, StatusClass::RateLimit);
+
+        let raw_error = reader.extract_error(status_code, b"{}");
+        assert_eq!(raw_error.http_status, 429);
     }
 }
 
