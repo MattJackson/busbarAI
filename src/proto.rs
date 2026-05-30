@@ -1571,8 +1571,117 @@ impl ProtocolWriter for OpenAiWriter {
 
     #[allow(dead_code)] // Used by B-502b/B-503 tests
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
-        let _ = (self, ev);
-        None
+        match ev {
+            IrStreamEvent::MessageStart { role, .. } => {
+                let openai_role = match role {
+                    crate::ir::IrRole::Assistant => "assistant",
+                    _ => return None,
+                };
+                let delta_obj = serde_json::json!({ "role": openai_role });
+                let chunk_obj = serde_json::json!({
+                    "object": "chat.completion.chunk",
+                    "choices": [{
+                        "index": 0,
+                        "delta": delta_obj,
+                        "finish_reason": null
+                    }]
+                });
+                Some(("".to_string(), chunk_obj))
+            }
+            IrStreamEvent::BlockStart { block, .. } => match block {
+                crate::ir::IrBlockMeta::Text => None,
+                crate::ir::IrBlockMeta::ToolUse { id, name } => {
+                    let delta_obj = serde_json::json!({
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": id,
+                            "type": "function",
+                            "function": { "name": name, "arguments": "" }
+                        }]
+                    });
+                    let chunk_obj = serde_json::json!({
+                        "object": "chat.completion.chunk",
+                        "choices": [{
+                            "index": 0,
+                            "delta": delta_obj,
+                            "finish_reason": null
+                        }]
+                    });
+                    Some(("".to_string(), chunk_obj))
+                }
+                crate::ir::IrBlockMeta::Thinking | crate::ir::IrBlockMeta::Image => None,
+            },
+            IrStreamEvent::BlockDelta { delta, .. } => match delta {
+                crate::ir::IrDelta::TextDelta(text) => {
+                    let delta_obj = serde_json::json!({ "content": text });
+                    let chunk_obj = serde_json::json!({
+                        "object": "chat.completion.chunk",
+                        "choices": [{
+                            "index": 0,
+                            "delta": delta_obj,
+                            "finish_reason": null
+                        }]
+                    });
+                    Some(("".to_string(), chunk_obj))
+                }
+                crate::ir::IrDelta::InputJsonDelta(json) => {
+                    let delta_obj = serde_json::json!({
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": { "arguments": json }
+                        }]
+                    });
+                    let chunk_obj = serde_json::json!({
+                        "object": "chat.completion.chunk",
+                        "choices": [{
+                            "index": 0,
+                            "delta": delta_obj,
+                            "finish_reason": null
+                        }]
+                    });
+                    Some(("".to_string(), chunk_obj))
+                }
+                crate::ir::IrDelta::ThinkingDelta(_) => {
+                    // Lossy-by-necessity: OpenAI has no thinking stream equivalent.
+                    None
+                }
+                crate::ir::IrDelta::SignatureDelta(_) => {
+                    // Lossy-by-necessity: OpenAI has no signature stream equivalent.
+                    None
+                }
+            },
+            IrStreamEvent::BlockStop { .. } => None,
+            IrStreamEvent::MessageDelta { stop_reason, .. } => {
+                let finish_reason = match stop_reason.as_deref() {
+                    Some("end_turn") | Some("stop_sequence") => "stop",
+                    Some("max_tokens") => "length",
+                    Some("tool_use") => "tool_calls",
+                    Some(reason) => reason,
+                    None => "",
+                };
+                let delta_obj = serde_json::json!({});
+                let chunk_obj = serde_json::json!({
+                    "object": "chat.completion.chunk",
+                    "choices": [{
+                        "index": 0,
+                        "delta": delta_obj,
+                        "finish_reason": finish_reason
+                    }]
+                });
+                Some(("".to_string(), chunk_obj))
+            }
+            IrStreamEvent::MessageStop => None,
+            IrStreamEvent::Error(err) => {
+                let message = err
+                    .provider_signal
+                    .clone()
+                    .unwrap_or_else(|| "error".to_string());
+                let error_obj = serde_json::json!({
+                    "error": { "message": message, "type": "error" }
+                });
+                Some(("".to_string(), error_obj))
+            }
+        }
     }
 
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
@@ -3085,6 +3194,194 @@ mod tests {
                 .and_then(|s| s.as_str())
                 .unwrap();
             assert_eq!(rt_sig, sig);
+        }
+
+        #[test]
+        fn test_openai_write_response_event_text_delta() {
+            let writer = OpenAiWriter;
+            let ev = crate::ir::IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::TextDelta("hello".to_string()),
+            };
+            let result = writer.write_response_event(&ev);
+            assert!(result.is_some());
+            let (_, chunk) = result.unwrap();
+            assert_eq!(
+                chunk.get("object").and_then(|v| v.as_str()),
+                Some("chat.completion.chunk")
+            );
+            let choices = chunk.get("choices").and_then(|c| c.as_array()).unwrap();
+            assert_eq!(choices.len(), 1);
+            let choice = &choices[0];
+            assert_eq!(choice.get("index").and_then(|v| v.as_u64()), Some(0));
+            assert_eq!(
+                choice
+                    .get("delta")
+                    .and_then(|d| d.get("content").and_then(|c| c.as_str())),
+                Some("hello")
+            );
+        }
+
+        #[test]
+        fn test_openai_write_response_event_message_start() {
+            let writer = OpenAiWriter;
+            let ev = crate::ir::IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+            };
+            let result = writer.write_response_event(&ev);
+            assert!(result.is_some());
+            let (_, chunk) = result.unwrap();
+            assert_eq!(
+                chunk.get("object").and_then(|v| v.as_str()),
+                Some("chat.completion.chunk")
+            );
+            let choices = chunk.get("choices").and_then(|c| c.as_array()).unwrap();
+            assert_eq!(choices.len(), 1);
+            let choice = &choices[0];
+            assert_eq!(
+                choice
+                    .get("delta")
+                    .and_then(|d| d.get("role").and_then(|r| r.as_str())),
+                Some("assistant")
+            );
+        }
+
+        #[test]
+        fn test_openai_write_response_event_finish_reason_mapping() {
+            let writer = OpenAiWriter;
+
+            // end_turn -> stop
+            let ev1 = crate::ir::IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                usage: crate::ir::IrUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            };
+            let result1 = writer.write_response_event(&ev1);
+            assert!(result1.is_some());
+            let (_, chunk1) = result1.unwrap();
+            let choices1 = chunk1.get("choices").and_then(|c| c.as_array()).unwrap();
+            assert_eq!(
+                choices1[0].get("finish_reason").and_then(|v| v.as_str()),
+                Some("stop")
+            );
+
+            // max_tokens -> length
+            let ev2 = crate::ir::IrStreamEvent::MessageDelta {
+                stop_reason: Some("max_tokens".to_string()),
+                usage: crate::ir::IrUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            };
+            let result2 = writer.write_response_event(&ev2);
+            assert!(result2.is_some());
+            let (_, chunk2) = result2.unwrap();
+            let choices2 = chunk2.get("choices").and_then(|c| c.as_array()).unwrap();
+            assert_eq!(
+                choices2[0].get("finish_reason").and_then(|v| v.as_str()),
+                Some("length")
+            );
+
+            // tool_use -> tool_calls
+            let ev3 = crate::ir::IrStreamEvent::MessageDelta {
+                stop_reason: Some("tool_use".to_string()),
+                usage: crate::ir::IrUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            };
+            let result3 = writer.write_response_event(&ev3);
+            assert!(result3.is_some());
+            let (_, chunk3) = result3.unwrap();
+            let choices3 = chunk3.get("choices").and_then(|c| c.as_array()).unwrap();
+            assert_eq!(
+                choices3[0].get("finish_reason").and_then(|v| v.as_str()),
+                Some("tool_calls")
+            );
+        }
+
+        #[test]
+        fn test_openai_write_response_event_tool_call_args() {
+            let writer = OpenAiWriter;
+            let ev = crate::ir::IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::InputJsonDelta(r#"{"x":1}"#.to_string()),
+            };
+            let result = writer.write_response_event(&ev);
+            assert!(result.is_some());
+            let (_, chunk) = result.unwrap();
+            let choices = chunk.get("choices").and_then(|c| c.as_array()).unwrap();
+            assert_eq!(choices.len(), 1);
+            let choice = &choices[0];
+            let tool_calls = choice
+                .get("delta")
+                .and_then(|d| d.get("tool_calls"))
+                .and_then(|tc| tc.as_array())
+                .unwrap();
+            assert_eq!(tool_calls.len(), 1);
+            let func_args = tool_calls[0]
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .unwrap();
+            assert_eq!(func_args, r#"{"x":1}"#);
+        }
+
+        #[test]
+        fn test_openai_write_response_event_lossy_drops() {
+            let writer = OpenAiWriter;
+
+            // ThinkingDelta -> None
+            let ev1 = crate::ir::IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::ThinkingDelta("thinking...".to_string()),
+            };
+            assert!(writer.write_response_event(&ev1).is_none());
+
+            // SignatureDelta -> None
+            let ev2 = crate::ir::IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::SignatureDelta("sig...".to_string()),
+            };
+            assert!(writer.write_response_event(&ev2).is_none());
+
+            // BlockStop -> None
+            let ev3 = crate::ir::IrStreamEvent::BlockStop { index: 0 };
+            assert!(writer.write_response_event(&ev3).is_none());
+
+            // MessageStop -> None
+            let ev4 = crate::ir::IrStreamEvent::MessageStop;
+            assert!(writer.write_response_event(&ev4).is_none());
+        }
+
+        #[test]
+        fn test_openai_write_response_event_error() {
+            let writer = OpenAiWriter;
+            let err = crate::proto::IrError {
+                class: crate::breaker::StatusClass::ClientError,
+                provider_signal: Some("boom".to_string()),
+                retry_after: None,
+            };
+            let ev = crate::ir::IrStreamEvent::Error(err);
+            let result = writer.write_response_event(&ev);
+            assert!(result.is_some());
+            let (_, chunk) = result.unwrap();
+            assert_eq!(
+                chunk
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str()),
+                Some("boom")
+            );
         }
     }
 }
