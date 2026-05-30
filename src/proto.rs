@@ -1452,13 +1452,15 @@ impl ProtocolWriter for OpenAiWriter {
             if msg.role == crate::ir::IrRole::Assistant {
                 let mut tool_calls_arr: Vec<serde_json::Value> = Vec::new();
                 for block in &msg.content {
-                    if let crate::ir::IrBlock::ToolUse { id: _, name, input } = block {
+                    if let crate::ir::IrBlock::ToolUse { id, name, input } = block {
                         // Serialize input to JSON string
                         let args_str =
                             serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                        // Preserve the original tool_call id verbatim — it must round-trip so the
+                        // assistant tool_call correlates with the tool-result `tool_call_id`.
                         tool_calls_arr.push(serde_json::json!({
                             "type": "function",
-                            "id": format!("tool_{}", name),
+                            "id": id,
                             "function": {
                                 "name": name,
                                 "arguments": args_str
@@ -2135,6 +2137,28 @@ mod tests {
             roundtrip.as_object().unwrap().get("top_p"),
             j.as_object().unwrap().get("top_p")
         );
+
+        // Correctness-critical: the tool_call id must round-trip VERBATIM (not be regenerated),
+        // so the assistant tool_call still correlates with the tool-result `tool_call_id`.
+        let msgs = roundtrip.get("messages").and_then(|v| v.as_array()).unwrap();
+        let written_id = msgs
+            .iter()
+            .find_map(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
+            .and_then(|tc| tc.first())
+            .and_then(|c| c.get("id"))
+            .and_then(|i| i.as_str());
+        assert_eq!(
+            written_id,
+            Some("call_123"),
+            "tool_call id must round-trip verbatim, not be regenerated"
+        );
+        // And the tool-result must still reference that same id (correlation preserved).
+        let result_ref = msgs
+            .iter()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+            .and_then(|m| m.get("tool_call_id"))
+            .and_then(|i| i.as_str());
+        assert_eq!(result_ref, Some("call_123"), "tool-result correlation must survive round-trip");
     }
 
     #[test]
