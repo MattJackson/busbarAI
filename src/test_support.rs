@@ -237,7 +237,7 @@ mod tests {
     use crate::auth::AuthMiddleware;
     use crate::config::AuthCfg;
     use crate::forward::{forward, forward_with_pool};
-    use crate::state::{now, App, Lane, ProtocolKind};
+    use crate::state::{now, App, Lane};
     use crate::store::{InMemoryStore, LaneData};
 
     use reqwest::Client;
@@ -364,7 +364,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -445,7 +445,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -534,7 +534,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 1,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -650,7 +650,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -660,7 +660,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-1".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -782,7 +782,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -792,7 +792,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-1".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -915,7 +915,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "busbar-key".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -1004,7 +1004,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "busbar-key".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -1099,7 +1099,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "busbar-central-key".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -1218,7 +1218,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -1228,7 +1228,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-1".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -1367,7 +1367,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -1377,7 +1377,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-1".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -1387,7 +1387,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-2".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -1512,7 +1512,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -1522,7 +1522,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-1".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -1741,7 +1741,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -1947,7 +1947,7 @@ mod tests {
                 provider: "z.ai".to_string(),
                 base_url: server.base_url(),
                 api_key: "test-key".to_string(),
-                protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+                protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
             };
@@ -2040,7 +2040,7 @@ mod tests {
                 provider: "z.ai".to_string(),
                 base_url: server.base_url(),
                 api_key: "test-key".to_string(),
-                protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+                protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
             };
@@ -2132,7 +2132,7 @@ mod tests {
                 provider: "z.ai".to_string(),
                 base_url: server.base_url(),
                 api_key: "test-key".to_string(),
-                protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+                protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
             };
@@ -2222,7 +2222,7 @@ mod tests {
                 provider: "z.ai".to_string(),
                 base_url: server.base_url(),
                 api_key: "test-key".to_string(),
-                protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+                protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
             };
@@ -2313,7 +2313,7 @@ mod tests {
                 provider: "z.ai".to_string(),
                 base_url: server.base_url(),
                 api_key: "test-key".to_string(),
-                protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+                protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
             };
@@ -2404,7 +2404,7 @@ mod tests {
                 provider: "z.ai".to_string(),
                 base_url: server.base_url(),
                 api_key: "test-key".to_string(),
-                protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+                protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
             };
@@ -2510,7 +2510,7 @@ mod tests {
                 provider: "z.ai".to_string(),
                 base_url: server1.base_url(),
                 api_key: "test-key-1".to_string(),
-                protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+                protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map_1),
             };
@@ -2540,7 +2540,7 @@ mod tests {
                 provider: "z.ai".to_string(),
                 base_url: server2.base_url(),
                 api_key: "test-key-2".to_string(),
-                protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+                protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map_2),
             };
@@ -2747,7 +2747,7 @@ mod tests {
                 provider: "anthropic".to_string(),
                 base_url: server.base_url(),
                 api_key: "test-key".to_string(),
-                protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+                protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
             };
@@ -2851,7 +2851,7 @@ mod tests {
                 provider: "anthropic".to_string(),
                 base_url: server0.base_url(),
                 api_key: "test-key-0".to_string(),
-                protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+                protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(HashMap::new()),
             };
@@ -2879,7 +2879,7 @@ mod tests {
                 provider: "anthropic".to_string(),
                 base_url: server1.base_url(),
                 api_key: "test-key-1".to_string(),
-                protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+                protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(HashMap::new()),
             };
@@ -2995,7 +2995,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -3005,7 +3005,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: "test-key-1".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -3134,7 +3134,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server0.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -3144,7 +3144,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server1.base_url(),
             api_key: "test-key-1".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -3257,7 +3257,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: key.to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -3398,7 +3398,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
             api_key: key.to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -3560,7 +3560,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server0.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -3570,7 +3570,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server1.base_url(),
             api_key: "test-key-1".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -3580,7 +3580,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server2.base_url(),
             api_key: "test-key-2".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -3755,7 +3755,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server0.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 1,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -3765,7 +3765,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server1.base_url(),
             api_key: "test-key-1".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 1,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -3895,7 +3895,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server0.base_url(),
             api_key: "test-key-0".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
@@ -3905,7 +3905,7 @@ mod tests {
             provider: "test-provider".to_string(),
             base_url: server1.base_url(),
             api_key: "test-key-1".to_string(),
-            protocol: ProtocolKind::Anthropic(crate::proto::Protocol::anthropic()),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };

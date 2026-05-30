@@ -49,8 +49,9 @@ use std::time::Duration;
 use axum::{routing::get, routing::post, Router};
 
 use auth::AuthMiddleware;
-use proto::Protocol;
-use state::{App, Lane, ProtocolKind, WeightedLane};
+
+use proto::ProtocolRegistry;
+use state::{App, Lane, WeightedLane};
 use store::{InMemoryStore, LaneData};
 
 #[tokio::main]
@@ -132,23 +133,23 @@ async fn main() {
         );
     }
 
+    let registry = ProtocolRegistry::with_builtins();
+
     let mut lanes = Vec::new();
     for ld in &lanes_data {
         let provider_cfg = cfg.providers.get(&ld.provider).unwrap();
-        let proto = if provider_cfg.protocol == "anthropic" {
-            ProtocolKind::Anthropic(Protocol::anthropic())
-        } else {
+        let protocol = registry.get(&provider_cfg.protocol).unwrap_or_else(|| {
             panic!(
                 "unknown protocol '{}' for provider {}",
                 provider_cfg.protocol, ld.provider
-            );
-        };
+            )
+        });
         lanes.push(Lane {
             model: ld.model.clone(),
             provider: ld.provider.clone(),
             base_url: provider_cfg.base_url.trim_end_matches('/').to_string(),
             api_key: std::env::var(&provider_cfg.api_key_env).unwrap_or_default(),
-            protocol: proto,
+            protocol,
             max: ld.max,
             error_map: Arc::new(provider_cfg.error_map.clone()),
         });

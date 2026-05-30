@@ -537,8 +537,10 @@ pub(crate) async fn forward_with_pool(
         // Mark this lane as excluded for future attempts in this request
         request_ctx.exclude(i);
 
-        let proto = &app.lanes[i].protocol;
-        proto.rewrite_model(&mut v, &app.lanes[i].model);
+        app.lanes[i]
+            .protocol
+            .writer()
+            .rewrite_model(&mut v, &app.lanes[i].model);
         let payload = serde_json::to_vec(&v).unwrap();
         let base = &app.lanes[i].base_url;
 
@@ -550,8 +552,13 @@ pub(crate) async fn forward_with_pool(
 
         let res = app
             .client
-            .post(format!("{base}{}", proto.upstream_path()))
-            .headers(convert_headers(proto.auth_headers(key)))
+            .post(format!(
+                "{base}{}",
+                app.lanes[i].protocol.writer().upstream_path()
+            ))
+            .headers(convert_headers(
+                app.lanes[i].protocol.writer().auth_headers(key),
+            ))
             .header(CONTENT_TYPE, "application/json")
             .timeout(std::time::Duration::from_secs(
                 request_ctx.remaining(now()).max(1),
@@ -596,7 +603,7 @@ pub(crate) async fn forward_with_pool(
                     // Two-stage pipeline: Stage 1a (proto.extract_error) → RawUpstreamError
                     //                     Stage 1b (normalize_raw_error + error_map) → CanonicalSignal
                     //                     Stage 2 (breaker::classify_disposition) → Disposition
-                    let raw = app.lanes[i].protocol.extract_error(status, &bytes);
+                    let raw = app.lanes[i].protocol.reader().extract_error(status, &bytes);
                     let sig = normalize_raw_error(&raw, &app.lanes[i].error_map);
                     let disposition = classify_disposition(&sig);
 
@@ -799,8 +806,10 @@ async fn forward_once(
         }
     };
 
-    let proto = &app.lanes[i].protocol;
-    proto.rewrite_model(&mut v, &app.lanes[i].model);
+    app.lanes[i]
+        .protocol
+        .writer()
+        .rewrite_model(&mut v, &app.lanes[i].model);
     let payload = serde_json::to_vec(&v).unwrap();
     let base = &app.lanes[i].base_url;
 
@@ -812,8 +821,13 @@ async fn forward_once(
 
     let res = app
         .client
-        .post(format!("{base}{}", proto.upstream_path()))
-        .headers(convert_headers(proto.auth_headers(key)))
+        .post(format!(
+            "{base}{}",
+            app.lanes[i].protocol.writer().upstream_path()
+        ))
+        .headers(convert_headers(
+            app.lanes[i].protocol.writer().auth_headers(key),
+        ))
         .header(CONTENT_TYPE, "application/json")
         .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
         .body(payload)

@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+pub(crate) use crate::proto::Protocol;
 pub(crate) use crate::store::now;
-pub(crate) use crate::{proto::Protocol, store::StateStore};
+pub(crate) use crate::store::StateStore;
 
 use reqwest::Client;
 
@@ -17,59 +18,10 @@ pub(crate) struct Lane {
     pub(crate) provider: String,
     pub(crate) base_url: String,
     pub(crate) api_key: String,
-    pub(crate) protocol: ProtocolKind,
+    pub(crate) protocol: Arc<Protocol>,
     pub(crate) max: usize,
     // error_map cloned into each lane at startup for Stage 1b normalization
     pub(crate) error_map: Arc<std::collections::HashMap<String, String>>,
-}
-
-#[derive(Clone)]
-pub(crate) enum ProtocolKind {
-    Anthropic(Protocol),
-}
-
-impl ProtocolKind {
-    pub(crate) fn upstream_path(&self) -> &str {
-        match self {
-            ProtocolKind::Anthropic(p) => p.writer().upstream_path(),
-        }
-    }
-
-    pub(crate) fn auth_headers(
-        &self,
-        key: &str,
-    ) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
-        match self {
-            ProtocolKind::Anthropic(p) => p.writer().auth_headers(key),
-        }
-    }
-
-    pub(crate) fn rewrite_model(&self, body: &mut serde_json::Value, model: &str) {
-        match self {
-            ProtocolKind::Anthropic(p) => p.writer().rewrite_model(body, model),
-        }
-    }
-
-    #[allow(dead_code)] // classify retained for future extensibility (currently using normalize_raw_error path)
-    pub(crate) fn classify(
-        &self,
-        status: axum::http::StatusCode,
-        body: &[u8],
-    ) -> crate::proto::CanonicalSignal {
-        match self {
-            ProtocolKind::Anthropic(p) => p.reader().classify(status, body),
-        }
-    }
-
-    pub(crate) fn extract_error(
-        &self,
-        status: axum::http::StatusCode,
-        body: &[u8],
-    ) -> crate::breaker::RawUpstreamError {
-        match self {
-            ProtocolKind::Anthropic(p) => p.reader().extract_error(status, body),
-        }
-    }
 }
 
 /// A pool lane with its associated weight (B-401).
