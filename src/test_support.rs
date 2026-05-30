@@ -954,8 +954,8 @@ mod tests {
         {
             let snap = app_token.store.snapshot(0, t);
             assert!(
-                snap.dead,
-                "lane should be dead after token-mode-401 (busbar's key)"
+                !snap.dead,
+                "token-mode-401 → recoverable hard-down (long cooldown + probe), NOT permanent dead (B-303a)"
             );
         }
 
@@ -1516,7 +1516,7 @@ mod tests {
             );
             {
                 let snap = app.store.snapshot(0, t);
-                assert!(snap.dead, "lane should be dead after Billing HardDown");
+                assert!(!snap.dead, "Billing HardDown → recoverable (long cooldown + probe), not permanent dead (B-303a)");
                 assert_eq!(
                     snap.dead_reason, "billing / insufficient balance",
                     "dead reason should match"
@@ -1828,7 +1828,7 @@ mod tests {
             );
             {
                 let snap = app.store.snapshot(0, t);
-                assert!(snap.dead, "lane should be dead after Auth HardDown");
+                assert!(!snap.dead, "Auth HardDown → recoverable (long cooldown + probe), not permanent dead (B-303a)");
                 assert!(
                     snap.dead_reason.contains("auth"),
                     "dead reason should mention auth"

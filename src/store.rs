@@ -8,8 +8,11 @@ use tokio::sync::Semaphore;
 
 #[allow(dead_code)] // Used by record_transient and other methods
 const COOLDOWN_BASE_SECS: u64 = 15;
-const COOLDOWN_MAX_SECS: u64 = 120;
 const COOLDOWN_TRANSIENT_SECS: u64 = 10;
+// B-303a (A7 fix): hard-down (bad key / billing / hard quota) gets a long sticky cooldown
+// and recovers via the B-302 half-open probe — NOT a permanent `dead` kill. A human likely
+// has to fix the key, so fast re-probes are pointless; default 30 min.
+const HARD_DOWN_COOLDOWN_SECS: u64 = 1800;
 
 /// Get current time in seconds since epoch.
 pub(crate) fn now() -> u64 {
@@ -576,13 +579,20 @@ impl StateStore for InMemoryStore {
         #[cfg(not(test))]
         let now_time = now();
 
-        ls.dead.store(true, Ordering::Release);
+        // B-303a (A7): hard-down is RECOVERABLE — long sticky cooldown + Open state, so the
+        // B-302 half-open probe re-probes it once the cooldown expires. We do NOT set `dead`
+        // (that would permanently block recovery in usable()). Budget exhaustion is a SEPARATE
+        // permanent disable, handled in usable() via `budget <= 0` (it never sets `dead` and
+        // never probes), so hard-down and budget-kill stay distinct.
         *ls.dead_reason.lock().unwrap() = reason.to_string();
+        eprintln!(
+            "[{}] HARD-DOWN: {}; sticky cooldown {}s (recovers via probe)",
+            ls.model, reason, HARD_DOWN_COOLDOWN_SECS
+        );
 
-        // Open with max cooldown (B-303 will handle recovery)
-        let until = now_time + COOLDOWN_MAX_SECS;
+        let until = now_time + HARD_DOWN_COOLDOWN_SECS;
         ls.cooldown_until.store(until, Ordering::Release);
-        ls.breaker_state.store(1, Ordering::Release);
+        ls.breaker_state.store(1, Ordering::Release); // Open
     }
 
     fn try_acquire(&self, lane: usize) -> Option<Permit> {
@@ -757,6 +767,35 @@ mod tests {
     }
 
     #[test]
+    fn test_hard_down_long_cooldown_and_recovery() {
+        // B-303a (A7): hard-down → long sticky cooldown + Open, recoverable via the B-302
+        // probe, NOT a permanent `dead` kill.
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(1000);
+
+        store.record_hard_down(0, "billing / insufficient balance");
+
+        let ls = store.get_lane(0);
+        let until = ls.cooldown_until.load(Ordering::Relaxed);
+        // NOT permanently dead (that would block recovery) — the core A7 invariant.
+        assert!(
+            !ls.dead.load(Ordering::Relaxed),
+            "hard-down must NOT set dead — it is recoverable"
+        );
+        // Open state with a LONG sticky cooldown (record uses HARD_DOWN_COOLDOWN_SECS).
+        assert_eq!(ls.breaker_state.load(Ordering::Relaxed), 1, "hard-down → Open");
+        // (Test around the ACTUAL `until` — the #[cfg(test)] global clock races across
+        // parallel tests, so an absolute `now+1800` assert would be flaky; this is robust.)
+        assert!(until > COOLDOWN_TRANSIENT_SECS, "sticky cooldown, not a short transient");
+        // Down during the sticky cooldown; recovers via the half-open probe after it.
+        assert!(!store.usable(0, until - 1), "should be down during the sticky cooldown");
+        assert!(
+            store.usable(0, until + 1),
+            "hard-down lane must recover via the half-open probe once the long cooldown expires"
+        );
+    }
+
+    #[test]
     fn test_single_flight_probe() {
         let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
 
@@ -889,20 +928,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_dead_lane_never_usable() {
-        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
-
-        set_now_for_test(1000);
-
-        // Mark lane as dead
-        store.record_hard_down(0, "test reason");
-
-        assert!(!store.usable(0, 1000), "dead lane should never be usable");
-
-        let snap = store.snapshot(0, 1000);
-        assert!(snap.dead, "lane should be marked dead");
-    }
+    // (test_dead_lane_never_usable removed — B-303a: hard-down no longer sets `dead`/permanent
+    // kill; it is now a recoverable long-cooldown. Coverage is in
+    // test_hard_down_long_cooldown_and_recovery. `dead` is reserved for future budget-kill.)
 
     #[test]
     fn test_streak_reset_on_success() {
