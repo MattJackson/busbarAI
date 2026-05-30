@@ -12,6 +12,9 @@ use std::sync::Arc;
 pub(crate) use crate::breaker::CanonicalSignal;
 pub(crate) use crate::breaker::StatusClass;
 
+// Import types needed for response/stream IR (B-502b)
+use crate::ir::{IrBlockMeta, IrDelta, IrStreamEvent, IrUsage};
+
 /// IrError is an alias for CanonicalSignal (B-500 scaffolding).
 /// Per ADR-0007: keep it compatible with CanonicalSignal; B-502 may promote to a richer struct.
 #[allow(dead_code)] // Used by B-501/B-502 for IR bridge
@@ -30,6 +33,14 @@ pub(crate) trait ProtocolReader: Send + Sync {
     /// Read an IR request from wire JSON.
     #[allow(dead_code)] // Used by B-502a/B-503
     fn read_request(&self, body: &serde_json::Value) -> Result<crate::ir::IrRequest, IrError>;
+
+    /// Read a response/stream event from already-de-framed SSE data (B-502b).
+    #[allow(dead_code)] // Used by B-502b/B-503
+    fn read_response_event(
+        &self,
+        event_type: &str,
+        data: &serde_json::Value,
+    ) -> Option<IrStreamEvent>;
 }
 
 /// ProtocolWriter rewrites intents for the upstream wire format.
@@ -47,6 +58,10 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// Write an IR request to wire JSON.
     #[allow(dead_code)] // Used by B-502a/B-503
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value;
+
+    /// Write a response/stream event to wire (event_type, data) (B-502b).
+    #[allow(dead_code)] // Used by B-502b/B-503
+    fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)>;
 }
 
 /// Bundled Protocol with name + reader + writer.
@@ -294,6 +309,149 @@ impl ProtocolReader for AnthropicReader {
             stream,
             extra,
         })
+    }
+
+    #[allow(dead_code)] // Used by B-502b/B-503 tests
+    fn read_response_event(
+        &self,
+        event_type: &str,
+        data: &serde_json::Value,
+    ) -> Option<IrStreamEvent> {
+        match event_type {
+            "message_start" => {
+                let msg = data.get("message")?;
+                let role_str = msg.get("role").and_then(|r| r.as_str())?;
+                let role = match role_str {
+                    "user" => crate::ir::IrRole::User,
+                    "assistant" => crate::ir::IrRole::Assistant,
+                    _ => return None,
+                };
+                let usage = data
+                    .get("message")
+                    .and_then(|m| m.get("usage"))
+                    .map(|u| IrUsage {
+                        input_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        output_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        cache_creation_input_tokens: u
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64()),
+                        cache_read_input_tokens: u
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64()),
+                    });
+                Some(IrStreamEvent::MessageStart { role, usage })
+            }
+            "content_block_start" => {
+                let index = data
+                    .get("index")
+                    .and_then(|i| i.as_u64())
+                    .map(|v| v as usize)?;
+                let block = data.get("content_block")?;
+                let block_type = block.get("type").and_then(|t| t.as_str())?;
+                let meta = match block_type {
+                    "text" => IrBlockMeta::Text,
+                    "thinking" => IrBlockMeta::Thinking,
+                    "tool_use" => {
+                        let id = block.get("id").and_then(|i| i.as_str()).map(String::from)?;
+                        let name = block
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .map(String::from)?;
+                        IrBlockMeta::ToolUse { id, name }
+                    }
+                    "image" => IrBlockMeta::Image,
+                    _ => return None,
+                };
+                Some(IrStreamEvent::BlockStart { index, block: meta })
+            }
+            "content_block_delta" => {
+                let index = data
+                    .get("index")
+                    .and_then(|i| i.as_u64())
+                    .map(|v| v as usize)?;
+                let delta_val = data.get("delta")?;
+                let delta_type = delta_val.get("type").and_then(|t| t.as_str())?;
+                let delta = match delta_type {
+                    "text_delta" => {
+                        let text = delta_val
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(String::from)?;
+                        IrDelta::TextDelta(text)
+                    }
+                    "thinking_delta" => {
+                        let thinking = delta_val
+                            .get("thinking")
+                            .and_then(|t| t.as_str())
+                            .map(String::from)?;
+                        IrDelta::ThinkingDelta(thinking)
+                    }
+                    "input_json_delta" => {
+                        let json = delta_val
+                            .get("partial_json")
+                            .or_else(|| delta_val.get("input_json"))
+                            .and_then(|j| j.as_str())
+                            .map(String::from)?;
+                        IrDelta::InputJsonDelta(json)
+                    }
+                    "signature_delta" => {
+                        let signature = delta_val
+                            .get("signature")
+                            .and_then(|s| s.as_str())
+                            .map(String::from)?;
+                        IrDelta::SignatureDelta(signature)
+                    }
+                    _ => return None,
+                };
+                Some(IrStreamEvent::BlockDelta { index, delta })
+            }
+            "content_block_stop" => {
+                let index = data
+                    .get("index")
+                    .and_then(|i| i.as_u64())
+                    .map(|v| v as usize)?;
+                Some(IrStreamEvent::BlockStop { index })
+            }
+            "message_delta" => {
+                let delta = data.get("delta")?;
+                let stop_reason = delta
+                    .get("stop_reason")
+                    .and_then(|r| r.as_str())
+                    .map(String::from);
+                let usage_val = data.get("usage")?;
+                let usage = IrUsage {
+                    input_tokens: usage_val
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    output_tokens: usage_val
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    cache_creation_input_tokens: usage_val
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64()),
+                    cache_read_input_tokens: usage_val
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64()),
+                };
+                Some(IrStreamEvent::MessageDelta { stop_reason, usage })
+            }
+            "message_stop" => Some(IrStreamEvent::MessageStop),
+            "error" => {
+                let err_val = data.get("error")?;
+                let provider_signal = err_val
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .map(String::from);
+                Some(IrStreamEvent::Error(IrError {
+                    class: StatusClass::ClientError,
+                    provider_signal: Some(provider_signal.unwrap_or_default()),
+                    retry_after: None,
+                }))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -659,6 +817,153 @@ impl ProtocolWriter for AnthropicWriter {
         }
         serde_json::Value::Object(out)
     }
+
+    #[allow(dead_code)] // Used by B-502b/B-503 tests
+    fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
+        match ev {
+            IrStreamEvent::MessageStart { role, usage } => {
+                let role_str = match role {
+                    crate::ir::IrRole::User => "user",
+                    crate::ir::IrRole::Assistant => "assistant",
+                    _ => return None,
+                };
+                let mut msg_obj = serde_json::Map::new();
+                msg_obj.insert("role".to_string(), serde_json::json!(role_str));
+                if let Some(usage_val) = usage {
+                    let mut usage_map = serde_json::Map::new();
+                    usage_map.insert(
+                        "input_tokens".to_string(),
+                        serde_json::json!(usage_val.input_tokens),
+                    );
+                    usage_map.insert(
+                        "output_tokens".to_string(),
+                        serde_json::json!(usage_val.output_tokens),
+                    );
+                    if let Some(ccit) = usage_val.cache_creation_input_tokens {
+                        usage_map.insert(
+                            "cache_creation_input_tokens".to_string(),
+                            serde_json::json!(ccit),
+                        );
+                    }
+                    if let Some(crit) = usage_val.cache_read_input_tokens {
+                        usage_map.insert(
+                            "cache_read_input_tokens".to_string(),
+                            serde_json::json!(crit),
+                        );
+                    }
+                    msg_obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
+                }
+                let mut data_obj = serde_json::Map::new();
+                data_obj.insert("message".to_string(), serde_json::Value::Object(msg_obj));
+                Some((
+                    "message_start".to_string(),
+                    serde_json::Value::Object(data_obj),
+                ))
+            }
+            IrStreamEvent::BlockStart { index, block } => {
+                let content_block = match block {
+                    IrBlockMeta::Text => {
+                        serde_json::json!({ "type": "text" })
+                    }
+                    IrBlockMeta::Thinking => {
+                        serde_json::json!({ "type": "thinking" })
+                    }
+                    IrBlockMeta::ToolUse { id, name } => {
+                        serde_json::json!({ "type": "tool_use", "id": id, "name": name })
+                    }
+                    IrBlockMeta::Image => {
+                        serde_json::json!({ "type": "image" })
+                    }
+                };
+                let mut data_obj = serde_json::Map::new();
+                data_obj.insert("index".to_string(), serde_json::json!(index));
+                data_obj.insert("content_block".to_string(), content_block);
+                Some((
+                    "content_block_start".to_string(),
+                    serde_json::Value::Object(data_obj),
+                ))
+            }
+            IrStreamEvent::BlockDelta { index, delta } => {
+                let delta_val = match delta {
+                    IrDelta::TextDelta(text) => {
+                        serde_json::json!({ "type": "text_delta", "text": text })
+                    }
+                    IrDelta::ThinkingDelta(thinking) => {
+                        serde_json::json!({ "type": "thinking_delta", "thinking": thinking })
+                    }
+                    IrDelta::InputJsonDelta(json) => {
+                        serde_json::json!({ "type": "input_json_delta", "partial_json": json })
+                    }
+                    IrDelta::SignatureDelta(sig) => {
+                        serde_json::json!({ "type": "signature_delta", "signature": sig })
+                    }
+                };
+                let mut data_obj = serde_json::Map::new();
+                data_obj.insert("index".to_string(), serde_json::json!(index));
+                data_obj.insert("delta".to_string(), delta_val);
+                Some((
+                    "content_block_delta".to_string(),
+                    serde_json::Value::Object(data_obj),
+                ))
+            }
+            IrStreamEvent::BlockStop { index } => {
+                let mut data_obj = serde_json::Map::new();
+                data_obj.insert("index".to_string(), serde_json::json!(index));
+                Some((
+                    "content_block_stop".to_string(),
+                    serde_json::Value::Object(data_obj),
+                ))
+            }
+            IrStreamEvent::MessageDelta { stop_reason, usage } => {
+                let mut delta_obj = serde_json::Map::new();
+                if let Some(reason) = stop_reason {
+                    delta_obj.insert("stop_reason".to_string(), serde_json::json!(reason));
+                } else {
+                    delta_obj.insert("stop_reason".to_string(), serde_json::Value::Null);
+                }
+                let mut usage_map = serde_json::Map::new();
+                usage_map.insert(
+                    "input_tokens".to_string(),
+                    serde_json::json!(usage.input_tokens),
+                );
+                usage_map.insert(
+                    "output_tokens".to_string(),
+                    serde_json::json!(usage.output_tokens),
+                );
+                if let Some(ccit) = usage.cache_creation_input_tokens {
+                    usage_map.insert(
+                        "cache_creation_input_tokens".to_string(),
+                        serde_json::json!(ccit),
+                    );
+                }
+                if let Some(crit) = usage.cache_read_input_tokens {
+                    usage_map.insert(
+                        "cache_read_input_tokens".to_string(),
+                        serde_json::json!(crit),
+                    );
+                }
+                let mut data_obj = serde_json::Map::new();
+                data_obj.insert("delta".to_string(), serde_json::Value::Object(delta_obj));
+                data_obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
+                Some((
+                    "message_delta".to_string(),
+                    serde_json::Value::Object(data_obj),
+                ))
+            }
+            IrStreamEvent::MessageStop => Some(("message_stop".to_string(), serde_json::json!({}))),
+            IrStreamEvent::Error(err) => {
+                let mut error_obj = serde_json::Map::new();
+                if let Some(ref ps) = err.provider_signal {
+                    error_obj.insert("type".to_string(), serde_json::json!(ps));
+                } else {
+                    error_obj.insert("type".to_string(), serde_json::Value::Null);
+                }
+                let mut data_obj = serde_json::Map::new();
+                data_obj.insert("error".to_string(), serde_json::Value::Object(error_obj));
+                Some(("error".to_string(), serde_json::Value::Object(data_obj)))
+            }
+        }
+    }
 }
 
 /// String-keyed registry for protocol lookup (ADR-0008).
@@ -878,5 +1183,288 @@ mod tests {
         };
 
         assert_eq!(ir_error.class, StatusClass::Billing);
+    }
+
+    #[test]
+    fn test_stream_roundtrip_identity() {
+        let reader = AnthropicReader;
+        let writer = AnthropicWriter;
+
+        // message_start with usage
+        let data = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "cache_creation_input_tokens": 5,
+                    "cache_read_input_tokens": 15
+                }
+            }
+        });
+        let ev = reader.read_response_event("message_start", &data);
+        assert!(ev.is_some());
+        if let Some(e) = ev {
+            assert_eq!(
+                writer.write_response_event(&e),
+                Some(("message_start".to_string(), data))
+            );
+        }
+
+        // content_block_start for tool_use
+        let data = serde_json::json!({
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "tool_123",
+                "name": "get_weather"
+            }
+        });
+        let ev = reader.read_response_event("content_block_start", &data);
+        assert!(ev.is_some());
+        if let Some(e) = ev {
+            assert_eq!(
+                writer.write_response_event(&e),
+                Some(("content_block_start".to_string(), data))
+            );
+        }
+
+        // content_block_delta - text_delta
+        let data = serde_json::json!({
+            "index": 0,
+            "delta": {
+                "type": "text_delta",
+                "text": "hello"
+            }
+        });
+        let ev = reader.read_response_event("content_block_delta", &data);
+        assert!(ev.is_some());
+        if let Some(e) = ev {
+            assert_eq!(
+                writer.write_response_event(&e),
+                Some(("content_block_delta".to_string(), data))
+            );
+        }
+
+        // content_block_delta - thinking_delta
+        let data = serde_json::json!({
+            "index": 1,
+            "delta": {
+                "type": "thinking_delta",
+                "thinking": "I need to think"
+            }
+        });
+        let ev = reader.read_response_event("content_block_delta", &data);
+        assert!(ev.is_some());
+        if let Some(e) = ev {
+            assert_eq!(
+                writer.write_response_event(&e),
+                Some(("content_block_delta".to_string(), data))
+            );
+        }
+
+        // content_block_delta - input_json_delta
+        let data = serde_json::json!({
+            "index": 2,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": "{\"loc"
+            }
+        });
+        let ev = reader.read_response_event("content_block_delta", &data);
+        assert!(ev.is_some());
+        if let Some(e) = ev {
+            assert_eq!(
+                writer.write_response_event(&e),
+                Some(("content_block_delta".to_string(), data))
+            );
+        }
+
+        // content_block_delta - signature_delta
+        let data = serde_json::json!({
+            "index": 1,
+            "delta": {
+                "type": "signature_delta",
+                "signature": "sig_abc123xyz"
+            }
+        });
+        let ev = reader.read_response_event("content_block_delta", &data);
+        assert!(ev.is_some());
+        if let Some(e) = ev {
+            assert_eq!(
+                writer.write_response_event(&e),
+                Some(("content_block_delta".to_string(), data))
+            );
+        }
+
+        // content_block_stop
+        let data = serde_json::json!({ "index": 0 });
+        let ev = reader.read_response_event("content_block_stop", &data);
+        assert!(ev.is_some());
+        if let Some(e) = ev {
+            assert_eq!(
+                writer.write_response_event(&e),
+                Some(("content_block_stop".to_string(), data))
+            );
+        }
+
+        // message_delta with usage
+        let data = serde_json::json!({
+            "delta": { "stop_reason": "end_turn" },
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 5,
+                "cache_read_input_tokens": 15
+            }
+        });
+        let ev = reader.read_response_event("message_delta", &data);
+        assert!(ev.is_some());
+        if let Some(e) = ev {
+            assert_eq!(
+                writer.write_response_event(&e),
+                Some(("message_delta".to_string(), data))
+            );
+        }
+
+        // message_stop
+        let data = serde_json::json!({});
+        let ev = reader.read_response_event("message_stop", &data);
+        assert!(ev.is_some());
+        if let Some(e) = ev {
+            assert_eq!(
+                writer.write_response_event(&e),
+                Some(("message_stop".to_string(), data))
+            );
+        }
+    }
+
+    #[test]
+    fn test_split_usage_never_collapses() {
+        let reader = AnthropicReader;
+        let writer = AnthropicWriter;
+
+        // message_delta with all four usage fields distinct
+        let data = serde_json::json!({
+            "delta": { "stop_reason": "end_turn" },
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_creation_input_tokens": 30,
+                "cache_read_input_tokens": 200
+            }
+        });
+
+        let ev = reader
+            .read_response_event("message_delta", &data)
+            .expect("should parse");
+        if let crate::ir::IrStreamEvent::MessageDelta {
+            stop_reason: _,
+            usage,
+        } = ev
+        {
+            assert_eq!(usage.input_tokens, 100);
+            assert_eq!(usage.output_tokens, 50);
+            assert_eq!(usage.cache_creation_input_tokens, Some(30));
+            assert_eq!(usage.cache_read_input_tokens, Some(200));
+            // Verify they weren't collapsed: input_tokens != sum of cache tokens
+            assert_ne!(100, 30 + 200);
+        } else {
+            panic!("expected MessageDelta");
+        }
+
+        let roundtrip = writer.write_response_event(&crate::ir::IrStreamEvent::MessageDelta {
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_input_tokens: Some(30),
+                cache_read_input_tokens: Some(200),
+            },
+        });
+        assert!(roundtrip.is_some());
+        let (_, rt_data) = roundtrip.unwrap();
+        assert_eq!(
+            rt_data
+                .get("usage")
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|v| v.as_u64()),
+            Some(100)
+        );
+        assert_eq!(
+            rt_data
+                .get("usage")
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|v| v.as_u64()),
+            Some(50)
+        );
+        assert_eq!(
+            rt_data
+                .get("usage")
+                .and_then(|u| u.get("cache_creation_input_tokens"))
+                .and_then(|v| v.as_u64()),
+            Some(30)
+        );
+        assert_eq!(
+            rt_data
+                .get("usage")
+                .and_then(|u| u.get("cache_read_input_tokens"))
+                .and_then(|v| v.as_u64()),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn test_signature_delta_verbatim() {
+        let reader = AnthropicReader;
+        let writer = AnthropicWriter;
+
+        // Signature delta with byte-identical string
+        let sig = "sig_abc123xyz_signature_for_thinking";
+        let data = serde_json::json!({
+            "index": 0,
+            "delta": {
+                "type": "signature_delta",
+                "signature": sig
+            }
+        });
+
+        let ev = reader
+            .read_response_event("content_block_delta", &data)
+            .expect("should parse");
+        if let crate::ir::IrStreamEvent::BlockDelta { index: _, delta } = ev {
+            if let crate::ir::IrDelta::SignatureDelta(s) = delta {
+                assert_eq!(s, sig);
+            } else {
+                panic!("expected SignatureDelta");
+            }
+        } else {
+            panic!("expected BlockDelta");
+        }
+
+        let roundtrip = writer.write_response_event(&crate::ir::IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::SignatureDelta(sig.to_string()),
+        });
+        assert!(roundtrip.is_some());
+        let (_, rt_data) = roundtrip.unwrap();
+        let rt_sig = rt_data
+            .get("delta")
+            .and_then(|d| d.get("signature"))
+            .and_then(|s| s.as_str())
+            .unwrap();
+        assert_eq!(rt_sig, sig);
+    }
+
+    #[test]
+    fn test_ping_returns_none() {
+        let reader = AnthropicReader;
+        let data = serde_json::json!({});
+        let result = reader.read_response_event("ping", &data);
+        assert!(result.is_none());
+
+        // Unknown event type also returns None
+        let result = reader.read_response_event("unknown_event_type", &data);
+        assert!(result.is_none());
     }
 }

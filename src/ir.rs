@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! ADR-0005 superset IR — request side only (B-502a). Response/stream IR is B-502b.
+//! ADR-0005 superset IR — request + response/stream sides (B-502a/B-502b).
 
 use serde_json::Value;
 
@@ -81,4 +81,57 @@ pub(crate) struct IrTool {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // B-502b: response/stream IR types (used by tests in proto.rs)
+pub(crate) enum IrStreamEvent {
+    MessageStart {
+        role: IrRole,
+        usage: Option<IrUsage>,
+    },
+    BlockStart {
+        index: usize,
+        block: IrBlockMeta,
+    },
+    BlockDelta {
+        index: usize,
+        delta: IrDelta,
+    },
+    BlockStop {
+        index: usize,
+    },
+    MessageDelta {
+        stop_reason: Option<String>,
+        usage: IrUsage,
+    },
+    MessageStop,
+    Error(crate::proto::IrError),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // B-502b: response/stream IR types (used by tests in proto.rs)
+pub(crate) struct IrUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // B-502b: response/stream IR types (used by tests in proto.rs)
+pub(crate) enum IrBlockMeta {
+    Text,
+    Thinking,
+    ToolUse { id: String, name: String },
+    Image,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code, clippy::enum_variant_names)] // B-502b: response/stream IR types (used by tests in proto.rs)
+pub(crate) enum IrDelta {
+    TextDelta(String),
+    ThinkingDelta(String),
+    InputJsonDelta(String),
+    SignatureDelta(String),
 }

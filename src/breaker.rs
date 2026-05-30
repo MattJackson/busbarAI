@@ -142,7 +142,7 @@ pub(crate) fn normalize_raw_error(
 
 /// Canonical signal emitted by protocol normalizers.
 /// Stage 1 output → Stage 2 input.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CanonicalSignal {
     pub(crate) class: StatusClass,
     #[allow(dead_code)] // provider_signal retained for future extensibility (B-301, ADR-0005)
