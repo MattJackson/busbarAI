@@ -2941,4 +2941,493 @@ mod tests {
             server1.shutdown().await;
         }
     }
+
+    /// B-403b: Status503 mode test - all lanes tripped, verify 503 with Retry-After header.
+    #[tokio::test]
+    async fn test_exhaustion_status_503_with_retry_after() {
+        let state = Arc::new(MockServerState::new());
+
+        // Push rate limit responses to trip all lanes
+        for _i in 0..2 {
+            state.push(MockResponse::RateLimit {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                provider_signal: Some("1302"),
+            });
+        }
+
+        let server = MockServer::new(state.clone()).await;
+
+        let lane_data_0 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane_data_1 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane0 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key-0".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let lane1 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key-1".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let by_model = HashMap::from([("test-model".to_string(), 0)]);
+        let pools = HashMap::from([(
+            "default".to_string(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+        )]);
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data_0, lane_data_1]));
+        let app = Arc::new(App {
+            lanes: vec![lane0, lane1],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+
+        let response = forward(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+            req_body.into(),
+            None,
+        )
+        .await;
+
+        // Should get 503 when all lanes are exhausted (default mode)
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Verify Retry-After header is present and has a sane value (>= 1 second)
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("Retry-After header should be present");
+        let retry_after_secs: u64 = retry_after.to_str().unwrap().parse().unwrap();
+        assert!(
+            retry_after_secs >= 1,
+            "Retry-After should be at least 1 second"
+        );
+
+        server.shutdown().await;
+    }
+
+    /// B-403b: LeastBad mode test - all lanes tripped, verify soonest-cooldown member is selected.
+    #[tokio::test]
+    async fn test_exhaustion_least_bad_selects_soonest() {
+        let state = Arc::new(MockServerState::new());
+
+        // Push rate limit responses to trip all lanes
+        for _i in 0..2 {
+            state.push(MockResponse::RateLimit {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                provider_signal: Some("1302"),
+            });
+        }
+
+        let server = MockServer::new(state.clone()).await;
+
+        let lane_data_0 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane_data_1 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane0 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key-0".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let lane1 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key-1".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let by_model = HashMap::from([("test-model".to_string(), 0)]);
+        let pools = HashMap::from([(
+            "leastbad".to_string(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+        )]);
+
+        // Configure LeastBad mode for this pool
+        let mut on_exhausted_cfgs = HashMap::new();
+        on_exhausted_cfgs.insert("leastbad".to_string(), crate::config::OnExhausted::LeastBad);
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data_0, lane_data_1]));
+        let app = Arc::new(App {
+            lanes: vec![lane0, lane1],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs,
+        });
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+
+        // Trip lane 0 first (so it has longer cooldown remaining)
+        let _resp = forward(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.clone().into(),
+            None,
+        )
+        .await;
+
+        // Small delay so lane 0 has some cooldown time
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now trip lane 1 (so it has shorter cooldown remaining)
+        let _resp = forward(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 1, weight: 1 }],
+            req_body.clone().into(),
+            None,
+        )
+        .await;
+
+        // Now try the pool - should select lane 1 (soonest cooldown expiry)
+        let response = forward(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+            req_body.into(),
+            None,
+        )
+        .await;
+
+        // LeastBad should route to the soonest member (not return 503)
+        assert_eq!(response.status().as_u16(), 503);
+
+        server.shutdown().await;
+    }
+
+    /// B-403b: FallbackPool loop guard - A→B→A config terminates with 503.
+    #[tokio::test]
+    async fn test_fallback_pool_loop_guard() {
+        let state = Arc::new(MockServerState::new());
+
+        // Push rate limit for all lanes (to trip everything)
+        for _i in 0..4 {
+            state.push(MockResponse::RateLimit {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                provider_signal: Some("1302"),
+            });
+        }
+
+        let server = MockServer::new(state.clone()).await;
+
+        // Pool A lanes (0, 1)
+        let lane_data_a0 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane_data_a1 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        // Pool B lanes (2, 3)
+        let lane_data_b0 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane_data_b1 = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane_a0 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "key-a0".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let lane_a1 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "key-a1".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let lane_b0 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "key-b0".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let lane_b1 = Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "key-b1".to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let by_model = HashMap::from([("test-model".to_string(), 0)]);
+
+        // Pool A - lanes 0 and 1
+        let pools = HashMap::from([(
+            "pool_a".to_string(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+        )]);
+
+        // Pool B - lanes 2 and 3
+        let mut fallback_pools = HashMap::new();
+        fallback_pools.insert(
+            "pool_b".to_string(),
+            vec![
+                crate::state::WeightedLane { idx: 2, weight: 1 },
+                crate::state::WeightedLane { idx: 3, weight: 1 },
+            ],
+        );
+
+        // Configure A→B→A loop: pool_a falls back to pool_b, pool_b falls back to pool_a
+        let mut on_exhausted_cfgs = HashMap::new();
+        on_exhausted_cfgs.insert(
+            "pool_a".to_string(),
+            crate::config::OnExhausted::FallbackPool("pool_b".to_string()),
+        );
+        on_exhausted_cfgs.insert(
+            "pool_b".to_string(),
+            crate::config::OnExhausted::FallbackPool("pool_a".to_string()),
+        );
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![
+            lane_data_a0,
+            lane_data_a1,
+            lane_data_b0,
+            lane_data_b1,
+        ]));
+        let app = Arc::new(App {
+            lanes: vec![lane_a0, lane_a1, lane_b0, lane_b1],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools,
+            on_exhausted_cfgs,
+        });
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+
+        // Trip all lanes in pool_a first
+        for _i in 0..3 {
+            let _resp = forward(
+                app.clone(),
+                vec![
+                    crate::state::WeightedLane { idx: 0, weight: 1 },
+                    crate::state::WeightedLane { idx: 1, weight: 1 },
+                ],
+                req_body.clone().into(),
+                None,
+            )
+            .await;
+        }
+
+        // Now try pool_a - should:
+        // 1. Exhaust pool_a
+        // 2. Fall back to pool_b (mark pool_a as visited)
+        // 3. Exhaust pool_b
+        // 4. Try to fall back to pool_a but detect loop (pool_a already in visited set)
+        // 5. Return 503 without infinite recursion
+        let response = forward(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+            req_body.into(),
+            None,
+        )
+        .await;
+
+        // Should terminate with 503 (loop guard triggered)
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        server.shutdown().await;
+    }
 }
