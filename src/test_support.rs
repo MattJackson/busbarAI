@@ -3994,4 +3994,210 @@ mod tests {
         server0.shutdown().await;
         server1.shutdown().await;
     }
+
+    async fn openai_mock_handler(
+        State(state): State<std::sync::Arc<MockServerState>>,
+        _request: Request<Body>,
+    ) -> Response<Body> {
+        let response = state.next_response().unwrap_or(MockResponse::default());
+        match response {
+            MockResponse::Ok { status, body } => Response::builder()
+                .status(status)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            _ => Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("unexpected response type"))
+                .unwrap(),
+        }
+    }
+
+    /// B-501b: OpenAI ingress same-protocol passthrough test.
+    #[tokio::test]
+    async fn test_openai_ingress_same_protocol_passthrough() {
+        use crate::route;
+        use axum::http::HeaderMap;
+
+        // Create a custom mock server that listens at /v1/chat/completions (OpenAI endpoint)
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: serde_json::json!({
+                "choices": [{"message": {"content": "hello", "role": "assistant"}, "finish_reason": "stop"}],
+                "model": "gpt-4"
+            }),
+        });
+
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", any(openai_mock_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        struct OpenAiMockServer {
+            addr: std::net::SocketAddr,
+            handle: tokio::task::JoinHandle<()>,
+        }
+        impl OpenAiMockServer {
+            fn base_url(&self) -> String {
+                format!("http://{}", self.addr)
+            }
+            async fn shutdown(self) {
+                self.handle.abort();
+            }
+        }
+        let server = OpenAiMockServer { addr, handle };
+
+        // Build a lane with OpenAI protocol (upstream_path = /v1/chat/completions)
+        let lane_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "openai-mock".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane = Lane {
+            model: "test-model".to_string(),
+            provider: "openai-mock".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::openai()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let by_model = HashMap::from([("test-model".to_string(), 0)]);
+        let pools = HashMap::new();
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+        let app = Arc::new(App {
+            lanes: vec![lane],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        // Build an OpenAI-format request body with model in the BODY (must match by_model key)
+        let req_body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let body_bytes = Bytes::from(serde_json::to_vec(&req_body).unwrap());
+
+        // Call openai_ingress handler directly
+        let response = route::openai_ingress(State(app), HeaderMap::new(), body_bytes).await;
+
+        // Assert 200 OK and the mock server received the request at /v1/chat/completions
+        assert_eq!(response.status().as_u16(), 200);
+
+        use http_body_util::BodyExt as _;
+        let collected = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&collected);
+        assert!(text.contains("hello"), "Response should contain mock body");
+
+        server.shutdown().await;
+    }
+
+    /// B-501b: OpenAI ingress missing model → 400.
+    #[tokio::test]
+    async fn test_openai_ingress_missing_model() {
+        use crate::route;
+        use axum::http::HeaderMap;
+
+        // Build a minimal App (no lanes needed for this test)
+        let by_model = HashMap::new();
+        let pools = HashMap::new();
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![]));
+        let app = Arc::new(App {
+            lanes: vec![],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        // Missing "model" field in body
+        let req_body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let body_bytes = Bytes::from(serde_json::to_vec(&req_body).unwrap());
+
+        let response = route::openai_ingress(State(app), HeaderMap::new(), body_bytes).await;
+
+        assert_eq!(response.status().as_u16(), 400);
+    }
+
+    /// B-501b: OpenAI ingress unknown model → 404.
+    #[tokio::test]
+    async fn test_openai_ingress_unknown_model() {
+        use crate::route;
+        use axum::http::HeaderMap;
+
+        // Build a minimal App with no "nope" model
+        let by_model = HashMap::new();
+        let pools = HashMap::new();
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![]));
+        let app = Arc::new(App {
+            lanes: vec![],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        // Unknown model in body
+        let req_body = serde_json::json!({
+            "model": "nope",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let body_bytes = Bytes::from(serde_json::to_vec(&req_body).unwrap());
+
+        let response = route::openai_ingress(State(app), HeaderMap::new(), body_bytes).await;
+
+        assert_eq!(response.status().as_u16(), 404);
+    }
 }

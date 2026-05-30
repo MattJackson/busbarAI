@@ -260,6 +260,7 @@ async fn main() {
     let router = Router::new()
         .route("/stats", get(handlers::stats))
         .route("/healthz", get(handlers::healthz))
+        .route("/v1/chat/completions", post(route::openai_ingress))
         .route("/:name/v1/messages", post(route::named))
         .route("/:provider/:model/v1/messages", post(route::adhoc))
         .layer(axum::middleware::from_fn_with_state(

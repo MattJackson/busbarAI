@@ -9,9 +9,67 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use serde_json::Value;
 
 use crate::forward::forward_with_pool;
 use crate::state::{App, WeightedLane};
+
+// POST /v1/chat/completions — OpenAI-style ingress: model from body, same-protocol passthrough.
+// Cross-protocol translation (openai ingress → non-openai lane) is B-503 and NOT implemented here;
+// if the body's model resolves to a non-openai lane, this would send an OpenAI body upstream (wrong).
+pub(crate) async fn openai_ingress(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let v: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("router: bad json: {e}")).into_response()
+        }
+    };
+
+    let model = match v.get("model").and_then(|m| m.as_str()) {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "router: missing 'model' in request body".to_string(),
+            )
+                .into_response()
+        }
+    };
+
+    let _affinity_key: Option<&str> = headers.get("x-session-id").and_then(|v| v.to_str().ok());
+
+    if let Some(cands) = app.pools.get(&model) {
+        return forward_with_pool(
+            app.clone(),
+            cands.clone(),
+            body,
+            None,
+            &model,
+            _affinity_key,
+        )
+        .await;
+    }
+
+    if let Some(&i) = app.by_model.get(&model) {
+        return crate::forward::forward(
+            app.clone(),
+            vec![WeightedLane { idx: i, weight: 1 }],
+            body,
+            None,
+        )
+        .await;
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        format!("router: unknown model '{model}'"),
+    )
+        .into_response()
+}
 
 // POST /<name>/v1/messages   — name resolves to a pool (round-robin) or a single model
 pub(crate) async fn named(
