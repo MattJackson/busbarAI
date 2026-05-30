@@ -3194,6 +3194,7 @@ mod tests {
             None,
             "leastbad",
             None,
+            "anthropic",
         )
         .await;
 
@@ -3331,6 +3332,7 @@ mod tests {
             None,
             "pool_a",
             None,
+            "anthropic",
         )
         .await;
 
@@ -3453,6 +3455,7 @@ mod tests {
             None,
             "primary",
             None,
+            "anthropic",
         )
         .await;
 
@@ -3632,6 +3635,7 @@ mod tests {
             None,
             "sticky-test",
             Some("session-abc"),
+            "anthropic",
         )
         .await;
 
@@ -3652,6 +3656,7 @@ mod tests {
             None,
             "sticky-test",
             Some("session-abc"),
+            "anthropic",
         )
         .await;
 
@@ -3678,6 +3683,7 @@ mod tests {
             None,
             "sticky-test",
             Some("session-xyz"),
+            "anthropic",
         )
         .await;
 
@@ -3811,6 +3817,7 @@ mod tests {
             None,
             "failover-test",
             Some("session-to-lane-0"),
+            "anthropic",
         )
         .await;
 
@@ -3958,6 +3965,7 @@ mod tests {
             None,
             "system-test",
             None, // No header - should derive from system block
+            "anthropic",
         )
         .await;
 
@@ -3977,6 +3985,7 @@ mod tests {
             None,
             "system-test",
             None, // No header - should derive from system block
+            "anthropic",
         )
         .await;
 
@@ -4199,5 +4208,185 @@ mod tests {
         let response = route::openai_ingress(State(app), HeaderMap::new(), body_bytes).await;
 
         assert_eq!(response.status().as_u16(), 404);
+    }
+
+    /// B-503a: Cross-protocol request translation test.
+    /// Build App with ONE anthropic lane, call forward_with_pool with OpenAI-format body and ingress_protocol="openai".
+    /// Assert the MOCK UPSTREAM RECEIVED an Anthropic-shaped body (top-level "system" field, messages without system entry).
+    #[tokio::test]
+    async fn test_b503a_cross_protocol_openai_to_anthropic() {
+        use std::collections::HashMap;
+
+        let state = Arc::new(MockServerState::new());
+
+        // Mock will receive translated Anthropic-shaped body and return 200
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({ "content": ["translated"], "model": "m", "stop": [] }),
+        });
+
+        let server = MockServer::new(state.clone()).await;
+
+        let lane_data = LaneData {
+            model: "m".to_string(),
+            provider: "anthropic".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane = Lane {
+            model: "m".to_string(),
+            provider: "anthropic".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let by_model = HashMap::from([("m".to_string(), 0)]);
+        let pools = HashMap::new();
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+        let app = Arc::new(App {
+            lanes: vec![lane],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        // OpenAI-format body (system inside first message)
+        let openai_body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+
+        // Forward with ingress_protocol="openai" to trigger translation into anthropic lane
+        let response = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            openai_body.to_string().into(),
+            None,
+            "m",
+            None,
+            "openai",
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 200);
+
+        server.shutdown().await;
+    }
+
+    /// B-503a: Same-protocol request passthrough test.
+    /// anthropic ingress → anthropic lane (ingress_protocol="anthropic") → mock receives body with model rewritten, NO translation applied.
+    #[tokio::test]
+    async fn test_b503a_same_protocol_anthropic_passthrough() {
+        use std::collections::HashMap;
+
+        let state = Arc::new(MockServerState::new());
+
+        // Mock will receive the anthropic body as-is (with model rewritten) and return 200
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({ "content": ["ok"], "model": "m", "stop": [] }),
+        });
+
+        let server = MockServer::new(state.clone()).await;
+
+        let lane_data = LaneData {
+            model: "m".to_string(),
+            provider: "anthropic".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane = Lane {
+            model: "m".to_string(),
+            provider: "anthropic".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let by_model = HashMap::from([("m".to_string(), 0)]);
+        let pools = HashMap::new();
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+        let app = Arc::new(App {
+            lanes: vec![lane],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        // Anthropic-format body (system at top level)
+        let anthropic_body = json!({
+            "model": "original-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "system": "sys"
+        });
+
+        // Forward with ingress_protocol="anthropic" - same protocol, no translation should occur
+        let response = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            anthropic_body.to_string().into(),
+            None,
+            "m",
+            None,
+            "anthropic",
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 200);
+
+        server.shutdown().await;
     }
 }

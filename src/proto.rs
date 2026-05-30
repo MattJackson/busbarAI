@@ -153,6 +153,16 @@ impl Protocol {
     }
 }
 
+/// Resolve a built-in Protocol by name (for ingress translation). Cheap (unit structs).
+#[allow(dead_code)] // used by forward (B-503a)
+pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
+    match name {
+        "anthropic" => Some(Protocol::anthropic()),
+        "openai" => Some(Protocol::openai()),
+        _ => None,
+    }
+}
+
 /// Anthropic reader implementation (migrated from `Protocol::extract_error` and `classify`).
 #[derive(Clone)]
 pub(crate) struct AnthropicReader;

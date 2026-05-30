@@ -50,6 +50,7 @@ pub(crate) async fn openai_ingress(
             None,
             &model,
             _affinity_key,
+            "openai",
         )
         .await;
     }
@@ -93,6 +94,7 @@ pub(crate) async fn named(
             _caller_token,
             &name,
             affinity_key,
+            "anthropic",
         )
         .await;
     }

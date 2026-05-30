@@ -450,7 +450,16 @@ pub(crate) async fn forward(
     body: Bytes,
     caller_token: Option<&str>,
 ) -> Response {
-    forward_with_pool(app, cands, body, caller_token, "__default__", None).await
+    forward_with_pool(
+        app,
+        cands,
+        body,
+        caller_token,
+        "__default__",
+        None,
+        "anthropic",
+    )
+    .await
 }
 
 /// Forward with pool name context for on_exhausted config lookup.
@@ -461,6 +470,7 @@ pub(crate) async fn forward_with_pool(
     caller_token: Option<&str>,
     pool_name: &str,
     affinity_key: Option<&str>,
+    ingress_protocol: &str,
 ) -> Response {
     let mut v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -530,6 +540,30 @@ pub(crate) async fn forward_with_pool(
         // Mark this lane as excluded for future attempts in this request
         request_ctx.exclude(i);
 
+        let egress_name = app.lanes[i].protocol.name();
+        if ingress_protocol != egress_name {
+            // Cross-protocol: translate the request body through the superset IR.
+            let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("router: unknown ingress protocol '{ingress_protocol}'"),
+                )
+                    .into_response();
+            };
+            match ingress_proto.reader().read_request(&v) {
+                Ok(ir) => {
+                    v = app.lanes[i].protocol.writer().write_request(&ir);
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "router: request translation failed",
+                    )
+                        .into_response();
+                }
+            }
+        }
+        // existing rewrite_model sets the lane's model on the (possibly translated) body:
         app.lanes[i]
             .protocol
             .writer()
@@ -783,6 +817,7 @@ fn handle_status_503(app: &Arc<App>, cands: &[WeightedLane], now: u64) -> Respon
 /// transient counter is recorded and `Err(())` is returned so the caller can try another
 /// candidate (or give up). The concurrency `permit` is held for the lifetime of a streamed
 /// success body (B-201 invariant) and dropped on error.
+/// NOTE: Cross-protocol request translation on this degraded path is deferred to B-503b.
 async fn forward_once(
     app: &Arc<App>,
     i: usize,
