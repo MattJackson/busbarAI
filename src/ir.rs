@@ -135,3 +135,15 @@ pub(crate) enum IrDelta {
     InputJsonDelta(String),
     SignatureDelta(String),
 }
+
+/// Per-request decode state for stateful stream fan-out (B-502c-2b).
+/// Anthropic events are 1:1 and ignore this; OpenAI's flat stream uses it to synthesize the
+/// IR's block boundaries (one chunk → 0..n events): whether MessageStart was emitted, whether
+/// the text block (index 0) is open, and which OpenAI tool_call indices have been opened.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // consumed by ProtocolReader::read_response_events (B-502c-2b / B-503)
+pub(crate) struct StreamDecodeState {
+    pub started: bool,
+    pub text_block_open: bool,
+    pub open_tools: std::collections::BTreeSet<usize>,
+}

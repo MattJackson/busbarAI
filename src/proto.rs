@@ -42,6 +42,18 @@ pub(crate) trait ProtocolReader: Send + Sync {
         data: &serde_json::Value,
     ) -> Option<IrStreamEvent>;
 
+    /// Fan-out variant (B-502c-2b): one wire event/chunk → 0..n IR stream events, threading
+    /// per-request decode state. Anthropic is 1:1 (wraps the singular, ignores state); OpenAI's
+    /// flat stream synthesizes block boundaries via the state. This is the general translation
+    /// API the live response-translation path (B-503) calls.
+    #[allow(dead_code)] // Used by B-503
+    fn read_response_events(
+        &self,
+        event_type: &str,
+        data: &serde_json::Value,
+        state: &mut crate::ir::StreamDecodeState,
+    ) -> Vec<IrStreamEvent>;
+
     /// Clone this reader as a trait object.
     #[allow(dead_code)] // Used by B-502a for Protocol cloning
     fn clone_box(&self) -> Box<dyn ProtocolReader>;
@@ -479,6 +491,19 @@ impl ProtocolReader for AnthropicReader {
                 }))
             }
             _ => None,
+        }
+    }
+
+    fn read_response_events(
+        &self,
+        event_type: &str,
+        data: &serde_json::Value,
+        _state: &mut crate::ir::StreamDecodeState,
+    ) -> Vec<IrStreamEvent> {
+        // Anthropic events are already block-structured (1:1): wrap the singular, ignore state.
+        match self.read_response_event(event_type, data) {
+            Some(ev) => vec![ev],
+            None => vec![],
         }
     }
 }
@@ -1274,7 +1299,7 @@ impl ProtocolReader for OpenAiReader {
         })
     }
 
-    #[allow(dead_code)] // Used by B-502b/B-503 tests
+    #[allow(dead_code)] // Singular 1:1 form is unused for OpenAI (flat stream needs fan-out); see read_response_events
     fn read_response_event(
         &self,
         event_type: &str,
@@ -1282,6 +1307,139 @@ impl ProtocolReader for OpenAiReader {
     ) -> Option<IrStreamEvent> {
         let _ = (event_type, data);
         None
+    }
+
+    /// OpenAI's flat stream → IR block-structured events (B-502c-2b). One chat.completion.chunk
+    /// may carry role + content + finish at once → up to several IR events. State synthesizes the
+    /// block boundaries OpenAI doesn't have.
+    fn read_response_events(
+        &self,
+        _event_type: &str,
+        data: &serde_json::Value,
+        state: &mut crate::ir::StreamDecodeState,
+    ) -> Vec<IrStreamEvent> {
+        let mut out: Vec<IrStreamEvent> = Vec::new();
+
+        // [DONE] sentinel (or any non-object) carries no IR events.
+        if data.as_str() == Some("[DONE]") {
+            return out;
+        }
+
+        // 1. MessageStart exactly once (on the first chunk, regardless of delta.role).
+        if !state.started {
+            state.started = true;
+            out.push(IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+            });
+        }
+
+        let choice0 = data
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first());
+        let delta = choice0.and_then(|c| c.get("delta"));
+
+        // 3. Text content → open text block (index 0) on first content, then a TextDelta.
+        if let Some(content) = delta
+            .and_then(|d| d.get("content"))
+            .and_then(|c| c.as_str())
+        {
+            if !state.text_block_open {
+                state.text_block_open = true;
+                out.push(IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: crate::ir::IrBlockMeta::Text,
+                });
+            }
+            out.push(IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::TextDelta(content.to_string()),
+            });
+        }
+
+        // 4. Tool calls → IR block index = oai_idx + 1 (text owns 0). BlockStart on first sight
+        //    (id+name present), InputJsonDelta for streamed arguments.
+        if let Some(tcs) = delta
+            .and_then(|d| d.get("tool_calls"))
+            .and_then(|t| t.as_array())
+        {
+            for tc in tcs {
+                let oai_idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let ir_idx = oai_idx + 1;
+                let func = tc.get("function");
+                if let Some(name) = func.and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
+                    if !state.open_tools.contains(&oai_idx) {
+                        let id = tc
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        state.open_tools.insert(oai_idx);
+                        out.push(IrStreamEvent::BlockStart {
+                            index: ir_idx,
+                            block: crate::ir::IrBlockMeta::ToolUse {
+                                id,
+                                name: name.to_string(),
+                            },
+                        });
+                    }
+                }
+                if let Some(args) = func
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|a| a.as_str())
+                {
+                    out.push(IrStreamEvent::BlockDelta {
+                        index: ir_idx,
+                        delta: crate::ir::IrDelta::InputJsonDelta(args.to_string()),
+                    });
+                }
+            }
+        }
+
+        // 5. finish_reason → close open blocks (text first, then tools ascending), MessageDelta, MessageStop.
+        if let Some(fr) = choice0
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|r| r.as_str())
+        {
+            if state.text_block_open {
+                state.text_block_open = false;
+                out.push(IrStreamEvent::BlockStop { index: 0 });
+            }
+            for oai_idx in std::mem::take(&mut state.open_tools) {
+                out.push(IrStreamEvent::BlockStop { index: oai_idx + 1 });
+            }
+            let stop_reason = Some(match fr {
+                "stop" => "end_turn".to_string(),
+                "length" => "max_tokens".to_string(),
+                "tool_calls" => "tool_use".to_string(),
+                other => other.to_string(),
+            });
+            let usage = data
+                .get("usage")
+                .map(|u| IrUsage {
+                    input_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                    output_tokens: u
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: u
+                        .get("prompt_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|v| v.as_u64()),
+                })
+                .unwrap_or(IrUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                });
+            out.push(IrStreamEvent::MessageDelta { stop_reason, usage });
+            out.push(IrStreamEvent::MessageStop);
+        }
+
+        out
     }
 
     fn clone_box(&self) -> Box<dyn ProtocolReader> {
@@ -3383,5 +3541,165 @@ mod tests {
                 Some("boom")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_fanout_tests {
+    use super::*;
+    use crate::ir::{IrBlockMeta, IrDelta, IrRole, IrStreamEvent, IrUsage, StreamDecodeState};
+    use serde_json::json;
+
+    // B-502c-2b: OpenAI flat stream → Anthropic-shaped IR events. Exact-sequence decode asserts
+    // (ungameable: the expected Vec is derived from the state-machine spec, not from output).
+    #[test]
+    fn test_openai_read_fanout_text() {
+        let reader = OpenAiReader;
+        let mut st = StreamDecodeState::default();
+        let mut events: Vec<IrStreamEvent> = Vec::new();
+        for chunk in [
+            json!({"choices":[{"delta":{"role":"assistant"}}]}),
+            json!({"choices":[{"delta":{"content":"Hel"}}]}),
+            json!({"choices":[{"delta":{"content":"lo"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}),
+        ] {
+            events.extend(reader.read_response_events("", &chunk, &mut st));
+        }
+        assert_eq!(
+            events,
+            vec![
+                IrStreamEvent::MessageStart {
+                    role: IrRole::Assistant,
+                    usage: None
+                },
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::Text
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::TextDelta("Hel".to_string())
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::TextDelta("lo".to_string())
+                },
+                IrStreamEvent::BlockStop { index: 0 },
+                IrStreamEvent::MessageDelta {
+                    stop_reason: Some("end_turn".to_string()),
+                    usage: IrUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None
+                    },
+                },
+                IrStreamEvent::MessageStop,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_openai_read_fanout_tool_call() {
+        let reader = OpenAiReader;
+        let mut st = StreamDecodeState::default();
+        let mut events: Vec<IrStreamEvent> = Vec::new();
+        for chunk in [
+            json!({"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"loc\":\"SF\"}"}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ] {
+            events.extend(reader.read_response_events("", &chunk, &mut st));
+        }
+        assert_eq!(
+            events,
+            vec![
+                IrStreamEvent::MessageStart {
+                    role: IrRole::Assistant,
+                    usage: None
+                },
+                IrStreamEvent::BlockStart {
+                    index: 1,
+                    block: IrBlockMeta::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "get_weather".to_string()
+                    }
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 1,
+                    delta: IrDelta::InputJsonDelta(String::new())
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 1,
+                    delta: IrDelta::InputJsonDelta("{\"loc\":\"SF\"}".to_string())
+                },
+                IrStreamEvent::BlockStop { index: 1 },
+                IrStreamEvent::MessageDelta {
+                    stop_reason: Some("tool_use".to_string()),
+                    usage: IrUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None
+                    },
+                },
+                IrStreamEvent::MessageStop,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_openai_read_fanout_cached_tokens() {
+        let reader = OpenAiReader;
+        let mut st = StreamDecodeState::default();
+        let mut events: Vec<IrStreamEvent> = Vec::new();
+        events.extend(reader.read_response_events(
+            "",
+            &json!({"choices":[{"delta":{"content":"hi"}}]}),
+            &mut st,
+        ));
+        events.extend(reader.read_response_events(
+            "",
+            &json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":7}}}),
+            &mut st,
+        ));
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::MessageDelta { usage, .. } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("MessageDelta present");
+        assert_eq!(
+            usage.cache_read_input_tokens,
+            Some(7),
+            "cached_tokens → cache_read"
+        );
+        assert_eq!(
+            usage.cache_creation_input_tokens, None,
+            "OpenAI has no cache-creation split"
+        );
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+    }
+
+    #[test]
+    fn test_anthropic_read_events_wraps_singular() {
+        let reader = AnthropicReader;
+        let mut st = StreamDecodeState::default();
+        let data = json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}});
+        let single = reader.read_response_event("content_block_delta", &data);
+        let plural = reader.read_response_events("content_block_delta", &data, &mut st);
+        assert_eq!(
+            plural,
+            single.into_iter().collect::<Vec<_>>(),
+            "Anthropic plural wraps singular 1:1"
+        );
+        assert_eq!(plural.len(), 1);
+        // ping → empty
+        assert_eq!(
+            reader.read_response_events("ping", &json!({}), &mut st),
+            Vec::<IrStreamEvent>::new()
+        );
     }
 }
