@@ -2685,26 +2685,269 @@ impl ProtocolReader for GeminiReader {
         _event_type: &str,
         _data: &serde_json::Value,
     ) -> Option<IrStreamEvent> {
-        // STUB: Gemini streaming not implemented this cycle
+        // Gemini streaming uses read_response_events (fan-out); this singular form is unused.
         None
     }
 
     fn read_response_events(
         &self,
         _event_type: &str,
-        _data: &serde_json::Value,
-        _state: &mut crate::ir::StreamDecodeState,
+        data: &serde_json::Value,
+        state: &mut crate::ir::StreamDecodeState,
     ) -> Vec<IrStreamEvent> {
-        // STUB: Returns empty vec (inert this cycle)
-        Vec::new()
+        let mut out: Vec<IrStreamEvent> = Vec::new();
+
+        if data.as_str() == Some("[DONE]") || !data.is_object() {
+            return out;
+        }
+
+        // 1. MessageStart exactly once on first chunk
+        if !state.started {
+            state.started = true;
+            out.push(IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+            });
+        }
+
+        let candidates = data.get("candidates").and_then(|c| c.as_array());
+
+        if let Some(cands) = candidates {
+            for candidate in cands {
+                // 2. Process content parts (text + functionCall)
+                if let Some(content) = candidate.get("content") {
+                    let role_val = content.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+                    if role_val == "model" || role_val.is_empty() {
+                        if let Some(parts_arr) = content.get("parts").and_then(|p| p.as_array()) {
+                            let mut ir_idx: usize = 0;
+
+                            for part in parts_arr {
+                                // Text block
+                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                    if !text.is_empty() {
+                                        if !state.text_block_open {
+                                            state.text_block_open = true;
+                                            out.push(IrStreamEvent::BlockStart {
+                                                index: ir_idx,
+                                                block: crate::ir::IrBlockMeta::Text,
+                                            });
+                                        }
+                                        out.push(IrStreamEvent::BlockDelta {
+                                            index: ir_idx,
+                                            delta: crate::ir::IrDelta::TextDelta(text.to_string()),
+                                        });
+                                    }
+                                }
+
+                                // FunctionCall (ToolUse) - Gemini sends whole args, not streamed
+                                if let Some(func_call) = part.get("functionCall") {
+                                    let name_val = func_call
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+
+                                    if !name_val.is_empty() {
+                                        // Open tool block at next index (after text)
+                                        ir_idx += 1;
+                                        let args = func_call
+                                            .get("args")
+                                            .cloned()
+                                            .unwrap_or(serde_json::Value::Null);
+
+                                        out.push(IrStreamEvent::BlockStart {
+                                            index: ir_idx,
+                                            block: crate::ir::IrBlockMeta::ToolUse {
+                                                id: String::new(),
+                                                name: name_val.clone(),
+                                            },
+                                        });
+
+                                        // Emit the whole args as InputJsonDelta (Gemini doesn't stream functionCall)
+                                        let args_str =
+                                            serde_json::to_string(&args).unwrap_or_default();
+                                        out.push(IrStreamEvent::BlockDelta {
+                                            index: ir_idx,
+                                            delta: crate::ir::IrDelta::InputJsonDelta(args_str),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. finishReason → close blocks + MessageDelta + MessageStop
+                if let Some(finish_reason_val) =
+                    candidate.get("finishReason").and_then(|r| r.as_str())
+                {
+                    let stop_reason = match finish_reason_val {
+                        "STOP" => "end_turn".to_string(),
+                        "MAX_TOKENS" => "max_tokens".to_string(),
+                        "SAFETY" => "safety".to_string(),
+                        other => other.to_lowercase(),
+                    };
+
+                    // Close text block first if open
+                    if state.text_block_open {
+                        state.text_block_open = false;
+                        out.push(IrStreamEvent::BlockStop { index: 0 });
+                    }
+
+                    // Close tools in ascending order (track via open_tools)
+                    for oai_idx in std::mem::take(&mut state.open_tools) {
+                        out.push(IrStreamEvent::BlockStop { index: oai_idx });
+                    }
+
+                    // Parse usageMetadata if present
+                    let usage = data
+                        .get("usageMetadata")
+                        .map(|u| crate::ir::IrUsage {
+                            input_tokens: u
+                                .get("promptTokenCount")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            output_tokens: u
+                                .get("candidatesTokenCount")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            cache_creation_input_tokens: None,
+                            cache_read_input_tokens: None,
+                        })
+                        .unwrap_or(crate::ir::IrUsage {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_creation_input_tokens: None,
+                            cache_read_input_tokens: None,
+                        });
+
+                    out.push(IrStreamEvent::MessageDelta {
+                        stop_reason: Some(stop_reason.to_string()),
+                        usage,
+                    });
+                    out.push(IrStreamEvent::MessageStop);
+                }
+            }
+        }
+
+        out
     }
 
-    fn read_response(&self, _body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError> {
-        // STUB: Return error indicating unimplemented
-        Err(IrError {
+    fn read_response(&self, body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError> {
+        let obj = body.as_object().ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("gemini_response_unimpl".into()),
+            provider_signal: Some("ir_parse".to_string()),
             retry_after: None,
+        })?;
+
+        // Parse candidates array - must have at least one
+        let candidates_val = obj.get("candidates").ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".into()),
+            retry_after: None,
+        })?;
+        let candidates = candidates_val.as_array().ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".into()),
+            retry_after: None,
+        })?;
+
+        if candidates.is_empty() {
+            return Err(IrError {
+                class: StatusClass::ClientError,
+                provider_signal: Some("ir_parse".into()),
+                retry_after: None,
+            });
+        }
+
+        let candidate = &candidates[0];
+
+        // Parse content → IrResponse.content
+        let content_val = candidate.get("content").ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".into()),
+            retry_after: None,
+        })?;
+
+        let mut content: Vec<crate::ir::IrBlock> = Vec::new();
+        if let Some(parts_arr) = content_val.get("parts").and_then(|p| p.as_array()) {
+            for part in parts_arr {
+                // Text part → IrBlock::Text
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    if !text.is_empty() {
+                        content.push(crate::ir::IrBlock::Text {
+                            text: text.to_string(),
+                            cache_control: None,
+                            citations: Vec::new(),
+                        });
+                    }
+                }
+
+                // FunctionCall → IrBlock::ToolUse (id="", name from functionCall.name, input=funcCall.args)
+                if let Some(func_call) = part.get("functionCall") {
+                    let name_val = func_call
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let args = func_call
+                        .get("args")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+
+                    content.push(crate::ir::IrBlock::ToolUse {
+                        id: String::new(),
+                        name: name_val,
+                        input: args,
+                    });
+                }
+            }
+        }
+
+        // Parse finishReason → stop_reason (map Gemini→canonical)
+        let stop_reason = candidate
+            .get("finishReason")
+            .and_then(|r| r.as_str())
+            .map(|fr| {
+                let s = match fr {
+                    "STOP" => "end_turn",
+                    "MAX_TOKENS" => "max_tokens",
+                    "SAFETY" => "safety",
+                    other => &other.to_lowercase(),
+                };
+                String::from(s)
+            });
+
+        // Parse usageMetadata: promptTokenCount→input_tokens, candidatesTokenCount→output_tokens
+        let usage_val = obj.get("usageMetadata");
+        let usage = if let Some(u) = usage_val {
+            crate::ir::IrUsage {
+                input_tokens: u
+                    .get("promptTokenCount")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                output_tokens: u
+                    .get("candidatesTokenCount")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }
+        } else {
+            crate::ir::IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }
+        };
+
+        Ok(crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content,
+            stop_reason,
+            usage,
         })
     }
 
@@ -2881,15 +3124,152 @@ impl ProtocolWriter for GeminiWriter {
         serde_json::Value::Object(out)
     }
 
-    fn write_response_event(&self, _ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
-        // STUB: Returns None (inert this cycle)
-        None
+    fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
+        match ev {
+            // MessageStart → None (no frame needed for start in Gemini)
+            IrStreamEvent::MessageStart { .. } => None,
+
+            // BlockStart → None (Gemini has no block-start SSE frame; inline parts)
+            IrStreamEvent::BlockStart { .. } => None,
+
+            // TextDelta → chunk with text part
+            IrStreamEvent::BlockDelta { index: _, delta } => match delta {
+                crate::ir::IrDelta::TextDelta(text) => Some((
+                    "".to_string(),
+                    serde_json::json!({
+                        "candidates": [{
+                            "content": {
+                                "role": "model",
+                                "parts": [{"text": text}]
+                            }
+                        }]
+                    }),
+                )),
+
+                // InputJsonDelta → functionCall with args (best-effort, parse JSON string)
+                crate::ir::IrDelta::InputJsonDelta(json_str) => {
+                    let args: serde_json::Value =
+                        serde_json::from_str(json_str).unwrap_or(serde_json::json!({}));
+                    Some((
+                        "".to_string(),
+                        serde_json::json!({
+                            "candidates": [{
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"functionCall": {"name": "", "args": args}}]
+                                }
+                            }]
+                        }),
+                    ))
+                }
+
+                // ThinkingDelta/SignatureDelta → None (Gemini has no thinking, lossy)
+                crate::ir::IrDelta::ThinkingDelta(_) | crate::ir::IrDelta::SignatureDelta(_) => {
+                    None
+                }
+            },
+
+            // BlockStop → None (no frame; stateless)
+            IrStreamEvent::BlockStop { .. } => None,
+
+            // MessageDelta → chunk with finishReason + usageMetadata
+            IrStreamEvent::MessageDelta { stop_reason, usage } => {
+                let finish_reason = match stop_reason.as_deref() {
+                    Some("end_turn") | Some("stop_sequence") => "STOP".to_string(),
+                    Some("max_tokens") => "MAX_TOKENS".to_string(),
+                    Some("safety") => "SAFETY".to_string(),
+                    Some(other) => other.to_uppercase(),
+                    None => "STOP".to_string(),
+                };
+
+                Some((
+                    "".to_string(),
+                    serde_json::json!({
+                        "candidates": [{
+                            "finishReason": finish_reason
+                        }],
+                        "usageMetadata": {
+                            "promptTokenCount": usage.input_tokens,
+                            "candidatesTokenCount": usage.output_tokens
+                        }
+                    }),
+                ))
+            }
+
+            // MessageStop → None (no frame needed)
+            IrStreamEvent::MessageStop => None,
+
+            // Error → error object
+            IrStreamEvent::Error(err) => {
+                let message = err
+                    .provider_signal
+                    .clone()
+                    .unwrap_or_else(|| "error".to_string());
+                Some((
+                    "".to_string(),
+                    serde_json::json!({
+                        "error": {"message": message}
+                    }),
+                ))
+            }
+        }
     }
 
     #[allow(dead_code)] // Used by B-502b/B-503 tests
-    fn write_response(&self, _resp: &crate::ir::IrResponse) -> serde_json::Value {
-        // STUB: Return empty object (inert this cycle)
-        serde_json::json!({})
+    fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
+        // Build candidates array (Gemini whole-response format)
+        let mut parts_arr: Vec<serde_json::Value> = Vec::new();
+
+        for block in &resp.content {
+            match block {
+                crate::ir::IrBlock::Text { text, .. } => {
+                    if !text.is_empty() {
+                        parts_arr.push(serde_json::json!({"text": text}));
+                    }
+                }
+
+                // ToolUse → functionCall{name, args}
+                crate::ir::IrBlock::ToolUse { id: _, name, input } => {
+                    let args_val = if input.is_object() || input.is_array() {
+                        input.clone()
+                    } else {
+                        serde_json::from_str(input.as_str().unwrap_or("{}"))
+                            .unwrap_or_else(|_| input.clone())
+                    };
+                    parts_arr.push(serde_json::json!({
+                        "functionCall": {"name": name, "args": args_val}
+                    }));
+                }
+
+                // Thinking blocks are DROPPED (Gemini has no thinking) - lossy-by-necessity
+                crate::ir::IrBlock::Thinking { .. } => {}
+
+                // Image/ToolResult not supported in response output (lossy)
+                crate::ir::IrBlock::Image { .. } | crate::ir::IrBlock::ToolResult { .. } => {}
+            }
+        }
+
+        let finish_reason = match resp.stop_reason.as_deref() {
+            Some("end_turn") | Some("stop_sequence") => "STOP".to_string(),
+            Some("max_tokens") => "MAX_TOKENS".to_string(),
+            Some("safety") => "SAFETY".to_string(),
+            Some(other) => other.to_uppercase(),
+            None => "STOP".to_string(),
+        };
+
+        serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": parts_arr
+                },
+                "finishReason": finish_reason
+            }],
+            "usageMetadata": {
+                "promptTokenCount": resp.usage.input_tokens,
+                "candidatesTokenCount": resp.usage.output_tokens
+            }
+        })
     }
 
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
@@ -5339,6 +5719,340 @@ mod stream_translate_tests {
 
         let raw_error = reader.extract_error(status_code, b"{}");
         assert_eq!(raw_error.http_status, 429);
+    }
+}
+
+#[cfg(test)]
+mod gemini_tests {
+    use super::*;
+    use crate::ir::{IrBlockMeta, IrDelta, IrRole, IrStreamEvent};
+
+    // B-510b: read_response decode - Gemini generateContent response with text + functionCall
+    #[test]
+    fn test_gemini_read_response_decode() {
+        let j = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "The weather in San Francisco is sunny."},
+                        {"functionCall": {"name": "get_weather", "args": {"location": "San Francisco"}}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 15,
+                "candidatesTokenCount": 8
+            }
+        });
+
+        let reader = GeminiReader;
+        let resp = reader.read_response(&j).expect("should parse");
+
+        // Assert content: Text + ToolUse
+        assert_eq!(resp.content.len(), 2);
+
+        if let crate::ir::IrBlock::Text { text, .. } = &resp.content[0] {
+            assert_eq!(text, "The weather in San Francisco is sunny.");
+        } else {
+            panic!("expected Text block");
+        }
+
+        if let crate::ir::IrBlock::ToolUse { id: _, name, input } = &resp.content[1] {
+            assert_eq!(name, "get_weather");
+            match input {
+                serde_json::Value::Object(obj) => {
+                    assert_eq!(
+                        obj.get("location"),
+                        Some(&serde_json::json!("San Francisco"))
+                    );
+                }
+                _ => panic!("input should be Object"),
+            }
+        } else {
+            panic!("expected ToolUse block");
+        }
+
+        // Assert stop_reason: "STOP" → "end_turn"
+        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
+
+        // Assert usage: promptTokenCount→input_tokens, candidatesTokenCount→output_tokens
+        assert_eq!(resp.usage.input_tokens, 15);
+        assert_eq!(resp.usage.output_tokens, 8);
+    }
+
+    // B-510b: whole-response round-trip - write_response(read_response(j)) == j
+    #[test]
+    fn test_gemini_read_write_response_roundtrip() {
+        let j = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "Hello, world!"}]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 3
+            }
+        });
+
+        let reader = GeminiReader;
+        let writer = GeminiWriter;
+
+        let ir = reader.read_response(&j).expect("should parse");
+        let roundtrip = writer.write_response(&ir);
+
+        // Round-trip must be byte-identical for canonical text-only fixture
+        assert_eq!(roundtrip, j, "whole-response round-trip must be identical");
+    }
+
+    // B-510b: stream fan-out - feed Gemini chunk sequence through StreamDecodeState
+    #[test]
+    fn test_gemini_read_response_events_stream_fanout() {
+        let reader = GeminiReader;
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        // Chunk 1: text delta (role+text)
+        let chunk1 = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Hello"}]},
+                "finishReason": null
+            }]
+        });
+
+        // Chunk 2: more text delta
+        let chunk2 = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": ", world!"}]},
+                "finishReason": null
+            }]
+        });
+
+        // Chunk 3: finish with STOP + usageMetadata
+        let chunk3 = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": []},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5
+            }
+        });
+
+        let mut events: Vec<IrStreamEvent> = Vec::new();
+
+        for chunk in [chunk1.clone(), chunk2.clone(), chunk3.clone()] {
+            events.extend(reader.read_response_events("", &chunk, &mut state));
+        }
+
+        // Assert exact event sequence: MessageStart, BlockStart{0,Text}, BlockDelta×2, BlockStop{0}, MessageDelta{end_turn,usage}, MessageStop
+        assert_eq!(events.len(), 7);
+
+        assert!(matches!(
+            events[0],
+            IrStreamEvent::MessageStart {
+                role: IrRole::Assistant,
+                usage: None
+            }
+        ));
+
+        assert!(matches!(
+            events[1],
+            IrStreamEvent::BlockStart {
+                index: 0,
+                block: IrBlockMeta::Text
+            }
+        ));
+
+        if let IrStreamEvent::BlockDelta { index: idx, delta } = &events[2] {
+            assert_eq!(*idx, 0);
+            if let IrDelta::TextDelta(text) = delta {
+                assert_eq!(text, "Hello");
+            } else {
+                panic!("expected TextDelta");
+            }
+        } else {
+            panic!("expected BlockDelta");
+        }
+
+        if let IrStreamEvent::BlockDelta { index: idx, delta } = &events[3] {
+            assert_eq!(*idx, 0);
+            if let IrDelta::TextDelta(text) = delta {
+                assert_eq!(text, ", world!");
+            } else {
+                panic!("expected TextDelta");
+            }
+        } else {
+            panic!("expected BlockDelta");
+        }
+
+        assert!(matches!(events[4], IrStreamEvent::BlockStop { index: 0 }));
+
+        if let IrStreamEvent::MessageDelta { stop_reason, usage } = &events[5] {
+            assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+            assert_eq!(usage.input_tokens, 10);
+            assert_eq!(usage.output_tokens, 5);
+        } else {
+            panic!("expected MessageDelta");
+        }
+
+        assert!(matches!(events[6], IrStreamEvent::MessageStop));
+    }
+
+    // B-510b: write_response_event - BlockDelta TextDelta → candidates[0].content.parts[0].text
+    #[test]
+    fn test_gemini_write_response_event_text_delta() {
+        let writer = GeminiWriter;
+
+        let ev = IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::TextDelta("hi".to_string()),
+        };
+
+        let result = writer.write_response_event(&ev);
+        assert!(result.is_some());
+
+        let (_, chunk) = result.unwrap();
+
+        // Assert structure: candidates[0].content.parts[0].text == "hi"
+        let candidates = chunk.get("candidates").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(candidates.len(), 1);
+
+        let candidate = &candidates[0];
+        let content = candidate.get("content").unwrap();
+
+        assert_eq!(content.get("role").and_then(|r| r.as_str()), Some("model"));
+
+        let parts_arr = content.get("parts").and_then(|p| p.as_array()).unwrap();
+        assert_eq!(parts_arr.len(), 1);
+
+        let part = &parts_arr[0];
+        assert_eq!(part.get("text").and_then(|t| t.as_str()), Some("hi"));
+    }
+
+    // B-510b: write_response_event - MessageDelta{end_turn} → finishReason "STOP"
+    #[test]
+    fn test_gemini_write_response_event_message_delta() {
+        let writer = GeminiWriter;
+
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+
+        let result = writer.write_response_event(&ev);
+        assert!(result.is_some());
+
+        let (_, chunk) = result.unwrap();
+
+        // Assert finishReason == "STOP"
+        let candidates = chunk.get("candidates").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(candidates.len(), 1);
+
+        let candidate = &candidates[0];
+        assert_eq!(
+            candidate.get("finishReason").and_then(|r| r.as_str()),
+            Some("STOP")
+        );
+
+        // Assert usageMetadata present
+        assert!(chunk.get("usageMetadata").is_some());
+    }
+
+    // B-510b: stream fan-out with functionCall - ToolUse via functionCall
+    #[test]
+    fn test_gemini_read_response_events_function_call() {
+        let reader = GeminiReader;
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        // Chunk with text delta
+        let chunk1 = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Let me check"}]},
+                "finishReason": null
+            }]
+        });
+
+        // Chunk with functionCall (Gemini sends whole args, not streamed)
+        let chunk2 = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": ""},
+                        {"functionCall": {"name": "get_weather", "args": {"location": "SF"}}}
+                    ]
+                },
+                "finishReason": null
+            }]
+        });
+
+        // Chunk with finishReason STOP
+        let chunk3 = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": []},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 20,
+                "candidatesTokenCount": 10
+            }
+        });
+
+        let mut events: Vec<IrStreamEvent> = Vec::new();
+
+        for chunk in [chunk1.clone(), chunk2.clone(), chunk3.clone()] {
+            events.extend(reader.read_response_events("", &chunk, &mut state));
+        }
+
+        // Verify we have MessageStart + BlockStart{Text} + text delta + ToolUse block + tool args delta + blocks stop + MessageDelta + MessageStop
+        assert!(events.len() >= 6);
+
+        // Find the ToolUse-related events
+        let mut found_tool_block_start = false;
+        let mut found_tool_args_delta = false;
+
+        for event in &events {
+            match event {
+                IrStreamEvent::BlockStart {
+                    index: _,
+                    block: crate::ir::IrBlockMeta::ToolUse { id: _, name },
+                    ..
+                } => {
+                    if *name == "get_weather" {
+                        found_tool_block_start = true;
+                    }
+                }
+
+                IrStreamEvent::BlockDelta {
+                    delta: IrDelta::InputJsonDelta(json_str),
+                    ..
+                } => {
+                    // Parse and check args contain location
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        if args.get("location").is_some() {
+                            found_tool_args_delta = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(found_tool_block_start, "should have ToolUse BlockStart");
+        assert!(
+            found_tool_args_delta,
+            "should have InputJsonDelta with args"
+        );
     }
 }
 
