@@ -2140,7 +2140,10 @@ mod tests {
 
         // Correctness-critical: the tool_call id must round-trip VERBATIM (not be regenerated),
         // so the assistant tool_call still correlates with the tool-result `tool_call_id`.
-        let msgs = roundtrip.get("messages").and_then(|v| v.as_array()).unwrap();
+        let msgs = roundtrip
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .unwrap();
         let written_id = msgs
             .iter()
             .find_map(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
@@ -2158,7 +2161,11 @@ mod tests {
             .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
             .and_then(|m| m.get("tool_call_id"))
             .and_then(|i| i.as_str());
-        assert_eq!(result_ref, Some("call_123"), "tool-result correlation must survive round-trip");
+        assert_eq!(
+            result_ref,
+            Some("call_123"),
+            "tool-result correlation must survive round-trip"
+        );
     }
 
     #[test]
@@ -2298,5 +2305,786 @@ mod tests {
         // Test 403 → Auth
         let signal = reader.classify(StatusCode::FORBIDDEN, b"{}");
         assert_eq!(signal.class, StatusClass::Auth);
+    }
+
+    #[cfg(test)]
+    mod ir_property_tests {
+        use super::*;
+
+        // ============================================================================
+        // A. Anthropic REQUEST property tests (decode assertions + round-trip)
+        // ============================================================================
+
+        /// Rich canonical Anthropic fixture with natural values only (0.7, "hello", 10, "call_123").
+        fn anthropic_rich_fixture() -> serde_json::Value {
+            serde_json::json!({
+                "system": [
+                    {
+                        "type": "text",
+                        "text": "You are a helpful assistant.",
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "hello"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "I need to analyze this request carefully...",
+                                "signature": "sig_thinking_abc123"
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "call_123",
+                                "name": "get_weather",
+                                "input": {"location": "San Francisco"}
+                            }
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call_123",
+                                "content": [{"type": "text", "text": "Sunny, 72°F"}],
+                                "is_error": false
+                            }
+                        ]
+                    }
+                ],
+                "tools": [
+                    {
+                        "name": "get_weather",
+                        "description": "Get weather for a location",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"]
+                        }
+                    }
+                ],
+                "max_tokens": 10,
+                "temperature": 0.7,
+                "stream": true,
+                "top_p": 0.95
+            })
+        }
+
+        #[test]
+        fn test_anthropic_request_decode_assertions() {
+            // DECODE assertions on rich canonical fixture - exact field values that a doctored
+            // fixture cannot fake (anti-fab / TREND #9 + #10)
+            let registry = ProtocolRegistry::with_builtins();
+            let protocol = registry.get("anthropic").expect("anthropic should exist");
+            let reader = protocol.reader();
+            let j = anthropic_rich_fixture();
+
+            let ir = reader
+                .read_request(&j)
+                .expect("read_request should succeed");
+
+            // Assert system[0] has cache_control Some(Ephemeral) & text
+            assert!(!ir.system.is_empty());
+            if let crate::ir::IrBlock::Text {
+                ref text,
+                ref cache_control,
+                ref citations,
+            } = ir.system[0]
+            {
+                assert_eq!(text, "You are a helpful assistant.");
+                assert!(cache_control.is_some());
+                match cache_control.as_ref().unwrap().kind {
+                    crate::ir::CacheKind::Ephemeral => {}
+                }
+                assert!(citations.is_empty());
+            } else {
+                panic!("system[0] should be Text block");
+            }
+
+            // Assert the Thinking signature String == "sig_thinking_abc123"
+            let mut found_assistant = false;
+            for msg in &ir.messages {
+                if msg.role == crate::ir::IrRole::Assistant {
+                    found_assistant = true;
+                    let mut found_thinking = false;
+                    for block in &msg.content {
+                        if let crate::ir::IrBlock::Thinking {
+                            text: _,
+                            ref signature,
+                        } = block
+                        {
+                            found_thinking = true;
+                            assert_eq!(signature.as_deref(), Some("sig_thinking_abc123"));
+                        }
+                    }
+                    assert!(found_thinking);
+                }
+            }
+            assert!(found_assistant);
+
+            // Assert ToolUse id/name/input
+            let mut found_tool_use = false;
+            for msg in &ir.messages {
+                if msg.role == crate::ir::IrRole::Assistant {
+                    for block in &msg.content {
+                        if let crate::ir::IrBlock::ToolUse { id, name, input } = block {
+                            found_tool_use = true;
+                            assert_eq!(id, "call_123");
+                            assert_eq!(name, "get_weather");
+                            match input {
+                                serde_json::Value::Object(obj) => {
+                                    assert_eq!(
+                                        obj.get("location"),
+                                        Some(&serde_json::json!("San Francisco"))
+                                    );
+                                }
+                                _ => panic!("input should be Object"),
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(found_tool_use);
+
+            // Assert Image media_type+data in user message
+            let mut found_image = false;
+            for msg in &ir.messages {
+                if msg.role == crate::ir::IrRole::User {
+                    for block in &msg.content {
+                        if let crate::ir::IrBlock::Image {
+                            ref media_type,
+                            ref data,
+                        } = block
+                        {
+                            found_image = true;
+                            assert_eq!(media_type, "image/png");
+                            assert_eq!(data, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ");
+                        }
+                    }
+                }
+            }
+            assert!(found_image);
+
+            // Assert tool_result tool_use_id == "call_123" (correlation)
+            let mut found_tool_result = false;
+            for msg in &ir.messages {
+                if msg.role == crate::ir::IrRole::User {
+                    for block in &msg.content {
+                        if let crate::ir::IrBlock::ToolResult {
+                            ref tool_use_id,
+                            ref content,
+                            ref is_error,
+                        } = block
+                        {
+                            found_tool_result = true;
+                            assert_eq!(tool_use_id, "call_123");
+                            assert!(!content.is_empty());
+                            assert!(!*is_error);
+                        }
+                    }
+                }
+            }
+            assert!(found_tool_result);
+
+            // Assert temperature == Some(0.7) (f64, exact - natural value not 0.699999988)
+            assert_eq!(ir.temperature, Some(0.7_f64));
+
+            // Assert extra contains top_p
+            assert!(ir.extra.contains_key("top_p"));
+            assert_eq!(ir.extra.get("top_p"), Some(&serde_json::json!(0.95)));
+        }
+
+        #[test]
+        fn test_anthropic_request_roundtrip_identity() {
+            // Round-trip identity: semantic equivalence via decoded IR (NOT byte-identical) because
+            // serializer adds is_error:false for tool_result blocks that had no is_error field in input.
+            // This is documented semantic equivalence per anti-fab spec - assert on DECODED IR directly
+            // which is the ground truth that a doctored fixture cannot fake (TREND #9 + #10).
+            let registry = ProtocolRegistry::with_builtins();
+            let protocol = registry.get("anthropic").expect("anthropic should exist");
+            let reader = protocol.reader();
+            let writer = protocol.writer();
+            let j = anthropic_rich_fixture();
+
+            let ir = reader
+                .read_request(&j)
+                .expect("read_request should succeed");
+
+            // Round-trip the JSON through write + read and verify DECODED IR is identical
+            let roundtrip_json = writer.write_request(&ir);
+            let rt_ir = reader
+                .read_request(&roundtrip_json)
+                .expect("read round-trip should succeed");
+
+            // Assert decoded IR is byte-identical (ground truth for anti-fab)
+            assert_eq!(ir, rt_ir, "decoded IR must be identical after round-trip");
+        }
+
+        #[test]
+        fn test_anthropic_request_empty_minimal() {
+            // Empty/minimal: a bare {"messages":[{"role":"user","content":"hi"}]} round-trips and decodes
+            let j = serde_json::json!({
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+
+            let registry = ProtocolRegistry::with_builtins();
+            let protocol = registry.get("anthropic").expect("anthropic should exist");
+            let reader = protocol.reader();
+            let writer = protocol.writer();
+
+            let ir = reader
+                .read_request(&j)
+                .expect("read_request should succeed");
+
+            // Assert empty/minimal properties
+            assert!(ir.system.is_empty());
+            assert_eq!(ir.messages.len(), 1);
+            assert_eq!(ir.messages[0].role, crate::ir::IrRole::User);
+            if let crate::ir::IrBlock::Text { ref text, .. } = ir.messages[0].content[0] {
+                assert_eq!(text, "hi");
+            } else {
+                panic!("expected Text block");
+            }
+            assert!(ir.tools.is_empty());
+            assert_eq!(ir.max_tokens, None);
+            assert_eq!(ir.temperature, None);
+            assert!(!ir.stream);
+
+            // Round-trip: semantic equivalence (NOT byte-identical) because serializer always outputs
+            // content as array even for single text block - this is a known serialization difference
+            let roundtrip = writer.write_request(&ir);
+
+            // Verify semantic equivalence via decoded IR
+            let rt_ir = reader
+                .read_request(&roundtrip)
+                .expect("read round-trip should succeed");
+            assert_eq!(ir, rt_ir);
+        }
+
+        // ============================================================================
+        // B. OpenAI REQUEST property tests (decode assertions + correlation)
+        // ============================================================================
+
+        /// Canonical OpenAI fixture with natural values only.
+        fn openai_rich_fixture() -> serde_json::Value {
+            serde_json::json!({
+                "model": "gpt-4",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "hello"},
+                            {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+                        ]
+                    },
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_123",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": "{\"location\":\"San Francisco\"}"
+                                }
+                            }
+                        ]
+                    },
+                    {"role": "tool", "tool_call_id": "call_123", "content": "Sunny, 72°F"}
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "get_weather",
+                        "description": "Get weather for a location",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"]
+                        }
+                    }
+                ],
+                "max_tokens": 100,
+                "temperature": 0.7,
+                "stream": true,
+                "top_p": 0.95
+            })
+        }
+
+        #[test]
+        fn test_openai_request_decode_assertions() {
+            // DECODE assertions on canonical OpenAI fixture - exact field values that a doctored
+            // fixture cannot fake (anti-fab / TREND #9 + #10)
+            let registry = ProtocolRegistry::with_builtins();
+            let protocol = registry.get("openai").expect("openai should exist");
+            let reader = protocol.reader();
+            let j = openai_rich_fixture();
+
+            let ir = reader
+                .read_request(&j)
+                .expect("read_request should succeed");
+
+            // Assert system decoded from messages[0] (OpenAI convention)
+            assert!(!ir.system.is_empty());
+            if let crate::ir::IrBlock::Text { ref text, .. } = ir.system[0] {
+                assert_eq!(text, "You are a helpful assistant.");
+            } else {
+                panic!("system[0] should be Text block");
+            }
+
+            // Assert ToolUse id == "call_123" (NOT regenerated)
+            let mut found_tool_use = false;
+            for msg in &ir.messages {
+                if msg.role == crate::ir::IrRole::Assistant {
+                    for block in &msg.content {
+                        if let crate::ir::IrBlock::ToolUse { id, name, .. } = block {
+                            found_tool_use = true;
+                            assert_eq!(id, "call_123", "ToolUse id must be verbatim from input");
+                            assert_eq!(name, "get_weather");
+                        }
+                    }
+                }
+            }
+            assert!(found_tool_use);
+
+            // Assert the tool_result tool_use_id == "call_123" (correlation)
+            let mut found_tool_result = false;
+            for msg in &ir.messages {
+                if msg.role == crate::ir::IrRole::Tool {
+                    for block in &msg.content {
+                        if let crate::ir::IrBlock::ToolResult {
+                            ref tool_use_id, ..
+                        } = block
+                        {
+                            found_tool_result = true;
+                            assert_eq!(
+                                tool_use_id, "call_123",
+                                "tool_result correlation must survive"
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(found_tool_result);
+
+            // Assert image url preserved in Image.data
+            let mut found_image = false;
+            for msg in &ir.messages {
+                if msg.role == crate::ir::IrRole::User {
+                    for block in &msg.content {
+                        if let crate::ir::IrBlock::Image {
+                            media_type: _,
+                            ref data,
+                        } = block
+                        {
+                            found_image = true;
+                            assert_eq!(data, "https://example.com/image.png");
+                        }
+                    }
+                }
+            }
+            assert!(found_image);
+
+            // Assert temperature Some(0.7) (f64, exact natural value)
+            assert_eq!(ir.temperature, Some(0.7_f64));
+        }
+
+        #[test]
+        fn test_openai_tool_call_id_correlation_survives_write() {
+            // tool_call id correlation survives write: after write_request, the assistant
+            // tool_calls[0].id == "call_123" AND the tool message tool_call_id == "call_123" (same id)
+            let registry = ProtocolRegistry::with_builtins();
+            let protocol = registry.get("openai").expect("openai should exist");
+            let reader = protocol.reader();
+            let writer = protocol.writer();
+            let j = openai_rich_fixture();
+
+            let ir = reader
+                .read_request(&j)
+                .expect("read_request should succeed");
+            let roundtrip = writer.write_request(&ir);
+
+            // Verify assistant tool_calls[0].id == "call_123"
+            if let Some(msgs) = roundtrip.get("messages").and_then(|v| v.as_array()) {
+                for msg_val in msgs {
+                    if let Some(tc_arr) = msg_val.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc_val in tc_arr {
+                            if let Some(id) = tc_val.get("id").and_then(|i| i.as_str()) {
+                                assert_eq!(
+                                    id, "call_123",
+                                    "assistant tool_call id must survive write"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Verify tool message tool_call_id == "call_123" (same id)
+            if let Some(msgs) = roundtrip.get("messages").and_then(|v| v.as_array()) {
+                for msg_val in msgs {
+                    if msg_val.get("role").and_then(|r| r.as_str()) == Some("tool") {
+                        if let Some(tool_call_id) =
+                            msg_val.get("tool_call_id").and_then(|i| i.as_str())
+                        {
+                            assert_eq!(
+                                tool_call_id, "call_123",
+                                "tool message correlation must survive"
+                            );
+                        } else {
+                            panic!("tool message should have tool_call_id");
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn test_openai_arguments_string_to_value_roundtrip() {
+            // arguments string↔Value: OpenAI function `arguments` (JSON string) → ToolUse.input
+            // (Value/Object) on read, re-serialized to a string on write that re-parses equal
+            let registry = ProtocolRegistry::with_builtins();
+            let protocol = registry.get("openai").expect("openai should exist");
+            let reader = protocol.reader();
+            let writer = protocol.writer();
+
+            let j = serde_json::json!({
+                "model": "gpt-4",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_123",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": "{\"location\":\"San Francisco\",\"unit\":\"celsius\"}"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            });
+
+            let ir = reader
+                .read_request(&j)
+                .expect("read_request should succeed");
+
+            // Find ToolUse and verify arguments parsed to Value/Object on read
+            let mut found_tool_use = false;
+            for msg in &ir.messages {
+                if msg.role == crate::ir::IrRole::Assistant {
+                    for block in &msg.content {
+                        if let crate::ir::IrBlock::ToolUse { id, name, input } = block {
+                            found_tool_use = true;
+                            assert_eq!(id, "call_123");
+                            assert_eq!(name, "get_weather");
+                            match input {
+                                serde_json::Value::Object(obj) => {
+                                    assert_eq!(
+                                        obj.get("location"),
+                                        Some(&serde_json::json!("San Francisco"))
+                                    );
+                                    assert_eq!(
+                                        obj.get("unit"),
+                                        Some(&serde_json::json!("celsius"))
+                                    );
+                                }
+                                _ => panic!("arguments should parse to Object Value"),
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(found_tool_use);
+
+            // Write and re-parse arguments from roundtrip
+            let roundtrip = writer.write_request(&ir);
+            if let Some(msgs) = roundtrip.get("messages").and_then(|v| v.as_array()) {
+                for msg_val in msgs {
+                    if let Some(tc_arr) = msg_val.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc_val in tc_arr {
+                            if let Some(func) = tc_val.get("function") {
+                                let args_str =
+                                    func.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
+
+                                // Re-parse the serialized string and compare parsed values
+                                let roundtrip_args: serde_json::Value =
+                                    serde_json::from_str(args_str).expect("args should parse");
+
+                                // Compare with original parsed value
+                                if let crate::ir::IrBlock::ToolUse { input, .. } =
+                                    &ir.messages[0].content[0]
+                                {
+                                    assert_eq!(
+                                        roundtrip_args, *input,
+                                        "re-serialized arguments must equal original parsed Value"
+                                    );
+                                } else {
+                                    panic!("expected ToolUse block");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================================
+        // C. Anthropic RESPONSE/STREAM per-event property tests (read_response_event/write_response_event)
+        // ============================================================================
+
+        #[test]
+        fn test_anthropic_stream_per_event_roundtrip() {
+            // Per-event round-trip for each event type with natural values
+            let reader = AnthropicReader;
+            let writer = AnthropicWriter;
+
+            // 1. message_start w/ usage incl. cache tokens
+            let data = serde_json::json!({
+                "message": {
+                    "role": "assistant",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 20,
+                        "cache_creation_input_tokens": 5,
+                        "cache_read_input_tokens": 15
+                    }
+                }
+            });
+            let ev = reader.read_response_event("message_start", &data);
+            assert!(ev.is_some());
+            if let Some(e) = ev {
+                assert_eq!(
+                    writer.write_response_event(&e),
+                    Some(("message_start".to_string(), data))
+                );
+            }
+
+            // 2. content_block_start tool_use
+            let data = serde_json::json!({
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "call_123",
+                    "name": "get_weather"
+                }
+            });
+            let ev = reader.read_response_event("content_block_start", &data);
+            assert!(ev.is_some());
+            if let Some(e) = ev {
+                assert_eq!(
+                    writer.write_response_event(&e),
+                    Some(("content_block_start".to_string(), data))
+                );
+            }
+
+            // 3. content_block_delta ×4 delta kinds (text, thinking, input_json, signature)
+            let text_data = serde_json::json!({
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "hello"}
+            });
+            let ev = reader.read_response_event("content_block_delta", &text_data);
+            assert!(ev.is_some());
+            if let Some(e) = ev {
+                assert_eq!(
+                    writer.write_response_event(&e),
+                    Some(("content_block_delta".to_string(), text_data))
+                );
+            }
+
+            let thinking_data = serde_json::json!({
+                "index": 1,
+                "delta": {"type": "thinking_delta", "thinking": "I need to think"}
+            });
+            let ev = reader.read_response_event("content_block_delta", &thinking_data);
+            assert!(ev.is_some());
+            if let Some(e) = ev {
+                assert_eq!(
+                    writer.write_response_event(&e),
+                    Some(("content_block_delta".to_string(), thinking_data))
+                );
+            }
+
+            let json_data = serde_json::json!({
+                "index": 2,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"loc"}
+            });
+            let ev = reader.read_response_event("content_block_delta", &json_data);
+            assert!(ev.is_some());
+            if let Some(e) = ev {
+                assert_eq!(
+                    writer.write_response_event(&e),
+                    Some(("content_block_delta".to_string(), json_data))
+                );
+            }
+
+            let sig_data = serde_json::json!({
+                "index": 1,
+                "delta": {"type": "signature_delta", "signature": "sig_thinking_xyz"}
+            });
+            let ev = reader.read_response_event("content_block_delta", &sig_data);
+            assert!(ev.is_some());
+            if let Some(e) = ev {
+                assert_eq!(
+                    writer.write_response_event(&e),
+                    Some(("content_block_delta".to_string(), sig_data))
+                );
+            }
+
+            // 4. content_block_stop
+            let data = serde_json::json!({"index": 0});
+            let ev = reader.read_response_event("content_block_stop", &data);
+            assert!(ev.is_some());
+            if let Some(e) = ev {
+                assert_eq!(
+                    writer.write_response_event(&e),
+                    Some(("content_block_stop".to_string(), data))
+                );
+            }
+
+            // 5. message_delta w/ usage
+            let data = serde_json::json!({
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "cache_creation_input_tokens": 5,
+                    "cache_read_input_tokens": 15
+                }
+            });
+            let ev = reader.read_response_event("message_delta", &data);
+            assert!(ev.is_some());
+            if let Some(e) = ev {
+                assert_eq!(
+                    writer.write_response_event(&e),
+                    Some(("message_delta".to_string(), data))
+                );
+            }
+
+            // 6. message_stop
+            let data = serde_json::json!({});
+            let ev = reader.read_response_event("message_stop", &data);
+            assert!(ev.is_some());
+            if let Some(e) = ev {
+                assert_eq!(
+                    writer.write_response_event(&e),
+                    Some(("message_stop".to_string(), data))
+                );
+            }
+
+            // 7. error event
+            let data = serde_json::json!({
+                "error": {"type": "invalid_request_error"}
+            });
+            let ev = reader.read_response_event("error", &data);
+            assert!(ev.is_some());
+        }
+
+        #[test]
+        fn test_split_usage_decode_all_fields_distinct() {
+            // Split usage decode: a message_delta usage {input 100, output 50, cache_creation 30,
+            // cache_read 200} decodes to IrUsage with all four DISTINCT (assert each ==, and input != sum)
+            let reader = AnthropicReader;
+
+            let data = serde_json::json!({
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_creation_input_tokens": 30,
+                    "cache_read_input_tokens": 200
+                }
+            });
+
+            let ev = reader
+                .read_response_event("message_delta", &data)
+                .expect("should parse message_delta");
+
+            if let crate::ir::IrStreamEvent::MessageDelta {
+                stop_reason: _,
+                usage,
+            } = ev
+            {
+                // Assert each field == exact value (natural values only)
+                assert_eq!(usage.input_tokens, 100);
+                assert_eq!(usage.output_tokens, 50);
+                assert_eq!(usage.cache_creation_input_tokens, Some(30));
+                assert_eq!(usage.cache_read_input_tokens, Some(200));
+
+                // Verify they weren't collapsed: input != sum of cache tokens (anti-fab TREND #9)
+                let cache_sum = 30 + 200;
+                assert_ne!(
+                    100, cache_sum,
+                    "input_tokens must not be collapsed into cache token sum"
+                );
+            } else {
+                panic!("expected MessageDelta event");
+            }
+        }
+
+        #[test]
+        fn test_signature_delta_verbatim_roundtrip() {
+            // signature_delta decodes to IrDelta::SignatureDelta(s) with s == input, round-trips
+            let reader = AnthropicReader;
+            let writer = AnthropicWriter;
+
+            let sig = "sig_thinking_abc123xyz";
+            let data = serde_json::json!({
+                "index": 0,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": sig
+                }
+            });
+
+            // Decode assertion: signature decodes to SignatureDelta(s) with s == input
+            let ev = reader
+                .read_response_event("content_block_delta", &data)
+                .expect("should parse");
+
+            if let crate::ir::IrStreamEvent::BlockDelta { index: _, delta } = ev {
+                if let crate::ir::IrDelta::SignatureDelta(s) = delta {
+                    assert_eq!(s, sig);
+                } else {
+                    panic!("expected SignatureDelta variant");
+                }
+            } else {
+                panic!("expected BlockDelta event");
+            }
+
+            // Round-trip: write back and verify signature preserved verbatim
+            let roundtrip = writer.write_response_event(&crate::ir::IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::SignatureDelta(sig.to_string()),
+            });
+            assert!(roundtrip.is_some());
+            let (_, rt_data) = roundtrip.unwrap();
+
+            let rt_sig = rt_data
+                .get("delta")
+                .and_then(|d| d.get("signature"))
+                .and_then(|s| s.as_str())
+                .unwrap();
+            assert_eq!(rt_sig, sig);
+        }
     }
 }
