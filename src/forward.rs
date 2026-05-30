@@ -701,6 +701,7 @@ pub(crate) async fn forward_with_pool(
                                     StatusClass::Auth => unreachable!(),
                                     StatusClass::Billing => unreachable!(),
                                     StatusClass::ClientError => unreachable!(),
+                                    StatusClass::ContextLength => unreachable!(),
                                     StatusClass::RateLimit => {
                                         // Should have been handled above but Rust needs exhaustive match
                                         "rate_limit"
@@ -728,6 +729,7 @@ pub(crate) async fn forward_with_pool(
                                 StatusClass::Timeout => unreachable!(),
                                 StatusClass::Network => unreachable!(),
                                 StatusClass::ClientError => unreachable!(),
+                                StatusClass::ContextLength => unreachable!(),
                             };
                             app.store.record_hard_down(i, &reason);
                             drop(permit);
@@ -743,6 +745,16 @@ pub(crate) async fn forward_with_pool(
                             }
 
                             // For billing hard downs: continue to next lane (failover)
+                            continue;
+                        }
+                        Disposition::ContextLength => {
+                            // B-504: the request is too large for THIS model's context window.
+                            // The lane is HEALTHY — record NOTHING (no cooldown/penalty). The
+                            // current lane is already excluded for this request, so fail over to
+                            // another member (ideally a larger-context model; context_max-aware
+                            // preference is B-504b). If the pool is exhausted, the normal
+                            // exhaustion path returns.
+                            drop(permit);
                             continue;
                         }
                     }

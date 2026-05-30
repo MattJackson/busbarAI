@@ -301,6 +301,20 @@ impl ProtocolReader for AnthropicReader {
             None
         };
 
+        // B-504: Anthropic signals context-length via the error MESSAGE (no distinct code).
+        // Surface the canonical code so the breaker pipeline (normalize_raw_error) → ContextLength.
+        let provider_code = provider_code.or_else(|| {
+            let lower = String::from_utf8_lossy(body).to_lowercase();
+            if lower.contains("prompt is too long")
+                || (lower.contains("exceeds the maximum")
+                    && (lower.contains("token") || lower.contains("context")))
+            {
+                Some("context_length_exceeded".to_string())
+            } else {
+                None
+            }
+        });
+
         crate::breaker::RawUpstreamError {
             http_status: status.as_u16(),
             provider_code,
@@ -310,6 +324,21 @@ impl ProtocolReader for AnthropicReader {
 
     fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal {
         let text = String::from_utf8_lossy(body);
+
+        // B-504: context-length-exceeded (Anthropic returns 400 invalid_request_error). The lane
+        // is healthy; this must fail over (to a larger-context model), not penalize the breaker.
+        // Check before the generic 400/client-error path so it wins.
+        let lower = text.to_lowercase();
+        if lower.contains("prompt is too long")
+            || (lower.contains("exceeds the maximum")
+                && (lower.contains("token") || lower.contains("context")))
+        {
+            return CanonicalSignal {
+                class: StatusClass::ContextLength,
+                provider_signal: Some("context_length".to_string()),
+                retry_after: None,
+            };
+        }
 
         // A3: prefer HTTP status first, then structured error codes, then substrings as fallback.
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
@@ -1297,7 +1326,29 @@ impl ProtocolReader for OpenAiReader {
     }
 
     fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal {
-        let _ = body;
+        // B-504: context-length-exceeded — the lane is healthy; this must fail over (to a
+        // larger-context model), not penalize the breaker. Detect by OpenAI code/message first.
+        let code_is_context = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|j| {
+                j.get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string())
+            })
+            .as_deref()
+            == Some("context_length_exceeded");
+        if code_is_context
+            || String::from_utf8_lossy(body)
+                .to_lowercase()
+                .contains("maximum context length")
+        {
+            return CanonicalSignal {
+                class: StatusClass::ContextLength,
+                provider_signal: Some("context_length".to_string()),
+                retry_after: None,
+            };
+        }
 
         if status == StatusCode::TOO_MANY_REQUESTS {
             return CanonicalSignal {
@@ -4569,5 +4620,58 @@ mod stream_translate_tests {
 
         // Decode IR must be identical (ground truth for anti-fab)
         assert_eq!(ir1, ir2, "decoded IR must be identical after round-trip");
+    }
+}
+
+#[cfg(test)]
+mod context_length_tests {
+    use super::*;
+    use crate::breaker::{classify, Disposition};
+    use axum::http::StatusCode;
+
+    #[test]
+    fn test_classify_context_length_both_protocols() {
+        // OpenAI: error.code == context_length_exceeded
+        let o = OpenAiReader.classify(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"code":"context_length_exceeded","message":"maximum context length is 8192 tokens"}}"#,
+        );
+        assert_eq!(
+            o.class,
+            StatusClass::ContextLength,
+            "openai code → ContextLength"
+        );
+
+        // Anthropic: "prompt is too long"
+        let a = AnthropicReader.classify(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
+        );
+        assert_eq!(
+            a.class,
+            StatusClass::ContextLength,
+            "anthropic message → ContextLength"
+        );
+
+        // A plain 400 client error is NOT context-length (must still be ClientError).
+        let c = AnthropicReader.classify(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"type":"invalid_request_error","message":"unexpected field 'foo'"}}"#,
+        );
+        assert_eq!(
+            c.class,
+            StatusClass::ClientError,
+            "generic 400 stays ClientError"
+        );
+    }
+
+    #[test]
+    fn test_context_length_disposition() {
+        let sig = CanonicalSignal {
+            class: StatusClass::ContextLength,
+            provider_signal: Some("context_length".to_string()),
+            retry_after: None,
+        };
+        assert_eq!(classify(&sig), Disposition::ContextLength);
     }
 }

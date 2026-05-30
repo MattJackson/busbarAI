@@ -36,18 +36,23 @@ pub(crate) enum StatusClass {
     Billing,
     /// Client error (4xx other than 401/403) — client fault, do not penalize lane
     ClientError,
+    /// Request exceeds this model's context window — the LANE is healthy; fail over (ideally to
+    /// a larger-context model) WITHOUT penalizing the breaker. (B-504)
+    ContextLength,
 }
 
 /// Final disposition that drives the StateStore write path.
-/// Three lanes per ADR-0002:
+/// Per ADR-0002 + B-504:
 ///   - ClientFault: caller's bad input → relay verbatim, record NOTHING
 ///   - TransientUpstream: transient failure → cooldown + err counter
 ///   - HardDown: definitive signal → permanent dead state (with probe recovery)
+///   - ContextLength: request too big for this model → fail over, record NOTHING (lane healthy)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Disposition {
     ClientFault,
     TransientUpstream,
     HardDown,
+    ContextLength,
 }
 
 /// Convert a string to StatusClass. Returns None for unknown values.
@@ -62,6 +67,7 @@ pub(crate) fn status_class_from_str(s: &str) -> Option<StatusClass> {
         "auth" => Some(StatusClass::Auth),
         "billing" => Some(StatusClass::Billing),
         "client_error" => Some(StatusClass::ClientError),
+        "context_length" => Some(StatusClass::ContextLength),
         _ => None,
     }
 }
@@ -78,6 +84,7 @@ pub(crate) fn classify(sig: &CanonicalSignal) -> Disposition {
         | StatusClass::Network => Disposition::TransientUpstream,
         StatusClass::Auth | StatusClass::Billing => Disposition::HardDown,
         StatusClass::ClientError => Disposition::ClientFault,
+        StatusClass::ContextLength => Disposition::ContextLength,
     }
 }
 
@@ -107,6 +114,16 @@ pub(crate) fn normalize_raw_error(
                     retry_after: None,
                 };
             }
+        }
+        // B-504: built-in recognition of the canonical context-length code (the operator
+        // error_map above overrides; this is the default when unmapped). The lane is healthy —
+        // ContextLength → fail over without penalty.
+        if code == "context_length_exceeded" {
+            return CanonicalSignal {
+                class: StatusClass::ContextLength,
+                provider_signal: Some(code.clone()),
+                retry_after: None,
+            };
         }
         // Code not in map or invalid mapping — fall through to HTTP classification
         Some(code.clone())

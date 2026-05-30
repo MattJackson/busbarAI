@@ -4660,4 +4660,100 @@ mod tests {
 
         server.shutdown().await;
     }
+
+    /// B-504a: a context-length error fails over to another lane WITHOUT penalizing the breaker
+    /// (the lane is healthy — the request was just too big for that model).
+    #[tokio::test]
+    async fn test_b504a_context_length_failover_no_penalty() {
+        use std::collections::HashMap;
+
+        // One mock server, LIFO queue: push the success LAST-but-popped-SECOND. responses.pop()
+        // is LIFO, so push 200 first, then the 400 context-length → the FIRST attempt gets the
+        // context-length error, the failover attempt gets 200.
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({"type": "message", "role": "assistant", "content": [{"type": "text", "text": "ok"}]}),
+        });
+        state.push(MockResponse::ServerError {
+            status: StatusCode::BAD_REQUEST,
+            body: json!({"error": {"type": "invalid_request_error", "message": "prompt is too long: 250000 tokens > 200000 maximum"}}),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        let mk_ld = || LaneData {
+            model: "m".to_string(),
+            provider: "anthropic".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+        let mk_lane = |key: &str| Lane {
+            model: "m".to_string(),
+            provider: "anthropic".to_string(),
+            base_url: server.base_url(),
+            api_key: key.to_string(),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![mk_ld(), mk_ld()]));
+        let app = Arc::new(App {
+            lanes: vec![mk_lane("k0"), mk_lane("k1")],
+            store,
+            by_model: HashMap::from([("m".to_string(), 0)]),
+            pools: HashMap::new(),
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let response = forward(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+            body.to_string().into(),
+            None,
+        )
+        .await;
+
+        // Failover to the healthy lane succeeded.
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "context-length should fail over to a 200 lane"
+        );
+
+        // KEY: neither lane was penalized — context-length is a request problem, not a lane fault.
+        let now = crate::state::now();
+        for idx in 0..2 {
+            assert_eq!(
+                app.store.cooldown_remaining(idx, now),
+                0,
+                "lane {idx} must NOT be in cooldown after a context-length failover"
+            );
+        }
+
+        server.shutdown().await;
+    }
 }
