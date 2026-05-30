@@ -1005,8 +1005,7 @@ mod tests {
     use axum::http::StatusCode;
 
     fn rich_fixture() -> serde_json::Value {
-        // Use 0.7f32 as hex to ensure exact round-trip: f32::from_bits(0x3f333333) = 0.699999988...
-
+        // temperature is a natural 0.7 — IrRequest.temperature is f64 so it round-trips exactly.
         serde_json::json!({
             "system": [{"type": "text", "text": "You are a helpful assistant.", "cache_control": {"type": "ephemeral"}}],
             "messages": [
