@@ -236,7 +236,7 @@ mod tests {
     use super::*;
     use crate::auth::AuthMiddleware;
     use crate::config::AuthCfg;
-    use crate::forward::forward;
+    use crate::forward::{forward, forward_with_pool};
     use crate::proto::AnthropicProtocol;
     use crate::state::{now, App, Lane, ProtocolKind};
     use crate::store::{InMemoryStore, LaneData};
@@ -3069,21 +3069,33 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// B-403b: LeastBad mode test - all lanes tripped, verify soonest-cooldown member is selected.
+    /// B-403b: LeastBad mode — both members Open (tripped), the request is ACTUALLY served
+    /// (200) by the member with the SOONEST cooldown expiry, not the other one.
+    /// Lane 0 (far cooldown) and lane 1 (soon cooldown) point at distinct mock servers that
+    /// return distinguishable bodies, so we can assert WHICH member served.
     #[tokio::test]
     async fn test_exhaustion_least_bad_selects_soonest() {
-        let state = Arc::new(MockServerState::new());
+        use crate::store::now as store_now;
 
-        // Push rate limit responses to trip all lanes
-        for _i in 0..2 {
-            state.push(MockResponse::RateLimit {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                provider_signal: Some("1302"),
-            });
-        }
+        // Lane 0 server (the "wrong" member — far cooldown). Marker identifies it if picked.
+        let state0 = Arc::new(MockServerState::new());
+        state0.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({ "served_by": "lane0", "content": [] }),
+        });
+        let server0 = MockServer::new(state0.clone()).await;
 
-        let server = MockServer::new(state.clone()).await;
+        // Lane 1 server (the soonest member — should be the one served).
+        let state1 = Arc::new(MockServerState::new());
+        state1.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({ "served_by": "lane1", "content": [] }),
+        });
+        let server1 = MockServer::new(state1.clone()).await;
 
+        // Both lanes Open: breaker defaults to Closed but a future cooldown_until makes
+        // usable() return false, so normal selection finds nothing and LeastBad kicks in.
+        let t0 = store_now();
         let lane_data_0 = LaneData {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
@@ -3091,13 +3103,13 @@ mod tests {
             sem: Arc::new(tokio::sync::Semaphore::new(10)),
             limited: false,
             budget: -1,
-            cooldown_until: 0,
-            streak: 0,
+            cooldown_until: t0 + 600, // far expiry
+            streak: 3,
             dead: false,
             dead_reason: String::new(),
             inflight: 0,
             ok: 0,
-            err: 0,
+            err: 5,
             client_fault: 0,
         };
 
@@ -3108,20 +3120,20 @@ mod tests {
             sem: Arc::new(tokio::sync::Semaphore::new(10)),
             limited: false,
             budget: -1,
-            cooldown_until: 0,
-            streak: 0,
+            cooldown_until: t0 + 5, // SOONEST expiry → least-bad should pick this one
+            streak: 3,
             dead: false,
             dead_reason: String::new(),
             inflight: 0,
             ok: 0,
-            err: 0,
+            err: 5,
             client_fault: 0,
         };
 
         let lane0 = Lane {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
-            base_url: server.base_url(),
+            base_url: server0.base_url(),
             api_key: "test-key-0".to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
@@ -3131,7 +3143,7 @@ mod tests {
         let lane1 = Lane {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
-            base_url: server.base_url(),
+            base_url: server1.base_url(),
             api_key: "test-key-1".to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
@@ -3172,29 +3184,8 @@ mod tests {
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
-        // Trip lane 0 first (so it has longer cooldown remaining)
-        let _resp = forward(
-            app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
-            req_body.clone().into(),
-            None,
-        )
-        .await;
-
-        // Small delay so lane 0 has some cooldown time
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Now trip lane 1 (so it has shorter cooldown remaining)
-        let _resp = forward(
-            app.clone(),
-            vec![crate::state::WeightedLane { idx: 1, weight: 1 }],
-            req_body.clone().into(),
-            None,
-        )
-        .await;
-
-        // Now try the pool - should select lane 1 (soonest cooldown expiry)
-        let response = forward(
+        // Route via the named pool so per-pool LeastBad config is consulted.
+        let response = forward_with_pool(
             app.clone(),
             vec![
                 crate::state::WeightedLane { idx: 0, weight: 1 },
@@ -3202,143 +3193,76 @@ mod tests {
             ],
             req_body.into(),
             None,
+            "leastbad",
         )
         .await;
 
-        // LeastBad should route to the soonest member (not return 503)
-        assert_eq!(response.status().as_u16(), 503);
+        // LeastBad actually serves (200), not a 503 stub.
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "LeastBad must actually route to the degraded member, not return 503"
+        );
 
-        server.shutdown().await;
+        // And it must be the SOONEST member (lane 1), not lane 0.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("lane1"),
+            "soonest-cooldown member (lane1) should serve; got: {body_str}"
+        );
+        assert!(
+            !body_str.contains("lane0"),
+            "must NOT route to the farther-cooldown member (lane0); got: {body_str}"
+        );
+
+        server0.shutdown().await;
+        server1.shutdown().await;
     }
 
-    /// B-403b: FallbackPool loop guard - A→B→A config terminates with 503.
+    /// B-403b: FallbackPool loop guard — an A→B→A config (pool_a→pool_b→pool_a), every member
+    /// tripped, must TERMINATE via the visited-set and return 503 rather than recursing forever.
+    /// This is the safety-critical test for multi-level fallback chains.
     #[tokio::test]
     async fn test_fallback_pool_loop_guard() {
+        use crate::store::now as store_now;
+
+        // No upstream is ever reached (all pools exhausted); the server only supplies base_urls.
         let state = Arc::new(MockServerState::new());
-
-        // Push rate limit for all lanes (to trip everything)
-        for _i in 0..4 {
-            state.push(MockResponse::RateLimit {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                provider_signal: Some("1302"),
-            });
-        }
-
         let server = MockServer::new(state.clone()).await;
 
-        // Pool A lanes (0, 1)
-        let lane_data_a0 = LaneData {
+        let t0 = store_now();
+        // All lanes Open (future cooldown → unusable): pool_a {0,1}, pool_b {2,3}.
+        let tripped = || LaneData {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             max: 10,
             sem: Arc::new(tokio::sync::Semaphore::new(10)),
             limited: false,
             budget: -1,
-            cooldown_until: 0,
-            streak: 0,
+            cooldown_until: t0 + 600,
+            streak: 3,
             dead: false,
             dead_reason: String::new(),
             inflight: 0,
             ok: 0,
-            err: 0,
+            err: 5,
             client_fault: 0,
         };
 
-        let lane_data_a1 = LaneData {
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            inflight: 0,
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-
-        // Pool B lanes (2, 3)
-        let lane_data_b0 = LaneData {
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            inflight: 0,
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-
-        let lane_data_b1 = LaneData {
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            inflight: 0,
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-
-        let lane_a0 = Lane {
+        let mk_lane = |key: &str| Lane {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             base_url: server.base_url(),
-            api_key: "key-a0".to_string(),
-            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-        };
-
-        let lane_a1 = Lane {
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            base_url: server.base_url(),
-            api_key: "key-a1".to_string(),
-            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-        };
-
-        let lane_b0 = Lane {
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            base_url: server.base_url(),
-            api_key: "key-b0".to_string(),
-            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-        };
-
-        let lane_b1 = Lane {
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            base_url: server.base_url(),
-            api_key: "key-b1".to_string(),
+            api_key: key.to_string(),
             protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
-
-        // Pool A - lanes 0 and 1
         let pools = HashMap::from([(
             "pool_a".to_string(),
             vec![
@@ -3346,8 +3270,6 @@ mod tests {
                 crate::state::WeightedLane { idx: 1, weight: 1 },
             ],
         )]);
-
-        // Pool B - lanes 2 and 3
         let mut fallback_pools = HashMap::new();
         fallback_pools.insert(
             "pool_b".to_string(),
@@ -3356,8 +3278,7 @@ mod tests {
                 crate::state::WeightedLane { idx: 3, weight: 1 },
             ],
         );
-
-        // Configure A→B→A loop: pool_a falls back to pool_b, pool_b falls back to pool_a
+        // A→B→A: pool_a falls back to pool_b, pool_b falls back to pool_a.
         let mut on_exhausted_cfgs = HashMap::new();
         on_exhausted_cfgs.insert(
             "pool_a".to_string(),
@@ -3370,13 +3291,18 @@ mod tests {
 
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let store = Arc::new(InMemoryStore::new(vec![
-            lane_data_a0,
-            lane_data_a1,
-            lane_data_b0,
-            lane_data_b1,
+            tripped(),
+            tripped(),
+            tripped(),
+            tripped(),
         ]));
         let app = Arc::new(App {
-            lanes: vec![lane_a0, lane_a1, lane_b0, lane_b1],
+            lanes: vec![
+                mk_lane("key-a0"),
+                mk_lane("key-a1"),
+                mk_lane("key-b0"),
+                mk_lane("key-b1"),
+            ],
             store,
             by_model,
             pools,
@@ -3394,27 +3320,8 @@ mod tests {
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
-        // Trip all lanes in pool_a first
-        for _i in 0..3 {
-            let _resp = forward(
-                app.clone(),
-                vec![
-                    crate::state::WeightedLane { idx: 0, weight: 1 },
-                    crate::state::WeightedLane { idx: 1, weight: 1 },
-                ],
-                req_body.clone().into(),
-                None,
-            )
-            .await;
-        }
-
-        // Now try pool_a - should:
-        // 1. Exhaust pool_a
-        // 2. Fall back to pool_b (mark pool_a as visited)
-        // 3. Exhaust pool_b
-        // 4. Try to fall back to pool_a but detect loop (pool_a already in visited set)
-        // 5. Return 503 without infinite recursion
-        let response = forward(
+        // pool_a exhausted → pool_b (marked) → pool_a (marked) → pool_b detected visited → 503.
+        let response = forward_with_pool(
             app.clone(),
             vec![
                 crate::state::WeightedLane { idx: 0, weight: 1 },
@@ -3422,11 +3329,144 @@ mod tests {
             ],
             req_body.into(),
             None,
+            "pool_a",
         )
         .await;
 
-        // Should terminate with 503 (loop guard triggered)
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "A→B→A fallback chain must terminate with 503 via the visited-set loop guard"
+        );
+
+        server.shutdown().await;
+    }
+
+    /// B-403b: FallbackPool actually ROUTES — primary pool all tripped, mode=FallbackPool,
+    /// the backup pool has a healthy member, and the request is genuinely SERVED (200) by the
+    /// backup, not a 503-with-header stub. This is the test B-403 skipped.
+    #[tokio::test]
+    async fn test_fallback_pool_routes_to_backup() {
+        use crate::store::now as store_now;
+
+        // Backup member (lane 2) returns a recognizable success body.
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({ "served_by": "backup", "content": [] }),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        let t0 = store_now();
+        // Primary lanes 0,1 tripped (Open); backup lane 2 healthy.
+        let tripped = || LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: t0 + 600,
+            streak: 3,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 5,
+            client_fault: 0,
+        };
+        let healthy = LaneData {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 10,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let mk_lane = |key: &str| Lane {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: key.to_string(),
+            protocol: ProtocolKind::Anthropic(AnthropicProtocol::new()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let by_model = HashMap::from([("test-model".to_string(), 0)]);
+        let pools = HashMap::from([(
+            "primary".to_string(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+        )]);
+        let mut fallback_pools = HashMap::new();
+        fallback_pools.insert(
+            "backup".to_string(),
+            vec![crate::state::WeightedLane { idx: 2, weight: 1 }],
+        );
+        let mut on_exhausted_cfgs = HashMap::new();
+        on_exhausted_cfgs.insert(
+            "primary".to_string(),
+            crate::config::OnExhausted::FallbackPool("backup".to_string()),
+        );
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![tripped(), tripped(), healthy]));
+        let app = Arc::new(App {
+            lanes: vec![mk_lane("key-0"), mk_lane("key-1"), mk_lane("key-2")],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools,
+            on_exhausted_cfgs,
+        });
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+
+        let response = forward_with_pool(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+            req_body.into(),
+            None,
+            "primary",
+        )
+        .await;
+
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "primary exhausted → request must be actually served by the backup pool"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("backup"),
+            "response must come from the backup member; got: {body_str}"
+        );
 
         server.shutdown().await;
     }

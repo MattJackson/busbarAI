@@ -481,20 +481,24 @@ pub(crate) async fn forward_with_pool(
         let (i, permit) = match pick_among(&app, &cands, &mut request_ctx).await {
             Some(x) => x,
             None => {
-                if !request_ctx.excluded.is_empty() && request_ctx.excluded.len() >= cands.len() {
-                    // All lanes exhausted - apply configured exhaustion mode with loop prevention
-                    return handle_exhaustion_for_pool(
-                        app.clone(),
-                        &cands,
-                        now(),
-                        pool_name,
-                        body,
-                        caller_token,
-                        &mut request_ctx,
-                    )
-                    .await;
+                if cands.is_empty() {
+                    // Pool has no members at all — nothing to do.
+                    return (StatusCode::SERVICE_UNAVAILABLE, "router: no usable lane")
+                        .into_response();
                 }
-                return (StatusCode::SERVICE_UNAVAILABLE, "router: no usable lane").into_response();
+                // No usable lane — whether the members were tripped before this request
+                // arrived or excluded during its failover attempts, apply the configured
+                // exhaustion mode (Status503 / FallbackPool / LeastBad) with loop prevention.
+                return handle_exhaustion_for_pool(
+                    app.clone(),
+                    &cands,
+                    now(),
+                    pool_name,
+                    body,
+                    caller_token,
+                    &mut request_ctx,
+                )
+                .await;
             }
         };
 
@@ -703,20 +707,21 @@ async fn handle_exhaustion_for_pool(
     caller_token: Option<&str>,
     request_ctx: &mut RequestCtx,
 ) -> Response {
-    // Look up pool-specific on_exhausted config, default to Status503 for unknown pools
-    let mode = if let Some(m) = app.on_exhausted_cfgs.get(pool_name) {
-        m.clone()
-    } else {
-        // Unknown pool name - use default
-        OnExhausted::Status503
-    };
+    // Look up pool-specific on_exhausted config, default to Status503 for unknown pools.
+    let mode = app
+        .on_exhausted_cfgs
+        .get(pool_name)
+        .cloned()
+        .unwrap_or(OnExhausted::Status503);
 
     match mode {
         OnExhausted::Status503 => handle_status_503(&app, cands, now),
         OnExhausted::FallbackPool(ref fallback_pool) => {
-            handle_fallback_pool(app, body, caller_token, fallback_pool, request_ctx).await
+            handle_fallback_pool(app.clone(), body, caller_token, fallback_pool, request_ctx).await
         }
-        OnExhausted::LeastBad => handle_least_bad(&app, cands, now),
+        OnExhausted::LeastBad => {
+            handle_least_bad(&app, cands, now, &body, caller_token, request_ctx).await
+        }
     }
 }
 
@@ -739,7 +744,93 @@ fn handle_status_503(app: &Arc<App>, cands: &[WeightedLane], now: u64) -> Respon
         .into_response()
 }
 
-/// FallbackPool mode: route to fallback pool with loop prevention via visited-set.
+/// Forward one request to a specific lane and relay the response. Shared by the degraded
+/// last-resort exhaustion paths (FallbackPool routing + LeastBad). Unlike the main forward
+/// loop these paths do NOT apply breaker disposition/failover classification — they relay
+/// whatever the upstream returns verbatim. On a pre-response transport error the lane's
+/// transient counter is recorded and `Err(())` is returned so the caller can try another
+/// candidate (or give up). The concurrency `permit` is held for the lifetime of a streamed
+/// success body (B-201 invariant) and dropped on error.
+async fn forward_once(
+    app: &Arc<App>,
+    i: usize,
+    permit: Permit,
+    body: &Bytes,
+    caller_token: Option<&str>,
+    timeout_secs: u64,
+) -> Result<Response, ()> {
+    // Re-parse body for per-lane model rewriting.
+    let mut v: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok((StatusCode::BAD_REQUEST, format!("router: bad json: {e}")).into_response());
+        }
+    };
+
+    let proto = &app.lanes[i].protocol;
+    proto.rewrite_model(&mut v, &app.lanes[i].model);
+    let payload = serde_json::to_vec(&v).unwrap();
+    let base = &app.lanes[i].base_url;
+
+    // Mode-aware key selection: passthrough uses caller token, others use lane's api_key.
+    let key = match app.auth_mode {
+        crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(&app.lanes[i].api_key),
+        crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
+    };
+
+    let res = app
+        .client
+        .post(format!("{base}{}", proto.upstream_path()))
+        .headers(convert_headers(proto.auth_headers(key)))
+        .header(CONTENT_TYPE, "application/json")
+        .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
+        .body(payload)
+        .send()
+        .await;
+
+    match res {
+        Ok(r) => {
+            let status = r.status();
+            let ct = r.headers().get(CONTENT_TYPE).cloned();
+
+            if !status.is_success() {
+                // Degraded path: relay the upstream error verbatim (no classification).
+                let bytes = r.bytes().await.unwrap_or_default();
+                let mut rb = Response::builder().status(status);
+                if let Some(ct) = ct {
+                    rb = rb.header(CONTENT_TYPE, ct);
+                }
+                return Ok(rb.body(Body::from(bytes)).unwrap());
+            }
+
+            // SUCCESS: stream the response body incrementally (permit held for stream life).
+            let is_sse = ct
+                .as_ref()
+                .map(|h| h.to_str().unwrap_or("").starts_with("text/event-stream"))
+                .unwrap_or(false);
+            let upstream_stream = r.bytes_stream();
+            let guarded_body = FirstByteBody::new(upstream_stream, is_sse, permit, app.clone(), i);
+            let mut rb = Response::builder().status(status);
+            if let Some(ct) = ct {
+                rb = rb.header(CONTENT_TYPE, ct);
+            }
+            Ok(rb.body(guarded_body.into_body()).unwrap())
+        }
+        Err(e) => {
+            // Pre-response transport error: record transient, drop permit, signal "try next".
+            let err_type = if e.is_timeout() { "timeout" } else { "connect" };
+            app.store.record_transient(i, err_type, None);
+            drop(permit);
+            Err(())
+        }
+    }
+}
+
+/// FallbackPool mode: actually route the request to a configured fallback pool's healthy
+/// member. Supports multi-level chains (A→B→C): when the fallback pool is itself exhausted
+/// it consults THAT pool's own `on_exhausted` config and re-enters. The `visited_pools` set
+/// in `RequestCtx` is the loop guard — a chain that cycles back to an already-visited pool
+/// (A→B→A) terminates with 503 instead of recursing forever.
 async fn handle_fallback_pool(
     app: Arc<App>,
     body: Bytes,
@@ -747,163 +838,104 @@ async fn handle_fallback_pool(
     pool_name: &str,
     request_ctx: &mut RequestCtx,
 ) -> Response {
-    // Check deadline first (propagated across hops)
+    // Deadline propagated across hops.
     if request_ctx.expired(now()) {
         return (StatusCode::SERVICE_UNAVAILABLE, "router: deadline exceeded").into_response();
     }
 
-    // Loop prevention: check if we've already tried this pool (A→B→A guard)
+    // Loop guard: if this request already routed through this pool, stop (A→B→A).
     if request_ctx.is_pool_visited(pool_name) {
         return handle_status_503(&app, &[], now());
     }
 
-    let Some(fallback_cands) = app.fallback_pools.get(pool_name) else {
-        // Fallback pool not found - cascade to Status503
+    let Some(fallback_cands) = app.fallback_pools.get(pool_name).cloned() else {
+        // Fallback pool not configured — cascade to Status503.
         return handle_status_503(&app, &[], now());
     };
 
-    // Mark current pool as visited before re-entering selection loop
+    // Mark before re-entering so a cycle back to this pool is detected.
     request_ctx.mark_pool_visited(pool_name);
 
-    // Loop over candidates in fallback pool (non-recursive)
-    let mut attempts = 0;
-    let max_attempts = fallback_cands.len();
-
-    while attempts < max_attempts {
-        attempts += 1;
-
-        // Check deadline before each attempt
+    // Try the fallback pool's members (concurrency-aware, accumulating exclusions across hops).
+    loop {
         if request_ctx.expired(now()) {
             return (StatusCode::SERVICE_UNAVAILABLE, "router: deadline exceeded").into_response();
         }
 
-        let Some((i, permit)) = pick_among(&app, fallback_cands, request_ctx).await else {
-            // No more candidates in fallback pool - cascade to Status503
-            return handle_status_503(&app, fallback_cands, now());
+        let Some((i, permit)) = pick_among(&app, &fallback_cands, request_ctx).await else {
+            // Fallback pool itself exhausted — consult ITS on_exhausted config (multi-level
+            // chains). The visited-set guarantees this recursion terminates.
+            return Box::pin(handle_exhaustion_for_pool(
+                app.clone(),
+                &fallback_cands,
+                now(),
+                pool_name,
+                body,
+                caller_token,
+                request_ctx,
+            ))
+            .await;
         };
 
-        // Mark this lane as excluded for future attempts
         request_ctx.exclude(i);
 
-        // Re-parse body (we need the Value for model rewriting)
-        let mut v: Value = match serde_json::from_slice(&body) {
-            Ok(v) => v,
-            Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("router: bad json: {e}")).into_response();
-            }
-        };
-
-        let proto = &app.lanes[i].protocol;
-        proto.rewrite_model(&mut v, &app.lanes[i].model);
-        let payload = serde_json::to_vec(&v).unwrap();
-        let base = &app.lanes[i].base_url;
-
-        // Mode-aware key selection: passthrough uses caller token, others use lane's api_key
-        let key = match app.auth_mode {
-            crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(&app.lanes[i].api_key),
-            crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
-        };
-
-        let res = app
-            .client
-            .post(format!("{base}{}", proto.upstream_path()))
-            .headers(convert_headers(proto.auth_headers(key)))
-            .header(CONTENT_TYPE, "application/json")
-            .timeout(std::time::Duration::from_secs(
-                request_ctx.remaining(now()).max(1),
-            ))
-            .body(payload)
-            .send()
-            .await;
-
-        match res {
-            Ok(r) => {
-                let status = r.status();
-                if !status.is_success() {
-                    // Handle errors similarly to main forward loop
-                    let ct = r.headers().get(CONTENT_TYPE).cloned();
-                    let bytes = r.bytes().await.unwrap_or_default();
-
-                    use axum::body::Body;
-                    let mut rb = Response::builder().status(status);
-                    if let Some(ct) = ct {
-                        rb = rb.header(CONTENT_TYPE, ct);
-                    }
-                    return rb.body(Body::from(bytes)).unwrap();
-                }
-
-                // SUCCESS: stream the response body incrementally
-                let ct = r.headers().get(CONTENT_TYPE).cloned();
-                let is_sse = ct
-                    .as_ref()
-                    .map(|h| h.to_str().unwrap_or("").starts_with("text/event-stream"))
-                    .unwrap_or(false);
-
-                let upstream_stream = r.bytes_stream();
-                let guarded_body =
-                    FirstByteBody::new(upstream_stream, is_sse, permit, app.clone(), i);
-                let axum_body = guarded_body.into_body();
-
-                let mut rb = Response::builder().status(status);
-                if let Some(ct) = ct {
-                    rb = rb.header(CONTENT_TYPE, ct);
-                }
-                return rb.body(axum_body).unwrap();
-            }
-            Err(e) => {
-                // Pre-response error: record and continue to next candidate in fallback pool
-                let err_type = if e.is_timeout() { "timeout" } else { "connect" };
-                app.store.record_transient(i, err_type, None);
-                drop(permit);
-                // Continue loop to try next candidate
-            }
+        match forward_once(
+            &app,
+            i,
+            permit,
+            &body,
+            caller_token,
+            request_ctx.remaining(now()),
+        )
+        .await
+        {
+            Ok(resp) => return resp,
+            Err(()) => continue, // transient transport error → try next member
         }
     }
-
-    // All candidates exhausted - cascade to Status503
-    handle_status_503(&app, fallback_cands, now())
 }
 
-/// LeastBad mode: send to soonest-cooldown member even though Open.
-fn handle_least_bad(app: &Arc<App>, cands: &[WeightedLane], now: u64) -> Response {
-    if let Some(soonest_idx) = find_soonest_cooldown(&app.store, cands, now) {
-        eprintln!(
-            "[WARN] B-403: LEAST-BAD MODE - routing to degraded member {} (cooldown: {}s remaining)",
-            soonest_idx,
-            app.store.cooldown_remaining(soonest_idx, now)
-        );
+/// LeastBad mode: actually route to the soonest-cooldown member even though it is Open
+/// ("least-bad last resort"). Bypasses the breaker's usability check and acquires the
+/// member's concurrency permit directly, then makes a single attempt (no failover from a
+/// last-resort path). Logs loudly that this is a degraded route. Falls back to Status503 if
+/// there is no candidate, the permit is unavailable, or the upstream is unreachable.
+async fn handle_least_bad(
+    app: &Arc<App>,
+    cands: &[WeightedLane],
+    now: u64,
+    body: &Bytes,
+    caller_token: Option<&str>,
+    request_ctx: &RequestCtx,
+) -> Response {
+    let Some(soonest_idx) = find_soonest_cooldown(&app.store, cands, now) else {
+        // No candidates at all - fall back to Status503.
+        return handle_status_503(app, cands, now);
+    };
 
-        // Note: Full implementation would need to construct and send request here.
-        // For now, return 503 with note about degraded path.
+    eprintln!(
+        "[WARN] B-403: LEAST-BAD MODE — routing to degraded member {} (cooldown {}s remaining)",
+        soonest_idx,
+        app.store.cooldown_remaining(soonest_idx, now)
+    );
 
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [
-                (axum::http::header::CONTENT_TYPE, "text/plain".to_string()),
-                (
-                    axum::http::HeaderName::from_static("x-least-bad-member"),
-                    soonest_idx.to_string(),
-                ),
-            ],
-            format!(
-                "router: least-bad routing to member {} (degraded)",
-                soonest_idx
-            ),
-        )
-            .into_response()
-    } else {
-        // No candidates at all - fall back to Status503
-        handle_status_503(app, cands, now)
-    }
-}
+    // Bypass breaker usability for the last-resort path; grab the concurrency permit directly.
+    let Some(permit) = app.store.try_acquire(soonest_idx) else {
+        return handle_status_503(app, cands, now);
+    };
 
-#[cfg(test)]
-mod helper_tests {
-    #[test]
-    fn test_helper_function_exists() {
-        // Verify the module compiles - actual testing done in config tests
-        let x = 1 + 1;
-        assert_eq!(x, 2);
+    match forward_once(
+        app,
+        soonest_idx,
+        permit,
+        body,
+        caller_token,
+        request_ctx.remaining(now),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(()) => handle_status_503(app, cands, now),
     }
 }
 
