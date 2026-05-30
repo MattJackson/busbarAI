@@ -240,13 +240,26 @@ struct FirstByteBody<S, P> {
     lane_idx: usize,
     /// B-203: Usage tap for extracting Anthropic SSE usage without buffering full body
     tap: UsageTap,
+    /// B-503b-2: when Some, translate each egress SSE chunk to the caller's ingress protocol.
+    /// None = native passthrough (same-protocol or non-SSE).
+    translate: Option<crate::proto::StreamTranslate>,
+    /// Set once the stream has fully ended (after any translation terminator), so a later poll
+    /// returns None instead of re-polling a finished inner stream.
+    ended: bool,
 }
 
 impl<S, P> FirstByteBody<S, P>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
-    fn new(inner: S, is_sse: bool, permit: P, app: Arc<App>, lane_idx: usize) -> Self {
+    fn new(
+        inner: S,
+        is_sse: bool,
+        permit: P,
+        app: Arc<App>,
+        lane_idx: usize,
+        translate: Option<crate::proto::StreamTranslate>,
+    ) -> Self {
         Self {
             inner,
             first_byte_sent: Arc::new(AtomicBool::new(false)),
@@ -255,6 +268,8 @@ where
             app: Some(app),
             lane_idx,
             tap: UsageTap::new(),
+            translate,
+            ended: false,
         }
     }
 
@@ -274,50 +289,74 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                if !this.first_byte_sent.load(Ordering::Relaxed) {
-                    this.first_byte_sent.store(true, Ordering::Relaxed);
-                }
-                // B-203: Feed chunk to tap for usage extraction (non-buffering)
-                this.tap.feed(&chunk);
-                Poll::Ready(Some(Ok(chunk)))
-            }
-            Poll::Ready(Some(Err(e))) => {
-                let had_first = this.first_byte_sent.load(Ordering::Relaxed);
-                if had_first && this.is_sse {
-                    // Mid-stream failure after first byte in SSE mode: record breaker failure then emit SSE error event
-                    if let Some(ref app) = this.app {
-                        app.store
-                            .record_transient(this.lane_idx, "mid-stream", None);
+        if this.ended {
+            return Poll::Ready(None);
+        }
+        // Loop so a translated chunk that yields no complete frame yet (partial) re-polls the
+        // inner stream instead of emitting an empty chunk to the client.
+        loop {
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    if !this.first_byte_sent.load(Ordering::Relaxed) {
+                        this.first_byte_sent.store(true, Ordering::Relaxed);
                     }
-                    let err_json = serde_json::json!({
-                        "type": "error",
-                        "error": {
-                            "message": e.to_string(),
-                            "source": "upstream"
+                    // B-203: Feed chunk to tap for usage extraction (non-buffering)
+                    this.tap.feed(&chunk);
+                    // B-503b-2: cross-protocol → translate egress SSE bytes to the ingress format.
+                    if let Some(t) = this.translate.as_mut() {
+                        let out = t.feed(&chunk);
+                        if out.is_empty() {
+                            continue; // only a partial frame buffered; poll inner again
                         }
-                    });
-                    let sse_error = format!("event: error\ndata: {}\n\n", err_json);
-                    Poll::Ready(Some(Ok(Bytes::from(sse_error))))
-                } else {
-                    // Before first byte or non-SSE: propagate error (allows failover at caller level)
-                    Poll::Ready(Some(Err(std::io::Error::other(e.to_string()))))
+                        return Poll::Ready(Some(Ok(Bytes::from(out))));
+                    }
+                    return Poll::Ready(Some(Ok(chunk)));
                 }
-            }
-
-            Poll::Ready(None) => {
-                // Stream ended - for SSE streams that sent at least one byte, record the failure
-                if this.is_sse && this.first_byte_sent.load(Ordering::Relaxed) {
-                    if let Some(ref app) = this.app {
-                        app.store
-                            .record_transient(this.lane_idx, "mid-stream-end", None);
+                Poll::Ready(Some(Err(e))) => {
+                    let had_first = this.first_byte_sent.load(Ordering::Relaxed);
+                    if had_first && this.is_sse {
+                        // Mid-stream failure after first byte in SSE mode: record breaker failure then emit SSE error event
+                        if let Some(ref app) = this.app {
+                            app.store
+                                .record_transient(this.lane_idx, "mid-stream", None);
+                        }
+                        let err_json = serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "message": e.to_string(),
+                                "source": "upstream"
+                            }
+                        });
+                        let sse_error = format!("event: error\ndata: {}\n\n", err_json);
+                        return Poll::Ready(Some(Ok(Bytes::from(sse_error))));
+                    } else {
+                        // Before first byte or non-SSE: propagate error (allows failover at caller level)
+                        return Poll::Ready(Some(Err(std::io::Error::other(e.to_string()))));
                     }
                 }
-                drop(this.permit.take());
-                Poll::Ready(None)
+                Poll::Ready(None) => {
+                    // Stream ended - for SSE streams that sent at least one byte, record the failure
+                    if this.is_sse && this.first_byte_sent.load(Ordering::Relaxed) {
+                        if let Some(ref app) = this.app {
+                            app.store
+                                .record_transient(this.lane_idx, "mid-stream-end", None);
+                        }
+                    }
+                    // B-503b-2: emit the ingress terminator (e.g. OpenAI `data: [DONE]`) before close.
+                    let done = this
+                        .translate
+                        .as_mut()
+                        .map(|t| t.finish())
+                        .unwrap_or_default();
+                    drop(this.permit.take());
+                    this.ended = true;
+                    if !done.is_empty() {
+                        return Poll::Ready(Some(Ok(Bytes::from(done))));
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -717,9 +756,18 @@ pub(crate) async fn forward_with_pool(
                     .unwrap_or(false);
 
                 // B-202: Use FirstByteBody wrapper to track first byte and emit SSE error events on mid-stream failures
+                // B-503b-2: on a cross-protocol SSE response, translate egress frames → ingress frames.
+                let translate = if is_sse {
+                    crate::proto::StreamTranslate::new(
+                        ingress_protocol,
+                        app.lanes[i].protocol.name(),
+                    )
+                } else {
+                    None
+                };
                 let upstream_stream = r.bytes_stream();
                 let guarded_body =
-                    FirstByteBody::new(upstream_stream, is_sse, permit, app.clone(), i);
+                    FirstByteBody::new(upstream_stream, is_sse, permit, app.clone(), i, translate);
                 let axum_body = guarded_body.into_body();
 
                 let mut rb = Response::builder().status(status);
@@ -883,7 +931,9 @@ async fn forward_once(
                 .map(|h| h.to_str().unwrap_or("").starts_with("text/event-stream"))
                 .unwrap_or(false);
             let upstream_stream = r.bytes_stream();
-            let guarded_body = FirstByteBody::new(upstream_stream, is_sse, permit, app.clone(), i);
+            // Degraded fallback/least-bad path: no cross-protocol translation here (B-503b scope).
+            let guarded_body =
+                FirstByteBody::new(upstream_stream, is_sse, permit, app.clone(), i, None);
             let mut rb = Response::builder().status(status);
             if let Some(ct) = ct {
                 rb = rb.header(CONTENT_TYPE, ct);

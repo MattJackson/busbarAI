@@ -111,6 +111,7 @@ impl MockServer {
     pub(crate) async fn new(state: std::sync::Arc<MockServerState>) -> Self {
         let app = Router::new()
             .route("/v1/messages", any(mock_handler))
+            .route("/v1/chat/completions", any(mock_handler))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4433,6 +4434,114 @@ mod tests {
         .await;
 
         assert_eq!(response.status().as_u16(), 200);
+
+        server.shutdown().await;
+    }
+
+    /// B-503b-2: cross-protocol STREAMING response translation end-to-end. An OpenAI egress lane
+    /// streams OpenAI chunks; an Anthropic-ingress caller must receive ANTHROPIC SSE `event:`
+    /// frames (translated on the wire), not raw OpenAI chunks.
+    #[tokio::test]
+    async fn test_b503b2_cross_protocol_stream_openai_lane_to_anthropic_client() {
+        use std::collections::HashMap;
+
+        let state = Arc::new(MockServerState::new());
+        // OpenAI egress lane streams chat.completion.chunks (handler wraps each as `data: ...`).
+        state.push(MockResponse::Sse {
+            events: vec![
+                r#"{"choices":[{"delta":{"role":"assistant"}}]}"#.to_string(),
+                r#"{"choices":[{"delta":{"content":"hi"}}]}"#.to_string(),
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#.to_string(),
+            ],
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        let lane_data = LaneData {
+            model: "m".to_string(),
+            provider: "openai-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+        let lane = Lane {
+            model: "m".to_string(),
+            provider: "openai-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "k".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::openai()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+        let app = Arc::new(App {
+            lanes: vec![lane],
+            store,
+            by_model: HashMap::from([("m".to_string(), 0)]),
+            pools: HashMap::new(),
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        // Anthropic-format streaming request; egress lane is openai → response stream translated back.
+        let anthropic_body =
+            json!({"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true});
+        let response = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            anthropic_body.to_string().into(),
+            None,
+            "m",
+            None,
+            "anthropic",
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&body);
+        // The Anthropic-ingress client must receive ANTHROPIC event: frames, translated on the wire.
+        assert!(
+            s.contains("event: message_start"),
+            "missing anthropic message_start; got: {s}"
+        );
+        assert!(
+            s.contains("event: content_block_delta"),
+            "missing content_block_delta; got: {s}"
+        );
+        assert!(
+            s.contains("text_delta") && s.contains("hi"),
+            "missing translated text 'hi'; got: {s}"
+        );
+        assert!(
+            s.contains("event: message_stop"),
+            "missing message_stop; got: {s}"
+        );
+        // And must NOT leak the raw OpenAI egress framing.
+        assert!(
+            !s.contains("chat.completion.chunk"),
+            "raw OpenAI chunks leaked to client; got: {s}"
+        );
 
         server.shutdown().await;
     }
