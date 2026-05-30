@@ -243,11 +243,11 @@ pub(crate) struct FailoverCfg {
 }
 
 fn default_failover_deadline() -> u64 {
-    5
+    120
 }
 
 fn default_cap() -> usize {
-    usize::MAX
+    3
 }
 
 #[allow(dead_code)] // v1 schema fields defined but not yet wired (B-4xx routing)

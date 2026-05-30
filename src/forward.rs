@@ -332,14 +332,72 @@ impl<S, P> FirstByteBody<S, P> {
     }
 }
 
-/// B-401: pick_among using weighted selection (SWRR) over healthy subset.
+/// Context for request lifecycle: deadline and accumulated exclusions.
+#[derive(Debug, Clone)]
+struct RequestCtx {
+    /// Computed once at start; each hop checks remaining time against this.
+    deadline: u64,
+    /// Accumulated excluded lane indices across hops (already tried).
+    excluded: std::collections::HashSet<usize>,
+}
+
+impl RequestCtx {
+    fn new(deadline_secs: u64) -> Self {
+        let start = now();
+        Self {
+            deadline: start.saturating_add(deadline_secs),
+            excluded: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Check if deadline has been exceeded.
+    fn expired(&self, now: u64) -> bool {
+        now >= self.deadline
+    }
+
+    /// Remaining time until deadline in seconds.
+    fn remaining(&self, now: u64) -> u64 {
+        if now >= self.deadline {
+            0
+        } else {
+            self.deadline - now
+        }
+    }
+
+    /// Add a lane to the exclusion set (mark as already tried).
+    fn exclude(&mut self, idx: usize) {
+        self.excluded.insert(idx);
+    }
+
+    /// Get candidate indices minus exclusions.
+    fn filter_candidates<'a>(&self, cands: &'a [WeightedLane]) -> Vec<&'a WeightedLane> {
+        cands
+            .iter()
+            .filter(|wl| !self.excluded.contains(&wl.idx))
+            .collect()
+    }
+}
+
+/// B-401 / B-402: pick_among using weighted selection (SWRR) over healthy subset.
 /// `cands` is now Vec<WeightedLane> where each lane has its weight from config.
-async fn pick_among(app: &Arc<App>, cands: &[WeightedLane]) -> Option<(usize, Permit)> {
+/// `request_ctx` provides accumulated exclusions to avoid retrying failed lanes.
+async fn pick_among(
+    app: &Arc<App>,
+    cands: &[WeightedLane],
+    request_ctx: &mut RequestCtx,
+) -> Option<(usize, Permit)> {
     let t = now();
 
+    // Filter out already-tried lanes (accumulated exclusions across hops)
+    let filtered_cands = request_ctx.filter_candidates(cands);
+
+    if filtered_cands.is_empty() {
+        return None;
+    }
+
     // Extract lane indices and weights for select_weighted call
-    let candidates: Vec<usize> = cands.iter().map(|wl| wl.idx).collect();
-    let weights: Vec<u32> = cands.iter().map(|wl| wl.weight).collect();
+    let candidates: Vec<usize> = filtered_cands.iter().map(|wl| wl.idx).collect();
+    let weights: Vec<u32> = filtered_cands.iter().map(|wl| wl.weight).collect();
 
     // Use SWRR selection over healthy members only (B-401)
     let picked_lane_idx = app.store.select_weighted(&candidates, &weights, t)?;
@@ -379,14 +437,37 @@ pub(crate) async fn forward(
     // - Record the breaker failure for that lane (the member tripped)
     // The client must restart the request itself after receiving the error event.
 
-    let attempts = cands.len() + 2;
-    for _attempt in 0..attempts {
-        let (i, permit) = match pick_among(&app, &cands).await {
+    // B-402: Get failover config from app
+    let (deadline_secs, max_cap) = if let Some(ref f) = app.failover_cfg {
+        (f.deadline_secs, f.cap)
+    } else {
+        (120, 3) // defaults: deadline_s=120, max_failover=3
+    };
+
+    let mut request_ctx = RequestCtx::new(deadline_secs);
+
+    for _attempt in 0..=max_cap {
+        // Check deadline first (propagated across hops)
+        if request_ctx.expired(now()) {
+            return (StatusCode::SERVICE_UNAVAILABLE, "router: deadline exceeded").into_response();
+        }
+
+        let (i, permit) = match pick_among(&app, &cands, &mut request_ctx).await {
             Some(x) => x,
             None => {
-                return (StatusCode::SERVICE_UNAVAILABLE, "router: no usable lane").into_response()
+                if !request_ctx.excluded.is_empty() && request_ctx.excluded.len() >= cands.len() {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "router: all lanes exhausted",
+                    )
+                        .into_response();
+                }
+                return (StatusCode::SERVICE_UNAVAILABLE, "router: no usable lane").into_response();
             }
         };
+
+        // Mark this lane as excluded for future attempts in this request
+        request_ctx.exclude(i);
 
         let proto = &app.lanes[i].protocol;
         proto.rewrite_model(&mut v, &app.lanes[i].model);
@@ -404,6 +485,9 @@ pub(crate) async fn forward(
             .post(format!("{base}{}", proto.upstream_path()))
             .headers(convert_headers(proto.auth_headers(key)))
             .header(CONTENT_TYPE, "application/json")
+            .timeout(std::time::Duration::from_secs(
+                request_ctx.remaining(now()).max(1),
+            )) // min 1s timeout
             .body(payload)
             .send()
             .await;

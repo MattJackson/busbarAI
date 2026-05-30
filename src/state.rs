@@ -91,4 +91,7 @@ pub(crate) struct App {
     pub(crate) client: Client,
     pub(crate) auth: Arc<crate::auth::AuthMiddleware>,
     pub(crate) auth_mode: crate::auth::AuthMode,
+    /// B-402: Default failover config (deadline_s and max_failover cap).
+    #[allow(dead_code)] // Used by forward.rs for default policy
+    pub(crate) failover_cfg: Option<crate::config::FailoverCfg>,
 }

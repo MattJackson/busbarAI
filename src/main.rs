@@ -153,23 +153,23 @@ async fn main() {
     }
 
     let mut pools = HashMap::new();
-    for (name, pool) in cfg.pools {
+    for (name, pool) in &cfg.pools {
         // Wire per-member weights from config into the pool structure (B-401).
         // Each pool member has a weight; default is 1 if not specified.
         let weighted_members: Vec<WeightedLane> = pool
             .members
             .iter()
             .map(|m| {
-                let lane_idx = *by_model
-                    .get(&m.target)
-                    .unwrap_or_else(|| panic!("pool {name} references unknown model {}", m.target));
+                let lane_idx = *by_model.get(&m.target).unwrap_or_else(|| {
+                    panic!("pool {} references unknown model {}", name, m.target)
+                });
                 WeightedLane {
                     idx: lane_idx,
                     weight: m.weight, // from config PoolMember.weight (default 1)
                 }
             })
             .collect();
-        pools.insert(name, weighted_members);
+        pools.insert(name.clone(), weighted_members);
     }
 
     eprintln!("busbar: {} models, {} pools", lanes.len(), pools.len());
@@ -200,6 +200,17 @@ async fn main() {
     let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg));
     let store = Arc::new(InMemoryStore::new(lanes_data.clone()));
 
+    // B-402: Extract default failover config (use first pool's config or defaults)
+    let failover_cfg =
+        cfg.pools
+            .values()
+            .find_map(|p| p.failover.clone())
+            .or(Some(crate::config::FailoverCfg {
+                deadline_secs: 120,
+                exclusions: None,
+                cap: 3,
+            }));
+
     let app = Arc::new(App {
         lanes,
         store,
@@ -213,6 +224,7 @@ async fn main() {
             .unwrap(),
         auth: auth_mw.clone(),
         auth_mode: auth_mw.mode,
+        failover_cfg,
     });
 
     let router = Router::new()
