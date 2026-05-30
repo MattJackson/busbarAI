@@ -163,6 +163,112 @@ pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
     }
 }
 
+/// B-503b: pure cross-protocol response-stream translator. Feed EGRESS-protocol SSE bytes,
+/// get the equivalent INGRESS-protocol SSE bytes — composing `egress.reader().read_response_events`
+/// (wire → IR, stateful fan-out) with `ingress.writer().write_response_event` (IR → wire). Holds
+/// a reassembly buffer for frames split across chunks and the IR decode state across the stream.
+/// The async wiring into the live stream path (FirstByteBody) is B-503b-2.
+#[allow(dead_code)] // wired into FirstByteBody by B-503b-2
+pub(crate) struct StreamTranslate {
+    ingress: Protocol,
+    egress: Protocol,
+    decode: crate::ir::StreamDecodeState,
+    buf: Vec<u8>,
+    /// ingress == "openai" → the stream must terminate with `data: [DONE]\n\n`.
+    emit_done: bool,
+}
+
+#[allow(dead_code)] // wired into FirstByteBody by B-503b-2
+impl StreamTranslate {
+    /// Build a translator for an ingress→egress pair. `None` if either protocol is unknown OR
+    /// ingress == egress (no translation needed — the caller does native passthrough).
+    pub(crate) fn new(ingress: &str, egress: &str) -> Option<Self> {
+        if ingress == egress {
+            return None;
+        }
+        Some(Self {
+            ingress: protocol_for(ingress)?,
+            egress: protocol_for(egress)?,
+            decode: crate::ir::StreamDecodeState::default(),
+            buf: Vec::new(),
+            emit_done: ingress == "openai",
+        })
+    }
+
+    /// Feed a chunk of EGRESS SSE bytes; return translated INGRESS SSE bytes for whatever
+    /// COMPLETE frames are now available (empty if only a partial frame is buffered).
+    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.buf.extend_from_slice(chunk);
+        let mut out: Vec<u8> = Vec::new();
+
+        // Drain every complete `\n\n`-delimited frame currently buffered.
+        while let Some(pos) = self.buf.windows(2).position(|w| w == b"\n\n") {
+            let end = pos + 2;
+            let frame: Vec<u8> = self.buf.drain(..end).collect();
+
+            let Some((event_type, data_str)) = parse_sse_frame(&frame) else {
+                continue; // no data: line, or non-utf8 — skip
+            };
+            if data_str.is_empty() || data_str == "[DONE]" {
+                continue; // egress terminator/keepalive — ingress terminator is finish()'s job
+            }
+            let Ok(data) = serde_json::from_str::<serde_json::Value>(&data_str) else {
+                continue; // malformed data JSON — skip the frame rather than abort the stream
+            };
+
+            for ev in
+                self.egress
+                    .reader()
+                    .read_response_events(&event_type, &data, &mut self.decode)
+            {
+                if let Some((out_et, out_data)) = self.ingress.writer().write_response_event(&ev) {
+                    out.extend_from_slice(reframe_sse(&out_et, &out_data).as_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Call once at end-of-stream. Returns the INGRESS terminator (OpenAI → `data: [DONE]\n\n`,
+    /// Anthropic → empty: its `message_stop` event already carries termination).
+    pub(crate) fn finish(&mut self) -> Vec<u8> {
+        if self.emit_done {
+            b"data: [DONE]\n\n".to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Parse one SSE frame into `(event_type, data_payload)`. `event_type` is "" when the frame has
+/// no `event:` line (OpenAI style). Returns `None` if there is no `data:` line or invalid UTF-8.
+fn parse_sse_frame(frame: &[u8]) -> Option<(String, String)> {
+    let text = std::str::from_utf8(frame).ok()?;
+    let mut event_type = String::new();
+    let mut data = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("event:") {
+            event_type = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            data = rest.trim().to_string();
+        }
+    }
+    if data.is_empty() && event_type.is_empty() {
+        return None;
+    }
+    Some((event_type, data))
+}
+
+/// Re-frame an IR-derived `(event_type, data)` as INGRESS SSE bytes. A non-empty `event_type`
+/// yields Anthropic-style `event:`/`data:` frames; an empty one yields OpenAI-style bare `data:`.
+fn reframe_sse(event_type: &str, data: &serde_json::Value) -> String {
+    if event_type.is_empty() {
+        format!("data: {data}\n\n")
+    } else {
+        format!("event: {event_type}\ndata: {data}\n\n")
+    }
+}
+
 /// Anthropic reader implementation (migrated from `Protocol::extract_error` and `classify`).
 #[derive(Clone)]
 pub(crate) struct AnthropicReader;
@@ -3711,5 +3817,146 @@ mod stream_fanout_tests {
             reader.read_response_events("ping", &json!({}), &mut st),
             Vec::<IrStreamEvent>::new()
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_translate_tests {
+    use super::*;
+
+    /// Collect the JSON payloads of all `data:` lines (excluding `[DONE]`).
+    fn data_payloads(out: &str) -> Vec<serde_json::Value> {
+        out.lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .map(|s| s.trim())
+            .filter(|s| *s != "[DONE]")
+            .filter_map(|s| serde_json::from_str(s).ok())
+            .collect()
+    }
+
+    // anthropic egress stream → openai ingress: client receives OpenAI chat.completion.chunks.
+    #[test]
+    fn test_translate_anthropic_egress_to_openai_ingress() {
+        let mut t = StreamTranslate::new("openai", "anthropic").expect("translator");
+        let mut out = String::new();
+        for frame in [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            out.push_str(&String::from_utf8(t.feed(frame.as_bytes())).unwrap());
+        }
+        out.push_str(&String::from_utf8(t.finish()).unwrap());
+
+        assert!(
+            !out.contains("event:"),
+            "OpenAI output must have no event: lines; got {out}"
+        );
+        let payloads = data_payloads(&out);
+        assert!(
+            payloads.iter().any(|p| p
+                .pointer("/choices/0/delta/content")
+                .and_then(|v| v.as_str())
+                == Some("hi")),
+            "translated content 'hi' missing; got {out}"
+        );
+        assert!(
+            payloads.iter().any(|p| p
+                .pointer("/choices/0/finish_reason")
+                .and_then(|v| v.as_str())
+                == Some("stop")),
+            "finish_reason 'stop' missing; got {out}"
+        );
+        assert!(
+            out.trim_end().ends_with("data: [DONE]"),
+            "OpenAI stream must end with data: [DONE]; got {out}"
+        );
+    }
+
+    // openai egress stream → anthropic ingress: client receives Anthropic event: frames.
+    #[test]
+    fn test_translate_openai_egress_to_anthropic_ingress() {
+        let mut t = StreamTranslate::new("anthropic", "openai").expect("translator");
+        let mut out = String::new();
+        for frame in [
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            out.push_str(&String::from_utf8(t.feed(frame.as_bytes())).unwrap());
+        }
+        assert!(
+            t.finish().is_empty(),
+            "Anthropic ingress has no [DONE] terminator"
+        );
+        assert!(
+            out.contains("event: message_start"),
+            "missing message_start; got {out}"
+        );
+        assert!(
+            out.contains("event: content_block_delta"),
+            "missing content_block_delta; got {out}"
+        );
+        assert!(
+            out.contains("text_delta") && out.contains("hi"),
+            "missing text_delta 'hi'; got {out}"
+        );
+        assert!(
+            out.contains("event: message_stop"),
+            "missing message_stop; got {out}"
+        );
+    }
+
+    // A frame split across two feeds yields no output until complete, then translates.
+    #[test]
+    fn test_translate_split_frame_reassembly() {
+        let mut t = StreamTranslate::new("openai", "anthropic").expect("translator");
+        let frame = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
+        let (a, b) = frame.as_bytes().split_at(20);
+        assert!(t.feed(a).is_empty(), "partial frame must yield no output");
+        let s = String::from_utf8(t.feed(b)).unwrap();
+        assert!(
+            s.contains("\"content\":\"hi\""),
+            "completed frame must translate to openai content; got {s}"
+        );
+    }
+
+    // Cross-protocol tool-calling fidelity: openai tool_calls → anthropic tool_use survives.
+    #[test]
+    fn test_translate_tool_call_fidelity() {
+        let mut t = StreamTranslate::new("anthropic", "openai").expect("translator");
+        let mut out = String::new();
+        for frame in [
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"loc\\\":\\\"SF\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        ] {
+            out.push_str(&String::from_utf8(t.feed(frame.as_bytes())).unwrap());
+        }
+        assert!(
+            out.contains("content_block_start"),
+            "missing content_block_start; got {out}"
+        );
+        assert!(
+            out.contains("tool_use"),
+            "tool_use block type missing; got {out}"
+        );
+        assert!(
+            out.contains("get_weather") && out.contains("call_1"),
+            "tool name/id must survive cross-protocol; got {out}"
+        );
+        assert!(
+            out.contains("input_json_delta"),
+            "missing input_json_delta; got {out}"
+        );
+    }
+
+    #[test]
+    fn test_translate_same_protocol_is_none() {
+        assert!(StreamTranslate::new("openai", "openai").is_none());
+        assert!(StreamTranslate::new("anthropic", "anthropic").is_none());
     }
 }
