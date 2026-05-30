@@ -262,10 +262,7 @@ impl ProtocolReader for AnthropicReader {
             .get("max_tokens")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
-        let temperature = obj
-            .get("temperature")
-            .and_then(|v| v.as_f64())
-            .map(|v| v as f32);
+        let temperature = obj.get("temperature").and_then(|v| v.as_f64());
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Collect unmodeled top-level keys into extra
@@ -714,7 +711,7 @@ mod tests {
             ],
             "tools": [{"name": "get_weather", "description": "Get weather for a location", "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}}],
             "max_tokens": 4096,
-            "temperature": 0.699999988079071,
+            "temperature": 0.7,
             "stream": true,
             "top_p": 0.95
         })

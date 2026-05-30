@@ -12,7 +12,9 @@ pub(crate) struct IrRequest {
     pub messages: Vec<IrMessage>,
     pub tools: Vec<IrTool>,
     pub max_tokens: Option<u32>,
-    pub temperature: Option<f32>,
+    // f64 (not ADR-0005's f32): JSON numbers are f64; an f32 round-trip silently mutates a
+    // caller's temperature (0.7 → 0.699999988) — the exact lossiness busbar exists to avoid.
+    pub temperature: Option<f64>,
     pub stream: bool,
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
