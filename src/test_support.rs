@@ -4545,4 +4545,119 @@ mod tests {
 
         server.shutdown().await;
     }
+
+    /// B-503c-2: NON-streaming cross-protocol response translation end-to-end. An OpenAI egress
+    /// lane returns a chat.completion JSON; an Anthropic-ingress caller must receive an
+    /// Anthropic-shaped message (translated whole-response), not the raw OpenAI body.
+    #[tokio::test]
+    async fn test_b503c2_cross_protocol_nonstream_openai_lane_to_anthropic_client() {
+        use std::collections::HashMap;
+
+        let state = Arc::new(MockServerState::new());
+        // OpenAI egress lane returns a non-streaming chat.completion.
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        let lane_data = LaneData {
+            model: "m".to_string(),
+            provider: "openai-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+        let lane = Lane {
+            model: "m".to_string(),
+            provider: "openai-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "k".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::openai()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+        };
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
+        let app = Arc::new(App {
+            lanes: vec![lane],
+            store,
+            by_model: HashMap::from([("m".to_string(), 0)]),
+            pools: HashMap::new(),
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        // Anthropic-format NON-streaming request; egress lane is openai → response translated back.
+        let anthropic_body = json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
+        let response = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            anthropic_body.to_string().into(),
+            None,
+            "m",
+            None,
+            "anthropic",
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let got: serde_json::Value = serde_json::from_slice(&body).expect("anthropic JSON");
+        // Anthropic-shaped message, translated on the wire.
+        assert_eq!(
+            got.get("type").and_then(|v| v.as_str()),
+            Some("message"),
+            "got: {got}"
+        );
+        let content = got
+            .get("content")
+            .and_then(|c| c.as_array())
+            .expect("content array");
+        assert_eq!(
+            content[0].get("type").and_then(|v| v.as_str()),
+            Some("text"),
+            "got: {got}"
+        );
+        assert_eq!(
+            content[0].get("text").and_then(|v| v.as_str()),
+            Some("hi"),
+            "got: {got}"
+        );
+        assert_eq!(
+            got.get("stop_reason").and_then(|v| v.as_str()),
+            Some("end_turn"),
+            "got: {got}"
+        );
+        // Must NOT be the raw OpenAI body.
+        assert!(
+            got.get("choices").is_none(),
+            "raw OpenAI body leaked: {got}"
+        );
+
+        server.shutdown().await;
+    }
 }

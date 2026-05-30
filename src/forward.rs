@@ -755,6 +755,34 @@ pub(crate) async fn forward_with_pool(
                     .map(|h| h.to_str().unwrap_or("").starts_with("text/event-stream"))
                     .unwrap_or(false);
 
+                // B-503c-2: non-streaming cross-protocol response → buffer the whole JSON and
+                // translate egress.read_response → IR → ingress.write_response. (Streaming
+                // cross-protocol is handled in FirstByteBody below; same-protocol passes through.)
+                if ingress_protocol != app.lanes[i].protocol.name() && !is_sse {
+                    let bytes = r.bytes().await.unwrap_or_default();
+                    drop(permit); // upstream call complete; a non-streamed response holds no permit
+                    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                        if let Ok(ir) = app.lanes[i].protocol.reader().read_response(&v) {
+                            if let Some(ingress_proto) =
+                                crate::proto::protocol_for(ingress_protocol)
+                            {
+                                let translated = ingress_proto.writer().write_response(&ir);
+                                return Response::builder()
+                                    .status(status)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Body::from(translated.to_string()))
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    // Not translatable (non-JSON / unexpected shape / unknown ingress): relay verbatim.
+                    let mut rb = Response::builder().status(status);
+                    if let Some(ct) = ct {
+                        rb = rb.header(CONTENT_TYPE, ct);
+                    }
+                    return rb.body(Body::from(bytes)).unwrap();
+                }
+
                 // B-202: Use FirstByteBody wrapper to track first byte and emit SSE error events on mid-stream failures
                 // B-503b-2: on a cross-protocol SSE response, translate egress frames → ingress frames.
                 let translate = if is_sse {
