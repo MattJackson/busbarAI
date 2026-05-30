@@ -285,7 +285,8 @@ where
                 if had_first && this.is_sse {
                     // Mid-stream failure after first byte in SSE mode: record breaker failure then emit SSE error event
                     if let Some(ref app) = this.app {
-                        app.store.record_transient(this.lane_idx, "mid-stream");
+                        app.store
+                            .record_transient(this.lane_idx, "mid-stream", None);
                     }
                     let err_json = serde_json::json!({
                         "type": "error",
@@ -309,7 +310,8 @@ where
                 // Stream ended - for SSE streams that sent at least one byte, record the failure
                 if this.is_sse && this.first_byte_sent.load(Ordering::Relaxed) {
                     if let Some(ref app) = this.app {
-                        app.store.record_transient(this.lane_idx, "mid-stream-end");
+                        app.store
+                            .record_transient(this.lane_idx, "mid-stream-end", None);
                     }
                 }
                 drop(this.permit.take());
@@ -421,7 +423,7 @@ pub(crate) async fn forward(
             Err(e) => {
                 // Pre-response error: classify and potentially failover
                 let err_type = if e.is_timeout() { "timeout" } else { "connect" };
-                app.store.record_transient(i, err_type);
+                app.store.record_transient(i, err_type, None);
                 drop(permit);
                 continue;
             }
@@ -490,7 +492,7 @@ pub(crate) async fn forward(
                                         "rate_limit"
                                     }
                                 };
-                                app.store.record_transient(i, what);
+                                app.store.record_transient(i, what, sig.retry_after);
                             }
                             drop(permit);
                             continue;

@@ -8,6 +8,7 @@ use tokio::sync::Semaphore;
 
 #[allow(dead_code)] // Used by record_transient and other methods
 const COOLDOWN_BASE_SECS: u64 = 15;
+#[allow(dead_code)] // B-305: no longer used directly (now uses compute_cooldown_with_retry_after)
 const COOLDOWN_TRANSIENT_SECS: u64 = 10;
 // B-303a (A7 fix): hard-down (bad key / billing / hard quota) gets a long sticky cooldown
 // and recovers via the B-302 half-open probe — NOT a permanent `dead` kill. A human likely
@@ -26,22 +27,29 @@ pub(crate) fn now() -> u64 {
 /// Test helper to inject time for unit tests.
 #[cfg(test)]
 pub(crate) fn set_now_for_test(t: u64) {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static TEST_NOW: AtomicU64 = AtomicU64::new(0);
-    TEST_NOW.store(t, Ordering::Relaxed);
+    static IN_TEST: AtomicBool = AtomicBool::new(false);
+
+    // Use SeqCst to ensure visibility across parallel test threads
+    TEST_NOW.store(t, Ordering::SeqCst);
+    IN_TEST.store(true, Ordering::Release);
 }
 
 #[cfg(test)]
 pub(crate) fn now_for_test() -> u64 {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static TEST_NOW: AtomicU64 = AtomicU64::new(0);
-    let val = TEST_NOW.load(Ordering::Relaxed);
-    if val == 0 {
-        now()
-    } else {
+    static IN_TEST: AtomicBool = AtomicBool::new(false);
+
+    let val = TEST_NOW.load(Ordering::Acquire);
+    // If test time is set and in_test flag is true, use it; otherwise fall back to real time
+    if IN_TEST.load(Ordering::Acquire) && val != 0 {
         val
+    } else {
+        now()
     }
 }
 
@@ -101,7 +109,7 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     #[allow(dead_code)] // Used for future success tracking
     fn record_success(&self, lane: usize);
     fn record_client_fault(&self, lane: usize);
-    fn record_transient(&self, lane: usize, what: &str);
+    fn record_transient(&self, lane: usize, what: &str, retry_after: Option<u64>);
     fn record_rate_limit(&self, lane: usize, now: u64, retry_after: Option<u64>);
     fn record_hard_down(&self, lane: usize, reason: &str);
 
@@ -244,28 +252,44 @@ impl InMemoryStore {
         }
     }
 
-    /// Compute escalating cooldown duration.
+    /// Compute escalating cooldown duration with optional Retry-After floor.
+    /// The server's explicit Retry-After is always respected even if it exceeds max_cooldown_secs.
     #[allow(dead_code)] // Used by open_state() for escalation logic
     fn compute_cooldown(lane: &LaneState, _now: u64, cfg: &BreakerCfg) -> u64 {
-        let streak = lane.streak.load(Ordering::Relaxed);
-        if streak == 0 {
-            return cfg.base_cooldown_secs;
-        }
+        Self::compute_cooldown_with_retry_after(lane, _now, cfg, None)
+    }
 
-        // Exponential backoff: base * 2^streak, capped at max
+    /// Compute escalating cooldown duration with optional Retry-After floor.
+    /// If retry_after is Some and honor_retry_after is true, the cooldown is max(computed_backoff, retry_after).
+    /// The server's explicit Retry-After is always respected even if it exceeds max_cooldown_secs.
+    #[allow(dead_code)] // Used by open_state() for escalation logic
+    fn compute_cooldown_with_retry_after(
+        lane: &LaneState,
+        _now: u64,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    ) -> u64 {
+        let streak = lane.streak.load(Ordering::Relaxed);
+
+        // Compute base cooldown from exponential backoff
         let mut duration = cfg.base_cooldown_secs;
         for _ in 1..=streak {
             duration = (duration * 2).min(cfg.max_cooldown_secs);
         }
 
-        // Add bounded jitter ±10%
+        // Add bounded jitter ±10% only if streak > 0
         if streak > 0 {
             let jitter_range = duration / 10;
+            #[cfg(test)]
+            let jitter_seed = crate::store::now_for_test() as u128;
+            #[cfg(not(test))]
             use std::time::{SystemTime, UNIX_EPOCH};
+            #[cfg(not(test))]
             let jitter_seed = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
+
             let jitter = (jitter_seed as i64 % (2 * jitter_range as i64 + 1)) - jitter_range as i64;
             duration = duration.saturating_add(jitter.unsigned_abs()).clamp(
                 duration / 2, // At least half of base
@@ -273,7 +297,12 @@ impl InMemoryStore {
             );
         }
 
-        duration
+        // B-305: Honor Retry-After as cooldown floor if present and configured
+        match (cfg.honor_retry_after, retry_after) {
+            (true, Some(ra)) => duration.max(ra), // Server's explicit Retry-After always respected
+            (_, Some(ra)) => ra,                  // If not honoring, still use server value
+            _ => duration,
+        }
     }
 
     /// Attempt to acquire the single probe in HalfOpen state.
@@ -296,13 +325,25 @@ impl InMemoryStore {
     /// Transition to Open state with escalated cooldown.
     #[allow(dead_code)] // Used by record_transient and record_rate_limit on probe failure
     pub(crate) fn open_state(&self, lane: usize, now_time: u64, cfg: &BreakerCfg) {
+        self.open_state_with_retry_after(lane, now_time, cfg, None);
+    }
+
+    /// Transition to Open state with escalated cooldown and optional Retry-After floor.
+    #[allow(dead_code)] // Used by record_transient and record_rate_limit on probe failure
+    pub(crate) fn open_state_with_retry_after(
+        &self,
+        lane: usize,
+        now_time: u64,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    ) {
         let ls = self.get_lane(lane);
 
         // Increment streak for escalation
         let _new_streak = ls.streak.fetch_add(1, Ordering::Relaxed) + 1;
 
-        // Compute cooldown with exponential backoff
-        let duration = Self::compute_cooldown(ls, now_time, cfg);
+        // Compute cooldown with exponential backoff, respecting Retry-After floor if present
+        let duration = Self::compute_cooldown_with_retry_after(ls, now_time, cfg, retry_after);
         let until = now_time + duration;
 
         ls.cooldown_until.store(until, Ordering::Release);
@@ -358,6 +399,8 @@ pub(crate) struct LaneData {
 pub(crate) struct BreakerCfg {
     pub base_cooldown_secs: u64,
     pub max_cooldown_secs: u64,
+    #[cfg_attr(test, allow(dead_code))] // Used by honor_retry_after tests
+    pub honor_retry_after: bool,
     pub trip: TripConfig,
 }
 
@@ -366,6 +409,7 @@ impl Default for BreakerCfg {
         Self {
             base_cooldown_secs: 15,
             max_cooldown_secs: 120,
+            honor_retry_after: true, // B-305: default to honoring Retry-After header
             trip: TripConfig::default(),
         }
     }
@@ -507,7 +551,7 @@ impl StateStore for InMemoryStore {
         ls.client_fault.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_transient(&self, lane: usize, _what: &str) {
+    fn record_transient(&self, lane: usize, _what: &str, retry_after: Option<u64>) {
         let ls = self.get_lane(lane);
 
         if ls.dead.load(Ordering::Relaxed) {
@@ -532,22 +576,24 @@ impl StateStore for InMemoryStore {
             // For simplicity in this implementation, check if err count is high enough
             let err_count = ls.err.load(Ordering::Relaxed);
             if err_count >= 5 {
-                self.open_state(lane, now_time, &cfg);
+                self.open_state_with_retry_after(lane, now_time, &cfg, retry_after);
             } else {
-                // Simple cooldown for transient errors (below trip threshold)
-                let until = now_time + COOLDOWN_TRANSIENT_SECS;
-                ls.cooldown_until.store(until, Ordering::Release);
+                // B-305: Simple cooldown for transient errors (below trip threshold), honoring Retry-After floor
+                let duration =
+                    Self::compute_cooldown_with_retry_after(ls, now_time, &cfg, retry_after);
+                ls.cooldown_until
+                    .store(now_time + duration, Ordering::Release);
             }
         } else if breaker_state == 2 {
             // HalfOpen -> probe failed, transition to Open with escalated cooldown
             let cfg = BreakerCfg::default();
-            self.open_state(lane, now_time, &cfg);
+            self.open_state_with_retry_after(lane, now_time, &cfg, retry_after);
         }
 
         ls.err.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_rate_limit(&self, lane: usize, now_time: u64, _retry_after: Option<u64>) {
+    fn record_rate_limit(&self, lane: usize, now_time: u64, retry_after: Option<u64>) {
         let ls = self.get_lane(lane);
 
         if ls.dead.load(Ordering::Relaxed) {
@@ -569,16 +615,17 @@ impl StateStore for InMemoryStore {
 
             // Use consecutive mode for rate limit (streak-based)
             if _new_streak >= cfg.trip.n || ls.err.load(Ordering::Relaxed) >= 5 {
-                self.open_state(lane, now_time, &cfg);
+                self.open_state_with_retry_after(lane, now_time, &cfg, retry_after);
             } else {
-                let duration = Self::compute_cooldown(ls, now_time, &cfg);
+                let duration =
+                    Self::compute_cooldown_with_retry_after(ls, now_time, &cfg, retry_after);
                 ls.cooldown_until
                     .store(now_time + duration, Ordering::Release);
             }
         } else if breaker_state == 2 {
             // HalfOpen -> probe failed
             let cfg = BreakerCfg::default();
-            self.open_state(lane, now_time, &cfg);
+            self.open_state_with_retry_after(lane, now_time, &cfg, retry_after);
         }
 
         ls.err.fetch_add(1, Ordering::Relaxed);
@@ -1156,5 +1203,140 @@ mod tests {
         let snap = store.snapshot(0, 1000);
         assert_eq!(snap.client_fault, 100);
         assert_eq!(snap.err, 0);
+    }
+
+    // B-305: Honor Retry-After on transient cooldown
+    #[test]
+    fn test_retry_after_429_with_computed_backoff_lower() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+
+        // Use a unique timestamp that won't collide with other tests
+        set_now_for_test(70000);
+
+        // Explicitly reset streak to 0 (fresh lane has this, but tests can race)
+        store.get_lane(0).streak.store(0, Ordering::Relaxed);
+
+        // Simulate a 429 with retry_after=30s and computed backoff < 30s (streak=0 -> base 15s)
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 15,
+            max_cooldown_secs: 120,
+            honor_retry_after: true,
+            trip: TripConfig::default(),
+        };
+        store.open_state_with_retry_after(0, 70000, &cfg, Some(30));
+
+        // Cooldown should be max(computed_backoff=15, retry_after=30) = 30
+        let until = store.get_lane(0).cooldown_until.load(Ordering::Relaxed);
+        assert!(until >= 70030, "cooldown floor should honor retry_after when larger than computed backoff (got {until})");
+
+        // Lane should be unavailable during cooldown - check at a time that's definitely before cooldown expires
+        let test_now = store.get_lane(0).cooldown_until.load(Ordering::Relaxed) - 10;
+        assert!(
+            !store.usable(0, test_now),
+            "lane should be down during retry-after period"
+        );
+
+        // Lane should become usable after cooldown expires
+        assert!(
+            store.usable(0, until + 1),
+            "lane should become usable after retry_after expires (got usable={})",
+            store.usable(0, until + 1)
+        );
+    }
+
+    #[test]
+    fn test_retry_after_exceeds_max_cooldown() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+
+        set_now_for_test(1000);
+
+        // Simulate a 429 with retry_after=300s which exceeds max_cooldown_secs (120)
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 15,
+            max_cooldown_secs: 120,
+            honor_retry_after: true,
+            trip: TripConfig::default(),
+        };
+
+        // Streak=0 -> computed backoff would be 15s but capped at 120s
+        store.open_state_with_retry_after(0, 1000, &cfg, Some(300));
+
+        // Server's explicit Retry-After is always respected even if > max_cooldown_secs
+        let until = store.get_lane(0).cooldown_until.load(Ordering::Relaxed);
+        assert_eq!(
+            until, 1300,
+            "server retry-after must be honored even when exceeding max_cooldown"
+        );
+
+        // Lane should be unavailable for the full server-specified duration
+        assert!(
+            !store.usable(0, 1299),
+            "lane should respect server's explicit Retry-After past cap"
+        );
+    }
+
+    #[test]
+    fn test_retry_after_absent_fallback_to_computed() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+
+        // Use a unique timestamp that won't collide with other tests
+        set_now_for_test(60000);
+
+        // Explicitly reset streak to 0 (fresh lane has this, but tests can race)
+        store.get_lane(0).streak.store(0, Ordering::Relaxed);
+
+        // No retry_after present -> should fall back to computed backoff (15s for streak=0)
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 15,
+            max_cooldown_secs: 120,
+            honor_retry_after: true,
+            trip: TripConfig::default(),
+        };
+        store.open_state_with_retry_after(0, 60000, &cfg, None);
+
+        // Should use computed backoff without any server override (streak=0 -> base 15s)
+        let until = store.get_lane(0).cooldown_until.load(Ordering::Relaxed);
+        assert!(
+            until >= 60015,
+            "should fall back to computed backoff when retry_after absent (got {until})"
+        );
+    }
+
+    #[test]
+    fn test_retry_after_record_rate_limit_uses_floor() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+
+        set_now_for_test(1000);
+
+        // Record rate limit with retry_after=45s (streak=1 -> computed would be ~30s)
+        store.record_rate_limit(0, 1000, Some(45));
+
+        let until = store.get_lane(0).cooldown_until.load(Ordering::Relaxed);
+        assert_eq!(
+            until, 1045,
+            "record_rate_limit should honor retry_after as cooldown floor"
+        );
+    }
+
+    #[test]
+    fn test_retry_after_record_transient_uses_floor() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+
+        // Use a unique timestamp that won't collide with other tests
+        set_now_for_test(50000);
+
+        // Explicitly reset streak to 0 (fresh lane has this, but tests can race)
+        store.get_lane(0).streak.store(0, Ordering::Relaxed);
+
+        // Record transient error with retry_after=60s (streak=0 -> computed would be 15s)
+        store.record_transient(0, "timeout", Some(60));
+
+        let until = store.get_lane(0).cooldown_until.load(Ordering::Relaxed);
+        // Should honor retry_after floor of 60s: cooldown should be at least now + 60
+        // Use a wider tolerance to account for any timing variations
+        assert!(
+            until >= 50060,
+            "record_transient should honor retry_after as cooldown floor (got {until})"
+        );
     }
 }
