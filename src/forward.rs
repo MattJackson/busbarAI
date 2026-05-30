@@ -749,11 +749,26 @@ pub(crate) async fn forward_with_pool(
                         }
                         Disposition::ContextLength => {
                             // B-504: the request is too large for THIS model's context window.
-                            // The lane is HEALTHY — record NOTHING (no cooldown/penalty). The
-                            // current lane is already excluded for this request, so fail over to
-                            // another member (ideally a larger-context model; context_max-aware
-                            // preference is B-504b). If the pool is exhausted, the normal
-                            // exhaustion path returns.
+                            // B-504b: exclude from this request any candidate lane whose context_max
+                            // is Some(c) with c <= failed_lane_context_max (and the failed lane itself).
+                            // Rationale: those lanes share or undercut the limit that just failed,
+                            // so don't waste attempts on them — failover lands on a larger-context
+                            // (or unknown-context) member. If failed lane's context_max is None,
+                            // exclude only the failed lane.
+                            let failed_context_max = app.lanes[i].context_max;
+
+                            // Exclude candidates that cannot handle this request due to context limits.
+                            for cand in &cands {
+                                if let Some(cand_context_max) = app.lanes[cand.idx].context_max {
+                                    // If this candidate has a known limit <= failed lane's limit, exclude it.
+                                    if let Some(failed_limit) = failed_context_max {
+                                        if cand_context_max <= failed_limit {
+                                            request_ctx.exclude(cand.idx);
+                                        }
+                                    }
+                                }
+                            }
+
                             drop(permit);
                             continue;
                         }

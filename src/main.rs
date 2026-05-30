@@ -135,6 +135,16 @@ async fn main() {
 
     let registry = ProtocolRegistry::with_builtins();
 
+    // Build a map from model name to context_max (pools can have different context_max per member).
+    let mut model_context_max: std::collections::HashMap<String, Option<usize>> =
+        std::collections::HashMap::new();
+    for pool in cfg.pools.values() {
+        for m in &pool.members {
+            // Later members override earlier ones if same target appears multiple times
+            model_context_max.insert(m.target.clone(), m.context_max);
+        }
+    }
+
     let mut lanes = Vec::new();
     for ld in &lanes_data {
         let provider_cfg = cfg.providers.get(&ld.provider).unwrap();
@@ -152,6 +162,7 @@ async fn main() {
             protocol,
             max: ld.max,
             error_map: Arc::new(provider_cfg.error_map.clone()),
+            context_max: model_context_max.get(&ld.model).copied().flatten(),
         });
     }
 

@@ -387,6 +387,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -468,6 +469,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -557,6 +559,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 1,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -673,6 +676,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let lane1 = Lane {
@@ -683,6 +687,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -805,6 +810,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let lane1 = Lane {
@@ -815,6 +821,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -938,6 +945,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1027,6 +1035,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let auth_cfg_token = AuthCfg {
@@ -1122,6 +1131,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1241,6 +1251,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let lane1 = Lane {
@@ -1251,6 +1262,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1390,6 +1402,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let lane1 = Lane {
@@ -1400,6 +1413,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let lane2 = Lane {
@@ -1410,6 +1424,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1535,6 +1550,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let lane1 = Lane {
@@ -1545,6 +1561,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1764,6 +1781,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -1970,6 +1988,7 @@ mod tests {
                 protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
+                context_max: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -2063,6 +2082,7 @@ mod tests {
                 protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
+                context_max: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -2155,6 +2175,7 @@ mod tests {
                 protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
+                context_max: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -2245,6 +2266,7 @@ mod tests {
                 protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
+                context_max: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -2336,6 +2358,7 @@ mod tests {
                 protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
+                context_max: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -2427,6 +2450,7 @@ mod tests {
                 protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
+                context_max: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -2533,6 +2557,7 @@ mod tests {
                 protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map_1),
+                context_max: None,
             };
 
             // Lane 2: NO mapping for any code → HTTP status classification only
@@ -2563,6 +2588,7 @@ mod tests {
                 protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map_2),
+                context_max: None,
             };
 
             let setup_app = |lane_data: LaneData, lane: Lane, _error_map_name: &str| {
@@ -2770,6 +2796,7 @@ mod tests {
                 protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(error_map),
+                context_max: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -2874,6 +2901,7 @@ mod tests {
                 protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(HashMap::new()),
+                context_max: None,
             };
 
             // Lane 1 setup (should NOT be called)
@@ -2902,6 +2930,7 @@ mod tests {
                 protocol: Arc::new(crate::proto::Protocol::anthropic()),
                 max: 10,
                 error_map: Arc::new(HashMap::new()),
+                context_max: None,
             };
 
             let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3018,6 +3047,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let lane1 = Lane {
@@ -3028,6 +3058,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3157,6 +3188,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let lane1 = Lane {
@@ -3167,6 +3199,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3281,6 +3314,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3423,6 +3457,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3586,6 +3621,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let lane1 = Lane {
@@ -3596,6 +3632,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let lane2 = Lane {
@@ -3606,6 +3643,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3784,6 +3822,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 1,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let lane1 = Lane {
@@ -3794,6 +3833,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 1,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -3925,6 +3965,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let lane1 = Lane {
@@ -3935,6 +3976,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -4107,6 +4149,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::openai()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("test-model".to_string(), 0)]);
@@ -4272,6 +4315,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("m".to_string(), 0)]);
@@ -4390,6 +4434,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
 
         let by_model = HashMap::from([("m".to_string(), 0)]);
@@ -4481,6 +4526,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::openai()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let store = Arc::new(InMemoryStore::new(vec![lane_data]));
@@ -4589,6 +4635,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::openai()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let store = Arc::new(InMemoryStore::new(vec![lane_data]));
@@ -4705,6 +4752,7 @@ mod tests {
             protocol: Arc::new(crate::proto::Protocol::anthropic()),
             max: 10,
             error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
         };
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let store = Arc::new(InMemoryStore::new(vec![mk_ld(), mk_ld()]));
@@ -4751,6 +4799,277 @@ mod tests {
                 app.store.cooldown_remaining(idx, now),
                 0,
                 "lane {idx} must NOT be in cooldown after a context-length failover"
+            );
+        }
+
+        server.shutdown().await;
+    }
+
+    /// B-504b: Prefers larger context on ContextLength failover.
+    /// Pool with lane0 (context_max Some(8000), returns context-length error) +
+    /// lane1 (context_max Some(200000), returns 200). Request → lane0 ContextLength →
+    /// failover EXCLUDES lane0 (and any ≤8000) → lane1 (200000) SERVES (assert 200 + lane1 served).
+    #[tokio::test]
+    async fn test_b504b_prefers_larger_context_max() {
+        use std::collections::HashMap;
+
+        let state = Arc::new(MockServerState::new());
+
+        // LIFO: push success (lane 1) first, then context-length error (lane 0)
+        // Lane 1 should succeed with 200
+        let events = vec!["data: event-0".to_string()];
+        state.push(MockResponse::Sse {
+            events,
+            abort_at_index: None,
+        });
+
+        // Lane 0 returns context-length error (400 with invalid_request_error type)
+        state.push(MockResponse::ServerError {
+            status: StatusCode::BAD_REQUEST,
+            body: json!({ "error": { "type": "invalid_request_error", "message": "prompt is too long: 250000 tokens > 8000 maximum" } }),
+        });
+
+        let server = MockServer::new(state.clone()).await;
+
+        let lane0_data = LaneData {
+            model: "small-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane1_data = LaneData {
+            model: "large-model".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane0 = Lane {
+            model: "small-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key-0".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: Some(8000), // Small context limit
+        };
+
+        let lane1 = Lane {
+            model: "large-model".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key-1".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: Some(200000), // Large context limit
+        };
+
+        let by_model = HashMap::from([("small-model".to_string(), 0)]);
+        let pools = HashMap::from([(
+            "default".to_string(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+        )]);
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane0_data, lane1_data]));
+        let app = Arc::new(App {
+            lanes: vec![lane0, lane1],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        let req_body = serde_json::to_vec(&json!({"model": "small-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+
+        // Should failover from lane 0 (context-length) to lane 1 (larger context, succeeds)
+        let response = forward(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+            req_body.into(),
+            None,
+        )
+        .await;
+
+        // Assert: lane 1 served the request (200 OK)
+        assert_eq!(response.status().as_u16(), 200);
+
+        // Verify: lane 0 was NOT penalized (context-length is not a lane fault)
+        let t = crate::state::now();
+        assert!(
+            app.store.usable(0, t),
+            "lane 0 should remain usable after context-length"
+        );
+
+        server.shutdown().await;
+    }
+
+    /// B-504b: Same-size pool exhausts on ContextLength failover.
+    /// Two lanes both context_max Some(8000), both return context-length →
+    /// failover finds no bigger lane → exhausts (returns 503/exhaustion, neither lane tripped).
+    #[tokio::test]
+    async fn test_b504b_same_size_pool_exhausts() {
+        use std::collections::HashMap;
+
+        let state = Arc::new(MockServerState::new());
+
+        // Both lanes return context-length errors (LIFO: lane 1, then lane 0)
+        for _i in 0..2 {
+            state.push(MockResponse::ServerError {
+                status: StatusCode::BAD_REQUEST,
+                body: json!({ "error": { "type": "invalid_request_error", "message": "prompt is too long: 250000 tokens > 8000 maximum" } }),
+            });
+        }
+
+        let server = MockServer::new(state.clone()).await;
+
+        let lane0_data = LaneData {
+            model: "model-8k".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane1_data = LaneData {
+            model: "model-8k".to_string(),
+            provider: "test-provider".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+
+        let lane0 = Lane {
+            model: "model-8k".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key-0".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: Some(8000), // Same limit as lane 1
+        };
+
+        let lane1 = Lane {
+            model: "model-8k".to_string(),
+            provider: "test-provider".to_string(),
+            base_url: server.base_url(),
+            api_key: "test-key-1".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: Some(8000), // Same limit as lane 0
+        };
+
+        let by_model = HashMap::from([("model-8k".to_string(), 0)]);
+        let pools = HashMap::from([(
+            "default".to_string(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+        )]);
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![lane0_data, lane1_data]));
+        let app = Arc::new(App {
+            lanes: vec![lane0, lane1],
+            store,
+            by_model,
+            pools,
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        let req_body = serde_json::to_vec(&json!({"model": "model-8k", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+
+        // Should exhaust both lanes and return 503 (not loop forever)
+        let response = forward(
+            app.clone(),
+            vec![
+                crate::state::WeightedLane { idx: 0, weight: 1 },
+                crate::state::WeightedLane { idx: 1, weight: 1 },
+            ],
+            req_body.into(),
+            None,
+        )
+        .await;
+
+        // Assert: returns 503 after exhausting both lanes
+        assert_eq!(response.status().as_u16(), 503);
+
+        // Verify: neither lane was penalized (context-length is not a lane fault)
+        let t = crate::state::now();
+        for idx in 0..2 {
+            assert_eq!(
+                app.store.cooldown_remaining(idx, t),
+                0,
+                "lane {} must NOT be in cooldown after context-length failover",
+                idx
             );
         }
 

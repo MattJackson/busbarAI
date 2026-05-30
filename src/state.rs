@@ -22,6 +22,8 @@ pub(crate) struct Lane {
     pub(crate) max: usize,
     // error_map cloned into each lane at startup for Stage 1b normalization
     pub(crate) error_map: Arc<std::collections::HashMap<String, String>>,
+    /// Optional maximum context window size for this lane's model (B-504b).
+    pub(crate) context_max: Option<usize>,
 }
 
 /// A pool lane with its associated weight (B-401).
