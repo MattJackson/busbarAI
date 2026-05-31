@@ -44,6 +44,11 @@ impl AuthMode {
     }
 }
 
+/// The caller's bearer token, threaded into request extensions by `auth_middleware` so handlers can
+/// forward it upstream in passthrough mode. `None` when no usable bearer token was presented.
+#[derive(Clone, Default)]
+pub(crate) struct CallerToken(pub(crate) Option<String>);
+
 /// AuthMiddleware holds the resolved auth mode and token allowlist.
 #[derive(Debug)]
 pub(crate) struct AuthMiddleware {
@@ -210,11 +215,9 @@ pub(crate) async fn auth_middleware(
             .insert(crate::governance::GovCtx::default());
     }
 
-    // Thread the caller's Bearer token into request extensions for passthrough forwarding
-    if let Some(bearer_token) = bearer_token {
-        use axum::extract::Extension;
-        req.extensions_mut().insert(Extension(bearer_token));
-    }
+    // Thread the caller's Bearer token into request extensions for passthrough forwarding. Always
+    // inserted (even when None) so the `Extension<CallerToken>` extractor in handlers never fails.
+    req.extensions_mut().insert(CallerToken(bearer_token));
 
     Ok(next.run(req).await)
 }

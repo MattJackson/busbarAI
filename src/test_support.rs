@@ -1097,7 +1097,7 @@ mod tests {
             })
             .unwrap();
         // Pre-seed usage past the 100c budget (window 0 = "total").
-        store.add_usage("kb", 0, 250, 0).unwrap();
+        store.add_usage("kb", 0, 250, 0, true).unwrap();
         let gov = Arc::new(GovState::new(store, 1, 0, None).unwrap());
 
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
@@ -5340,6 +5340,7 @@ mod tests {
         let response = route::openai_ingress(
             State(app),
             axum::extract::Extension(crate::governance::GovCtx::default()),
+            axum::extract::Extension(crate::auth::CallerToken::default()),
             HeaderMap::new(),
             body_bytes,
         )
@@ -5394,6 +5395,7 @@ mod tests {
         let response = route::openai_ingress(
             State(app),
             axum::extract::Extension(crate::governance::GovCtx::default()),
+            axum::extract::Extension(crate::auth::CallerToken::default()),
             HeaderMap::new(),
             body_bytes,
         )
@@ -5441,6 +5443,7 @@ mod tests {
         let response = route::openai_ingress(
             State(app),
             axum::extract::Extension(crate::governance::GovCtx::default()),
+            axum::extract::Extension(crate::auth::CallerToken::default()),
             HeaderMap::new(),
             body_bytes,
         )
@@ -5644,6 +5647,7 @@ mod tests {
         let resp = route::openai_ingress(
             State(app),
             axum::extract::Extension(crate::governance::GovCtx::default()),
+            axum::extract::Extension(crate::auth::CallerToken::default()),
             axum::http::HeaderMap::new(),
             Bytes::from(body.to_string()),
         )

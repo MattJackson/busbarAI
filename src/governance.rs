@@ -81,7 +81,9 @@ impl GovState {
         let window = budget_window(budget_period, now);
         let spend = (tokens.saturating_mul(self.price_per_1k_tokens_cents.max(0) as u64)
             / TOKENS_PER_PRICE_UNIT) as i64;
-        if let Err(e) = self.store.add_usage(key_id, window, spend, tokens) {
+        // count_request = false: this accrues token spend for a request already counted by
+        // record_request, so it must not increment the request counter again.
+        if let Err(e) = self.store.add_usage(key_id, window, spend, tokens, false) {
             tracing::warn!(key = %key_id, error = %e, "token usage record failed");
         }
         self.add_rate_tokens(key_id, now, tokens);
@@ -151,6 +153,9 @@ impl GovState {
         let window = now / RATE_WINDOW_SECS * RATE_WINDOW_SECS;
         let retry = (window + RATE_WINDOW_SECS).saturating_sub(now).max(1);
         let mut map = self.rate.write().unwrap();
+        // Evict entries from older windows so the map stays bounded by the current window's active
+        // keys — a key that stops sending requests would otherwise leak its entry forever.
+        map.retain(|_, st| st.window_start == window);
         let st = map.entry(key.id.clone()).or_default();
         if st.window_start != window {
             *st = RateState {
@@ -203,9 +208,10 @@ impl GovState {
     /// Best-effort: a store error is logged-and-dropped (telemetry must not break serving).
     pub(crate) fn record_request(&self, key: &VirtualKey, now: u64, tokens: u64) {
         let window = budget_window(&key.budget_period, now);
-        if let Err(e) = self
-            .store
-            .add_usage(&key.id, window, self.price_per_request_cents, tokens)
+        // count_request = true: this is the once-per-request accounting call.
+        if let Err(e) =
+            self.store
+                .add_usage(&key.id, window, self.price_per_request_cents, tokens, true)
         {
             tracing::warn!(key = %key.id, error = %e, "usage record failed");
         }
@@ -361,12 +367,16 @@ pub(crate) trait Store: Send + Sync + 'static {
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>>;
     fn delete_key(&self, id: &str) -> StoreResult<()>;
     /// Add usage to a key's counter for the given budget-window start (UPSERT/accumulate).
+    /// `count_request` increments the request counter by one — true for the per-request fee, false
+    /// when only accruing token spend for an already-counted request (so requests aren't double
+    /// counted when both the flat fee and token usage are recorded for one request).
     fn add_usage(
         &self,
         key_id: &str,
         window_start: u64,
         spend_cents: i64,
         tokens: u64,
+        count_request: bool,
     ) -> StoreResult<()>;
     fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage>;
 }
@@ -516,20 +526,23 @@ impl Store for SqliteStore {
         window_start: u64,
         spend_cents: i64,
         tokens: u64,
+        count_request: bool,
     ) -> StoreResult<()> {
+        let req_delta = i64::from(count_request);
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
-             VALUES (?1,?2,?3,?4,1)
+             VALUES (?1,?2,?3,?4,?5)
              ON CONFLICT(key_id, window_start) DO UPDATE SET
                 spend_cents = spend_cents + excluded.spend_cents,
                 tokens      = tokens + excluded.tokens,
-                requests    = requests + 1",
+                requests    = requests + excluded.requests",
             params![
                 key_id,
                 window_start as i64,
                 spend_cents,
-                i64::try_from(tokens).unwrap_or(i64::MAX)
+                i64::try_from(tokens).unwrap_or(i64::MAX),
+                req_delta
             ],
         )?;
         Ok(())
@@ -713,12 +726,22 @@ mod tests {
     #[test]
     fn test_usage_accumulates() {
         let s = SqliteStore::open_in_memory().unwrap();
-        s.add_usage("k1", 100, 25, 1000).unwrap();
-        s.add_usage("k1", 100, 30, 500).unwrap();
+        s.add_usage("k1", 100, 25, 1000, true).unwrap();
+        s.add_usage("k1", 100, 30, 500, true).unwrap();
         let u = s.get_usage("k1", 100).unwrap();
         assert_eq!(u.spend_cents, 55);
         assert_eq!(u.tokens, 1500);
         assert_eq!(u.requests, 2);
+        // A token-accrual call (count_request = false) adds spend/tokens but NOT a request — so the
+        // per-request fee + token usage for one request don't double-count it.
+        s.add_usage("k1", 100, 7, 250, false).unwrap();
+        let u2 = s.get_usage("k1", 100).unwrap();
+        assert_eq!(u2.spend_cents, 62);
+        assert_eq!(u2.tokens, 1750);
+        assert_eq!(
+            u2.requests, 2,
+            "count_request=false must not increment requests"
+        );
         // Different window is independent; unknown = zero.
         assert_eq!(s.get_usage("k1", 200).unwrap(), Usage::default());
     }

@@ -705,6 +705,7 @@ pub(crate) async fn forward_with_pool(
                     body,
                     caller_token,
                     &mut request_ctx,
+                    ingress_protocol,
                 )
                 .await;
             }
@@ -1095,6 +1096,7 @@ pub(crate) async fn forward_with_pool(
         body,
         caller_token,
         &mut request_ctx,
+        ingress_protocol,
     )
     .await
 }
@@ -1121,6 +1123,7 @@ fn find_soonest_cooldown(
 }
 
 /// Handle pool exhaustion based on configured mode for a specific pool.
+#[allow(clippy::too_many_arguments)] // plumbing: each arg is an independent request input
 async fn handle_exhaustion_for_pool(
     app: Arc<App>,
     cands: &[WeightedLane],
@@ -1129,6 +1132,7 @@ async fn handle_exhaustion_for_pool(
     body: Bytes,
     caller_token: Option<&str>,
     request_ctx: &mut RequestCtx,
+    ingress_protocol: &str,
 ) -> Response {
     // Look up pool-specific on_exhausted config, default to Status503 for unknown pools.
     let mode = app
@@ -1140,7 +1144,15 @@ async fn handle_exhaustion_for_pool(
     match mode {
         OnExhausted::Status503 => handle_status_503(&app, cands, now, pool_name),
         OnExhausted::FallbackPool(ref fallback_pool) => {
-            handle_fallback_pool(app.clone(), body, caller_token, fallback_pool, request_ctx).await
+            handle_fallback_pool(
+                app.clone(),
+                body,
+                caller_token,
+                fallback_pool,
+                request_ctx,
+                ingress_protocol,
+            )
+            .await
         }
         OnExhausted::LeastBad => {
             handle_least_bad(
@@ -1151,6 +1163,7 @@ async fn handle_exhaustion_for_pool(
                 caller_token,
                 request_ctx,
                 pool_name,
+                ingress_protocol,
             )
             .await
         }
@@ -1195,6 +1208,7 @@ async fn forward_once(
     body: &Bytes,
     caller_token: Option<&str>,
     timeout_secs: u64,
+    ingress_protocol: &str,
 ) -> Result<Response, ()> {
     // Re-parse body for per-lane model rewriting.
     let mut v: Value = match serde_json::from_slice(body) {
@@ -1206,6 +1220,29 @@ async fn forward_once(
 
     // stream intent for the stream-aware upstream path (Gemini).
     let wants_stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+
+    // Cross-protocol translation through the superset IR — same as the main path — so this degraded
+    // route is correct when the chosen lane speaks a different protocol than the caller.
+    let egress_name = app.lanes[i].protocol.name();
+    if ingress_protocol != egress_name {
+        let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) else {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                format!("router: unknown ingress protocol '{ingress_protocol}'"),
+            )
+                .into_response());
+        };
+        match ingress_proto.reader().read_request(&v) {
+            Ok(ir) => v = app.lanes[i].protocol.writer().write_request(&ir),
+            Err(_) => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    "router: request translation failed",
+                )
+                    .into_response())
+            }
+        }
+    }
 
     app.lanes[i]
         .protocol
@@ -1309,6 +1346,7 @@ async fn handle_fallback_pool(
     caller_token: Option<&str>,
     pool_name: &str,
     request_ctx: &mut RequestCtx,
+    ingress_protocol: &str,
 ) -> Response {
     // Deadline propagated across hops.
     if request_ctx.expired(now()) {
@@ -1347,6 +1385,7 @@ async fn handle_fallback_pool(
                 body,
                 caller_token,
                 request_ctx,
+                ingress_protocol,
             ))
             .await;
         };
@@ -1360,6 +1399,7 @@ async fn handle_fallback_pool(
             &body,
             caller_token,
             request_ctx.remaining(now()),
+            ingress_protocol,
         )
         .await
         {
@@ -1374,6 +1414,7 @@ async fn handle_fallback_pool(
 /// member's concurrency permit directly, then makes a single attempt (no failover from a
 /// last-resort path). Logs loudly that this is a degraded route. Falls back to Status503 if
 /// there is no candidate, the permit is unavailable, or the upstream is unreachable.
+#[allow(clippy::too_many_arguments)] // plumbing: each arg is an independent request input
 async fn handle_least_bad(
     app: &Arc<App>,
     cands: &[WeightedLane],
@@ -1382,6 +1423,7 @@ async fn handle_least_bad(
     caller_token: Option<&str>,
     request_ctx: &RequestCtx,
     pool: &str,
+    ingress_protocol: &str,
 ) -> Response {
     let Some(soonest_idx) = find_soonest_cooldown(&app.store, cands, now, pool) else {
         // No candidates at all - fall back to Status503.
@@ -1407,6 +1449,7 @@ async fn handle_least_bad(
         body,
         caller_token,
         request_ctx.remaining(now),
+        ingress_protocol,
     )
     .await
     {

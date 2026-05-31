@@ -153,9 +153,11 @@ fn finish(
 pub(crate) async fn openai_ingress(
     State(app): State<Arc<App>>,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
+    axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let caller_token = caller.0.as_deref();
     let started = Instant::now();
     let v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -196,7 +198,7 @@ pub(crate) async fn openai_ingress(
             app.clone(),
             cands.clone(),
             body,
-            None,
+            caller_token,
             &model,
             affinity_key,
             "openai",
@@ -214,7 +216,7 @@ pub(crate) async fn openai_ingress(
             app.clone(),
             vec![WeightedLane { idx: i, weight: 1 }],
             body,
-            None,
+            caller_token,
             &model,
             None,
             "openai",
@@ -237,12 +239,12 @@ pub(crate) async fn named(
     State(app): State<Arc<App>>,
     Path(name): Path<String>,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
+    axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // NOTE: Caller token extraction from request extensions requires handler signature change.
-    // For now, caller_token is None - passthrough mode will use lane's api_key as fallback.
-    let _caller_token = None;
+    // Caller's bearer token (for passthrough-mode forwarding); None falls back to the lane's key.
+    let caller_token = caller.0.as_deref();
 
     // enforce the virtual key's allowed-pools against the named pool/model.
     if let Some(resp) = pool_authorized(&gov, &name) {
@@ -267,7 +269,7 @@ pub(crate) async fn named(
             app.clone(),
             cands.clone(),
             body,
-            _caller_token,
+            caller_token,
             &name,
             affinity_key,
             "anthropic",
@@ -282,7 +284,7 @@ pub(crate) async fn named(
             app.clone(),
             vec![WeightedLane { idx: i, weight: 1 }],
             body,
-            _caller_token,
+            caller_token,
             usage_sink(&app, &gov),
         )
         .await;
@@ -302,9 +304,10 @@ pub(crate) async fn adhoc(
     State(app): State<Arc<App>>,
     Path((provider, model)): Path<(String, String)>,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
+    axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
     body: Bytes,
 ) -> Response {
-    let _caller_token = None;
+    let caller_token = caller.0.as_deref();
     let started = Instant::now();
 
     // enforce the virtual key's allowed-pools against the ad-hoc model target.
@@ -327,7 +330,7 @@ pub(crate) async fn adhoc(
                 app.clone(),
                 vec![WeightedLane { idx: i, weight: 1 }],
                 body,
-                _caller_token,
+                caller_token,
                 usage_sink(&app, &gov),
             )
             .await;
