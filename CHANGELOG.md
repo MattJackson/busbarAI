@@ -5,7 +5,16 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.15.0] — unreleased
+## [0.15.0] — 2026-05-31
+
+### Fixed
+- **Breaker recovery was broken — a tripped lane never came back.** On cooldown
+  expiry the lane went HalfOpen and admitted a single probe; the probe's success
+  reset the streak but never transitioned the breaker out of HalfOpen
+  (`closed_state` was only ever called from tests), so `probe_in_flight` stayed set
+  and every later `usable()` returned false. Any lane that ever tripped became
+  permanently dead after one request. `record_success` now completes the recovery
+  (→ Closed, cooldown cleared, probe released) when it sees a HalfOpen lane.
 
 ### Added
 - **Active health checks are now live.** A provider's `health:` block has a `mode`:
