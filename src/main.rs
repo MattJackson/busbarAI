@@ -33,6 +33,7 @@ mod config;
 mod config_validate;
 mod eventstream;
 mod forward;
+mod governance;
 mod handlers;
 mod ir;
 mod metrics;
