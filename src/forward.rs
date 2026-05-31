@@ -159,8 +159,8 @@ impl UsageTap {
         }
     }
 
-    /// Check if any usage data was extracted.
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
+    /// Check if any usage data was extracted (test-only assertion helper).
+    #[cfg(test)]
     pub(crate) fn has_usage(&self) -> bool {
         self.input_tokens.is_some() || self.output_tokens.is_some()
     }
@@ -198,65 +198,6 @@ fn find_matching_brace(chunk: &[u8]) -> Option<usize> {
         }
     }
     None
-}
-
-/// Carry buffer for SSE frame reassembly across chunk boundaries.
-///
-/// This is a bounded accumulator that holds at most MAX_CARRY_BYTES to prevent
-/// memory unboundedness when frames span multiple chunks. It never retains the full body.
-#[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
-pub(crate) struct SseCarryBuffer {
-    /// Accumulated bytes from incomplete SSE frame
-    buffer: Vec<u8>,
-    /// Maximum bytes to carry (hard cap for bounded memory)
-    max_bytes: usize,
-}
-
-impl SseCarryBuffer {
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
-    pub(crate) fn new() -> Self {
-        Self {
-            buffer: Vec::new(),
-            max_bytes: 4096, // 4KB carry buffer cap - enough for multi-chunk frames but bounded
-        }
-    }
-
-    /// Feed a chunk and return the complete SSE frame if available.
-    /// Returns Some(frame_bytes) when a complete event is assembled, None otherwise.
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
-    pub(crate) fn feed(&mut self, chunk: &Bytes) -> Option<Bytes> {
-        // Append new bytes (bounded by max_bytes)
-        let to_add = chunk
-            .len()
-            .min(self.max_bytes.saturating_sub(self.buffer.len()));
-        if to_add > 0 {
-            self.buffer.extend_from_slice(&chunk[..to_add]);
-        }
-
-        // Look for complete SSE frame (double newline separator)
-        if let Some(start_pos) = self.buffer.windows(2).position(|w| w == b"\n\n") {
-            // Extract the complete frame including separators
-            let end_pos = start_pos + 2;
-            let frame_bytes = self.buffer[..end_pos].to_vec();
-            // Remove processed bytes from buffer
-            self.buffer.drain(..end_pos);
-            return Some(Bytes::from(frame_bytes));
-        }
-
-        None
-    }
-
-    /// Get the current carry buffer size (for testing boundedness).
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
-    pub(crate) fn len(&self) -> usize {
-        self.buffer.len()
-    }
-}
-
-impl Default for SseCarryBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Body wrapper that implements the before-first-byte failover boundary.
@@ -328,12 +269,6 @@ where
             usage_sink,
             ended: false,
         }
-    }
-
-    /// Get a reference to the extracted usage data after stream completion.
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
-    pub(crate) fn usage(&self) -> &UsageTap {
-        &self.tap
     }
 }
 

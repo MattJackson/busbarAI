@@ -6,9 +6,8 @@ use std::sync::Arc;
 
 use tokio::sync::Semaphore;
 
-#[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
-const COOLDOWN_BASE_SECS: u64 = 15;
-#[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
+// Lower bound a hard-down sticky cooldown is asserted to exceed, in tests.
+#[cfg(test)]
 const COOLDOWN_TRANSIENT_SECS: u64 = 10;
 // (A7 fix): hard-down (bad key / billing / hard quota) gets a long sticky cooldown
 // and recovers via the half-open probe — NOT a permanent `dead` kill. A human likely
@@ -55,7 +54,6 @@ pub(crate) fn now_for_test() -> u64 {
 
 /// Breaker state for a lane per ADR-0002.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
 pub(crate) enum BreakerState {
     Closed,
     Open { until: u64 },
@@ -66,7 +64,9 @@ pub(crate) enum BreakerState {
 /// Must be Send + 'static and movable into FirstByteBody stream.
 #[must_use]
 pub(crate) struct Permit {
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
+    // RAII guard: never read — held solely to keep the concurrency slot reserved for this request's
+    // lifetime; the slot is returned to the semaphore when the Permit (and this field) is dropped.
+    #[allow(dead_code)]
     inner: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -86,7 +86,6 @@ pub(crate) struct LaneSnapshot {
     pub free_slots: usize,
     pub ok: u64,
     pub err: u64,
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub client_fault: u64,
     pub usable: bool,
     pub dead: bool,
@@ -204,7 +203,6 @@ impl OutcomeWindow {
     }
 
     /// Clear all entries.
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     fn clear(&mut self) {
         self.entries.clear();
     }
@@ -665,7 +663,6 @@ fn make_lane_data_with_weight(id: usize, max_permits: usize) -> (LaneData, u32) 
 pub(crate) struct BreakerCfg {
     pub base_cooldown_secs: u64,
     pub max_cooldown_secs: u64,
-    #[cfg_attr(test, allow(dead_code))] // Used by honor_retry_after tests
     pub honor_retry_after: bool,
     pub trip: TripConfig,
 }

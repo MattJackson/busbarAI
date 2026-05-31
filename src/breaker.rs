@@ -87,8 +87,10 @@ pub(crate) fn classify(sig: &CanonicalSignal) -> Disposition {
 #[derive(Debug, Clone)]
 pub(crate) struct RawUpstreamError {
     pub http_status: u16,
+    /// Provider-specific error *code* (e.g. a numeric `code` field), checked against `error_map`.
     pub provider_code: Option<String>,
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
+    /// Provider-specific structured error *type* (e.g. a `type`/`error.type` string), checked
+    /// against `error_map` as a second signal when the code doesn't match.
     pub structured_type: Option<String>,
 }
 
@@ -125,6 +127,19 @@ pub(crate) fn normalize_raw_error(
         None
     };
 
+    // Step 1b: the provider's structured error *type* is a second data-driven signal — an operator
+    // can map it in error_map just like a code (useful when a provider has no numeric code but a
+    // typed `error.type`). The explicit code (above) wins; this refines when the code didn't match.
+    if let Some(ref ty) = raw.structured_type {
+        if let Some(class) = error_map.get(ty).and_then(|m| status_class_from_str(m)) {
+            return CanonicalSignal {
+                class,
+                provider_signal: provider_signal.or_else(|| Some(ty.clone())),
+                retry_after: None,
+            };
+        }
+    }
+
     // Step 2: Classify by HTTP status (universal spec; exhaustive match)
     let http_status = raw.http_status;
     let class = if http_status == 401 || http_status == 403 {
@@ -158,4 +173,55 @@ pub(crate) struct CanonicalSignal {
     pub(crate) class: StatusClass,
     pub(crate) provider_signal: Option<String>,
     pub(crate) retry_after: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn err_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_structured_type_drives_error_map() {
+        // No provider code, but a structured error type the operator mapped to `overloaded`.
+        let raw = RawUpstreamError {
+            http_status: 400, // would otherwise classify as ClientError
+            provider_code: None,
+            structured_type: Some("model_overloaded".to_string()),
+        };
+        let map = err_map(&[("model_overloaded", "overloaded")]);
+        let sig = normalize_raw_error(&raw, &map);
+        assert_eq!(sig.class, StatusClass::Overloaded);
+        assert_eq!(sig.provider_signal.as_deref(), Some("model_overloaded"));
+    }
+
+    #[test]
+    fn test_provider_code_wins_over_structured_type() {
+        let raw = RawUpstreamError {
+            http_status: 500,
+            provider_code: Some("1302".to_string()),
+            structured_type: Some("server_error".to_string()),
+        };
+        // Both mapped; the explicit code takes precedence.
+        let map = err_map(&[("1302", "rate_limit"), ("server_error", "server_error")]);
+        let sig = normalize_raw_error(&raw, &map);
+        assert_eq!(sig.class, StatusClass::RateLimit);
+    }
+
+    #[test]
+    fn test_unmapped_structured_type_falls_through_to_http() {
+        let raw = RawUpstreamError {
+            http_status: 429,
+            provider_code: None,
+            structured_type: Some("something_unmapped".to_string()),
+        };
+        let sig = normalize_raw_error(&raw, &HashMap::new());
+        assert_eq!(sig.class, StatusClass::RateLimit); // from HTTP 429
+    }
 }

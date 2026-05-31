@@ -1,6 +1,6 @@
 [package]
 name = "busbar"
-version = "0.16.0"
+version = "0.16.1"
 edition = "2021"
 description = "Native-protocol LLM gateway: lossless cross-protocol translation, weighted pools, per-(pool,lane) circuit breaking, and governance — in one static Rust binary."
 license = "AGPL-3.0-or-later"

@@ -25,8 +25,11 @@ pub(crate) trait ProtocolReader: Send + Sync {
     /// Extract raw error info from HTTP response without classifying.
     fn extract_error(&self, status: StatusCode, body: &[u8]) -> crate::breaker::RawUpstreamError;
 
-    /// Classify a response into a canonical signal (two-stage pipeline).
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
+    /// Classify a response into a canonical signal in one call (convenience over
+    /// `extract_error` + `normalize_raw_error`). The release path runs those two stages explicitly
+    /// (so it can apply the lane's `error_map`); this all-in-one form is exercised by the
+    /// per-protocol classification unit tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal;
 
     /// Read an IR request from wire JSON.

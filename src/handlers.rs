@@ -27,6 +27,7 @@ pub(crate) async fn stats(State(app): State<Arc<App>>) -> Response {
                 "free_slots": snap.free_slots,
                 "ok": snap.ok,
                 "err": snap.err,
+                "client_fault": snap.client_fault,
                 "usable": snap.usable,
                 "dead": snap.dead,
                 "dead_reason": snap.dead_reason,

@@ -5,6 +5,23 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1] — 2026-05-31
+
+### Added
+- **`error_map` can now match a provider's structured error *type***, not just its
+  numeric code. Stage 1b checks `raw.structured_type` against `error_map` as a second
+  data-driven signal (the explicit code still wins) — useful for providers that
+  surface a typed `error.type` but no code. (Previously `structured_type` was
+  extracted by every protocol but never consulted.)
+- `/stats` now reports each lane's `client_fault` counter alongside `ok`/`err`.
+
+### Changed
+- Dead-code cleanup: removed vestigial scaffolding (`SseCarryBuffer` and its test,
+  `COOLDOWN_BASE_SECS`, an unused `FirstByteBody::usage` and `GovState::store`
+  accessor) and resolved nearly every `#[allow(dead_code)]` — the remaining
+  suppressions are one RAII permit guard plus test-only API gated behind
+  `cfg(test)` / `cfg_attr(not(test))`. No behavior change from this part.
+
 ## [0.16.0] — 2026-05-31
 
 ### Added

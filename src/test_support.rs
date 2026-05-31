@@ -2599,7 +2599,7 @@ mod tests {
     /// (c) maintains bounded memory via carry buffer cap
     #[tokio::test]
     async fn test_stream_inspection_tap_usage_parsing() {
-        use crate::forward::{SseCarryBuffer, UsageTap};
+        use crate::forward::UsageTap;
 
         // Test 1: UsageTap extracts usage from Anthropic-style events
         let mut tap = UsageTap::new();
@@ -2658,48 +2658,7 @@ mod tests {
             "output_tokens from message_stop should be 8"
         );
 
-        // Test 3: Carry buffer boundedness (hard cap test)
-        let mut carry = SseCarryBuffer::new();
-
-        // Feed a chunk larger than max carry bytes
-        let large_chunk = vec![b'x'; 10000];
-        carry.feed(&Bytes::from(large_chunk));
-
-        // Assert: carry buffer respects MAX_CARRY_BYTES cap (4KB)
-        assert!(
-            carry.len() <= 4096,
-            "carry buffer should be bounded by max_bytes"
-        );
-
-        // Test 4: SSE frame reassembly across chunk boundaries
-        let mut carry2 = SseCarryBuffer::new();
-
-        // Split a complete SSE event across two chunks
-        let event1 = "data: {\"type\": \"message_start\"}\n\n";
-
-        // Feed first part (incomplete)
-        let split_point = event1.len() / 2;
-        carry2.feed(&Bytes::from(&event1.as_bytes()[..split_point]));
-
-        // Assert: no complete frame yet
-        assert!(
-            carry2.feed(&Bytes::new()).is_none(),
-            "should not have complete frame after first chunk"
-        );
-
-        // Feed remainder (completes the frame)
-        let remaining = &event1.as_bytes()[split_point..];
-        if let Some(frame) = carry2.feed(&Bytes::from(remaining)) {
-            let frame_str = String::from_utf8_lossy(&frame);
-            assert!(
-                frame_str.contains("message_start"),
-                "should contain first message"
-            );
-        } else {
-            panic!("Expected complete frame after second chunk");
-        }
-
-        // Test 5: Byte-identical stream forwarding (integration test with mock)
+        // Test 3: Byte-identical stream forwarding (integration test with mock)
         let state = Arc::new(MockServerState::new());
 
         // Create Anthropic-style SSE events including message_delta and message_stop

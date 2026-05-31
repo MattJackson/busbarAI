@@ -167,7 +167,6 @@ pub(crate) struct PoolCfg {
     #[serde(default)]
     pub(crate) on_exhausted: Option<OnExhaustedCfg>,
     #[serde(default)]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) affinity: Option<AffinityCfg>,
 }
 

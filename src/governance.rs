@@ -223,7 +223,8 @@ impl GovState {
         self.by_hash.read().unwrap().get(&hash).cloned()
     }
 
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
+    /// Direct handle to the backing store, for tests that seed/inspect persistence.
+    #[cfg(test)]
     pub(crate) fn store(&self) -> Arc<dyn Store> {
         self.store.clone()
     }
@@ -351,7 +352,9 @@ impl From<rusqlite::Error> for StoreError {
 pub(crate) trait Store: Send + Sync + 'static {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()>;
     fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>>;
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
+    // Lookup by key hash — part of the Store contract and unit-tested, but the hot-path key
+    // resolution uses the in-memory cache by id, so it's not called in release.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn get_key_by_hash(&self, key_hash: &str) -> StoreResult<Option<VirtualKey>>;
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>>;
     fn delete_key(&self, id: &str) -> StoreResult<()>;
@@ -404,7 +407,8 @@ impl SqliteStore {
         Ok(store)
     }
 
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
+    /// In-memory SQLite store, for unit tests.
+    #[cfg(test)]
     pub(crate) fn open_in_memory() -> StoreResult<Self> {
         let store = Self {
             conn: Mutex::new(Connection::open_in_memory()?),
