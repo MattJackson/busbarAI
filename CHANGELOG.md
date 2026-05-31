@@ -5,6 +5,45 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] — 2026-05-31
+
+Release candidate for final testing ahead of 1.0. Outcome of a three-model code audit
+(Opus, Sonnet, qwen3.5) of the full source.
+
+### Fixed (correctness / security)
+- **Panics removed on hostile input:** a malformed `Authorization` header could panic on a
+  UTF-8 boundary; a closing brace before an opening one in an upstream body could underflow
+  the JSON brace scanner; an API key with a control character could panic the worker. All now
+  fail cleanly.
+- **Circuit-breaker error-rate trip** now uses windowed errors vs windowed total (both from the
+  sliding window) — a long-running lane no longer spuriously trips on clean recent traffic once
+  old errors age out.
+- **SWRR weight updates are serialized** — concurrent selections could corrupt the algorithm's
+  invariant and bias distribution.
+- **Cooldown jitter** applies its sign (±) instead of only ever lengthening cooldowns.
+- **Session affinity** uses a stable hash, so sticky routing survives a restart (was a randomly
+  seeded hasher).
+- **Passthrough auth** now forwards the caller's bearer token (handlers previously dropped it,
+  silently falling back to the lane's static key).
+- **Degraded routing** (least-bad / fallback-pool) now applies cross-protocol translation, so it
+  is correct when the chosen lane speaks a different protocol.
+- Anthropic `tool` role messages map to the `user` role (no nonexistent `tool_use` role → 422);
+  bedrock parse-error signal typo (`ir-parse` → `ir_parse`); token-count i64 saturation.
+
+### Fixed (robustness / accounting)
+- Per-key rate-limit map evicts stale windows (was an unbounded per-key memory leak).
+- `/admin` usage `requests` no longer double-counts non-streaming cross-protocol responses.
+- `/stats` `inflight` is derived from the semaphore (was always 0).
+
+### Changed
+- **Logging:** a stderr `tracing` subscriber is always installed (level from `RUST_LOG`); OTLP
+  export composes on top when configured. Previously all spans/warnings were dropped unless OTLP
+  was set. Operational warnings moved from `eprintln!` to structured `tracing`.
+- **Quality:** named the magic numbers/strings (auth modes, breaker states, failover/timeout/
+  probe/rate-window/price/window-capacity defaults, Anthropic API version); the outcome window is
+  a `VecDeque` (O(1) eviction); scrubbed internal references from comments; `Cargo.toml` reports
+  the real version. One unconditional dead-code allow remains (a RAII guard).
+
 ## [0.16.2] — 2026-05-31
 
 ### Security
