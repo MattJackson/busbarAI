@@ -406,10 +406,18 @@ pub(crate) struct GovernanceCfg {
     /// SQLite database path for the durable Store (ADR-0009). Defaults to `busbar-governance.db`.
     #[serde(default = "default_gov_db_path")]
     pub(crate) db_path: String,
+    /// G-3: flat cents charged per request for budget accounting (token-/model-priced budgets are a
+    /// future refinement). Defaults to 1.
+    #[serde(default = "default_price_per_request_cents")]
+    pub(crate) price_per_request_cents: i64,
 }
 
 fn default_gov_db_path() -> String {
     "busbar-governance.db".to_string()
+}
+
+fn default_price_per_request_cents() -> i64 {
+    1
 }
 
 /// Observability sinks (sprint 0.11). All fields optional; absent = that sink is disabled.

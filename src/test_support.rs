@@ -516,7 +516,7 @@ mod tests {
                 created_at: 0,
             })
             .unwrap();
-        let gov = Arc::new(GovState::new(store).unwrap());
+        let gov = Arc::new(GovState::new(store, 1).unwrap());
 
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let st = Arc::new(InMemoryStore::new(vec![]));
@@ -577,6 +577,70 @@ mod tests {
             r.status().as_u16(),
             404,
             "ACL passed; unknown pool → not found"
+        );
+
+        handle.abort();
+    }
+
+    /// G-3: a virtual key over its budget is rejected with 402 before forwarding.
+    #[tokio::test]
+    async fn test_governance_budget_402() {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let secret = "sk-vk-broke";
+        store
+            .put_key(&VirtualKey {
+                id: "kb".to_string(),
+                key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
+                name: "broke".to_string(),
+                allowed_pools: vec![], // all pools
+                max_budget_cents: Some(100),
+                budget_period: "total".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        // Pre-seed usage past the 100c budget (window 0 = "total").
+        store.add_usage("kb", 0, 250, 0).unwrap();
+        let gov = Arc::new(GovState::new(store, 1).unwrap());
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let st = Arc::new(InMemoryStore::new(vec![]));
+        let app = Arc::new(App {
+            lanes: vec![],
+            store: st,
+            by_model: HashMap::new(),
+            pools: HashMap::new(),
+            rr: AtomicUsize::new(0),
+            client: Client::builder().build().unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+            governance: Some(gov),
+        });
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}/anypool/v1/messages"))
+            .bearer_auth(secret)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            402,
+            "over-budget key → payment required"
         );
 
         handle.abort();

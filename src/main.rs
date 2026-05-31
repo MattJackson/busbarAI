@@ -266,16 +266,18 @@ async fn main() {
     // G-2: open the governance store + load the virtual-key cache when enabled.
     let governance = match governance_cfg {
         Some(g) if g.enabled => match governance::SqliteStore::open(&g.db_path) {
-            Ok(store) => match governance::GovState::new(Arc::new(store)) {
-                Ok(gs) => {
-                    eprintln!("busbar: governance enabled (sqlite {})", g.db_path);
-                    Some(Arc::new(gs))
+            Ok(store) => {
+                match governance::GovState::new(Arc::new(store), g.price_per_request_cents) {
+                    Ok(gs) => {
+                        eprintln!("busbar: governance enabled (sqlite {})", g.db_path);
+                        Some(Arc::new(gs))
+                    }
+                    Err(e) => {
+                        eprintln!("[error] governance init failed: {e}");
+                        std::process::exit(1);
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[error] governance init failed: {e}");
-                    std::process::exit(1);
-                }
-            },
+            }
             Err(e) => {
                 eprintln!("[error] governance db open failed ({}): {e}", g.db_path);
                 std::process::exit(1);

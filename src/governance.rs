@@ -18,16 +18,45 @@ use std::sync::{Arc, Mutex, RwLock};
 pub(crate) struct GovState {
     store: Arc<dyn Store>,
     by_hash: RwLock<HashMap<String, VirtualKey>>,
+    /// G-3 cost model: flat cents charged per request. Budgets are enforced against accumulated
+    /// request-cost. (Token-/model-priced budgets are a documented future refinement; this keeps
+    /// the budget real + enforceable without parsing every response body.)
+    price_per_request_cents: i64,
 }
 
 #[allow(dead_code)] // refresh/store used by the management API (G-5)
 impl GovState {
-    pub(crate) fn new(store: Arc<dyn Store>) -> StoreResult<Self> {
+    pub(crate) fn new(store: Arc<dyn Store>, price_per_request_cents: i64) -> StoreResult<Self> {
         let by_hash = Self::load(store.as_ref())?;
         Ok(Self {
             store,
             by_hash: RwLock::new(by_hash),
+            price_per_request_cents,
         })
+    }
+
+    /// G-3: is this key already at/over its budget for the current window? (No cap → never.)
+    pub(crate) fn is_over_budget(&self, key: &VirtualKey, now: u64) -> bool {
+        let Some(limit) = key.max_budget_cents else {
+            return false;
+        };
+        let window = budget_window(&key.budget_period, now);
+        self.store
+            .get_usage(&key.id, window)
+            .map(|u| u.spend_cents >= limit)
+            .unwrap_or(false)
+    }
+
+    /// G-3: charge one request (flat per-request cost + token count) to the key's current window.
+    /// Best-effort: a store error is logged-and-dropped (telemetry must not break serving).
+    pub(crate) fn record_request(&self, key: &VirtualKey, now: u64, tokens: u64) {
+        let window = budget_window(&key.budget_period, now);
+        if let Err(e) = self
+            .store
+            .add_usage(&key.id, window, self.price_per_request_cents, tokens)
+        {
+            eprintln!("busbar: usage record failed for key {}: {e}", key.id);
+        }
     }
 
     fn load(store: &dyn Store) -> StoreResult<HashMap<String, VirtualKey>> {
@@ -66,6 +95,43 @@ pub(crate) struct GovCtx {
 /// Whether `key` may target `pool` (empty allowed_pools = all pools).
 pub(crate) fn pool_allowed(key: &VirtualKey, pool: &str) -> bool {
     key.allowed_pools.is_empty() || key.allowed_pools.iter().any(|p| p == pool)
+}
+
+/// The epoch start of the budget window containing `now` for a given period (G-3). "total" = a
+/// single all-time window (0); "daily" = UTC midnight; "monthly" = UTC first-of-month.
+pub(crate) fn budget_window(period: &str, now: u64) -> u64 {
+    match period {
+        "daily" => now / 86_400 * 86_400,
+        "monthly" => {
+            let days = (now / 86_400) as i64;
+            let (y, m, _) = civil_from_days(days);
+            (days_from_civil(y, m, 1) as u64) * 86_400
+        }
+        _ => 0, // "total" (and any unknown period) = one all-time window
+    }
+}
+
+// Howard Hinnant's civil-date algorithms (shared shape with sigv4); self-contained here.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// A virtual key issued by busbar (distinct from upstream provider keys). Maps a caller to the
@@ -378,7 +444,7 @@ mod tests {
         k.allowed_pools = vec!["prod".to_string()];
         store.put_key(&k).unwrap();
 
-        let gov = GovState::new(store).unwrap();
+        let gov = GovState::new(store, 1).unwrap();
         // hashed-secret lookup hits the cache.
         assert_eq!(gov.lookup(secret).unwrap().id, "k1");
         assert!(gov.lookup("wrong-secret").is_none());
@@ -396,6 +462,37 @@ mod tests {
         gov.refresh().unwrap();
         let r2 = gov.lookup(secret2).unwrap();
         assert!(pool_allowed(&r2, "anything"), "empty allowed_pools = all");
+    }
+
+    #[test]
+    fn test_budget_window_periods() {
+        assert_eq!(budget_window("total", 1_700_000_000), 0);
+        assert_eq!(budget_window("unknown", 1_700_000_000), 0);
+        assert_eq!(budget_window("daily", 1_700_000_000), 1_699_920_000);
+        // 1700000000 = 2023-11-14 → 2023-11-01 00:00Z = 1698796800.
+        assert_eq!(budget_window("monthly", 1_700_000_000), 1_698_796_800);
+    }
+
+    #[test]
+    fn test_is_over_budget_and_record() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut k = sample_key("k1", "h1");
+        k.max_budget_cents = Some(100);
+        k.budget_period = "total".to_string();
+        store.put_key(&k).unwrap();
+        let gov = GovState::new(store, 30).unwrap(); // 30 cents/request
+
+        assert!(!gov.is_over_budget(&k, 1_700_000_000));
+        for _ in 0..3 {
+            gov.record_request(&k, 1_700_000_000, 0); // 90c < 100c
+        }
+        assert!(!gov.is_over_budget(&k, 1_700_000_000));
+        gov.record_request(&k, 1_700_000_000, 0); // 120c ≥ 100c
+        assert!(gov.is_over_budget(&k, 1_700_000_000));
+
+        let mut unlimited = k.clone();
+        unlimited.max_budget_cents = None;
+        assert!(!gov.is_over_budget(&unlimited, 1_700_000_000));
     }
 
     #[test]

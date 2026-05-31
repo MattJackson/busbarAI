@@ -36,10 +36,34 @@ fn pool_authorized(gov: &crate::governance::GovCtx, pool: &str) -> Option<Respon
     None
 }
 
-/// B-602: emit the per-request observability metrics at the ingress boundary (one client request =
-/// one call here, unlike the re-entrant forward_with_pool). Outcome is derived from the final
-/// status; duration is wall-clock for the whole proxied request.
-fn finish(ingress_protocol: &str, pool: &str, started: Instant, resp: Response) -> Response {
+/// G-3 (0.12): reject (402) before forwarding when the resolved virtual key is already over its
+/// budget for the current window. No-op when governance is off or the key has no budget cap.
+fn budget_check(app: &Arc<App>, gov: &crate::governance::GovCtx) -> Option<Response> {
+    if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
+        if g.is_over_budget(key, crate::store::now()) {
+            return Some(
+                (
+                    StatusCode::PAYMENT_REQUIRED,
+                    format!("virtual key '{}' has exceeded its budget", key.id),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    None
+}
+
+/// B-602/G-3: the ingress boundary — emit per-request observability metrics (one client request =
+/// one call here, unlike the re-entrant forward_with_pool) AND charge the request to the virtual
+/// key's budget. Outcome is derived from the final status; duration is wall-clock.
+fn finish(
+    app: &Arc<App>,
+    gov: &crate::governance::GovCtx,
+    ingress_protocol: &str,
+    pool: &str,
+    started: Instant,
+    resp: Response,
+) -> Response {
     let outcome = match resp.status().as_u16() {
         200..=299 => "ok",
         503 => "exhausted",
@@ -69,6 +93,12 @@ fn finish(ingress_protocol: &str, pool: &str, started: Instant, resp: Response) 
         outcome,
         elapsed.as_millis() as u64,
     ));
+
+    // G-3: charge the request to the virtual key's budget. Token-based cost is a future refinement
+    // (tokens=0 here); the flat per-request price is what accrues today.
+    if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
+        g.record_request(key, crate::store::now(), 0);
+    }
     resp
 }
 
@@ -105,6 +135,10 @@ pub(crate) async fn openai_ingress(
     if let Some(resp) = pool_authorized(&gov, &model) {
         return resp;
     }
+    // G-3: reject over-budget keys before forwarding.
+    if let Some(resp) = budget_check(&app, &gov) {
+        return resp;
+    }
 
     let _affinity_key: Option<&str> = headers.get("x-session-id").and_then(|v| v.to_str().ok());
 
@@ -119,7 +153,7 @@ pub(crate) async fn openai_ingress(
             "openai",
         )
         .await;
-        return finish("openai", &model, started, resp);
+        return finish(&app, &gov, "openai", &model, started, resp);
     }
 
     if let Some(&i) = app.by_model.get(&model) {
@@ -130,7 +164,7 @@ pub(crate) async fn openai_ingress(
             None,
         )
         .await;
-        return finish("openai", &model, started, resp);
+        return finish(&app, &gov, "openai", &model, started, resp);
     }
 
     (
@@ -157,6 +191,10 @@ pub(crate) async fn named(
     if let Some(resp) = pool_authorized(&gov, &name) {
         return resp;
     }
+    // G-3: reject over-budget keys before forwarding.
+    if let Some(resp) = budget_check(&app, &gov) {
+        return resp;
+    }
 
     let started = Instant::now();
     let affinity_key = headers.get("x-session-id").and_then(|v| v.to_str().ok());
@@ -173,7 +211,7 @@ pub(crate) async fn named(
             "anthropic",
         )
         .await;
-        return finish("anthropic", &name, started, resp);
+        return finish(&app, &gov, "anthropic", &name, started, resp);
     }
     if let Some(&i) = app.by_model.get(&name) {
         // Use forward for model-based routing (no pool name context needed)
@@ -184,7 +222,7 @@ pub(crate) async fn named(
             _caller_token,
         )
         .await;
-        return finish("anthropic", &name, started, resp);
+        return finish(&app, &gov, "anthropic", &name, started, resp);
     }
 
     (
@@ -209,6 +247,10 @@ pub(crate) async fn adhoc(
     if let Some(resp) = pool_authorized(&gov, &model) {
         return resp;
     }
+    // G-3: reject over-budget keys before forwarding.
+    if let Some(resp) = budget_check(&app, &gov) {
+        return resp;
+    }
 
     match app.by_model.get(&model) {
         Some(&i) if app.lanes[i].provider == provider => {
@@ -220,7 +262,7 @@ pub(crate) async fn adhoc(
                 _caller_token,
             )
             .await;
-            finish("anthropic", &model, started, resp)
+            finish(&app, &gov, "anthropic", &model, started, resp)
         }
         Some(&i) => (
             StatusCode::BAD_REQUEST,
@@ -242,11 +284,39 @@ pub(crate) async fn adhoc(
 mod tests {
     use super::*;
 
+    /// Minimal governance-off App for exercising `finish` in isolation.
+    fn minimal_app() -> Arc<App> {
+        use std::sync::atomic::AtomicUsize;
+        Arc::new(App {
+            lanes: vec![],
+            store: Arc::new(crate::store::InMemoryStore::new(vec![])),
+            by_model: std::collections::HashMap::new(),
+            pools: std::collections::HashMap::new(),
+            rr: AtomicUsize::new(0),
+            client: reqwest::Client::new(),
+            auth: Arc::new(crate::auth::AuthMiddleware::new(
+                &crate::config::AuthCfg::default_none(),
+            )),
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: std::collections::HashMap::new(),
+            on_exhausted_cfgs: std::collections::HashMap::new(),
+            governance: None,
+        })
+    }
+
     #[test]
     fn test_finish_emits_request_metrics() {
         crate::metrics::init();
         let resp = (StatusCode::OK, "ok").into_response();
-        let out = finish("openai", "mypool", Instant::now(), resp);
+        let out = finish(
+            &minimal_app(),
+            &crate::governance::GovCtx::default(),
+            "openai",
+            "mypool",
+            Instant::now(),
+            resp,
+        );
         // finish must pass the response through unchanged.
         assert_eq!(out.status(), StatusCode::OK);
 
@@ -269,7 +339,14 @@ mod tests {
     fn test_finish_outcome_mapping_503_is_exhausted() {
         crate::metrics::init();
         let resp = (StatusCode::SERVICE_UNAVAILABLE, "x").into_response();
-        let _ = finish("anthropic", "p2", Instant::now(), resp);
+        let _ = finish(
+            &minimal_app(),
+            &crate::governance::GovCtx::default(),
+            "anthropic",
+            "p2",
+            Instant::now(),
+            resp,
+        );
         assert!(
             crate::metrics::render().contains("outcome=\"exhausted\""),
             "503 maps to outcome=exhausted"
