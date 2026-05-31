@@ -399,6 +399,10 @@ pub(crate) struct ProviderDeploy {
     /// Optional auth-style override (see ProviderDef::auth).
     #[serde(default)]
     pub(crate) auth: Option<String>,
+    /// Optional active health-probe settings (see ProviderDef::health). Overrides the catalog's
+    /// `health` when set; this is the block the shipped `config.yaml` documents under a provider.
+    #[serde(default)]
+    pub(crate) health: Option<HealthCfg>,
 }
 
 /// Deployment configuration - operator-owned config.yaml structure.
@@ -511,7 +515,9 @@ pub(crate) fn resolve(
                 protocol,
                 base_url,
                 api_key_env: deploy_cfg.api_key_env.clone(),
-                health: def.health.clone(),
+                // Deployment health config wins over the catalog default (mirrors path/auth), so
+                // the `health:` block documented in config.yaml actually takes effect.
+                health: deploy_cfg.health.clone().or_else(|| def.health.clone()),
                 error_map,
                 // deployment override wins over the catalog default
                 path: deploy_cfg.path.clone().or_else(|| def.path.clone()),
@@ -584,6 +590,12 @@ models:
                 error_map: None,
                 path: None, // inherit the catalog override
                 auth: None,
+                // Deployment-side health (the block config.yaml documents under a provider).
+                health: Some(HealthCfg {
+                    mode: HealthMode::Dead,
+                    interval_secs: Some(5),
+                    timeout_secs: None,
+                }),
             },
         );
         let deploy = DeployCfg {
@@ -600,6 +612,12 @@ models:
             cfg.providers["zai-payg"].path.as_deref(),
             Some("/chat/completions"),
             "catalog path override must resolve into ProviderCfg"
+        );
+        // Deployment-side health must survive resolve (regression: it was silently dropped).
+        assert_eq!(
+            cfg.providers["zai-payg"].health.as_ref().map(|h| h.mode),
+            Some(HealthMode::Dead),
+            "config.yaml provider health must resolve into ProviderCfg"
         );
     }
 
@@ -734,6 +752,7 @@ models:
                 error_map: None,
                 path: None,
                 auth: None,
+                health: None,
             },
         );
 
@@ -781,6 +800,7 @@ models:
                 error_map: None,
                 path: None,
                 auth: None,
+                health: None,
             },
         );
 
@@ -833,6 +853,7 @@ models:
                 error_map: Some(override_error_map),  // Override error_map
                 path: None,
                 auth: None,
+                health: None,
             },
         );
 
@@ -893,6 +914,7 @@ models:
                 error_map: None,
                 path: None,
                 auth: None,
+                health: None,
             },
         );
 

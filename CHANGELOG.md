@@ -5,6 +5,16 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.2] — 2026-05-31
+
+### Fixed
+- **Provider `health:` in `config.yaml` now takes effect.** The deployment-side `ProviderDeploy`
+  had no `health` field, so a `health:` block under a provider in `config.yaml` (exactly as the
+  shipped example documents it) was silently dropped at parse time and `resolve()` only used the
+  catalog's `providers.yaml` health — meaning active/dead health probing never spawned for
+  config-defined health. `ProviderDeploy` now carries `health`, and `resolve()` merges it
+  deployment-wins-over-catalog (mirroring `path`/`auth`). + regression test. (QA finding C)
+
 ## [0.17.1] — 2026-05-31
 
 Second RC for final testing — fixes from the first 0.17.0 testing pass.
