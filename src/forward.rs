@@ -25,7 +25,6 @@ use crate::store::{now, Permit};
 /// This accumulator extracts the final `message_delta` / `message_stop` usage object
 /// from a streaming Anthropic response without buffering the entire body. It maintains
 /// only small parsed fields and a bounded carry buffer for frame reassembly across chunks.
-#[allow(dead_code)] // Usage exposed via FirstByteBody::usage for cost accounting
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UsageTap {
     /// Extracted input tokens (from message_delta.usage.input_tokens or message_stop.usage.input_tokens)
@@ -161,7 +160,7 @@ impl UsageTap {
     }
 
     /// Check if any usage data was extracted.
-    #[allow(dead_code)] // Used for future integration
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) fn has_usage(&self) -> bool {
         self.input_tokens.is_some() || self.output_tokens.is_some()
     }
@@ -205,7 +204,7 @@ fn find_matching_brace(chunk: &[u8]) -> Option<usize> {
 ///
 /// This is a bounded accumulator that holds at most MAX_CARRY_BYTES to prevent
 /// memory unboundedness when frames span multiple chunks. It never retains the full body.
-#[allow(dead_code)] // Methods used in tests and for future integration
+#[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
 pub(crate) struct SseCarryBuffer {
     /// Accumulated bytes from incomplete SSE frame
     buffer: Vec<u8>,
@@ -214,6 +213,7 @@ pub(crate) struct SseCarryBuffer {
 }
 
 impl SseCarryBuffer {
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) fn new() -> Self {
         Self {
             buffer: Vec::new(),
@@ -223,7 +223,7 @@ impl SseCarryBuffer {
 
     /// Feed a chunk and return the complete SSE frame if available.
     /// Returns Some(frame_bytes) when a complete event is assembled, None otherwise.
-    #[allow(dead_code)] // Used in tests to verify bounded memory behavior
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) fn feed(&mut self, chunk: &Bytes) -> Option<Bytes> {
         // Append new bytes (bounded by max_bytes)
         let to_add = chunk
@@ -247,7 +247,7 @@ impl SseCarryBuffer {
     }
 
     /// Get the current carry buffer size (for testing boundedness).
-    #[allow(dead_code)] // Used in tests to verify bounded memory
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) fn len(&self) -> usize {
         self.buffer.len()
     }
@@ -320,7 +320,7 @@ where
     }
 
     /// Get a reference to the extracted usage data after stream completion.
-    #[allow(dead_code)] // Exposed for cost accounting integration
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) fn usage(&self) -> &UsageTap {
         &self.tap
     }

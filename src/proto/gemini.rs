@@ -866,7 +866,6 @@ impl ProtocolWriter for GeminiWriter {
         }
     }
 
-    #[allow(dead_code)] // Used by / tests
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
         // Build candidates array (Gemini whole-response format)
         let mut parts_arr: Vec<serde_json::Value> = Vec::new();

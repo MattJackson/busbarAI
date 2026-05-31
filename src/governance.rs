@@ -48,7 +48,6 @@ pub(crate) struct NewKeySpec {
     pub tpm_limit: Option<u32>,
 }
 
-#[allow(dead_code)] // refresh/store used by the management API
 impl GovState {
     pub(crate) fn new(
         store: Arc<dyn Store>,
@@ -224,6 +223,7 @@ impl GovState {
         self.by_hash.read().unwrap().get(&hash).cloned()
     }
 
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) fn store(&self) -> Arc<dyn Store> {
         self.store.clone()
     }
@@ -348,10 +348,10 @@ impl From<rusqlite::Error> for StoreError {
 
 /// The durable governance store seam (ADR-0009). Swappable: `SqliteStore` today, `PostgresStore`
 /// later behind the same trait.
-#[allow(dead_code)] // CRUD surface; wired by..
 pub(crate) trait Store: Send + Sync + 'static {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()>;
     fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>>;
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     fn get_key_by_hash(&self, key_hash: &str) -> StoreResult<Option<VirtualKey>>;
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>>;
     fn delete_key(&self, id: &str) -> StoreResult<()>;
@@ -395,7 +395,6 @@ pub(crate) struct SqliteStore {
     conn: Mutex<Connection>,
 }
 
-#[allow(dead_code)] // open/open_in_memory used by main + tests
 impl SqliteStore {
     pub(crate) fn open(path: &str) -> StoreResult<Self> {
         let store = Self {
@@ -405,6 +404,7 @@ impl SqliteStore {
         Ok(store)
     }
 
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) fn open_in_memory() -> StoreResult<Self> {
         let store = Self {
             conn: Mutex::new(Connection::open_in_memory()?),

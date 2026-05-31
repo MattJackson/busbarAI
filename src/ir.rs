@@ -6,7 +6,6 @@
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Used by tests only
 pub(crate) struct IrRequest {
     pub system: Vec<IrBlock>,
     pub messages: Vec<IrMessage>,
@@ -57,14 +56,12 @@ pub(crate) struct IrResponse {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Used by tests only
 pub(crate) struct IrMessage {
     pub role: IrRole,
     pub content: Vec<IrBlock>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Used by tests only
 pub(crate) enum IrRole {
     System,
     User,
@@ -73,7 +70,6 @@ pub(crate) enum IrRole {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Used by tests only
 pub(crate) enum IrBlock {
     Text {
         text: String,
@@ -101,19 +97,16 @@ pub(crate) enum IrBlock {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Used by tests only
 pub(crate) struct CacheControl {
     pub kind: CacheKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Used by tests only
 pub(crate) enum CacheKind {
     Ephemeral,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Used by tests only
 pub(crate) struct IrTool {
     pub name: String,
     pub description: Option<String>,
@@ -121,7 +114,6 @@ pub(crate) struct IrTool {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // response/stream IR types (used by tests in proto.rs)
 pub(crate) struct IrUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -130,7 +122,6 @@ pub(crate) struct IrUsage {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // response/stream IR types (used by tests in proto.rs)
 pub(crate) enum IrBlockMeta {
     Text,
     Thinking,
@@ -152,7 +143,6 @@ pub(crate) enum IrDelta {
 /// IR's block boundaries (one chunk → 0..n events): whether MessageStart was emitted, whether
 /// the text block (index 0) is open, and which OpenAI tool_call indices have been opened.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // consumed by ProtocolReader::read_response_events (/)
 pub(crate) struct StreamDecodeState {
     pub started: bool,
     pub text_block_open: bool,

@@ -49,12 +49,10 @@ pub(crate) struct App {
     pub(crate) auth: Arc<crate::auth::AuthMiddleware>,
     pub(crate) auth_mode: crate::auth::AuthMode,
     /// Default failover config (deadline_s and max_failover cap).
-    #[allow(dead_code)] // Used by forward.rs for default policy
     pub(crate) failover_cfg: Option<crate::config::FailoverCfg>,
     /// Fallback pools mapping (pool name -> WeightedLane vec) for fallback mode.
     pub(crate) fallback_pools: HashMap<String, Vec<WeightedLane>>,
     /// OnExhausted config per pool name.
-    #[allow(dead_code)] // Used by forward.rs for exhaustion handling
     pub(crate) on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
     /// governance runtime (virtual keys + budgets/limits store). `None` = disabled.
     pub(crate) governance: Option<std::sync::Arc<crate::governance::GovState>>,

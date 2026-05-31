@@ -303,7 +303,6 @@ impl ProtocolReader for OpenAiReader {
         })
     }
 
-    #[allow(dead_code)] // Singular 1:1 form is unused for OpenAI (flat stream needs fan-out); see read_response_events
     fn read_response_event(
         &self,
         event_type: &str,
@@ -591,7 +590,6 @@ impl ProtocolReader for OpenAiReader {
 }
 
 /// Read an OpenAI-format block from JSON.
-#[allow(dead_code)] // Used by tests only
 fn read_openai_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrError> {
     let obj = block_val.as_object().ok_or(IrError {
         class: StatusClass::ClientError,
@@ -636,7 +634,6 @@ fn read_openai_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock
 }
 
 /// Read an OpenAI-format tool from JSON.
-#[allow(dead_code)] // Used by tests only
 fn read_openai_tool(tool_val: &serde_json::Value) -> Result<crate::ir::IrTool, IrError> {
     let obj = tool_val.as_object().ok_or(IrError {
         class: StatusClass::ClientError,
@@ -877,7 +874,6 @@ impl ProtocolWriter for OpenAiWriter {
         serde_json::Value::Object(out)
     }
 
-    #[allow(dead_code)] // Used by / tests
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
         match ev {
             IrStreamEvent::MessageStart { role, .. } => {

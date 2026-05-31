@@ -320,7 +320,6 @@ impl ProtocolReader for CohereReader {
         })
     }
 
-    #[allow(dead_code)]
     fn read_response_event(
         &self,
         _event_type: &str,
@@ -821,7 +820,6 @@ impl ProtocolWriter for CohereWriter {
         }
     }
 
-    #[allow(dead_code)]
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
         let mut out = serde_json::Map::new();
         let mut content_arr: Vec<serde_json::Value> = Vec::new();

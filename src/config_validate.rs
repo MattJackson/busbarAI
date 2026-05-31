@@ -119,7 +119,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)] // Helper function for tests
     fn make_provider(protocol: &str, base_url: &str, api_key_env: &str) -> config::ProviderCfg {
         // Provide a minimal valid error_map to satisfy validation
         let mut error_map = std::collections::HashMap::new();

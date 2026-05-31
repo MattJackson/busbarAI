@@ -38,7 +38,6 @@ pub(crate) fn interpolate_env(s: &str) -> Result<String, String> {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // fields parsed but not wired into routing
 pub(crate) struct RootCfg {
     #[serde(default = "default_listen")]
     pub(crate) listen: String,
@@ -48,7 +47,6 @@ pub(crate) struct RootCfg {
     pub(crate) pools: HashMap<String, PoolCfg>,
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct AuthCfg {
     #[serde(default = "default_auth_mode")]
@@ -88,7 +86,6 @@ fn default_auth_mode() -> String {
     "none".to_string()
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProviderCfg {
     #[serde(default = "default_protocol")]
@@ -96,6 +93,7 @@ pub(crate) struct ProviderCfg {
     pub(crate) base_url: String,
     pub(crate) api_key_env: String,
     #[serde(default)]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) health: Option<HealthCfg>,
     // error_map is REQUIRED on every provider — NO default (fail loud if missing)
     pub(crate) error_map: HashMap<String, String>,
@@ -114,10 +112,11 @@ fn default_protocol() -> String {
     "anthropic".to_string()
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct HealthCfg {
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) interval_secs: Option<u64>,
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) timeout_secs: Option<u64>,
 }
 
@@ -133,22 +132,22 @@ fn neg1() -> i64 {
     -1
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct PoolCfg {
     #[serde(default)]
     pub(crate) members: Vec<PoolMember>,
     #[serde(default)]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) breaker: Option<BreakerCfg>,
     #[serde(default)]
     pub(crate) failover: Option<FailoverCfg>,
     #[serde(default)]
     pub(crate) on_exhausted: Option<OnExhaustedCfg>,
     #[serde(default)]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) affinity: Option<AffinityCfg>,
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct PoolMember {
     pub(crate) target: String,
@@ -173,17 +172,21 @@ pub(crate) enum BreakerTripMode {
 
 /// Trip configuration parameters (ADR-0002 defaults).
 #[derive(Debug, Deserialize, Clone, Default)]
-#[allow(dead_code)] // Fields defined for config, used by FSM logic
 pub(crate) struct BreakerTripConfig {
     #[serde(default = "default_trip_mode")]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub mode: BreakerTripMode,
     #[serde(default = "default_window_s")]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub window_s: u64,
     #[serde(default = "default_threshold")]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub threshold: f64,
     #[serde(default = "default_min_requests")]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub min_requests: usize,
     #[serde(default = "default_consecutive_n")]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub n: u32,
 }
 
@@ -209,13 +212,15 @@ fn default_consecutive_n() -> u32 {
 
 /// Breaker configuration per pool with full trip settings (ADR-0002).
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)] // Fields defined for config, used by FSM logic
 pub(crate) struct BreakerCfg {
     #[serde(default = "default_cooldown")]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub base_cooldown_secs: u64,
     #[serde(default = "default_max_cooldown")]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub max_cooldown_secs: u64,
     #[serde(default)]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub trip: Option<BreakerTripConfig>,
 }
 
@@ -237,12 +242,12 @@ fn default_max_cooldown() -> u64 {
     120
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct FailoverCfg {
     #[serde(default = "default_failover_deadline")]
     pub(crate) deadline_secs: u64,
     #[serde(default)]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) exclusions: Option<Vec<String>>,
     #[serde(default = "default_cap")]
     pub(crate) cap: usize,
@@ -256,7 +261,6 @@ fn default_cap() -> usize {
     3
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct OnExhaustedCfg {
     #[serde(default = "default_on_exhausted_action")]
@@ -314,12 +318,13 @@ impl OnExhausted {
     }
 }
 
-#[allow(dead_code)] // v1 schema fields defined but not yet wired into routing
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct AffinityCfg {
     #[serde(default = "default_affinity_mode")]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) mode: String,
     #[serde(default)]
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) header_name: Option<String>,
 }
 

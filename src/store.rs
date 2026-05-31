@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use tokio::sync::Semaphore;
 
-#[allow(dead_code)] // Used by record_transient and other methods
+#[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
 const COOLDOWN_BASE_SECS: u64 = 15;
-#[allow(dead_code)] // no longer used directly (now uses compute_cooldown_with_retry_after)
+#[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
 const COOLDOWN_TRANSIENT_SECS: u64 = 10;
 // (A7 fix): hard-down (bad key / billing / hard quota) gets a long sticky cooldown
 // and recovers via the half-open probe — NOT a permanent `dead` kill. A human likely
@@ -55,7 +55,7 @@ pub(crate) fn now_for_test() -> u64 {
 
 /// Breaker state for a lane per ADR-0002.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Variants constructed by breaker_state() and used in FSM logic
+#[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
 pub(crate) enum BreakerState {
     Closed,
     Open { until: u64 },
@@ -66,7 +66,7 @@ pub(crate) enum BreakerState {
 /// Must be Send + 'static and movable into FirstByteBody stream.
 #[must_use]
 pub(crate) struct Permit {
-    #[allow(dead_code)] // Dropped via Drop impl at end of stream
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     inner: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -86,7 +86,7 @@ pub(crate) struct LaneSnapshot {
     pub free_slots: usize,
     pub ok: u64,
     pub err: u64,
-    #[allow(dead_code)] // Tracked for /stats expansion (client fault vs upstream fault)
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub client_fault: u64,
     pub usable: bool,
     pub dead: bool,
@@ -101,12 +101,11 @@ pub(crate) struct LaneSnapshot {
 pub(crate) trait StateStore: Send + Sync + 'static {
     // health queries
     fn usable(&self, lane: usize, now: u64) -> bool;
-    #[allow(dead_code)] // Used for future breaker state tracking
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     fn breaker_state(&self, lane: usize) -> BreakerState;
     fn cooldown_remaining(&self, lane: usize, now: u64) -> u64;
 
     // outcome recording (the breaker's write path)
-    #[allow(dead_code)] // Used for future success tracking
     fn record_success(&self, lane: usize);
     fn record_client_fault(&self, lane: usize);
     fn record_transient(&self, lane: usize, what: &str, retry_after: Option<u64>);
@@ -115,7 +114,6 @@ pub(crate) trait StateStore: Send + Sync + 'static {
 
     // concurrency + budget (kept as-is conceptually)
     fn try_acquire(&self, lane: usize) -> Option<Permit>;
-    #[allow(dead_code)] // Used for future budget tracking
     fn spend_budget(&self, lane: usize) -> bool; // false => exhausted
 
     // weighted member selection (SWRR algorithm)
@@ -132,7 +130,6 @@ pub(crate) trait StateStore: Send + Sync + 'static {
 /// Bounded sliding window of timestamped outcomes (ring buffer style).
 /// Stores timestamps in seconds since epoch. Memory is bounded by `capacity`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Methods used for trip evaluation (future full implementation)
 struct OutcomeWindow {
     entries: Vec<u64>,
     capacity: usize,
@@ -147,7 +144,6 @@ impl OutcomeWindow {
     }
 
     /// Add a timestamped outcome. If over capacity, drop oldest.
-    #[allow(dead_code)] // Used for trip evaluation
     fn push(&mut self, ts: u64) {
         if self.entries.len() >= self.capacity {
             self.entries.remove(0);
@@ -156,14 +152,14 @@ impl OutcomeWindow {
     }
 
     /// Count outcomes within `window_s` seconds of `now`.
-    #[allow(dead_code)] // Used for trip evaluation
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     fn count_in_window(&self, now: u64, window_s: u64) -> usize {
         let start = now.saturating_sub(window_s);
         self.entries.iter().filter(|&&ts| ts >= start).count()
     }
 
     /// Clear all entries.
-    #[allow(dead_code)] // Used for recovery on probe success
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     fn clear(&mut self) {
         self.entries.clear();
     }
@@ -233,7 +229,7 @@ impl InMemoryStore {
 
     /// Evaluate trip condition for Closed → Open transition.
     /// Returns true if the lane should trip to Open.
-    #[allow(dead_code)] // Used for full FSM implementation
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     fn should_trip(lane: &LaneState, now: u64, cfg: &BreakerCfg) -> bool {
         let window = lane.outcome_window.lock().unwrap();
 
@@ -264,7 +260,7 @@ impl InMemoryStore {
 
     /// Compute escalating cooldown duration with optional Retry-After floor.
     /// The server's explicit Retry-After is always respected even if it exceeds max_cooldown_secs.
-    #[allow(dead_code)] // Used by open_state() for escalation logic
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     fn compute_cooldown(lane: &LaneState, _now: u64, cfg: &BreakerCfg) -> u64 {
         Self::compute_cooldown_with_retry_after(lane, _now, cfg, None)
     }
@@ -272,7 +268,6 @@ impl InMemoryStore {
     /// Compute escalating cooldown duration with optional Retry-After floor.
     /// If retry_after is Some and honor_retry_after is true, the cooldown is max(computed_backoff, retry_after).
     /// The server's explicit Retry-After is always respected even if it exceeds max_cooldown_secs.
-    #[allow(dead_code)] // Used by open_state() for escalation logic
     fn compute_cooldown_with_retry_after(
         lane: &LaneState,
         _now: u64,
@@ -317,7 +312,7 @@ impl InMemoryStore {
 
     /// Attempt to acquire the single probe in HalfOpen state.
     /// Returns true if this request wins the probe (becomes THE probe).
-    #[allow(dead_code)] // Used by usable() for single-flight logic
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) fn try_acquire_probe(&self, lane: usize) -> bool {
         let ls = self.get_lane(lane);
         ls.probe_in_flight
@@ -326,20 +321,19 @@ impl InMemoryStore {
     }
 
     /// Clear the probe flag (called after probe completes).
-    #[allow(dead_code)] // Used by closed_state() on recovery
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) fn clear_probe(&self, lane: usize) {
         let ls = self.get_lane(lane);
         ls.probe_in_flight.store(false, Ordering::Release);
     }
 
     /// Transition to Open state with escalated cooldown.
-    #[allow(dead_code)] // Used by record_transient and record_rate_limit on probe failure
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) fn open_state(&self, lane: usize, now_time: u64, cfg: &BreakerCfg) {
         self.open_state_with_retry_after(lane, now_time, cfg, None);
     }
 
     /// Transition to Open state with escalated cooldown and optional Retry-After floor.
-    #[allow(dead_code)] // Used by record_transient and record_rate_limit on probe failure
     pub(crate) fn open_state_with_retry_after(
         &self,
         lane: usize,
@@ -361,14 +355,13 @@ impl InMemoryStore {
     }
 
     /// Transition to HalfOpen state (cooldown expired).
-    #[allow(dead_code)] // Used internally by usable() for state transitions
     pub(crate) fn half_open_state(&self, lane: usize) {
         let ls = self.get_lane(lane);
         ls.breaker_state.store(2, Ordering::Release); // 2 = HalfOpen
     }
 
     /// Transition to Closed state (probe success).
-    #[allow(dead_code)] // Used by closed_state() on recovery
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) fn closed_state(&self, lane: usize, _now_time: u64) {
         let ls = self.get_lane(lane);
 
@@ -449,19 +442,22 @@ impl Default for BreakerCfg {
 
 /// Trip configuration mode.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Consecutive variant planned for full implementation
 pub(crate) enum TripMode {
     ErrorRate,
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     Consecutive,
 }
 
 /// Trip configuration parameters (ADR-0002 defaults).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields defined for config API
 pub(crate) struct TripConfig {
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub mode: TripMode,
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub window_s: u64,
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub threshold: f64,
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub min_requests: usize,
     pub n: u32, // For consecutive mode
 }
@@ -791,7 +787,6 @@ impl InMemoryStore {
     }
 
     /// Record success outcome with explicit time.
-    #[allow(dead_code)] // Used by record_success() internally
     pub(crate) fn record_outcome_success_with_time(&self, lane: usize, now_time: u64) {
         let ls = self.get_lane(lane);
 

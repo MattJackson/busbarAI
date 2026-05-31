@@ -15,20 +15,16 @@
 /// Protocol-neutral, dialect-normalized status class.
 /// Emitted by Stage 1 normalizer (Protocol::classify) in src/proto.rs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Variants reserved for future protocol normalizers
 pub(crate) enum StatusClass {
     /// Rate limit / slow down — transient, may recover with retry-after
     RateLimit,
     /// Overloaded server — transient
-    #[allow(dead_code)] // Reserved for future use
     Overloaded,
     /// Server error (5xx) — transient
     ServerError,
     /// Request timeout — transient
-    #[allow(dead_code)] // Reserved for future use
     Timeout,
     /// Network failure — transient
-    #[allow(dead_code)] // Reserved for future use
     Network,
     /// Authentication failure (401/403) — hard down, key invalid
     Auth,
@@ -56,7 +52,6 @@ pub(crate) enum Disposition {
 }
 
 /// Convert a string to StatusClass. Returns None for unknown values.
-#[allow(dead_code)] // Used by config validation
 pub(crate) fn status_class_from_str(s: &str) -> Option<StatusClass> {
     match s {
         "rate_limit" => Some(StatusClass::RateLimit),
@@ -93,13 +88,12 @@ pub(crate) fn classify(sig: &CanonicalSignal) -> Disposition {
 pub(crate) struct RawUpstreamError {
     pub http_status: u16,
     pub provider_code: Option<String>,
-    #[allow(dead_code)] // structured_type reserved for future use
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub structured_type: Option<String>,
 }
 
 /// Classify a raw upstream error into a canonical signal using an error_map.
 /// Stage 1b (provider normalizer): data-driven mapping from raw errors to StatusClass.
-#[allow(dead_code)] // Used by forward.rs
 pub(crate) fn normalize_raw_error(
     raw: &RawUpstreamError,
     error_map: &std::collections::HashMap<String, String>,
@@ -162,7 +156,6 @@ pub(crate) fn normalize_raw_error(
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CanonicalSignal {
     pub(crate) class: StatusClass,
-    #[allow(dead_code)] // provider_signal retained for future extensibility (, ADR-0005)
     pub(crate) provider_signal: Option<String>,
     pub(crate) retry_after: Option<u64>,
 }

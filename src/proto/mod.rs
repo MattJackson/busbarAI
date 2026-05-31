@@ -17,7 +17,6 @@ use crate::ir::{IrBlockMeta, IrDelta, IrStreamEvent, IrUsage};
 
 /// IrError is an alias for CanonicalSignal (scaffolding).
 /// Per ADR-0007: keep it compatible with CanonicalSignal; may promote to a richer struct.
-#[allow(dead_code)] // Used by / for IR bridge
 pub(crate) type IrError = crate::breaker::CanonicalSignal;
 
 /// ProtocolReader extracts signals from wire responses (Stage 1a + 1b).
@@ -27,15 +26,13 @@ pub(crate) trait ProtocolReader: Send + Sync {
     fn extract_error(&self, status: StatusCode, body: &[u8]) -> crate::breaker::RawUpstreamError;
 
     /// Classify a response into a canonical signal (two-stage pipeline).
-    #[allow(dead_code)] // Used by /
+    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal;
 
     /// Read an IR request from wire JSON.
-    #[allow(dead_code)] // Used by /
     fn read_request(&self, body: &serde_json::Value) -> Result<crate::ir::IrRequest, IrError>;
 
     /// Read a response/stream event from already-de-framed SSE data.
-    #[allow(dead_code)] // Used by /
     fn read_response_event(
         &self,
         event_type: &str,
@@ -46,7 +43,6 @@ pub(crate) trait ProtocolReader: Send + Sync {
     /// per-request decode state. Anthropic is 1:1 (wraps the singular, ignores state); OpenAI's
     /// flat stream synthesizes block boundaries via the state. This is the general translation
     /// API the live response-translation path calls.
-    #[allow(dead_code)] // Used by
     fn read_response_events(
         &self,
         event_type: &str,
@@ -55,11 +51,9 @@ pub(crate) trait ProtocolReader: Send + Sync {
     ) -> Vec<IrStreamEvent>;
 
     /// Read a whole (non-streaming) response from wire JSON.
-    #[allow(dead_code)] // Used by
     fn read_response(&self, body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError>;
 
     /// Clone this reader as a trait object.
-    #[allow(dead_code)] // Used by for Protocol cloning
     fn clone_box(&self) -> Box<dyn ProtocolReader>;
 }
 
@@ -107,23 +101,18 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     }
 
     /// Rewrites the model field in the request body.
-    #[allow(dead_code)] // Used by /
     fn rewrite_model(&self, body: &mut serde_json::Value, model: &str);
 
     /// Write an IR request to wire JSON.
-    #[allow(dead_code)] // Used by /
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value;
 
     /// Write a response/stream event to wire (event_type, data).
-    #[allow(dead_code)] // Used by /
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)>;
 
     /// Write a whole (non-streaming) response to wire JSON.
-    #[allow(dead_code)] // Used by
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value;
 
     /// Clone this writer as a trait object.
-    #[allow(dead_code)] // Used by for Protocol cloning
     fn clone_box(&self) -> Box<dyn ProtocolWriter>;
 }
 
@@ -170,7 +159,6 @@ impl Protocol {
     }
 
     /// Returns the protocol name ("anthropic", "openai", etc.).
-    #[allow(dead_code)] // Reserved for future extensibility
     pub(crate) fn name(&self) -> &str {
         self.name
     }
@@ -196,41 +184,34 @@ impl Protocol {
     }
 
     /// Construct a Gemini protocol instance.
-    #[allow(dead_code)] // Reserved for integration (later cycle)
     pub(crate) fn gemini() -> Self {
         Self::new("gemini", GeminiReader, GeminiWriter)
     }
 
     /// Construct an OpenAI Responses protocol instance.
-    #[allow(dead_code)] // Reserved for integration (later cycle)
     pub(crate) fn responses() -> Self {
         Self::new("responses", ResponsesReader, ResponsesWriter)
     }
 
     /// Construct a Bedrock protocol instance.
-    #[allow(dead_code)] // Reserved for / integration (later cycle)
     pub(crate) fn bedrock() -> Self {
         Self::new("bedrock", BedrockReader, BedrockWriter)
     }
 
     /// Construct a Cohere (v2 chat) protocol instance.
-    #[allow(dead_code)] // Reserved for integration (later cycle)
     pub(crate) fn cohere() -> Self {
         Self::new("cohere", CohereReader, CohereWriter)
     }
 }
 
 /// Resolve a built-in Protocol by name (for ingress translation). Cheap (unit structs).
-#[allow(dead_code)] // used by forward
 pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
     match name {
         "anthropic" => Some(Protocol::anthropic()),
         "bedrock" => Some(Protocol::bedrock()),
         "cohere" => Some(Protocol::cohere()),
-        #[allow(dead_code)] // Reserved for integration (later cycle)
         "gemini" => Some(Protocol::gemini()),
         "openai" => Some(Protocol::openai()),
-        #[allow(dead_code)] // Reserved for integration (later cycle)
         "responses" => Some(Protocol::responses()),
         _ => None,
     }
@@ -241,7 +222,6 @@ pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
 /// (wire → IR, stateful fan-out) with `ingress.writer().write_response_event` (IR → wire). Holds
 /// a reassembly buffer for frames split across chunks and the IR decode state across the stream.
 /// The async wiring into the live stream path (FirstByteBody) is.
-#[allow(dead_code)] // wired into FirstByteBody by
 pub(crate) struct StreamTranslate {
     ingress: Protocol,
     egress: Protocol,
@@ -253,7 +233,6 @@ pub(crate) struct StreamTranslate {
     egress_eventstream: bool,
 }
 
-#[allow(dead_code)] // wired into FirstByteBody by
 impl StreamTranslate {
     /// Build a translator for an ingress→egress pair. `None` if either protocol is unknown OR
     /// ingress == egress (no translation needed — the caller does native passthrough).
@@ -387,14 +366,12 @@ pub(crate) use responses::{ResponsesReader, ResponsesWriter};
 /// String-keyed registry for protocol lookup (ADR-0008). Shared infrastructure: lives in the
 /// proto module root, not any single protocol's file. `with_builtins` registers every protocol.
 #[derive(Default)]
-#[allow(dead_code)] // Scaffolding: not wired into App/Lane yet
 pub(crate) struct ProtocolRegistry {
     map: std::collections::HashMap<String, Arc<Protocol>>,
 }
 
 impl ProtocolRegistry {
     /// Create a new registry with built-in protocols.
-    #[allow(dead_code)] // Used by for provider resolution
     pub(crate) fn with_builtins() -> Self {
         let mut map = std::collections::HashMap::new();
         map.insert("anthropic".to_string(), Arc::new(Protocol::anthropic()));
@@ -407,7 +384,6 @@ impl ProtocolRegistry {
     }
 
     /// Get a protocol by name.
-    #[allow(dead_code)] // Used by for provider resolution
     pub(crate) fn get(&self, name: &str) -> Option<Arc<Protocol>> {
         self.map.get(name).cloned()
     }

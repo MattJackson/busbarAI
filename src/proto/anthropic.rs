@@ -231,7 +231,6 @@ impl ProtocolReader for AnthropicReader {
         })
     }
 
-    #[allow(dead_code)] // Used by / tests
     fn read_response_event(
         &self,
         event_type: &str,
@@ -462,7 +461,6 @@ impl ProtocolReader for AnthropicReader {
 }
 
 // Helper functions for IR mapping (used by read_request/write_request)
-#[allow(dead_code)] // Used by tests only
 fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrError> {
     let obj = block_val.as_object().ok_or(IrError {
         class: StatusClass::ClientError,
@@ -604,7 +602,6 @@ fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrErr
     }
 }
 
-#[allow(dead_code)] // Used by tests only
 fn read_message(msg_val: &serde_json::Value) -> Result<crate::ir::IrMessage, IrError> {
     let obj = msg_val.as_object().ok_or(IrError {
         class: StatusClass::ClientError,
@@ -645,7 +642,6 @@ fn read_message(msg_val: &serde_json::Value) -> Result<crate::ir::IrMessage, IrE
     Ok(crate::ir::IrMessage { role, content })
 }
 
-#[allow(dead_code)] // Used by tests only
 fn read_tool(tool_val: &serde_json::Value) -> Result<crate::ir::IrTool, IrError> {
     let obj = tool_val.as_object().ok_or(IrError {
         class: StatusClass::ClientError,
@@ -673,7 +669,6 @@ fn read_tool(tool_val: &serde_json::Value) -> Result<crate::ir::IrTool, IrError>
     })
 }
 
-#[allow(dead_code)] // Used by tests only
 fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
     match block {
         crate::ir::IrBlock::Text {
@@ -737,7 +732,6 @@ fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
     }
 }
 
-#[allow(dead_code)] // Used by tests only
 fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
     let role_str = match msg.role {
         crate::ir::IrRole::System => "system",
@@ -753,7 +747,6 @@ fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
     serde_json::json!({ "role": role_str, "content": content_val })
 }
 
-#[allow(dead_code)] // Used by tests only
 fn write_tool(tool: &crate::ir::IrTool) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("name".to_string(), serde_json::json!(tool.name));
@@ -828,7 +821,6 @@ impl ProtocolWriter for AnthropicWriter {
         serde_json::Value::Object(out)
     }
 
-    #[allow(dead_code)] // Used by / tests
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
         match ev {
             IrStreamEvent::MessageStart { role, usage } => {
