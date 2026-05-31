@@ -13,17 +13,21 @@ The name comes from electrical distribution: a busbar takes one feed and fans it
 out across many breakered circuits — one entry point, weighted distribution,
 per-circuit protection.
 
-> **Project status: 0.10.0 (pre-1.0), in active development.** Working today:
+> **Project status: 0.11.0 (pre-1.0), in active development.** Working today:
 > **five protocols** — Anthropic, OpenAI (chat completions), Google **Gemini**, AWS **Bedrock**
 > (Converse), and OpenAI **Responses** — each read/written natively, with **full cross-protocol
 > translation** through a lossless superset IR (request *and* response, streaming *and*
 > non-streaming, both directions — e.g. an OpenAI-format client driving a Gemini backend, or vice
 > versa). Plus named/ad-hoc routing, **weighted** pools (smooth WRR) with failover + session
-> affinity, a two-stage **circuit breaker**, and **context-length failover**. Protocol caveats:
+> affinity, a two-stage **circuit breaker**, **context-length failover**, and **observability**:
+> a Prometheus `/metrics` endpoint (request/attempt/failure/failover/breaker-trip/translation
+> counters + latency histogram), optional **OpenTelemetry** OTLP trace export, and an optional
+> fire-and-forget **request-log webhook** (both opt-in via an `observability` config section).
+> Protocol caveats:
 > Bedrock auth (AWS SigV4) and its binary-eventstream streaming transport are deferred — Bedrock is
 > usable for non-streaming requests behind a SigV4 proxy; Gemini's `:streamGenerateContent` endpoint
 > is likewise a follow-up (a streaming request to a Gemini/Bedrock lane is served non-streamed).
-> Roadmap (0.11+): accounting + observability (Prometheus/OTel), virtual keys/budgets, persistence,
+> Roadmap (0.12+): governance — virtual keys, budgets, rate limits — plus persistence and a
 > management API. APIs and config may change before 1.0. See [`docs/`](docs/) for design and roadmap.
 
 ## Why Busbar
