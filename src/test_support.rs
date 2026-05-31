@@ -670,6 +670,131 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// Regression: a lane's `max_requests` lifetime cap (loaded as `budget`, `limited=true`) must
+    /// actually exhaust the lane — and each success must increment the per-lane `ok` counter. Both
+    /// were unwired: the success path never called record_success or spend_budget, so the cap never
+    /// tripped (unlimited requests) and `ok` stayed 0.
+    #[tokio::test]
+    async fn test_max_requests_budget_caps_lane_and_counts_ok() {
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        for _ in 0..3 {
+            state.push(MockResponse::Ok {
+                status: StatusCode::OK,
+                body: json!({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "model": "glm-4.6",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }),
+            });
+        }
+        let server = MockServer::new(state.clone()).await;
+
+        let lane_data = LaneData {
+            model: "glm-4.6".to_string(),
+            provider: "z".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: true, // max_requests was configured
+            budget: 2,     // lifetime cap of 2 requests
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+        let lane = Lane {
+            model: "glm-4.6".to_string(),
+            provider: "z".to_string(),
+            base_url: server.base_url(),
+            api_key: "k".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
+            path: None,
+            auth: None,
+        };
+        let app = Arc::new(App {
+            lanes: vec![lane],
+            store: Arc::new(InMemoryStore::new(vec![lane_data])),
+            by_model: HashMap::from([("glm-4.6".to_string(), 0)]),
+            pools: HashMap::from([(
+                "pc".to_string(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            )]),
+            rr: AtomicUsize::new(0),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+            governance: None,
+        });
+
+        let cands = vec![crate::state::WeightedLane { idx: 0, weight: 1 }];
+        let body = serde_json::to_vec(
+            &json!({"model": "pc", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}),
+        )
+        .unwrap();
+
+        use http_body_util::BodyExt as _;
+        // First two requests are within budget → served.
+        for n in 0..2 {
+            let resp = forward_with_pool(
+                app.clone(),
+                cands.clone(),
+                body.clone().into(),
+                None,
+                "pc",
+                None,
+                "anthropic",
+                None,
+            )
+            .await;
+            assert_eq!(resp.status().as_u16(), 200, "request {n} should be served");
+            let _ = resp.into_body().collect().await.unwrap(); // drain → release permit
+        }
+
+        // Budget spent (2 → 0): the lane is no longer usable, so the pool is exhausted → 503.
+        let resp3 = forward_with_pool(
+            app.clone(),
+            cands.clone(),
+            body.clone().into(),
+            None,
+            "pc",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp3.status().as_u16(),
+            503,
+            "third request must be rejected once the max_requests budget is spent"
+        );
+
+        let snap = app.store.snapshot(0, now());
+        assert_eq!(
+            snap.ok, 2,
+            "per-lane ok counter must increment on each success"
+        );
+        assert!(
+            !snap.usable,
+            "lane must be unusable after its max_requests budget is exhausted"
+        );
+        server.shutdown().await;
+    }
+
     /// GET /metrics through the REAL router (route table + auth middleware) over HTTP returns
     /// the Prometheus exposition with NO caller token — the endpoint is auth-exempt like /healthz.
     #[tokio::test]

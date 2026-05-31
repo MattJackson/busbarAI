@@ -561,19 +561,19 @@ impl StateStore for InMemoryStore {
     fn record_success(&self, lane: usize) {
         let ls = self.get_lane(lane);
 
-        // Only reset streak if not dead/broken
         if !ls.dead.load(Ordering::Relaxed) {
-            ls.streak.store(0, Ordering::Relaxed);
-
             #[cfg(test)]
             let now_time = crate::store::now_for_test();
             #[cfg(not(test))]
             let now_time = now();
 
+            // Resets the streak, pushes the success into the outcome window, and increments `ok`.
             self.record_outcome_success_with_time(lane, now_time);
+        } else {
+            // Dead lane: still count the success for observability, but don't touch the breaker
+            // window/streak (the lane is administratively down, not recovering via normal traffic).
+            ls.ok.fetch_add(1, Ordering::Relaxed);
         }
-
-        ls.ok.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_client_fault(&self, lane: usize) {
@@ -700,7 +700,10 @@ impl StateStore for InMemoryStore {
         if !ls.limited {
             return true; // unlimited budget
         }
-        ls.budget.load(Ordering::Relaxed) > 0
+        // Consume one unit of the lifetime request budget (cost cap). Returns false when the lane
+        // was already exhausted. Once budget reaches 0, `usable()` stops admitting the lane.
+        let prev = ls.budget.fetch_sub(1, Ordering::Relaxed);
+        prev > 0
     }
 
     fn snapshot(&self, lane: usize, t: u64) -> LaneSnapshot {

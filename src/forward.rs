@@ -984,7 +984,14 @@ pub(crate) async fn forward_with_pool(
                     }
                 }
 
-                // SUCCESS case: stream the response body incrementally with first-byte boundary tracking
+                // SUCCESS case: the upstream served a 2xx. Record the success for this lane (feeds
+                // the per-lane `ok` counter and the breaker's success window) and consume one unit
+                // of its lifetime request budget (the `max_requests` cost cap; `usable()` stops
+                // admitting the lane once it reaches 0).
+                app.store.record_success(i);
+                app.store.spend_budget(i);
+
+                // stream the response body incrementally with first-byte boundary tracking
                 let ct = r.headers().get(CONTENT_TYPE).cloned();
                 let is_sse = ct
                     .as_ref()
