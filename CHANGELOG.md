@@ -5,6 +5,24 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] — 2026-05-31
+
+### Added
+- **Per-(pool, lane) circuit-breaker isolation.** A lane shared by multiple pools now carries
+  independent breaker state (Open/Closed/HalfOpen, streak, cooldown, error window, SWRR weight)
+  per pool, so one pool's traffic tripping a lane no longer benches it for every other pool.
+  Direct/ad-hoc routes and `/stats` use a lane-default cell; named pools each get their own,
+  created lazily and inheriting the lane's current known health on first use. The breaker FSM
+  is now written once over a `BreakerCellAccess` seam and run against either cell — no logic
+  duplication. Lane-global concerns (the concurrency semaphore and the `max_requests` lifetime
+  budget) remain shared across pools, since they cap the one upstream.
+- Active health probing now recovers a lane across **every** cell (all pools + default) on a
+  successful probe, and gates `dead`-mode probing on "tripped in any cell" — a probe tests the
+  shared upstream, so its result is lane-global.
+
+### Notes
+- This supersedes the 0.15.0 note that deferred per-(pool, lane) state.
+
 ## [0.15.0] — 2026-05-31
 
 ### Fixed

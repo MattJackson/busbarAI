@@ -99,24 +99,58 @@ pub(crate) struct LaneSnapshot {
 /// StateStore trait - the seam for lane state access.
 /// Operations, NOT field access. `lane: usize` identifies a member.
 pub(crate) trait StateStore: Send + Sync + 'static {
-    // health queries
+    // ── Health queries ─────────────────────────────────────────────────────────────────────────
+    // The bare `lane` methods operate on the lane-default cell (direct/ad-hoc routes, `/stats`);
+    // the `_in(pool, …)` variants operate on the per-(pool, lane) breaker cell so a lane shared
+    // across pools carries independent Open/Closed status per pool. Lane-global checks (dead /
+    // budget) are identical across both — only the breaker FSM is isolated.
     fn usable(&self, lane: usize, now: u64) -> bool;
+    fn usable_in(&self, pool: &str, lane: usize, now: u64) -> bool;
+    // The bare lane-default breaker mutators below are exercised by the unit tests; in release,
+    // routing always goes through the `_in(pool, …)` variants, so they're unreachable there — hence
+    // the not(test) dead-code allow (they remain a tested part of the lane-default API).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn breaker_state(&self, lane: usize) -> BreakerState;
     fn cooldown_remaining(&self, lane: usize, now: u64) -> u64;
+    fn cooldown_remaining_in(&self, pool: &str, lane: usize, now: u64) -> u64;
+    /// True if this lane is tripped in ANY cell (default or any pool). Used by the health prober:
+    /// a probe tests the shared upstream, so "tripped anywhere" gates whether to probe at all.
+    fn lane_tripped_anywhere(&self, lane: usize) -> bool;
 
-    // outcome recording (the breaker's write path)
+    // ── Outcome recording (the breaker's write path) ─────────────────────────────────────────────
+    #[cfg_attr(not(test), allow(dead_code))]
     fn record_success(&self, lane: usize);
+    fn record_success_in(&self, pool: &str, lane: usize);
     fn record_client_fault(&self, lane: usize);
     /// Record a transient upstream failure. `cfg` is the routing pool's resolved breaker config,
     /// which drives the trip decision (error-rate vs consecutive thresholds) and cooldown backoff.
     fn record_transient(&self, lane: usize, what: &str, cfg: &BreakerCfg, retry_after: Option<u64>);
+    fn record_transient_in(
+        &self,
+        pool: &str,
+        lane: usize,
+        what: &str,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    );
+    #[cfg_attr(not(test), allow(dead_code))]
     fn record_rate_limit(&self, lane: usize, now: u64, cfg: &BreakerCfg, retry_after: Option<u64>);
+    fn record_rate_limit_in(
+        &self,
+        pool: &str,
+        lane: usize,
+        now: u64,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    );
+    #[cfg_attr(not(test), allow(dead_code))]
     fn record_hard_down(&self, lane: usize, reason: &str);
-    /// A successful out-of-band health probe: recover the lane to Closed if it was tripped. No-op
-    /// on an already-healthy (Closed) lane, so probes never disturb normal state.
+    fn record_hard_down_in(&self, pool: &str, lane: usize, reason: &str);
+    /// A successful out-of-band health probe: recover the lane to Closed in EVERY cell (default and
+    /// all pools), since the probe tests the shared upstream. No-op on cells already Closed.
     fn recover_lane(&self, lane: usize);
 
-    // concurrency + budget (kept as-is conceptually)
+    // concurrency + budget — lane-global (shared across every pool fronting the lane).
     fn try_acquire(&self, lane: usize) -> Option<Permit>;
     fn spend_budget(&self, lane: usize) -> bool; // false => exhausted
 
@@ -125,7 +159,15 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// `candidates` are indices into the store's lane array.
     /// `weights` is the per-member weight for each candidate (must match candidates length).
     /// Returns None if no healthy members or all candidates are unusable.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn select_weighted(&self, candidates: &[usize], weights: &[u32], now: u64) -> Option<usize>;
+    fn select_weighted_in(
+        &self,
+        pool: &str,
+        candidates: &[usize],
+        weights: &[u32],
+        now: u64,
+    ) -> Option<usize>;
 
     // stats snapshot for /stats
     fn snapshot(&self, lane: usize, now: u64) -> LaneSnapshot;
@@ -134,7 +176,7 @@ pub(crate) trait StateStore: Send + Sync + 'static {
 /// Bounded sliding window of timestamped outcomes (ring buffer style).
 /// Stores timestamps in seconds since epoch. Memory is bounded by `capacity`.
 #[derive(Debug, Clone)]
-struct OutcomeWindow {
+pub(crate) struct OutcomeWindow {
     entries: Vec<u64>,
     capacity: usize,
 }
@@ -168,9 +210,106 @@ impl OutcomeWindow {
     }
 }
 
+/// The per-cell circuit-breaker FSM state. `LaneState` embeds these fields directly (the default
+/// cell, used by direct/ad-hoc routes and `/stats`); named pools get their own `BreakerCell` per
+/// member lane so a lane shared across pools carries independent Open/Closed status per pool.
+///
+/// Lane-global concerns (the concurrency semaphore and the lifetime `max_requests` budget) are NOT
+/// here — they stay on `LaneState` and are shared across every pool routing to that lane, so the
+/// cost/concurrency caps remain per-upstream regardless of how many pools front it.
+pub(crate) struct BreakerCell {
+    pub(crate) breaker_state: AtomicU64, // 0=Closed, 1=Open, 2=HalfOpen
+    pub(crate) streak: AtomicU32,
+    pub(crate) cooldown_until: AtomicU64,
+    pub(crate) probe_in_flight: AtomicBool,
+    pub(crate) err: AtomicU64,
+    pub(crate) outcome_window: std::sync::Mutex<OutcomeWindow>,
+    pub(crate) current_weight: AtomicI64, // SWRR state (per pool — selection runs over a pool's set)
+}
+
+impl BreakerCell {
+    fn new() -> Self {
+        Self {
+            breaker_state: AtomicU64::new(0), // Closed
+            streak: AtomicU32::new(0),
+            cooldown_until: AtomicU64::new(0),
+            probe_in_flight: AtomicBool::new(false),
+            err: AtomicU64::new(0),
+            outcome_window: std::sync::Mutex::new(OutcomeWindow::new(1024)),
+            current_weight: AtomicI64::new(0),
+        }
+    }
+}
+
+/// Read access to the breaker atomics, so the FSM logic can be written once and run against either
+/// a `LaneState` (the default cell) or a per-pool `BreakerCell` without duplication.
+pub(crate) trait BreakerCellAccess {
+    fn breaker_state(&self) -> &AtomicU64;
+    fn streak(&self) -> &AtomicU32;
+    fn cooldown_until(&self) -> &AtomicU64;
+    fn probe_in_flight(&self) -> &AtomicBool;
+    fn err(&self) -> &AtomicU64;
+    fn outcome_window(&self) -> &std::sync::Mutex<OutcomeWindow>;
+    fn current_weight(&self) -> &AtomicI64;
+}
+
+impl BreakerCellAccess for BreakerCell {
+    fn breaker_state(&self) -> &AtomicU64 {
+        &self.breaker_state
+    }
+    fn streak(&self) -> &AtomicU32 {
+        &self.streak
+    }
+    fn cooldown_until(&self) -> &AtomicU64 {
+        &self.cooldown_until
+    }
+    fn probe_in_flight(&self) -> &AtomicBool {
+        &self.probe_in_flight
+    }
+    fn err(&self) -> &AtomicU64 {
+        &self.err
+    }
+    fn outcome_window(&self) -> &std::sync::Mutex<OutcomeWindow> {
+        &self.outcome_window
+    }
+    fn current_weight(&self) -> &AtomicI64 {
+        &self.current_weight
+    }
+}
+
+impl BreakerCellAccess for LaneState {
+    fn breaker_state(&self) -> &AtomicU64 {
+        &self.breaker_state
+    }
+    fn streak(&self) -> &AtomicU32 {
+        &self.streak
+    }
+    fn cooldown_until(&self) -> &AtomicU64 {
+        &self.cooldown_until
+    }
+    fn probe_in_flight(&self) -> &AtomicBool {
+        &self.probe_in_flight
+    }
+    fn err(&self) -> &AtomicU64 {
+        &self.err
+    }
+    fn outcome_window(&self) -> &std::sync::Mutex<OutcomeWindow> {
+        &self.outcome_window
+    }
+    fn current_weight(&self) -> &AtomicI64 {
+        &self.current_weight
+    }
+}
+
 /// InMemoryStore wraps the existing atomics/semaphores per lane with FSM breaker logic.
+/// Keyed by (pool name, lane index). Lazily populated.
+type PoolCellMap = std::collections::HashMap<(Box<str>, usize), Arc<BreakerCell>>;
+
 pub(crate) struct InMemoryStore {
     lanes: Vec<Arc<LaneState>>,
+    /// Per-(pool, lane) breaker cells, created lazily on first access. The lane-global fields
+    /// (sem/budget/dead/ok) always live on `lanes[lane]`; only the breaker FSM is isolated per pool.
+    pool_cells: std::sync::Mutex<PoolCellMap>,
 }
 
 struct LaneState {
@@ -223,17 +362,52 @@ impl InMemoryStore {
                 })
             })
             .collect();
-        Self { lanes: lane_states }
+        Self {
+            lanes: lane_states,
+            pool_cells: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     fn get_lane(&self, lane: usize) -> &Arc<LaneState> {
         &self.lanes[lane]
     }
 
-    /// Evaluate trip condition for Closed → Open transition.
-    /// Returns true if the lane should trip to Open.
-    fn should_trip(lane: &LaneState, now: u64, cfg: &BreakerCfg) -> bool {
-        let window = lane.outcome_window.lock().unwrap();
+    /// Resolve the breaker cell for a (pool, lane). An empty pool name selects the lane-global
+    /// default cell (the `LaneState` itself) — used by direct/ad-hoc routes. A named pool gets a
+    /// dedicated `BreakerCell`, created Closed on first access.
+    fn cell(&self, pool: &str, lane: usize) -> Arc<dyn BreakerCellAccess> {
+        if pool.is_empty() {
+            return self.lanes[lane].clone();
+        }
+        let mut cells = self.pool_cells.lock().unwrap();
+        cells
+            .entry((Box::from(pool), lane))
+            .or_insert_with(|| {
+                // A new pool cell inherits the lane's current known health (breaker state + pending
+                // cooldown + streak) rather than blindly assuming Closed — so a pool whose first
+                // request arrives while the lane is mid-cooldown respects it. In production cells are
+                // created while the lane is healthy, so this is normally a no-op.
+                let ls = &self.lanes[lane];
+                let c = BreakerCell::new();
+                c.breaker_state
+                    .store(ls.breaker_state.load(Ordering::Acquire), Ordering::Release);
+                c.cooldown_until
+                    .store(ls.cooldown_until.load(Ordering::Acquire), Ordering::Release);
+                c.streak
+                    .store(ls.streak.load(Ordering::Relaxed), Ordering::Relaxed);
+                Arc::new(c)
+            })
+            .clone()
+    }
+
+    // ── Generic breaker-FSM core ──────────────────────────────────────────────────────────────
+    // These operate on any `&dyn BreakerCellAccess` so the exact same logic runs against a
+    // `LaneState` (the default/direct-route cell) or a per-pool `BreakerCell`. The `&self, lane`
+    // and `_in(pool, lane)` methods are thin wrappers that resolve the right cell and delegate.
+
+    /// Evaluate trip condition for Closed → Open transition. Returns true if the cell should trip.
+    fn should_trip(c: &dyn BreakerCellAccess, now: u64, cfg: &BreakerCfg) -> bool {
+        let window = c.outcome_window().lock().unwrap();
 
         match cfg.trip.mode {
             TripMode::ErrorRate => {
@@ -241,10 +415,9 @@ impl InMemoryStore {
                 if count < cfg.trip.min_requests {
                     return false; // Below floor
                 }
-                let error_count = lane.err.load(Ordering::Relaxed) as usize;
-                // Note: err is cumulative; we use ratio of err to total recorded outcomes
-                // For simplicity, treat all entries in window as potential errors for rate-limit scenarios
-                // The actual error_fraction is derived from transient/rate_limit calls which increment err
+                let error_count = c.err().load(Ordering::Relaxed) as usize;
+                // err is cumulative since the last close; cap it at the windowed outcome count so
+                // a stale error count can't dominate once recent traffic has been healthy.
                 let fraction = if count > 0 {
                     (error_count.min(count)) as f64 / count as f64
                 } else {
@@ -252,11 +425,7 @@ impl InMemoryStore {
                 };
                 fraction >= cfg.trip.threshold
             }
-            TripMode::Consecutive => {
-                // Check streak against consecutive threshold
-                let current_streak = lane.streak.load(Ordering::Relaxed);
-                current_streak >= cfg.trip.n
-            }
+            TripMode::Consecutive => c.streak().load(Ordering::Relaxed) >= cfg.trip.n,
         }
     }
 
@@ -264,12 +433,12 @@ impl InMemoryStore {
     /// If retry_after is Some and honor_retry_after is true, the cooldown is max(computed_backoff, retry_after).
     /// The server's explicit Retry-After is always respected even if it exceeds max_cooldown_secs.
     fn compute_cooldown_with_retry_after(
-        lane: &LaneState,
+        c: &dyn BreakerCellAccess,
         _now: u64,
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
     ) -> u64 {
-        let streak = lane.streak.load(Ordering::Relaxed);
+        let streak = c.streak().load(Ordering::Relaxed);
 
         // Compute base cooldown from exponential backoff
         let mut duration = cfg.base_cooldown_secs;
@@ -305,30 +474,135 @@ impl InMemoryStore {
         }
     }
 
-    /// Attempt to acquire the single probe in HalfOpen state.
-    /// Returns true if this request wins the probe (becomes THE probe).
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
+    /// Transition the cell to Open with an escalated cooldown (streak is owned by the record path,
+    /// only read here).
+    fn cell_open(
+        c: &dyn BreakerCellAccess,
+        now_time: u64,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    ) {
+        let duration = Self::compute_cooldown_with_retry_after(c, now_time, cfg, retry_after);
+        c.cooldown_until()
+            .store(now_time + duration, Ordering::Release);
+        c.breaker_state().store(1, Ordering::Release); // 1 = Open
+    }
+
+    /// Transition the cell to Closed (full recovery): reset streak/err/window, clear the cooldown
+    /// and release the single-flight probe.
+    fn cell_closed(c: &dyn BreakerCellAccess) {
+        c.streak().store(0, Ordering::Release);
+        c.err().store(0, Ordering::Release);
+        c.outcome_window().lock().unwrap().clear();
+        c.cooldown_until().store(0, Ordering::Release);
+        c.breaker_state().store(0, Ordering::Release); // 0 = Closed
+        c.probe_in_flight().store(false, Ordering::Release);
+    }
+
+    /// The breaker portion of `usable`: Closed honors any pending cooldown; Open transitions to
+    /// HalfOpen on expiry and admits exactly one probe (CAS); HalfOpen admits nobody else.
+    fn cell_usable_breaker(c: &dyn BreakerCellAccess, now: u64) -> bool {
+        match c.breaker_state().load(Ordering::Acquire) {
+            0 => now >= c.cooldown_until().load(Ordering::Acquire),
+            1 => {
+                let until = c.cooldown_until().load(Ordering::Acquire);
+                if now >= until {
+                    c.breaker_state().store(2, Ordering::Release); // HalfOpen
+                    c.probe_in_flight()
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                } else {
+                    false
+                }
+            }
+            2 => false,
+            _ => unreachable!("Invalid breaker state"),
+        }
+    }
+
+    /// Query the cell's breaker state (does NOT account for lane-global `dead`/budget).
+    #[cfg_attr(not(test), allow(dead_code))] // reached only via the test-exercised `breaker_state`
+    fn cell_breaker_state(c: &dyn BreakerCellAccess) -> BreakerState {
+        match c.breaker_state().load(Ordering::Acquire) {
+            0 => BreakerState::Closed,
+            1 => BreakerState::Open {
+                until: c.cooldown_until().load(Ordering::Acquire),
+            },
+            2 => BreakerState::HalfOpen,
+            _ => unreachable!("Invalid breaker state"),
+        }
+    }
+
+    /// Record a failure (transient or rate-limit — identical breaker handling) against the cell:
+    /// push the outcome, bump err + consecutive streak, then trip-or-cooldown per the config.
+    fn cell_record_failure(
+        c: &dyn BreakerCellAccess,
+        now_time: u64,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    ) {
+        c.outcome_window().lock().unwrap().push(now_time);
+        c.err().fetch_add(1, Ordering::Relaxed);
+        c.streak().fetch_add(1, Ordering::Relaxed);
+
+        match c.breaker_state().load(Ordering::Acquire) {
+            0 => {
+                if Self::should_trip(c, now_time, cfg) {
+                    Self::cell_open(c, now_time, cfg, retry_after);
+                } else {
+                    let duration =
+                        Self::compute_cooldown_with_retry_after(c, now_time, cfg, retry_after);
+                    c.cooldown_until()
+                        .store(now_time + duration, Ordering::Release);
+                }
+            }
+            2 => Self::cell_open(c, now_time, cfg, retry_after), // HalfOpen probe failed → reopen
+            _ => {}
+        }
+    }
+
+    /// Record a success against the cell: reset the streak, push the outcome, and — if this was the
+    /// half-open probe — complete recovery to Closed. (The lane-global `ok` counter is bumped by the
+    /// caller, since it is shared across pools.)
+    fn cell_record_success(c: &dyn BreakerCellAccess, now_time: u64) {
+        let was_half_open = c.breaker_state().load(Ordering::Acquire) == 2;
+        c.streak().store(0, Ordering::Release);
+        c.outcome_window().lock().unwrap().push(now_time);
+        if was_half_open {
+            Self::cell_closed(c);
+        }
+    }
+
+    // ── Thin lane-default wrappers ─────────────────────────────────────────────────────────────
+    // These drive the breaker FSM by lane index against the default cell. Release code goes through
+    // the cell-core fns directly (cell_open / cell_closed / cell_usable_breaker), so these exist
+    // only to give the unit tests a concrete, lane-indexed handle — hence `#[cfg(test)]`.
+
+    /// Attempt to acquire the single probe in HalfOpen state. True if this request wins the probe.
+    #[cfg(test)]
     pub(crate) fn try_acquire_probe(&self, lane: usize) -> bool {
-        let ls = self.get_lane(lane);
-        ls.probe_in_flight
+        self.get_lane(lane)
+            .probe_in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
     /// Clear the probe flag (called after probe completes).
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
+    #[cfg(test)]
     pub(crate) fn clear_probe(&self, lane: usize) {
-        let ls = self.get_lane(lane);
-        ls.probe_in_flight.store(false, Ordering::Release);
+        self.get_lane(lane)
+            .probe_in_flight
+            .store(false, Ordering::Release);
     }
 
     /// Transition to Open state with escalated cooldown.
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
+    #[cfg(test)]
     pub(crate) fn open_state(&self, lane: usize, now_time: u64, cfg: &BreakerCfg) {
-        self.open_state_with_retry_after(lane, now_time, cfg, None);
+        Self::cell_open(self.get_lane(lane).as_ref(), now_time, cfg, None);
     }
 
     /// Transition to Open state with escalated cooldown and optional Retry-After floor.
+    #[cfg(test)]
     pub(crate) fn open_state_with_retry_after(
         &self,
         lane: usize,
@@ -336,41 +610,13 @@ impl InMemoryStore {
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
     ) {
-        let ls = self.get_lane(lane);
-
-        // NOTE: streak is owned by the record path (record_transient / record_rate_limit increment
-        // it once per failure; record_success resets it). open_state only reads it to escalate the
-        // cooldown, so it must NOT increment — that would double-count and inflate the backoff.
-
-        // Compute cooldown with exponential backoff, respecting Retry-After floor if present
-        let duration = Self::compute_cooldown_with_retry_after(ls, now_time, cfg, retry_after);
-        let until = now_time + duration;
-
-        ls.cooldown_until.store(until, Ordering::Release);
-        ls.breaker_state.store(1, Ordering::Release); // 1 = Open
-    }
-
-    /// Transition to HalfOpen state (cooldown expired).
-    pub(crate) fn half_open_state(&self, lane: usize) {
-        let ls = self.get_lane(lane);
-        ls.breaker_state.store(2, Ordering::Release); // 2 = HalfOpen
+        Self::cell_open(self.get_lane(lane).as_ref(), now_time, cfg, retry_after);
     }
 
     /// Transition to Closed state (probe success).
+    #[cfg(test)]
     pub(crate) fn closed_state(&self, lane: usize, _now_time: u64) {
-        let ls = self.get_lane(lane);
-
-        // Reset streak and window on recovery
-        ls.streak.store(0, Ordering::Release);
-        ls.err.store(0, Ordering::Release);
-
-        let mut window = ls.outcome_window.lock().unwrap();
-        window.clear();
-
-        ls.cooldown_until.store(0, Ordering::Release);
-        ls.breaker_state.store(0, Ordering::Release); // 0 = Closed
-
-        self.clear_probe(lane);
+        Self::cell_closed(self.get_lane(lane).as_ref());
     }
 }
 
@@ -492,112 +738,155 @@ impl Default for TripConfig {
     }
 }
 
-impl StateStore for InMemoryStore {
-    fn usable(&self, lane: usize, now: u64) -> bool {
-        let ls = self.get_lane(lane);
+// Pool-aware breaker operations, shared by the lane-default trait methods (pool "") and the
+// `_in(pool, …)` trait methods. The lane-global checks (dead / budget) always read `lanes[lane]`;
+// the breaker FSM runs against the resolved (pool, lane) cell.
+impl InMemoryStore {
+    #[cfg(test)]
+    fn now_secs() -> u64 {
+        crate::store::now_for_test()
+    }
+    #[cfg(not(test))]
+    fn now_secs() -> u64 {
+        now()
+    }
 
+    fn usable_for(&self, pool: &str, lane: usize, now: u64) -> bool {
+        let ls = self.get_lane(lane);
         if ls.dead.load(Ordering::Relaxed) {
             return false;
         }
         if ls.limited && ls.budget.load(Ordering::Relaxed) <= 0 {
             return false;
         }
+        Self::cell_usable_breaker(self.cell(pool, lane).as_ref(), now)
+    }
 
-        // Check breaker state
-        let breaker_state = ls.breaker_state.load(Ordering::Acquire);
-
-        match breaker_state {
-            0 => {
-                // Closed -> check if there's a pending cooldown from previous transient error
-                let until = ls.cooldown_until.load(Ordering::Acquire);
-                if now < until {
-                    false // Still in cooldown
-                } else {
-                    true // Cooldown expired, fully usable again
-                }
-            }
-            1 => {
-                // Open -> check if cooldown expired
-                let until = ls.cooldown_until.load(Ordering::Acquire);
-                if now >= until {
-                    // Transition to HalfOpen and try to acquire probe
-                    self.half_open_state(lane);
-
-                    // Try to acquire the single probe - CAS succeeds means we're THE probe
-                    let acquired = ls
-                        .probe_in_flight
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok();
-
-                    if acquired {
-                        true // This request IS the probe
-                    } else {
-                        false // Another request won the probe
-                    }
-                } else {
-                    false
-                }
-            }
-            2 => {
-                // HalfOpen -> return false (probe already in flight or waiting for it)
-                // Only the request that won the CAS in Open->HalfOpen transition is allowed through
-                false
-            }
-            _ => unreachable!("Invalid breaker state"),
+    #[cfg_attr(not(test), allow(dead_code))] // reached only via the test-exercised `breaker_state`
+    fn breaker_state_for(&self, pool: &str, lane: usize) -> BreakerState {
+        if self.get_lane(lane).dead.load(Ordering::Relaxed) {
+            return BreakerState::Open { until: u64::MAX };
         }
+        Self::cell_breaker_state(self.cell(pool, lane).as_ref())
+    }
+
+    fn cooldown_remaining_for(&self, pool: &str, lane: usize, now: u64) -> u64 {
+        self.cell(pool, lane)
+            .cooldown_until()
+            .load(Ordering::Acquire)
+            .saturating_sub(now)
+    }
+
+    fn record_failure_for(
+        &self,
+        pool: &str,
+        lane: usize,
+        now_time: u64,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    ) {
+        if self.get_lane(lane).dead.load(Ordering::Relaxed) {
+            return; // administratively down — ignore
+        }
+        Self::cell_record_failure(self.cell(pool, lane).as_ref(), now_time, cfg, retry_after);
+    }
+
+    fn record_success_for(&self, pool: &str, lane: usize) {
+        let ls = self.get_lane(lane);
+        if ls.dead.load(Ordering::Relaxed) {
+            // Dead lane: count the success for observability, don't touch the breaker.
+            ls.ok.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        Self::cell_record_success(self.cell(pool, lane).as_ref(), Self::now_secs());
+        ls.ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_hard_down_for(&self, pool: &str, lane: usize, reason: &str) {
+        let ls = self.get_lane(lane);
+        // (A7): hard-down is RECOVERABLE — long sticky cooldown + Open, recovered via the half-open
+        // probe. We do NOT set `dead` (that would block recovery). Per (pool, lane): only the
+        // routing pool's view is tripped; other pools discover the bad upstream independently.
+        *ls.dead_reason.lock().unwrap() = reason.to_string();
+        eprintln!(
+            "[{}] HARD-DOWN: {}; sticky cooldown {}s (recovers via probe)",
+            ls.model, reason, HARD_DOWN_COOLDOWN_SECS
+        );
+        let cell = self.cell(pool, lane);
+        cell.cooldown_until().store(
+            Self::now_secs() + HARD_DOWN_COOLDOWN_SECS,
+            Ordering::Release,
+        );
+        cell.breaker_state().store(1, Ordering::Release); // Open
+    }
+
+    fn select_weighted_for(
+        &self,
+        pool: &str,
+        candidates: &[usize],
+        weights: &[u32],
+        now: u64,
+    ) -> Option<usize> {
+        // Filter to usable members and build (lane_idx, cell, effective_weight).
+        let mut healthy: Vec<(usize, Arc<dyn BreakerCellAccess>, i64)> =
+            Vec::with_capacity(candidates.len());
+        for (&candidate, &weight) in candidates.iter().zip(weights.iter()) {
+            if self.usable_for(pool, candidate, now) {
+                healthy.push((candidate, self.cell(pool, candidate), weight as i64));
+            }
+        }
+        if healthy.is_empty() {
+            return None;
+        }
+
+        // SWRR over the healthy subset (ADR-0001), using each cell's per-pool current_weight.
+        let total: i64 = healthy.iter().map(|(_, _, w)| *w).sum();
+        for (_, cell, eff_wt) in &healthy {
+            cell.current_weight().fetch_add(*eff_wt, Ordering::Relaxed);
+        }
+        let mut best: Option<(usize, &Arc<dyn BreakerCellAccess>)> = None;
+        let mut best_weight = i64::MIN;
+        for (lane_idx, cell, _) in &healthy {
+            let cw = cell.current_weight().load(Ordering::Relaxed);
+            if cw > best_weight {
+                best_weight = cw;
+                best = Some((*lane_idx, cell));
+            }
+        }
+        if let Some((_, cell)) = best {
+            cell.current_weight().fetch_sub(total, Ordering::Relaxed);
+        }
+        best.map(|(idx, _)| idx)
+    }
+}
+
+impl StateStore for InMemoryStore {
+    fn usable(&self, lane: usize, now: u64) -> bool {
+        self.usable_for("", lane, now)
+    }
+
+    fn usable_in(&self, pool: &str, lane: usize, now: u64) -> bool {
+        self.usable_for(pool, lane, now)
     }
 
     fn breaker_state(&self, lane: usize) -> BreakerState {
-        let ls = self.get_lane(lane);
-
-        if ls.dead.load(Ordering::Relaxed) {
-            return BreakerState::Open { until: u64::MAX };
-        }
-
-        let state = ls.breaker_state.load(Ordering::Acquire);
-        match state {
-            0 => BreakerState::Closed,
-            1 => {
-                let until = ls.cooldown_until.load(Ordering::Acquire);
-                BreakerState::Open { until }
-            }
-            2 => BreakerState::HalfOpen,
-            _ => unreachable!("Invalid breaker state"),
-        }
+        self.breaker_state_for("", lane)
     }
 
     fn cooldown_remaining(&self, lane: usize, now: u64) -> u64 {
-        let ls = self.get_lane(lane);
-        let until = ls.cooldown_until.load(Ordering::Acquire);
-        until.saturating_sub(now)
+        self.cooldown_remaining_for("", lane, now)
+    }
+
+    fn cooldown_remaining_in(&self, pool: &str, lane: usize, now: u64) -> u64 {
+        self.cooldown_remaining_for(pool, lane, now)
     }
 
     fn record_success(&self, lane: usize) {
-        let ls = self.get_lane(lane);
+        self.record_success_for("", lane);
+    }
 
-        if !ls.dead.load(Ordering::Relaxed) {
-            #[cfg(test)]
-            let now_time = crate::store::now_for_test();
-            #[cfg(not(test))]
-            let now_time = now();
-
-            // A success arriving while the breaker is HalfOpen IS the half-open probe succeeding —
-            // complete the recovery: close the breaker, clear the cooldown, and release the
-            // single-flight probe so the lane is admitted again. Without this the lane stayed stuck
-            // in HalfOpen (probe_in_flight never cleared) and was never usable after its one probe.
-            let was_half_open = ls.breaker_state.load(Ordering::Acquire) == 2;
-
-            // Resets the streak, pushes the success into the outcome window, and increments `ok`.
-            self.record_outcome_success_with_time(lane, now_time);
-
-            if was_half_open {
-                self.closed_state(lane, now_time);
-            }
-        } else {
-            // Dead lane: still count the success for observability, but don't touch the breaker
-            // window/streak (the lane is administratively down, not recovering via normal traffic).
-            ls.ok.fetch_add(1, Ordering::Relaxed);
-        }
+    fn record_success_in(&self, pool: &str, lane: usize) {
+        self.record_success_for(pool, lane);
     }
 
     fn record_client_fault(&self, lane: usize) {
@@ -614,40 +903,18 @@ impl StateStore for InMemoryStore {
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
     ) {
-        let ls = self.get_lane(lane);
+        self.record_failure_for("", lane, Self::now_secs(), cfg, retry_after);
+    }
 
-        if ls.dead.load(Ordering::Relaxed) {
-            return; // Already dead, ignore
-        }
-
-        // Record the error outcome in sliding window using injected time
-        #[cfg(test)]
-        let now_time = crate::store::now_for_test();
-        #[cfg(not(test))]
-        let now_time = now();
-
-        // Record the failure: window + cumulative err + consecutive streak (streak is owned here,
-        // not by open_state). should_trip then evaluates the pool's configured trip condition.
-        self.record_outcome_error_with_time(lane, now_time);
-        ls.streak.fetch_add(1, Ordering::Relaxed);
-
-        let breaker_state = ls.breaker_state.load(Ordering::Acquire);
-
-        if breaker_state == 0 {
-            // Closed -> evaluate the configured trip condition (error-rate or consecutive).
-            if Self::should_trip(ls, now_time, cfg) {
-                self.open_state_with_retry_after(lane, now_time, cfg, retry_after);
-            } else {
-                // Below the trip threshold: brief escalating cooldown, honoring Retry-After floor.
-                let duration =
-                    Self::compute_cooldown_with_retry_after(ls, now_time, cfg, retry_after);
-                ls.cooldown_until
-                    .store(now_time + duration, Ordering::Release);
-            }
-        } else if breaker_state == 2 {
-            // HalfOpen -> probe failed, transition to Open with escalated cooldown
-            self.open_state_with_retry_after(lane, now_time, cfg, retry_after);
-        }
+    fn record_transient_in(
+        &self,
+        pool: &str,
+        lane: usize,
+        _what: &str,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    ) {
+        self.record_failure_for(pool, lane, Self::now_secs(), cfg, retry_after);
     }
 
     fn record_rate_limit(
@@ -657,73 +924,51 @@ impl StateStore for InMemoryStore {
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
     ) {
-        let ls = self.get_lane(lane);
+        self.record_failure_for("", lane, now_time, cfg, retry_after);
+    }
 
-        if ls.dead.load(Ordering::Relaxed) {
-            return;
-        }
-
-        // Record the failure: window + cumulative err + consecutive streak (a 429 is a consecutive
-        // failure for streak purposes). should_trip then applies the pool's configured trip rule.
-        {
-            let mut window = ls.outcome_window.lock().unwrap();
-            window.push(now_time);
-        }
-        ls.err.fetch_add(1, Ordering::Relaxed);
-        ls.streak.fetch_add(1, Ordering::Relaxed);
-
-        let breaker_state = ls.breaker_state.load(Ordering::Acquire);
-
-        if breaker_state == 0 {
-            // Closed -> evaluate the configured trip condition.
-            if Self::should_trip(ls, now_time, cfg) {
-                self.open_state_with_retry_after(lane, now_time, cfg, retry_after);
-            } else {
-                let duration =
-                    Self::compute_cooldown_with_retry_after(ls, now_time, cfg, retry_after);
-                ls.cooldown_until
-                    .store(now_time + duration, Ordering::Release);
-            }
-        } else if breaker_state == 2 {
-            // HalfOpen -> probe failed
-            self.open_state_with_retry_after(lane, now_time, cfg, retry_after);
-        }
+    fn record_rate_limit_in(
+        &self,
+        pool: &str,
+        lane: usize,
+        now_time: u64,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    ) {
+        self.record_failure_for(pool, lane, now_time, cfg, retry_after);
     }
 
     fn record_hard_down(&self, lane: usize, reason: &str) {
-        let ls = self.get_lane(lane);
+        self.record_hard_down_for("", lane, reason);
+    }
 
-        #[cfg(test)]
-        let now_time = crate::store::now_for_test();
-        #[cfg(not(test))]
-        let now_time = now();
-
-        // (A7): hard-down is RECOVERABLE — long sticky cooldown + Open state, so the
-        // half-open probe re-probes it once the cooldown expires. We do NOT set `dead`
-        // (that would permanently block recovery in usable()). Budget exhaustion is a SEPARATE
-        // permanent disable, handled in usable() via `budget <= 0` (it never sets `dead` and
-        // never probes), so hard-down and budget-kill stay distinct.
-        *ls.dead_reason.lock().unwrap() = reason.to_string();
-        eprintln!(
-            "[{}] HARD-DOWN: {}; sticky cooldown {}s (recovers via probe)",
-            ls.model, reason, HARD_DOWN_COOLDOWN_SECS
-        );
-
-        let until = now_time + HARD_DOWN_COOLDOWN_SECS;
-        ls.cooldown_until.store(until, Ordering::Release);
-        ls.breaker_state.store(1, Ordering::Release); // Open
+    fn record_hard_down_in(&self, pool: &str, lane: usize, reason: &str) {
+        self.record_hard_down_for(pool, lane, reason);
     }
 
     fn recover_lane(&self, lane: usize) {
+        // A health probe tests the UPSTREAM, which is shared across pools — so a successful probe
+        // recovers EVERY cell for this lane (the default/direct-route cell and all per-pool cells).
         let ls = self.get_lane(lane);
-        // Only act on a tripped lane (Open/HalfOpen); a Closed lane is already healthy.
         if ls.breaker_state.load(Ordering::Acquire) != 0 {
-            #[cfg(test)]
-            let now_time = crate::store::now_for_test();
-            #[cfg(not(test))]
-            let now_time = now();
-            self.closed_state(lane, now_time);
+            Self::cell_closed(ls.as_ref());
         }
+        let cells = self.pool_cells.lock().unwrap();
+        for ((_, l), cell) in cells.iter() {
+            if *l == lane && cell.breaker_state.load(Ordering::Acquire) != 0 {
+                Self::cell_closed(cell.as_ref());
+            }
+        }
+    }
+
+    fn lane_tripped_anywhere(&self, lane: usize) -> bool {
+        if self.get_lane(lane).breaker_state.load(Ordering::Acquire) != 0 {
+            return true;
+        }
+        let cells = self.pool_cells.lock().unwrap();
+        cells
+            .iter()
+            .any(|((_, l), cell)| *l == lane && cell.breaker_state.load(Ordering::Acquire) != 0)
     }
 
     fn try_acquire(&self, lane: usize) -> Option<Permit> {
@@ -769,54 +1014,25 @@ impl StateStore for InMemoryStore {
         }
     }
 
-    // SWRR selection over healthy subset (ADR-0001 algorithm)
+    // SWRR selection over the healthy subset (ADR-0001 algorithm). Uses the lane-default cells.
     fn select_weighted(&self, candidates: &[usize], weights: &[u32], now: u64) -> Option<usize> {
-        // Filter to usable members only and build (lane_idx, effective_weight) pairs
-        let mut healthy: Vec<(usize, i64)> = Vec::with_capacity(candidates.len());
-        for (&candidate, &weight) in candidates.iter().zip(weights.iter()) {
-            if self.usable(candidate, now) {
-                healthy.push((candidate, weight as i64));
-            }
-        }
+        self.select_weighted_for("", candidates, weights, now)
+    }
 
-        if healthy.is_empty() {
-            return None; // No healthy members -> pool exhaustion (handles this)
-        }
-
-        // SWRR algorithm over healthy subset only (ADR-0001):
-        // total = Σ effective_weight_i (healthy members only)
-        let total: i64 = healthy.iter().map(|(_, w)| *w).sum();
-
-        // for each healthy i: current_weight_i += effective_weight_i
-        for &(lane_idx, eff_wt) in &healthy {
-            let ls = self.get_lane(lane_idx);
-            ls.current_weight.fetch_add(eff_wt, Ordering::Relaxed);
-        }
-
-        // pick = argmax_i(current_weight_i) over healthy members
-        let mut best_lane: Option<usize> = None;
-        let mut best_weight: i64 = i64::MIN;
-
-        for &(lane_idx, _) in &healthy {
-            let ls = self.get_lane(lane_idx);
-            let cw = ls.current_weight.load(Ordering::Relaxed);
-            if cw > best_weight {
-                best_weight = cw;
-                best_lane = Some(lane_idx);
-            }
-        }
-
-        // current_weight_pick -= total for the picked member
-        if let Some(pick) = best_lane {
-            let ls = self.get_lane(pick);
-            ls.current_weight.fetch_sub(total, Ordering::Relaxed);
-        }
-
-        best_lane
+    fn select_weighted_in(
+        &self,
+        pool: &str,
+        candidates: &[usize],
+        weights: &[u32],
+        now: u64,
+    ) -> Option<usize> {
+        self.select_weighted_for(pool, candidates, weights, now)
     }
 }
 
-// Helper methods for InMemoryStore (not part of StateStore trait)
+// Test-only helpers: release code records outcomes via the cell-core fns; these give the unit
+// tests a lane-indexed handle to seed the default cell's outcome window directly.
+#[cfg(test)]
 impl InMemoryStore {
     /// Record an error outcome in the sliding window with explicit time.
     pub(crate) fn record_outcome_error_with_time(&self, lane: usize, now_time: u64) {
@@ -1315,6 +1531,88 @@ mod tests {
         assert!(
             !store.get_lane(0).probe_in_flight.load(Ordering::Relaxed),
             "the single-flight probe must be released on recovery"
+        );
+    }
+
+    // ── per-(pool, lane) breaker isolation ──────────────────────────────────────────────────────
+
+    /// Tripping a lane in one pool must NOT trip the same lane in another pool, nor the lane-default
+    /// cell — the core promise of per-(pool, lane) isolation.
+    #[test]
+    fn test_pool_breaker_isolation() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(8000);
+
+        // Consecutive(n=1) so a single failure trips immediately.
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 15,
+            max_cooldown_secs: 120,
+            honor_retry_after: true,
+            trip: TripConfig {
+                mode: TripMode::Consecutive,
+                window_s: 30,
+                threshold: 0.5,
+                min_requests: 5,
+                n: 1,
+            },
+        };
+
+        // Trip lane 0 in pool "A".
+        store.record_transient_in("A", 0, "5xx", &cfg, None);
+
+        assert!(
+            !store.usable_in("A", 0, 8000),
+            "pool A's cell must be tripped"
+        );
+        assert!(
+            store.usable_in("B", 0, 8000),
+            "pool B's cell must be unaffected by pool A's trip"
+        );
+        assert!(
+            store.usable(0, 8000),
+            "the lane-default cell must be unaffected by pool A's trip"
+        );
+        assert!(
+            store.lane_tripped_anywhere(0),
+            "lane is tripped in at least one cell (pool A)"
+        );
+
+        // A successful health probe recovers EVERY cell for the lane.
+        store.recover_lane(0);
+        assert!(
+            !store.lane_tripped_anywhere(0),
+            "recover_lane must clear every cell (probe tests the shared upstream)"
+        );
+        assert!(store.usable_in("A", 0, 8000), "pool A recovered");
+    }
+
+    /// The concurrency budget (max_requests) is lane-global: spending it through one pool must
+    /// exhaust it for every pool, since they share the one upstream.
+    #[test]
+    fn test_budget_is_lane_global_across_pools() {
+        let mut ld = make_lane_data(0, 10);
+        ld.limited = true;
+        ld.budget = 1;
+        let store = Arc::new(InMemoryStore::new(vec![ld]));
+        set_now_for_test(8100);
+
+        assert!(store.spend_budget(0), "first spend succeeds");
+        assert!(
+            !store.spend_budget(0),
+            "lifetime budget of 1 is now exhausted"
+        );
+        // Exhaustion is visible from every pool's view (budget is checked on the shared lane).
+        assert!(
+            !store.usable_in("A", 0, 8100),
+            "exhausted budget blocks pool A"
+        );
+        assert!(
+            !store.usable_in("B", 0, 8100),
+            "exhausted budget blocks pool B"
+        );
+        assert!(
+            !store.usable(0, 8100),
+            "exhausted budget blocks direct route"
         );
     }
 

@@ -282,6 +282,9 @@ struct FirstByteBody<S, P> {
     /// Resolved breaker config for the routing pool, so a mid-stream failure trips this lane using
     /// the same thresholds the synchronous path used (defaults on the degraded path).
     breaker_cfg: Arc<crate::store::BreakerCfg>,
+    /// Routing pool name, so a mid-stream failure trips this lane's per-pool breaker cell (empty on
+    /// the degraded path → the lane-default cell).
+    pool: Box<str>,
     /// Usage tap for extracting Anthropic SSE usage without buffering full body
     tap: UsageTap,
     /// when Some, translate each egress SSE chunk to the caller's ingress protocol.
@@ -307,6 +310,7 @@ where
         app: Arc<App>,
         lane_idx: usize,
         breaker_cfg: Arc<crate::store::BreakerCfg>,
+        pool: &str,
         translate: Option<crate::proto::StreamTranslate>,
         usage_sink: Option<UsageSink>,
     ) -> Self {
@@ -318,6 +322,7 @@ where
             app: Some(app),
             lane_idx,
             breaker_cfg,
+            pool: Box::from(pool),
             tap: UsageTap::new(),
             translate,
             usage_sink,
@@ -369,7 +374,8 @@ where
                     if had_first && this.is_sse {
                         // Mid-stream failure after first byte in SSE mode: record breaker failure then emit SSE error event
                         if let Some(ref app) = this.app {
-                            app.store.record_transient(
+                            app.store.record_transient_in(
+                                &this.pool,
                                 this.lane_idx,
                                 "mid-stream",
                                 &this.breaker_cfg,
@@ -394,7 +400,8 @@ where
                     // Stream ended - for SSE streams that sent at least one byte, record the failure
                     if this.is_sse && this.first_byte_sent.load(Ordering::Relaxed) {
                         if let Some(ref app) = this.app {
-                            app.store.record_transient(
+                            app.store.record_transient_in(
+                                &this.pool,
                                 this.lane_idx,
                                 "mid-stream-end",
                                 &this.breaker_cfg,
@@ -502,10 +509,11 @@ async fn pick_among(
     cands: &[WeightedLane],
     request_ctx: &mut RequestCtx,
     _affinity_key: Option<&str>,
+    pool_name: &str,
 ) -> Option<(usize, Permit)> {
     let t = now();
 
-    // Session affinity preference - try sticky lane first if usable
+    // Session affinity preference - try sticky lane first if usable (in this pool's breaker view)
     if let Some(k) = _affinity_key {
         if !cands.is_empty() {
             let mut h = DefaultHasher::new();
@@ -513,7 +521,8 @@ async fn pick_among(
             let pos = (h.finish() as usize) % cands.len();
             let sticky = cands[pos].idx;
 
-            if !request_ctx.excluded.contains(&sticky) && app.store.usable(sticky, t) {
+            if !request_ctx.excluded.contains(&sticky) && app.store.usable_in(pool_name, sticky, t)
+            {
                 if let Some(p) = app.store.try_acquire(sticky) {
                     return Some((sticky, p));
                 }
@@ -532,8 +541,10 @@ async fn pick_among(
     let candidates: Vec<usize> = filtered_cands.iter().map(|wl| wl.idx).collect();
     let weights: Vec<u32> = filtered_cands.iter().map(|wl| wl.weight).collect();
 
-    // Use SWRR selection over healthy members only
-    let picked_lane_idx = app.store.select_weighted(&candidates, &weights, t)?;
+    // Use SWRR selection over healthy members only (per this pool's breaker cells)
+    let picked_lane_idx = app
+        .store
+        .select_weighted_in(pool_name, &candidates, &weights, t)?;
 
     // Try to acquire the selected lane immediately
     if let Some(p) = app.store.try_acquire(picked_lane_idx) {
@@ -610,12 +621,14 @@ pub(crate) async fn forward(
     caller_token: Option<&str>,
     usage_sink: Option<UsageSink>,
 ) -> Response {
+    // Empty pool name → the lane-default breaker cell (shared by all direct/ad-hoc routes and
+    // surfaced by /stats and /healthz). Named pools route via forward_with_pool with their own cells.
     forward_with_pool(
         app,
         cands,
         body,
         caller_token,
-        "__default__",
+        "",
         None,
         "anthropic",
         usage_sink,
@@ -710,30 +723,37 @@ pub(crate) async fn forward_with_pool(
             return (StatusCode::SERVICE_UNAVAILABLE, "router: deadline exceeded").into_response();
         }
 
-        let (i, permit) =
-            match pick_among(&app, &cands, &mut request_ctx, _affinity_key_str.as_deref()).await {
-                Some(x) => x,
-                None => {
-                    if cands.is_empty() {
-                        // Pool has no members at all — nothing to do.
-                        return (StatusCode::SERVICE_UNAVAILABLE, "router: no usable lane")
-                            .into_response();
-                    }
-                    // No usable lane — whether the members were tripped before this request
-                    // arrived or excluded during its failover attempts, apply the configured
-                    // exhaustion mode (Status503 / FallbackPool / LeastBad) with loop prevention.
-                    return handle_exhaustion_for_pool(
-                        app.clone(),
-                        &cands,
-                        now(),
-                        pool_name,
-                        body,
-                        caller_token,
-                        &mut request_ctx,
-                    )
-                    .await;
+        let (i, permit) = match pick_among(
+            &app,
+            &cands,
+            &mut request_ctx,
+            _affinity_key_str.as_deref(),
+            pool_name,
+        )
+        .await
+        {
+            Some(x) => x,
+            None => {
+                if cands.is_empty() {
+                    // Pool has no members at all — nothing to do.
+                    return (StatusCode::SERVICE_UNAVAILABLE, "router: no usable lane")
+                        .into_response();
                 }
-            };
+                // No usable lane — whether the members were tripped before this request
+                // arrived or excluded during its failover attempts, apply the configured
+                // exhaustion mode (Status503 / FallbackPool / LeastBad) with loop prevention.
+                return handle_exhaustion_for_pool(
+                    app.clone(),
+                    &cands,
+                    now(),
+                    pool_name,
+                    body,
+                    caller_token,
+                    &mut request_ctx,
+                )
+                .await;
+            }
+        };
 
         // Mark this lane as excluded for future attempts in this request
         request_ctx.exclude(i);
@@ -824,7 +844,8 @@ pub(crate) async fn forward_with_pool(
             Err(e) => {
                 // Pre-response error: classify and potentially failover
                 let err_type = if e.is_timeout() { "timeout" } else { "connect" };
-                app.store.record_transient(i, err_type, &breaker_cfg, None);
+                app.store
+                    .record_transient_in(pool_name, i, err_type, &breaker_cfg, None);
                 metrics::counter!(
                     crate::metrics::UPSTREAM_FAILURES_TOTAL,
                     "pool" => pool_name.to_string(),
@@ -890,7 +911,8 @@ pub(crate) async fn forward_with_pool(
                             // Transient upstream failure → cooldown + err counter
                             // Record based on specific error type (exhaustive over remaining variants)
                             if matches!(sig.class, StatusClass::RateLimit) {
-                                app.store.record_rate_limit(
+                                app.store.record_rate_limit_in(
+                                    pool_name,
                                     i,
                                     now(),
                                     &breaker_cfg,
@@ -912,8 +934,13 @@ pub(crate) async fn forward_with_pool(
                                         "rate_limit"
                                     }
                                 };
-                                app.store
-                                    .record_transient(i, what, &breaker_cfg, sig.retry_after);
+                                app.store.record_transient_in(
+                                    pool_name,
+                                    i,
+                                    what,
+                                    &breaker_cfg,
+                                    sig.retry_after,
+                                );
                             }
                             metrics::counter!(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
@@ -950,7 +977,7 @@ pub(crate) async fn forward_with_pool(
                                 StatusClass::ClientError => unreachable!(),
                                 StatusClass::ContextLength => unreachable!(),
                             };
-                            app.store.record_hard_down(i, &reason);
+                            app.store.record_hard_down_in(pool_name, i, &reason);
                             // a hard-down is a breaker trip for this lane.
                             metrics::counter!(
                                 crate::metrics::BREAKER_TRIPS_TOTAL,
@@ -1032,7 +1059,7 @@ pub(crate) async fn forward_with_pool(
                 // the per-lane `ok` counter and the breaker's success window) and consume one unit
                 // of its lifetime request budget (the `max_requests` cost cap; `usable()` stops
                 // admitting the lane once it reaches 0).
-                app.store.record_success(i);
+                app.store.record_success_in(pool_name, i);
                 app.store.spend_budget(i);
 
                 // stream the response body incrementally with first-byte boundary tracking
@@ -1090,6 +1117,7 @@ pub(crate) async fn forward_with_pool(
                     app.clone(),
                     i,
                     breaker_cfg.clone(),
+                    pool_name,
                     translate,
                     usage_sink,
                 );
@@ -1121,12 +1149,13 @@ fn find_soonest_cooldown(
     store: &Arc<dyn crate::store::StateStore>,
     cands: &[WeightedLane],
     now: u64,
+    pool: &str,
 ) -> Option<usize> {
     let mut soonest_idx = None;
     let mut soonest_remaining = u64::MAX;
 
     for wl in cands {
-        let remaining = store.cooldown_remaining(wl.idx, now);
+        let remaining = store.cooldown_remaining_in(pool, wl.idx, now);
         if remaining < soonest_remaining {
             soonest_remaining = remaining;
             soonest_idx = Some(wl.idx);
@@ -1154,20 +1183,29 @@ async fn handle_exhaustion_for_pool(
         .unwrap_or(OnExhausted::Status503);
 
     match mode {
-        OnExhausted::Status503 => handle_status_503(&app, cands, now),
+        OnExhausted::Status503 => handle_status_503(&app, cands, now, pool_name),
         OnExhausted::FallbackPool(ref fallback_pool) => {
             handle_fallback_pool(app.clone(), body, caller_token, fallback_pool, request_ctx).await
         }
         OnExhausted::LeastBad => {
-            handle_least_bad(&app, cands, now, &body, caller_token, request_ctx).await
+            handle_least_bad(
+                &app,
+                cands,
+                now,
+                &body,
+                caller_token,
+                request_ctx,
+                pool_name,
+            )
+            .await
         }
     }
 }
 
 /// Status503 mode: return 503 with Retry-After header.
-fn handle_status_503(app: &Arc<App>, cands: &[WeightedLane], now: u64) -> Response {
-    let soonest_remaining = find_soonest_cooldown(&app.store, cands, now)
-        .map(|idx| app.store.cooldown_remaining(idx, now))
+fn handle_status_503(app: &Arc<App>, cands: &[WeightedLane], now: u64, pool: &str) -> Response {
+    let soonest_remaining = find_soonest_cooldown(&app.store, cands, now, pool)
+        .map(|idx| app.store.cooldown_remaining_in(pool, idx, now))
         .unwrap_or(1);
 
     let retry_after = soonest_remaining.max(1); // Ensure at least 1 second
@@ -1280,6 +1318,7 @@ async fn forward_once(
                 app.clone(),
                 i,
                 Arc::new(crate::store::BreakerCfg::default()),
+                "", // degraded path: lane-default breaker cell
                 None,
                 None,
             );
@@ -1320,12 +1359,12 @@ async fn handle_fallback_pool(
 
     // Loop guard: if this request already routed through this pool, stop (A→B→A).
     if request_ctx.is_pool_visited(pool_name) {
-        return handle_status_503(&app, &[], now());
+        return handle_status_503(&app, &[], now(), pool_name);
     }
 
     let Some(fallback_cands) = app.fallback_pools.get(pool_name).cloned() else {
         // Fallback pool not configured — cascade to Status503.
-        return handle_status_503(&app, &[], now());
+        return handle_status_503(&app, &[], now(), pool_name);
     };
 
     // Mark before re-entering so a cycle back to this pool is detected.
@@ -1337,7 +1376,9 @@ async fn handle_fallback_pool(
             return (StatusCode::SERVICE_UNAVAILABLE, "router: deadline exceeded").into_response();
         }
 
-        let Some((i, permit)) = pick_among(&app, &fallback_cands, request_ctx, None).await else {
+        let Some((i, permit)) =
+            pick_among(&app, &fallback_cands, request_ctx, None, pool_name).await
+        else {
             // Fallback pool itself exhausted — consult ITS on_exhausted config (multi-level
             // chains). The visited-set guarantees this recursion terminates.
             return Box::pin(handle_exhaustion_for_pool(
@@ -1382,21 +1423,22 @@ async fn handle_least_bad(
     body: &Bytes,
     caller_token: Option<&str>,
     request_ctx: &RequestCtx,
+    pool: &str,
 ) -> Response {
-    let Some(soonest_idx) = find_soonest_cooldown(&app.store, cands, now) else {
+    let Some(soonest_idx) = find_soonest_cooldown(&app.store, cands, now, pool) else {
         // No candidates at all - fall back to Status503.
-        return handle_status_503(app, cands, now);
+        return handle_status_503(app, cands, now, pool);
     };
 
     eprintln!(
         "[WARN] LEAST-BAD MODE — routing to degraded member {} (cooldown {}s remaining)",
         soonest_idx,
-        app.store.cooldown_remaining(soonest_idx, now)
+        app.store.cooldown_remaining_in(pool, soonest_idx, now)
     );
 
     // Bypass breaker usability for the last-resort path; grab the concurrency permit directly.
     let Some(permit) = app.store.try_acquire(soonest_idx) else {
-        return handle_status_503(app, cands, now);
+        return handle_status_503(app, cands, now, pool);
     };
 
     match forward_once(
@@ -1410,7 +1452,7 @@ async fn handle_least_bad(
     .await
     {
         Ok(resp) => resp,
-        Err(()) => handle_status_503(app, cands, now),
+        Err(()) => handle_status_503(app, cands, now, pool),
     }
 }
 

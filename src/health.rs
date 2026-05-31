@@ -24,7 +24,7 @@ use axum::http::header::CONTENT_TYPE;
 use crate::config::HealthMode;
 use crate::proto::convert_headers;
 use crate::state::App;
-use crate::store::{now, BreakerCfg, BreakerState};
+use crate::store::{now, BreakerCfg};
 
 /// Spawn one background prober task per lane that has a probing mode configured. A no-op for lanes
 /// with `mode: none` (or no `health:` block). Tasks live for the process lifetime.
@@ -55,8 +55,8 @@ pub(crate) fn spawn_probers(app: Arc<App>) {
                 ticker.tick().await;
                 let should = match mode {
                     HealthMode::Active => true,
-                    // Only re-probe lanes that are currently tripped.
-                    HealthMode::Dead => app.store.breaker_state(i) != BreakerState::Closed,
+                    // Only re-probe lanes tripped in ANY cell (probing tests the shared upstream).
+                    HealthMode::Dead => app.store.lane_tripped_anywhere(i),
                     HealthMode::None => false,
                 };
                 if should {
@@ -110,7 +110,8 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
 
     let healthy = matches!(&res, Ok(r) if r.status().is_success());
     if healthy {
-        if app.store.breaker_state(i) != BreakerState::Closed {
+        if app.store.lane_tripped_anywhere(i) {
+            // Probe tests the shared upstream → recover the lane in every cell (all pools + default).
             app.store.recover_lane(i);
             eprintln!("[health] lane '{}' recovered via probe", lane.model);
         }
