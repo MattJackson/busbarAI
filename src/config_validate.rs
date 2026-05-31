@@ -92,16 +92,15 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
-    // Rule 5: Validate the auth mode (otherwise AuthMiddleware::new would panic at startup). The
-    // mode is matched case-insensitively to mirror config normalization.
+    // Rule 5: Validate the auth mode (otherwise AuthMiddleware::new would panic at startup).
     if let Some(auth) = &cfg.auth {
-        if !matches!(
-            auth.mode.trim().to_lowercase().as_str(),
-            "token" | "passthrough" | "none"
-        ) {
+        if crate::auth::AuthMode::from_config_str(&auth.mode).is_none() {
             errors.push(format!(
-                "auth.mode '{}' is invalid: must be 'token', 'passthrough', or 'none'",
-                auth.mode
+                "auth.mode '{}' is invalid: must be '{}', '{}', or '{}'",
+                auth.mode,
+                crate::auth::AuthMode::TOKEN,
+                crate::auth::AuthMode::PASSTHROUGH,
+                crate::auth::AuthMode::NONE
             ));
         }
     }

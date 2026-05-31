@@ -9,10 +9,15 @@ use tokio::sync::Semaphore;
 // Lower bound a hard-down sticky cooldown is asserted to exceed, in tests.
 #[cfg(test)]
 const COOLDOWN_TRANSIENT_SECS: u64 = 10;
-// (A7 fix): hard-down (bad key / billing / hard quota) gets a long sticky cooldown
-// and recovers via the half-open probe — NOT a permanent `dead` kill. A human likely
-// has to fix the key, so fast re-probes are pointless; default 30 min.
+// A hard-down fault (bad key / billing / hard quota) gets a long sticky cooldown and recovers via
+// the half-open probe — NOT a permanent `dead` kill. A human likely has to fix the key, so fast
+// re-probes are pointless; default 30 min.
 const HARD_DOWN_COOLDOWN_SECS: u64 = 1800;
+
+// Breaker-state encoding for the per-cell `AtomicU64` (stored as u64 so it can be CAS'd).
+const ST_CLOSED: u64 = 0;
+const ST_OPEN: u64 = 1;
+const ST_HALF_OPEN: u64 = 2;
 
 /// Get current time in seconds since epoch.
 pub(crate) fn now() -> u64 {
@@ -489,7 +494,7 @@ impl InMemoryStore {
         let duration = Self::compute_cooldown_with_retry_after(c, now_time, cfg, retry_after);
         c.cooldown_until()
             .store(now_time + duration, Ordering::Release);
-        c.breaker_state().store(1, Ordering::Release); // 1 = Open
+        c.breaker_state().store(ST_OPEN, Ordering::Release);
     }
 
     /// Transition the cell to Closed (full recovery): reset streak/err/window, clear the cooldown
@@ -499,7 +504,7 @@ impl InMemoryStore {
         c.err().store(0, Ordering::Release);
         c.outcome_window().lock().unwrap().clear();
         c.cooldown_until().store(0, Ordering::Release);
-        c.breaker_state().store(0, Ordering::Release); // 0 = Closed
+        c.breaker_state().store(ST_CLOSED, Ordering::Release);
         c.probe_in_flight().store(false, Ordering::Release);
     }
 
@@ -507,11 +512,11 @@ impl InMemoryStore {
     /// HalfOpen on expiry and admits exactly one probe (CAS); HalfOpen admits nobody else.
     fn cell_usable_breaker(c: &dyn BreakerCellAccess, now: u64) -> bool {
         match c.breaker_state().load(Ordering::Acquire) {
-            0 => now >= c.cooldown_until().load(Ordering::Acquire),
-            1 => {
+            ST_CLOSED => now >= c.cooldown_until().load(Ordering::Acquire),
+            ST_OPEN => {
                 let until = c.cooldown_until().load(Ordering::Acquire);
                 if now >= until {
-                    c.breaker_state().store(2, Ordering::Release); // HalfOpen
+                    c.breaker_state().store(ST_HALF_OPEN, Ordering::Release);
                     c.probe_in_flight()
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
@@ -519,7 +524,7 @@ impl InMemoryStore {
                     false
                 }
             }
-            2 => false,
+            ST_HALF_OPEN => false,
             _ => unreachable!("Invalid breaker state"),
         }
     }
@@ -528,11 +533,11 @@ impl InMemoryStore {
     #[cfg_attr(not(test), allow(dead_code))] // reached only via the test-exercised `breaker_state`
     fn cell_breaker_state(c: &dyn BreakerCellAccess) -> BreakerState {
         match c.breaker_state().load(Ordering::Acquire) {
-            0 => BreakerState::Closed,
-            1 => BreakerState::Open {
+            ST_CLOSED => BreakerState::Closed,
+            ST_OPEN => BreakerState::Open {
                 until: c.cooldown_until().load(Ordering::Acquire),
             },
-            2 => BreakerState::HalfOpen,
+            ST_HALF_OPEN => BreakerState::HalfOpen,
             _ => unreachable!("Invalid breaker state"),
         }
     }
@@ -550,7 +555,7 @@ impl InMemoryStore {
         c.streak().fetch_add(1, Ordering::Relaxed);
 
         match c.breaker_state().load(Ordering::Acquire) {
-            0 => {
+            ST_CLOSED => {
                 if Self::should_trip(c, now_time, cfg) {
                     Self::cell_open(c, now_time, cfg, retry_after);
                 } else {
@@ -560,7 +565,7 @@ impl InMemoryStore {
                         .store(now_time + duration, Ordering::Release);
                 }
             }
-            2 => Self::cell_open(c, now_time, cfg, retry_after), // HalfOpen probe failed → reopen
+            ST_HALF_OPEN => Self::cell_open(c, now_time, cfg, retry_after), // probe failed → reopen
             _ => {}
         }
     }
@@ -569,7 +574,7 @@ impl InMemoryStore {
     /// half-open probe — complete recovery to Closed. (The lane-global `ok` counter is bumped by the
     /// caller, since it is shared across pools.)
     fn cell_record_success(c: &dyn BreakerCellAccess, now_time: u64) {
-        let was_half_open = c.breaker_state().load(Ordering::Acquire) == 2;
+        let was_half_open = c.breaker_state().load(Ordering::Acquire) == ST_HALF_OPEN;
         c.streak().store(0, Ordering::Release);
         c.outcome_window().lock().unwrap().push(now_time);
         if was_half_open {
@@ -822,7 +827,7 @@ impl InMemoryStore {
             Self::now_secs() + HARD_DOWN_COOLDOWN_SECS,
             Ordering::Release,
         );
-        cell.breaker_state().store(1, Ordering::Release); // Open
+        cell.breaker_state().store(ST_OPEN, Ordering::Release);
     }
 
     fn select_weighted_for(
@@ -955,25 +960,27 @@ impl StateStore for InMemoryStore {
         // A health probe tests the UPSTREAM, which is shared across pools — so a successful probe
         // recovers EVERY cell for this lane (the default/direct-route cell and all per-pool cells).
         let ls = self.get_lane(lane);
-        if ls.breaker_state.load(Ordering::Acquire) != 0 {
+        if ls.breaker_state.load(Ordering::Acquire) != ST_CLOSED {
             Self::cell_closed(ls.as_ref());
         }
         let cells = self.pool_cells.lock().unwrap();
         for ((_, l), cell) in cells.iter() {
-            if *l == lane && cell.breaker_state.load(Ordering::Acquire) != 0 {
+            if *l == lane && cell.breaker_state.load(Ordering::Acquire) != ST_CLOSED {
                 Self::cell_closed(cell.as_ref());
             }
         }
     }
 
     fn lane_tripped_anywhere(&self, lane: usize) -> bool {
-        if self.get_lane(lane).breaker_state.load(Ordering::Acquire) != 0 {
+        if self.get_lane(lane).breaker_state.load(Ordering::Acquire) != ST_CLOSED {
             return true;
         }
         let cells = self.pool_cells.lock().unwrap();
         cells
             .iter()
-            .any(|((_, l), cell)| *l == lane && cell.breaker_state.load(Ordering::Acquire) != 0)
+            .any(|((_, l), cell)| {
+                *l == lane && cell.breaker_state.load(Ordering::Acquire) != ST_CLOSED
+            })
     }
 
     fn try_acquire(&self, lane: usize) -> Option<Permit> {

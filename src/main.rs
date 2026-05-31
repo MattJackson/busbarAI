@@ -224,7 +224,7 @@ async fn main() {
     // Loud warning for auth.mode=none (open relay). Not fatal — busbar still starts (useful for
     // local dev) — but operators must not run this in production.
     if let Some(ref acfg) = cfg.auth {
-        if acfg.clone().normalize().mode == "none" {
+        if auth::AuthMode::from_config_str(&acfg.mode) == Some(auth::AuthMode::None) {
             tracing::warn!(
                 "auth is DISABLED (auth.mode=none) — this is an open relay; do not run in production"
             );

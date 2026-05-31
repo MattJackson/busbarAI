@@ -75,7 +75,7 @@ impl AuthCfg {
     #[allow(deprecated)] // accessing deprecated field in constructor
     pub(crate) fn default_none() -> Self {
         Self {
-            mode: "none".to_string(),
+            mode: crate::auth::AuthMode::NONE.to_string(),
             _legacy_token: None,
             client_tokens: vec![],
         }
@@ -83,7 +83,7 @@ impl AuthCfg {
 }
 
 fn default_auth_mode() -> String {
-    "none".to_string()
+    crate::auth::AuthMode::NONE.to_string()
 }
 
 #[derive(Debug, Deserialize)]

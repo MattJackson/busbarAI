@@ -25,6 +25,25 @@ pub(crate) enum AuthMode {
     None,
 }
 
+impl AuthMode {
+    /// The wire/config spellings of each mode — the single source of truth for the `auth.mode`
+    /// strings (used by parsing, validation, and the config default), so no comparison site
+    /// hardcodes them.
+    pub(crate) const TOKEN: &'static str = "token";
+    pub(crate) const PASSTHROUGH: &'static str = "passthrough";
+    pub(crate) const NONE: &'static str = "none";
+
+    /// Parse the config `auth.mode` value (case-insensitive, trimmed). `None` if unrecognized.
+    pub(crate) fn from_config_str(s: &str) -> Option<AuthMode> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            Self::TOKEN => Some(AuthMode::Token),
+            Self::PASSTHROUGH => Some(AuthMode::Passthrough),
+            Self::NONE => Some(AuthMode::None),
+            _ => None,
+        }
+    }
+}
+
 /// AuthMiddleware holds the resolved auth mode and token allowlist.
 #[derive(Debug)]
 pub(crate) struct AuthMiddleware {
@@ -34,14 +53,17 @@ pub(crate) struct AuthMiddleware {
 
 impl AuthMiddleware {
     pub(crate) fn new(cfg: &AuthCfg) -> Self {
-        let mode = match cfg.mode.as_str() {
-            "token" => AuthMode::Token,
-            "passthrough" => AuthMode::Passthrough,
-            "none" => AuthMode::None,
-            other => {
-                panic!("invalid auth mode '{other}': must be 'token', 'passthrough', or 'none'")
-            }
-        };
+        // Config is validated before this point (see config_validate), so an unknown mode here is a
+        // programming error rather than user error.
+        let mode = AuthMode::from_config_str(&cfg.mode).unwrap_or_else(|| {
+            panic!(
+                "invalid auth mode '{}': must be '{}', '{}', or '{}'",
+                cfg.mode,
+                AuthMode::TOKEN,
+                AuthMode::PASSTHROUGH,
+                AuthMode::NONE
+            )
+        });
 
         // Expand env vars in client_tokens (interpolation pass)
         let tokens: Vec<String> = cfg
