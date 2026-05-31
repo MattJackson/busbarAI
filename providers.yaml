@@ -117,6 +117,134 @@ moonshot:
   error_map:
     rate_limit_exceeded: rate_limit
 
+# Additional OpenAI-compatible providers (base_urls verified against provider docs). Most signal
+# errors via HTTP status (classified by the breaker), so error_map is empty; add billing/rate
+# codes per provider only when documented. `path` overrides are set where the version lives in the
+# base path and the endpoint is <base>/chat/completions.
+meta-llama:
+  protocol: openai
+  base_url: https://api.llama.com/compat
+  error_map: {}
+
+nvidia-nim:
+  protocol: openai
+  base_url: https://integrate.api.nvidia.com
+  error_map: {}
+
+sambanova:
+  protocol: openai
+  base_url: https://api.sambanova.ai
+  error_map: {}
+
+hyperbolic:
+  protocol: openai
+  base_url: https://api.hyperbolic.xyz
+  error_map: {}
+
+novita:
+  protocol: openai
+  base_url: https://api.novita.ai/v3/openai
+  path: /chat/completions
+  error_map: {}
+
+nebius:
+  protocol: openai
+  base_url: https://api.studio.nebius.ai
+  error_map: {}
+
+lambda:
+  protocol: openai
+  base_url: https://api.lambda.ai
+  error_map: {}
+
+featherless:
+  protocol: openai
+  base_url: https://api.featherless.ai
+  error_map: {}
+
+friendliai:
+  protocol: openai
+  base_url: https://api.friendli.ai/serverless
+  error_map: {}
+
+scaleway:
+  protocol: openai
+  base_url: https://api.scaleway.ai
+  error_map: {}
+
+ovhcloud:
+  protocol: openai
+  base_url: https://oai.endpoints.kepler.ai.cloud.ovh.net
+  error_map: {}
+
+nscale:
+  protocol: openai
+  base_url: https://inference.api.nscale.com
+  error_map: {}
+
+gmi:
+  protocol: openai
+  base_url: https://api.gmi-serving.com
+  error_map: {}
+
+baseten:
+  protocol: openai
+  base_url: https://inference.baseten.co
+  error_map: {}
+
+chutes:
+  protocol: openai
+  base_url: https://llm.chutes.ai
+  error_map: {}
+
+# Alibaba DashScope (Qwen) international host; the version lives in /compatible-mode/v1 so the
+# default /v1/chat/completions composes correctly.
+dashscope:
+  protocol: openai
+  base_url: https://dashscope-intl.aliyuncs.com/compatible-mode
+  error_map: {}
+
+minimax:
+  protocol: openai
+  base_url: https://api.minimax.io
+  error_map: {}
+
+sarvam:
+  protocol: openai
+  base_url: https://api.sarvam.ai
+  error_map: {}
+
+# Multi-model aggregators exposing one OpenAI-compatible chat-completions endpoint.
+aimlapi:
+  protocol: openai
+  base_url: https://api.aimlapi.com
+  error_map: {}
+
+cometapi:
+  protocol: openai
+  base_url: https://api.cometapi.com
+  error_map: {}
+
+nano-gpt:
+  protocol: openai
+  base_url: https://nano-gpt.com/api
+  error_map: {}
+
+publicai:
+  protocol: openai
+  base_url: https://platform.publicai.co
+  error_map: {}
+
+synthetic:
+  protocol: openai
+  base_url: https://api.synthetic.new/openai
+  error_map: {}
+
+wandb:
+  protocol: openai
+  base_url: https://api.inference.wandb.ai
+  error_map: {}
+
 # ── OpenAI Responses protocol (/v1/responses) ────────────────────────────────────────────────────
 # The newer stateful OpenAI surface, distinct from chat completions. Bearer auth + a fixed path.
 responses:
