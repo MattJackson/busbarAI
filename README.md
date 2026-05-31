@@ -21,7 +21,7 @@ The name comes from electrical distribution: a busbar takes one feed and fans it
 out across many breakered circuits — one entry point, weighted distribution,
 per-circuit protection.
 
-> **Project status: 0.17.2 (pre-1.0), in active development.** APIs and config may
+> **Project status: 0.17.3 (pre-1.0), in active development.** APIs and config may
 > change before 1.0. See [`docs/roadmap.md`](docs/roadmap.md) for the
 > protocols-not-providers thesis and the auth-adapter design.
 

@@ -91,7 +91,11 @@ impl AuthMiddleware {
         }
     }
 
-    /// Constant-time comparison to prevent timing attacks.
+    /// Constant-time string comparison to avoid leaking how much of a token matches via timing.
+    /// `#[inline(never)]` + `black_box` keep the optimizer from turning the accumulation loop into
+    /// an early-exit branch (which would reintroduce a timing signal). The length check is a
+    /// deliberate fast-path: token *length* is not treated as secret.
+    #[inline(never)]
     fn constant_time_eq(a: &str, b: &str) -> bool {
         let a_bytes = a.as_bytes();
         let b_bytes = b.as_bytes();
@@ -106,7 +110,7 @@ impl AuthMiddleware {
             result |= x ^ y;
         }
 
-        result == 0
+        std::hint::black_box(result) == 0
     }
 
     /// Extract the token from an `Authorization: Bearer <token>` header (scheme match is

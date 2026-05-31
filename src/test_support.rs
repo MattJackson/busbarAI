@@ -5404,6 +5404,93 @@ mod tests {
         assert_eq!(response.status().as_u16(), 400);
     }
 
+    /// Security (SSRF): the ad-hoc `/:provider/:model` route only reaches CONFIGURED lanes — a
+    /// caller cannot coerce busbar to an arbitrary upstream. Unknown model → 404; known model on a
+    /// mismatched provider → 400. Both reject BEFORE any upstream call (and before any metric is
+    /// emitted, so caller path segments can't inflate `/metrics` cardinality).
+    #[tokio::test]
+    async fn test_adhoc_rejects_unconfigured_provider_model() {
+        use crate::route;
+
+        let lane_data = LaneData {
+            model: "test-model".to_string(),
+            provider: "openai".to_string(),
+            max: 1,
+            sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+        let lane = Lane {
+            model: "test-model".to_string(),
+            provider: "openai".to_string(),
+            base_url: "https://configured.example.com".to_string(),
+            api_key: "k".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::openai()),
+            max: 1,
+            error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
+            path: None,
+            auth: None,
+            health: None,
+        };
+        let app = Arc::new(App {
+            lanes: vec![lane],
+            store: Arc::new(InMemoryStore::new(vec![lane_data])),
+            by_model: HashMap::from([("test-model".to_string(), 0)]),
+            pools: HashMap::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+            governance: None,
+        });
+
+        let body = Bytes::from_static(b"{\"messages\":[]}");
+
+        // Attacker-chosen provider/model that isn't configured → 404, no upstream reached.
+        let resp = route::adhoc(
+            State(app.clone()),
+            axum::extract::Path(("evil.example.com".to_string(), "../secret".to_string())),
+            axum::extract::Extension(crate::governance::GovCtx::default()),
+            axum::extract::Extension(crate::auth::CallerToken::default()),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "unknown provider/model must 404"
+        );
+
+        // Configured model but WRONG provider → 400 (must match the lane's provider).
+        let resp2 = route::adhoc(
+            State(app),
+            axum::extract::Path(("wrong-provider".to_string(), "test-model".to_string())),
+            axum::extract::Extension(crate::governance::GovCtx::default()),
+            axum::extract::Extension(crate::auth::CallerToken::default()),
+            body,
+        )
+        .await;
+        assert_eq!(
+            resp2.status().as_u16(),
+            400,
+            "model on a mismatched provider must be rejected"
+        );
+    }
+
     /// OpenAI ingress unknown model → 404.
     #[tokio::test]
     async fn test_openai_ingress_unknown_model() {

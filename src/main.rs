@@ -62,6 +62,10 @@ use store::{InMemoryStore, LaneData};
 const UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// Max idle keep-alive connections the shared HTTP client pools per upstream host.
 const POOL_MAX_IDLE_PER_HOST: usize = 64;
+/// Maximum accepted request body size. Caps memory per request (the body is buffered before
+/// handling) so a hostile/oversized payload can't exhaust memory — generous enough for long
+/// histories and multimodal/base64 image content, but bounded. (axum's default is only 2 MiB.)
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// Handle CLI flags before any environment or file access, so they work without a configured
 /// deployment. Returns `Some(exit_code)` when the process should exit (after printing), `None` to
@@ -444,5 +448,7 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
             app.clone(),
             auth::auth_middleware,
         ))
+        // Cap request body size (buffered before the handler) to bound per-request memory.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(app)
 }

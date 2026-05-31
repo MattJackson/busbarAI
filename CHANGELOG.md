@@ -5,6 +5,31 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.3] — 2026-05-31
+
+Security hardening from a three-model independent review (Opus, Sonnet, qwen3.5). All three
+concurred the audited vectors are clean — SSRF on the routing paths (provider/model validated
+against config; upstream URL never caller-derived), token-compare timing (constant-time for client
+and admin tokens; virtual keys via SHA-256 + map), `/metrics` label cardinality (unknown models are
+rejected before any metric, so labels stay config-bounded), secret-in-logs (no keys/tokens/bodies
+logged), SQL injection (fully parameterized), and auth-bypass. Fixes below close the few hardening
+gaps the review surfaced.
+
+### Security
+- **Request body size limit.** The HTTP router now caps request bodies at 32 MiB
+  (`DefaultBodyLimit`) — previously unbounded beyond axum's 2 MiB default toggling, so a
+  multi-gigabyte body could be buffered and exhaust memory (notably under `auth.mode=none`).
+- **Constant-time token compare hardened.** `constant_time_eq` is now `#[inline(never)]` and runs
+  its result through `std::hint::black_box`, so the optimizer can't fold the accumulation loop into
+  an early-exit branch and reintroduce a timing signal (no new dependency).
+- Documented the two `to_vec` re-serialization sites as the invariants they are (built from
+  already-valid JSON), and corrected a stale `UsageTap` doc comment that referenced a nonexistent
+  carry buffer.
+
+### Tests
+- Added an ad-hoc-route SSRF regression test (unknown provider/model → 404, mismatched provider →
+  400, both before any upstream call). 262 tests total.
+
 ## [0.17.2] — 2026-05-31
 
 ### Fixed

@@ -18,11 +18,11 @@ use crate::proto::{convert_headers, StatusClass};
 use crate::state::{App, WeightedLane};
 use crate::store::{now, Permit};
 
-/// Non-buffering stream inspection tap for Anthropic SSE usage parsing.
+/// Non-buffering stream inspection tap for usage parsing.
 ///
-/// This accumulator extracts the final `message_delta` / `message_stop` usage object
-/// from a streaming Anthropic response without buffering the entire body. It maintains
-/// only small parsed fields and a bounded carry buffer for frame reassembly across chunks.
+/// Extracts the final usage object from a streaming response without buffering the body: it scans
+/// each chunk for complete JSON objects and keeps only the small parsed usage fields. A JSON object
+/// split across chunk boundaries is simply not parsed in that chunk (no unbounded state is kept).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UsageTap {
     /// Extracted input tokens (from message_delta.usage.input_tokens or message_stop.usage.input_tokens)
@@ -43,10 +43,8 @@ impl UsageTap {
         Self::default()
     }
 
-    /// Feed a chunk to the tap and extract any usage fields.
-    ///
-    /// This is a bounded operation: it only scans for JSON objects within each chunk,
-    /// never accumulating more than the carry buffer size (MAX_CARRY_BYTES).
+    /// Feed a chunk to the tap and extract any usage fields. Bounded: it only scans complete JSON
+    /// objects within this chunk and keeps no cross-chunk buffer.
     pub(crate) fn feed(&mut self, chunk: &Bytes) {
         let mut pos = 0;
         while pos < chunk.len() {
@@ -758,7 +756,7 @@ pub(crate) async fn forward_with_pool(
             .protocol
             .writer()
             .rewrite_model(&mut v, &app.lanes[i].model);
-        let payload = serde_json::to_vec(&v).unwrap();
+        let payload = serde_json::to_vec(&v).expect("request body re-serializes (it was parsed from valid JSON and only rewritten with serde_json::json! values)");
         let base = &app.lanes[i].base_url;
 
         // Mode-aware key selection: passthrough uses caller token, others use lane's api_key
@@ -1248,7 +1246,7 @@ async fn forward_once(
         .protocol
         .writer()
         .rewrite_model(&mut v, &app.lanes[i].model);
-    let payload = serde_json::to_vec(&v).unwrap();
+    let payload = serde_json::to_vec(&v).expect("request body re-serializes (it was parsed from valid JSON and only rewritten with serde_json::json! values)");
     let base = &app.lanes[i].base_url;
 
     // Mode-aware key selection: passthrough uses caller token, others use lane's api_key.
