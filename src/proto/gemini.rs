@@ -593,9 +593,19 @@ impl ProtocolWriter for GeminiWriter {
         "/v1beta/models"
     }
 
-    /// B-510c: Gemini's URL embeds the model. Non-streaming uses `:generateContent`.
-    /// (Streaming via `:streamGenerateContent?alt=sse` is a later refinement; today a streaming
-    /// request to a Gemini egress lane is served as a non-streamed response.)
+    /// B-510c/C-3: Gemini's URL embeds the model AND the stream mode. Streaming requests go to
+    /// `:streamGenerateContent?alt=sse` (the gemini reader already decodes those SSE chunks);
+    /// non-streaming to `:generateContent`.
+    fn upstream_path_for_stream(&self, model: &str, stream: bool) -> String {
+        if stream {
+            // C-3: SSE streaming endpoint. `alt=sse` yields `data:`-framed chunks the gemini
+            // reader's read_response_events already decodes.
+            format!("/v1beta/models/{model}:streamGenerateContent?alt=sse")
+        } else {
+            format!("/v1beta/models/{model}:generateContent")
+        }
+    }
+
     fn upstream_path_for(&self, model: &str) -> String {
         format!("/v1beta/models/{model}:generateContent")
     }

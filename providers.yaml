@@ -48,7 +48,7 @@ responses:
 # point base_url at a SigV4-signing proxy (or sidecar) that injects credentials. (2) Bedrock's live
 # streaming transport is the binary application/vnd.amazon.eventstream framing, not SSE; that
 # deframing is not yet wired, so a streaming request to a bedrock lane is served non-streamed (same
-# deferral as Gemini :streamGenerateContent). Bedrock is therefore usable today for NON-streaming
+# transport). Bedrock is therefore usable today for NON-streaming
 # requests behind a SigV4 proxy. region in base_url is a placeholder — set it to your region.
 bedrock:
   protocol: bedrock

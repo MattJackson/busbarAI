@@ -523,6 +523,10 @@ pub(crate) async fn forward_with_pool(
         }
     };
 
+    // C-3: capture the caller's stream intent from the ingress body BEFORE any cross-protocol
+    // translation rewrites `v` (Gemini routes streaming requests to a different upstream endpoint).
+    let wants_stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+
     // Derive affinity key early (before any mutations to v)
     let _affinity_key_str: Option<String> = if let Some(k) = affinity_key {
         Some(k.to_string())
@@ -644,7 +648,7 @@ pub(crate) async fn forward_with_pool(
                 app.lanes[i]
                     .protocol
                     .writer()
-                    .upstream_path_for(&app.lanes[i].model)
+                    .upstream_path_for_stream(&app.lanes[i].model, wants_stream)
             ))
             .headers(convert_headers(
                 app.lanes[i].protocol.writer().auth_headers(key),
@@ -1022,6 +1026,9 @@ async fn forward_once(
         }
     };
 
+    // C-3: stream intent for the stream-aware upstream path (Gemini).
+    let wants_stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+
     app.lanes[i]
         .protocol
         .writer()
@@ -1042,7 +1049,7 @@ async fn forward_once(
             app.lanes[i]
                 .protocol
                 .writer()
-                .upstream_path_for(&app.lanes[i].model)
+                .upstream_path_for_stream(&app.lanes[i].model, wants_stream)
         ))
         .headers(convert_headers(
             app.lanes[i].protocol.writer().auth_headers(key),

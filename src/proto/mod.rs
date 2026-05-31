@@ -75,6 +75,14 @@ pub(crate) trait ProtocolWriter: Send + Sync {
         self.upstream_path().to_string()
     }
 
+    /// Per-request upstream path that also knows whether the caller wants a streamed response.
+    /// Defaults to `upstream_path_for` (most protocols use one path for both stream and non-stream).
+    /// Gemini overrides it: streaming uses `:streamGenerateContent?alt=sse` (C-3), non-streaming
+    /// `:generateContent`.
+    fn upstream_path_for_stream(&self, model: &str, _stream: bool) -> String {
+        self.upstream_path_for(model)
+    }
+
     /// Returns auth headers given an API key.
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)>;
 
@@ -2796,6 +2804,26 @@ mod stream_translate_tests {
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0.as_str(), "authorization");
         assert_eq!(headers[0].1.to_str().unwrap(), "Bearer sk-test");
+
+        // C-3: Gemini selects the streaming vs non-streaming endpoint by request intent.
+        let gemini = Protocol::gemini();
+        assert_eq!(
+            gemini
+                .writer()
+                .upstream_path_for_stream("gemini-pro", false),
+            "/v1beta/models/gemini-pro:generateContent"
+        );
+        assert_eq!(
+            gemini.writer().upstream_path_for_stream("gemini-pro", true),
+            "/v1beta/models/gemini-pro:streamGenerateContent?alt=sse"
+        );
+        // Non-Gemini protocols ignore the stream flag (single path).
+        assert_eq!(
+            Protocol::openai()
+                .writer()
+                .upstream_path_for_stream("x", true),
+            Protocol::openai().writer().upstream_path_for("x")
+        );
 
         // Bedrock: model-in-path Converse URL. (SigV4 auth + binary eventstream streaming are
         // deferred — see providers.yaml; Bedrock is usable for non-stream behind a SigV4 proxy.)
