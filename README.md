@@ -13,16 +13,18 @@ The name comes from electrical distribution: a busbar takes one feed and fans it
 out across many breakered circuits — one entry point, weighted distribution,
 per-circuit protection.
 
-> **Project status: 0.9.1 (pre-1.0), in active development.** Working today:
-> **Anthropic and OpenAI ingress** (`/v1/messages` and `/v1/chat/completions`), named/ad-hoc
-> routing, **weighted** pools (smooth WRR) with failover + session affinity, a two-stage
-> **circuit breaker**, **full cross-protocol translation** through a lossless superset IR
-> (request *and* response, streaming *and* non-streaming, both directions — e.g. an OpenAI-format
-> client driving an Anthropic backend, or vice versa), and **context-length failover** (a
-> too-large request fails over to another model without penalizing the healthy lane). Roadmap
-> (0.9.x+): content-policy failover, more protocols (Gemini, Bedrock, OpenAI Responses),
-> accounting + observability, virtual keys/budgets. APIs and config may change before 1.0. See
-> [`docs/`](docs/) for the design and roadmap.
+> **Project status: 0.10.0 (pre-1.0), in active development.** Working today:
+> **five protocols** — Anthropic, OpenAI (chat completions), Google **Gemini**, AWS **Bedrock**
+> (Converse), and OpenAI **Responses** — each read/written natively, with **full cross-protocol
+> translation** through a lossless superset IR (request *and* response, streaming *and*
+> non-streaming, both directions — e.g. an OpenAI-format client driving a Gemini backend, or vice
+> versa). Plus named/ad-hoc routing, **weighted** pools (smooth WRR) with failover + session
+> affinity, a two-stage **circuit breaker**, and **context-length failover**. Protocol caveats:
+> Bedrock auth (AWS SigV4) and its binary-eventstream streaming transport are deferred — Bedrock is
+> usable for non-streaming requests behind a SigV4 proxy; Gemini's `:streamGenerateContent` endpoint
+> is likewise a follow-up (a streaming request to a Gemini/Bedrock lane is served non-streamed).
+> Roadmap (0.11+): accounting + observability (Prometheus/OTel), virtual keys/budgets, persistence,
+> management API. APIs and config may change before 1.0. See [`docs/`](docs/) for design and roadmap.
 
 ## Why Busbar
 

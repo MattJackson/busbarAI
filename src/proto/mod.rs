@@ -336,6 +336,8 @@ impl ProtocolRegistry {
         map.insert("anthropic".to_string(), Arc::new(Protocol::anthropic()));
         map.insert("openai".to_string(), Arc::new(Protocol::openai()));
         map.insert("gemini".to_string(), Arc::new(Protocol::gemini()));
+        map.insert("bedrock".to_string(), Arc::new(Protocol::bedrock()));
+        map.insert("responses".to_string(), Arc::new(Protocol::responses()));
         Self { map }
     }
 
@@ -2769,6 +2771,40 @@ mod stream_translate_tests {
 
         let raw_error = reader.extract_error(status_code, b"{}");
         assert_eq!(raw_error.http_status, 429);
+    }
+
+    #[test]
+    fn test_bedrock_and_responses_register() {
+        // Both 0.10 protocols resolve via the registry and the ingress resolver.
+        let registry = ProtocolRegistry::with_builtins();
+        assert!(registry.get("bedrock").is_some(), "bedrock in registry");
+        assert!(registry.get("responses").is_some(), "responses in registry");
+        assert!(
+            protocol_for("bedrock").is_some(),
+            "bedrock resolves for ingress"
+        );
+        assert!(
+            protocol_for("responses").is_some(),
+            "responses resolves for ingress"
+        );
+
+        // Responses: bearer auth + the /v1/responses egress path (fully usable).
+        let responses = Protocol::responses();
+        assert_eq!(responses.name(), "responses");
+        assert_eq!(responses.writer().upstream_path(), "/v1/responses");
+        let headers = responses.writer().auth_headers("sk-test");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0.as_str(), "authorization");
+        assert_eq!(headers[0].1.to_str().unwrap(), "Bearer sk-test");
+
+        // Bedrock: model-in-path Converse URL. (SigV4 auth + binary eventstream streaming are
+        // deferred — see providers.yaml; Bedrock is usable for non-stream behind a SigV4 proxy.)
+        let bedrock = Protocol::bedrock();
+        assert_eq!(bedrock.name(), "bedrock");
+        assert_eq!(
+            bedrock.writer().upstream_path_for("anthropic.claude-3"),
+            "/model/anthropic.claude-3/converse"
+        );
     }
 }
 
