@@ -33,8 +33,12 @@ per-circuit protection.
 > (per-request fee + per-1k-token cost from response usage). A vetted catalog of **41 providers**
 > ships in `providers.yaml` (per-provider `path` override for version-in-base-url endpoints). Builds
 > and runs on **Linux, macOS, and Windows** (Intel + ARM binaries shipped per release).
-> Roadmap (0.14+): more protocols (Cohere), then 1.0 hardening (docs, soak, security review). APIs
-> and config may change before 1.0. See [`docs/`](docs/) for design and roadmap.
+> Roadmap (0.14+): more protocols (Cohere); **auth adapters** for enterprise backends (Azure
+> OpenAI, Google Vertex AI) — extending the same per-request signing seam that already powers
+> Bedrock **SigV4**, since busbar is not bearer-only (Gemini uses `x-goog-api-key`, Bedrock uses
+> SigV4); then 1.0 hardening (docs, soak, security review). APIs and config may change before 1.0.
+> See [`docs/roadmap.md`](docs/roadmap.md) for the protocols-not-providers thesis and the
+> auth-adapter design.
 
 ## Why Busbar
 

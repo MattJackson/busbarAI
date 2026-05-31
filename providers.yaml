@@ -12,9 +12,11 @@
 # those protocols is just a catalog entry here — no new code. A client speaking any protocol can
 # target any provider; busbar translates through its superset IR when they differ.
 #
-# Auth: providers use `Authorization: Bearer <key>` unless noted (gemini = x-goog-api-key in the
-# protocol; bedrock = AWS SigV4, see below). HTTP-status errors (429/5xx/401/...) are classified by
-# the circuit breaker without an error_map; error_map is only for provider-specific JSON codes.
+# Auth is a per-protocol seam, not a single scheme: most providers use `Authorization: Bearer <key>`,
+# gemini uses the `x-goog-api-key` header, and bedrock signs each request with AWS SigV4 (see below).
+# Future enterprise backends (Azure OpenAI, Google Vertex AI) plug into this same seam as auth
+# adapters — see docs/roadmap.md. HTTP-status errors (429/5xx/401/...) are classified by the circuit
+# breaker without an error_map; error_map is only for provider-specific JSON codes.
 
 # ── Anthropic protocol (/v1/messages) ───────────────────────────────────────────────────────────
 anthropic:
