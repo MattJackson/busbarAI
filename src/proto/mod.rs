@@ -445,6 +445,54 @@ mod tests {
     }
 
     #[test]
+    fn test_openai_tool_schema_translates_to_anthropic() {
+        // Regression: OpenAI nests name/description/parameters under `function`. The reader must
+        // descend into it so the JSON schema reaches Anthropic's `input_schema` — otherwise the
+        // translated tool has `input_schema: null` and the Anthropic backend 422s.
+        let openai_body = serde_json::json!({
+            "model": "x",
+            "max_tokens": 200,
+            "messages": [{"role": "user", "content": "weather in Paris?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"]
+                    }
+                }
+            }]
+        });
+        let ir = OpenAiReader
+            .read_request(&openai_body)
+            .expect("openai read_request");
+        assert_eq!(ir.tools.len(), 1);
+        assert_eq!(
+            ir.tools[0].name, "get_weather",
+            "tool name (nested under function)"
+        );
+        assert_eq!(
+            ir.tools[0].input_schema["properties"]["city"]["type"], "string",
+            "parameters schema must be read into IrTool.input_schema"
+        );
+
+        let anthropic = AnthropicWriter.write_request(&ir);
+        let tools = anthropic.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(tools[0]["name"], "get_weather");
+        assert!(
+            !tools[0]["input_schema"].is_null(),
+            "Anthropic tool input_schema must not be null (caused the 422)"
+        );
+        assert_eq!(
+            tools[0]["input_schema"]["properties"]["city"]["type"], "string",
+            "the full JSON schema must survive OpenAI → Anthropic translation"
+        );
+    }
+
+    #[test]
     fn test_roundtrip_identity() {
         let registry = ProtocolRegistry::with_builtins();
         let protocol = registry.get("anthropic").expect("anthropic should exist");

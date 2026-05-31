@@ -3507,76 +3507,69 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_config_missing_error_map_fails_validation() {
-            // A provider config with empty error_map → config_validate returns an error
+        async fn test_empty_error_map_is_valid_but_bad_value_fails() {
+            // An EMPTY error_map is valid (HTTP-status classification still applies, like the
+            // shipped `anthropic` catalog entry) — it must NOT fail validation. A present entry
+            // with an unknown StatusClass value must still fail.
             use crate::config::RootCfg;
 
-            let mut providers = HashMap::new();
-            // Create a provider WITHOUT error_map entries (intentionally empty)
-            providers.insert(
-                "badprovider".to_string(),
-                crate::config::ProviderCfg {
-                    protocol: "anthropic".into(),
-                    base_url: "https://api.example.com".into(),
-                    api_key_env: "API_KEY".into(),
-                    health: None,
-                    error_map: std::collections::HashMap::new(), // Empty = validation error
-                    path: None,
+            let model = crate::config::ModelCfg {
+                max_requests: -1,
+                provider: "p".into(),
+                max_concurrent: 10,
+            };
+            let pool = crate::config::PoolCfg {
+                members: vec![crate::config::PoolMember {
+                    target: "m".into(),
+                    weight: 1,
+                    context_max: None,
+                }],
+                breaker: None,
+                failover: None,
+                on_exhausted: None,
+                affinity: None,
+            };
+            let make = |error_map: std::collections::HashMap<String, String>| {
+                let mut providers = HashMap::new();
+                providers.insert(
+                    "p".to_string(),
+                    crate::config::ProviderCfg {
+                        protocol: "anthropic".into(),
+                        base_url: "https://api.example.com".into(),
+                        api_key_env: "API_KEY".into(),
+                        health: None,
+                        error_map,
+                        path: None,
+                        auth: None,
+                        _legacy_api_key: None,
+                    },
+                );
+                let mut models = HashMap::new();
+                models.insert("m".to_string(), model.clone());
+                let mut pools = HashMap::new();
+                pools.insert("mypool".to_string(), pool.clone());
+                RootCfg {
+                    listen: "0.0.0.0:8080".into(),
                     auth: None,
-                    _legacy_api_key: None,
-                },
-            );
-
-            let mut models = HashMap::new();
-            models.insert(
-                "mymodel".to_string(),
-                crate::config::ModelCfg {
-                    max_requests: -1,
-                    provider: "badprovider".into(),
-                    max_concurrent: 10,
-                },
-            );
-
-            let mut pools = HashMap::new();
-            pools.insert(
-                "mypool".to_string(),
-                crate::config::PoolCfg {
-                    members: vec![crate::config::PoolMember {
-                        target: "mymodel".into(),
-                        weight: 1,
-                        context_max: None,
-                    }],
-                    breaker: None,
-                    failover: None,
-                    on_exhausted: None,
-                    affinity: None,
-                },
-            );
-
-            let cfg = RootCfg {
-                listen: "0.0.0.0:8080".into(),
-                auth: None,
-                providers,
-                models,
-                pools,
+                    providers,
+                    models,
+                    pools,
+                }
             };
 
             use crate::config_validate::validate;
-            let result = validate(&cfg);
+            // Empty error_map → valid.
             assert!(
-                result.is_err(),
-                "Validation should fail when error_map is empty"
+                validate(&make(std::collections::HashMap::new())).is_ok(),
+                "empty error_map must be valid (relies on HTTP-status classification)"
             );
-
-            let errs = result.unwrap_err();
-            let err_text = errs.join(" | ");
+            // Bad value → still rejected.
+            let mut bad = std::collections::HashMap::new();
+            bad.insert("1234".to_string(), "not_a_status_class".to_string());
+            let err = validate(&make(bad)).expect_err("invalid StatusClass must fail");
             assert!(
-                err_text.contains("badprovider"),
-                "Error message should mention the provider"
-            );
-            assert!(
-                err_text.contains("error_map"),
-                "Error message should mention error_map"
+                err.join(" | ").contains("invalid StatusClass"),
+                "error should name the invalid StatusClass; got: {err:?}"
             );
         }
 

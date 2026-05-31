@@ -36,22 +36,17 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
-    // Rule 4: Validate error_map on every provider (REQUIRED, no silent default)
+    // Rule 4: Validate error_map values on every provider. An EMPTY error_map is valid — a provider
+    // may have no provider-specific JSON error codes and rely on HTTP-status classification (the
+    // circuit breaker), exactly like the shipped `anthropic` catalog entry. Only the entries that
+    // ARE present must name a known StatusClass.
     for (provider_name, provider_cfg) in &cfg.providers {
-        if provider_cfg.error_map.is_empty() {
-            errors.push(format!(
-                "provider '{}' is missing required 'error_map' config — add per-provider error code mappings",
-                provider_name
-            ));
-        } else {
-            // Validate each value in error_map is a known StatusClass name
-            for (code, mapped_class) in &provider_cfg.error_map {
-                if crate::config::status_class_from_str(mapped_class).is_none() {
-                    errors.push(format!(
-                        "provider '{}' error_map code '{}': invalid StatusClass '{}', must be one of: rate_limit, overloaded, server_error, timeout, network, auth, billing, client_error",
-                        provider_name, code, mapped_class
-                    ));
-                }
+        for (code, mapped_class) in &provider_cfg.error_map {
+            if crate::config::status_class_from_str(mapped_class).is_none() {
+                errors.push(format!(
+                    "provider '{}' error_map code '{}': invalid StatusClass '{}', must be one of: rate_limit, overloaded, server_error, timeout, network, auth, billing, client_error",
+                    provider_name, code, mapped_class
+                ));
             }
         }
 

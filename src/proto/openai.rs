@@ -644,17 +644,24 @@ fn read_openai_tool(tool_val: &serde_json::Value) -> Result<crate::ir::IrTool, I
         retry_after: None,
     })?;
 
-    let name = obj
+    // OpenAI nests the tool definition under `function` ({"type":"function","function":{...}}).
+    // Read from there, falling back to the top level so a flattened/native-shaped tool still works.
+    let src = obj
+        .get("function")
+        .and_then(|f| f.as_object())
+        .unwrap_or(obj);
+
+    let name = src
         .get("name")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let description = obj
+    let description = src
         .get("description")
         .and_then(|v| v.as_str().map(String::from));
-    let input_schema = obj
+    let input_schema = src
         .get("parameters")
-        .or_else(|| obj.get("input_schema"))
+        .or_else(|| src.get("input_schema"))
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
