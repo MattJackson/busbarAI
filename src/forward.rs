@@ -483,6 +483,15 @@ async fn pick_among(
 }
 
 /// Original forward function without pool context - uses default Status503 mode.
+/// C-4: extract the host (no scheme, no trailing slash) from a base URL, for SigV4's signed `host`
+/// header. base_urls are already trailing-slash-trimmed and carry no path.
+fn host_from_base(base: &str) -> String {
+    base.strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+        .unwrap_or(base)
+        .to_string()
+}
+
 pub(crate) async fn forward(
     app: Arc<App>,
     cands: Vec<WeightedLane>,
@@ -641,18 +650,23 @@ pub(crate) async fn forward_with_pool(
             crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
         };
 
+        // C-4: per-request auth (SigV4 for Bedrock; static for others) needs the host/path/body.
+        let writer = app.lanes[i].protocol.writer();
+        let url_path = writer.upstream_path_for_stream(&app.lanes[i].model, wants_stream);
+        let signing_ctx = crate::proto::SigningContext {
+            host: host_from_base(base),
+            canonical_uri: crate::sigv4::uri_encode_path(
+                url_path.split('?').next().unwrap_or(&url_path),
+            ),
+            body: &payload,
+            timestamp_epoch: now(),
+        };
+        let auth = writer.sign_request(key, &signing_ctx);
+
         let res = app
             .client
-            .post(format!(
-                "{base}{}",
-                app.lanes[i]
-                    .protocol
-                    .writer()
-                    .upstream_path_for_stream(&app.lanes[i].model, wants_stream)
-            ))
-            .headers(convert_headers(
-                app.lanes[i].protocol.writer().auth_headers(key),
-            ))
+            .post(format!("{base}{url_path}"))
+            .headers(convert_headers(auth))
             .header(CONTENT_TYPE, "application/json")
             .timeout(std::time::Duration::from_secs(
                 request_ctx.remaining(now()).max(1),
@@ -1042,18 +1056,23 @@ async fn forward_once(
         crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
     };
 
+    // C-4: per-request auth (SigV4 for Bedrock; static otherwise).
+    let writer = app.lanes[i].protocol.writer();
+    let url_path = writer.upstream_path_for_stream(&app.lanes[i].model, wants_stream);
+    let signing_ctx = crate::proto::SigningContext {
+        host: host_from_base(base),
+        canonical_uri: crate::sigv4::uri_encode_path(
+            url_path.split('?').next().unwrap_or(&url_path),
+        ),
+        body: &payload,
+        timestamp_epoch: now(),
+    };
+    let auth = writer.sign_request(key, &signing_ctx);
+
     let res = app
         .client
-        .post(format!(
-            "{base}{}",
-            app.lanes[i]
-                .protocol
-                .writer()
-                .upstream_path_for_stream(&app.lanes[i].model, wants_stream)
-        ))
-        .headers(convert_headers(
-            app.lanes[i].protocol.writer().auth_headers(key),
-        ))
+        .post(format!("{base}{url_path}"))
+        .headers(convert_headers(auth))
         .header(CONTENT_TYPE, "application/json")
         .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
         .body(payload)

@@ -38,6 +38,7 @@ mod metrics;
 mod observability;
 mod proto;
 mod route;
+mod sigv4;
 mod state;
 mod store;
 #[cfg(test)]

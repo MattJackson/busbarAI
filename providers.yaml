@@ -43,13 +43,13 @@ responses:
     insufficient_quota: billing
     rate_limit_exceeded: rate_limit
 
-# AWS Bedrock (Converse API). Request/response/stream translation is implemented at the IR level.
-# CAVEATS (0.10): (1) auth is AWS SigV4, which busbar does not yet sign — auth_headers is a stub, so
-# point base_url at a SigV4-signing proxy (or sidecar) that injects credentials. (2) Bedrock's live
-# streaming transport is the binary application/vnd.amazon.eventstream framing, not SSE; that
-# deframing is not yet wired, so a streaming request to a bedrock lane is served non-streamed (same
-# transport). Bedrock is therefore usable today for NON-streaming
-# requests behind a SigV4 proxy. region in base_url is a placeholder — set it to your region.
+# AWS Bedrock (Converse API). Request/response translation is at the IR level; auth is native AWS
+# SigV4 (C-4). Set this provider's api_key_env to the AWS credentials in the form
+# `ACCESS_KEY_ID:SECRET_ACCESS_KEY` or `ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN`. The region is
+# parsed from the base_url host (`bedrock-runtime.<region>.amazonaws.com`) — set it to your region.
+# CAVEAT: Bedrock's live streaming transport is the binary application/vnd.amazon.eventstream
+# framing (not SSE); that decoder is not yet wired, so a *streaming* request to a bedrock lane is
+# served as a single non-streamed response. Non-streaming Converse is fully native.
 bedrock:
   protocol: bedrock
   base_url: https://bedrock-runtime.us-east-1.amazonaws.com

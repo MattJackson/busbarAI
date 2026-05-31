@@ -63,6 +63,19 @@ pub(crate) trait ProtocolReader: Send + Sync {
     fn clone_box(&self) -> Box<dyn ProtocolReader>;
 }
 
+/// Per-request signing context (C-4). Most protocols' `auth_headers` ignore this; protocols that
+/// sign the whole request (AWS SigV4 for Bedrock) need the method/host/path/body/time.
+pub(crate) struct SigningContext<'a> {
+    /// Upstream host (no scheme), e.g. `bedrock-runtime.us-east-1.amazonaws.com`.
+    pub host: String,
+    /// URI-encoded request path (no query), e.g. `/model/anthropic.claude%3A0/converse`.
+    pub canonical_uri: String,
+    /// The exact request body bytes that will be sent.
+    pub body: &'a [u8],
+    /// Unix epoch seconds at signing time.
+    pub timestamp_epoch: u64,
+}
+
 /// ProtocolWriter rewrites intents for the upstream wire format.
 pub(crate) trait ProtocolWriter: Send + Sync {
     /// Returns the upstream path suffix (e.g., "/v1/messages").
@@ -85,6 +98,13 @@ pub(crate) trait ProtocolWriter: Send + Sync {
 
     /// Returns auth headers given an API key.
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)>;
+
+    /// Per-request auth, given the signing context. Defaults to the static `auth_headers` (bearer /
+    /// api-key protocols ignore `ctx`). Bedrock overrides this to compute AWS SigV4 headers (C-4),
+    /// which depend on the method/host/path/body/timestamp.
+    fn sign_request(&self, key: &str, _ctx: &SigningContext) -> Vec<(HeaderName, HeaderValue)> {
+        self.auth_headers(key)
+    }
 
     /// Rewrites the model field in the request body.
     #[allow(dead_code)] // Used by B-502a/B-503
@@ -2825,8 +2845,8 @@ mod stream_translate_tests {
             Protocol::openai().writer().upstream_path_for("x")
         );
 
-        // Bedrock: model-in-path Converse URL. (SigV4 auth + binary eventstream streaming are
-        // deferred — see providers.yaml; Bedrock is usable for non-stream behind a SigV4 proxy.)
+        // Bedrock: model-in-path Converse URL + native SigV4 auth (C-4). (Binary eventstream
+        // streaming transport is the remaining deferral — see providers.yaml.)
         let bedrock = Protocol::bedrock();
         assert_eq!(bedrock.name(), "bedrock");
         assert_eq!(

@@ -589,7 +589,80 @@ impl ProtocolWriter for BedrockWriter {
     }
 
     fn auth_headers(&self, _key: &str) -> Vec<(HeaderName, HeaderValue)> {
+        // Bedrock auth is per-request SigV4 — see `sign_request`. Static headers can't carry it.
         vec![]
+    }
+
+    /// C-4: AWS SigV4 signing for the Converse request. The lane key encodes credentials as
+    /// `ACCESS_KEY_ID:SECRET_ACCESS_KEY` or `ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN`; the
+    /// region is parsed from the host (`bedrock-runtime.<region>.amazonaws.com`); service=`bedrock`.
+    fn sign_request(
+        &self,
+        key: &str,
+        ctx: &super::SigningContext,
+    ) -> Vec<(HeaderName, HeaderValue)> {
+        let mut parts = key.splitn(3, ':');
+        let (access, secret, token) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(a), Some(s), tok) if !a.is_empty() && !s.is_empty() => (a, s, tok),
+            _ => return vec![], // misconfigured key → no signature (AWS will 403, surfaced as auth)
+        };
+        let region = ctx
+            .host
+            .strip_prefix("bedrock-runtime.")
+            .and_then(|r| r.split('.').next())
+            .unwrap_or("us-east-1");
+        let service = "bedrock";
+        let (amzdate, datestamp) = crate::sigv4::format_amz_time(ctx.timestamp_epoch);
+        let payload_hash = crate::sigv4::sha256_hex(ctx.body);
+
+        let mut signed = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("host".to_string(), ctx.host.clone()),
+            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+            ("x-amz-date".to_string(), amzdate.clone()),
+        ];
+        if let Some(t) = token {
+            signed.push(("x-amz-security-token".to_string(), t.to_string()));
+        }
+
+        let (signature, signed_headers) = crate::sigv4::sign_v4(
+            secret,
+            region,
+            service,
+            "POST",
+            &ctx.canonical_uri,
+            "",
+            &signed,
+            &payload_hash,
+            &amzdate,
+            &datestamp,
+        );
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={access}/{datestamp}/{region}/{service}/aws4_request, \
+             SignedHeaders={signed_headers}, Signature={signature}"
+        );
+
+        // Headers to ADD to the wire request (content-type + host are set elsewhere / by the client).
+        let mut out = vec![
+            (
+                HeaderName::from_static("authorization"),
+                HeaderValue::from_str(&authorization).expect("valid auth header"),
+            ),
+            (
+                HeaderName::from_static("x-amz-date"),
+                HeaderValue::from_str(&amzdate).expect("valid date header"),
+            ),
+            (
+                HeaderName::from_static("x-amz-content-sha256"),
+                HeaderValue::from_str(&payload_hash).expect("valid sha header"),
+            ),
+        ];
+        if let Some(t) = token {
+            if let Ok(v) = HeaderValue::from_str(t) {
+                out.push((HeaderName::from_static("x-amz-security-token"), v));
+            }
+        }
+        out
     }
 
     fn rewrite_model(&self, _body: &mut serde_json::Value, _model: &str) {}
@@ -853,6 +926,78 @@ impl ProtocolWriter for BedrockWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_bedrock_sigv4_sign_request_structure() {
+        // C-4: SigV4 header assembly + scope/region derivation. (The signing crypto itself is
+        // verified against AWS's published vector in sigv4::tests.)
+        let writer = BedrockWriter;
+        let ctx = crate::proto::SigningContext {
+            host: "bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            canonical_uri: crate::sigv4::uri_encode_path("/model/anthropic.claude:0/converse"),
+            body: br#"{"messages":[]}"#,
+            timestamp_epoch: 1_440_938_160, // 20150830T123600Z
+        };
+        let headers = writer.sign_request("AKIDEXAMPLE:SECRETKEY", &ctx);
+
+        let get = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.as_str() == name)
+                .map(|(_, v)| v.to_str().unwrap().to_string())
+        };
+        let auth = get("authorization").expect("authorization header");
+        assert!(
+            auth.starts_with(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/bedrock/aws4_request, "
+            ),
+            "scope/region derived from host; got: {auth}"
+        );
+        assert!(auth.contains("SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date"));
+        assert!(auth.contains("Signature="));
+        assert_eq!(get("x-amz-date").as_deref(), Some("20150830T123600Z"));
+        assert!(get("x-amz-content-sha256").is_some());
+        // No session token configured → no security-token header.
+        assert!(get("x-amz-security-token").is_none());
+    }
+
+    #[test]
+    fn test_bedrock_sigv4_session_token() {
+        let writer = BedrockWriter;
+        let ctx = crate::proto::SigningContext {
+            host: "bedrock-runtime.eu-west-1.amazonaws.com".to_string(),
+            canonical_uri: "/model/m/converse".to_string(),
+            body: b"{}",
+            timestamp_epoch: 1_440_938_160,
+        };
+        let headers = writer.sign_request("AKID:SECRET:SESSIONTOKEN", &ctx);
+        let tok = headers
+            .iter()
+            .find(|(k, _)| k.as_str() == "x-amz-security-token")
+            .map(|(_, v)| v.to_str().unwrap().to_string());
+        assert_eq!(tok.as_deref(), Some("SESSIONTOKEN"));
+        // region parsed from the eu-west-1 host + token in the signed set.
+        let auth = headers
+            .iter()
+            .find(|(k, _)| k.as_str() == "authorization")
+            .map(|(_, v)| v.to_str().unwrap().to_string())
+            .unwrap();
+        assert!(auth.contains("/eu-west-1/bedrock/aws4_request"));
+        assert!(auth.contains("x-amz-security-token"));
+    }
+
+    #[test]
+    fn test_bedrock_sigv4_misconfigured_key_no_signature() {
+        // A key without ACCESS:SECRET shape yields no headers (AWS will 403 → surfaced as auth).
+        let writer = BedrockWriter;
+        let ctx = crate::proto::SigningContext {
+            host: "bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            canonical_uri: "/model/m/converse".to_string(),
+            body: b"{}",
+            timestamp_epoch: 1_440_938_160,
+        };
+        assert!(writer.sign_request("not-a-valid-key", &ctx).is_empty());
+    }
 
     fn bedrock_rich_fixture() -> serde_json::Value {
         serde_json::json!({
