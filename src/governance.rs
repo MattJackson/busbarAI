@@ -243,17 +243,15 @@ pub(crate) struct GovCtx {
     pub key: Option<VirtualKey>,
 }
 
-/// generate a virtual-key secret. Prefers 16 cryptographic bytes from `/dev/urandom`; falls
-/// back to a time-derived value (non-crypto) only if that read fails. No `rand` dependency.
+/// Generate a virtual-key secret from 16 bytes of the OS CSPRNG (portable across Unix/Windows via
+/// getrandom); falls back to a time-derived value only if the OS exposes no entropy source.
 fn generate_secret() -> String {
-    use std::io::Read;
+    // Portable OS CSPRNG via getrandom: /dev/urandom on Unix, BCryptGenRandom on Windows, etc.
     let mut buf = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        if f.read_exact(&mut buf).is_ok() {
-            return format!("sk-bb-{}", hex::encode(buf));
-        }
+    if getrandom::getrandom(&mut buf).is_ok() {
+        return format!("sk-bb-{}", hex::encode(buf));
     }
-    // Fallback (documented): time-derived, not cryptographically strong.
+    // Fallback (only if the OS exposes no entropy source): time-derived, not cryptographically strong.
     let seed =
         crate::sigv4::sha256_hex(format!("busbar-fallback-{}", crate::store::now()).as_bytes());
     format!("sk-bb-{}", &seed[..32])

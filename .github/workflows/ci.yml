@@ -35,3 +35,16 @@ jobs:
 
       - name: Test
         run: cargo test --verbose
+
+  # Portability gate: busbar must build + pass tests on Windows too (no OS-specific code).
+  windows:
+    name: windows build · test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --verbose
+      - name: Test
+        run: cargo test --verbose
