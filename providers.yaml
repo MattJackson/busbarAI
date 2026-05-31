@@ -47,9 +47,8 @@ responses:
 # SigV4 (C-4). Set this provider's api_key_env to the AWS credentials in the form
 # `ACCESS_KEY_ID:SECRET_ACCESS_KEY` or `ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN`. The region is
 # parsed from the base_url host (`bedrock-runtime.<region>.amazonaws.com`) — set it to your region.
-# CAVEAT: Bedrock's live streaming transport is the binary application/vnd.amazon.eventstream
-# framing (not SSE); that decoder is not yet wired, so a *streaming* request to a bedrock lane is
-# served as a single non-streamed response. Non-streaming Converse is fully native.
+# Streaming requests use ConverseStream and busbar decodes the binary
+# application/vnd.amazon.eventstream frames, translating them to the caller's protocol (C-5).
 bedrock:
   protocol: bedrock
   base_url: https://bedrock-runtime.us-east-1.amazonaws.com

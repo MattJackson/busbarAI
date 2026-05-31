@@ -588,6 +588,15 @@ impl ProtocolWriter for BedrockWriter {
         format!("/model/{}/converse", model)
     }
 
+    fn upstream_path_for_stream(&self, model: &str, stream: bool) -> String {
+        // C-5: streaming uses ConverseStream (binary application/vnd.amazon.eventstream response).
+        if stream {
+            format!("/model/{}/converse-stream", model)
+        } else {
+            format!("/model/{}/converse", model)
+        }
+    }
+
     fn auth_headers(&self, _key: &str) -> Vec<(HeaderName, HeaderValue)> {
         // Bedrock auth is per-request SigV4 — see `sign_request`. Static headers can't carry it.
         vec![]

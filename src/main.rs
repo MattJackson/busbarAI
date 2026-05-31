@@ -31,6 +31,7 @@ mod auth;
 mod breaker;
 mod config;
 mod config_validate;
+mod eventstream;
 mod forward;
 mod handlers;
 mod ir;

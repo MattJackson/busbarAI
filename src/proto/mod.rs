@@ -242,6 +242,8 @@ pub(crate) struct StreamTranslate {
     buf: Vec<u8>,
     /// ingress == "openai" → the stream must terminate with `data: [DONE]\n\n`.
     emit_done: bool,
+    /// C-5: egress == "bedrock" → frames are binary `application/vnd.amazon.eventstream`, not SSE.
+    egress_eventstream: bool,
 }
 
 #[allow(dead_code)] // wired into FirstByteBody by B-503b-2
@@ -258,7 +260,22 @@ impl StreamTranslate {
             decode: crate::ir::StreamDecodeState::default(),
             buf: Vec::new(),
             emit_done: ingress == "openai",
+            egress_eventstream: egress == "bedrock",
         })
+    }
+
+    /// Translate one egress event `(event_type, payload)` into ingress wire bytes, advancing the
+    /// decode state. Shared by the SSE and event-stream feed paths.
+    fn translate_event(&mut self, event_type: &str, data: &serde_json::Value, out: &mut Vec<u8>) {
+        for ev in self
+            .egress
+            .reader()
+            .read_response_events(event_type, data, &mut self.decode)
+        {
+            if let Some((out_et, out_data)) = self.ingress.writer().write_response_event(&ev) {
+                out.extend_from_slice(reframe_sse(&out_et, &out_data).as_bytes());
+            }
+        }
     }
 
     /// Feed a chunk of EGRESS SSE bytes; return translated INGRESS SSE bytes for whatever
@@ -267,7 +284,26 @@ impl StreamTranslate {
         self.buf.extend_from_slice(chunk);
         let mut out: Vec<u8> = Vec::new();
 
-        // Drain every complete `\n\n`-delimited frame currently buffered.
+        if self.egress_eventstream {
+            // C-5: egress is binary AWS event-stream framing (Bedrock ConverseStream). The event
+            // name lives in the frame's `:event-type` header, not the JSON payload; the Bedrock
+            // reader keys off a `type` field, so fold the header into the payload.
+            for (event_type, payload) in crate::eventstream::drain_frames(&mut self.buf) {
+                let Ok(mut data) = serde_json::from_slice::<serde_json::Value>(&payload) else {
+                    continue; // non-JSON payload — skip the frame
+                };
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert(
+                        "type".to_string(),
+                        serde_json::Value::String(event_type.clone()),
+                    );
+                }
+                self.translate_event(&event_type, &data, &mut out);
+            }
+            return out;
+        }
+
+        // Drain every complete `\n\n`-delimited SSE frame currently buffered.
         while let Some(pos) = self.buf.windows(2).position(|w| w == b"\n\n") {
             let end = pos + 2;
             let frame: Vec<u8> = self.buf.drain(..end).collect();
@@ -281,16 +317,7 @@ impl StreamTranslate {
             let Ok(data) = serde_json::from_str::<serde_json::Value>(&data_str) else {
                 continue; // malformed data JSON — skip the frame rather than abort the stream
             };
-
-            for ev in
-                self.egress
-                    .reader()
-                    .read_response_events(&event_type, &data, &mut self.decode)
-            {
-                if let Some((out_et, out_data)) = self.ingress.writer().write_response_event(&ev) {
-                    out.extend_from_slice(reframe_sse(&out_et, &out_data).as_bytes());
-                }
-            }
+            self.translate_event(&event_type, &data, &mut out);
         }
         out
     }
@@ -2213,6 +2240,73 @@ mod stream_fanout_tests {
 mod stream_translate_tests {
     use super::*;
 
+    /// Encode one AWS event-stream frame (`:event-type` string header + JSON payload) for C-5 tests.
+    fn es_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
+        let name = b":event-type";
+        let mut headers = vec![name.len() as u8];
+        headers.extend_from_slice(name);
+        headers.push(7);
+        headers.extend_from_slice(&(event_type.len() as u16).to_be_bytes());
+        headers.extend_from_slice(event_type.as_bytes());
+        let total = 12 + headers.len() + payload.len() + 4;
+        let mut f = Vec::new();
+        f.extend_from_slice(&(total as u32).to_be_bytes());
+        f.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        f.extend_from_slice(&[0, 0, 0, 0]);
+        f.extend_from_slice(&headers);
+        f.extend_from_slice(payload);
+        f.extend_from_slice(&[0, 0, 0, 0]);
+        f
+    }
+
+    /// C-5: a Bedrock ConverseStream (binary event-stream egress) translates to Anthropic SSE for
+    /// the caller — proving the eventstream decoder → IR → ingress-writer path end to end.
+    #[test]
+    fn test_translate_bedrock_eventstream_egress_to_anthropic_ingress() {
+        let mut st =
+            StreamTranslate::new("anthropic", "bedrock").expect("bedrock egress translator");
+        let mut bytes = es_frame("messageStart", br#"{"role":"assistant"}"#);
+        bytes.extend(es_frame(
+            "contentBlockDelta",
+            br#"{"contentBlockIndex":0,"delta":{"text":"Hi"}}"#,
+        ));
+        bytes.extend(es_frame("contentBlockStop", br#"{"contentBlockIndex":0}"#));
+        bytes.extend(es_frame("messageStop", br#"{"stopReason":"end_turn"}"#));
+        bytes.extend(es_frame(
+            "metadata",
+            br#"{"usage":{"inputTokens":5,"outputTokens":2}}"#,
+        ));
+
+        let out = String::from_utf8(st.feed(&bytes)).unwrap();
+        // Anthropic SSE framing with the translated content.
+        assert!(out.contains("event: message_start"), "got:\n{out}");
+        assert!(
+            out.contains("\"text\":\"Hi\"") || out.contains("Hi"),
+            "text delta; got:\n{out}"
+        );
+        assert!(out.contains("message_stop"), "terminator; got:\n{out}");
+    }
+
+    /// Decoder also works when the binary frames arrive split across feed() calls (partial frame
+    /// buffered, then completed) — the realistic chunked-transport case.
+    #[test]
+    fn test_translate_bedrock_eventstream_split_chunks() {
+        let mut st = StreamTranslate::new("anthropic", "bedrock").expect("translator");
+        let mut bytes = es_frame("messageStart", br#"{"role":"assistant"}"#);
+        bytes.extend(es_frame(
+            "contentBlockDelta",
+            br#"{"contentBlockIndex":0,"delta":{"text":"Yo"}}"#,
+        ));
+        let split = bytes.len() - 6; // mid-second-frame
+        let mut out = st.feed(&bytes[..split]);
+        out.extend(st.feed(&bytes[split..]));
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.contains("Yo"),
+            "text survives a frame split across chunks; got:\n{s}"
+        );
+    }
+
     /// Collect the JSON payloads of all `data:` lines (excluding `[DONE]`).
     fn data_payloads(out: &str) -> Vec<serde_json::Value> {
         out.lines()
@@ -2845,8 +2939,8 @@ mod stream_translate_tests {
             Protocol::openai().writer().upstream_path_for("x")
         );
 
-        // Bedrock: model-in-path Converse URL + native SigV4 auth (C-4). (Binary eventstream
-        // streaming transport is the remaining deferral — see providers.yaml.)
+        // Bedrock: model-in-path Converse URL + native SigV4 auth (C-4) + ConverseStream
+        // event-stream decoding (C-5). Fully first-class.
         let bedrock = Protocol::bedrock();
         assert_eq!(bedrock.name(), "bedrock");
         assert_eq!(

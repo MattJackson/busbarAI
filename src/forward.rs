@@ -483,6 +483,13 @@ async fn pick_among(
 }
 
 /// Original forward function without pool context - uses default Status503 mode.
+/// True for content types that carry an incremental streamed response: SSE (text/event-stream,
+/// used by Anthropic/OpenAI/Gemini-SSE) and AWS event-stream (Bedrock ConverseStream, C-5). Both
+/// must engage the streaming body path rather than being buffered.
+fn is_streaming_content_type(ct: &str) -> bool {
+    ct.starts_with("text/event-stream") || ct.starts_with("application/vnd.amazon.eventstream")
+}
+
 /// C-4: extract the host (no scheme, no trailing slash) from a base URL, for SigV4's signed `host`
 /// header. base_urls are already trailing-slash-trimmed and carry no path.
 fn host_from_base(base: &str) -> String {
@@ -881,7 +888,7 @@ pub(crate) async fn forward_with_pool(
                 let ct = r.headers().get(CONTENT_TYPE).cloned();
                 let is_sse = ct
                     .as_ref()
-                    .map(|h| h.to_str().unwrap_or("").starts_with("text/event-stream"))
+                    .map(|h| is_streaming_content_type(h.to_str().unwrap_or("")))
                     .unwrap_or(false);
 
                 // B-503c-2: non-streaming cross-protocol response → buffer the whole JSON and
@@ -1097,7 +1104,7 @@ async fn forward_once(
             // SUCCESS: stream the response body incrementally (permit held for stream life).
             let is_sse = ct
                 .as_ref()
-                .map(|h| h.to_str().unwrap_or("").starts_with("text/event-stream"))
+                .map(|h| is_streaming_content_type(h.to_str().unwrap_or("")))
                 .unwrap_or(false);
             let upstream_stream = r.bytes_stream();
             // Degraded fallback/least-bad path: no cross-protocol translation here (B-503b scope).
