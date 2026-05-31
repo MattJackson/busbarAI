@@ -15,6 +15,27 @@ use serde_json::Value;
 use crate::forward::forward_with_pool;
 use crate::state::{App, WeightedLane};
 
+/// G-2 (0.12): enforce a virtual key's allowed-pools list against the resolved target pool. No-op
+/// when governance is off (`gov.key` is None) or the key allows all pools. Returns a 403 response
+/// to short-circuit when the key may not use this pool.
+fn pool_authorized(gov: &crate::governance::GovCtx, pool: &str) -> Option<Response> {
+    if let Some(key) = &gov.key {
+        if !crate::governance::pool_allowed(key, pool) {
+            return Some(
+                (
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "virtual key '{}' is not allowed to use pool '{pool}'",
+                        key.id
+                    ),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    None
+}
+
 /// B-602: emit the per-request observability metrics at the ingress boundary (one client request =
 /// one call here, unlike the re-entrant forward_with_pool). Outcome is derived from the final
 /// status; duration is wall-clock for the whole proxied request.
@@ -57,6 +78,7 @@ fn finish(ingress_protocol: &str, pool: &str, started: Instant, resp: Response) 
 #[tracing::instrument(name = "openai_ingress", skip_all)]
 pub(crate) async fn openai_ingress(
     State(app): State<Arc<App>>,
+    axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -78,6 +100,11 @@ pub(crate) async fn openai_ingress(
                 .into_response()
         }
     };
+
+    // G-2: enforce the virtual key's allowed-pools against the requested model/pool.
+    if let Some(resp) = pool_authorized(&gov, &model) {
+        return resp;
+    }
 
     let _affinity_key: Option<&str> = headers.get("x-session-id").and_then(|v| v.to_str().ok());
 
@@ -118,12 +145,18 @@ pub(crate) async fn openai_ingress(
 pub(crate) async fn named(
     State(app): State<Arc<App>>,
     Path(name): Path<String>,
+    axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     // NOTE: Caller token extraction from request extensions requires handler signature change.
     // For now, caller_token is None - passthrough mode will use lane's api_key as fallback.
     let _caller_token = None;
+
+    // G-2: enforce the virtual key's allowed-pools against the named pool/model.
+    if let Some(resp) = pool_authorized(&gov, &name) {
+        return resp;
+    }
 
     let started = Instant::now();
     let affinity_key = headers.get("x-session-id").and_then(|v| v.to_str().ok());
@@ -166,10 +199,16 @@ pub(crate) async fn named(
 pub(crate) async fn adhoc(
     State(app): State<Arc<App>>,
     Path((provider, model)): Path<(String, String)>,
+    axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
     body: Bytes,
 ) -> Response {
     let _caller_token = None;
     let started = Instant::now();
+
+    // G-2: enforce the virtual key's allowed-pools against the ad-hoc model target.
+    if let Some(resp) = pool_authorized(&gov, &model) {
+        return resp;
+    }
 
     match app.by_model.get(&model) {
         Some(&i) if app.lanes[i].provider == provider => {

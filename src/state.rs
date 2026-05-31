@@ -53,4 +53,6 @@ pub(crate) struct App {
     /// B-403: OnExhausted config per pool name.
     #[allow(dead_code)] // Used by forward.rs for exhaustion handling
     pub(crate) on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
+    /// G-2 (0.12): governance runtime (virtual keys + budgets/limits store). `None` = disabled.
+    pub(crate) governance: Option<std::sync::Arc<crate::governance::GovState>>,
 }

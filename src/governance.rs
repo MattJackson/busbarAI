@@ -9,7 +9,64 @@
 //! a `PostgresStore` can implement the same trait later for multi-node.
 
 use rusqlite::{params, Connection, OptionalExtension};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
+
+/// Per-instance governance runtime: the durable `Store` plus an in-memory key cache (hashed-secret
+/// → key) so validation on the hot path is a map lookup, not a DB round-trip. Held in `App`
+/// (`Option`: `None` = governance disabled) — NOT a process-global, so tests stay isolated.
+pub(crate) struct GovState {
+    store: Arc<dyn Store>,
+    by_hash: RwLock<HashMap<String, VirtualKey>>,
+}
+
+#[allow(dead_code)] // refresh/store used by the management API (G-5)
+impl GovState {
+    pub(crate) fn new(store: Arc<dyn Store>) -> StoreResult<Self> {
+        let by_hash = Self::load(store.as_ref())?;
+        Ok(Self {
+            store,
+            by_hash: RwLock::new(by_hash),
+        })
+    }
+
+    fn load(store: &dyn Store) -> StoreResult<HashMap<String, VirtualKey>> {
+        Ok(store
+            .list_keys()?
+            .into_iter()
+            .map(|k| (k.key_hash.clone(), k))
+            .collect())
+    }
+
+    /// Resolve a presented secret to its virtual key (cache lookup; secret hashed, never compared raw).
+    pub(crate) fn lookup(&self, secret: &str) -> Option<VirtualKey> {
+        let hash = crate::sigv4::sha256_hex(secret.as_bytes());
+        self.by_hash.read().unwrap().get(&hash).cloned()
+    }
+
+    pub(crate) fn store(&self) -> Arc<dyn Store> {
+        self.store.clone()
+    }
+
+    /// Reload the cache from the store (after a management-API mutation, G-5).
+    pub(crate) fn refresh(&self) -> StoreResult<()> {
+        let fresh = Self::load(self.store.as_ref())?;
+        *self.by_hash.write().unwrap() = fresh;
+        Ok(())
+    }
+}
+
+/// Resolved governance context attached to each request by the auth middleware. `key` is `None`
+/// when governance is disabled (so downstream enforcement is a no-op).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GovCtx {
+    pub key: Option<VirtualKey>,
+}
+
+/// Whether `key` may target `pool` (empty allowed_pools = all pools).
+pub(crate) fn pool_allowed(key: &VirtualKey, pool: &str) -> bool {
+    key.allowed_pools.is_empty() || key.allowed_pools.iter().any(|p| p == pool)
+}
 
 /// A virtual key issued by busbar (distinct from upstream provider keys). Maps a caller to the
 /// pools they may use plus their budget/rate-limit policy.
@@ -311,6 +368,34 @@ mod tests {
 
         s.delete_key("k1").unwrap();
         assert_eq!(s.get_key("k1").unwrap(), None);
+    }
+
+    #[test]
+    fn test_govstate_lookup_pool_allowed_refresh() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let secret = "sk-vk-abc";
+        let mut k = sample_key("k1", &crate::sigv4::sha256_hex(secret.as_bytes()));
+        k.allowed_pools = vec!["prod".to_string()];
+        store.put_key(&k).unwrap();
+
+        let gov = GovState::new(store).unwrap();
+        // hashed-secret lookup hits the cache.
+        assert_eq!(gov.lookup(secret).unwrap().id, "k1");
+        assert!(gov.lookup("wrong-secret").is_none());
+
+        let resolved = gov.lookup(secret).unwrap();
+        assert!(pool_allowed(&resolved, "prod"));
+        assert!(!pool_allowed(&resolved, "other"));
+
+        // A key added after construction isn't visible until refresh().
+        let secret2 = "sk-vk-def";
+        let mut k2 = sample_key("k2", &crate::sigv4::sha256_hex(secret2.as_bytes()));
+        k2.allowed_pools = vec![]; // empty = all pools
+        gov.store().put_key(&k2).unwrap();
+        assert!(gov.lookup(secret2).is_none(), "not cached pre-refresh");
+        gov.refresh().unwrap();
+        let r2 = gov.lookup(secret2).unwrap();
+        assert!(pool_allowed(&r2, "anything"), "empty allowed_pools = all");
     }
 
     #[test]

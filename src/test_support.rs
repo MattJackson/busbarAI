@@ -414,6 +414,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -461,6 +462,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let router = crate::build_router(app);
@@ -487,6 +489,94 @@ mod tests {
         assert!(
             body.contains(crate::metrics::REQUESTS_TOTAL),
             "exposition should contain a metric; got:\n{body}"
+        );
+
+        handle.abort();
+    }
+
+    /// G-2: governance-enabled router enforces virtual-key auth + allowed-pools over real HTTP.
+    #[tokio::test]
+    async fn test_governance_vkey_auth_and_pool_acl() {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let secret = "sk-vk-allowed";
+        store
+            .put_key(&VirtualKey {
+                id: "k1".to_string(),
+                key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
+                name: "tester".to_string(),
+                allowed_pools: vec!["allowedpool".to_string()],
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        let gov = Arc::new(GovState::new(store).unwrap());
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let st = Arc::new(InMemoryStore::new(vec![]));
+        let app = Arc::new(App {
+            lanes: vec![],
+            store: st,
+            by_model: HashMap::new(),
+            pools: HashMap::new(),
+            rr: AtomicUsize::new(0),
+            client: Client::builder().build().unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+            governance: Some(gov),
+        });
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // No virtual key → 401.
+        let r = client
+            .post(format!("http://{addr}/somepool/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401, "no vkey → unauthorized");
+
+        // Valid vkey but a pool not in allowed_pools → 403.
+        let r = client
+            .post(format!("http://{addr}/somepool/v1/messages"))
+            .bearer_auth(secret)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            403,
+            "vkey not allowed for pool → forbidden"
+        );
+
+        // Valid vkey on its allowed pool passes the ACL; routing then 404s (no such pool wired) —
+        // proving the request got PAST the 403 gate.
+        let r = client
+            .post(format!("http://{addr}/allowedpool/v1/messages"))
+            .bearer_auth(secret)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            404,
+            "ACL passed; unknown pool → not found"
         );
 
         handle.abort();
@@ -555,6 +645,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -645,6 +736,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -776,6 +868,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -910,6 +1003,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -1036,6 +1130,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -1121,6 +1216,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -1222,6 +1318,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         // Caller's Bearer token (NOT busbar's key)
@@ -1352,6 +1449,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -1518,6 +1616,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -1659,6 +1758,7 @@ mod tests {
             }),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -1867,6 +1967,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2074,6 +2175,7 @@ mod tests {
                 failover_cfg: None,
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
+                governance: None,
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2168,6 +2270,7 @@ mod tests {
                 failover_cfg: None,
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
+                governance: None,
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2261,6 +2364,7 @@ mod tests {
                 failover_cfg: None,
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
+                governance: None,
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2352,6 +2456,7 @@ mod tests {
                 failover_cfg: None,
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
+                governance: None,
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2444,6 +2549,7 @@ mod tests {
                 failover_cfg: None,
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
+                governance: None,
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2536,6 +2642,7 @@ mod tests {
                 failover_cfg: None,
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
+                governance: None,
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2675,6 +2782,7 @@ mod tests {
                     failover_cfg: None,
                     fallback_pools: HashMap::new(),
                     on_exhausted_cfgs: HashMap::new(),
+                    governance: None,
                 })
             };
 
@@ -2883,6 +2991,7 @@ mod tests {
                 failover_cfg: None,
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
+                governance: None,
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -3019,6 +3128,7 @@ mod tests {
                 failover_cfg: None,
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
+                governance: None,
             });
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -3148,6 +3258,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -3293,6 +3404,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs,
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -3432,6 +3544,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools,
             on_exhausted_cfgs,
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -3557,6 +3670,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools,
             on_exhausted_cfgs,
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -3738,6 +3852,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -3923,6 +4038,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -4066,6 +4182,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         // Request with system block
@@ -4232,6 +4349,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         // Build an OpenAI-format request body with model in the BODY (must match by_model key)
@@ -4242,7 +4360,13 @@ mod tests {
         let body_bytes = Bytes::from(serde_json::to_vec(&req_body).unwrap());
 
         // Call openai_ingress handler directly
-        let response = route::openai_ingress(State(app), HeaderMap::new(), body_bytes).await;
+        let response = route::openai_ingress(
+            State(app),
+            axum::extract::Extension(crate::governance::GovCtx::default()),
+            HeaderMap::new(),
+            body_bytes,
+        )
+        .await;
 
         // Assert 200 OK and the mock server received the request at /v1/chat/completions
         assert_eq!(response.status().as_u16(), 200);
@@ -4281,6 +4405,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         // Missing "model" field in body
@@ -4289,7 +4414,13 @@ mod tests {
         });
         let body_bytes = Bytes::from(serde_json::to_vec(&req_body).unwrap());
 
-        let response = route::openai_ingress(State(app), HeaderMap::new(), body_bytes).await;
+        let response = route::openai_ingress(
+            State(app),
+            axum::extract::Extension(crate::governance::GovCtx::default()),
+            HeaderMap::new(),
+            body_bytes,
+        )
+        .await;
 
         assert_eq!(response.status().as_u16(), 400);
     }
@@ -4320,6 +4451,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         // Unknown model in body
@@ -4329,7 +4461,13 @@ mod tests {
         });
         let body_bytes = Bytes::from(serde_json::to_vec(&req_body).unwrap());
 
-        let response = route::openai_ingress(State(app), HeaderMap::new(), body_bytes).await;
+        let response = route::openai_ingress(
+            State(app),
+            axum::extract::Extension(crate::governance::GovCtx::default()),
+            HeaderMap::new(),
+            body_bytes,
+        )
+        .await;
 
         assert_eq!(response.status().as_u16(), 404);
     }
@@ -4398,6 +4536,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         // OpenAI-format body (system inside first message)
@@ -4517,6 +4656,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         // Anthropic-format body (system at top level)
@@ -4606,6 +4746,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         // Anthropic-format streaming request; egress lane is openai → response stream translated back.
@@ -4715,6 +4856,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         // Anthropic-format NON-streaming request; egress lane is openai → response translated back.
@@ -4832,6 +4974,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
@@ -4974,6 +5117,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "small-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -5104,6 +5248,7 @@ mod tests {
             failover_cfg: None,
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
+            governance: None,
         });
 
         let req_body = serde_json::to_vec(&json!({"model": "model-8k", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();

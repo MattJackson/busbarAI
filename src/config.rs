@@ -392,6 +392,24 @@ pub(crate) struct DeployCfg {
     /// (`/metrics`) are always on and need no config.
     #[serde(default)]
     pub(crate) observability: Option<ObservabilityCfg>,
+    /// G-2 (0.12): optional governance (virtual keys, budgets, rate limits). Absent = disabled.
+    #[serde(default)]
+    pub(crate) governance: Option<GovernanceCfg>,
+}
+
+/// Governance config (sprint 0.12). When present + enabled, callers authenticate with virtual keys
+/// (not the static auth token) and are subject to per-key allowed-pools / budgets / rate limits.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub(crate) struct GovernanceCfg {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    /// SQLite database path for the durable Store (ADR-0009). Defaults to `busbar-governance.db`.
+    #[serde(default = "default_gov_db_path")]
+    pub(crate) db_path: String,
+}
+
+fn default_gov_db_path() -> String {
+    "busbar-governance.db".to_string()
 }
 
 /// Observability sinks (sprint 0.11). All fields optional; absent = that sink is disabled.
@@ -567,6 +585,7 @@ mod tests {
             models: HashMap::new(),
             pools: HashMap::new(),
             observability: None,
+            governance: None,
         };
 
         let result = resolve(&deploy, &defs).expect("resolve should succeed");
@@ -611,6 +630,7 @@ mod tests {
             models: HashMap::new(),
             pools: HashMap::new(),
             observability: None,
+            governance: None,
         };
 
         let result = resolve(&deploy, &defs);
@@ -658,6 +678,7 @@ mod tests {
             models: HashMap::new(),
             pools: HashMap::new(),
             observability: None,
+            governance: None,
         };
 
         let result = resolve(&deploy, &defs).expect("resolve should succeed");
@@ -713,6 +734,7 @@ mod tests {
             models: HashMap::new(),
             pools: HashMap::new(),
             observability: None,
+            governance: None,
         };
 
         let result = resolve(&deploy, &defs).expect("resolve should succeed");

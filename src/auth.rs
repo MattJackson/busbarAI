@@ -129,15 +129,35 @@ pub(crate) async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
-    // /stats requires auth by default (per spec decision).
-    if !app.auth.validate_token(auth_header) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    // Derive owned values up front so no immutable borrow of `req` is live when we mutate its
+    // extensions below.
+    let token_valid = app.auth.validate_token(auth_header);
+    let bearer_token: Option<String> =
+        auth_header.and_then(|h| h.strip_prefix("Bearer ").map(String::from));
+
+    // G-2 (0.12): when governance is enabled, the caller's Bearer token MUST resolve to an enabled
+    // virtual key; the resolved key is attached for downstream allowed-pools enforcement. This
+    // supersedes the static AuthMode token check. When governance is disabled, the existing
+    // AuthMode (None/Token/Passthrough) applies unchanged.
+    if let Some(gov) = &app.governance {
+        match gov.lookup(bearer_token.as_deref().unwrap_or("")) {
+            Some(key) if key.enabled => {
+                req.extensions_mut()
+                    .insert(crate::governance::GovCtx { key: Some(key) });
+            }
+            _ => return Err((StatusCode::UNAUTHORIZED, "invalid or disabled virtual key")),
+        }
+    } else {
+        // /stats requires auth by default (per spec decision).
+        if !token_valid {
+            return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+        }
+        req.extensions_mut()
+            .insert(crate::governance::GovCtx::default());
     }
 
     // Thread the caller's Bearer token into request extensions for passthrough forwarding
-    if let Some(bearer_token) =
-        auth_header.and_then(|h| h.strip_prefix("Bearer ").map(String::from))
-    {
+    if let Some(bearer_token) = bearer_token {
         use axum::extract::Extension;
         req.extensions_mut().insert(Extension(bearer_token));
     }

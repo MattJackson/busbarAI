@@ -84,6 +84,8 @@ async fn main() {
 
     // Observability sinks (B-603/B-604): grab before `deploy` is borrowed by resolve().
     let observability_cfg = deploy.observability.clone().unwrap_or_default();
+    // Governance (G-2): grab before `deploy` is borrowed by resolve().
+    let governance_cfg = deploy.governance.clone();
 
     // Resolve deployment + definitions into resolved RootCfg
     let cfg =
@@ -261,6 +263,27 @@ async fn main() {
         }
     }
 
+    // G-2: open the governance store + load the virtual-key cache when enabled.
+    let governance = match governance_cfg {
+        Some(g) if g.enabled => match governance::SqliteStore::open(&g.db_path) {
+            Ok(store) => match governance::GovState::new(Arc::new(store)) {
+                Ok(gs) => {
+                    eprintln!("busbar: governance enabled (sqlite {})", g.db_path);
+                    Some(Arc::new(gs))
+                }
+                Err(e) => {
+                    eprintln!("[error] governance init failed: {e}");
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                eprintln!("[error] governance db open failed ({}): {e}", g.db_path);
+                std::process::exit(1);
+            }
+        },
+        _ => None,
+    };
+
     let app = Arc::new(App {
         lanes,
         store,
@@ -277,6 +300,7 @@ async fn main() {
         failover_cfg,
         fallback_pools,
         on_exhausted_cfgs,
+        governance,
     });
 
     // B-604: configure the request-log webhook (reusing the pooled client). No-op if unset.
