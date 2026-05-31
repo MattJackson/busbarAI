@@ -601,7 +601,7 @@ impl ProtocolWriter for GeminiWriter {
         "/v1beta/models"
     }
 
-    /// /: Gemini's URL embeds the model AND the stream mode. Streaming requests go to
+    /// Gemini's URL embeds the model AND the stream mode. Streaming requests go to
     /// `:streamGenerateContent?alt=sse` (the gemini reader already decodes those SSE chunks);
     /// non-streaming to `:generateContent`.
     fn upstream_path_for_stream(&self, model: &str, stream: bool) -> String {

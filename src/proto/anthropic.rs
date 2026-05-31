@@ -71,7 +71,7 @@ impl ProtocolReader for AnthropicReader {
             };
         }
 
-        // A3: prefer HTTP status first, then structured error codes, then substrings as fallback.
+        // Prefer the HTTP status, then structured error codes, then substrings as a fallback.
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
             if let Some(code_val) = json.get("error").and_then(|e| e.get("code")) {
                 if code_val.as_str() == Some("400") || code_val.as_str() == Some("422") {
@@ -763,7 +763,7 @@ fn write_tool(tool: &crate::ir::IrTool) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-/// Anthropic writer implementation (migrated from `Protocol::upstream_path`, `auth_headers`, `rewrite_model`).
+/// Anthropic writer implementation.
 #[derive(Clone)]
 pub(crate) struct AnthropicWriter;
 

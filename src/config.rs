@@ -408,7 +408,7 @@ pub(crate) struct DeployCfg {
     /// without defining any pool.
     #[serde(default)]
     pub(crate) pools: HashMap<String, PoolCfg>,
-    /// /: optional observability sinks (OTLP traces + request-log webhook). Metrics
+    /// Optional observability sinks (OTLP traces + request-log webhook). Metrics
     /// (`/metrics`) are always on and need no config.
     #[serde(default)]
     pub(crate) observability: Option<ObservabilityCfg>,
@@ -423,7 +423,7 @@ pub(crate) struct DeployCfg {
 pub(crate) struct GovernanceCfg {
     #[serde(default)]
     pub(crate) enabled: bool,
-    /// SQLite database path for the durable Store (ADR-0009). Defaults to `busbar-governance.db`.
+    /// SQLite database path for the durable governance store. Defaults to `busbar-governance.db`.
     #[serde(default = "default_gov_db_path")]
     pub(crate) db_path: String,
     /// Flat cents charged per request for budget accounting. Defaults to 1.
@@ -697,7 +697,7 @@ models:
         assert_eq!(result, "plain-text-no-vars");
     }
 
-    // ADR-0008: Two-file resolution tests
+    // Two-file (providers.yaml + config.yaml) resolution tests
 
     #[test]
     fn test_resolve_provider_from_def() {

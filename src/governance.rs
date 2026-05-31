@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! Governance persistence (sprint 0.12, ADR-0009). A durable `Store` seam — SEPARATE from the hot
-//! in-memory `StateStore` (breaker/lane health) — holding only bounded ENFORCEMENT state: virtual
-//! keys + config, and per-key usage counters (spend/tokens/requests) per budget window. Historical
-//! request logs are NOT stored here (they go to the observability pipeline, 0.11). The default impl
-//! is `SqliteStore` (embedded, single file, statically linked — preserves the single-binary story);
-//! a `PostgresStore` can implement the same trait later for multi-node.
+//! Governance persistence. A durable `Store` seam — SEPARATE from the hot in-memory `StateStore`
+//! (breaker/lane health) — holding only bounded ENFORCEMENT state: virtual keys + config, and
+//! per-key usage counters (spend/tokens/requests) per budget window. Historical request logs are
+//! NOT stored here (they go to the observability pipeline). The default impl is `SqliteStore`
+//! (embedded, single file, statically linked — preserves the single-binary story); a
+//! `PostgresStore` could implement the same trait later for multi-node.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-/// per-key rate-limit state for the current 60s window. Ephemeral (in-memory, not persisted —
-/// ADR-0009: single-node rate windows; cross-node distributed limits are a future Redis concern).
+/// Per-key rate-limit state for the current 60s window. Ephemeral (in-memory, not persisted):
+/// rate windows are single-node; cross-node distributed limits would be a future concern.
 #[derive(Default)]
 struct RateState {
     window_start: u64,
@@ -275,7 +275,7 @@ pub(crate) fn budget_window(period: &str, now: u64) -> u64 {
     }
 }
 
-// Howard Hinnant's civil-date algorithms (shared shape with sigv4); self-contained here.
+// Public-domain civil-date algorithms (same approach as sigv4); self-contained, no date crate.
 fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
@@ -345,7 +345,7 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
-/// The durable governance store seam (ADR-0009). Swappable: `SqliteStore` today, `PostgresStore`
+/// The durable governance store seam. Swappable: `SqliteStore` today, `PostgresStore`
 /// later behind the same trait.
 pub(crate) trait Store: Send + Sync + 'static {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()>;
@@ -390,7 +390,7 @@ CREATE TABLE IF NOT EXISTS usage_counters (
 );
 ";
 
-/// Embedded SQLite store (the ADR-0009 default). The single `Connection` is mutex-guarded; the
+/// Embedded SQLite store (the default `Store`). The single `Connection` is mutex-guarded; the
 /// governance surface is low-frequency (key CRUD) or batched (usage), so this is not on the hot path.
 pub(crate) struct SqliteStore {
     conn: Mutex<Connection>,

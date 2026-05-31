@@ -835,7 +835,7 @@ impl InMemoryStore {
 
     fn record_hard_down_for(&self, pool: &str, lane: usize, reason: &str) {
         let ls = self.get_lane(lane);
-        // (A7): hard-down is RECOVERABLE — long sticky cooldown + Open, recovered via the half-open
+        // Hard-down is RECOVERABLE — long sticky cooldown + Open, recovered via the half-open
         // probe. We do NOT set `dead` (that would block recovery). Per (pool, lane): only the
         // routing pool's view is tripped; other pools discover the bad upstream independently.
         *ls.dead_reason.lock().unwrap() = reason.to_string();
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn test_hard_down_long_cooldown_and_recovery() {
-        // (A7): hard-down → long sticky cooldown + Open, recoverable via the
+        // hard-down → long sticky cooldown + Open, recoverable via the
         // probe, NOT a permanent `dead` kill.
         let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
         set_now_for_test(1000);
@@ -1212,7 +1212,7 @@ mod tests {
 
         let ls = store.get_lane(0);
         let until = ls.cooldown_until.load(Ordering::Relaxed);
-        // NOT permanently dead (that would block recovery) — the core A7 invariant.
+        // NOT permanently dead (that would block recovery) — the core hard-down invariant.
         assert!(
             !ls.dead.load(Ordering::Relaxed),
             "hard-down must NOT set dead — it is recoverable"

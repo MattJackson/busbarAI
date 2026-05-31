@@ -97,7 +97,7 @@ fn rate_check(app: &Arc<App>, gov: &crate::governance::GovCtx) -> Option<Respons
     None
 }
 
-/// /: the ingress boundary — emit per-request observability metrics (one client request =
+/// The ingress boundary — emit per-request observability metrics (one client request =
 /// one call here, unlike the re-entrant forward_with_pool) AND charge the request to the virtual
 /// key's budget. Outcome is derived from the final status; duration is wall-clock.
 fn finish(

@@ -48,7 +48,7 @@ pub(crate) fn uri_encode_path(path: &str) -> String {
 }
 
 /// Convert a Unix epoch (seconds) to (amzdate `YYYYMMDDTHHMMSSZ`, datestamp `YYYYMMDD`). Pure UTC,
-/// no external date crate (Howard Hinnant's civil-from-days algorithm).
+/// no external date crate (a public-domain civil-from-days algorithm).
 pub(crate) fn format_amz_time(epoch_secs: u64) -> (String, String) {
     let days = (epoch_secs / 86_400) as i64;
     let sod = epoch_secs % 86_400;

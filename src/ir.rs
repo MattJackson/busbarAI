@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! ADR-0005 superset IR — request + response/stream sides (/).
+//! The superset intermediate representation (IR) — request and response/stream sides — that every
+//! protocol's Reader/Writer maps to and from, so any ingress protocol can reach any backend
+//! losslessly. (See `docs/adr/0005-ir-fidelity.md` for the fidelity contract.)
 
 use serde_json::Value;
 

@@ -244,7 +244,8 @@ async fn main() {
                 cap: 3,
             }));
 
-    // Build fallback_pools map (same as pools for now; can diverge later)
+    // The fallback-pool routing table: on_exhausted `fallback_pool:<name>` looks a pool up here,
+    // so it mirrors the pools map (any pool can be a fallback target).
     let fallback_pools = pools.clone();
 
     // Per-pool runtime config (failover/exclusions), keyed by pool name.

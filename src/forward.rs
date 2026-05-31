@@ -451,7 +451,8 @@ impl RequestCtx {
     }
 }
 
-/// / /: pick_among using weighted selection (SWRR) over healthy subset.
+/// Pick a lane from `cands` using session affinity (if any) then weighted selection (SWRR) over
+/// the healthy subset, returning the chosen lane index and its acquired concurrency permit.
 /// `cands` is now Vec<WeightedLane> where each lane has its weight from config.
 /// `request_ctx` provides accumulated exclusions to avoid retrying failed lanes.
 /// `_affinity_key` enables sticky routing as a preference (not a hard constraint).
@@ -1179,7 +1180,10 @@ fn handle_status_503(app: &Arc<App>, cands: &[WeightedLane], now: u64, pool: &st
 /// transient counter is recorded and `Err(())` is returned so the caller can try another
 /// candidate (or give up). The concurrency `permit` is held for the lifetime of a streamed
 /// success body (invariant) and dropped on error.
-/// NOTE: Cross-protocol request translation on this degraded path is deferred to.
+///
+/// Limitation: this degraded path (least-bad / fallback-pool routing) forwards the request body
+/// as-is and does not translate between protocols, so it is only correct for same-protocol
+/// targets. Cross-protocol routing goes through the main `forward_with_pool` path.
 #[tracing::instrument(name = "forward_once", skip_all, fields(lane = i))]
 async fn forward_once(
     app: &Arc<App>,

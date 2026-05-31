@@ -100,7 +100,7 @@ pub(crate) fn normalize_raw_error(
     raw: &RawUpstreamError,
     error_map: &std::collections::HashMap<String, String>,
 ) -> CanonicalSignal {
-    // Step 1: Check if provider_code is in error_map (provider override; A3 "codes refine")
+    // Step 1: a provider error code mapped in error_map refines (overrides) the HTTP-status default.
     let provider_signal = if let Some(ref code) = raw.provider_code {
         if let Some(mapped_class) = error_map.get(code) {
             if let Some(class) = status_class_from_str(mapped_class) {

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! ADR-0006 protocol seam: agnostic core vs. protocol-specific edges.
-//! Per: split the flat `Protocol` trait into Reader (wire→signal) + Writer (intent→wire),
-//! bundle them in `Protocol`, and add a string-keyed registry for provider lookup.
+//! The protocol seam: a protocol-agnostic core, with each wire dialect's specifics confined to a
+//! `Reader` (wire → signal/IR) and a `Writer` (IR/intent → wire). `Protocol` bundles a Reader and
+//! Writer; a string-keyed registry maps a provider's protocol name to its `Protocol`.
 
 use axum::http::{header::HeaderValue, HeaderName, StatusCode};
 use std::sync::Arc;
@@ -15,8 +15,7 @@ pub(crate) use crate::breaker::StatusClass;
 // Import types needed for response/stream IR
 use crate::ir::{IrBlockMeta, IrDelta, IrStreamEvent, IrUsage};
 
-/// IrError is an alias for CanonicalSignal (scaffolding).
-/// Per ADR-0007: keep it compatible with CanonicalSignal; may promote to a richer struct.
+/// An IR-level error, currently an alias for `CanonicalSignal` (the normalized error signal).
 pub(crate) type IrError = crate::breaker::CanonicalSignal;
 
 /// ProtocolReader extracts signals from wire responses (Stage 1a + 1b).
@@ -250,7 +249,7 @@ pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
 /// get the equivalent INGRESS-protocol SSE bytes — composing `egress.reader().read_response_events`
 /// (wire → IR, stateful fan-out) with `ingress.writer().write_response_event` (IR → wire). Holds
 /// a reassembly buffer for frames split across chunks and the IR decode state across the stream.
-/// The async wiring into the live stream path (FirstByteBody) is.
+/// It is driven from the live streaming response path (see `FirstByteBody` in `forward`).
 pub(crate) struct StreamTranslate {
     ingress: Protocol,
     egress: Protocol,
@@ -377,7 +376,7 @@ fn reframe_sse(event_type: &str, data: &serde_json::Value) -> String {
     }
 }
 
-/// Anthropic reader implementation (migrated from `Protocol::extract_error` and `classify`).
+/// Anthropic reader implementation.
 mod anthropic;
 mod bedrock;
 mod cohere;
@@ -392,8 +391,8 @@ pub(crate) use gemini::{GeminiReader, GeminiWriter};
 pub(crate) use openai::{OpenAiReader, OpenAiWriter};
 pub(crate) use responses::{ResponsesReader, ResponsesWriter};
 
-/// String-keyed registry for protocol lookup (ADR-0008). Shared infrastructure: lives in the
-/// proto module root, not any single protocol's file. `with_builtins` registers every protocol.
+/// String-keyed registry mapping a provider's protocol name to its `Protocol`.
+/// `with_builtins` registers every protocol busbar ships with.
 #[derive(Default)]
 pub(crate) struct ProtocolRegistry {
     map: std::collections::HashMap<String, Arc<Protocol>>,

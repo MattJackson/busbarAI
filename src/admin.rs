@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! Virtual-key management API (, sprint 0.12). Admin CRUD over `/admin/keys`, guarded by the
+//! Virtual-key management API. Admin CRUD over `/admin/keys`, guarded by the
 //! configured admin token (enforced in `auth_middleware`, not here). Mutations refresh the
 //! `GovState` cache. Responses never include a key's `key_hash`; the plaintext secret is returned
 //! exactly once, on creation.
