@@ -657,14 +657,28 @@ pub(crate) async fn forward_with_pool(
     // - Record the breaker failure for that lane (the member tripped)
     // The client must restart the request itself after receiving the error event.
 
-    // Get failover config from app
-    let (deadline_secs, max_cap) = if let Some(ref f) = app.failover_cfg {
-        (f.deadline_secs, f.cap)
-    } else {
-        (120, 3) // defaults: deadline_s=120, max_failover=3
+    // Failover config: prefer this pool's own settings, fall back to the global default.
+    let pool_failover = app
+        .pool_runtime
+        .get(pool_name)
+        .and_then(|r| r.failover.as_ref())
+        .or(app.failover_cfg.as_ref());
+    let (deadline_secs, max_cap) = match pool_failover {
+        Some(f) => (f.deadline_secs, f.cap),
+        None => (120, 3), // defaults: deadline_s=120, max_failover=3
     };
 
     let mut request_ctx = RequestCtx::new(deadline_secs);
+
+    // Apply configured failover exclusions: members named here are excluded from this pool's
+    // candidate set (never selected, primary or failover) — a per-pool member blocklist.
+    if let Some(excl) = pool_failover.and_then(|f| f.exclusions.as_ref()) {
+        for wl in &cands {
+            if excl.iter().any(|m| m == &app.lanes[wl.idx].model) {
+                request_ctx.exclude(wl.idx);
+            }
+        }
+    }
 
     for _attempt in 0..=max_cap {
         // Check deadline first (propagated across hops)

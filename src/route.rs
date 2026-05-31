@@ -355,6 +355,7 @@ mod tests {
             )),
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: std::collections::HashMap::new(),
             on_exhausted_cfgs: std::collections::HashMap::new(),
             governance: None,

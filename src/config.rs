@@ -246,8 +246,9 @@ fn default_max_cooldown() -> u64 {
 pub(crate) struct FailoverCfg {
     #[serde(default = "default_failover_deadline")]
     pub(crate) deadline_secs: u64,
+    /// Member model names excluded from this pool's candidate set — never selected (primary or
+    /// failover). A per-pool blocklist for temporarily benching a member without editing `members`.
     #[serde(default)]
-    #[allow(dead_code)] // unused today: test-only helper or scaffolding for an unwired feature
     pub(crate) exclusions: Option<Vec<String>>,
     #[serde(default = "default_cap")]
     pub(crate) cap: usize,

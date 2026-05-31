@@ -243,6 +243,17 @@ async fn main() {
     // Build fallback_pools map (same as pools for now; can diverge later)
     let fallback_pools = pools.clone();
 
+    // Per-pool runtime config (failover/exclusions), keyed by pool name.
+    let mut pool_runtime = std::collections::HashMap::new();
+    for (pool_name, pool_cfg) in &cfg.pools {
+        pool_runtime.insert(
+            pool_name.clone(),
+            state::PoolRuntime {
+                failover: pool_cfg.failover.clone(),
+            },
+        );
+    }
+
     // Parse on_exhausted configs per pool
     let mut on_exhausted_cfgs = std::collections::HashMap::new();
     for (pool_name, pool_cfg) in &cfg.pools {
@@ -306,6 +317,7 @@ async fn main() {
         auth: auth_mw.clone(),
         auth_mode: auth_mw.mode,
         failover_cfg,
+        pool_runtime,
         fallback_pools,
         on_exhausted_cfgs,
         governance,

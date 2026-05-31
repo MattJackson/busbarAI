@@ -412,6 +412,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -505,6 +506,7 @@ mod tests {
             auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -620,6 +622,7 @@ mod tests {
             auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: Some(gov),
@@ -731,6 +734,7 @@ mod tests {
             auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -790,6 +794,143 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// Regression: a pool's `failover.exclusions` must actually exclude the named member from the
+    /// candidate set. Two backends (alpha, beta) in one pool; beta excluded → every response must
+    /// come from alpha. Without the wiring, smooth weighted round-robin would return beta ~half
+    /// the time.
+    #[tokio::test]
+    async fn test_failover_exclusions_remove_member_from_pool() {
+        crate::metrics::init();
+        let mk_server = |model: &'static str| async move {
+            let state = Arc::new(MockServerState::new());
+            for _ in 0..6 {
+                state.push(MockResponse::Ok {
+                    status: StatusCode::OK,
+                    body: json!({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "hi"}],
+                        "model": model,
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }),
+                });
+            }
+            MockServer::new(state).await
+        };
+        let server_a = mk_server("alpha").await;
+        let server_b = mk_server("beta").await;
+
+        let mk_lane_data = |model: &str| LaneData {
+            model: model.to_string(),
+            provider: "p".to_string(),
+            max: 10,
+            sem: Arc::new(tokio::sync::Semaphore::new(10)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            inflight: 0,
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        };
+        let mk_lane = |model: &str, base_url: String| Lane {
+            model: model.to_string(),
+            provider: "p".to_string(),
+            base_url,
+            api_key: "k".to_string(),
+            protocol: Arc::new(crate::proto::Protocol::anthropic()),
+            max: 10,
+            error_map: Arc::new(std::collections::HashMap::new()),
+            context_max: None,
+            path: None,
+            auth: None,
+        };
+
+        let mut pool_runtime = HashMap::new();
+        pool_runtime.insert(
+            "pe".to_string(),
+            crate::state::PoolRuntime {
+                failover: Some(crate::config::FailoverCfg {
+                    deadline_secs: 120,
+                    exclusions: Some(vec!["beta".to_string()]),
+                    cap: 3,
+                }),
+            },
+        );
+
+        let app = Arc::new(App {
+            lanes: vec![
+                mk_lane("alpha", server_a.base_url()),
+                mk_lane("beta", server_b.base_url()),
+            ],
+            store: Arc::new(InMemoryStore::new(vec![
+                mk_lane_data("alpha"),
+                mk_lane_data("beta"),
+            ])),
+            by_model: HashMap::from([("alpha".to_string(), 0), ("beta".to_string(), 1)]),
+            pools: HashMap::from([(
+                "pe".to_string(),
+                vec![
+                    crate::state::WeightedLane { idx: 0, weight: 1 },
+                    crate::state::WeightedLane { idx: 1, weight: 1 },
+                ],
+            )]),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            pool_runtime,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+            governance: None,
+        });
+
+        let cands = vec![
+            crate::state::WeightedLane { idx: 0, weight: 1 },
+            crate::state::WeightedLane { idx: 1, weight: 1 },
+        ];
+        let body = serde_json::to_vec(
+            &json!({"model": "pe", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}),
+        )
+        .unwrap();
+
+        use http_body_util::BodyExt as _;
+        for n in 0..5 {
+            let resp = forward_with_pool(
+                app.clone(),
+                cands.clone(),
+                body.clone().into(),
+                None,
+                "pe",
+                None,
+                "anthropic",
+                None,
+            )
+            .await;
+            assert_eq!(resp.status().as_u16(), 200, "request {n}");
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                v["model"], "alpha",
+                "excluded member 'beta' must never serve; request {n} got {v}"
+            );
+        }
+        // beta was excluded → it served nothing.
+        assert_eq!(
+            app.store.snapshot(1, now()).ok,
+            0,
+            "excluded lane must have 0 successes"
+        );
+        server_a.shutdown().await;
+        server_b.shutdown().await;
+    }
+
     /// GET /metrics through the REAL router (route table + auth middleware) over HTTP returns
     /// the Prometheus exposition with NO caller token — the endpoint is auth-exempt like /healthz.
     #[tokio::test]
@@ -808,6 +949,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -877,6 +1019,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: Some(gov),
@@ -966,6 +1109,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: Some(gov),
@@ -1027,6 +1171,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: Some(gov),
@@ -1091,6 +1236,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: Some(gov),
@@ -1244,6 +1390,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -1337,6 +1484,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -1473,6 +1621,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -1612,6 +1761,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -1741,6 +1891,7 @@ mod tests {
             auth: auth_mw_passthrough,
             auth_mode: crate::auth::AuthMode::Passthrough,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -1829,6 +1980,7 @@ mod tests {
             auth: auth_mw_token,
             auth_mode: crate::auth::AuthMode::Token,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -1933,6 +2085,7 @@ mod tests {
             auth: auth_mw,
             auth_mode: crate::auth::AuthMode::Passthrough,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -2068,6 +2221,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -2241,6 +2395,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -2387,6 +2542,7 @@ mod tests {
                 exclusions: None,
                 cap: 3,
             }),
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -2598,6 +2754,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -2808,6 +2965,7 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                pool_runtime: std::collections::HashMap::new(),
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
                 governance: None,
@@ -2905,6 +3063,7 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                pool_runtime: std::collections::HashMap::new(),
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
                 governance: None,
@@ -3004,6 +3163,7 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                pool_runtime: std::collections::HashMap::new(),
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
                 governance: None,
@@ -3098,6 +3258,7 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                pool_runtime: std::collections::HashMap::new(),
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
                 governance: None,
@@ -3193,6 +3354,7 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                pool_runtime: std::collections::HashMap::new(),
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
                 governance: None,
@@ -3288,6 +3450,7 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                pool_runtime: std::collections::HashMap::new(),
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
                 governance: None,
@@ -3435,6 +3598,7 @@ mod tests {
                     auth,
                     auth_mode: crate::auth::AuthMode::None,
                     failover_cfg: None,
+                    pool_runtime: std::collections::HashMap::new(),
                     fallback_pools: HashMap::new(),
                     on_exhausted_cfgs: HashMap::new(),
                     governance: None,
@@ -3642,6 +3806,7 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                pool_runtime: std::collections::HashMap::new(),
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
                 governance: None,
@@ -3783,6 +3948,7 @@ mod tests {
                 auth,
                 auth_mode: crate::auth::AuthMode::None,
                 failover_cfg: None,
+                pool_runtime: std::collections::HashMap::new(),
                 fallback_pools: HashMap::new(),
                 on_exhausted_cfgs: HashMap::new(),
                 governance: None,
@@ -3917,6 +4083,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -4067,6 +4234,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs,
             governance: None,
@@ -4209,6 +4377,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools,
             on_exhausted_cfgs,
             governance: None,
@@ -4337,6 +4506,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools,
             on_exhausted_cfgs,
             governance: None,
@@ -4525,6 +4695,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -4717,6 +4888,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -4865,6 +5037,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -5035,6 +5208,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -5090,6 +5264,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -5135,6 +5310,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -5221,6 +5397,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -5342,6 +5519,7 @@ mod tests {
             auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -5433,6 +5611,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -5525,6 +5704,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -5637,6 +5817,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -5757,6 +5938,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -5904,6 +6086,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,
@@ -6039,6 +6222,7 @@ mod tests {
             auth,
             auth_mode: crate::auth::AuthMode::None,
             failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
             fallback_pools: HashMap::new(),
             on_exhausted_cfgs: HashMap::new(),
             governance: None,

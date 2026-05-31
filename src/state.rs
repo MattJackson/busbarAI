@@ -39,6 +39,15 @@ pub(crate) struct WeightedLane {
     pub(crate) weight: u32, // member weight from config
 }
 
+/// Per-pool runtime config resolved from config.yaml. Keyed by pool name so the re-entrant
+/// `forward_with_pool` (which knows its pool name) can look up the right failover/breaker/affinity
+/// settings — pools are first-class, but lanes are shared, so this config lives per pool.
+#[derive(Clone, Default)]
+pub(crate) struct PoolRuntime {
+    /// Per-pool failover settings (deadline, cap, and member exclusions).
+    pub(crate) failover: Option<crate::config::FailoverCfg>,
+}
+
 pub(crate) struct App {
     pub(crate) lanes: Vec<Lane>,
     pub(crate) store: Arc<dyn StateStore>,
@@ -48,8 +57,10 @@ pub(crate) struct App {
     pub(crate) client: Client,
     pub(crate) auth: Arc<crate::auth::AuthMiddleware>,
     pub(crate) auth_mode: crate::auth::AuthMode,
-    /// Default failover config (deadline_s and max_failover cap).
+    /// Default failover config (deadline_s and max_failover cap) when a pool has no override.
     pub(crate) failover_cfg: Option<crate::config::FailoverCfg>,
+    /// Per-pool runtime config (failover/exclusions today; breaker/affinity as they're wired).
+    pub(crate) pool_runtime: HashMap<String, PoolRuntime>,
     /// Fallback pools mapping (pool name -> WeightedLane vec) for fallback mode.
     pub(crate) fallback_pools: HashMap<String, Vec<WeightedLane>>,
     /// OnExhausted config per pool name.
