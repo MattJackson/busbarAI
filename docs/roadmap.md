@@ -12,14 +12,15 @@ vendor integrations. It implements a small set of protocols losslessly:
 | `responses` | `/v1/responses` | bearer |
 | `gemini` | `:generateContent` / `:streamGenerateContent` | api-key header (`x-goog-api-key`) |
 | `bedrock` | Converse / ConverseStream | per-request **AWS SigV4** |
+| `cohere` | v2 `/v2/chat` | bearer |
 
 Any provider that speaks one of these is a **catalog entry** in `providers.yaml`
 (a name, a `base_url`, an env var for its key, an optional `path` override) — no
 code. A client speaking any protocol can target any provider; busbar translates
 through its superset IR when the two differ.
 
-This is why the public number to watch is the **protocol count (5)**, not the
-provider count. The shipped catalog (currently 41 providers) is a convenience
+This is why the public number to watch is the **protocol count (6)**, not the
+provider count. The shipped catalog (currently 42 providers) is a convenience
 list of vetted hosted endpoints; an operator can point busbar at *any*
 OpenAI-compatible endpoint — including their own — with three lines of YAML and
 no wait for an "integration."
@@ -43,12 +44,14 @@ of the same flexibility.
 So "non-standard auth/path" backends are not a categorical exclusion — they are
 the next **auth adapters** on a seam that already exists.
 
-## Roadmap (0.14+)
+## Shipped in 0.14
 
-### More protocols
-- **Cohere v2** (`/v2/chat`) — adds the Command family natively. (A first pass was
-  reverted for quality; needs a clean implementation registered in `mod.rs` so it
-  compiles + tests from the start.)
+### Cohere v2 protocol
+- **Cohere v2** (`/v2/chat`) — the Command family natively, as the 6th protocol
+  (request/response/streaming Reader + Writer, bearer auth). System prompts are
+  canonicalized into the IR so they survive cross-protocol translation.
+
+## Roadmap (1.0)
 
 ### Auth adapters for enterprise backends
 These reuse existing protocols (no new wire format) gated behind an auth shim — the

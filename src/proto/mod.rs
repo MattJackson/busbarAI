@@ -212,6 +212,12 @@ impl Protocol {
     pub(crate) fn bedrock() -> Self {
         Self::new("bedrock", BedrockReader, BedrockWriter)
     }
+
+    /// Construct a Cohere (v2 chat) protocol instance.
+    #[allow(dead_code)] // Reserved for integration (later cycle)
+    pub(crate) fn cohere() -> Self {
+        Self::new("cohere", CohereReader, CohereWriter)
+    }
 }
 
 /// Resolve a built-in Protocol by name (for ingress translation). Cheap (unit structs).
@@ -220,6 +226,7 @@ pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
     match name {
         "anthropic" => Some(Protocol::anthropic()),
         "bedrock" => Some(Protocol::bedrock()),
+        "cohere" => Some(Protocol::cohere()),
         #[allow(dead_code)] // Reserved for integration (later cycle)
         "gemini" => Some(Protocol::gemini()),
         "openai" => Some(Protocol::openai()),
@@ -365,12 +372,14 @@ fn reframe_sse(event_type: &str, data: &serde_json::Value) -> String {
 /// Anthropic reader implementation (migrated from `Protocol::extract_error` and `classify`).
 mod anthropic;
 mod bedrock;
+mod cohere;
 mod gemini;
 mod openai;
 mod responses;
 
 pub(crate) use anthropic::{AnthropicReader, AnthropicWriter};
 pub(crate) use bedrock::{BedrockReader, BedrockWriter};
+pub(crate) use cohere::{CohereReader, CohereWriter};
 pub(crate) use gemini::{GeminiReader, GeminiWriter};
 pub(crate) use openai::{OpenAiReader, OpenAiWriter};
 pub(crate) use responses::{ResponsesReader, ResponsesWriter};
@@ -393,6 +402,7 @@ impl ProtocolRegistry {
         map.insert("gemini".to_string(), Arc::new(Protocol::gemini()));
         map.insert("bedrock".to_string(), Arc::new(Protocol::bedrock()));
         map.insert("responses".to_string(), Arc::new(Protocol::responses()));
+        map.insert("cohere".to_string(), Arc::new(Protocol::cohere()));
         Self { map }
     }
 

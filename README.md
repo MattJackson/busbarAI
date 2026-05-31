@@ -13,9 +13,9 @@ The name comes from electrical distribution: a busbar takes one feed and fans it
 out across many breakered circuits — one entry point, weighted distribution,
 per-circuit protection.
 
-> **Project status: 0.13.0 (pre-1.0), in active development.** Working today:
-> **five protocols** — Anthropic, OpenAI (chat completions), Google **Gemini**, AWS **Bedrock**
-> (Converse), and OpenAI **Responses** — each read/written natively, with **full cross-protocol
+> **Project status: 0.14.0 (pre-1.0), in active development.** Working today:
+> **six protocols** — Anthropic, OpenAI (chat completions), Google **Gemini**, AWS **Bedrock**
+> (Converse), OpenAI **Responses**, and **Cohere** (v2 Chat) — each read/written natively, with **full cross-protocol
 > translation** through a lossless superset IR (request *and* response, streaming *and*
 > non-streaming, both directions — e.g. an OpenAI-format client driving a Gemini backend, or vice
 > versa). Plus named/ad-hoc routing, **weighted** pools (smooth WRR) with failover + session
@@ -23,22 +23,23 @@ per-circuit protection.
 > a Prometheus `/metrics` endpoint (request/attempt/failure/failover/breaker-trip/translation
 > counters + latency histogram), optional **OpenTelemetry** OTLP trace export, and an optional
 > fire-and-forget **request-log webhook** (both opt-in via an `observability` config section).
-> All five protocols are first-class including streaming: Gemini uses `:streamGenerateContent`,
+> All protocols are first-class including streaming: Gemini uses `:streamGenerateContent`,
 > Bedrock uses native AWS **SigV4** auth + ConverseStream (busbar decodes the binary
-> `application/vnd.amazon.eventstream` frames and translates them to the caller's protocol).
+> `application/vnd.amazon.eventstream` frames and translates them to the caller's protocol),
+> and Cohere uses the v2 `/v2/chat` Chat API.
 > And **governance** (opt-in `governance` config section, durable in embedded SQLite per ADR-0009):
 > **virtual keys** (busbar-issued, distinct from provider keys) with per-key **allowed-pools** ACLs
 > (403), **budgets** (402 when exceeded), and **rate limits** (429 + Retry-After), administered via
 > an admin-token-guarded **management API** (`/admin/keys` CRUD + usage); budgets are token-accurate
-> (per-request fee + per-1k-token cost from response usage). A vetted catalog of **41 providers**
+> (per-request fee + per-1k-token cost from response usage). A vetted catalog of **42 providers**
 > ships in `providers.yaml` (per-provider `path` override for version-in-base-url endpoints). Builds
 > and runs on **Linux, macOS, and Windows** (Intel + ARM binaries shipped per release).
 > busbar is **not bearer-only**: auth is a per-protocol/provider seam (Gemini uses `x-goog-api-key`,
 > Bedrock uses **SigV4**, and a per-provider `auth: api-key` override drives **Azure OpenAI**).
-> Roadmap (0.14+): more protocols (**Cohere**); a **Google Vertex AI** auth adapter (the `gemini`
-> protocol behind GCP OAuth2) on the same signing seam; then 1.0 hardening (docs, soak, security
-> review). APIs and config may change before 1.0. See [`docs/roadmap.md`](docs/roadmap.md) for the
-> protocols-not-providers thesis and the auth-adapter design.
+> Roadmap (1.0): a **Google Vertex AI** auth adapter (the `gemini` protocol behind GCP OAuth2) on
+> the same signing seam; then 1.0 hardening (docs, soak, security review). APIs and config may
+> change before 1.0. See [`docs/roadmap.md`](docs/roadmap.md) for the protocols-not-providers
+> thesis and the auth-adapter design.
 
 ## Why Busbar
 

@@ -289,3 +289,11 @@ bedrock:
   error_map:
     ThrottlingException: rate_limit
     ServiceQuotaExceededException: billing
+
+# ── Cohere v2 Chat protocol (/v2/chat) ───────────────────────────────────────────────────────────
+# Cohere's Command family via the v2 Chat API. Bearer auth; the protocol targets /v2/chat. Errors
+# are signalled by HTTP status (classified by the breaker), so error_map is empty.
+cohere:
+  protocol: cohere
+  base_url: https://api.cohere.com
+  error_map: {}
