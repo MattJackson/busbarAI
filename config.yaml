@@ -1,61 +1,189 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Matthew Jackson
 #
-# Deployment configuration for busbar.
-# This file references providers by NAME from providers.yaml and supplies their keys.
+# busbar deployment configuration (config.yaml).
+#
+# Two-file model:
+#   • providers.yaml  — the vetted provider catalog (protocol, base_url, error_map). Shipped.
+#   • config.yaml     — THIS file: your deployment. References providers by NAME and supplies their
+#                       keys via environment-variable names (never the keys themselves).
+#
+# Flow: clients call busbar; busbar routes each request to a `model` or a `pool` of models, tracks
+# per-member health with a circuit breaker, and translates between protocols when a client speaks a
+# different wire format than the chosen backend. Secrets are never written here — configure the
+# environment-variable NAME that holds each key; dollar-brace placeholders are expanded at load time
+# (see `client_tokens` below). Every such placeholder's variable must be set in the environment.
+#
+# This example builds up from the simplest case to progressively richer pools — read top to bottom.
 
+# ── Listen address ───────────────────────────────────────────────────────────────────────────────
 listen: "0.0.0.0:8080"
 
+# ── Client authentication ────────────────────────────────────────────────────────────────────────
+# mode:
+#   token        — clients must send `Authorization: Bearer <token>` matching an allowlist below.
+#   passthrough  — the client's own key is forwarded to the upstream provider (busbar adds nothing).
+#   none         — open relay (no client auth; dev only).
+# When governance is enabled (bottom of file), virtual keys supersede this for proxied requests.
 auth:
   mode: token
   client_tokens:
-    - "${BUSBAR_CLIENT_TOKEN}"
+    - "${BUSBAR_CLIENT_TOKEN}"        # one or more allowed client tokens (env-expanded)
 
+# ── Providers ────────────────────────────────────────────────────────────────────────────────────
+# Reference a provider NAME from providers.yaml and give the env var holding its key. protocol /
+# base_url / error_map are inherited from providers.yaml; override here only in unusual cases.
 providers:
+  anthropic:
+    api_key_env: ANTHROPIC_KEY
+  openai:
+    api_key_env: OPENAI_KEY
+  gemini:
+    api_key_env: GEMINI_KEY
   z.ai:
     api_key_env: ZAI_KEY
-    # Optional overrides (rarely needed):
-    # protocol: anthropic
-    # base_url: https://api.z.ai/api/anthropic
-    # error_map:
-    #   "1113": billing
+  bedrock:
+    # Bedrock auth is AWS SigV4: the key env holds `ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]`.
+    api_key_env: AWS_BEDROCK_CREDS
 
-  # Uncomment to use anthropic directly:
-  # anthropic:
-  #   api_key_env: ANTHROPIC_KEY
-
-  # Enable when OpenAI protocol lands (B-501):
-  # openai:
-  #   api_key_env: OPENAI_KEY
-
+# ── Models ───────────────────────────────────────────────────────────────────────────────────────
+# Each model names its provider, a per-model concurrency cap (max_concurrent), and an optional
+# lifetime request budget (max_requests; -1 = unlimited). A model is a "lane" with its own semaphore
+# and health state. Clients can target a model directly (`POST /<model>/v1/messages`) or via a pool.
 models:
-  glm-4.5:
-    provider: z.ai
-    max_concurrent: 10
+  claude-sonnet:
+    provider: anthropic
+    max_concurrent: 20
     max_requests: -1
-  glm-5.1:
-    provider: z.ai
-    max_concurrent: 10
+  claude-haiku:
+    provider: anthropic
+    max_concurrent: 40
+    max_requests: -1
+  gpt-4o:
+    provider: openai
+    max_concurrent: 20
+    max_requests: -1
+  gpt-4o-mini:
+    provider: openai
+    max_concurrent: 50
+    max_requests: -1
+  gemini-1.5-pro:
+    provider: gemini
+    max_concurrent: 15
     max_requests: -1
   glm-4.6:
     provider: z.ai
-    max_concurrent: 3
+    max_concurrent: 10
+    max_requests: -1
+  claude-sonnet-bedrock:
+    provider: bedrock
+    max_concurrent: 20
     max_requests: -1
 
+# ── Pools ────────────────────────────────────────────────────────────────────────────────────────
+# A pool is a named set of weighted member models. Its members' concurrency caps stack into one
+# aggregate, and the breaker fails a request over to a healthy member when one is tripped. Target a
+# pool with `POST /<pool>/v1/messages` (or the `model` field for `/v1/chat/completions`).
 pools:
-  glm:
+
+  # 1) Simplest pool: a single model. Useful to give a model a stable public name / alias.
+  haiku:
     members:
-      - target: glm-5.1
-        weight: 1
+      - target: claude-haiku
+
+  # 2) Basic round-robin: equal-weight members. Smooth weighted round-robin spreads load evenly;
+  #    if one member trips, traffic shifts to the others automatically.
+  fast:
+    members:
+      - target: claude-haiku
+      - target: gpt-4o-mini
+
+  # 3) Weighted split: send ~80% to the first member, ~20% to the second (e.g. canarying a model).
+  balanced:
+    members:
+      - target: claude-sonnet
+        weight: 8
+      - target: gpt-4o
+        weight: 2
+
+  # 4) Context-length aware: declare each member's max context window. A request that is too large
+  #    for one member fails over to a larger-context member instead of erroring — without penalizing
+  #    the smaller lane (it was healthy; the request simply didn't fit).
+  long-context:
+    members:
+      - target: claude-sonnet
+        context_max: 200000
+      - target: gemini-1.5-pro
+        context_max: 2000000
+
+  # 5) Failover tuning: bound how long/often busbar retries across members for one request.
+  #    deadline_secs — give up after this wall-clock budget. cap — at most this many failover hops.
+  #    exclusions — member models to never fail a request over TO (e.g. an expensive last resort).
+  resilient:
+    members:
+      - target: claude-sonnet
+        weight: 3
+      - target: gpt-4o
+        weight: 2
       - target: glm-4.6
         weight: 1
-      - target: glm-4.5
-        weight: 1
-  hindsight:
+    failover:
+      deadline_secs: 30
+      cap: 3
+      exclusions:
+        - glm-4.6        # kept in the pool for capacity, but never used as a failover destination
+
+  # 6) Exhaustion policy + fallback pool: when every member is tripped/at-capacity, choose what to do.
+  #    action: reject | status_503 | least_bad | fallback_pool:<name>
+  #      least_bad      — serve the member whose cooldown expires soonest rather than 503.
+  #      fallback_pool  — route to another pool entirely (loop-guarded).
+  primary:
     members:
-      - target: glm-5.1
-        weight: 1
+      - target: claude-sonnet
+      - target: gpt-4o
+    on_exhausted:
+      action: fallback_pool:overflow      # when primary is fully exhausted, spill to `overflow`
+
+  # The fallback target referenced above. Its own exhaustion policy serves the soonest-healthy member.
+  overflow:
+    members:
+      - target: claude-haiku
+      - target: gpt-4o-mini
       - target: glm-4.6
+    on_exhausted:
+      action: least_bad
+
+  # 7) Session affinity + cross-protocol: pin a conversation to one member while it's healthy (so
+  #    cache/state stays warm), keyed by a request header. Members here span THREE protocols
+  #    (Anthropic, OpenAI, Gemini) — a client speaking any one of them reaches all three, because
+  #    busbar translates losslessly through its superset IR.
+  smart:
+    members:
+      - target: claude-sonnet
+        weight: 2
+      - target: gpt-4o
+        weight: 2
+      - target: gemini-1.5-pro
         weight: 1
-      - target: glm-4.5
-        weight: 1
+    affinity:
+      mode: session              # stick to one member per session while it stays healthy
+      header_name: x-session-id  # the request header carrying the session key (this is the default)
+
+# ── Observability (optional) ─────────────────────────────────────────────────────────────────────
+# Prometheus `/metrics` is always on and needs no config. These two sinks are opt-in:
+#   otlp_endpoint            — export OpenTelemetry traces (OTLP/HTTP) to a collector.
+#   request_log_webhook_url  — fire-and-forget a JSON request-log POST per request.
+# observability:
+#   otlp_endpoint: "http://localhost:4318/v1/traces"
+#   request_log_webhook_url: "https://logs.example.com/busbar"
+
+# ── Governance (optional) ────────────────────────────────────────────────────────────────────────
+# When enabled, clients authenticate with busbar-issued VIRTUAL KEYS (managed via the admin API)
+# instead of the static `auth` tokens above. Each key carries allowed-pools (403), a spend budget
+# (402 when exceeded), and RPM/TPM rate limits (429). Enforcement state persists in embedded SQLite.
+# governance:
+#   enabled: true
+#   db_path: /var/lib/busbar/governance.db
+#   admin_token: "${BUSBAR_ADMIN_TOKEN}"      # guards the /admin/keys management API
+#   price_per_request_cents: 1                # flat per-request budget charge
+#   price_per_1k_tokens_cents: 50             # plus per-1000-token charge (from response usage)

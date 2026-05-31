@@ -510,6 +510,32 @@ pub(crate) fn resolve(
 mod tests {
     use super::*;
 
+    /// The shipped example config.yaml must parse and resolve cleanly against providers.yaml
+    /// (every referenced provider/model exists; the example stays a working starting point).
+    #[test]
+    fn test_shipped_example_config_resolves() {
+        // The example references these env-var placeholders (interpolation scans the whole file,
+        // including the commented governance block).
+        std::env::set_var("BUSBAR_CLIENT_TOKEN", "example-token");
+        std::env::set_var("BUSBAR_ADMIN_TOKEN", "example-admin");
+        let providers_raw =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/providers.yaml"))
+                .unwrap();
+        let defs: HashMap<String, ProviderDef> =
+            serde_yaml::from_str(&providers_raw).expect("parse providers.yaml");
+
+        let config_raw =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.yaml")).unwrap();
+        let expanded = interpolate_env(&config_raw).expect("expand ${ENV} in example config.yaml");
+        let deploy: DeployCfg = serde_yaml::from_str(&expanded).expect("parse example config.yaml");
+
+        let cfg = resolve(&deploy, &defs).expect("example config.yaml must resolve");
+        // Spot-check the progressively-complex pools all wired up.
+        assert!(cfg.pools.contains_key("smart"));
+        assert!(cfg.pools.contains_key("overflow"));
+        assert!(cfg.models.contains_key("claude-sonnet"));
+    }
+
     /// The shipped providers.yaml catalog must parse, name only known protocols, and use HTTPS.
     #[test]
     fn test_shipped_providers_catalog_valid() {
