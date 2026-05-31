@@ -375,21 +375,299 @@ impl ProtocolReader for ResponsesReader {
 
     fn read_response_events(
         &self,
-        _event_type: &str,
-        _data: &serde_json::Value,
-        _state: &mut crate::ir::StreamDecodeState,
+        event_type: &str,
+        data: &serde_json::Value,
+        state: &mut crate::ir::StreamDecodeState,
     ) -> Vec<IrStreamEvent> {
-        Vec::new()
+        let mut out: Vec<IrStreamEvent> = Vec::new();
+
+        if !data.is_object() {
+            return out;
+        }
+
+        match event_type {
+            "response.created" | "response.in_progress" => {
+                if !state.started {
+                    state.started = true;
+                    out.push(IrStreamEvent::MessageStart {
+                        role: crate::ir::IrRole::Assistant,
+                        usage: None,
+                    });
+                }
+            }
+
+            "response.output_item.added" => {
+                if let Some(item_obj) = data.get("item") {
+                    if item_obj.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                        let call_id = item_obj
+                            .get("call_id")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = item_obj
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if let Some(output_index) =
+                            data.get("output_index").and_then(|i| i.as_u64())
+                        {
+                            out.push(IrStreamEvent::BlockStart {
+                                index: output_index as usize,
+                                block: crate::ir::IrBlockMeta::ToolUse { id: call_id, name },
+                            });
+                        }
+                    } else if item_obj.get("type").and_then(|t| t.as_str()) == Some("message") {
+                    }
+                }
+            }
+
+            "response.output_text.delta" => {
+                let delta = data
+                    .get("delta")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !state.text_block_open && !delta.is_empty() {
+                    state.text_block_open = true;
+                    out.push(IrStreamEvent::BlockStart {
+                        index: 0,
+                        block: crate::ir::IrBlockMeta::Text,
+                    });
+                }
+                if !delta.is_empty() || state.text_block_open {
+                    let idx = data
+                        .get("output_index")
+                        .and_then(|i| i.as_u64())
+                        .map_or(0, |v| v as usize);
+                    out.push(IrStreamEvent::BlockDelta {
+                        index: idx,
+                        delta: crate::ir::IrDelta::TextDelta(delta),
+                    });
+                }
+            }
+
+            "response.function_call_arguments.delta" => {
+                let delta = data
+                    .get("delta")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !delta.is_empty() {
+                    if let Some(output_index) = data.get("output_index").and_then(|i| i.as_u64()) {
+                        out.push(IrStreamEvent::BlockDelta {
+                            index: output_index as usize,
+                            delta: crate::ir::IrDelta::InputJsonDelta(delta),
+                        });
+                    }
+                }
+            }
+
+            "response.output_item.done" | "response.content_part.done" => {
+                if let Some(output_index) = data.get("output_index").and_then(|i| i.as_u64()) {
+                    out.push(IrStreamEvent::BlockStop {
+                        index: output_index as usize,
+                    });
+                }
+            }
+
+            "response.completed" | "response.failed" | "response.incomplete" => {
+                if let Some(response_obj) = data.get("response") {
+                    let status = response_obj
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+
+                    let stop_reason = match status {
+                        "completed" => Some("end_turn".to_string()),
+                        "incomplete" | "failed" => {
+                            if let Some(incomplete_details) = response_obj.get("incomplete_details")
+                            {
+                                if let Some(reason) =
+                                    incomplete_details.get("reason").and_then(|r| r.as_str())
+                                {
+                                    match reason {
+                                        "max_output_tokens" => Some("max_tokens".to_string()),
+                                        "content_filter" => Some("safety".to_string()),
+                                        _ => Some(reason.to_string()),
+                                    }
+                                } else {
+                                    Some("end_turn".to_string())
+                                }
+                            } else {
+                                Some("end_turn".to_string())
+                            }
+                        }
+                        _ => Some("end_turn".to_string()),
+                    };
+
+                    let usage = response_obj
+                        .get("usage")
+                        .map(|u| crate::ir::IrUsage {
+                            input_tokens: u
+                                .get("input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            output_tokens: u
+                                .get("output_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            cache_creation_input_tokens: None,
+                            cache_read_input_tokens: None,
+                        })
+                        .unwrap_or(crate::ir::IrUsage {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_creation_input_tokens: None,
+                            cache_read_input_tokens: None,
+                        });
+
+                    out.push(IrStreamEvent::MessageDelta { stop_reason, usage });
+                    out.push(IrStreamEvent::MessageStop);
+                } else if event_type == "response.failed" {
+                    let stop_reason = Some("end_turn".to_string());
+                    let usage = crate::ir::IrUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
+                    };
+                    out.push(IrStreamEvent::MessageDelta { stop_reason, usage });
+                    out.push(IrStreamEvent::MessageStop);
+                }
+            }
+
+            _ => {}
+        }
+
+        out
     }
 
     fn read_response(&self, body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError> {
-        let _ = body;
-        Err(IrError {
+        let obj = body.as_object().ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some(
-                "responses read_response not yet implemented (B-540b)".to_string(),
-            ),
+            provider_signal: Some("ir_parse".to_string()),
             retry_after: None,
+        })?;
+
+        let status = obj.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        let mut stop_reason: Option<String> = match status {
+            "completed" => Some("end_turn".to_string()),
+            "incomplete" => {
+                if let Some(incomplete_details) = obj.get("incomplete_details") {
+                    if let Some(reason) = incomplete_details.get("reason").and_then(|r| r.as_str())
+                    {
+                        match reason {
+                            "max_output_tokens" => Some("max_tokens".to_string()),
+                            "content_filter" => Some("safety".to_string()),
+                            _ => Some(reason.to_string()),
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        let mut content: Vec<crate::ir::IrBlock> = Vec::new();
+        if let Some(output_arr) = obj.get("output").and_then(|o| o.as_array()) {
+            for item in output_arr {
+                let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                match item_type {
+                    "message" => {
+                        if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
+                            for block_item in content_arr {
+                                let block_type = block_item
+                                    .get("type")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("");
+
+                                if block_type == "output_text" {
+                                    if let Some(text) =
+                                        block_item.get("text").and_then(|t| t.as_str())
+                                    {
+                                        content.push(crate::ir::IrBlock::Text {
+                                            text: text.to_string(),
+                                            cache_control: None,
+                                            citations: Vec::new(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    "function_call" => {
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = item
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let arguments = item
+                            .get("arguments")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("{}");
+                        let input =
+                            serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+
+                        content.push(crate::ir::IrBlock::ToolUse {
+                            id: call_id,
+                            name,
+                            input,
+                        });
+                    }
+
+                    _ => {}
+                }
+            }
+        } else {
+            return Err(IrError {
+                class: StatusClass::ClientError,
+                provider_signal: Some("ir_parse".to_string()),
+                retry_after: None,
+            });
+        }
+
+        if content
+            .iter()
+            .any(|b| matches!(b, crate::ir::IrBlock::ToolUse { .. }))
+        {
+            stop_reason = Some("tool_use".to_string());
+        }
+
+        let usage_val = obj.get("usage").ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".into()),
+            retry_after: None,
+        })?;
+
+        let usage = crate::ir::IrUsage {
+            input_tokens: usage_val
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage_val
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+
+        Ok(crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content,
+            stop_reason,
+            usage,
         })
     }
 
@@ -642,13 +920,201 @@ impl ProtocolWriter for ResponsesWriter {
         serde_json::Value::Object(out)
     }
 
-    fn write_response_event(&self, _ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
-        None
+    fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
+        match ev {
+            IrStreamEvent::MessageStart { .. } => Some((
+                "response.created".to_string(),
+                serde_json::json!({
+                    "response": {
+                        "object": "response",
+                        "status": "in_progress"
+                    }
+                }),
+            )),
+
+            IrStreamEvent::BlockStart { index, block } => match block {
+                crate::ir::IrBlockMeta::Text => None,
+                crate::ir::IrBlockMeta::ToolUse { id, name } => Some((
+                    "response.output_item.added".to_string(),
+                    serde_json::json!({
+                        "output_index": index,
+                        "item": {
+                            "type": "function_call",
+                            "call_id": id,
+                            "name": name
+                        }
+                    }),
+                )),
+                crate::ir::IrBlockMeta::Thinking | crate::ir::IrBlockMeta::Image => None,
+            },
+
+            IrStreamEvent::BlockDelta { index, delta } => match delta {
+                crate::ir::IrDelta::TextDelta(text) if !text.is_empty() => Some((
+                    "response.output_text.delta".to_string(),
+                    serde_json::json!({
+                        "output_index": index,
+                        "delta": text
+                    }),
+                )),
+                crate::ir::IrDelta::InputJsonDelta(json_str) => Some((
+                    "response.function_call_arguments.delta".to_string(),
+                    serde_json::json!({
+                        "output_index": index,
+                        "delta": json_str
+                    }),
+                )),
+                &crate::ir::IrDelta::TextDelta(_) => None,
+                crate::ir::IrDelta::ThinkingDelta(_) | crate::ir::IrDelta::SignatureDelta(_) => {
+                    None
+                }
+            },
+
+            IrStreamEvent::BlockStop { index } => Some((
+                "response.output_item.done".to_string(),
+                serde_json::json!({
+                    "output_index": index,
+                }),
+            )),
+
+            IrStreamEvent::MessageDelta { stop_reason, usage } => {
+                let status = match stop_reason.as_deref() {
+                    Some("tool_use") | Some("end_turn") | Some("stop_sequence") => "completed",
+                    Some("max_tokens") => "incomplete",
+                    Some("safety") => "incomplete",
+                    _ => "failed",
+                };
+
+                let mut resp_obj = serde_json::Map::new();
+                resp_obj.insert("object".to_string(), serde_json::json!("response"));
+                resp_obj.insert("status".to_string(), serde_json::json!(status));
+
+                if status == "incomplete" {
+                    let reason = match stop_reason.as_deref() {
+                        Some("max_tokens") => "max_output_tokens",
+                        Some("safety") => "content_filter",
+                        _ => "other",
+                    };
+                    let mut incomplete_details = serde_json::Map::new();
+                    incomplete_details.insert("reason".to_string(), serde_json::json!(reason));
+                    resp_obj.insert(
+                        "incomplete_details".to_string(),
+                        serde_json::Value::Object(incomplete_details),
+                    );
+                }
+
+                let mut usage_map = serde_json::Map::new();
+                usage_map.insert(
+                    "input_tokens".to_string(),
+                    serde_json::json!(usage.input_tokens),
+                );
+                usage_map.insert(
+                    "output_tokens".to_string(),
+                    serde_json::json!(usage.output_tokens),
+                );
+                resp_obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
+
+                Some((
+                    if status == "failed" {
+                        "response.failed".to_string()
+                    } else {
+                        "response.completed".to_string()
+                    },
+                    serde_json::json!({ "response": resp_obj }),
+                ))
+            }
+
+            IrStreamEvent::MessageStop => None,
+
+            IrStreamEvent::Error(err) => Some((
+                "response.failed".to_string(),
+                serde_json::json!({
+                    "error": {
+                        "message": err.provider_signal.clone().unwrap_or_else(|| "error".to_string())
+                    }
+                }),
+            )),
+        }
     }
 
-    #[allow(dead_code)]
-    fn write_response(&self, _resp: &crate::ir::IrResponse) -> serde_json::Value {
-        serde_json::json!({})
+    fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
+        let status = match resp.stop_reason.as_deref() {
+            Some("tool_use") | Some("end_turn") | Some("stop_sequence") => "completed",
+            Some("max_tokens") => "incomplete",
+            Some("safety") => "incomplete",
+            _ => "failed",
+        };
+
+        let mut output_arr: Vec<serde_json::Value> = Vec::new();
+
+        let mut text_blocks: Vec<&str> = Vec::new();
+        for block in &resp.content {
+            match block {
+                crate::ir::IrBlock::Text { text, .. } => {
+                    if !text.is_empty() {
+                        text_blocks.push(text);
+                    }
+                }
+                crate::ir::IrBlock::ToolUse { id, name, input } => {
+                    let args_str =
+                        serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                    output_arr.push(serde_json::json!({
+                        "type": "function_call",
+                        "call_id": id,
+                        "name": name,
+                        "arguments": args_str
+                    }));
+                }
+                crate::ir::IrBlock::Thinking { .. } => {}
+                _ => {}
+            }
+        }
+
+        if !text_blocks.is_empty() {
+            let text_content = text_blocks.join("");
+            output_arr.insert(
+                0,
+                serde_json::json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": text_content
+                    }]
+                }),
+            );
+        }
+
+        let mut usage_map = serde_json::Map::new();
+        usage_map.insert(
+            "input_tokens".to_string(),
+            serde_json::json!(resp.usage.input_tokens),
+        );
+        usage_map.insert(
+            "output_tokens".to_string(),
+            serde_json::json!(resp.usage.output_tokens),
+        );
+
+        let mut obj = serde_json::Map::new();
+        obj.insert("object".to_string(), serde_json::json!("response"));
+        obj.insert("status".to_string(), serde_json::json!(status));
+        obj.insert("output".to_string(), serde_json::Value::Array(output_arr));
+        obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
+
+        if status == "incomplete" {
+            let reason = match resp.stop_reason.as_deref() {
+                Some("max_tokens") => "max_output_tokens",
+                Some("safety") => "content_filter",
+                _ => "other",
+            };
+            let mut incomplete_details = serde_json::Map::new();
+            incomplete_details.insert("reason".to_string(), serde_json::json!(reason));
+            obj.insert(
+                "incomplete_details".to_string(),
+                serde_json::Value::Object(incomplete_details),
+            );
+        }
+
+        serde_json::Value::Object(obj)
     }
 
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
@@ -908,5 +1374,201 @@ mod tests {
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0.as_str(), "authorization");
         assert_eq!(headers[0].1.to_str().unwrap(), "Bearer sk-test");
+    }
+
+    #[test]
+    fn test_read_response_decode() {
+        let json = serde_json::json!({
+            "id": "resp_1",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "The weather in SF is sunny."}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "fc_1",
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"SF\"}"
+                }
+            ],
+            "usage": {"input_tokens": 50, "output_tokens": 25}
+        });
+
+        let reader = ResponsesReader;
+        let resp = reader
+            .read_response(&json)
+            .expect("read_response should succeed");
+
+        assert_eq!(resp.content.len(), 2);
+        match &resp.content[0] {
+            crate::ir::IrBlock::Text { text, .. } => {
+                assert_eq!(text, "The weather in SF is sunny.")
+            }
+            _ => panic!("first block should be Text"),
+        }
+        match &resp.content[1] {
+            crate::ir::IrBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "fc_1");
+                assert_eq!(name, "get_weather");
+                assert_eq!(input.get("city").and_then(|v| v.as_str()), Some("SF"));
+            }
+            _ => panic!("second block should be ToolUse"),
+        }
+
+        assert_eq!(resp.stop_reason, Some("tool_use".to_string()));
+        assert_eq!(resp.usage.input_tokens, 50);
+        assert_eq!(resp.usage.output_tokens, 25);
+    }
+
+    #[test]
+    fn test_write_response_roundtrip_text_only() {
+        let json = serde_json::json!({
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hello world"}]
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let reader = ResponsesReader;
+        let writer = ResponsesWriter;
+
+        let ir_resp = reader.read_response(&json).expect("read should succeed");
+        let roundtrip_json = writer.write_response(&ir_resp);
+
+        assert_eq!(roundtrip_json, json);
+    }
+
+    #[test]
+    fn test_stream_fanout() {
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        // response.created → MessageStart only (first time)
+        let events1 = reader_read_response_events(
+            "response.created",
+            &serde_json::json!({"response": {"object":"response","status":"in_progress"}}),
+            &mut state,
+        );
+        assert_eq!(events1.len(), 1);
+        matches!(events1[0], crate::ir::IrStreamEvent::MessageStart { .. });
+
+        // response.output_item.added for function_call → BlockStart
+        let events2 = reader_read_response_events(
+            "response.output_item.added",
+            &serde_json::json!({
+                "output_index": 1,
+                "item": {"type":"function_call","call_id":"fc_1","name":"get_weather"}
+            }),
+            &mut state,
+        );
+        assert_eq!(events2.len(), 1);
+        matches!(events2[0], crate::ir::IrStreamEvent::BlockStart { .. });
+
+        // response.output_text.delta ×3 → BlockStart (lazy) + BlockDelta ×3
+        let delta_json = |d: &str| serde_json::json!({"output_index": 0, "delta": d});
+        let events3a =
+            reader_read_response_events("response.output_text.delta", &delta_json("H"), &mut state);
+        assert_eq!(events3a.len(), 2); // BlockStart + BlockDelta
+        matches!(events3a[0], crate::ir::IrStreamEvent::BlockStart { .. });
+        matches!(events3a[1], crate::ir::IrStreamEvent::BlockDelta { .. });
+
+        let events3b =
+            reader_read_response_events("response.output_text.delta", &delta_json("i"), &mut state);
+        assert_eq!(events3b.len(), 1); // BlockDelta only
+        matches!(events3b[0], crate::ir::IrStreamEvent::BlockDelta { .. });
+
+        let events3c =
+            reader_read_response_events("response.output_text.delta", &delta_json("!"), &mut state);
+        assert_eq!(events3c.len(), 1); // BlockDelta only
+
+        // response.output_item.done → BlockStop
+        let events4 = reader_read_response_events(
+            "response.output_item.done",
+            &serde_json::json!({"output_index": 0}),
+            &mut state,
+        );
+        assert_eq!(events4.len(), 1);
+        matches!(events4[0], crate::ir::IrStreamEvent::BlockStop { .. });
+
+        // response.completed with usage → MessageDelta + MessageStop
+        let completed_json = serde_json::json!({
+            "response": {
+                "status": "completed",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
+        });
+        let events5 =
+            reader_read_response_events("response.completed", &completed_json, &mut state);
+        assert_eq!(events5.len(), 2);
+        matches!(events5[0], crate::ir::IrStreamEvent::MessageDelta { .. });
+        matches!(events5[1], crate::ir::IrStreamEvent::MessageStop);
+
+        // response.in_progress should not emit MessageStart again (state.started=true)
+        let events6 = reader_read_response_events(
+            "response.in_progress",
+            &serde_json::json!({"response": {"object":"response","status":"in_progress"}}),
+            &mut state,
+        );
+        assert_eq!(events6.len(), 0);
+
+        // Unknown event type → empty (no panic)
+        let events7 = reader_read_response_events(
+            "response.content_part.added",
+            &serde_json::json!({}),
+            &mut state,
+        );
+        assert_eq!(events7.len(), 0);
+    }
+
+    #[test]
+    fn test_write_response_event_blockdelta() {
+        let writer = ResponsesWriter;
+
+        // BlockDelta TextDelta("hi") → ("response.output_text.delta", delta=="hi")
+        let ev1 = crate::ir::IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::TextDelta("hi".to_string()),
+        };
+        let (etype1, payload1) = writer.write_response_event(&ev1).expect("should emit");
+        assert_eq!(etype1, "response.output_text.delta");
+        assert_eq!(payload1.get("delta").and_then(|d| d.as_str()), Some("hi"));
+
+        // MessageDelta{end_turn} → ("response.completed", status maps to completed)
+        let ev2 = crate::ir::IrStreamEvent::MessageDelta {
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (etype2, payload2) = writer.write_response_event(&ev2).expect("should emit");
+        assert_eq!(etype2, "response.completed");
+        let resp_obj = payload2
+            .get("response")
+            .expect("payload should have response");
+        assert_eq!(
+            resp_obj.get("status"),
+            Some(&serde_json::json!("completed"))
+        );
+    }
+
+    fn reader_read_response_events(
+        event_type: &str,
+        data: &serde_json::Value,
+        state: &mut crate::ir::StreamDecodeState,
+    ) -> Vec<crate::ir::IrStreamEvent> {
+        let reader = ResponsesReader;
+        reader.read_response_events(event_type, data, state)
     }
 }
