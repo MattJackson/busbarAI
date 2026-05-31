@@ -5,6 +5,30 @@
 
 use super::*;
 
+/// Bedrock stopReason → canonical IR stop_reason.
+fn stop_reason_map(ward: &str) -> String {
+    match ward {
+        "end_turn" => "end_turn".to_string(),
+        "tool_use" => "tool_use".to_string(),
+        "max_tokens" => "max_tokens".to_string(),
+        "stop_sequence" => "stop_sequence".to_string(),
+        "content_filtered" => "safety".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Canonical IR stop_reason → Bedrock stopReason (inverse of `stop_reason_map`).
+fn stop_reason_reverse(canonical: &str) -> String {
+    match canonical {
+        "end_turn" => "end_turn".to_string(),
+        "tool_use" => "tool_use".to_string(),
+        "max_tokens" => "max_tokens".to_string(),
+        "stop_sequence" => "stop_sequence".to_string(),
+        "safety" => "content_filtered".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct BedrockReader;
 
@@ -298,27 +322,252 @@ impl ProtocolReader for BedrockReader {
         _event_type: &str,
         _data: &serde_json::Value,
     ) -> Option<IrStreamEvent> {
-        // B-530b: STUB - Converse response/stream R/W next cycle
+        // Bedrock streaming uses read_response_events (fan-out); this singular form is unused.
         None
     }
 
     fn read_response_events(
         &self,
         _event_type: &str,
-        _data: &serde_json::Value,
-        _state: &mut crate::ir::StreamDecodeState,
+        data: &serde_json::Value,
+        state: &mut crate::ir::StreamDecodeState,
     ) -> Vec<IrStreamEvent> {
-        // B-530b: STUB - Converse response/stream R/W next cycle
-        Vec::new()
+        let mut out: Vec<IrStreamEvent> = Vec::new();
+
+        if !data.is_object() {
+            return out;
+        }
+
+        match data.get("type").and_then(|t| t.as_str()) {
+            Some("messageStart") => {
+                if !state.started {
+                    state.started = true;
+                    out.push(IrStreamEvent::MessageStart {
+                        role: crate::ir::IrRole::Assistant,
+                        usage: None,
+                    });
+                }
+            }
+
+            Some("contentBlockStart") => {
+                let idx = data
+                    .get("contentBlockIndex")
+                    .and_then(|i| i.as_u64())
+                    .unwrap_or(0) as usize;
+
+                if let Some(start_obj) = data.get("start").and_then(|s| s.as_object()) {
+                    if let Some(tool_use) = start_obj.get("toolUse").and_then(|t| t.as_object()) {
+                        let tu_id = tool_use
+                            .get("toolUseId")
+                            .and_then(|id| id.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = tool_use
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        out.push(IrStreamEvent::BlockStart {
+                            index: idx,
+                            block: crate::ir::IrBlockMeta::ToolUse { id: tu_id, name },
+                        });
+                    } else if state.started && !state.text_block_open {
+                        state.text_block_open = true;
+                        out.push(IrStreamEvent::BlockStart {
+                            index: idx,
+                            block: crate::ir::IrBlockMeta::Text,
+                        });
+                    }
+                } else if state.started && !state.text_block_open {
+                    state.text_block_open = true;
+                    out.push(IrStreamEvent::BlockStart {
+                        index: idx,
+                        block: crate::ir::IrBlockMeta::Text,
+                    });
+                }
+            }
+
+            Some("contentBlockDelta") => {
+                let idx = data
+                    .get("contentBlockIndex")
+                    .and_then(|i| i.as_u64())
+                    .unwrap_or(0) as usize;
+
+                if let Some(delta_obj) = data.get("delta").and_then(|d| d.as_object()) {
+                    if delta_obj.contains_key("text") {
+                        let text_val = delta_obj
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        out.push(IrStreamEvent::BlockDelta {
+                            index: idx,
+                            delta: crate::ir::IrDelta::TextDelta(text_val),
+                        });
+                    } else if let Some(tool_use) =
+                        delta_obj.get("toolUse").and_then(|t| t.as_object())
+                    {
+                        if let Some(input_str) = tool_use.get("input").and_then(|i| i.as_str()) {
+                            out.push(IrStreamEvent::BlockDelta {
+                                index: idx,
+                                delta: crate::ir::IrDelta::InputJsonDelta(input_str.to_string()),
+                            });
+                        }
+                    }
+                }
+            }
+
+            Some("contentBlockStop") => {
+                let idx = data
+                    .get("contentBlockIndex")
+                    .and_then(|i| i.as_u64())
+                    .unwrap_or(0) as usize;
+
+                if state.text_block_open && idx == 0 {
+                    state.text_block_open = false;
+                }
+
+                out.push(IrStreamEvent::BlockStop { index: idx });
+            }
+
+            Some("messageStop") => {
+                let stop_reason_val = data
+                    .get("stopReason")
+                    .and_then(|s| s.as_str())
+                    .map(stop_reason_map);
+
+                // Bedrock splits stop reason (messageStop) from usage (a following `metadata`
+                // event). Emit the stop_reason here with zero usage; `metadata` emits a second
+                // MessageDelta carrying the real usage, then the single terminating MessageStop.
+                if let Some(reason) = stop_reason_val {
+                    out.push(IrStreamEvent::MessageDelta {
+                        stop_reason: Some(reason),
+                        usage: crate::ir::IrUsage {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_creation_input_tokens: None,
+                            cache_read_input_tokens: None,
+                        },
+                    });
+                }
+            }
+
+            Some("metadata") => {
+                if let Some(usage_obj) = data.get("usage").and_then(|u| u.as_object()) {
+                    let usage = crate::ir::IrUsage {
+                        input_tokens: usage_obj
+                            .get("inputTokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                        output_tokens: usage_obj
+                            .get("outputTokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
+                    };
+
+                    out.push(IrStreamEvent::MessageDelta {
+                        stop_reason: None,
+                        usage,
+                    });
+                }
+
+                out.push(IrStreamEvent::MessageStop);
+            }
+
+            _ => {}
+        }
+
+        out
     }
 
     fn read_response(&self, body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError> {
-        let _ = body;
-        // B-530b: STUB - Converse response/stream R/W next cycle
-        Err(IrError {
+        let obj = body.as_object().ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("bedrock read_response not yet implemented (B-530b)".to_string()),
+            provider_signal: Some("ir-parse".to_string()),
             retry_after: None,
+        })?;
+
+        let output_val = obj.get("output").ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir-parse".to_string()),
+            retry_after: None,
+        })?;
+
+        let message_val = output_val.get("message").ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir-parse".to_string()),
+            retry_after: None,
+        })?;
+
+        let mut content: Vec<crate::ir::IrBlock> = Vec::new();
+
+        if let Some(content_arr) = message_val.get("content").and_then(|c| c.as_array()) {
+            for block_val in content_arr {
+                if let Some(text_val) = block_val.get("text").and_then(|t| t.as_str()) {
+                    content.push(crate::ir::IrBlock::Text {
+                        text: text_val.to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    });
+                } else if let Some(tool_use) = block_val.get("toolUse").and_then(|t| t.as_object())
+                {
+                    let tu_id = tool_use
+                        .get("toolUseId")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = tool_use
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let input = tool_use
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+
+                    content.push(crate::ir::IrBlock::ToolUse {
+                        id: tu_id,
+                        name,
+                        input,
+                    });
+                }
+            }
+        }
+
+        let stop_reason_val = obj
+            .get("stopReason")
+            .and_then(|s| s.as_str())
+            .map(stop_reason_map);
+
+        let usage_val = obj.get("usage").ok_or(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir-parse".to_string()),
+            retry_after: None,
+        })?;
+
+        let usage = crate::ir::IrUsage {
+            input_tokens: usage_val
+                .get("inputTokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage_val
+                .get("outputTokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+
+        Ok(crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content,
+            stop_reason: stop_reason_val,
+            usage,
         })
     }
 
@@ -478,13 +727,122 @@ impl ProtocolWriter for BedrockWriter {
         serde_json::Value::Object(out)
     }
 
-    fn write_response_event(&self, _ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
-        None
+    fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
+        match ev {
+            IrStreamEvent::MessageStart { role: _, usage: _ } => Some((
+                "messageStart".to_string(),
+                serde_json::json!({ "role": "assistant" }),
+            )),
+
+            IrStreamEvent::BlockStart { index, block } => match block {
+                crate::ir::IrBlockMeta::Text => None,
+                crate::ir::IrBlockMeta::ToolUse { id, name } => Some((
+                    "contentBlockStart".to_string(),
+                    serde_json::json!({
+                        "contentBlockIndex": index,
+                        "start": { "toolUse": { "toolUseId": id, "name": name } }
+                    }),
+                )),
+                crate::ir::IrBlockMeta::Thinking | crate::ir::IrBlockMeta::Image => None,
+            },
+
+            IrStreamEvent::BlockDelta { index, delta } => match delta {
+                crate::ir::IrDelta::TextDelta(text) => Some((
+                    "contentBlockDelta".to_string(),
+                    serde_json::json!({
+                        "contentBlockIndex": index,
+                        "delta": { "text": text }
+                    }),
+                )),
+
+                crate::ir::IrDelta::InputJsonDelta(json_str) => Some((
+                    "contentBlockDelta".to_string(),
+                    serde_json::json!({
+                        "contentBlockIndex": index,
+                        "delta": { "toolUse": { "input": json_str } }
+                    }),
+                )),
+
+                crate::ir::IrDelta::ThinkingDelta(_) | crate::ir::IrDelta::SignatureDelta(_) => {
+                    None
+                }
+            },
+
+            IrStreamEvent::BlockStop { index } => Some((
+                "contentBlockStop".to_string(),
+                serde_json::json!({ "contentBlockIndex": index }),
+            )),
+
+            IrStreamEvent::MessageDelta {
+                stop_reason,
+                usage: _,
+            } => {
+                let reason_str = stop_reason.as_deref().unwrap_or("end_turn");
+                Some((
+                    "messageStop".to_string(),
+                    serde_json::json!({ "stopReason": stop_reason_reverse(reason_str) }),
+                ))
+            }
+
+            IrStreamEvent::MessageStop => None,
+
+            IrStreamEvent::Error(err) => {
+                let message = err
+                    .provider_signal
+                    .clone()
+                    .unwrap_or_else(|| "error".to_string());
+                Some((
+                    "error".to_string(),
+                    serde_json::json!({ "message": message }),
+                ))
+            }
+        }
     }
 
-    #[allow(dead_code)]
-    fn write_response(&self, _resp: &crate::ir::IrResponse) -> serde_json::Value {
-        serde_json::json!({})
+    fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
+        let mut content_arr: Vec<serde_json::Value> = Vec::new();
+
+        for block in &resp.content {
+            match block {
+                crate::ir::IrBlock::Text { text, .. } => {
+                    if !text.is_empty() {
+                        content_arr.push(serde_json::json!({ "text": text }));
+                    }
+                }
+
+                crate::ir::IrBlock::ToolUse { id, name, input } => {
+                    content_arr.push(serde_json::json!({
+                        "toolUse": {
+                            "toolUseId": id,
+                            "name": name,
+                            "input": input
+                        }
+                    }));
+                }
+
+                crate::ir::IrBlock::Thinking { .. } => {}
+
+                crate::ir::IrBlock::ToolResult { .. } | crate::ir::IrBlock::Image { .. } => {}
+            }
+        }
+
+        let stop_reason_str = resp.stop_reason.as_deref().unwrap_or("end_turn");
+        let reverse_reason = stop_reason_reverse(stop_reason_str);
+
+        serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": content_arr
+                }
+            },
+            "stopReason": reverse_reason,
+            "usage": {
+                "inputTokens": resp.usage.input_tokens,
+                "outputTokens": resp.usage.output_tokens,
+                "totalTokens": resp.usage.input_tokens + resp.usage.output_tokens
+            }
+        })
     }
 
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
@@ -773,5 +1131,247 @@ mod tests {
             .read_request(&j)
             .expect("read_request should succeed");
         assert_eq!(ir.temperature, Some(0.7_f64));
+    }
+
+    #[test]
+    fn test_read_response_decode() {
+        let j = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"text": "Let me check the weather for you."},
+                        {"toolUse": {"toolUseId": "tu_1", "name": "get_weather", "input": {"city": "SF"}}}
+                    ]
+                }
+            },
+            "stopReason": "tool_use",
+            "usage": {
+                "inputTokens": 42,
+                "outputTokens": 15,
+                "totalTokens": 57
+            }
+        });
+
+        let reader = BedrockReader;
+        let resp = reader
+            .read_response(&j)
+            .expect("read_response should succeed");
+
+        assert_eq!(resp.role, crate::ir::IrRole::Assistant);
+        assert_eq!(resp.content.len(), 2);
+
+        if let crate::ir::IrBlock::Text { text, .. } = &resp.content[0] {
+            assert_eq!(text, "Let me check the weather for you.");
+        } else {
+            panic!("content[0] should be Text block");
+        }
+
+        if let crate::ir::IrBlock::ToolUse { id, name, input } = &resp.content[1] {
+            assert_eq!(id, "tu_1");
+            assert_eq!(name, "get_weather");
+            match input {
+                serde_json::Value::Object(obj) => {
+                    assert_eq!(obj.get("city"), Some(&serde_json::json!("SF")));
+                }
+                _ => panic!("input should be Object"),
+            }
+        } else {
+            panic!("content[1] should be ToolUse block");
+        }
+
+        assert_eq!(resp.stop_reason, Some("tool_use".to_string()));
+        assert_eq!(resp.usage.input_tokens, 42);
+        assert_eq!(resp.usage.output_tokens, 15);
+    }
+
+    #[test]
+    fn test_read_write_response_roundtrip() {
+        let j = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": "Hello, world!"}]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15
+            }
+        });
+
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+
+        let resp = reader
+            .read_response(&j)
+            .expect("read_response should succeed");
+        let written = writer.write_response(&resp);
+
+        assert_eq!(
+            written, j,
+            "round-trip must be byte-identical for text-only response"
+        );
+    }
+
+    #[test]
+    fn test_stream_decode_sequence() {
+        use crate::ir::IrStreamEvent;
+
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = BedrockReader;
+
+        let events: Vec<_> = vec![
+            (serde_json::json!({"type": "messageStart", "role": "assistant"})),
+            (serde_json::json!({
+                "type": "contentBlockStart",
+                "contentBlockIndex": 0,
+                "start": {}
+            })),
+            (serde_json::json!({
+                "type": "contentBlockDelta",
+                "contentBlockIndex": 0,
+                "delta": {"text": "Hello"}
+            })),
+            (serde_json::json!({
+                "type": "contentBlockDelta",
+                "contentBlockIndex": 0,
+                "delta": {"text": ", world!"}
+            })),
+            (serde_json::json!({"type": "contentBlockStop", "contentBlockIndex": 0})),
+            (serde_json::json!({
+                "type": "messageStop",
+                "stopReason": "end_turn"
+            })),
+            (serde_json::json!({
+                "type": "metadata",
+                "usage": {"inputTokens": 10, "outputTokens": 5}
+            })),
+        ]
+        .into_iter()
+        .flat_map(|data| reader.read_response_events("", &data, &mut state))
+        .collect();
+
+        assert_eq!(events.len(), 8);
+
+        match &events[0] {
+            IrStreamEvent::MessageStart { role, usage } => {
+                assert_eq!(*role, crate::ir::IrRole::Assistant);
+                assert!(usage.is_none());
+            }
+            _ => panic!("event[0] should be MessageStart"),
+        }
+
+        match &events[1] {
+            IrStreamEvent::BlockStart { index, block } => {
+                assert_eq!(*index, 0);
+                assert!(matches!(block, crate::ir::IrBlockMeta::Text));
+            }
+            _ => panic!("event[1] should be BlockStart"),
+        }
+
+        match &events[2] {
+            IrStreamEvent::BlockDelta { index, delta } => {
+                assert_eq!(*index, 0);
+                if let crate::ir::IrDelta::TextDelta(text) = delta {
+                    assert_eq!(text, "Hello");
+                } else {
+                    panic!("event[2] should be TextDelta");
+                }
+            }
+            _ => panic!("event[2] should be BlockDelta"),
+        }
+
+        match &events[3] {
+            IrStreamEvent::BlockDelta { index, delta } => {
+                assert_eq!(*index, 0);
+                if let crate::ir::IrDelta::TextDelta(text) = delta {
+                    assert_eq!(text, ", world!");
+                } else {
+                    panic!("event[3] should be TextDelta");
+                }
+            }
+            _ => panic!("event[3] should be BlockDelta"),
+        }
+
+        match &events[4] {
+            IrStreamEvent::BlockStop { index } => assert_eq!(*index, 0),
+            _ => panic!("event[4] should be BlockStop"),
+        }
+
+        // messageStop carries the stop reason with zero usage...
+        match &events[5] {
+            IrStreamEvent::MessageDelta { stop_reason, usage } => {
+                assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+                assert_eq!(usage.input_tokens, 0);
+                assert_eq!(usage.output_tokens, 0);
+            }
+            _ => panic!("event[5] should be MessageDelta"),
+        }
+
+        // ...and the trailing `metadata` event carries the real usage (lossless), then MessageStop.
+        match &events[6] {
+            IrStreamEvent::MessageDelta { stop_reason, usage } => {
+                assert!(stop_reason.is_none());
+                assert_eq!(usage.input_tokens, 10);
+                assert_eq!(usage.output_tokens, 5);
+            }
+            _ => panic!("event[6] should be MessageDelta carrying usage"),
+        }
+
+        match &events[7] {
+            IrStreamEvent::MessageStop => {}
+            _ => panic!("event[7] should be MessageStop"),
+        }
+    }
+
+    #[test]
+    fn test_write_response_event() {
+        let writer = BedrockWriter;
+
+        let delta_ev = IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::TextDelta("hi".to_string()),
+        };
+
+        if let Some((event_type, payload)) = writer.write_response_event(&delta_ev) {
+            assert_eq!(event_type, "contentBlockDelta");
+            assert_eq!(
+                payload.get("contentBlockIndex").and_then(|i| i.as_u64()),
+                Some(0)
+            );
+            assert_eq!(
+                payload
+                    .get("delta")
+                    .and_then(|d| d.as_object())
+                    .and_then(|o| o.get("text"))
+                    .and_then(|t| t.as_str()),
+                Some("hi")
+            );
+        } else {
+            panic!("write_response_event should return Some for BlockDelta");
+        }
+
+        let delta_ev2 = IrStreamEvent::MessageDelta {
+            stop_reason: Some("tool_use".to_string()),
+            usage: IrUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+
+        if let Some((event_type, payload)) = writer.write_response_event(&delta_ev2) {
+            assert_eq!(event_type, "messageStop");
+            assert_eq!(
+                payload.get("stopReason").and_then(|s| s.as_str()),
+                Some("tool_use")
+            );
+        } else {
+            panic!("write_response_event should return Some for MessageDelta with tool_use");
+        }
     }
 }
