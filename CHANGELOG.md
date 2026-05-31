@@ -5,6 +5,26 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.2] — 2026-05-31
+
+### Security
+- **Admin-token comparison is now constant-time.** The `/admin` management API
+  compared the configured admin token with `==`, a timing side channel that could
+  let an attacker recover the token byte-by-byte. It now uses the same
+  constant-time comparison as client tokens.
+- **Virtual-key generation fails closed.** If the OS CSPRNG (`getrandom`) is
+  unavailable, busbar now refuses to mint a key instead of falling back to a
+  predictable, time-derived secret. (CSPRNG failure is near-impossible on supported
+  platforms; the failure aborts only the key-mint request.)
+
+### Notes
+- Security review found no other issues: virtual keys are SHA-256 hashed and never
+  stored/compared raw; the admin API is token-gated and disabled when no admin token
+  is set; key listings never expose hashes; no secrets are logged; cross-protocol JSON
+  parsing has no caller-triggered panics; ad-hoc routes only reach configured
+  (provider, model) pairs (no SSRF). `/healthz` and `/metrics` are intentionally open
+  (protect `/metrics` at the network layer).
+
 ## [0.16.1] — 2026-05-31
 
 ### Added

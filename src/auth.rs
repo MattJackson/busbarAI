@@ -146,8 +146,15 @@ pub(crate) async fn auth_middleware(
     if is_admin {
         let configured = app.governance.as_ref().and_then(|g| g.admin_token());
         let authorized = match configured {
+            // Constant-time compare so the admin token can't be recovered byte-by-byte via a timing
+            // side channel (matches the client-token path).
             Some(t) => {
-                bearer_token.as_deref() == Some(t) || admin_header_token.as_deref() == Some(t)
+                bearer_token
+                    .as_deref()
+                    .is_some_and(|b| AuthMiddleware::constant_time_eq(b, t))
+                    || admin_header_token
+                        .as_deref()
+                        .is_some_and(|h| AuthMiddleware::constant_time_eq(h, t))
             }
             None => false,
         };

@@ -245,17 +245,15 @@ pub(crate) struct GovCtx {
 }
 
 /// Generate a virtual-key secret from 16 bytes of the OS CSPRNG (portable across Unix/Windows via
-/// getrandom); falls back to a time-derived value only if the OS exposes no entropy source.
+/// getrandom). Fails closed: if the OS exposes no entropy source we refuse to mint a key rather
+/// than fall back to a guessable (time-derived) secret. getrandom failure is near-impossible on
+/// supported platforms; the panic aborts only the key-mint request (the server stays up).
 fn generate_secret() -> String {
     // Portable OS CSPRNG via getrandom: /dev/urandom on Unix, BCryptGenRandom on Windows, etc.
     let mut buf = [0u8; 16];
-    if getrandom::getrandom(&mut buf).is_ok() {
-        return format!("sk-bb-{}", hex::encode(buf));
-    }
-    // Fallback (only if the OS exposes no entropy source): time-derived, not cryptographically strong.
-    let seed =
-        crate::sigv4::sha256_hex(format!("busbar-fallback-{}", crate::store::now()).as_bytes());
-    format!("sk-bb-{}", &seed[..32])
+    getrandom::getrandom(&mut buf)
+        .expect("OS CSPRNG (getrandom) unavailable — refusing to mint a guessable virtual key");
+    format!("sk-bb-{}", hex::encode(buf))
 }
 
 /// Whether `key` may target `pool` (empty allowed_pools = all pools).
