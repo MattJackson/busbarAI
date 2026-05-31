@@ -355,6 +355,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_stream_json_relay() {
+        // B-602: ensure the Prometheus recorder is live so the forward path's counters record.
+        crate::metrics::init();
         let state = Arc::new(MockServerState::new());
         state.push(MockResponse::Ok {
             status: StatusCode::OK,
@@ -428,6 +430,13 @@ mod tests {
         let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body_str = String::from_utf8_lossy(&body_bytes);
         assert!(body_str.contains("Hello"));
+        // B-602: the forward path (forward → forward_with_pool) must have emitted the
+        // upstream-attempt counter into the Prometheus exposition.
+        assert!(
+            crate::metrics::render().contains(crate::metrics::UPSTREAM_ATTEMPTS_TOTAL),
+            "forward path should emit {} into /metrics",
+            crate::metrics::UPSTREAM_ATTEMPTS_TOTAL
+        );
         server.shutdown().await;
     }
 

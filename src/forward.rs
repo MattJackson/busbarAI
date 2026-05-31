@@ -579,8 +579,23 @@ pub(crate) async fn forward_with_pool(
         // Mark this lane as excluded for future attempts in this request
         request_ctx.exclude(i);
 
+        // B-602: count this upstream attempt (re-entrant across failover hops — each is a real attempt).
+        metrics::counter!(
+            crate::metrics::UPSTREAM_ATTEMPTS_TOTAL,
+            "pool" => pool_name.to_string(),
+            "lane" => app.lanes[i].model.clone()
+        )
+        .increment(1);
+
         let egress_name = app.lanes[i].protocol.name();
         if ingress_protocol != egress_name {
+            // B-602: one cross-protocol translation hop for this request.
+            metrics::counter!(
+                crate::metrics::TRANSLATIONS_TOTAL,
+                "from" => ingress_protocol.to_string(),
+                "to" => egress_name.to_string()
+            )
+            .increment(1);
             // Cross-protocol: translate the request body through the superset IR.
             let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) else {
                 return (
@@ -641,6 +656,19 @@ pub(crate) async fn forward_with_pool(
                 // Pre-response error: classify and potentially failover
                 let err_type = if e.is_timeout() { "timeout" } else { "connect" };
                 app.store.record_transient(i, err_type, None);
+                metrics::counter!(
+                    crate::metrics::UPSTREAM_FAILURES_TOTAL,
+                    "pool" => pool_name.to_string(),
+                    "lane" => app.lanes[i].model.clone(),
+                    "disposition" => "transient_upstream"
+                )
+                .increment(1);
+                metrics::counter!(
+                    crate::metrics::FAILOVERS_TOTAL,
+                    "pool" => pool_name.to_string(),
+                    "reason" => err_type.to_string()
+                )
+                .increment(1);
                 drop(permit);
                 continue;
             }
@@ -712,6 +740,19 @@ pub(crate) async fn forward_with_pool(
                                 };
                                 app.store.record_transient(i, what, sig.retry_after);
                             }
+                            metrics::counter!(
+                                crate::metrics::UPSTREAM_FAILURES_TOTAL,
+                                "pool" => pool_name.to_string(),
+                                "lane" => app.lanes[i].model.clone(),
+                                "disposition" => "transient_upstream"
+                            )
+                            .increment(1);
+                            metrics::counter!(
+                                crate::metrics::FAILOVERS_TOTAL,
+                                "pool" => pool_name.to_string(),
+                                "reason" => "transient_upstream"
+                            )
+                            .increment(1);
                             drop(permit);
                             continue;
                         }
@@ -735,6 +776,20 @@ pub(crate) async fn forward_with_pool(
                                 StatusClass::ContextLength => unreachable!(),
                             };
                             app.store.record_hard_down(i, &reason);
+                            // B-602: a hard-down is a breaker trip for this lane.
+                            metrics::counter!(
+                                crate::metrics::BREAKER_TRIPS_TOTAL,
+                                "pool" => pool_name.to_string(),
+                                "lane" => app.lanes[i].model.clone()
+                            )
+                            .increment(1);
+                            metrics::counter!(
+                                crate::metrics::UPSTREAM_FAILURES_TOTAL,
+                                "pool" => pool_name.to_string(),
+                                "lane" => app.lanes[i].model.clone(),
+                                "disposition" => "hard_down"
+                            )
+                            .increment(1);
                             drop(permit);
 
                             // For auth failures: return error to caller
@@ -748,6 +803,12 @@ pub(crate) async fn forward_with_pool(
                             }
 
                             // For billing hard downs: continue to next lane (failover)
+                            metrics::counter!(
+                                crate::metrics::FAILOVERS_TOTAL,
+                                "pool" => pool_name.to_string(),
+                                "reason" => "hard_down"
+                            )
+                            .increment(1);
                             continue;
                         }
                         Disposition::ContextLength => {
@@ -772,6 +833,19 @@ pub(crate) async fn forward_with_pool(
                                 }
                             }
 
+                            metrics::counter!(
+                                crate::metrics::UPSTREAM_FAILURES_TOTAL,
+                                "pool" => pool_name.to_string(),
+                                "lane" => app.lanes[i].model.clone(),
+                                "disposition" => "context_length"
+                            )
+                            .increment(1);
+                            metrics::counter!(
+                                crate::metrics::FAILOVERS_TOTAL,
+                                "pool" => pool_name.to_string(),
+                                "reason" => "context_length"
+                            )
+                            .increment(1);
                             drop(permit);
                             continue;
                         }
