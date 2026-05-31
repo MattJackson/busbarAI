@@ -57,6 +57,12 @@ use proto::ProtocolRegistry;
 use state::{App, Lane, WeightedLane};
 use store::{InMemoryStore, LaneData};
 
+/// Per-request timeout for upstream calls. Generous because it must cover long streamed
+/// completions, not just time-to-first-byte.
+const UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 300;
+/// Max idle keep-alive connections the shared HTTP client pools per upstream host.
+const POOL_MAX_IDLE_PER_HOST: usize = 64;
+
 #[tokio::main]
 async fn main() {
     // Install the Prometheus recorder before anything emits metrics.
@@ -233,16 +239,14 @@ async fn main() {
     let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg));
     let store = Arc::new(InMemoryStore::new(lanes_data.clone()));
 
-    // Extract default failover config (use first pool's config or defaults)
-    let failover_cfg =
-        cfg.pools
-            .values()
-            .find_map(|p| p.failover.clone())
-            .or(Some(crate::config::FailoverCfg {
-                deadline_secs: 120,
-                exclusions: None,
-                cap: 3,
-            }));
+    // Global default failover config — the fallback for pools that don't set their own. A fixed
+    // default (not "whatever pool HashMap iteration happens to yield first", which was
+    // nondeterministic across restarts).
+    let failover_cfg = Some(crate::config::FailoverCfg {
+        deadline_secs: crate::config::DEFAULT_FAILOVER_DEADLINE_SECS,
+        exclusions: None,
+        cap: crate::config::DEFAULT_FAILOVER_CAP,
+    });
 
     // The fallback-pool routing table: on_exhausted `fallback_pool:<name>` looks a pool up here,
     // so it mirrors the pools map (any pool can be a fallback target).
@@ -317,10 +321,10 @@ async fn main() {
         by_model,
         pools,
         client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .pool_max_idle_per_host(64)
+            .timeout(Duration::from_secs(UPSTREAM_REQUEST_TIMEOUT_SECS))
+            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
             .build()
-            .unwrap(),
+            .expect("build upstream HTTP client"),
         auth: auth_mw.clone(),
         auth_mode: auth_mw.mode,
         failover_cfg,

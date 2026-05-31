@@ -26,6 +26,11 @@ use crate::proto::convert_headers;
 use crate::state::App;
 use crate::store::{now, BreakerCfg};
 
+/// Default seconds between probes when a `health:` block omits `interval_secs`.
+const DEFAULT_PROBE_INTERVAL_SECS: u64 = 30;
+/// Default per-probe request timeout when a `health:` block omits `timeout_secs`.
+const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 5;
+
 /// Spawn one background prober task per lane that has a probing mode configured. A no-op for lanes
 /// with `mode: none` (or no `health:` block). Tasks live for the process lifetime.
 pub(crate) fn spawn_probers(app: Arc<App>) {
@@ -36,14 +41,21 @@ pub(crate) fn spawn_probers(app: Arc<App>) {
         if h.mode == HealthMode::None {
             continue;
         }
-        let interval = Duration::from_secs(h.interval_secs.unwrap_or(30).max(1));
-        let timeout = Duration::from_secs(h.timeout_secs.unwrap_or(5).max(1));
+        let interval = Duration::from_secs(
+            h.interval_secs
+                .unwrap_or(DEFAULT_PROBE_INTERVAL_SECS)
+                .max(1),
+        );
+        let timeout =
+            Duration::from_secs(h.timeout_secs.unwrap_or(DEFAULT_PROBE_TIMEOUT_SECS).max(1));
         let mode = h.mode;
         let app = app.clone();
         let model = app.lanes[i].model.clone();
-        eprintln!(
-            "[health] probing lane '{model}' mode={mode:?} every {}s",
-            interval.as_secs()
+        tracing::info!(
+            lane = %model,
+            mode = ?mode,
+            interval_secs = interval.as_secs(),
+            "active health probing enabled for lane"
         );
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -113,7 +125,7 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
         if app.store.lane_tripped_anywhere(i) {
             // Probe tests the shared upstream → recover the lane in every cell (all pools + default).
             app.store.recover_lane(i);
-            eprintln!("[health] lane '{}' recovered via probe", lane.model);
+            tracing::info!(lane = %lane.model, "lane recovered via health probe");
         }
     } else {
         app.store

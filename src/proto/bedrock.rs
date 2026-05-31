@@ -489,19 +489,19 @@ impl ProtocolReader for BedrockReader {
     fn read_response(&self, body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError> {
         let obj = body.as_object().ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir-parse".to_string()),
+            provider_signal: Some("ir_parse".to_string()),
             retry_after: None,
         })?;
 
         let output_val = obj.get("output").ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir-parse".to_string()),
+            provider_signal: Some("ir_parse".to_string()),
             retry_after: None,
         })?;
 
         let message_val = output_val.get("message").ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir-parse".to_string()),
+            provider_signal: Some("ir_parse".to_string()),
             retry_after: None,
         })?;
 
@@ -548,7 +548,7 @@ impl ProtocolReader for BedrockReader {
 
         let usage_val = obj.get("usage").ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir-parse".to_string()),
+            provider_signal: Some("ir_parse".to_string()),
             retry_after: None,
         })?;
 

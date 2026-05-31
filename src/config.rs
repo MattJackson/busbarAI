@@ -270,12 +270,17 @@ pub(crate) struct FailoverCfg {
     pub(crate) cap: usize,
 }
 
+/// Default failover wall-clock budget (seconds) when a pool doesn't set `failover.deadline_secs`.
+pub(crate) const DEFAULT_FAILOVER_DEADLINE_SECS: u64 = 120;
+/// Default maximum failover hops per request when a pool doesn't set `failover.cap`.
+pub(crate) const DEFAULT_FAILOVER_CAP: usize = 3;
+
 fn default_failover_deadline() -> u64 {
-    120
+    DEFAULT_FAILOVER_DEADLINE_SECS
 }
 
 fn default_cap() -> usize {
-    3
+    DEFAULT_FAILOVER_CAP
 }
 
 #[derive(Debug, Deserialize, Clone)]

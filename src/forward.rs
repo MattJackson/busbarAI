@@ -644,7 +644,10 @@ pub(crate) async fn forward_with_pool(
         .or(app.failover_cfg.as_ref());
     let (deadline_secs, max_cap) = match pool_failover {
         Some(f) => (f.deadline_secs, f.cap),
-        None => (120, 3), // defaults: deadline_s=120, max_failover=3
+        None => (
+            crate::config::DEFAULT_FAILOVER_DEADLINE_SECS,
+            crate::config::DEFAULT_FAILOVER_CAP,
+        ),
     };
 
     // Breaker config: prefer this pool's own settings, fall back to ADR-0002 defaults. Resolved

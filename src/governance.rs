@@ -12,6 +12,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
+/// Length of the fixed rate-limit window (RPM/TPM are evaluated per this many seconds).
+const RATE_WINDOW_SECS: u64 = 60;
+/// `price_per_1k_tokens_cents` is priced per this many tokens.
+const TOKENS_PER_PRICE_UNIT: u64 = 1000;
+
 /// Per-key rate-limit state for the current 60s window. Ephemeral (in-memory, not persisted):
 /// rate windows are single-node; cross-node distributed limits would be a future concern.
 #[derive(Default)]
@@ -71,12 +76,11 @@ impl GovState {
     /// once per request at stream end from the response usage tap. Best-effort (store errors logged).
     pub(crate) fn record_tokens(&self, key_id: &str, budget_period: &str, now: u64, tokens: u64) {
         if tokens == 0 {
-            // Still feed the (zero) rate counter to be explicit; nothing to spend.
-            return;
+            return; // nothing to spend or count
         }
         let window = budget_window(budget_period, now);
-        let spend =
-            (tokens.saturating_mul(self.price_per_1k_tokens_cents.max(0) as u64) / 1000) as i64;
+        let spend = (tokens.saturating_mul(self.price_per_1k_tokens_cents.max(0) as u64)
+            / TOKENS_PER_PRICE_UNIT) as i64;
         if let Err(e) = self.store.add_usage(key_id, window, spend, tokens) {
             tracing::warn!(key = %key_id, error = %e, "token usage record failed");
         }
@@ -144,8 +148,8 @@ impl GovState {
         if key.rpm_limit.is_none() && key.tpm_limit.is_none() {
             return Ok(());
         }
-        let window = now / 60 * 60;
-        let retry = (window + 60).saturating_sub(now).max(1);
+        let window = now / RATE_WINDOW_SECS * RATE_WINDOW_SECS;
+        let retry = (window + RATE_WINDOW_SECS).saturating_sub(now).max(1);
         let mut map = self.rate.write().unwrap();
         let st = map.entry(key.id.clone()).or_default();
         if st.window_start != window {
@@ -174,7 +178,7 @@ impl GovState {
         if tokens == 0 {
             return;
         }
-        let window = now / 60 * 60;
+        let window = now / RATE_WINDOW_SECS * RATE_WINDOW_SECS;
         let mut map = self.rate.write().unwrap();
         if let Some(st) = map.get_mut(key_id) {
             if st.window_start == window {
