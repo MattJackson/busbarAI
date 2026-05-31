@@ -131,9 +131,33 @@ pub(crate) async fn auth_middleware(
 
     // Derive owned values up front so no immutable borrow of `req` is live when we mutate its
     // extensions below.
+    let is_admin = path.starts_with("/admin");
+    let admin_header_token = req
+        .headers()
+        .get("x-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     let token_valid = app.auth.validate_token(auth_header);
     let bearer_token: Option<String> =
         auth_header.and_then(|h| h.strip_prefix("Bearer ").map(String::from));
+
+    // G-5: the /admin management API is guarded by the configured admin token (Bearer or
+    // X-Admin-Token) — NOT a virtual key. Disabled (401) when no admin token is configured.
+    if is_admin {
+        let configured = app.governance.as_ref().and_then(|g| g.admin_token());
+        let authorized = match configured {
+            Some(t) => {
+                bearer_token.as_deref() == Some(t) || admin_header_token.as_deref() == Some(t)
+            }
+            None => false,
+        };
+        if !authorized {
+            return Err((StatusCode::UNAUTHORIZED, "admin unauthorized"));
+        }
+        req.extensions_mut()
+            .insert(crate::governance::GovCtx::default());
+        return Ok(next.run(req).await);
+    }
 
     // G-2 (0.12): when governance is enabled, the caller's Bearer token MUST resolve to an enabled
     // virtual key; the resolved key is attached for downstream allowed-pools enforcement. This

@@ -27,6 +27,7 @@
 // v2: OpenAI-protocol providers (P4/A5500 /v1/chat/completions) need Anthropic
 // <-> OpenAI translation; not handled here. All v1 lanes are Anthropic-format.
 
+mod admin;
 mod auth;
 mod breaker;
 mod config;
@@ -267,7 +268,11 @@ async fn main() {
     let governance = match governance_cfg {
         Some(g) if g.enabled => match governance::SqliteStore::open(&g.db_path) {
             Ok(store) => {
-                match governance::GovState::new(Arc::new(store), g.price_per_request_cents) {
+                match governance::GovState::new(
+                    Arc::new(store),
+                    g.price_per_request_cents,
+                    g.admin_token.clone(),
+                ) {
                     Ok(gs) => {
                         eprintln!("busbar: governance enabled (sqlite {})", g.db_path);
                         Some(Arc::new(gs))
@@ -329,6 +334,10 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
         .route("/stats", get(handlers::stats))
         .route("/healthz", get(handlers::healthz))
         .route("/metrics", get(metrics::handler))
+        // G-5: virtual-key management API (admin-token guarded in auth_middleware).
+        .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
+        .route("/admin/keys/:id", axum::routing::delete(admin::delete_key))
+        .route("/admin/keys/:id/usage", get(admin::key_usage))
         .route("/v1/chat/completions", post(route::openai_ingress))
         .route("/:name/v1/messages", post(route::named))
         .route("/:provider/:model/v1/messages", post(route::adhoc))

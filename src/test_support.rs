@@ -516,7 +516,7 @@ mod tests {
                 created_at: 0,
             })
             .unwrap();
-        let gov = Arc::new(GovState::new(store, 1).unwrap());
+        let gov = Arc::new(GovState::new(store, 1, None).unwrap());
 
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let st = Arc::new(InMemoryStore::new(vec![]));
@@ -606,7 +606,7 @@ mod tests {
             .unwrap();
         // Pre-seed usage past the 100c budget (window 0 = "total").
         store.add_usage("kb", 0, 250, 0).unwrap();
-        let gov = Arc::new(GovState::new(store, 1).unwrap());
+        let gov = Arc::new(GovState::new(store, 1, None).unwrap());
 
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let st = Arc::new(InMemoryStore::new(vec![]));
@@ -668,7 +668,7 @@ mod tests {
                 created_at: 0,
             })
             .unwrap();
-        let gov = Arc::new(GovState::new(store, 0).unwrap());
+        let gov = Arc::new(GovState::new(store, 0, None).unwrap());
 
         let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
         let st = Arc::new(InMemoryStore::new(vec![]));
@@ -721,6 +721,119 @@ mod tests {
             r.headers().get(reqwest::header::RETRY_AFTER).is_some(),
             "429 must carry Retry-After"
         );
+
+        handle.abort();
+    }
+
+    /// G-5: the /admin management API — create→list→usage→delete, admin-token gating, and a minted
+    /// secret then authenticating as a working virtual key.
+    #[tokio::test]
+    async fn test_governance_admin_api() {
+        use crate::governance::{GovState, SqliteStore};
+
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 1, Some("admintok".to_string())).unwrap());
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let st = Arc::new(InMemoryStore::new(vec![]));
+        let app = Arc::new(App {
+            lanes: vec![],
+            store: st,
+            by_model: HashMap::new(),
+            pools: HashMap::new(),
+            rr: AtomicUsize::new(0),
+            client: Client::builder().build().unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+            governance: Some(gov),
+        });
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // Missing admin token → 401.
+        let r = client
+            .post(format!("{base}/admin/keys"))
+            .json(&serde_json::json!({"name": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401, "no admin token → unauthorized");
+
+        // Create a key with the admin token.
+        let r = client
+            .post(format!("{base}/admin/keys"))
+            .bearer_auth("admintok")
+            .json(&serde_json::json!({"name": "team-a", "allowed_pools": ["allowedpool"], "rpm_limit": 5}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 201, "admin create → 201");
+        let created: serde_json::Value = r.json().await.unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        let secret = created["secret"].as_str().unwrap().to_string();
+        assert!(secret.starts_with("sk-bb-"), "secret returned once");
+        assert!(created.get("key_hash").is_none(), "hash never returned");
+
+        // List shows it (no hash).
+        let r = client
+            .get(format!("{base}/admin/keys"))
+            .bearer_auth("admintok")
+            .send()
+            .await
+            .unwrap();
+        let listed: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(listed["keys"].as_array().unwrap().len(), 1);
+        assert!(listed["keys"][0].get("key_hash").is_none());
+
+        // Usage endpoint works.
+        let r = client
+            .get(format!("{base}/admin/keys/{id}/usage"))
+            .bearer_auth("admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+
+        // The minted secret authenticates as a virtual key: its allowed pool passes the ACL →
+        // routing 404 (no such pool wired), proving the key is live + ACL applied.
+        let r = client
+            .post(format!("{base}/allowedpool/v1/messages"))
+            .bearer_auth(&secret)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            404,
+            "minted key authenticates + ACL passes"
+        );
+
+        // Delete, then it's gone from the list.
+        let r = client
+            .delete(format!("{base}/admin/keys/{id}"))
+            .bearer_auth("admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let r = client
+            .get(format!("{base}/admin/keys"))
+            .bearer_auth("admintok")
+            .send()
+            .await
+            .unwrap();
+        let listed: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(listed["keys"].as_array().unwrap().len(), 0, "deleted");
 
         handle.abort();
     }

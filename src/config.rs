@@ -410,6 +410,9 @@ pub(crate) struct GovernanceCfg {
     /// future refinement). Defaults to 1.
     #[serde(default = "default_price_per_request_cents")]
     pub(crate) price_per_request_cents: i64,
+    /// G-5: bearer token guarding the /admin management API. None = admin API disabled.
+    #[serde(default)]
+    pub(crate) admin_token: Option<String>,
 }
 
 fn default_gov_db_path() -> String {

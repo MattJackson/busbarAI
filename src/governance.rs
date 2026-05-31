@@ -33,18 +33,88 @@ pub(crate) struct GovState {
     price_per_request_cents: i64,
     /// G-4: per-key RPM/TPM windows (ephemeral).
     rate: RwLock<HashMap<String, RateState>>,
+    /// G-5: bearer token guarding the /admin management API (None = admin API disabled).
+    admin_token: Option<String>,
+}
+
+/// G-5: parameters for minting a new virtual key (from the management API).
+pub(crate) struct NewKeySpec {
+    pub name: String,
+    pub allowed_pools: Vec<String>,
+    pub max_budget_cents: Option<i64>,
+    pub budget_period: String,
+    pub rpm_limit: Option<u32>,
+    pub tpm_limit: Option<u32>,
 }
 
 #[allow(dead_code)] // refresh/store used by the management API (G-5)
 impl GovState {
-    pub(crate) fn new(store: Arc<dyn Store>, price_per_request_cents: i64) -> StoreResult<Self> {
+    pub(crate) fn new(
+        store: Arc<dyn Store>,
+        price_per_request_cents: i64,
+        admin_token: Option<String>,
+    ) -> StoreResult<Self> {
         let by_hash = Self::load(store.as_ref())?;
         Ok(Self {
             store,
             by_hash: RwLock::new(by_hash),
             price_per_request_cents,
             rate: RwLock::new(HashMap::new()),
+            admin_token,
         })
+    }
+
+    /// G-5: the configured admin token (None = admin API disabled).
+    pub(crate) fn admin_token(&self) -> Option<&str> {
+        self.admin_token.as_deref()
+    }
+
+    /// G-5: mint a new virtual key, persist it, refresh the cache, and return (key, plaintext
+    /// secret). The secret is shown to the caller ONCE here and never stored (only its hash is).
+    pub(crate) fn create_key(
+        &self,
+        spec: NewKeySpec,
+        now: u64,
+    ) -> StoreResult<(VirtualKey, String)> {
+        let secret = generate_secret();
+        let hash = crate::sigv4::sha256_hex(secret.as_bytes());
+        let key = VirtualKey {
+            id: format!("vk_{}", &hash[..16]),
+            key_hash: hash,
+            name: spec.name,
+            allowed_pools: spec.allowed_pools,
+            max_budget_cents: spec.max_budget_cents,
+            budget_period: spec.budget_period,
+            rpm_limit: spec.rpm_limit,
+            tpm_limit: spec.tpm_limit,
+            enabled: true,
+            created_at: now,
+        };
+        self.store.put_key(&key)?;
+        self.refresh()?;
+        Ok((key, secret))
+    }
+
+    /// G-5: all virtual keys (metadata; callers must strip `key_hash` before returning).
+    pub(crate) fn all_keys(&self) -> StoreResult<Vec<VirtualKey>> {
+        self.store.list_keys()
+    }
+
+    /// G-5: delete a key by id + refresh the cache.
+    pub(crate) fn delete_key(&self, id: &str) -> StoreResult<()> {
+        self.store.delete_key(id)?;
+        self.refresh()
+    }
+
+    /// G-5: current-window usage for a key (None if the key doesn't exist).
+    pub(crate) fn usage_for(&self, id: &str, now: u64) -> StoreResult<Option<Usage>> {
+        match self.store.get_key(id)? {
+            Some(key) => {
+                let window = budget_window(&key.budget_period, now);
+                Ok(Some(self.store.get_usage(id, window)?))
+            }
+            None => Ok(None),
+        }
     }
 
     /// G-4: check + consume one request slot against the key's RPM/TPM for the current 60s window.
@@ -151,6 +221,22 @@ impl GovState {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GovCtx {
     pub key: Option<VirtualKey>,
+}
+
+/// G-5: generate a virtual-key secret. Prefers 16 cryptographic bytes from `/dev/urandom`; falls
+/// back to a time-derived value (non-crypto) only if that read fails. No `rand` dependency.
+fn generate_secret() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(&mut buf).is_ok() {
+            return format!("sk-bb-{}", hex::encode(buf));
+        }
+    }
+    // Fallback (documented): time-derived, not cryptographically strong.
+    let seed =
+        crate::sigv4::sha256_hex(format!("busbar-fallback-{}", crate::store::now()).as_bytes());
+    format!("sk-bb-{}", &seed[..32])
 }
 
 /// Whether `key` may target `pool` (empty allowed_pools = all pools).
@@ -505,7 +591,7 @@ mod tests {
         k.allowed_pools = vec!["prod".to_string()];
         store.put_key(&k).unwrap();
 
-        let gov = GovState::new(store, 1).unwrap();
+        let gov = GovState::new(store, 1, None).unwrap();
         // hashed-secret lookup hits the cache.
         assert_eq!(gov.lookup(secret).unwrap().id, "k1");
         assert!(gov.lookup("wrong-secret").is_none());
@@ -541,7 +627,7 @@ mod tests {
         k.max_budget_cents = Some(100);
         k.budget_period = "total".to_string();
         store.put_key(&k).unwrap();
-        let gov = GovState::new(store, 30).unwrap(); // 30 cents/request
+        let gov = GovState::new(store, 30, None).unwrap(); // 30 cents/request
 
         assert!(!gov.is_over_budget(&k, 1_700_000_000));
         for _ in 0..3 {
@@ -559,7 +645,7 @@ mod tests {
     #[test]
     fn test_check_rate_rpm_window() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let gov = GovState::new(store, 1).unwrap();
+        let gov = GovState::new(store, 1, None).unwrap();
         let mut k = sample_key("k1", "h1");
         k.rpm_limit = Some(2);
         k.tpm_limit = None;
