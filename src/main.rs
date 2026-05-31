@@ -34,6 +34,7 @@ mod config_validate;
 mod forward;
 mod handlers;
 mod ir;
+mod metrics;
 mod proto;
 mod route;
 mod state;
@@ -56,6 +57,9 @@ use store::{InMemoryStore, LaneData};
 
 #[tokio::main]
 async fn main() {
+    // Install the Prometheus recorder before anything emits metrics (B-601).
+    metrics::init();
+
     // Read providers.yaml (shipped definitions)
     let providers_path =
         std::env::var("BUSBAR_PROVIDERS").unwrap_or_else(|_| "/etc/busbar/providers.yaml".into());
@@ -271,6 +275,7 @@ async fn main() {
     let router = Router::new()
         .route("/stats", get(handlers::stats))
         .route("/healthz", get(handlers::healthz))
+        .route("/metrics", get(metrics::handler))
         .route("/v1/chat/completions", post(route::openai_ingress))
         .route("/:name/v1/messages", post(route::named))
         .route("/:provider/:model/v1/messages", post(route::adhoc))

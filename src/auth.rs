@@ -122,9 +122,10 @@ pub(crate) async fn auth_middleware(
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
 
-    // /healthz is always open (per spec decision).
+    // /healthz and /metrics are always open: liveness and Prometheus scraping must not require a
+    // caller token (operators protect /metrics at the network layer if needed). (B-601)
     let path = req.uri().path();
-    if path == "/healthz" {
+    if path == "/healthz" || path == "/metrics" {
         return Ok(next.run(req).await);
     }
 
