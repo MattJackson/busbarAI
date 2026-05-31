@@ -48,7 +48,6 @@ mod store;
 mod test_support;
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -299,7 +298,6 @@ async fn main() {
         store,
         by_model,
         pools,
-        rr: AtomicUsize::new(0),
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .pool_max_idle_per_host(64)

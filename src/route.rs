@@ -344,13 +344,11 @@ mod tests {
 
     /// Minimal governance-off App for exercising `finish` in isolation.
     fn minimal_app() -> Arc<App> {
-        use std::sync::atomic::AtomicUsize;
         Arc::new(App {
             lanes: vec![],
             store: Arc::new(crate::store::InMemoryStore::new(vec![])),
             by_model: std::collections::HashMap::new(),
             pools: std::collections::HashMap::new(),
-            rr: AtomicUsize::new(0),
             client: reqwest::Client::new(),
             auth: Arc::new(crate::auth::AuthMiddleware::new(
                 &crate::config::AuthCfg::default_none(),

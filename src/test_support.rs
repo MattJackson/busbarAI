@@ -263,7 +263,6 @@ mod tests {
     use reqwest::Client;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -406,7 +405,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -500,7 +498,6 @@ mod tests {
                 "pa".to_string(),
                 vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
             )]),
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -616,7 +613,6 @@ mod tests {
                 "pa".to_string(),
                 vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
             )]),
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -728,7 +724,6 @@ mod tests {
                 "pc".to_string(),
                 vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
             )]),
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -809,7 +804,6 @@ mod tests {
             store,
             by_model: HashMap::new(),
             pools: HashMap::new(),
-            rr: AtomicUsize::new(0),
             client: Client::builder().build().unwrap(),
             auth,
             auth_mode: crate::auth::AuthMode::None,
@@ -879,7 +873,6 @@ mod tests {
             store: st,
             by_model: HashMap::new(),
             pools: HashMap::new(),
-            rr: AtomicUsize::new(0),
             client: Client::builder().build().unwrap(),
             auth,
             auth_mode: crate::auth::AuthMode::None,
@@ -969,7 +962,6 @@ mod tests {
             store: st,
             by_model: HashMap::new(),
             pools: HashMap::new(),
-            rr: AtomicUsize::new(0),
             client: Client::builder().build().unwrap(),
             auth,
             auth_mode: crate::auth::AuthMode::None,
@@ -1031,7 +1023,6 @@ mod tests {
             store: st,
             by_model: HashMap::new(),
             pools: HashMap::new(),
-            rr: AtomicUsize::new(0),
             client: Client::builder().build().unwrap(),
             auth,
             auth_mode: crate::auth::AuthMode::None,
@@ -1096,7 +1087,6 @@ mod tests {
             store: st,
             by_model: HashMap::new(),
             pools: HashMap::new(),
-            rr: AtomicUsize::new(0),
             client: Client::builder().build().unwrap(),
             auth,
             auth_mode: crate::auth::AuthMode::None,
@@ -1247,7 +1237,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -1341,7 +1330,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -1478,7 +1466,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -1618,7 +1605,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -1748,7 +1734,6 @@ mod tests {
             store,
             by_model: by_model.clone(),
             pools: pools.clone(),
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -1837,7 +1822,6 @@ mod tests {
             store: store_token,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -1942,7 +1926,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -2078,7 +2061,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -2252,7 +2234,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -2395,7 +2376,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -2611,7 +2591,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -2822,7 +2801,6 @@ mod tests {
                 store,
                 by_model,
                 pools,
-                rr: AtomicUsize::new(0),
                 client: Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
@@ -2920,7 +2898,6 @@ mod tests {
                 store,
                 by_model,
                 pools,
-                rr: AtomicUsize::new(0),
                 client: Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
@@ -3020,7 +2997,6 @@ mod tests {
                 store,
                 by_model,
                 pools,
-                rr: AtomicUsize::new(0),
                 client: Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
@@ -3115,7 +3091,6 @@ mod tests {
                 store,
                 by_model,
                 pools,
-                rr: AtomicUsize::new(0),
                 client: Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
@@ -3211,7 +3186,6 @@ mod tests {
                 store,
                 by_model,
                 pools,
-                rr: AtomicUsize::new(0),
                 client: Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
@@ -3307,7 +3281,6 @@ mod tests {
                 store,
                 by_model,
                 pools,
-                rr: AtomicUsize::new(0),
                 client: Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
@@ -3455,7 +3428,6 @@ mod tests {
                     store,
                     by_model,
                     pools,
-                    rr: AtomicUsize::new(0),
                     client: Client::builder()
                         .timeout(Duration::from_secs(30))
                         .build()
@@ -3663,7 +3635,6 @@ mod tests {
                 store,
                 by_model,
                 pools,
-                rr: AtomicUsize::new(0),
                 client: Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
@@ -3805,7 +3776,6 @@ mod tests {
                 store,
                 by_model,
                 pools,
-                rr: AtomicUsize::new(0),
                 client: Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
@@ -3940,7 +3910,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -4091,7 +4060,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -4234,7 +4202,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -4363,7 +4330,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -4552,7 +4518,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -4745,7 +4710,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -4894,7 +4858,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -5065,7 +5028,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -5121,7 +5083,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -5167,7 +5128,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -5254,7 +5214,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -5379,7 +5338,6 @@ mod tests {
             store: Arc::new(InMemoryStore::new(vec![lane_data])),
             by_model: HashMap::from([("glm-4.5".to_string(), 0)]),
             pools: HashMap::new(),
-            rr: AtomicUsize::new(0),
             client: Client::builder().build().unwrap(),
             auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
             auth_mode: crate::auth::AuthMode::None,
@@ -5468,7 +5426,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -5561,7 +5518,6 @@ mod tests {
             store,
             by_model: HashMap::from([("m".to_string(), 0)]),
             pools: HashMap::new(),
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -5674,7 +5630,6 @@ mod tests {
             store,
             by_model: HashMap::from([("m".to_string(), 0)]),
             pools: HashMap::new(),
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -5795,7 +5750,6 @@ mod tests {
             store,
             by_model: HashMap::from([("m".to_string(), 0)]),
             pools: HashMap::new(),
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -5943,7 +5897,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -6079,7 +6032,6 @@ mod tests {
             store,
             by_model,
             pools,
-            rr: AtomicUsize::new(0),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()

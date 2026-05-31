@@ -312,37 +312,6 @@ impl OnExhausted {
             )),
         }
     }
-
-    /// Parse with optional pool name argument (reserved for future use).
-    #[allow(dead_code)] // Reserved for future extension
-    pub(crate) fn parse_with_arg(action: &str, arg: Option<&str>) -> Result<Self, String> {
-        match action {
-            "reject" | "503" | "status_503" | "status503" => Ok(OnExhausted::Status503),
-            "least_bad" | "least-bad" | "leastbad" => Ok(OnExhausted::LeastBad),
-            "fallback_pool" => {
-                let pool_name = arg.ok_or("fallback_pool requires a pool name argument")?;
-                if pool_name.is_empty() {
-                    Err("fallback_pool requires a non-empty pool name".into())
-                } else {
-                    Ok(OnExhausted::FallbackPool(pool_name.to_string()))
-                }
-            }
-            // Explicit handling of common typos/variants for clarity
-            s if s.starts_with("fallback_pool:") => {
-                let pool_name = &s["fallback_pool:".len()..];
-                if pool_name.is_empty() {
-                    Err("fallback_pool requires a non-empty pool name".into())
-                } else {
-                    Ok(OnExhausted::FallbackPool(pool_name.to_string()))
-                }
-            }
-            // Unknown actions - explicit error, NO _ => catch-all
-            unknown => Err(format!(
-                "unknown on_exhausted action '{}': valid values are 'reject', '503', 'status_503', 'fallback_pool:<name>', or 'least_bad'",
-                unknown
-            )),
-        }
-    }
 }
 
 #[allow(dead_code)] // v1 schema fields defined but not yet wired into routing

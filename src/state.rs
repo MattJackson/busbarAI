@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Matthew Jackson
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 pub(crate) use crate::proto::Protocol;
@@ -46,9 +45,6 @@ pub(crate) struct App {
     pub(crate) by_model: HashMap<String, usize>,
     /// Pools now carry weights alongside lane indices.
     pub(crate) pools: HashMap<String, Vec<WeightedLane>>,
-    /// Round-robin counter - no longer used after but kept for potential fallback.
-    #[allow(dead_code)] // No longer used; SWRR handles selection
-    pub(crate) rr: AtomicUsize,
     pub(crate) client: Client,
     pub(crate) auth: Arc<crate::auth::AuthMiddleware>,
     pub(crate) auth_mode: crate::auth::AuthMode,
