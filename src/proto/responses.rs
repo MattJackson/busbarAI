@@ -1459,8 +1459,10 @@ mod tests {
             &mut state,
         );
         assert_eq!(events1.len(), 1);
-        matches!(events1[0], crate::ir::IrStreamEvent::MessageStart { .. });
-
+        assert!(matches!(
+            events1[0],
+            crate::ir::IrStreamEvent::MessageStart { .. }
+        ));
         // response.output_item.added for function_call → BlockStart
         let events2 = reader_read_response_events(
             "response.output_item.added",
@@ -1471,21 +1473,30 @@ mod tests {
             &mut state,
         );
         assert_eq!(events2.len(), 1);
-        matches!(events2[0], crate::ir::IrStreamEvent::BlockStart { .. });
-
+        assert!(matches!(
+            events2[0],
+            crate::ir::IrStreamEvent::BlockStart { .. }
+        ));
         // response.output_text.delta ×3 → BlockStart (lazy) + BlockDelta ×3
         let delta_json = |d: &str| serde_json::json!({"output_index": 0, "delta": d});
         let events3a =
             reader_read_response_events("response.output_text.delta", &delta_json("H"), &mut state);
         assert_eq!(events3a.len(), 2); // BlockStart + BlockDelta
-        matches!(events3a[0], crate::ir::IrStreamEvent::BlockStart { .. });
-        matches!(events3a[1], crate::ir::IrStreamEvent::BlockDelta { .. });
-
+        assert!(matches!(
+            events3a[0],
+            crate::ir::IrStreamEvent::BlockStart { .. }
+        ));
+        assert!(matches!(
+            events3a[1],
+            crate::ir::IrStreamEvent::BlockDelta { .. }
+        ));
         let events3b =
             reader_read_response_events("response.output_text.delta", &delta_json("i"), &mut state);
         assert_eq!(events3b.len(), 1); // BlockDelta only
-        matches!(events3b[0], crate::ir::IrStreamEvent::BlockDelta { .. });
-
+        assert!(matches!(
+            events3b[0],
+            crate::ir::IrStreamEvent::BlockDelta { .. }
+        ));
         let events3c =
             reader_read_response_events("response.output_text.delta", &delta_json("!"), &mut state);
         assert_eq!(events3c.len(), 1); // BlockDelta only
@@ -1497,8 +1508,10 @@ mod tests {
             &mut state,
         );
         assert_eq!(events4.len(), 1);
-        matches!(events4[0], crate::ir::IrStreamEvent::BlockStop { .. });
-
+        assert!(matches!(
+            events4[0],
+            crate::ir::IrStreamEvent::BlockStop { .. }
+        ));
         // response.completed with usage → MessageDelta + MessageStop
         let completed_json = serde_json::json!({
             "response": {
@@ -1509,9 +1522,11 @@ mod tests {
         let events5 =
             reader_read_response_events("response.completed", &completed_json, &mut state);
         assert_eq!(events5.len(), 2);
-        matches!(events5[0], crate::ir::IrStreamEvent::MessageDelta { .. });
-        matches!(events5[1], crate::ir::IrStreamEvent::MessageStop);
-
+        assert!(matches!(
+            events5[0],
+            crate::ir::IrStreamEvent::MessageDelta { .. }
+        ));
+        assert!(matches!(events5[1], crate::ir::IrStreamEvent::MessageStop));
         // response.in_progress should not emit MessageStart again (state.started=true)
         let events6 = reader_read_response_events(
             "response.in_progress",
