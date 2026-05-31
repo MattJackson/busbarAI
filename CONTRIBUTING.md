@@ -22,14 +22,18 @@ cargo clippy --all-targets -- -D warnings   # lints must be clean
 cargo fmt --all          # format before committing
 ```
 
-Run locally against the example config:
+Run locally against the shipped example config (two YAML files; keys are supplied
+via the env vars named in `config.yaml`):
 
 ```bash
-cp config.example.json config.json
-BUSBAR_CONFIG=./config.json cargo run
+export BUSBAR_CLIENT_TOKEN=dev-token
+export ANTHROPIC_KEY=sk-ant-...      # any provider key referenced by config.yaml
+BUSBAR_PROVIDERS=./providers.yaml BUSBAR_CONFIG=./config.yaml cargo run
 curl -s localhost:8080/healthz
-curl -s localhost:8080/stats | jq
+curl -s -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" localhost:8080/stats | jq
 ```
+
+See [docs/configuration.md](docs/configuration.md) for the full config reference.
 
 ## Before you open a pull request
 

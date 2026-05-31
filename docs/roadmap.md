@@ -51,6 +51,30 @@ the next **auth adapters** on a seam that already exists.
   (request/response/streaming Reader + Writer, bearer auth). System prompts are
   canonicalized into the IR so they survive cross-protocol translation.
 
+## Shipped in 0.15
+
+- **Active health checks** — a per-provider `health:` block (`mode: none|dead|active`,
+  `interval_secs`, `timeout_secs`). `dead` re-probes only tripped lanes for prompt
+  recovery; `active` probes every lane so a silently-dead upstream trips before real
+  traffic hits it. Probes reuse each protocol's `probe_body`, so all six protocols
+  work with no per-protocol code.
+- **Per-pool circuit-breaker config** — a pool's `breaker:` block (`trip.mode`
+  error_rate|consecutive, window/threshold/min_requests/n, base/max cooldown) now
+  drives the trip decision instead of a hardcoded rule.
+- **`failover.exclusions`** — members named there are removed from a pool's
+  candidate set entirely (never primary or failover).
+- **Configurable affinity header** — a pool's `affinity.header_name` (default
+  `x-session-id`).
+- **Breaker recovery fix** — a tripped lane now completes recovery to Closed on a
+  successful half-open probe (previously it could become permanently dead).
+
+## Shipped in 0.16
+
+- **Per-(pool, lane) circuit-breaker isolation** — a lane shared across pools now
+  carries independent breaker state per pool, so one pool tripping a lane no longer
+  benches it for the others. Concurrency and `max_requests` budget stay shared
+  (one upstream); a successful health probe recovers the lane in every pool.
+
 ## Roadmap (1.0)
 
 ### Auth adapters for enterprise backends
@@ -74,8 +98,10 @@ same pattern Bedrock established with SigV4:
   documented as a recipe.
 
 ### 1.0 hardening
-- Operator documentation (`docs/configuration.md` — every field, routing model,
-  governance/observability setup).
+- Operator documentation — initial pass shipped:
+  [`configuration.md`](configuration.md) (every config field + worked examples),
+  [`architecture.md`](architecture.md) (request lifecycle + IR seam), and
+  [`operations.md`](operations.md) (breaker, health, governance, troubleshooting).
 - Soak / load testing.
 - Security review (virtual-key issuance, budget accounting, Bedrock SigV4).
 

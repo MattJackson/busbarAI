@@ -1,8 +1,8 @@
 [package]
 name = "busbar"
-version = "0.1.0"
+version = "0.16.0"
 edition = "2021"
-description = "A tiny central LLM gateway: path-based routing + round-robin pools that stack per-model concurrency, with smart per-lane health."
+description = "Native-protocol LLM gateway: lossless cross-protocol translation, weighted pools, per-(pool,lane) circuit breaking, and governance — in one static Rust binary."
 license = "AGPL-3.0-or-later"
 
 [[bin]]

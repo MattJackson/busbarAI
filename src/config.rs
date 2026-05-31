@@ -250,7 +250,9 @@ impl Default for BreakerCfg {
 }
 
 fn default_cooldown() -> u64 {
-    10
+    // Matches `store::BreakerCfg::default()` (used when a pool omits the `breaker:` block), so the
+    // base cooldown is a consistent 15s whether or not the block is present.
+    15
 }
 
 fn default_max_cooldown() -> u64 {

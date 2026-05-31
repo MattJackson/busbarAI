@@ -146,9 +146,9 @@ fn finish(
     resp
 }
 
-// POST /v1/chat/completions — OpenAI-style ingress: model from body, same-protocol passthrough.
-// Cross-protocol translation (openai ingress → non-openai lane) is and NOT implemented here;
-// if the body's model resolves to a non-openai lane, this would send an OpenAI body upstream (wrong).
+// POST /v1/chat/completions — OpenAI-style ingress: model comes from the body. Routes through
+// `forward_with_pool` with ingress protocol "openai", so a request whose model resolves to a
+// non-OpenAI lane is translated both ways (request and response) via the IR — cross-protocol works.
 #[tracing::instrument(name = "openai_ingress", skip_all)]
 pub(crate) async fn openai_ingress(
     State(app): State<Arc<App>>,
