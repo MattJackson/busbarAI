@@ -172,6 +172,12 @@ impl Protocol {
     pub(crate) fn gemini() -> Self {
         Self::new("gemini", GeminiReader, GeminiWriter)
     }
+
+    /// Construct an OpenAI Responses protocol instance.
+    #[allow(dead_code)] // Reserved for B-540b integration (later cycle)
+    pub(crate) fn responses() -> Self {
+        Self::new("responses", ResponsesReader, ResponsesWriter)
+    }
 }
 
 /// Resolve a built-in Protocol by name (for ingress translation). Cheap (unit structs).
@@ -182,6 +188,8 @@ pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
         "openai" => Some(Protocol::openai()),
         #[allow(dead_code)] // Reserved for B-510 integration (later cycle)
         "gemini" => Some(Protocol::gemini()),
+        #[allow(dead_code)] // Reserved for B-540b integration (later cycle)
+        "responses" => Some(Protocol::responses()),
         _ => None,
     }
 }
@@ -296,10 +304,12 @@ fn reframe_sse(event_type: &str, data: &serde_json::Value) -> String {
 mod anthropic;
 mod gemini;
 mod openai;
+mod responses;
 
 pub(crate) use anthropic::{AnthropicReader, AnthropicWriter};
 pub(crate) use gemini::{GeminiReader, GeminiWriter};
 pub(crate) use openai::{OpenAiReader, OpenAiWriter};
+pub(crate) use responses::{ResponsesReader, ResponsesWriter};
 
 /// String-keyed registry for protocol lookup (ADR-0008). Shared infrastructure: lives in the
 /// proto module root, not any single protocol's file. `with_builtins` registers every protocol.
