@@ -286,7 +286,17 @@ async fn main() {
         observability::init_otlp(endpoint);
     }
 
-    let router = Router::new()
+    let router = build_router(app);
+
+    let listener = tokio::net::TcpListener::bind(&listen).await.expect("bind");
+    eprintln!("busbar listening on {listen}");
+    axum::serve(listener, router).await.unwrap();
+}
+
+/// Build the busbar HTTP router for a given `App` state. Factored out of `main` so the full
+/// route table + auth middleware can be exercised end-to-end in tests (C-2).
+pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
+    Router::new()
         .route("/stats", get(handlers::stats))
         .route("/healthz", get(handlers::healthz))
         .route("/metrics", get(metrics::handler))
@@ -297,9 +307,5 @@ async fn main() {
             app.clone(),
             auth::auth_middleware,
         ))
-        .with_state(app);
-
-    let listener = tokio::net::TcpListener::bind(&listen).await.expect("bind");
-    eprintln!("busbar listening on {listen}");
-    axum::serve(listener, router).await.unwrap();
+        .with_state(app)
 }

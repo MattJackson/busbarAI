@@ -54,6 +54,7 @@ fn finish(ingress_protocol: &str, pool: &str, started: Instant, resp: Response) 
 // POST /v1/chat/completions — OpenAI-style ingress: model from body, same-protocol passthrough.
 // Cross-protocol translation (openai ingress → non-openai lane) is B-503 and NOT implemented here;
 // if the body's model resolves to a non-openai lane, this would send an OpenAI body upstream (wrong).
+#[tracing::instrument(name = "openai_ingress", skip_all)]
 pub(crate) async fn openai_ingress(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -113,6 +114,7 @@ pub(crate) async fn openai_ingress(
 }
 
 // POST /<name>/v1/messages   — name resolves to a pool (round-robin) or a single model
+#[tracing::instrument(name = "named", skip_all, fields(pool = %name))]
 pub(crate) async fn named(
     State(app): State<Arc<App>>,
     Path(name): Path<String>,
@@ -160,6 +162,7 @@ pub(crate) async fn named(
 }
 
 // POST /<provider>/<model>/v1/messages — ad-hoc direct
+#[tracing::instrument(name = "adhoc", skip_all, fields(provider = %provider, model = %model))]
 pub(crate) async fn adhoc(
     State(app): State<Arc<App>>,
     Path((provider, model)): Path<(String, String)>,

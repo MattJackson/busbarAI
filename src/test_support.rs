@@ -440,6 +440,58 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// C-2: GET /metrics through the REAL router (route table + auth middleware) over HTTP returns
+    /// the Prometheus exposition with NO caller token — the endpoint is auth-exempt like /healthz.
+    #[tokio::test]
+    async fn test_metrics_endpoint_served_over_http_no_auth() {
+        crate::metrics::init();
+        metrics::counter!(crate::metrics::REQUESTS_TOTAL, "outcome" => "ok").increment(1);
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let store = Arc::new(InMemoryStore::new(vec![]));
+        let app = Arc::new(App {
+            lanes: vec![],
+            store,
+            by_model: HashMap::new(),
+            pools: HashMap::new(),
+            rr: AtomicUsize::new(0),
+            client: Client::builder().build().unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+        });
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .expect("GET /metrics");
+        assert_eq!(resp.status().as_u16(), 200);
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(ct.starts_with("text/plain"), "content-type was {ct}");
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains(crate::metrics::REQUESTS_TOTAL),
+            "exposition should contain a metric; got:\n{body}"
+        );
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_sse_incremental_arrival() {
         let state = Arc::new(MockServerState::new());

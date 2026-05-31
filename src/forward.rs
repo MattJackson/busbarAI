@@ -502,6 +502,11 @@ pub(crate) async fn forward(
 }
 
 /// Forward with pool name context for on_exhausted config lookup.
+#[tracing::instrument(
+    name = "forward",
+    skip_all,
+    fields(pool = %pool_name, ingress = %ingress_protocol)
+)]
 pub(crate) async fn forward_with_pool(
     app: Arc<App>,
     cands: Vec<WeightedLane>,
@@ -586,6 +591,7 @@ pub(crate) async fn forward_with_pool(
             "lane" => app.lanes[i].model.clone()
         )
         .increment(1);
+        tracing::debug!(pool = %pool_name, lane = %app.lanes[i].model, "upstream attempt");
 
         let egress_name = app.lanes[i].protocol.name();
         if ingress_protocol != egress_name {
@@ -783,6 +789,7 @@ pub(crate) async fn forward_with_pool(
                                 "lane" => app.lanes[i].model.clone()
                             )
                             .increment(1);
+                            tracing::warn!(pool = %pool_name, lane = %app.lanes[i].model, reason = %reason, "lane hard-down (breaker trip)");
                             metrics::counter!(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
                                 "pool" => pool_name.to_string(),
@@ -998,6 +1005,7 @@ fn handle_status_503(app: &Arc<App>, cands: &[WeightedLane], now: u64) -> Respon
 /// candidate (or give up). The concurrency `permit` is held for the lifetime of a streamed
 /// success body (B-201 invariant) and dropped on error.
 /// NOTE: Cross-protocol request translation on this degraded path is deferred to B-503b.
+#[tracing::instrument(name = "forward_once", skip_all, fields(lane = i))]
 async fn forward_once(
     app: &Arc<App>,
     i: usize,
