@@ -75,7 +75,9 @@ impl AuthMiddleware {
             .collect();
 
         if mode == AuthMode::None && tokens.is_empty() {
-            tracing::warn!("auth.mode=none (open relay) — only acceptable for dev; reject in production");
+            tracing::warn!(
+                "auth.mode=none (open relay) — only acceptable for dev; reject in production"
+            );
         }
 
         Self {

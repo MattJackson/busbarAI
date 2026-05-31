@@ -91,9 +91,7 @@ pub(crate) fn init_logging(otlp_endpoint: Option<&str>) {
 
 /// Build the OpenTelemetry tracing layer for OTLP/HTTP export to `endpoint`. Returns `None` (and
 /// logs to stderr — the subscriber isn't up yet) if the exporter can't be built.
-fn build_otlp_layer<S>(
-    endpoint: &str,
-) -> Option<impl tracing_subscriber::Layer<S>>
+fn build_otlp_layer<S>(endpoint: &str) -> Option<impl tracing_subscriber::Layer<S>>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {

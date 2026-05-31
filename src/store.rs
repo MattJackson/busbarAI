@@ -19,6 +19,10 @@ const ST_CLOSED: u64 = 0;
 const ST_OPEN: u64 = 1;
 const ST_HALF_OPEN: u64 = 2;
 
+// Bounded capacity of each cell's sliding outcome window (recent request outcomes for the
+// error-rate trip computation).
+const OUTCOME_WINDOW_CAPACITY: usize = 1024;
+
 /// Get current time in seconds since epoch.
 pub(crate) fn now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -177,34 +181,45 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     fn snapshot(&self, lane: usize, now: u64) -> LaneSnapshot;
 }
 
-/// Bounded sliding window of timestamped outcomes (ring buffer style).
-/// Stores timestamps in seconds since epoch. Memory is bounded by `capacity`.
+/// Bounded sliding window of recent request outcomes, each tagged success/error, used to compute
+/// the error-rate trip signal. Backed by a `VecDeque` so dropping the oldest entry at capacity is
+/// O(1). Memory is bounded by `capacity`.
 #[derive(Debug, Clone)]
 pub(crate) struct OutcomeWindow {
-    entries: Vec<u64>,
+    /// (timestamp_secs, is_error) per outcome, oldest at the front.
+    entries: std::collections::VecDeque<(u64, bool)>,
     capacity: usize,
 }
 
 impl OutcomeWindow {
     fn new(capacity: usize) -> Self {
         Self {
-            entries: Vec::with_capacity(capacity),
+            entries: std::collections::VecDeque::with_capacity(capacity),
             capacity,
         }
     }
 
-    /// Add a timestamped outcome. If over capacity, drop oldest.
-    fn push(&mut self, ts: u64) {
+    /// Record a timestamped outcome (`is_error` true for a failure). Drops the oldest at capacity.
+    fn push(&mut self, ts: u64, is_error: bool) {
         if self.entries.len() >= self.capacity {
-            self.entries.remove(0);
+            self.entries.pop_front();
         }
-        self.entries.push(ts);
+        self.entries.push_back((ts, is_error));
     }
 
-    /// Count outcomes within `window_s` seconds of `now`.
+    /// Total outcomes within `window_s` seconds of `now`.
     fn count_in_window(&self, now: u64, window_s: u64) -> usize {
         let start = now.saturating_sub(window_s);
-        self.entries.iter().filter(|&&ts| ts >= start).count()
+        self.entries.iter().filter(|(ts, _)| *ts >= start).count()
+    }
+
+    /// Error outcomes within `window_s` seconds of `now`.
+    fn error_count_in_window(&self, now: u64, window_s: u64) -> usize {
+        let start = now.saturating_sub(window_s);
+        self.entries
+            .iter()
+            .filter(|(ts, is_error)| *ts >= start && *is_error)
+            .count()
     }
 
     /// Clear all entries.
@@ -233,12 +248,12 @@ pub(crate) struct BreakerCell {
 impl BreakerCell {
     fn new() -> Self {
         Self {
-            breaker_state: AtomicU64::new(0), // Closed
+            breaker_state: AtomicU64::new(ST_CLOSED),
             streak: AtomicU32::new(0),
             cooldown_until: AtomicU64::new(0),
             probe_in_flight: AtomicBool::new(false),
             err: AtomicU64::new(0),
-            outcome_window: std::sync::Mutex::new(OutcomeWindow::new(1024)),
+            outcome_window: std::sync::Mutex::new(OutcomeWindow::new(OUTCOME_WINDOW_CAPACITY)),
             current_weight: AtomicI64::new(0),
         }
     }
@@ -313,6 +328,10 @@ pub(crate) struct InMemoryStore {
     /// Per-(pool, lane) breaker cells, created lazily on first access. The lane-global fields
     /// (sem/budget/dead/ok) always live on `lanes[lane]`; only the breaker FSM is isolated per pool.
     pool_cells: std::sync::Mutex<PoolCellMap>,
+    /// Serializes the SWRR weight read-modify-write so concurrent selections don't interleave their
+    /// `current_weight` updates (which would desync the algorithm's `Σ current_weight == 0` invariant
+    /// and bias distribution). Selection is microsecond-fast, so the contention is negligible.
+    swrr_lock: std::sync::Mutex<()>,
 }
 
 struct LaneState {
@@ -326,12 +345,11 @@ struct LaneState {
     streak: AtomicU32,
     dead: AtomicBool,
     dead_reason: std::sync::Mutex<String>,
-    inflight: AtomicI64,
     ok: AtomicU64,
     err: AtomicU64,
     client_fault: AtomicU64,
     // FSM state per lane
-    breaker_state: AtomicU64, // 0=Closed, 1=Open, 2=HalfOpen (stored as u64 for CAS)
+    breaker_state: AtomicU64, // stored as u64 (ST_CLOSED/ST_OPEN/ST_HALF_OPEN) so it can be CAS'd
     probe_in_flight: AtomicBool,
     outcome_window: std::sync::Mutex<OutcomeWindow>,
     // SWRR state per lane
@@ -360,13 +378,14 @@ impl InMemoryStore {
                     streak: AtomicU32::new(ld.streak),
                     dead: AtomicBool::new(ld.dead),
                     dead_reason: std::sync::Mutex::new(ld.dead_reason),
-                    inflight: AtomicI64::new(ld.inflight),
                     ok: AtomicU64::new(ld.ok),
                     err: AtomicU64::new(ld.err),
                     client_fault: AtomicU64::new(ld.client_fault),
-                    breaker_state: AtomicU64::new(0), // Closed
+                    breaker_state: AtomicU64::new(ST_CLOSED),
                     probe_in_flight: AtomicBool::new(false),
-                    outcome_window: std::sync::Mutex::new(OutcomeWindow::new(1024)),
+                    outcome_window: std::sync::Mutex::new(OutcomeWindow::new(
+                        OUTCOME_WINDOW_CAPACITY,
+                    )),
                     current_weight: AtomicI64::new(0),
                 })
             })
@@ -374,6 +393,7 @@ impl InMemoryStore {
         Self {
             lanes: lane_states,
             pool_cells: std::sync::Mutex::new(std::collections::HashMap::new()),
+            swrr_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -420,19 +440,16 @@ impl InMemoryStore {
 
         match cfg.trip.mode {
             TripMode::ErrorRate => {
+                // Both numerator and denominator come from the SAME sliding window, so the fraction
+                // reflects RECENT health only. (Previously the numerator was the cumulative error
+                // counter, which could exceed the windowed count and spuriously trip a long-running
+                // lane on clean traffic.)
                 let count = window.count_in_window(now, cfg.trip.window_s);
                 if count < cfg.trip.min_requests {
                     return false; // Below floor
                 }
-                let error_count = c.err().load(Ordering::Relaxed) as usize;
-                // err is cumulative since the last close; cap it at the windowed outcome count so
-                // a stale error count can't dominate once recent traffic has been healthy.
-                let fraction = if count > 0 {
-                    (error_count.min(count)) as f64 / count as f64
-                } else {
-                    0.0
-                };
-                fraction >= cfg.trip.threshold
+                let errors = window.error_count_in_window(now, cfg.trip.window_s);
+                (errors as f64 / count as f64) >= cfg.trip.threshold
             }
             TripMode::Consecutive => c.streak().load(Ordering::Relaxed) >= cfg.trip.n,
         }
@@ -468,8 +485,16 @@ impl InMemoryStore {
                 .unwrap_or_default()
                 .as_nanos();
 
+            // Signed jitter in [-jitter_range, +jitter_range]; apply its sign so cooldowns are
+            // spread both shorter AND longer (desyncing lanes). Using the absolute value here was a
+            // bug — it only ever lengthened the cooldown.
             let jitter = (jitter_seed as i64 % (2 * jitter_range as i64 + 1)) - jitter_range as i64;
-            duration = duration.saturating_add(jitter.unsigned_abs()).clamp(
+            let jittered = if jitter >= 0 {
+                duration.saturating_add(jitter as u64)
+            } else {
+                duration.saturating_sub(jitter.unsigned_abs())
+            };
+            duration = jittered.clamp(
                 duration / 2, // At least half of base
                 cfg.max_cooldown_secs,
             );
@@ -550,7 +575,7 @@ impl InMemoryStore {
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
     ) {
-        c.outcome_window().lock().unwrap().push(now_time);
+        c.outcome_window().lock().unwrap().push(now_time, true); // error outcome
         c.err().fetch_add(1, Ordering::Relaxed);
         c.streak().fetch_add(1, Ordering::Relaxed);
 
@@ -576,7 +601,7 @@ impl InMemoryStore {
     fn cell_record_success(c: &dyn BreakerCellAccess, now_time: u64) {
         let was_half_open = c.breaker_state().load(Ordering::Acquire) == ST_HALF_OPEN;
         c.streak().store(0, Ordering::Release);
-        c.outcome_window().lock().unwrap().push(now_time);
+        c.outcome_window().lock().unwrap().push(now_time, false); // success outcome
         if was_half_open {
             Self::cell_closed(c);
         }
@@ -641,7 +666,6 @@ pub(crate) struct LaneData {
     pub streak: u32,
     pub dead: bool,
     pub dead_reason: String,
-    pub inflight: i64,
     pub ok: u64,
     pub err: u64,
     pub client_fault: u64,
@@ -661,7 +685,6 @@ fn make_lane_data_with_weight(id: usize, max_permits: usize) -> (LaneData, u32) 
         streak: 0,
         dead: false,
         dead_reason: String::new(),
-        inflight: 0,
         ok: 0,
         err: 0,
         client_fault: 0,
@@ -849,7 +872,11 @@ impl InMemoryStore {
             return None;
         }
 
-        // SWRR over the healthy subset (ADR-0001), using each cell's per-pool current_weight.
+        // Smooth weighted round-robin over the healthy subset, using each cell's per-pool
+        // current_weight. The add/find-max/subtract is one logical step, so serialize it across
+        // concurrent selections (otherwise interleaving corrupts the `Σ current_weight == 0`
+        // invariant and biases distribution).
+        let _swrr = self.swrr_lock.lock().unwrap();
         let total: i64 = healthy.iter().map(|(_, _, w)| *w).sum();
         for (_, cell, eff_wt) in &healthy {
             cell.current_weight().fetch_add(*eff_wt, Ordering::Relaxed);
@@ -976,11 +1003,9 @@ impl StateStore for InMemoryStore {
             return true;
         }
         let cells = self.pool_cells.lock().unwrap();
-        cells
-            .iter()
-            .any(|((_, l), cell)| {
-                *l == lane && cell.breaker_state.load(Ordering::Acquire) != ST_CLOSED
-            })
+        cells.iter().any(|((_, l), cell)| {
+            *l == lane && cell.breaker_state.load(Ordering::Acquire) != ST_CLOSED
+        })
     }
 
     fn try_acquire(&self, lane: usize) -> Option<Permit> {
@@ -1008,7 +1033,9 @@ impl StateStore for InMemoryStore {
             model: ls.model.clone(),
             provider: ls.provider.clone(),
             max_concurrent: ls.max,
-            inflight: ls.inflight.load(Ordering::Relaxed),
+            // In-flight count derived from the semaphore (the source of truth): a held permit is an
+            // in-flight request. `max - available` rather than a separate counter that can drift.
+            inflight: ls.max.saturating_sub(ls.sem.available_permits()) as i64,
             free_slots: ls.sem.available_permits(),
             ok: ls.ok.load(Ordering::Relaxed),
             err: ls.err.load(Ordering::Relaxed),
@@ -1052,7 +1079,7 @@ impl InMemoryStore {
 
         // Add to sliding window
         let mut window = ls.outcome_window.lock().unwrap();
-        window.push(now_time);
+        window.push(now_time, true);
 
         ls.err.fetch_add(1, Ordering::Relaxed);
     }
@@ -1064,9 +1091,9 @@ impl InMemoryStore {
         // Reset streak on success (for the FSM to know we recovered)
         ls.streak.store(0, Ordering::Release);
 
-        // Add to sliding window (success doesn't count toward error fraction directly)
+        // Add to sliding window
         let mut window = ls.outcome_window.lock().unwrap();
-        window.push(now_time);
+        window.push(now_time, false);
 
         ls.ok.fetch_add(1, Ordering::Relaxed);
     }
@@ -1088,7 +1115,6 @@ mod tests {
             streak: 0,
             dead: false,
             dead_reason: String::new(),
-            inflight: 0,
             ok: 0,
             err: 0,
             client_fault: 0,
@@ -1694,6 +1720,44 @@ mod tests {
             store.cell_err_for_test("A", 0),
             0,
             "pool A's cell must be untouched by pool B's transients (isolation under load)"
+        );
+    }
+
+    /// Regression: the error-rate trip must use WINDOWED errors, not the cumulative counter. Old
+    /// errors that have aged out of the window must not trip a lane whose recent traffic is clean.
+    #[test]
+    fn test_error_rate_ignores_stale_errors_outside_window() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 15,
+            max_cooldown_secs: 120,
+            honor_retry_after: true,
+            trip: TripConfig {
+                mode: TripMode::ErrorRate,
+                window_s: 30,
+                threshold: 0.5,
+                min_requests: 5,
+                n: u32::MAX,
+            },
+        };
+
+        // 100 errors long ago (raw helper: seeds the window + cumulative err without evaluating).
+        set_now_for_test(1000);
+        for _ in 0..100 {
+            store.record_outcome_error_with_time(0, 1000);
+        }
+        // Advance well past the 30s window, then take clean recent traffic.
+        set_now_for_test(2000);
+        for _ in 0..5 {
+            store.record_outcome_success_with_time(0, 2000);
+        }
+        // One recent error arrives. Windowed view: 5 successes + 1 error = 1/6 ≈ 0.17 < 0.5 → no
+        // trip. (The old cumulative-error logic would have computed min(101,6)/6 = 1.0 and tripped.)
+        store.record_transient(0, "5xx", &cfg, None);
+        assert_eq!(
+            store.breaker_state(0),
+            BreakerState::Closed,
+            "stale out-of-window errors must not trip a lane on clean recent traffic"
         );
     }
 

@@ -621,7 +621,7 @@ impl ProtocolWriter for GeminiWriter {
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
         vec![(
             HeaderName::from_static("x-goog-api-key"),
-            HeaderValue::from_str(key).expect("api key is valid"),
+            HeaderValue::from_str(key).unwrap_or_else(|_| HeaderValue::from_static("")),
         )]
     }
 

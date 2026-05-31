@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -166,6 +164,19 @@ impl UsageTap {
     }
 }
 
+/// Deterministic FNV-1a hash of a string — stable across processes/restarts (unlike the
+/// std `DefaultHasher`, whose seed is randomized), so session affinity pins consistently.
+fn stable_hash(s: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for &byte in s.as_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 /// Find the start of a JSON object (opening brace) in bytes.
 fn find_json_start(chunk: &[u8]) -> Option<usize> {
     chunk.iter().position(|&b| b == b'{')
@@ -188,6 +199,11 @@ fn find_matching_brace(chunk: &[u8]) -> Option<usize> {
             b'"' => in_string = !in_string,
             b'{' if !in_string => depth += 1,
             b'}' if !in_string => {
+                // Guard against a closing brace with no matching opener (malformed/adversarial
+                // upstream bytes): `depth` is unsigned, so `depth -= 1` here would underflow.
+                if depth == 0 {
+                    return None;
+                }
                 depth -= 1;
                 if depth == 0 {
                     return Some(i + 1);
@@ -448,12 +464,12 @@ async fn pick_among(
 ) -> Option<(usize, Permit)> {
     let t = now();
 
-    // Session affinity preference - try sticky lane first if usable (in this pool's breaker view)
+    // Session affinity preference - try sticky lane first if usable (in this pool's breaker view).
+    // Uses a stable hash (NOT DefaultHasher, whose seed is randomized per process) so a session
+    // pins to the same lane across restarts.
     if let Some(k) = _affinity_key {
         if !cands.is_empty() {
-            let mut h = DefaultHasher::new();
-            k.hash(&mut h);
-            let pos = (h.finish() as usize) % cands.len();
+            let pos = (stable_hash(k) as usize) % cands.len();
             let sticky = cands[pos].idx;
 
             if !request_ctx.excluded.contains(&sticky) && app.store.usable_in(pool_name, sticky, t)

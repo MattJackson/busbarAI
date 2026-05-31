@@ -133,7 +133,6 @@ async fn main() {
             streak: 0,
             dead: false,
             dead_reason: String::new(),
-            inflight: 0,
             ok: 0,
             err: 0,
             client_fault: 0,

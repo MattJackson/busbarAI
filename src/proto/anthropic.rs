@@ -5,6 +5,10 @@
 
 use super::*;
 
+/// Value of the required `anthropic-version` request header (the Messages API version busbar
+/// targets). Bump when adopting a newer Anthropic API version.
+const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+
 #[derive(Clone)]
 pub(crate) struct AnthropicReader;
 
@@ -737,7 +741,9 @@ fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
         crate::ir::IrRole::System => "system",
         crate::ir::IrRole::User => "user",
         crate::ir::IrRole::Assistant => "assistant",
-        crate::ir::IrRole::Tool => "tool_use",
+        // Anthropic has no "tool" message role — tool results are carried as `user` messages whose
+        // content holds `tool_result` block(s). (Reachable when translating an OpenAI `tool` message.)
+        crate::ir::IrRole::Tool => "user",
     };
     let content_val: serde_json::Value = if msg.content.is_empty() {
         serde_json::Value::String("".to_string())
@@ -771,18 +777,22 @@ impl ProtocolWriter for AnthropicWriter {
     }
 
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
+        // A key with bytes that aren't valid in an HTTP header (e.g. a stray newline in the env
+        // var) yields an empty header rather than panicking the worker — the upstream then returns
+        // a clean 401 that the breaker classifies normally.
         vec![
             (
                 HeaderName::from_static("x-api-key"),
-                HeaderValue::from_str(key).expect("api key is valid"),
+                HeaderValue::from_str(key).unwrap_or_else(|_| HeaderValue::from_static("")),
             ),
             (
                 HeaderName::from_static("authorization"),
-                HeaderValue::from_str(&format!("Bearer {}", key)).expect("bearer token is valid"),
+                HeaderValue::from_str(&format!("Bearer {key}"))
+                    .unwrap_or_else(|_| HeaderValue::from_static("")),
             ),
             (
                 HeaderName::from_static("anthropic-version"),
-                HeaderValue::from_static("2023-06-01"),
+                HeaderValue::from_static(ANTHROPIC_API_VERSION),
             ),
         ]
     }

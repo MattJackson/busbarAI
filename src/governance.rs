@@ -521,7 +521,12 @@ impl Store for SqliteStore {
                 spend_cents = spend_cents + excluded.spend_cents,
                 tokens      = tokens + excluded.tokens,
                 requests    = requests + 1",
-            params![key_id, window_start as i64, spend_cents, tokens as i64],
+            params![
+                key_id,
+                window_start as i64,
+                spend_cents,
+                i64::try_from(tokens).unwrap_or(i64::MAX)
+            ],
         )?;
         Ok(())
     }

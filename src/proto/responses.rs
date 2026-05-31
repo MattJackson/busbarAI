@@ -751,7 +751,8 @@ impl ProtocolWriter for ResponsesWriter {
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
         vec![(
             HeaderName::from_static("authorization"),
-            HeaderValue::from_str(&format!("Bearer {}", key)).expect("bearer token is valid"),
+            HeaderValue::from_str(&format!("Bearer {key}"))
+                .unwrap_or_else(|_| HeaderValue::from_static("")),
         )]
     }
 
