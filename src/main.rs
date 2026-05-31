@@ -35,6 +35,7 @@ mod forward;
 mod handlers;
 mod ir;
 mod metrics;
+mod observability;
 mod proto;
 mod route;
 mod state;
@@ -77,6 +78,9 @@ async fn main() {
         config::interpolate_env(&raw_config).expect("expand ${ENV} variables in config");
     let deploy: config::DeployCfg =
         serde_yaml::from_str(&interpolated_config).expect("parse config.yaml as DeployCfg");
+
+    // Observability sinks (B-603/B-604): grab before `deploy` is borrowed by resolve().
+    let observability_cfg = deploy.observability.clone().unwrap_or_default();
 
     // Resolve deployment + definitions into resolved RootCfg
     let cfg =
@@ -271,6 +275,16 @@ async fn main() {
         fallback_pools,
         on_exhausted_cfgs,
     });
+
+    // B-604: configure the request-log webhook (reusing the pooled client). No-op if unset.
+    observability::configure_webhook(
+        observability_cfg.request_log_webhook_url.clone(),
+        app.client.clone(),
+    );
+    // B-603: install the OTLP tracer when an endpoint is configured (no-op otherwise).
+    if let Some(endpoint) = observability_cfg.otlp_endpoint.as_deref() {
+        observability::init_otlp(endpoint);
+    }
 
     let router = Router::new()
         .route("/stats", get(handlers::stats))

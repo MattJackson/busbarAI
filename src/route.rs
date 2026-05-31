@@ -32,12 +32,22 @@ fn finish(ingress_protocol: &str, pool: &str, started: Instant, resp: Response) 
         "outcome" => outcome
     )
     .increment(1);
+    let elapsed = started.elapsed();
     metrics::histogram!(
         crate::metrics::REQUEST_DURATION_SECONDS,
         "ingress_protocol" => ingress_protocol.to_string(),
         "pool" => pool.to_string()
     )
-    .record(started.elapsed().as_secs_f64());
+    .record(elapsed.as_secs_f64());
+
+    // B-604: best-effort request-log webhook (no-op unless configured).
+    crate::observability::fire_request_log(crate::observability::build_request_log(
+        crate::store::now(),
+        ingress_protocol,
+        pool,
+        outcome,
+        elapsed.as_millis() as u64,
+    ));
     resp
 }
 

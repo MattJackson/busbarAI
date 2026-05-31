@@ -388,6 +388,23 @@ pub(crate) struct DeployCfg {
     pub(crate) providers: HashMap<String, ProviderDeploy>,
     pub(crate) models: HashMap<String, ModelCfg>,
     pub(crate) pools: HashMap<String, PoolCfg>,
+    /// B-603/B-604: optional observability sinks (OTLP traces + request-log webhook). Metrics
+    /// (`/metrics`) are always on and need no config.
+    #[serde(default)]
+    pub(crate) observability: Option<ObservabilityCfg>,
+}
+
+/// Observability sinks (sprint 0.11). All fields optional; absent = that sink is disabled.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub(crate) struct ObservabilityCfg {
+    /// OTLP/HTTP traces endpoint (e.g. `http://localhost:4318/v1/traces`). When set, busbar
+    /// installs an OpenTelemetry tracer + exports spans (B-603).
+    #[serde(default)]
+    pub(crate) otlp_endpoint: Option<String>,
+    /// When set, busbar fires a best-effort (fire-and-forget) JSON request-log POST per request
+    /// to this URL (B-604).
+    #[serde(default)]
+    pub(crate) request_log_webhook_url: Option<String>,
 }
 
 /// Resolve DeployCfg + ProviderDef map into resolved RootCfg.
@@ -549,6 +566,7 @@ mod tests {
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
+            observability: None,
         };
 
         let result = resolve(&deploy, &defs).expect("resolve should succeed");
@@ -592,6 +610,7 @@ mod tests {
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
+            observability: None,
         };
 
         let result = resolve(&deploy, &defs);
@@ -638,6 +657,7 @@ mod tests {
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
+            observability: None,
         };
 
         let result = resolve(&deploy, &defs).expect("resolve should succeed");
@@ -692,6 +712,7 @@ mod tests {
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
+            observability: None,
         };
 
         let result = resolve(&deploy, &defs).expect("resolve should succeed");
