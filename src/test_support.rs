@@ -646,6 +646,85 @@ mod tests {
         handle.abort();
     }
 
+    /// G-4: a virtual key over its RPM is rejected with 429 + Retry-After.
+    #[tokio::test]
+    async fn test_governance_rate_limit_429() {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let secret = "sk-vk-rl";
+        store
+            .put_key(&VirtualKey {
+                id: "krl".to_string(),
+                key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
+                name: "rl".to_string(),
+                allowed_pools: vec![],
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: Some(2),
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        let gov = Arc::new(GovState::new(store, 0).unwrap());
+
+        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
+        let st = Arc::new(InMemoryStore::new(vec![]));
+        let app = Arc::new(App {
+            lanes: vec![],
+            store: st,
+            by_model: HashMap::new(),
+            pools: HashMap::new(),
+            rr: AtomicUsize::new(0),
+            client: Client::builder().build().unwrap(),
+            auth,
+            auth_mode: crate::auth::AuthMode::None,
+            failover_cfg: None,
+            fallback_pools: HashMap::new(),
+            on_exhausted_cfgs: HashMap::new(),
+            governance: Some(gov),
+        });
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/anypool/v1/messages");
+
+        // RPM=2: first two pass the rate gate (then 404 — no such pool); the third is rate-limited.
+        for i in 0..2 {
+            let r = client
+                .post(&url)
+                .bearer_auth(secret)
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status().as_u16(),
+                404,
+                "request {i} under limit (routing 404)"
+            );
+        }
+        let r = client
+            .post(&url)
+            .bearer_auth(secret)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 429, "3rd request over RPM → 429");
+        assert!(
+            r.headers().get(reqwest::header::RETRY_AFTER).is_some(),
+            "429 must carry Retry-After"
+        );
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_sse_incremental_arrival() {
         let state = Arc::new(MockServerState::new());

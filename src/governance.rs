@@ -12,6 +12,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
+/// G-4: per-key rate-limit state for the current 60s window. Ephemeral (in-memory, not persisted —
+/// ADR-0009: single-node rate windows; cross-node distributed limits are a future Redis concern).
+#[derive(Default)]
+struct RateState {
+    window_start: u64,
+    requests: u32,
+    tokens: u64,
+}
+
 /// Per-instance governance runtime: the durable `Store` plus an in-memory key cache (hashed-secret
 /// → key) so validation on the hot path is a map lookup, not a DB round-trip. Held in `App`
 /// (`Option`: `None` = governance disabled) — NOT a process-global, so tests stay isolated.
@@ -22,6 +31,8 @@ pub(crate) struct GovState {
     /// request-cost. (Token-/model-priced budgets are a documented future refinement; this keeps
     /// the budget real + enforceable without parsing every response body.)
     price_per_request_cents: i64,
+    /// G-4: per-key RPM/TPM windows (ephemeral).
+    rate: RwLock<HashMap<String, RateState>>,
 }
 
 #[allow(dead_code)] // refresh/store used by the management API (G-5)
@@ -32,7 +43,55 @@ impl GovState {
             store,
             by_hash: RwLock::new(by_hash),
             price_per_request_cents,
+            rate: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// G-4: check + consume one request slot against the key's RPM/TPM for the current 60s window.
+    /// `Ok(())` admits the request (and counts it); `Err(retry_after_secs)` rejects it (429). RPM is
+    /// enforced precisely; TPM is enforced against tokens accrued so far this window (tokens are
+    /// added post-response via `record_request`, so TPM trails RPM until token accounting lands).
+    pub(crate) fn check_rate(&self, key: &VirtualKey, now: u64) -> Result<(), u64> {
+        if key.rpm_limit.is_none() && key.tpm_limit.is_none() {
+            return Ok(());
+        }
+        let window = now / 60 * 60;
+        let retry = (window + 60).saturating_sub(now).max(1);
+        let mut map = self.rate.write().unwrap();
+        let st = map.entry(key.id.clone()).or_default();
+        if st.window_start != window {
+            *st = RateState {
+                window_start: window,
+                requests: 0,
+                tokens: 0,
+            };
+        }
+        if let Some(tpm) = key.tpm_limit {
+            if st.tokens >= tpm as u64 {
+                return Err(retry);
+            }
+        }
+        if let Some(rpm) = key.rpm_limit {
+            if st.requests >= rpm {
+                return Err(retry);
+            }
+        }
+        st.requests += 1;
+        Ok(())
+    }
+
+    /// G-4: add tokens to the key's current rate window (for TPM). Called from `record_request`.
+    fn add_rate_tokens(&self, key_id: &str, now: u64, tokens: u64) {
+        if tokens == 0 {
+            return;
+        }
+        let window = now / 60 * 60;
+        let mut map = self.rate.write().unwrap();
+        if let Some(st) = map.get_mut(key_id) {
+            if st.window_start == window {
+                st.tokens += tokens;
+            }
+        }
     }
 
     /// G-3: is this key already at/over its budget for the current window? (No cap → never.)
@@ -57,6 +116,8 @@ impl GovState {
         {
             eprintln!("busbar: usage record failed for key {}: {e}", key.id);
         }
+        // G-4: also feed the rate window's TPM counter.
+        self.add_rate_tokens(&key.id, now, tokens);
     }
 
     fn load(store: &dyn Store) -> StoreResult<HashMap<String, VirtualKey>> {
@@ -493,6 +554,34 @@ mod tests {
         let mut unlimited = k.clone();
         unlimited.max_budget_cents = None;
         assert!(!gov.is_over_budget(&unlimited, 1_700_000_000));
+    }
+
+    #[test]
+    fn test_check_rate_rpm_window() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 1).unwrap();
+        let mut k = sample_key("k1", "h1");
+        k.rpm_limit = Some(2);
+        k.tpm_limit = None;
+        let now = 1_700_000_040; // mid-window
+
+        assert!(gov.check_rate(&k, now).is_ok(), "1st request");
+        assert!(gov.check_rate(&k, now).is_ok(), "2nd request");
+        let retry = gov.check_rate(&k, now).unwrap_err();
+        assert!((1..=60).contains(&retry), "3rd → 429 with retry {retry}");
+        // Next 60s window resets the counter.
+        assert!(
+            gov.check_rate(&k, now + 60).is_ok(),
+            "new window admits again"
+        );
+
+        // A key with no RPM/TPM cap is never rate-limited.
+        let mut unl = sample_key("k2", "h2");
+        unl.rpm_limit = None;
+        unl.tpm_limit = None;
+        for _ in 0..100 {
+            assert!(gov.check_rate(&unl, now).is_ok());
+        }
     }
 
     #[test]

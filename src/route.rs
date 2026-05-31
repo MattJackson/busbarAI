@@ -53,6 +53,24 @@ fn budget_check(app: &Arc<App>, gov: &crate::governance::GovCtx) -> Option<Respo
     None
 }
 
+/// G-4 (0.12): reject (429 + Retry-After) before forwarding when the resolved virtual key is over
+/// its RPM/TPM for the current window. No-op when governance is off or the key has no rate cap.
+fn rate_check(app: &Arc<App>, gov: &crate::governance::GovCtx) -> Option<Response> {
+    if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
+        if let Err(retry) = g.check_rate(key, crate::store::now()) {
+            return Some(
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(axum::http::header::RETRY_AFTER, retry.to_string())],
+                    format!("rate limit exceeded for virtual key '{}'", key.id),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    None
+}
+
 /// B-602/G-3: the ingress boundary — emit per-request observability metrics (one client request =
 /// one call here, unlike the re-entrant forward_with_pool) AND charge the request to the virtual
 /// key's budget. Outcome is derived from the final status; duration is wall-clock.
@@ -139,6 +157,10 @@ pub(crate) async fn openai_ingress(
     if let Some(resp) = budget_check(&app, &gov) {
         return resp;
     }
+    // G-4: reject rate-limited keys before forwarding.
+    if let Some(resp) = rate_check(&app, &gov) {
+        return resp;
+    }
 
     let _affinity_key: Option<&str> = headers.get("x-session-id").and_then(|v| v.to_str().ok());
 
@@ -195,6 +217,10 @@ pub(crate) async fn named(
     if let Some(resp) = budget_check(&app, &gov) {
         return resp;
     }
+    // G-4: reject rate-limited keys before forwarding.
+    if let Some(resp) = rate_check(&app, &gov) {
+        return resp;
+    }
 
     let started = Instant::now();
     let affinity_key = headers.get("x-session-id").and_then(|v| v.to_str().ok());
@@ -249,6 +275,10 @@ pub(crate) async fn adhoc(
     }
     // G-3: reject over-budget keys before forwarding.
     if let Some(resp) = budget_check(&app, &gov) {
+        return resp;
+    }
+    // G-4: reject rate-limited keys before forwarding.
+    if let Some(resp) = rate_check(&app, &gov) {
         return resp;
     }
 
