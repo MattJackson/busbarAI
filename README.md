@@ -13,7 +13,7 @@ The name comes from electrical distribution: a busbar takes one feed and fans it
 out across many breakered circuits — one entry point, weighted distribution,
 per-circuit protection.
 
-> **Project status: 0.11.0 (pre-1.0), in active development.** Working today:
+> **Project status: 0.11.1 (pre-1.0), in active development.** Working today:
 > **five protocols** — Anthropic, OpenAI (chat completions), Google **Gemini**, AWS **Bedrock**
 > (Converse), and OpenAI **Responses** — each read/written natively, with **full cross-protocol
 > translation** through a lossless superset IR (request *and* response, streaming *and*
