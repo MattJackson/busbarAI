@@ -5,6 +5,30 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.1] — 2026-05-31
+
+Second RC for final testing — fixes from the first 0.17.0 testing pass.
+
+### Fixed
+- **Dead-mode health probing now recovers soft-cooldown lanes.** A sub-threshold transient leaves
+  the breaker Closed but arms a cooldown; the prober gate only fired for fully-tripped (Open) cells,
+  so a single 5xx benched a single-member route for the full ~30s cooldown with no active recovery.
+  The gate is now "breaker-suppressed in any cell" (Open/HalfOpen **or** a pending cooldown), and a
+  successful probe clears the soft cooldown too.
+- **Cross-protocol reasoning is preserved (OpenAI → Anthropic).** A model's `reasoning_content`
+  (chain-of-thought) now maps to a `thinking` block instead of being dropped — both non-streaming
+  (a leading thinking block) and streaming (a thinking block at index 0, with text/tools shifted
+  after it). Non-reasoning responses are unchanged.
+- **`--help` / `--version` and startup errors** no longer panic before argument handling: those
+  flags print and exit without touching the filesystem, an unknown flag is a clean usage error, and
+  every misconfiguration (missing/invalid providers.yaml or config.yaml, bad env interpolation,
+  unknown provider/protocol, pool→unknown-model, invalid on_exhausted, bind failure) prints a clean
+  `[error] …` instead of a backtrace.
+
+### Notes
+- +7 unit tests (now 261): soft-cooldown recovery, reasoning translation (stream + non-stream),
+  malformed-Authorization safety, config parsing, JSON-scanner underflow safety, stable affinity hash.
+
 ## [0.17.0] — 2026-05-31
 
 Release candidate for final testing ahead of 1.0. Outcome of a three-model code audit
