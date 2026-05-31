@@ -399,6 +399,9 @@ pub(crate) struct DeployCfg {
     pub(crate) auth: Option<AuthCfg>,
     pub(crate) providers: HashMap<String, ProviderDeploy>,
     pub(crate) models: HashMap<String, ModelCfg>,
+    /// Pools are optional: a deployment can route to models directly (`/<model>/v1/messages`)
+    /// without defining any pool.
+    #[serde(default)]
     pub(crate) pools: HashMap<String, PoolCfg>,
     /// /: optional observability sinks (OTLP traces + request-log webhook). Metrics
     /// (`/metrics`) are always on and need no config.
@@ -523,6 +526,26 @@ pub(crate) fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal config without a `pools:` section parses fine — pools are optional (direct
+    /// model routing). Only providers + models are required.
+    #[test]
+    fn test_config_without_pools_parses() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+providers:
+  anthropic:
+    api_key_env: ANTHROPIC_KEY
+models:
+  claude:
+    provider: anthropic
+    max_concurrent: 10
+"#;
+        let deploy: DeployCfg =
+            serde_yaml::from_str(yaml).expect("config without pools must parse");
+        assert!(deploy.pools.is_empty());
+        assert!(deploy.models.contains_key("claude"));
+    }
 
     /// A provider's `path` override flows from the catalog (and a deployment override wins) into
     /// the resolved ProviderCfg — the knob that fixes version-in-base-url providers.
