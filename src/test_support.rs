@@ -5884,7 +5884,11 @@ mod tests {
             Bytes::from(request_body.to_string()),
         )
         .await;
-        assert_eq!(resp.status().as_u16(), 200, "translation route must succeed");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "translation route must succeed"
+        );
 
         let received = state
             .get_last_request_body()

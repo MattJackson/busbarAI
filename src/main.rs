@@ -265,10 +265,7 @@ async fn main() {
             path: provider_cfg.path.clone(),
             auth: provider_cfg.auth.clone(),
             health: provider_cfg.health.clone(),
-            default_max_tokens: model_default_max_tokens
-                .get(&ld.model)
-                .copied()
-                .flatten(),
+            default_max_tokens: model_default_max_tokens.get(&ld.model).copied().flatten(),
         });
     }
 

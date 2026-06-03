@@ -25,7 +25,10 @@ use crate::store::{now, Permit};
 /// already carries a value or the egress protocol treats `max_tokens` as optional.
 fn apply_required_max_tokens(ir: &mut crate::ir::IrRequest, lane: &Lane) {
     if ir.max_tokens.is_none() && lane.protocol.writer().requires_max_tokens() {
-        ir.max_tokens = Some(lane.default_max_tokens.unwrap_or(crate::proto::DEFAULT_MAX_TOKENS));
+        ir.max_tokens = Some(
+            lane.default_max_tokens
+                .unwrap_or(crate::proto::DEFAULT_MAX_TOKENS),
+        );
     }
 }
 
