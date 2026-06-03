@@ -250,6 +250,272 @@ async fn mock_handler(
     }
 }
 
+// ───────────────────────── test fixtures ─────────────────────────
+// One `LaneSpec` describes a lane and emits BOTH its `Lane` (routing/health view) and its
+// `LaneData` (breaker/permit view), so the two can't drift. `TestApp` collects lanes + optional
+// pools/auth/governance and builds an `Arc<App>` with the in-memory store wired up — replacing the
+// ~20-field `Lane`/`LaneData`/`App` literals every test used to hand-roll. Defaults match the
+// common case; chainable setters override only what a test cares about. Adding a field to
+// `Lane`/`LaneData`/`App` is now a one-line change in `to_lane`/`to_lane_data`/`build`.
+//
+// `allow(dead_code)`: this is a test DSL — not every setter is exercised by every revision of the
+// suite; keeping the full, symmetric builder surface is intentional.
+#[allow(dead_code)]
+pub(crate) struct LaneSpec {
+    model: String,
+    provider: String,
+    base_url: String,
+    protocol: std::sync::Arc<crate::proto::Protocol>,
+    max: usize,
+    api_key: String,
+    error_map: std::collections::HashMap<String, String>,
+    context_max: Option<usize>,
+    path: Option<String>,
+    auth: Option<String>,
+    health: Option<crate::config::HealthCfg>,
+    default_max_tokens: Option<u32>,
+    // LaneData-only runtime state (defaults = a fresh, healthy, unlimited lane):
+    limited: bool,
+    budget: i64,
+    cooldown_until: u64,
+    streak: u32,
+    dead: bool,
+    dead_reason: String,
+    ok: u64,
+    err: u64,
+    client_fault: u64,
+}
+
+#[allow(dead_code)]
+impl LaneSpec {
+    pub(crate) fn new(model: &str, protocol: crate::proto::Protocol, base_url: &str) -> Self {
+        Self {
+            model: model.into(),
+            provider: "test-provider".into(),
+            base_url: base_url.into(),
+            protocol: std::sync::Arc::new(protocol),
+            max: 10,
+            api_key: "k".into(),
+            error_map: std::collections::HashMap::new(),
+            context_max: None,
+            path: None,
+            auth: None,
+            health: None,
+            default_max_tokens: None,
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        }
+    }
+    pub(crate) fn provider(mut self, p: &str) -> Self {
+        self.provider = p.into();
+        self
+    }
+    pub(crate) fn max(mut self, n: usize) -> Self {
+        self.max = n;
+        self
+    }
+    pub(crate) fn api_key(mut self, k: &str) -> Self {
+        self.api_key = k.into();
+        self
+    }
+    pub(crate) fn error_map(mut self, m: std::collections::HashMap<String, String>) -> Self {
+        self.error_map = m;
+        self
+    }
+    pub(crate) fn context_max(mut self, n: usize) -> Self {
+        self.context_max = Some(n);
+        self
+    }
+    pub(crate) fn path(mut self, p: &str) -> Self {
+        self.path = Some(p.into());
+        self
+    }
+    pub(crate) fn auth(mut self, a: &str) -> Self {
+        self.auth = Some(a.into());
+        self
+    }
+    pub(crate) fn health(mut self, h: crate::config::HealthCfg) -> Self {
+        self.health = Some(h);
+        self
+    }
+    pub(crate) fn default_max_tokens(mut self, n: u32) -> Self {
+        self.default_max_tokens = Some(n);
+        self
+    }
+    /// Mark the lane as budget-limited with `n` remaining requests (sets `limited = true`).
+    pub(crate) fn budget(mut self, n: i64) -> Self {
+        self.limited = true;
+        self.budget = n;
+        self
+    }
+    pub(crate) fn cooldown_until(mut self, t: u64) -> Self {
+        self.cooldown_until = t;
+        self
+    }
+    pub(crate) fn streak(mut self, n: u32) -> Self {
+        self.streak = n;
+        self
+    }
+    pub(crate) fn dead(mut self, reason: &str) -> Self {
+        self.dead = true;
+        self.dead_reason = reason.into();
+        self
+    }
+    pub(crate) fn ok(mut self, n: u64) -> Self {
+        self.ok = n;
+        self
+    }
+    pub(crate) fn err(mut self, n: u64) -> Self {
+        self.err = n;
+        self
+    }
+
+    fn to_lane(&self) -> crate::state::Lane {
+        crate::state::Lane {
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            protocol: self.protocol.clone(),
+            max: self.max,
+            error_map: std::sync::Arc::new(self.error_map.clone()),
+            context_max: self.context_max,
+            path: self.path.clone(),
+            auth: self.auth.clone(),
+            health: self.health.clone(),
+            default_max_tokens: self.default_max_tokens,
+        }
+    }
+    fn to_lane_data(&self) -> crate::store::LaneData {
+        crate::store::LaneData {
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            max: self.max,
+            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(self.max)),
+            limited: self.limited,
+            budget: self.budget,
+            cooldown_until: self.cooldown_until,
+            streak: self.streak,
+            dead: self.dead,
+            dead_reason: self.dead_reason.clone(),
+            ok: self.ok,
+            err: self.err,
+            client_fault: self.client_fault,
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct TestApp {
+    lanes: Vec<LaneSpec>,
+    pools: std::collections::HashMap<String, Vec<crate::state::WeightedLane>>,
+    auth_mode: crate::auth::AuthMode,
+    auth: Option<std::sync::Arc<crate::auth::AuthMiddleware>>,
+    governance: Option<std::sync::Arc<crate::governance::GovState>>,
+    failover_cfg: Option<crate::config::FailoverCfg>,
+    pool_runtime: std::collections::HashMap<String, crate::state::PoolRuntime>,
+    fallback_pools: std::collections::HashMap<String, Vec<crate::state::WeightedLane>>,
+    on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
+}
+
+#[allow(dead_code)]
+impl TestApp {
+    pub(crate) fn new() -> Self {
+        Self {
+            lanes: Vec::new(),
+            pools: std::collections::HashMap::new(),
+            auth_mode: crate::auth::AuthMode::None,
+            auth: None,
+            governance: None,
+            failover_cfg: None,
+            pool_runtime: std::collections::HashMap::new(),
+            fallback_pools: std::collections::HashMap::new(),
+            on_exhausted_cfgs: std::collections::HashMap::new(),
+        }
+    }
+    pub(crate) fn lane(mut self, spec: LaneSpec) -> Self {
+        self.lanes.push(spec);
+        self
+    }
+    /// Define a pool over lane indices: `members` is `(lane_index, weight)` pairs.
+    pub(crate) fn pool(mut self, name: &str, members: &[(usize, u32)]) -> Self {
+        self.pools.insert(name.into(), weighted(members));
+        self
+    }
+    pub(crate) fn auth_mode(mut self, m: crate::auth::AuthMode) -> Self {
+        self.auth_mode = m;
+        self
+    }
+    pub(crate) fn auth(mut self, a: std::sync::Arc<crate::auth::AuthMiddleware>) -> Self {
+        self.auth = Some(a);
+        self
+    }
+    pub(crate) fn governance(mut self, g: std::sync::Arc<crate::governance::GovState>) -> Self {
+        self.governance = Some(g);
+        self
+    }
+    pub(crate) fn failover(mut self, f: crate::config::FailoverCfg) -> Self {
+        self.failover_cfg = Some(f);
+        self
+    }
+    pub(crate) fn pool_runtime(mut self, name: &str, rt: crate::state::PoolRuntime) -> Self {
+        self.pool_runtime.insert(name.into(), rt);
+        self
+    }
+    pub(crate) fn fallback_pool(mut self, name: &str, members: &[(usize, u32)]) -> Self {
+        self.fallback_pools.insert(name.into(), weighted(members));
+        self
+    }
+    pub(crate) fn on_exhausted(mut self, name: &str, oe: crate::config::OnExhausted) -> Self {
+        self.on_exhausted_cfgs.insert(name.into(), oe);
+        self
+    }
+    pub(crate) fn build(self) -> std::sync::Arc<crate::state::App> {
+        let mut by_model = std::collections::HashMap::new();
+        let mut lanes = Vec::with_capacity(self.lanes.len());
+        let mut lane_data = Vec::with_capacity(self.lanes.len());
+        for (i, spec) in self.lanes.iter().enumerate() {
+            by_model.insert(spec.model.clone(), i);
+            lanes.push(spec.to_lane());
+            lane_data.push(spec.to_lane_data());
+        }
+        let auth = self.auth.unwrap_or_else(|| {
+            std::sync::Arc::new(crate::auth::AuthMiddleware::new(
+                &crate::config::AuthCfg::default_none(),
+            ))
+        });
+        std::sync::Arc::new(crate::state::App {
+            lanes,
+            store: std::sync::Arc::new(crate::store::InMemoryStore::new(lane_data)),
+            by_model,
+            pools: self.pools,
+            client: reqwest::Client::builder().build().unwrap(),
+            auth,
+            auth_mode: self.auth_mode,
+            failover_cfg: self.failover_cfg,
+            pool_runtime: self.pool_runtime,
+            fallback_pools: self.fallback_pools,
+            on_exhausted_cfgs: self.on_exhausted_cfgs,
+            governance: self.governance,
+        })
+    }
+}
+
+#[allow(dead_code)]
+fn weighted(members: &[(usize, u32)]) -> Vec<crate::state::WeightedLane> {
+    members
+        .iter()
+        .map(|&(idx, weight)| crate::state::WeightedLane { idx, weight })
+        .collect()
+}
+
 #[allow(deprecated)]
 #[cfg(test)]
 mod tests {
@@ -363,61 +629,14 @@ mod tests {
         });
         let server = MockServer::new(state.clone()).await;
 
-        let lane_data = LaneData {
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-
-        let lane = Lane {
-            default_max_tokens: None,
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            base_url: server.base_url(),
-            api_key: "test-key".to_string(),
-            protocol: Arc::new(crate::proto::Protocol::anthropic()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-            context_max: None,
-            path: None,
-            auth: None,
-            health: None,
-        };
-
-        let by_model = HashMap::from([("test-model".to_string(), 0)]);
-        let pools = HashMap::from([(
-            "default".to_string(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
-        )]);
-        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
-        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
-        let app = Arc::new(App {
-            lanes: vec![lane],
-            store,
-            by_model,
-            pools,
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            auth,
-            auth_mode: crate::auth::AuthMode::None,
-            failover_cfg: None,
-            pool_runtime: std::collections::HashMap::new(),
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: None,
-        });
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "test-model",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            ))
+            .pool("default", &[(0, 1)])
+            .build();
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward(
@@ -463,56 +682,18 @@ mod tests {
         });
         let server = MockServer::new(state.clone()).await;
 
-        let lane_data = LaneData {
-            model: "glm-4.5".to_string(),
-            provider: "zai".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
         // Lane speaks the OpenAI protocol; ingress below is Anthropic → cross-protocol translation.
-        let lane = Lane {
-            default_max_tokens: None,
-            model: "glm-4.5".to_string(),
-            provider: "zai".to_string(),
-            base_url: server.base_url(),
-            api_key: "k".to_string(),
-            protocol: Arc::new(crate::proto::Protocol::openai()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-            context_max: None,
-            path: None,
-            auth: None,
-            health: None,
-        };
-        let app = Arc::new(App {
-            lanes: vec![lane],
-            store: Arc::new(InMemoryStore::new(vec![lane_data])),
-            by_model: HashMap::from([("glm-4.5".to_string(), 0)]),
-            pools: HashMap::from([(
-                "pa".to_string(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
-            )]),
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
-            auth_mode: crate::auth::AuthMode::None,
-            failover_cfg: None,
-            pool_runtime: std::collections::HashMap::new(),
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: None,
-        });
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "glm-4.5",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("pa", &[(0, 1)])
+            .build();
 
         let body = serde_json::to_vec(
             &json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50}),
@@ -581,55 +762,18 @@ mod tests {
             .unwrap();
         let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
 
-        let lane_data = LaneData {
-            model: "glm-4.5".to_string(),
-            provider: "zai".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-        let lane = Lane {
-            default_max_tokens: None,
-            model: "glm-4.5".to_string(),
-            provider: "zai".to_string(),
-            base_url: server.base_url(),
-            api_key: "k".to_string(),
-            protocol: Arc::new(crate::proto::Protocol::openai()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-            context_max: None,
-            path: None,
-            auth: None,
-            health: None,
-        };
-        let app = Arc::new(App {
-            lanes: vec![lane],
-            store: Arc::new(InMemoryStore::new(vec![lane_data])),
-            by_model: HashMap::from([("glm-4.5".to_string(), 0)]),
-            pools: HashMap::from([(
-                "pa".to_string(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
-            )]),
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
-            auth_mode: crate::auth::AuthMode::None,
-            failover_cfg: None,
-            pool_runtime: std::collections::HashMap::new(),
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: Some(gov),
-        });
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "glm-4.5",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("pa", &[(0, 1)])
+            .governance(gov)
+            .build();
 
         let router = crate::build_router(app);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -694,55 +838,19 @@ mod tests {
         }
         let server = MockServer::new(state.clone()).await;
 
-        let lane_data = LaneData {
-            model: "glm-4.6".to_string(),
-            provider: "z".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: true, // max_requests was configured
-            budget: 2,     // lifetime cap of 2 requests
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-        let lane = Lane {
-            default_max_tokens: None,
-            model: "glm-4.6".to_string(),
-            provider: "z".to_string(),
-            base_url: server.base_url(),
-            api_key: "k".to_string(),
-            protocol: Arc::new(crate::proto::Protocol::anthropic()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-            context_max: None,
-            path: None,
-            auth: None,
-            health: None,
-        };
-        let app = Arc::new(App {
-            lanes: vec![lane],
-            store: Arc::new(InMemoryStore::new(vec![lane_data])),
-            by_model: HashMap::from([("glm-4.6".to_string(), 0)]),
-            pools: HashMap::from([(
-                "pc".to_string(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
-            )]),
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
-            auth_mode: crate::auth::AuthMode::None,
-            failover_cfg: None,
-            pool_runtime: std::collections::HashMap::new(),
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: None,
-        });
+        // limited lane: max_requests=2 lifetime cap (sets limited=true, budget=2).
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "glm-4.6",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .provider("z")
+                .budget(2),
+            )
+            .pool("pc", &[(0, 1)])
+            .build();
 
         let cands = vec![crate::state::WeightedLane { idx: 0, weight: 1 }];
         let body = serde_json::to_vec(
@@ -824,79 +932,37 @@ mod tests {
         let server_a = mk_server("alpha").await;
         let server_b = mk_server("beta").await;
 
-        let mk_lane_data = |model: &str| LaneData {
-            model: model.to_string(),
-            provider: "p".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-        let mk_lane = |model: &str, base_url: String| Lane {
-            default_max_tokens: None,
-            model: model.to_string(),
-            provider: "p".to_string(),
-            base_url,
-            api_key: "k".to_string(),
-            protocol: Arc::new(crate::proto::Protocol::anthropic()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-            context_max: None,
-            path: None,
-            auth: None,
-            health: None,
-        };
-
-        let mut pool_runtime = HashMap::new();
-        pool_runtime.insert(
-            "pe".to_string(),
-            crate::state::PoolRuntime {
-                failover: Some(crate::config::FailoverCfg {
-                    deadline_secs: 120,
-                    exclusions: Some(vec!["beta".to_string()]),
-                    cap: 3,
-                }),
-                affinity: None,
-                breaker: None,
-            },
-        );
-
-        let app = Arc::new(App {
-            lanes: vec![
-                mk_lane("alpha", server_a.base_url()),
-                mk_lane("beta", server_b.base_url()),
-            ],
-            store: Arc::new(InMemoryStore::new(vec![
-                mk_lane_data("alpha"),
-                mk_lane_data("beta"),
-            ])),
-            by_model: HashMap::from([("alpha".to_string(), 0), ("beta".to_string(), 1)]),
-            pools: HashMap::from([(
-                "pe".to_string(),
-                vec![
-                    crate::state::WeightedLane { idx: 0, weight: 1 },
-                    crate::state::WeightedLane { idx: 1, weight: 1 },
-                ],
-            )]),
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
-            auth_mode: crate::auth::AuthMode::None,
-            failover_cfg: None,
-            pool_runtime,
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: None,
-        });
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "alpha",
+                    crate::proto::Protocol::anthropic(),
+                    &server_a.base_url(),
+                )
+                .provider("p"),
+            )
+            .lane(
+                LaneSpec::new(
+                    "beta",
+                    crate::proto::Protocol::anthropic(),
+                    &server_b.base_url(),
+                )
+                .provider("p"),
+            )
+            .pool("pe", &[(0, 1), (1, 1)])
+            .pool_runtime(
+                "pe",
+                crate::state::PoolRuntime {
+                    failover: Some(crate::config::FailoverCfg {
+                        deadline_secs: 120,
+                        exclusions: Some(vec!["beta".to_string()]),
+                        cap: 3,
+                    }),
+                    affinity: None,
+                    breaker: None,
+                },
+            )
+            .build();
 
         let cands = vec![
             crate::state::WeightedLane { idx: 0, weight: 1 },
@@ -945,22 +1011,7 @@ mod tests {
         crate::metrics::init();
         metrics::counter!(crate::metrics::REQUESTS_TOTAL, "outcome" => "ok").increment(1);
 
-        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
-        let store = Arc::new(InMemoryStore::new(vec![]));
-        let app = Arc::new(App {
-            lanes: vec![],
-            store,
-            by_model: HashMap::new(),
-            pools: HashMap::new(),
-            client: Client::builder().build().unwrap(),
-            auth,
-            auth_mode: crate::auth::AuthMode::None,
-            failover_cfg: None,
-            pool_runtime: std::collections::HashMap::new(),
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: None,
-        });
+        let app = TestApp::new().build();
 
         let router = crate::build_router(app);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2895,65 +2946,21 @@ mod tests {
             });
 
             let server = MockServer::new(state.clone()).await;
-            let lane_data = LaneData {
-                model: "test-model".to_string(),
-                provider: "z.ai".to_string(),
-                max: 10,
-                sem: Arc::new(tokio::sync::Semaphore::new(10)),
-                limited: false,
-                budget: -1,
-                cooldown_until: 0,
-                streak: 0,
-                dead: false,
-                dead_reason: String::new(),
-                ok: 0,
-                err: 0,
-                client_fault: 0,
-            };
-
             let mut error_map = HashMap::new();
             error_map.insert("1113".to_string(), "billing".to_string());
             error_map.insert("1302".to_string(), "rate_limit".to_string());
-
-            let lane = Lane {
-                default_max_tokens: None,
-                model: "test-model".to_string(),
-                provider: "z.ai".to_string(),
-                base_url: server.base_url(),
-                api_key: "test-key".to_string(),
-                protocol: Arc::new(crate::proto::Protocol::anthropic()),
-                max: 10,
-                error_map: Arc::new(error_map),
-                context_max: None,
-                path: None,
-                auth: None,
-                health: None,
-            };
-
-            let by_model = HashMap::from([("test-model".to_string(), 0)]);
-            let pools = HashMap::from([(
-                "default".to_string(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
-            )]);
-            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
-            let store = Arc::new(InMemoryStore::new(vec![lane_data]));
-            let app = Arc::new(App {
-                lanes: vec![lane],
-                store,
-                by_model,
-                pools,
-                client: Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .unwrap(),
-                auth,
-                auth_mode: crate::auth::AuthMode::None,
-                failover_cfg: None,
-                pool_runtime: std::collections::HashMap::new(),
-                fallback_pools: HashMap::new(),
-                on_exhausted_cfgs: HashMap::new(),
-                governance: None,
-            });
+            let app = TestApp::new()
+                .lane(
+                    LaneSpec::new(
+                        "test-model",
+                        crate::proto::Protocol::anthropic(),
+                        &server.base_url(),
+                    )
+                    .provider("z.ai")
+                    .error_map(error_map),
+                )
+                .pool("default", &[(0, 1)])
+                .build();
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let response = forward(
@@ -2994,65 +3001,21 @@ mod tests {
             });
 
             let server = MockServer::new(state.clone()).await;
-            let lane_data = LaneData {
-                model: "test-model".to_string(),
-                provider: "z.ai".to_string(),
-                max: 10,
-                sem: Arc::new(tokio::sync::Semaphore::new(10)),
-                limited: false,
-                budget: -1,
-                cooldown_until: 0,
-                streak: 0,
-                dead: false,
-                dead_reason: String::new(),
-                ok: 0,
-                err: 0,
-                client_fault: 0,
-            };
-
             let mut error_map = HashMap::new();
             error_map.insert("1113".to_string(), "billing".to_string());
             error_map.insert("1302".to_string(), "rate_limit".to_string());
-
-            let lane = Lane {
-                default_max_tokens: None,
-                model: "test-model".to_string(),
-                provider: "z.ai".to_string(),
-                base_url: server.base_url(),
-                api_key: "test-key".to_string(),
-                protocol: Arc::new(crate::proto::Protocol::anthropic()),
-                max: 10,
-                error_map: Arc::new(error_map),
-                context_max: None,
-                path: None,
-                auth: None,
-                health: None,
-            };
-
-            let by_model = HashMap::from([("test-model".to_string(), 0)]);
-            let pools = HashMap::from([(
-                "default".to_string(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
-            )]);
-            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
-            let store = Arc::new(InMemoryStore::new(vec![lane_data]));
-            let app = Arc::new(App {
-                lanes: vec![lane],
-                store,
-                by_model,
-                pools,
-                client: Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .unwrap(),
-                auth,
-                auth_mode: crate::auth::AuthMode::None,
-                failover_cfg: None,
-                pool_runtime: std::collections::HashMap::new(),
-                fallback_pools: HashMap::new(),
-                on_exhausted_cfgs: HashMap::new(),
-                governance: None,
-            });
+            let app = TestApp::new()
+                .lane(
+                    LaneSpec::new(
+                        "test-model",
+                        crate::proto::Protocol::anthropic(),
+                        &server.base_url(),
+                    )
+                    .provider("z.ai")
+                    .error_map(error_map),
+                )
+                .pool("default", &[(0, 1)])
+                .build();
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let _response = forward(
@@ -3095,65 +3058,21 @@ mod tests {
             });
 
             let server = MockServer::new(state.clone()).await;
-            let lane_data = LaneData {
-                model: "test-model".to_string(),
-                provider: "z.ai".to_string(),
-                max: 10,
-                sem: Arc::new(tokio::sync::Semaphore::new(10)),
-                limited: false,
-                budget: -1,
-                cooldown_until: 0,
-                streak: 0,
-                dead: false,
-                dead_reason: String::new(),
-                ok: 0,
-                err: 0,
-                client_fault: 0,
-            };
-
             let mut error_map = HashMap::new();
             error_map.insert("1113".to_string(), "billing".to_string());
             error_map.insert("1302".to_string(), "rate_limit".to_string());
-
-            let lane = Lane {
-                default_max_tokens: None,
-                model: "test-model".to_string(),
-                provider: "z.ai".to_string(),
-                base_url: server.base_url(),
-                api_key: "test-key".to_string(),
-                protocol: Arc::new(crate::proto::Protocol::anthropic()),
-                max: 10,
-                error_map: Arc::new(error_map),
-                context_max: None,
-                path: None,
-                auth: None,
-                health: None,
-            };
-
-            let by_model = HashMap::from([("test-model".to_string(), 0)]);
-            let pools = HashMap::from([(
-                "default".to_string(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
-            )]);
-            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
-            let store = Arc::new(InMemoryStore::new(vec![lane_data]));
-            let app = Arc::new(App {
-                lanes: vec![lane],
-                store,
-                by_model,
-                pools,
-                client: Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .unwrap(),
-                auth,
-                auth_mode: crate::auth::AuthMode::None,
-                failover_cfg: None,
-                pool_runtime: std::collections::HashMap::new(),
-                fallback_pools: HashMap::new(),
-                on_exhausted_cfgs: HashMap::new(),
-                governance: None,
-            });
+            let app = TestApp::new()
+                .lane(
+                    LaneSpec::new(
+                        "test-model",
+                        crate::proto::Protocol::anthropic(),
+                        &server.base_url(),
+                    )
+                    .provider("z.ai")
+                    .error_map(error_map),
+                )
+                .pool("default", &[(0, 1)])
+                .build();
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let _response = forward(
@@ -3191,65 +3110,21 @@ mod tests {
             });
 
             let server = MockServer::new(state.clone()).await;
-            let lane_data = LaneData {
-                model: "test-model".to_string(),
-                provider: "z.ai".to_string(),
-                max: 10,
-                sem: Arc::new(tokio::sync::Semaphore::new(10)),
-                limited: false,
-                budget: -1,
-                cooldown_until: 0,
-                streak: 0,
-                dead: false,
-                dead_reason: String::new(),
-                ok: 0,
-                err: 0,
-                client_fault: 0,
-            };
-
             let mut error_map = HashMap::new();
             error_map.insert("1113".to_string(), "billing".to_string());
             error_map.insert("1302".to_string(), "rate_limit".to_string());
-
-            let lane = Lane {
-                default_max_tokens: None,
-                model: "test-model".to_string(),
-                provider: "z.ai".to_string(),
-                base_url: server.base_url(),
-                api_key: "test-key".to_string(),
-                protocol: Arc::new(crate::proto::Protocol::anthropic()),
-                max: 10,
-                error_map: Arc::new(error_map),
-                context_max: None,
-                path: None,
-                auth: None,
-                health: None,
-            };
-
-            let by_model = HashMap::from([("test-model".to_string(), 0)]);
-            let pools = HashMap::from([(
-                "default".to_string(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
-            )]);
-            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
-            let store = Arc::new(InMemoryStore::new(vec![lane_data]));
-            let app = Arc::new(App {
-                lanes: vec![lane],
-                store,
-                by_model,
-                pools,
-                client: Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .unwrap(),
-                auth,
-                auth_mode: crate::auth::AuthMode::None,
-                failover_cfg: None,
-                pool_runtime: std::collections::HashMap::new(),
-                fallback_pools: HashMap::new(),
-                on_exhausted_cfgs: HashMap::new(),
-                governance: None,
-            });
+            let app = TestApp::new()
+                .lane(
+                    LaneSpec::new(
+                        "test-model",
+                        crate::proto::Protocol::anthropic(),
+                        &server.base_url(),
+                    )
+                    .provider("z.ai")
+                    .error_map(error_map),
+                )
+                .pool("default", &[(0, 1)])
+                .build();
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let _response = forward(
@@ -3288,65 +3163,21 @@ mod tests {
             });
 
             let server = MockServer::new(state.clone()).await;
-            let lane_data = LaneData {
-                model: "test-model".to_string(),
-                provider: "z.ai".to_string(),
-                max: 10,
-                sem: Arc::new(tokio::sync::Semaphore::new(10)),
-                limited: false,
-                budget: -1,
-                cooldown_until: 0,
-                streak: 0,
-                dead: false,
-                dead_reason: String::new(),
-                ok: 0,
-                err: 0,
-                client_fault: 0,
-            };
-
             let mut error_map = HashMap::new();
             error_map.insert("1113".to_string(), "billing".to_string());
             error_map.insert("1302".to_string(), "rate_limit".to_string());
-
-            let lane = Lane {
-                default_max_tokens: None,
-                model: "test-model".to_string(),
-                provider: "z.ai".to_string(),
-                base_url: server.base_url(),
-                api_key: "test-key".to_string(),
-                protocol: Arc::new(crate::proto::Protocol::anthropic()),
-                max: 10,
-                error_map: Arc::new(error_map),
-                context_max: None,
-                path: None,
-                auth: None,
-                health: None,
-            };
-
-            let by_model = HashMap::from([("test-model".to_string(), 0)]);
-            let pools = HashMap::from([(
-                "default".to_string(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
-            )]);
-            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
-            let store = Arc::new(InMemoryStore::new(vec![lane_data]));
-            let app = Arc::new(App {
-                lanes: vec![lane],
-                store,
-                by_model,
-                pools,
-                client: Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .unwrap(),
-                auth,
-                auth_mode: crate::auth::AuthMode::None,
-                failover_cfg: None,
-                pool_runtime: std::collections::HashMap::new(),
-                fallback_pools: HashMap::new(),
-                on_exhausted_cfgs: HashMap::new(),
-                governance: None,
-            });
+            let app = TestApp::new()
+                .lane(
+                    LaneSpec::new(
+                        "test-model",
+                        crate::proto::Protocol::anthropic(),
+                        &server.base_url(),
+                    )
+                    .provider("z.ai")
+                    .error_map(error_map),
+                )
+                .pool("default", &[(0, 1)])
+                .build();
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let _response = forward(
@@ -3385,65 +3216,21 @@ mod tests {
             });
 
             let server = MockServer::new(state.clone()).await;
-            let lane_data = LaneData {
-                model: "test-model".to_string(),
-                provider: "z.ai".to_string(),
-                max: 10,
-                sem: Arc::new(tokio::sync::Semaphore::new(10)),
-                limited: false,
-                budget: -1,
-                cooldown_until: 0,
-                streak: 0,
-                dead: false,
-                dead_reason: String::new(),
-                ok: 0,
-                err: 0,
-                client_fault: 0,
-            };
-
             let mut error_map = HashMap::new();
             error_map.insert("1113".to_string(), "billing".to_string());
             error_map.insert("1302".to_string(), "rate_limit".to_string());
-
-            let lane = Lane {
-                default_max_tokens: None,
-                model: "test-model".to_string(),
-                provider: "z.ai".to_string(),
-                base_url: server.base_url(),
-                api_key: "test-key".to_string(),
-                protocol: Arc::new(crate::proto::Protocol::anthropic()),
-                max: 10,
-                error_map: Arc::new(error_map),
-                context_max: None,
-                path: None,
-                auth: None,
-                health: None,
-            };
-
-            let by_model = HashMap::from([("test-model".to_string(), 0)]);
-            let pools = HashMap::from([(
-                "default".to_string(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
-            )]);
-            let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
-            let store = Arc::new(InMemoryStore::new(vec![lane_data]));
-            let app = Arc::new(App {
-                lanes: vec![lane],
-                store,
-                by_model,
-                pools,
-                client: Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .unwrap(),
-                auth,
-                auth_mode: crate::auth::AuthMode::None,
-                failover_cfg: None,
-                pool_runtime: std::collections::HashMap::new(),
-                fallback_pools: HashMap::new(),
-                on_exhausted_cfgs: HashMap::new(),
-                governance: None,
-            });
+            let app = TestApp::new()
+                .lane(
+                    LaneSpec::new(
+                        "test-model",
+                        crate::proto::Protocol::anthropic(),
+                        &server.base_url(),
+                    )
+                    .provider("z.ai")
+                    .error_map(error_map),
+                )
+                .pool("default", &[(0, 1)])
+                .build();
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let _response = forward(
