@@ -43,5 +43,12 @@ futures = "0.3"
 bytes = "1"
 
 [profile.release]
-opt-level = 2
-lto = false
+# Tuned for the shipped "deploy-and-done" binary: max optimization and smallest size,
+# at the cost of slower release compiles (fine — releases are built in CI, not in the loop).
+opt-level = 3        # full speed (was throttled to 2)
+lto = "fat"          # whole-program inlining across crates: faster hot path + smaller binary
+codegen-units = 1    # let LTO optimize across the whole crate graph (best codegen, smaller output)
+strip = true         # strip symbols from the shipped binary (much smaller; set RUST_BACKTRACE aside)
+# panic is left at the default `unwind` ON PURPOSE: a panic in one request task must unwind that
+# task, not abort the whole gateway. `panic = "abort"` would trade per-request isolation for a
+# little size — the wrong trade for a service in the request path.
