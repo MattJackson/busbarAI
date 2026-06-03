@@ -2,6 +2,12 @@
 
 **Point your existing SDK at one URL and reach every LLM vendor — with real failover, not a `try/except`.**
 
+[![CI](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/MattJackson/busbarAI)](https://github.com/MattJackson/busbarAI/releases)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+![Binary](https://img.shields.io/badge/binary-7.4MB%20static-success)
+![Rust](https://img.shields.io/badge/built%20with-Rust-orange)
+
 Your code already speaks OpenAI (or Anthropic, or Gemini). Change the base URL to Busbar, and `model: "fast"` becomes a *pool* — Claude, GPT, and Gemini behind one name, load-balanced by weight, with mid-request failover when a vendor degrades. Your application code never learns that any of it happened.
 
 ```diff
@@ -17,7 +23,7 @@ Your code already speaks OpenAI (or Anthropic, or Gemini). Change the base URL t
 
 That request left as OpenAI, may have been *served* by Anthropic, and came back as OpenAI — translated losslessly both ways. If Anthropic had returned a 429 mid-flight, Busbar would have rerouted to another pool member before your client saw a byte. One vendor's bad day stops being your outage.
 
-It's **one static Rust binary**. No Python sidecar, no runtime, no dependency tree, no GC pauses in your request path. Download it, point two YAML files at it, run it.
+It's **one static 7.4 MB binary** — no Python sidecar, no runtime, no interpreter, no dependency tree, no GC pauses in your request path. Download it, point two YAML files at it, run it.
 
 > The name is from electrical distribution: a busbar takes one feed and fans it out across many breakered circuits — one entry point, weighted distribution, per-circuit protection. That's exactly the shape of this thing.
 
@@ -45,7 +51,7 @@ If you're already weighing the options:
 
 **Thesis: protocols, not providers.** Implement a handful of wire protocols losslessly, and every vendor that speaks one is just a catalog entry — a name, a `base_url`, and the env var holding its key. Six protocols are implemented; 42 vetted providers ship as catalog entries, and any OpenAI-compatible endpoint (including your own) is three lines of YAML.
 
-> **Status: 0.17.4 — feature-complete, in pre-1.0 hardening.** Stable in practice; config and APIs may still shift before 1.0. AGPL-3.0.
+> **Status: 1.0.0-rc.1 — feature-complete and API-stable; final hardening (72h soak + perf baseline) in progress before 1.0.0.** AGPL-3.0.
 
 ## Quick start
 

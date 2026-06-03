@@ -5,6 +5,21 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-rc.1] — 2026-06-03
+
+First release candidate for 1.0. Busbar is feature-complete and API-stable: six wire protocols
+with lossless cross-protocol translation, weighted SWRR pools with per-(pool,lane) circuit breaking
+and in-flight failover, governance (virtual keys / budgets / rate limits), and a security-hardened
+request path — all in one static binary. The remaining work before 1.0.0 is operational validation
+(72h soak/leak + perf baseline vs litellm), not features.
+
+### Changed
+- **Release profile optimized for distribution.** opt-level 3 + fat LTO + `codegen-units = 1` +
+  symbol stripping cut the release binary from ~12 MB to **7.4 MB** with a faster hot path. `panic`
+  stays `unwind` so a panic in one request task can't abort the whole gateway.
+- **README rewritten** around the value proposition (SDK-swap hook, competitor comparison, Security
+  and cross-protocol-translation sections, badges).
+
 ## [0.17.4] — 2026-06-03
 
 ### Fixed
