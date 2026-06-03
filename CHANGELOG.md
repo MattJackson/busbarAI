@@ -11,7 +11,7 @@ First release candidate for 1.0. Busbar is feature-complete and API-stable: six 
 with lossless cross-protocol translation, weighted SWRR pools with per-(pool,lane) circuit breaking
 and in-flight failover, governance (virtual keys / budgets / rate limits), and a security-hardened
 request path — all in one static binary. The remaining work before 1.0.0 is operational validation
-(72h soak/leak + perf baseline vs litellm), not features.
+(extended soak/leak testing and a performance/SLO baseline), not features.
 
 ### Changed
 - **Release profile optimized for distribution.** opt-level 3 + fat LTO + `codegen-units = 1` +
