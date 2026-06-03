@@ -1634,95 +1634,19 @@ mod tests {
 
         let server = MockServer::new(state.clone()).await;
 
-        let lane0_data = LaneData {
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-
-        let lane1_data = LaneData {
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-
-        let lane0 = Lane {
-            default_max_tokens: None,
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            base_url: server.base_url(),
-            api_key: "test-key-0".to_string(),
-            protocol: Arc::new(crate::proto::Protocol::anthropic()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-            context_max: None,
-            path: None,
-            auth: None,
-            health: None,
-        };
-
-        let lane1 = Lane {
-            default_max_tokens: None,
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            base_url: server.base_url(),
-            api_key: "test-key-1".to_string(),
-            protocol: Arc::new(crate::proto::Protocol::anthropic()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-            context_max: None,
-            path: None,
-            auth: None,
-            health: None,
-        };
-
-        let by_model = HashMap::from([("test-model".to_string(), 0)]);
-        let pools = HashMap::from([(
-            "default".to_string(),
-            vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
-            ],
-        )]);
-        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
-        let store = Arc::new(InMemoryStore::new(vec![lane0_data, lane1_data]));
-        let app = Arc::new(App {
-            lanes: vec![lane0, lane1],
-            store,
-            by_model,
-            pools,
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            auth,
-            auth_mode: crate::auth::AuthMode::None,
-            failover_cfg: None,
-            pool_runtime: std::collections::HashMap::new(),
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: None,
-        });
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "lane0",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            ))
+            .lane(LaneSpec::new(
+                "lane1",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            ))
+            .pool("default", &[(0, 1), (1, 1)])
+            .build();
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
@@ -1794,66 +1718,24 @@ mod tests {
         let server = MockServer::new(state.clone()).await;
 
         // Scenario A: Passthrough mode — lane should NOT be tripped
-        let lane_data = LaneData {
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-
-        let lane = Lane {
-            default_max_tokens: None,
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            base_url: server.base_url(),
-            api_key: "busbar-key".to_string(),
-            protocol: Arc::new(crate::proto::Protocol::anthropic()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-            context_max: None,
-            path: None,
-            auth: None,
-            health: None,
-        };
-
-        let by_model = HashMap::from([("test-model".to_string(), 0)]);
-        let pools = HashMap::from([(
-            "default".to_string(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
-        )]);
         let auth_cfg_passthrough = AuthCfg {
             mode: "passthrough".to_string(),
             client_tokens: vec![],
             _legacy_token: None,
         };
-        let auth_mw_passthrough = Arc::new(AuthMiddleware::new(&auth_cfg_passthrough));
-        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
-        let app_passthrough = Arc::new(App {
-            lanes: vec![lane],
-            store,
-            by_model: by_model.clone(),
-            pools: pools.clone(),
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            auth: auth_mw_passthrough,
-            auth_mode: crate::auth::AuthMode::Passthrough,
-            failover_cfg: None,
-            pool_runtime: std::collections::HashMap::new(),
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: None,
-        });
+        let app_passthrough = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "test-model",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .api_key("busbar-key"),
+            )
+            .pool("default", &[(0, 1)])
+            .auth(Arc::new(AuthMiddleware::new(&auth_cfg_passthrough)))
+            .auth_mode(crate::auth::AuthMode::Passthrough)
+            .build();
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward(
@@ -1889,61 +1771,24 @@ mod tests {
             status: StatusCode::UNAUTHORIZED,
         });
 
-        let lane_data_token = LaneData {
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-
-        let lane_token = Lane {
-            default_max_tokens: None,
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            base_url: server.base_url(),
-            api_key: "busbar-key".to_string(),
-            protocol: Arc::new(crate::proto::Protocol::anthropic()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-            context_max: None,
-            path: None,
-            auth: None,
-            health: None,
-        };
-
         let auth_cfg_token = AuthCfg {
             mode: "token".to_string(),
             client_tokens: vec!["caller-token-123".to_string()],
             _legacy_token: None,
         };
-        let auth_mw_token = Arc::new(AuthMiddleware::new(&auth_cfg_token));
-        let store_token = Arc::new(InMemoryStore::new(vec![lane_data_token]));
-        let app_token = Arc::new(App {
-            lanes: vec![lane_token],
-            store: store_token,
-            by_model,
-            pools,
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            auth: auth_mw_token,
-            auth_mode: crate::auth::AuthMode::Token,
-            failover_cfg: None,
-            pool_runtime: std::collections::HashMap::new(),
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: None,
-        });
+        let app_token = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "test-model",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .api_key("busbar-key"),
+            )
+            .pool("default", &[(0, 1)])
+            .auth(Arc::new(AuthMiddleware::new(&auth_cfg_token)))
+            .auth_mode(crate::auth::AuthMode::Token)
+            .build();
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward(
@@ -1990,66 +1835,24 @@ mod tests {
 
         let server = MockServer::new(state.clone()).await;
 
-        let lane_data = LaneData {
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-
-        let lane = Lane {
-            default_max_tokens: None,
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            base_url: server.base_url(),
-            api_key: "busbar-central-key".to_string(),
-            protocol: Arc::new(crate::proto::Protocol::anthropic()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-            context_max: None,
-            path: None,
-            auth: None,
-            health: None,
-        };
-
-        let by_model = HashMap::from([("test-model".to_string(), 0)]);
-        let pools = HashMap::from([(
-            "default".to_string(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
-        )]);
         let auth_cfg_passthrough = AuthCfg {
             mode: "passthrough".to_string(),
             client_tokens: vec![],
             _legacy_token: None,
         };
-        let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg_passthrough));
-        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
-        let app = Arc::new(App {
-            lanes: vec![lane],
-            store,
-            by_model,
-            pools,
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            auth: auth_mw,
-            auth_mode: crate::auth::AuthMode::Passthrough,
-            failover_cfg: None,
-            pool_runtime: std::collections::HashMap::new(),
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: None,
-        });
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "test-model",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .api_key("busbar-central-key"),
+            )
+            .pool("default", &[(0, 1)])
+            .auth(Arc::new(AuthMiddleware::new(&auth_cfg_passthrough)))
+            .auth_mode(crate::auth::AuthMode::Passthrough)
+            .build();
 
         // Caller's Bearer token (NOT busbar's key)
         let caller_bearer_token = "caller-specific-token-abc123";
@@ -4825,27 +4628,7 @@ mod tests {
         use axum::http::HeaderMap;
 
         // Build a minimal App (no lanes needed for this test)
-        let by_model = HashMap::new();
-        let pools = HashMap::new();
-        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
-        let store = Arc::new(InMemoryStore::new(vec![]));
-        let app = Arc::new(App {
-            lanes: vec![],
-            store,
-            by_model,
-            pools,
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            auth,
-            auth_mode: crate::auth::AuthMode::None,
-            failover_cfg: None,
-            pool_runtime: std::collections::HashMap::new(),
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: None,
-        });
+        let app = TestApp::new().build();
 
         // Missing "model" field in body
         let req_body = serde_json::json!({
@@ -4873,52 +4656,17 @@ mod tests {
     async fn test_adhoc_rejects_unconfigured_provider_model() {
         use crate::route;
 
-        let lane_data = LaneData {
-            model: "test-model".to_string(),
-            provider: "openai".to_string(),
-            max: 1,
-            sem: Arc::new(tokio::sync::Semaphore::new(1)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-        let lane = Lane {
-            default_max_tokens: None,
-            model: "test-model".to_string(),
-            provider: "openai".to_string(),
-            base_url: "https://configured.example.com".to_string(),
-            api_key: "k".to_string(),
-            protocol: Arc::new(crate::proto::Protocol::openai()),
-            max: 1,
-            error_map: Arc::new(std::collections::HashMap::new()),
-            context_max: None,
-            path: None,
-            auth: None,
-            health: None,
-        };
-        let app = Arc::new(App {
-            lanes: vec![lane],
-            store: Arc::new(InMemoryStore::new(vec![lane_data])),
-            by_model: HashMap::from([("test-model".to_string(), 0)]),
-            pools: HashMap::new(),
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
-            auth_mode: crate::auth::AuthMode::None,
-            failover_cfg: None,
-            pool_runtime: std::collections::HashMap::new(),
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: None,
-        });
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "test-model",
+                    crate::proto::Protocol::openai(),
+                    "https://configured.example.com",
+                )
+                .provider("openai")
+                .max(1),
+            )
+            .build();
 
         let body = Bytes::from_static(b"{\"messages\":[]}");
 
@@ -4960,27 +4708,7 @@ mod tests {
         use axum::http::HeaderMap;
 
         // Build a minimal App with no "nope" model
-        let by_model = HashMap::new();
-        let pools = HashMap::new();
-        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
-        let store = Arc::new(InMemoryStore::new(vec![]));
-        let app = Arc::new(App {
-            lanes: vec![],
-            store,
-            by_model,
-            pools,
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            auth,
-            auth_mode: crate::auth::AuthMode::None,
-            failover_cfg: None,
-            pool_runtime: std::collections::HashMap::new(),
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: None,
-        });
+        let app = TestApp::new().build();
 
         // Unknown model in body
         let req_body = serde_json::json!({
@@ -5006,8 +4734,6 @@ mod tests {
     /// Assert the MOCK UPSTREAM RECEIVED an Anthropic-shaped body (top-level "system" field, messages without system entry).
     #[tokio::test]
     async fn test_cross_protocol_openai_to_anthropic() {
-        use std::collections::HashMap;
-
         let state = Arc::new(MockServerState::new());
 
         // Mock will receive translated Anthropic-shaped body and return 200
@@ -5018,58 +4744,12 @@ mod tests {
 
         let server = MockServer::new(state.clone()).await;
 
-        let lane_data = LaneData {
-            model: "m".to_string(),
-            provider: "anthropic".to_string(),
-            max: 10,
-            sem: Arc::new(tokio::sync::Semaphore::new(10)),
-            limited: false,
-            budget: -1,
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-        };
-
-        let lane = Lane {
-            default_max_tokens: None,
-            model: "m".to_string(),
-            provider: "anthropic".to_string(),
-            base_url: server.base_url(),
-            api_key: "test-key".to_string(),
-            protocol: Arc::new(crate::proto::Protocol::anthropic()),
-            max: 10,
-            error_map: Arc::new(std::collections::HashMap::new()),
-            context_max: None,
-            path: None,
-            auth: None,
-            health: None,
-        };
-
-        let by_model = HashMap::from([("m".to_string(), 0)]);
-        let pools = HashMap::new();
-        let auth = Arc::new(AuthMiddleware::new(&AuthCfg::default_none()));
-        let store = Arc::new(InMemoryStore::new(vec![lane_data]));
-        let app = Arc::new(App {
-            lanes: vec![lane],
-            store,
-            by_model,
-            pools,
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            auth,
-            auth_mode: crate::auth::AuthMode::None,
-            failover_cfg: None,
-            pool_runtime: std::collections::HashMap::new(),
-            fallback_pools: HashMap::new(),
-            on_exhausted_cfgs: HashMap::new(),
-            governance: None,
-        });
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("m", crate::proto::Protocol::anthropic(), &server.base_url())
+                    .provider("anthropic"),
+            )
+            .build();
 
         // OpenAI-format body (system inside first message)
         let openai_body = json!({
