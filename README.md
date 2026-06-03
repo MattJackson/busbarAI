@@ -1,76 +1,121 @@
 # Busbar
 
-> **One endpoint for every LLM. Swap models and vendors without touching client code.**
+**Point your existing SDK at one URL and reach every LLM vendor — with real failover, not a `try/except`.**
 
-Point your app at Busbar, speak whatever protocol your SDK already speaks, and reach
-any backend — Anthropic, OpenAI, Gemini, Bedrock, and 38 more — behind a single URL.
-Busbar translates between wire protocols *losslessly*, spreads load across weighted
-**pools**, and fails over in-flight when a vendor degrades, so one provider's bad day
-isn't your outage.
+Your code already speaks OpenAI (or Anthropic, or Gemini). Change the base URL to Busbar, and `model: "fast"` becomes a *pool* — Claude, GPT, and Gemini behind one name, load-balanced by weight, with mid-request failover when a vendor degrades. Your application code never learns that any of it happened.
 
-No per-vendor SDKs in your app. No Python sidecar. No pile of per-provider
-`try/except` failover. Just one static binary and two YAML files.
+```diff
+- client = OpenAI(api_key=OPENAI_KEY)
++ client = OpenAI(api_key=BUSBAR_TOKEN, base_url="http://busbar:8080")
 
-`Feature-complete` · `267 tests` · `clippy -D warnings` clean · `security-hardened` ·
-`single static binary` · `AGPL-3.0`
+  client.chat.completions.create(
+-     model="gpt-4o-mini",
++     model="fast",          # a pool: 80% Claude, 20% GPT-4o-mini, Gemini on failover
+      messages=[{"role": "user", "content": "Hello!"}],
+  )
+```
 
-### Why it exists
+That request left as OpenAI, may have been *served* by Anthropic, and came back as OpenAI — translated losslessly both ways. If Anthropic had returned a 429 mid-flight, Busbar would have rerouted to another pool member before your client saw a byte. One vendor's bad day stops being your outage.
 
-If you build with LLMs, you've felt this: every vendor ships its own SDK and wire
-format, "failover" is a `try/except` around two clients, rate-limit and billing errors
-surface differently everywhere, and switching models means a code change and a deploy.
-Busbar makes the model a **config value**, not a dependency.
+It's **one static Rust binary**. No Python sidecar, no runtime, no dependency tree, no GC pauses in your request path. Download it, point two YAML files at it, run it.
 
-Its thesis is **protocols, not providers**: implement a handful of *wire protocols*
-losslessly, and every provider that speaks one is just a catalog entry — a name, a
-`base_url`, and the env var holding its key. Adding a vendor (or your own
-OpenAI-compatible endpoint) is three lines of YAML, not an integration.
+> The name is from electrical distribution: a busbar takes one feed and fans it out across many breakered circuits — one entry point, weighted distribution, per-circuit protection. That's exactly the shape of this thing.
 
-The name comes from electrical distribution: a busbar takes one feed and fans it out
-across many breakered circuits — one entry point, weighted distribution, per-circuit
-protection.
+---
 
-> **Project status: 0.17.4 — feature-complete, in pre-1.0 hardening.** The surface is
-> stable in practice; config and APIs may still change before 1.0. See
-> [`docs/roadmap.md`](docs/roadmap.md) for the protocols-not-providers thesis and the
-> auth-adapter design.
+## Why you'll want it
 
-## What you get
+**The model becomes a config value, not a dependency.** Switching from GPT to Claude — or splitting traffic 80/20 between them — is an edit to `config.yaml`, not a code change and a deploy. No per-vendor SDKs in your app.
 
-- **One API for every model.** Your client speaks the protocol it already knows
-  (Anthropic, OpenAI, Gemini, Bedrock, Responses, or Cohere); Busbar reaches a backend
-  speaking *any* of them. Change models or vendors in `config.yaml` — the client never
-  changes.
-- **Lossless cross-protocol translation.** A superset IR with a `ProtocolReader` /
-  `ProtocolWriter` seam translates request *and* response, streamed *and* buffered, in
-  both directions — and reconciles the awkward asymmetries between dialects (a field one
-  protocol requires and another makes optional) so the call just works.
-- **Protocols, not providers.** Six wire protocols implemented losslessly; 42 vetted
-  providers ship as catalog entries in `providers.yaml`, and any OpenAI-compatible
-  endpoint — including your own — is three lines of YAML, not vendor integration code.
-- **In-flight failover, not a 3am page.** Weighted smooth round-robin across a pool,
-  per-pool failover with deadlines and exclusions, and a two-stage circuit breaker with
-  exponential cooldown and single-flight recovery. One vendor's 429 reroutes mid-request;
-  it doesn't cascade into your outage.
-- **Correct failure semantics.** A backend is ejected for *upstream* faults (5xx,
-  overload, rate-limit, billing/quota, auth) but **never** for a *client* 4xx — a healthy
-  backend is never penalized because a caller sent a malformed or oversized request.
-- **Not bearer-only.** Auth is a per-provider seam: bearer, Gemini's `x-goog-api-key`,
-  Azure's `api-key` header, and AWS **SigV4** for Bedrock all ride one signing hook.
-- **Governance when you need it.** Busbar-issued virtual keys with allowed-pools ACLs,
-  token-accurate budgets, and RPM/TPM limits — over an admin-guarded API, persisted in
-  embedded SQLite. Off by default; one config block to turn on.
-- **Deploy-and-done.** A single static Rust binary — no runtime, no GC pauses, no
-  dependency tree. Builds for Linux, macOS, and Windows (Intel + ARM).
+**Failover is a real subsystem, not an `except` block.** Weighted smooth round-robin across a pool, a per-(pool, lane) circuit breaker with exponential cooldown and single-flight half-open recovery, deadline- and hop-capped failover, session affinity, and oversized-request failover to a larger-context member. It honors upstream `Retry-After`. It reroutes a streaming response right up until the first byte reaches your client.
+
+**Translation is lossless, and the hard parts are handled.** Same-protocol calls pass through untouched — `cache_control`, thinking blocks, citations, and native usage accounting all survive. Cross-protocol calls go through a superset IR that also reconciles dialect asymmetries: an OpenAI request with no `max_tokens` routed to Anthropic (which requires one) gets a configured default instead of a rejection, and a caller-supplied value is always preserved. Even `temperature` is carried as `f64`, because an `f32` round-trip would quietly turn `0.7` into `0.699999988`.
+
+**It penalizes the right failures.** A backend is ejected for *upstream* faults — 5xx, overload, rate-limit, billing/quota, auth — but **never** for a client `4xx`. A healthy lane is never marked dead because a caller sent a malformed or oversized request. Most gateways get this wrong.
+
+**It's boring in your request path, on purpose.** SSRF-safe (destinations come only from your vetted catalog, never from request data), constant-time token comparison, SHA-256-hashed virtual keys, bounded request bodies, fully parameterized SQL, and secrets that never touch the logs.
+
+## How it's different
+
+If you're already weighing the options:
+
+- **vs. a hand-rolled `try/except` over two SDK clients** — that gives you fallback, not failover: no health tracking, no weighting, no breaker, no streaming boundary, and a new branch every time you add a vendor. Busbar makes adding a vendor three lines of YAML.
+- **vs. Python-based gateways (e.g. LiteLLM)** — Busbar is a single native binary with no interpreter, no virtualenv, and no GC in the hot path. The reliability primitives (SWRR, the two-stage breaker, context-length failover) are first-class, not add-ons.
+- **vs. hosted routers (e.g. OpenRouter)** — Busbar runs in *your* infrastructure with *your* vendor keys. Nothing about your traffic or prompts leaves your network, and you pay your providers directly.
+
+**Thesis: protocols, not providers.** Implement a handful of wire protocols losslessly, and every vendor that speaks one is just a catalog entry — a name, a `base_url`, and the env var holding its key. Six protocols are implemented; 42 vetted providers ship as catalog entries, and any OpenAI-compatible endpoint (including your own) is three lines of YAML.
+
+> **Status: 0.17.4 — feature-complete, in pre-1.0 hardening.** Stable in practice; config and APIs may still shift before 1.0. AGPL-3.0.
+
+## Quick start
+
+### 1. Get the binary
+
+Grab a release for your platform (Linux, macOS, Windows — Intel and ARM) from the [releases page](https://github.com/MattJackson/busbarAI/releases), or build from source:
+
+```bash
+cargo build --release   # → target/release/busbar
+```
+
+### 2. Configure
+
+Busbar reads two YAML files. `providers.yaml` is the shipped catalog (protocol, `base_url`, error map per provider — you rarely touch it). `config.yaml` is your deployment. **Keys are never written into config** — only the *names* of the env vars that hold them; `${VAR}` is expanded at load time, and an unset referenced variable is a loud startup failure.
+
+```yaml
+listen: "0.0.0.0:8080"
+
+auth:
+  mode: token
+  client_tokens: ["${BUSBAR_CLIENT_TOKEN}"]
+
+providers:
+  anthropic: { api_key_env: ANTHROPIC_KEY }
+  openai:    { api_key_env: OPENAI_KEY }
+
+models:
+  claude-sonnet: { provider: anthropic, max_concurrent: 20 }
+  gpt-4o-mini:   { provider: openai,    max_concurrent: 50 }
+
+pools:
+  fast:
+    members:
+      - { target: claude-sonnet, weight: 8 }
+      - { target: gpt-4o-mini,   weight: 2 }
+```
+
+### 3. Run
+
+```bash
+export BUSBAR_CLIENT_TOKEN=changeme ANTHROPIC_KEY=sk-ant-... OPENAI_KEY=sk-...
+BUSBAR_PROVIDERS=./providers.yaml BUSBAR_CONFIG=./config.yaml ./target/release/busbar
+```
+
+### 4. Call it
+
+Clients append the protocol path themselves, exactly as their SDK would. Anthropic-format client hitting one model:
+
+```bash
+curl -s http://localhost:8080/claude-sonnet/v1/messages \
+  -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" -H "content-type: application/json" \
+  -d '{"model":"ignored","max_tokens":256,"messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+OpenAI-format client whose `model` selects the cross-protocol `fast` pool:
+
+```bash
+curl -s http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" -H "content-type: application/json" \
+  -d '{"model":"fast","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+Busbar rewrites the request's `model` to the selected member and injects the provider credential; the caller's own `model` and key fields are ignored (except in `passthrough` auth mode, where the caller's key is forwarded upstream).
 
 ## Protocol support
 
-Busbar's scope is the **protocol count (6)**, not the provider count. Each protocol
-is a first-class ingress *and* egress: it can be the format a client speaks, the
-format a backend speaks, or both.
+Busbar's scope is the **protocol count (6)**, not the provider count. Each protocol is a first-class *ingress* and *egress* — the format a client speaks, the format a backend speaks, or both.
 
-| Protocol | Wire surface (upstream) | Auth shape | Request | Response | Streaming | Tools |
-|---|---|---|---|---|---|---|
+| Protocol | Upstream wire surface | Auth | Req | Resp | Stream | Tools |
+|---|---|---|:-:|:-:|:-:|:-:|
 | `anthropic` | `/v1/messages` | bearer + `x-api-key` | ✅ | ✅ | ✅ | ✅ |
 | `openai` | `/v1/chat/completions` | bearer (or `api-key` for Azure) | ✅ | ✅ | ✅ | ✅ |
 | `gemini` | `:generateContent` / `:streamGenerateContent` | `x-goog-api-key` | ✅ | ✅ | ✅ | ✅ |
@@ -78,230 +123,43 @@ format a backend speaks, or both.
 | `responses` | `/v1/responses` | bearer | ✅ | ✅ | ✅ | ✅ |
 | `cohere` | `/v2/chat` | bearer | ✅ | ✅ | ✅ | ✅ |
 
-Streaming is first-class for every protocol: Gemini uses `:streamGenerateContent?alt=sse`,
-Bedrock uses ConverseStream (busbar decodes the binary
-`application/vnd.amazon.eventstream` frames and re-frames them as the caller's
-protocol), and the others use SSE.
+Streaming is first-class for all six: Gemini via `:streamGenerateContent?alt=sse`, Bedrock by decoding the binary `application/vnd.amazon.eventstream` frames and re-framing them as the caller's protocol, the rest via SSE.
 
-### Translation, done right
+## Routing
 
-"Lossless" is a contract, not a slogan. **Same-protocol** calls pass through
-untouched — `cache_control`, thinking blocks, citations, and native usage accounting
-are all preserved. **Cross-protocol** calls go through the superset IR, which also
-reconciles the asymmetries between dialects: when a client legally omits a field the
-target backend requires — e.g. an OpenAI request with no `max_tokens` routed to an
-Anthropic model, which mandates one — Busbar supplies a configured default instead of
-letting the backend reject the call. A caller-supplied value is always preserved.
-
-## Quick start
-
-### 1. Build
-
-```bash
-cargo build --release
-```
-
-### 2. Configure
-
-Busbar reads two files. `providers.yaml` is the vetted catalog (shipped — you
-rarely edit it); `config.yaml` is your deployment, referencing providers by name
-and naming the env vars that hold their keys. **Keys are never written into config
-files** — only env-var names. `${VAR}` placeholders are expanded at load time, and
-an unset referenced variable is a hard, loud startup failure.
-
-A minimal `config.yaml`:
-
-```yaml
-listen: "0.0.0.0:8080"
-
-auth:
-  mode: token
-  client_tokens:
-    - "${BUSBAR_CLIENT_TOKEN}"
-
-providers:
-  anthropic:
-    api_key_env: ANTHROPIC_KEY
-  openai:
-    api_key_env: OPENAI_KEY
-
-models:
-  claude-sonnet:
-    provider: anthropic
-    max_concurrent: 20
-  gpt-4o-mini:
-    provider: openai
-    max_concurrent: 50
-
-pools:
-  fast:
-    members:
-      - target: claude-sonnet
-        weight: 8
-      - target: gpt-4o-mini
-        weight: 2
-```
-
-The referenced providers (`anthropic`, `openai`) are already defined in the shipped
-`providers.yaml`, which supplies their protocol, `base_url`, and error map.
-
-### 3. Run
-
-```bash
-export BUSBAR_CLIENT_TOKEN=changeme
-export ANTHROPIC_KEY=sk-ant-...
-export OPENAI_KEY=sk-...
-
-# BUSBAR_PROVIDERS defaults to /etc/busbar/providers.yaml, BUSBAR_CONFIG to /etc/busbar/config.yaml
-BUSBAR_PROVIDERS=./providers.yaml BUSBAR_CONFIG=./config.yaml ./target/release/busbar
-```
-
-### 4. Call it
-
-Clients append the protocol path themselves, exactly as their SDK would. An
-Anthropic-format client targeting the `claude-sonnet` model:
-
-```bash
-curl -s http://localhost:8080/claude-sonnet/v1/messages \
-  -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" \
-  -H "content-type: application/json" \
-  -d '{
-        "model": "ignored-busbar-rewrites-this",
-        "max_tokens": 256,
-        "messages": [{"role": "user", "content": "Hello!"}]
-      }'
-```
-
-A cross-protocol example — an **OpenAI-format** client whose body's `model`
-resolves to the `fast` pool (which contains a Gemini-, Anthropic-, or
-OpenAI-backed member). Busbar translates the OpenAI request to the chosen member's
-protocol and translates the response back:
-
-```bash
-curl -s http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" \
-  -H "content-type: application/json" \
-  -d '{
-        "model": "fast",
-        "messages": [{"role": "user", "content": "Hello!"}]
-      }'
-```
-
-Busbar rewrites the request's `model` field to the selected member and injects the
-provider's credential — the caller's own `model` and key fields are ignored (except
-in `passthrough` auth mode, where the caller's key is forwarded upstream).
-
-## Routing model
-
-| Method · Route | Purpose |
+| Route | Targets |
 |---|---|
-| `POST /<name>/v1/messages` | Anthropic-format ingress; `<name>` is a model (`/claude-sonnet`) **or** a pool (`/fast`) |
-| `POST /<provider>/<model>/v1/messages` | ad-hoc direct route to one provider+model (`/anthropic/claude-sonnet`) |
-| `POST /v1/chat/completions` | OpenAI-format ingress; the body's `model` field selects the model or pool |
-| `GET /stats` | per-lane health, counts, and pool membership (JSON) |
-| `GET /healthz` | `200` if any lane is usable, else `503` |
-| `GET /metrics` | Prometheus exposition (always on, no auth) |
-| `POST /admin/keys`, `GET /admin/keys`, `DELETE /admin/keys/:id`, `GET /admin/keys/:id/usage` | virtual-key management API (governance only) |
+| `POST /<name>/v1/messages` | Anthropic ingress; `<name>` is a model (`/claude-sonnet`) **or** a pool (`/fast`) |
+| `POST /<provider>/<model>/v1/messages` | ad-hoc direct route to one provider+model, no pool needed |
+| `POST /v1/chat/completions` | OpenAI ingress; the body's `model` selects the model or pool |
+| `GET /stats` · `GET /healthz` · `GET /metrics` | per-lane health (JSON) · liveness · Prometheus |
+| `/admin/keys` (POST/GET/DELETE) | virtual-key management (governance only) |
 
-Three ways to target a backend:
-
-- **Direct** — `/<model>/v1/messages`: route to one named model.
-- **Ad-hoc** — `/<provider>/<model>/v1/messages`: route to a specific provider+model
-  without defining a pool (the provider must own the model).
-- **Pooled** — `/<pool>/v1/messages` or the `model` field of `/v1/chat/completions`:
-  weighted distribution across the pool's members with failover.
-
-**Cross-protocol** routing works across all three: the ingress protocol is fixed by
-the route (`anthropic` for `/v1/messages`, `openai` for `/v1/chat/completions`), and
-if the selected lane speaks a different protocol, busbar translates losslessly
-through its IR.
+Cross-protocol translation applies to all three targeting modes: the ingress protocol is fixed by the route, and if the chosen lane speaks something else, Busbar translates through the IR.
 
 ## Features
 
-| Feature | Summary | Docs |
-|---|---|---|
-| Pools & weighting | Smooth weighted round-robin (SWRR) across lanes; concurrency caps stack into one aggregate | [configuration.md](docs/configuration.md) |
-| Failover | Per-pool deadline + hop cap + member exclusions | [configuration.md](docs/configuration.md) |
-| Exhaustion policy | `reject` / `status_503` / `least_bad` / `fallback_pool:<name>` | [configuration.md](docs/configuration.md) |
-| Circuit breaker | Two-stage classify → disposition; `error_rate` or `consecutive` trips; exponential cooldown; single-flight half-open recovery; Retry-After honored | [operations.md](docs/operations.md) |
-| Session affinity | Sticky-by-header routing while a member stays healthy | [configuration.md](docs/configuration.md) |
-| Context-length failover | Oversized request fails over to a larger-context member without penalizing the smaller lane | [architecture.md](docs/architecture.md) |
-| Active health probing | `none` / `dead` / `active` background probes per provider | [operations.md](docs/operations.md) |
-| Governance | Virtual keys, allowed-pools ACLs, token-accurate budgets, RPM/TPM limits | [operations.md](docs/operations.md) |
-| Observability | Prometheus `/metrics`, optional OTLP traces, optional request-log webhook | [operations.md](docs/operations.md) |
+| Feature | What it does |
+|---|---|
+| Pools & weighting | Smooth weighted round-robin across lanes; concurrency caps stack into one aggregate |
+| Failover | Per-pool deadline + hop cap + member exclusions, applied across direct, ad-hoc, and pooled routes |
+| Exhaustion policy | `reject` / `status_503` / `least_bad` / `fallback_pool:<name>` |
+| Circuit breaker | Two-stage classify → disposition; `error_rate` or `consecutive` trips; exponential cooldown; single-flight half-open recovery; honors `Retry-After` |
+| Session affinity | Sticky-by-header routing while a member stays healthy |
+| Context-length failover | Oversized request fails over to a larger-context member without penalizing the smaller lane |
+| Health probing | `none` / `dead` / `active` background probes per provider |
+| Governance | Virtual keys, allowed-pools ACLs, token-accurate budgets, RPM/TPM limits — durable in embedded SQLite, off by default |
+| Observability | Prometheus `/metrics`, optional OTLP traces, optional request-log webhook |
 
-## Observability
-
-- **`GET /metrics`** — Prometheus text exposition, always on, no auth required
-  (protect it at the network layer if needed). Metrics include
-  `busbar_requests_total`, `busbar_upstream_attempts_total`,
-  `busbar_upstream_failures_total`, `busbar_breaker_trips_total`,
-  `busbar_failovers_total`, `busbar_translations_total`, and the
-  `busbar_request_duration_seconds` histogram.
-- **`GET /stats`** — per-lane health snapshot (inflight, ok/err counts, breaker
-  state, cooldown remaining, budget) and pool membership, as JSON.
-- **`GET /healthz`** — liveness: `200` when at least one lane is usable.
-- **OTLP traces** (opt-in) and a **request-log webhook** (opt-in) via the
-  `observability` config section.
-
-## Governance (optional)
-
-When the `governance` section is enabled, clients authenticate with busbar-issued
-**virtual keys** instead of the static `auth` tokens. Each key carries an
-allowed-pools ACL (403 on violation), a spend budget (402 when exceeded), and
-RPM/TPM rate limits (429 + `Retry-After`). Budgets are token-accurate: a flat
-per-request fee plus a per-1000-token charge derived from response usage.
-Enforcement state is durable in embedded SQLite. Keys are minted and revoked over
-the admin-token-guarded `/admin/keys` management API. See
-[docs/operations.md](docs/operations.md).
+Full field-by-field config reference, with defaults and worked examples, lives in [`docs/configuration.md`](docs/configuration.md); the architecture and the protocols-not-providers thesis are in [`docs/architecture.md`](docs/architecture.md) and [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Security
 
-Busbar lives in your request path, so it's built to be boring there:
+Busbar sits in your request path, so it's built to be unremarkable there: no caller-controlled upstreams (destinations come from your vetted `providers.yaml`, never from request data, so it's SSRF-safe), constant-time comparison of client and admin tokens, virtual keys stored only as SHA-256 hashes, request bodies bounded at 32 MiB (even in open-relay mode), fully parameterized governance SQL, and provider keys / tokens / bodies kept out of the logs. These are exercised by the test suite (267 tests) and were the focus of a dedicated hardening pass. To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
-- **No caller-controlled upstreams (SSRF-safe).** The destination URL is built from
-  your vetted `providers.yaml` — never from request data. A caller can't steer Busbar
-  at an arbitrary host.
-- **Constant-time secret comparison.** Client tokens and the admin token are compared
-  in constant time; virtual keys are stored as SHA-256 hashes, never in plaintext.
-- **Bounded request bodies.** Requests are capped (32 MiB) so an oversized body can't
-  exhaust memory — enforced even in open-relay (`auth.mode=none`) deployments.
-- **Parameterized persistence.** All governance SQL is fully parameterized; no
-  string-built queries.
-- **Secrets stay out of logs.** Provider keys, client tokens, and request bodies are
-  never written to logs.
+## Build & platforms
 
-These properties are exercised by the test suite and were the focus of a dedicated
-hardening pass. To report a vulnerability, see [SECURITY.md](SECURITY.md).
-
-## Configuration summary
-
-Two files, both YAML with `${VAR}` interpolation:
-
-- **`providers.yaml`** (shipped catalog): each entry maps a provider name to its
-  `protocol`, `base_url`, optional `error_map`, optional `path` override (for
-  version-in-base-url endpoints), optional `auth` override (e.g. `api-key` for
-  Azure), and optional `health` probing config.
-- **`config.yaml`** (your deployment): `listen`, `auth`, the `providers` you use
-  (name + `api_key_env`), `models` (provider + `max_concurrent` + optional
-  `max_requests` lifetime cap), `pools` (weighted members + failover + affinity +
-  breaker + on_exhausted), and optional `observability` / `governance` sections.
-
-The full field-by-field reference with defaults and worked examples lives in
-[docs/configuration.md](docs/configuration.md).
-
-## Build, CI, and platforms
-
-Busbar is a single Rust binary on stable toolchain (edition 2021). CI builds and
-tests on Linux, macOS, and Windows; releases ship binaries for five targets:
-
-| Target | Platform |
-|---|---|
-| `x86_64-unknown-linux-gnu` | Linux (Intel/AMD) |
-| `aarch64-unknown-linux-gnu` | Linux (ARM) |
-| `x86_64-apple-darwin` | macOS (Intel) |
-| `aarch64-apple-darwin` | macOS (Apple Silicon) |
-| `x86_64-pc-windows-msvc` | Windows |
+Single Rust binary, stable toolchain (edition 2021). CI builds and tests on Linux, macOS, and Windows; releases ship `x86_64`/`aarch64` Linux, Intel/Apple-Silicon macOS, and `x86_64` Windows.
 
 ```bash
 cargo build --release
@@ -309,15 +167,6 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-## Contributing
+## Contributing & license
 
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). To report a
-security issue, see [SECURITY.md](SECURITY.md).
-
-## License
-
-Busbar is licensed under the **GNU Affero General Public License v3.0 or later**
-([AGPL-3.0-or-later](LICENSE)). Because Busbar is typically run as a network
-service, the AGPL's §13 network-use clause applies: if you run a modified Busbar
-and let others interact with it over a network, you must offer them the
-corresponding modified source.
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Licensed **AGPL-3.0-or-later** ([LICENSE](LICENSE)). Because Busbar typically runs as a network service, the AGPL's §13 network-use clause applies: run a modified Busbar and let others reach it over a network, and you must offer them the corresponding modified source.
