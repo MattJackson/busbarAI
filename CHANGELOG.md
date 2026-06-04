@@ -5,6 +5,16 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **~30× faster cold start (≈206 ms → ≈6 ms).** The Prometheus recorder is now installed on a
+  background thread, so its one-time clock calibration (quanta's TSC calibration, ~200 ms) no longer
+  blocks the listener — busbar binds and serves (including `/healthz`) in single-digit milliseconds,
+  the right behavior for a daemon/k8s readiness path. Trade-off: `/metrics` renders empty until the
+  recorder finishes calibrating shortly after start, and the few requests in that window are not
+  counted.
+
 ## [1.0.0-rc.1] — 2026-06-03
 
 First release candidate for 1.0. Busbar is feature-complete and API-stable: six wire protocols

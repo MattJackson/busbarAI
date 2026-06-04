@@ -126,8 +126,12 @@ async fn main() {
         std::process::exit(code);
     }
 
-    // Install the Prometheus recorder before anything emits metrics.
-    metrics::init();
+    // Install the Prometheus recorder on a background thread. Its one-time clock calibration
+    // (quanta's TSC calibration, ~200ms) would otherwise block the listener; deferring it lets
+    // busbar bind and serve (incl. /healthz) in tens of ms. `/metrics` renders empty until the
+    // recorder is live, and the sliver of requests in that startup window go uncounted — an
+    // acceptable trade for a daemon/k8s readiness path. Emission macros are no-ops until then.
+    std::thread::spawn(metrics::init);
 
     // Read providers.yaml (shipped definitions)
     let providers_path =
