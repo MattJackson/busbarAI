@@ -6,7 +6,7 @@
 [![Release](https://img.shields.io/github/v/release/MattJackson/busbarAI?include_prereleases)](https://github.com/MattJackson/busbarAI/releases)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 ![Binary](https://img.shields.io/badge/binary-7.4MB%20static-success)
-![Cold start](https://img.shields.io/badge/cold%20start-%3C10ms-success)
+![Cold start](https://img.shields.io/badge/cold%20start-%3C15ms-success)
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 
 Your code already speaks OpenAI (or Anthropic, or Gemini). Change the base URL to Busbar, and `model: "fast"` becomes a *pool* — Claude, GPT, and Gemini behind one name, load-balanced by weight, with mid-request failover when a vendor degrades. Your application code never learns that any of it happened.
@@ -24,7 +24,7 @@ Your code already speaks OpenAI (or Anthropic, or Gemini). Change the base URL t
 
 That request left as OpenAI, may have been *served* by Anthropic, and came back as OpenAI — translated losslessly both ways. If Anthropic had returned a 429 mid-flight, Busbar would have rerouted to another pool member before your client saw a byte. One vendor's bad day stops being your outage.
 
-It's **one static 7.4 MB binary** — no Python sidecar, no runtime, no interpreter, no dependency tree, no GC pauses in your request path. It binds and starts serving in **single-digit milliseconds**. Download it, point two YAML files at it, run it.
+It's **one static 7.4 MB binary** — no Python sidecar, no runtime, no interpreter, no dependency tree, no GC pauses in your request path. It binds and starts serving in **under 15 ms**. Download it, point two YAML files at it, run it.
 
 > The name is from electrical distribution: a busbar takes one feed and fans it out across many breakered circuits — one entry point, weighted distribution, per-circuit protection. That's exactly the shape of this thing.
 
