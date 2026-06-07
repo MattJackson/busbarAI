@@ -49,13 +49,12 @@ request path — all in one static binary. The remaining work before 1.0.0 is op
 
 ## [0.17.3] — 2026-05-31
 
-Security hardening from a three-model independent review (Opus, Sonnet, qwen3.5). All three
-concurred the audited vectors are clean — SSRF on the routing paths (provider/model validated
-against config; upstream URL never caller-derived), token-compare timing (constant-time for client
-and admin tokens; virtual keys via SHA-256 + map), `/metrics` label cardinality (unknown models are
-rejected before any metric, so labels stay config-bounded), secret-in-logs (no keys/tokens/bodies
-logged), SQL injection (fully parameterized), and auth-bypass. Fixes below close the few hardening
-gaps the review surfaced.
+Security hardening. The following vectors were reviewed and confirmed clean — SSRF on the routing
+paths (provider/model validated against config; upstream URL never caller-derived), token-compare
+timing (constant-time for client and admin tokens; virtual keys via SHA-256 + map), `/metrics` label
+cardinality (unknown models are rejected before any metric, so labels stay config-bounded),
+secret-in-logs (no keys/tokens/bodies logged), SQL injection (fully parameterized), and auth-bypass.
+Fixes below close the few hardening gaps that review surfaced.
 
 ### Security
 - **Request body size limit.** The HTTP router now caps request bodies at 32 MiB
@@ -80,7 +79,7 @@ gaps the review surfaced.
   shipped example documents it) was silently dropped at parse time and `resolve()` only used the
   catalog's `providers.yaml` health — meaning active/dead health probing never spawned for
   config-defined health. `ProviderDeploy` now carries `health`, and `resolve()` merges it
-  deployment-wins-over-catalog (mirroring `path`/`auth`). + regression test. (QA finding C)
+  deployment-wins-over-catalog (mirroring `path`/`auth`). + regression test.
 
 ## [0.17.1] — 2026-05-31
 
@@ -108,8 +107,8 @@ Second RC for final testing — fixes from the first 0.17.0 testing pass.
 
 ## [0.17.0] — 2026-05-31
 
-Release candidate for final testing ahead of 1.0. Outcome of a three-model code audit
-(Opus, Sonnet, qwen3.5) of the full source.
+Release candidate for final testing ahead of 1.0. Outcome of a systematic review of the full
+source for correctness, robustness, and security.
 
 ### Fixed (correctness / security)
 - **Panics removed on hostile input:** a malformed `Authorization` header could panic on a
@@ -277,11 +276,5 @@ Release candidate for final testing ahead of 1.0. Outcome of a three-model code 
 ### Changed
 - Licensed the project under **AGPL-3.0-or-later** (previously MIT) — the AGPL's
   network-use clause is the appropriate copyleft for a gateway run as a service.
-
-### Notes
-- Pre-1.0: the current binary is an Anthropic-format gateway with named/ad-hoc
-  routing, round-robin pools, and a circuit breaker. See the roadmap for the path
-  to native multi-protocol support, weighted distribution, and cross-protocol
-  failover.
 
 [Unreleased]: https://github.com/MattJackson/busbarAI/commits/main

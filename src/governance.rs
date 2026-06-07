@@ -71,9 +71,36 @@ impl GovState {
         })
     }
 
+    /// Run a best-effort, fire-and-forget store write WITHOUT blocking the async executor thread.
+    ///
+    /// `Store` I/O is synchronous (a mutex-guarded SQLite connection that may fsync / checkpoint /
+    /// contend on the WAL). Running it directly on a Tokio worker thread would stall every other
+    /// task scheduled there. When a Tokio runtime is present we hand the SQL off to the blocking
+    /// pool (`spawn_blocking`) and return immediately; the write completes asynchronously and any
+    /// error is logged. Outside a runtime (unit tests that call the accounting methods directly) we
+    /// run the closure inline so behaviour is observable synchronously.
+    fn offload_store_write<F>(&self, what: &'static str, key_id: &str, op: F)
+    where
+        F: FnOnce(&dyn Store) -> StoreResult<()> + Send + 'static,
+    {
+        let store = self.store.clone();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let key_id = key_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = op(store.as_ref()) {
+                    tracing::warn!(key = %key_id, error = %e, "{what}");
+                }
+            });
+        } else if let Err(e) = op(store.as_ref()) {
+            tracing::warn!(key = %key_id, error = %e, "{what}");
+        }
+    }
+
     /// Accrue token-based usage from a completed response to a key's current budget window: adds
     /// `tokens/1000 * price_per_1k_tokens_cents` to spend, plus the raw tokens (for TPM). Called
     /// once per request at stream end from the response usage tap. Best-effort (store errors logged).
+    /// The SQLite write is offloaded to the blocking pool so it never stalls the async executor;
+    /// the in-memory TPM counter is updated inline (it is cheap and must reflect the write order).
     pub(crate) fn record_tokens(&self, key_id: &str, budget_period: &str, now: u64, tokens: u64) {
         if tokens == 0 {
             return; // nothing to spend or count
@@ -81,11 +108,12 @@ impl GovState {
         let window = budget_window(budget_period, now);
         let spend = (tokens.saturating_mul(self.price_per_1k_tokens_cents.max(0) as u64)
             / TOKENS_PER_PRICE_UNIT) as i64;
+        let key_owned = key_id.to_string();
         // count_request = false: this accrues token spend for a request already counted by
         // record_request, so it must not increment the request counter again.
-        if let Err(e) = self.store.add_usage(key_id, window, spend, tokens, false) {
-            tracing::warn!(key = %key_id, error = %e, "token usage record failed");
-        }
+        self.offload_store_write("token usage record failed", key_id, move |store| {
+            store.add_usage(&key_owned, window, spend, tokens, false)
+        });
         self.add_rate_tokens(key_id, now, tokens);
     }
 
@@ -143,9 +171,20 @@ impl GovState {
     }
 
     /// check + consume one request slot against the key's RPM/TPM for the current 60s window.
-    /// `Ok(())` admits the request (and counts it); `Err(retry_after_secs)` rejects it (429). RPM is
-    /// enforced precisely; TPM is enforced against tokens accrued so far this window (tokens are
-    /// fed post-response from the response usage tap, so TPM reflects the prior window's tokens).
+    /// `Ok(())` admits the request (and counts it); `Err(retry_after_secs)` rejects it (429).
+    ///
+    /// RPM is enforced precisely: the request counter is incremented synchronously on admission.
+    ///
+    /// TPM is BEST-EFFORT, not a hard cap. Token counts are fed in post-response (from the usage
+    /// tap, via `record_tokens`/`record_request`), so this check only sees tokens from requests
+    /// that have ALREADY COMPLETED in the current 60s window. Consequences operators must know:
+    /// - In-flight concurrent requests are not counted, so N requests can pass the check
+    ///   simultaneously while each is under the limit and collectively exceed the configured TPM.
+    /// - The first request of each window is admitted regardless of TPM, because the window's token
+    ///   counter starts at zero (it is intentionally not carried across the 60s boundary).
+    ///
+    /// A hard TPM cap would require reserving estimated tokens at admit time; that is out of scope
+    /// for the single-node best-effort limiter. Use the budget cap (cents) for a real spend ceiling.
     pub(crate) fn check_rate(&self, key: &VirtualKey, now: u64) -> Result<(), u64> {
         if key.rpm_limit.is_none() && key.tpm_limit.is_none() {
             return Ok(());
@@ -156,14 +195,16 @@ impl GovState {
         // Evict entries from older windows so the map stays bounded by the current window's active
         // keys — a key that stops sending requests would otherwise leak its entry forever.
         map.retain(|_, st| st.window_start == window);
-        let st = map.entry(key.id.clone()).or_default();
-        if st.window_start != window {
-            *st = RateState {
+        // Fast path: the entry already exists for this window — mutate in place without cloning the
+        // key id. Only the cold path (missing entry, after a window roll) pays the clone+insert.
+        let st = match map.get_mut(&key.id) {
+            Some(st) if st.window_start == window => st,
+            _ => map.entry(key.id.clone()).or_insert_with(|| RateState {
                 window_start: window,
                 requests: 0,
                 tokens: 0,
-            };
-        }
+            }),
+        };
         if let Some(tpm) = key.tpm_limit {
             if st.tokens >= tpm as u64 {
                 return Err(retry);
@@ -178,7 +219,15 @@ impl GovState {
         Ok(())
     }
 
-    /// add tokens to the key's current rate window (for TPM). Called from `record_request`.
+    /// Add tokens to the key's rate window for TPM accounting. Called post-response from
+    /// `record_request`/`record_tokens`. Tokens are attributed to the window implied by `now` (the
+    /// moment the response completed): if no entry exists, or it belongs to a stale (earlier)
+    /// window, we (re)initialise the entry for `now`'s window and credit the tokens there. The prior
+    /// behaviour silently dropped tokens whenever the entry had been evicted or rolled by a later
+    /// `check_rate` call (i.e. whenever a response completed in a different 60s window than it
+    /// started — the common case for streaming), causing TPM to under-count and a key to sustain
+    /// above its configured limit. We never credit a stale window, so a late response cannot inflate
+    /// a window that has already closed.
     fn add_rate_tokens(&self, key_id: &str, now: u64, tokens: u64) {
         if tokens == 0 {
             return;
@@ -187,12 +236,45 @@ impl GovState {
         let mut map = self.rate.write().unwrap();
         if let Some(st) = map.get_mut(key_id) {
             if st.window_start == window {
-                st.tokens += tokens;
+                // Entry is for the window this response belongs to -> credit it.
+                st.tokens = st.tokens.saturating_add(tokens);
+            } else if st.window_start < window {
+                // Entry is for an OLDER window (it rolled forward as `check_rate` evicted/reset it)
+                // -> reinitialise for this response's window and credit there. Previously these
+                // tokens were silently dropped, so any response that completed in a different 60s
+                // window than it started (the common streaming case) never reached the TPM counter,
+                // letting a key sustain above its configured limit. This is the fix.
+                *st = RateState {
+                    window_start: window,
+                    requests: 0,
+                    tokens,
+                };
             }
+            // else: entry is for a NEWER window than this (late) response -> its window has already
+            // closed; drop the credit rather than revive a stale window or inflate the current one.
+        } else {
+            // No entry yet -> create one for this response's window and credit it.
+            map.insert(
+                key_id.to_string(),
+                RateState {
+                    window_start: window,
+                    requests: 0,
+                    tokens,
+                },
+            );
         }
     }
 
-    /// is this key already at/over its budget for the current window? (No cap → never.)
+    /// Is this key already at/over its budget for the current window? (No cap → never.) Synchronous
+    /// core; the request-path gate must use [`GovState::is_over_budget_async`] so the SQLite read
+    /// does not block the async executor thread.
+    ///
+    /// NOTE: the budget cap is BEST-EFFORT (soft) under concurrency. This read and the later
+    /// `record_request` charge are separate, non-atomic store round-trips, so N concurrent in-flight
+    /// requests for the same key can each observe spend < limit, all be admitted, then all charge —
+    /// overshooting `max_budget_cents` by up to (concurrent in-flight) * (per-request + token cost).
+    /// The overshoot is bounded by the caller's parallelism. A hard cap would require an atomic
+    /// check-and-charge (a single UPSERT returning post-charge spend) in the `Store`.
     pub(crate) fn is_over_budget(&self, key: &VirtualKey, now: u64) -> bool {
         let Some(limit) = key.max_budget_cents else {
             return false;
@@ -204,17 +286,47 @@ impl GovState {
             .unwrap_or(false)
     }
 
+    /// Async budget gate for the request path: runs the (blocking) SQLite read on the blocking pool
+    /// so it never stalls a Tokio worker thread. Falls back to a synchronous read when called
+    /// outside a runtime (defensive — the request path always has one). On a store/join error it
+    /// fails OPEN (returns `false`, i.e. "not over budget") to match the synchronous variant, which
+    /// preserves availability rather than rejecting traffic on a telemetry-store hiccup.
+    pub(crate) async fn is_over_budget_async(&self, key: &VirtualKey, now: u64) -> bool {
+        if key.max_budget_cents.is_none() {
+            return false;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            return self.is_over_budget(key, now);
+        }
+        let store = self.store.clone();
+        let key_id = key.id.clone();
+        let limit = key.max_budget_cents.unwrap_or(i64::MAX);
+        let window = budget_window(&key.budget_period, now);
+        match tokio::task::spawn_blocking(move || store.get_usage(&key_id, window)).await {
+            Ok(Ok(u)) => u.spend_cents >= limit,
+            Ok(Err(e)) => {
+                tracing::warn!(key = %key.id, error = %e, "budget read failed; failing open");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(key = %key.id, error = %e, "budget read task panicked; failing open");
+                false
+            }
+        }
+    }
+
     /// charge one request (flat per-request cost + token count) to the key's current window.
-    /// Best-effort: a store error is logged-and-dropped (telemetry must not break serving).
+    /// Best-effort: a store error is logged-and-dropped (telemetry must not break serving). The
+    /// SQLite write is offloaded to the blocking pool so it never stalls the async executor; the
+    /// in-memory TPM counter is updated inline.
     pub(crate) fn record_request(&self, key: &VirtualKey, now: u64, tokens: u64) {
         let window = budget_window(&key.budget_period, now);
+        let key_id = key.id.clone();
+        let fee = self.price_per_request_cents;
         // count_request = true: this is the once-per-request accounting call.
-        if let Err(e) =
-            self.store
-                .add_usage(&key.id, window, self.price_per_request_cents, tokens, true)
-        {
-            tracing::warn!(key = %key.id, error = %e, "usage record failed");
-        }
+        self.offload_store_write("usage record failed", &key.id, move |store| {
+            store.add_usage(&key_id, window, fee, tokens, true)
+        });
         // also feed the rate window's TPM counter.
         self.add_rate_tokens(&key.id, now, tokens);
     }
@@ -721,6 +833,130 @@ mod tests {
         for _ in 0..100 {
             assert!(gov.check_rate(&unl, now).is_ok());
         }
+    }
+
+    #[test]
+    fn test_tpm_enforced_against_accrued_tokens_same_window() {
+        // TPM is enforced against tokens from completed requests in the current window.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 0, 0, None).unwrap();
+        let mut k = sample_key("k1", "h1");
+        k.rpm_limit = None;
+        k.tpm_limit = Some(1000);
+        let now = 1_700_000_040; // mid-window
+
+        // First request admitted (window token counter starts at 0).
+        assert!(
+            gov.check_rate(&k, now).is_ok(),
+            "first request admits regardless of TPM"
+        );
+        // Its response completes in the same window and accrues 1000 tokens (>= the cap).
+        gov.record_tokens("k1", "total", now, 1000);
+        // Next request in the same window is now rejected on TPM.
+        let retry = gov.check_rate(&k, now + 1).unwrap_err();
+        assert!(
+            (1..=60).contains(&retry),
+            "TPM exceeded → 429, retry {retry}"
+        );
+    }
+
+    #[test]
+    fn test_add_rate_tokens_credits_completion_window_not_dropped() {
+        // Regression: a streamed response that completes in a LATER 60s window than it started must
+        // still have its tokens counted (previously they were silently dropped because check_rate
+        // had evicted/rolled the entry).
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 0, 0, None).unwrap();
+        let mut k = sample_key("k1", "h1");
+        k.rpm_limit = Some(10);
+        k.tpm_limit = Some(500);
+        let start = 1_700_000_040; // window W0 starts at 1_700_000_040? compute: start/60*60
+        let w0 = start / 60 * 60;
+        let later = w0 + 65; // a request landing in the next window evicts the W0 entry
+
+        // Admit a request in W0 (creates a W0 entry with requests=1).
+        assert!(gov.check_rate(&k, start).is_ok());
+        // A new request lands in the next window — check_rate's retain() evicts the W0 entry.
+        assert!(gov.check_rate(&k, later).is_ok());
+        // The first request's response completes (post-eviction) in its window `later`.
+        gov.record_tokens("k1", "total", later, 400);
+        // Those 400 tokens must be attributed to `later`'s window, not dropped: a follow-up that
+        // would push over the 500 TPM cap is rejected.
+        gov.record_tokens("k1", "total", later, 200); // now 600 >= 500 in this window
+        let retry = gov.check_rate(&k, later + 1).unwrap_err();
+        assert!(
+            (1..=60).contains(&retry),
+            "accrued tokens enforce TPM in completion window"
+        );
+    }
+
+    #[test]
+    fn test_add_rate_tokens_does_not_revive_stale_window() {
+        // Tokens credited with an OLD `now` must not inflate the current window's counter.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 0, 0, None).unwrap();
+        let mut k = sample_key("k1", "h1");
+        k.rpm_limit = Some(10);
+        k.tpm_limit = Some(100);
+        let now = 1_700_000_040;
+
+        // Establish the current window with a request.
+        assert!(gov.check_rate(&k, now).is_ok());
+        // A late credit for a PRIOR window (now - 120) must not touch the current window's tokens.
+        gov.record_tokens("k1", "total", now.saturating_sub(120), 1000);
+        // Current window still under TPM → admitted.
+        assert!(
+            gov.check_rate(&k, now + 1).is_ok(),
+            "stale-window credit must not affect current window"
+        );
+    }
+
+    #[test]
+    fn test_check_rate_fast_path_reuses_entry_no_double_reset() {
+        // The get_mut fast path must not reset an existing current-window entry (which would drop
+        // the request count and break RPM). Two requests in the same window must both count.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 0, 0, None).unwrap();
+        let mut k = sample_key("k1", "h1");
+        k.rpm_limit = Some(2);
+        k.tpm_limit = None;
+        let now = 1_700_000_040;
+        assert!(gov.check_rate(&k, now).is_ok());
+        assert!(gov.check_rate(&k, now).is_ok());
+        assert!(
+            gov.check_rate(&k, now).is_err(),
+            "RPM=2 → third rejected (entry reused, not reset)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_request_offloaded_charges_under_runtime() {
+        // Inside a Tokio runtime, record_request offloads the SQLite write to the blocking pool.
+        // The charge must still land (we await the blocking pool draining via a yield + poll).
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut k = sample_key("k1", "h1");
+        k.max_budget_cents = Some(1000);
+        k.budget_period = "total".to_string();
+        let gov = GovState::new(store.clone(), 30, 0, None).unwrap();
+
+        gov.record_request(&k, 1_700_000_000, 0);
+        // Drain the spawn_blocking write: poll until the usage row appears (bounded retries).
+        let mut spend = 0;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            spend = store.get_usage("k1", 0).unwrap().spend_cents;
+            if spend == 30 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            spend, 30,
+            "offloaded record_request must charge the per-request fee"
+        );
+
+        // And the async budget gate observes it.
+        assert!(!gov.is_over_budget_async(&k, 1_700_000_000).await);
     }
 
     #[test]

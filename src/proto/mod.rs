@@ -273,6 +273,14 @@ pub(crate) struct StreamTranslate {
     egress: Protocol,
     decode: crate::ir::StreamDecodeState,
     buf: Vec<u8>,
+    /// How far into `buf` we have already scanned for an SSE frame terminator. Searching only the
+    /// unscanned tail keeps `feed()` linear even when a single large frame arrives as many small
+    /// chunks (otherwise the whole accumulated prefix is re-scanned on every call → O(n^2)).
+    scanned: usize,
+    /// Set once the reassembly buffer exceeds `MAX_BUF` with no complete frame: the stream is
+    /// abandoned (an untrusted upstream that never emits a terminator must not grow `buf`
+    /// without bound — that is a memory-exhaustion DoS).
+    aborted: bool,
     /// ingress == "openai" → the stream must terminate with `data: [DONE]\n\n`.
     emit_done: bool,
     /// egress == "bedrock" → frames are binary `application/vnd.amazon.eventstream`, not SSE.
@@ -291,6 +299,8 @@ impl StreamTranslate {
             egress: protocol_for(egress)?,
             decode: crate::ir::StreamDecodeState::default(),
             buf: Vec::new(),
+            scanned: 0,
+            aborted: false,
             emit_done: ingress == "openai",
             egress_eventstream: egress == "bedrock",
         })
@@ -310,9 +320,19 @@ impl StreamTranslate {
         }
     }
 
+    /// Hard cap on the reassembly buffer. An upstream that streams bytes without ever emitting a
+    /// frame terminator must not grow `buf` indefinitely (memory-exhaustion DoS). A few MB is far
+    /// larger than any legitimate single SSE / event-stream frame from a chat completion.
+    const MAX_BUF: usize = 8 * 1024 * 1024;
+
     /// Feed a chunk of EGRESS SSE bytes; return translated INGRESS SSE bytes for whatever
-    /// COMPLETE frames are now available (empty if only a partial frame is buffered).
+    /// COMPLETE frames are now available (empty if only a partial frame is buffered). Once the
+    /// reassembly buffer exceeds [`Self::MAX_BUF`] with no complete frame the stream is abandoned
+    /// and all further input is ignored.
     pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if self.aborted {
+            return Vec::new();
+        }
         self.buf.extend_from_slice(chunk);
         let mut out: Vec<u8> = Vec::new();
 
@@ -332,26 +352,57 @@ impl StreamTranslate {
                 }
                 self.translate_event(&event_type, &data, &mut out);
             }
+            if self.buf.len() > Self::MAX_BUF {
+                self.abort_overflow();
+            }
             return out;
         }
 
-        // Drain every complete `\n\n`-delimited SSE frame currently buffered.
-        while let Some(pos) = self.buf.windows(2).position(|w| w == b"\n\n") {
-            let end = pos + 2;
-            let frame: Vec<u8> = self.buf.drain(..end).collect();
+        // Drain every complete `\n\n`-delimited SSE frame currently buffered. We only rescan the
+        // tail that has not been searched before (`scanned`), backing up one byte so a terminator
+        // straddling the previous chunk boundary is still found — this keeps `feed()` linear.
+        loop {
+            let search_from = self.scanned.saturating_sub(1).min(self.buf.len());
+            match self.buf[search_from..]
+                .windows(2)
+                .position(|w| w == b"\n\n")
+            {
+                Some(rel) => {
+                    let end = search_from + rel + 2;
+                    let frame: Vec<u8> = self.buf.drain(..end).collect();
+                    self.scanned = 0;
 
-            let Some((event_type, data_str)) = parse_sse_frame(&frame) else {
-                continue; // no data: line, or non-utf8 — skip
-            };
-            if data_str.is_empty() || data_str == "[DONE]" {
-                continue; // egress terminator/keepalive — ingress terminator is finish()'s job
+                    let Some((event_type, data_str)) = parse_sse_frame(&frame) else {
+                        continue; // no data: line, or non-utf8 — skip
+                    };
+                    if data_str.is_empty() || data_str == "[DONE]" {
+                        continue; // egress terminator/keepalive — ingress terminator is finish()'s
+                    }
+                    let Ok(data) = serde_json::from_str::<serde_json::Value>(&data_str) else {
+                        continue; // malformed data JSON — skip the frame rather than abort
+                    };
+                    self.translate_event(&event_type, &data, &mut out);
+                }
+                None => {
+                    // No complete frame: everything currently buffered has been scanned.
+                    self.scanned = self.buf.len();
+                    break;
+                }
             }
-            let Ok(data) = serde_json::from_str::<serde_json::Value>(&data_str) else {
-                continue; // malformed data JSON — skip the frame rather than abort the stream
-            };
-            self.translate_event(&event_type, &data, &mut out);
+        }
+        if self.buf.len() > Self::MAX_BUF {
+            self.abort_overflow();
         }
         out
+    }
+
+    /// Abandon a stream whose reassembly buffer grew past [`Self::MAX_BUF`] without a frame
+    /// terminator. The buffer is released and all subsequent `feed()` calls become no-ops.
+    fn abort_overflow(&mut self) {
+        self.aborted = true;
+        self.buf.clear();
+        self.buf.shrink_to_fit();
+        self.scanned = 0;
     }
 
     /// Call once at end-of-stream. Returns the INGRESS terminator (OpenAI → `data: [DONE]\n\n`,
@@ -366,22 +417,27 @@ impl StreamTranslate {
 }
 
 /// Parse one SSE frame into `(event_type, data_payload)`. `event_type` is "" when the frame has
-/// no `event:` line (OpenAI style). Returns `None` if there is no `data:` line or invalid UTF-8.
+/// no `event:` line (OpenAI style). Multiple `data:` lines in a single frame are concatenated with
+/// `\n` per the SSE spec (§9.2.6). Returns `None` if the frame carries no `data:` line (including a
+/// frame with only an `event:` line) or is invalid UTF-8.
 fn parse_sse_frame(frame: &[u8]) -> Option<(String, String)> {
     let text = std::str::from_utf8(frame).ok()?;
     let mut event_type = String::new();
-    let mut data = String::new();
+    let mut data_lines: Vec<&str> = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("event:") {
             event_type = rest.trim().to_string();
         } else if let Some(rest) = line.strip_prefix("data:") {
-            data = rest.trim().to_string();
+            // Per the SSE spec a single leading space after the colon is stripped; the rest of the
+            // value is preserved verbatim so multi-line JSON payloads survive intact.
+            data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
         }
     }
-    if data.is_empty() && event_type.is_empty() {
+    if data_lines.is_empty() {
+        // No `data:` line at all (e.g. an `event:`-only frame) — nothing to translate.
         return None;
     }
-    Some((event_type, data))
+    Some((event_type, data_lines.join("\n")))
 }
 
 /// Re-frame an IR-derived `(event_type, data)` as INGRESS SSE bytes. A non-empty `event_type`
@@ -2688,6 +2744,116 @@ mod stream_translate_tests {
     fn test_translate_same_protocol_is_none() {
         assert!(StreamTranslate::new("openai", "openai").is_none());
         assert!(StreamTranslate::new("anthropic", "anthropic").is_none());
+    }
+
+    /// Multiple `data:` lines in one SSE frame must be concatenated with `\n` (SSE spec §9.2.6),
+    /// not collapsed to the last line. A leading space after the colon is stripped exactly once.
+    #[test]
+    fn test_parse_sse_frame_concatenates_multiple_data_lines() {
+        let frame = b"event: e\ndata: {\"a\":1,\ndata: \"b\":2}\n\n";
+        let (et, data) = parse_sse_frame(frame).expect("frame has data");
+        assert_eq!(et, "e");
+        assert_eq!(data, "{\"a\":1,\n\"b\":2}");
+        // and the joined payload is valid JSON
+        let v: serde_json::Value = serde_json::from_str(&data).expect("joined data parses");
+        assert_eq!(v.get("a"), Some(&serde_json::json!(1)));
+        assert_eq!(v.get("b"), Some(&serde_json::json!(2)));
+    }
+
+    /// A frame carrying only an `event:` line (no `data:`) must return None.
+    #[test]
+    fn test_parse_sse_frame_event_only_is_none() {
+        assert!(parse_sse_frame(b"event: ping\n\n").is_none());
+        assert!(parse_sse_frame(b"\n\n").is_none());
+    }
+
+    /// A `data:` line with empty value still yields Some (caller treats empty payload as a
+    /// terminator/keepalive); the OpenAI `[DONE]` sentinel survives leading-space stripping.
+    #[test]
+    fn test_parse_sse_frame_done_sentinel() {
+        let (et, data) = parse_sse_frame(b"data: [DONE]\n\n").expect("data line present");
+        assert_eq!(et, "");
+        assert_eq!(data, "[DONE]");
+    }
+
+    /// An upstream that splits a single JSON event across two `data:` lines must still translate
+    /// correctly end-to-end (the payload is rejoined before JSON parsing).
+    #[test]
+    fn test_translate_multiline_data_payload() {
+        let mut t = StreamTranslate::new("openai", "anthropic").expect("translator");
+        let frame = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\ndata: \"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
+        let s = String::from_utf8(t.feed(frame.as_bytes())).unwrap();
+        assert!(
+            s.contains("\"content\":\"hi\""),
+            "multi-line data payload must reassemble and translate; got {s}"
+        );
+    }
+
+    /// An upstream that streams bytes without ever emitting a frame terminator must not grow the
+    /// reassembly buffer without bound: once past the cap the stream is abandoned and the buffer
+    /// is released.
+    #[test]
+    fn test_feed_aborts_on_unbounded_buffer() {
+        let mut t = StreamTranslate::new("openai", "anthropic").expect("translator");
+        let chunk = vec![b'x'; 1024 * 1024]; // 1 MiB of garbage, no `\n\n`
+        let mut total = 0usize;
+        for _ in 0..16 {
+            let out = t.feed(&chunk);
+            assert!(out.is_empty(), "garbage stream must produce no output");
+            total += chunk.len();
+            if t.aborted {
+                break;
+            }
+            assert!(
+                t.buf.len() <= StreamTranslate::MAX_BUF,
+                "buffer must stay within MAX_BUF while accumulating"
+            );
+        }
+        assert!(
+            t.aborted,
+            "stream must abort after exceeding MAX_BUF (fed {total} bytes)"
+        );
+        assert!(t.buf.is_empty(), "aborted stream must release its buffer");
+        // Further feeds are no-ops, including a now-complete frame.
+        assert!(
+            t.feed(b"data: {\"choices\":[]}\n\n").is_empty(),
+            "feeds after abort must be ignored"
+        );
+    }
+
+    /// The scanned-offset optimization must not break terminator detection when `\n\n` straddles a
+    /// chunk boundary (one `\n` at the end of chunk A, the next at the start of chunk B).
+    #[test]
+    fn test_feed_terminator_straddles_chunk_boundary() {
+        let mut t = StreamTranslate::new("openai", "anthropic").expect("translator");
+        let frame = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n";
+        // First chunk ends right after the first '\n'; the second '\n' opens the next chunk.
+        assert!(t.feed(frame.as_bytes()).is_empty(), "no terminator yet");
+        let s = String::from_utf8(t.feed(b"\n")).unwrap();
+        assert!(
+            s.contains("\"content\":\"hi\""),
+            "terminator split across chunks must still complete the frame; got {s}"
+        );
+    }
+
+    /// Many tiny chunks comprising a single large frame must reassemble and translate exactly once.
+    #[test]
+    fn test_feed_large_frame_many_chunks() {
+        let mut t = StreamTranslate::new("openai", "anthropic").expect("translator");
+        let big = "x".repeat(200_000);
+        let frame = format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{big}\"}}}}\n\n"
+        );
+        let bytes = frame.as_bytes();
+        let mut out = Vec::new();
+        for chunk in bytes.chunks(64) {
+            out.extend(t.feed(chunk));
+        }
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.contains(&big),
+            "large frame split across many chunks must reassemble"
+        );
     }
 
     // ============================================================

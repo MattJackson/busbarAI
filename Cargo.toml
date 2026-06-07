@@ -11,20 +11,35 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.7"
-tokio = { version = "1", features = ["full"] }
+# Only the subsystems busbar actually touches: the multi-thread runtime (#[tokio::main],
+# spawn/JoinHandle), macros (main/test), net (TcpListener), time (sleep/interval), and sync
+# (Semaphore/OwnedSemaphorePermit). The "full" meta-feature additionally pulls fs/process/signal/
+# io-util/io-std/test-util — none referenced in src/ — so it is dropped to shrink the request-path
+# binary's compile + attack surface.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+# `serde_yaml` (dtolnay) is archived/deprecated — the locked 0.9 is literally `0.9.34+deprecated`
+# and drags in the large `unsafe-libyaml` C transliteration. `serde_yaml_ng` is the maintained,
+# API-compatible fork; the `package` rename keeps every `serde_yaml::from_str` call site unchanged.
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 futures = "0.3"
 bytes = "1"
 http-body-util = "0.1"
-http-body = "1"
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
 opentelemetry = "0.32.0"
 opentelemetry_sdk = "0.32.1"
-opentelemetry-otlp = "0.32.0"
+# Pin OTLP to the HTTP/proto trace path busbar uses (`SpanExporter::builder().with_http()`), with
+# the reqwest client on rustls so HTTPS export actually works. Dropping default features removes
+# `reqwest-blocking-client` (a blocking reqwest busbar never uses) and the OTLP metrics/logs paths
+# (busbar exports metrics via Prometheus, not OTLP).
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-rustls",
+] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 tracing-opentelemetry = "0.33.0"

@@ -70,14 +70,12 @@ impl AuthMiddleware {
             )
         });
 
-        // Expand env vars in client_tokens (interpolation pass)
-        let tokens: Vec<String> = cfg
-            .client_tokens
-            .iter()
-            .map(|t| {
-                crate::config::interpolate_env(t).expect("env var expansion in auth.client_tokens")
-            })
-            .collect();
+        // client_tokens are already env-interpolated: `interpolate_env` runs over the WHOLE
+        // config.yaml text once at load (main.rs), before deserialization. A second per-token pass
+        // here would double-interpolate — a token that legitimately contains the literal `${...}`
+        // (legal in opaque API keys) would be re-expanded or abort startup via `.expect`. Interpolate
+        // exactly once; just clone the resolved values.
+        let tokens: Vec<String> = cfg.client_tokens.clone();
 
         if mode == AuthMode::None && tokens.is_empty() {
             tracing::warn!(
@@ -346,5 +344,139 @@ mod tests {
 
         // Should panic on invalid mode
         assert!(std::panic::catch_unwind(|| AuthMiddleware::new(&cfg)).is_err());
+    }
+
+    #[test]
+    fn test_client_tokens_not_double_interpolated() {
+        // A client token that legitimately contains the literal `${...}` (legal in opaque API keys)
+        // must be passed through verbatim — the whole config file is already env-interpolated once
+        // at load, so AuthMiddleware::new must NOT interpolate again (which would re-expand or panic
+        // on an unset var). Regression for the dropped second interpolation pass.
+        let raw = "sk-${NOT_A_REAL_ENV_VAR}-suffix";
+        let cfg = AuthCfg {
+            mode: "token".to_string(),
+            client_tokens: vec![raw.to_string()],
+            _legacy_token: None,
+        };
+        // Must not panic even though NOT_A_REAL_ENV_VAR is unset.
+        let mw = AuthMiddleware::new(&cfg);
+        assert_eq!(mw.client_tokens, vec![raw.to_string()]);
+        // And the verbatim token authenticates (it was not mangled by a second expansion pass).
+        assert!(mw.validate_token(Some(&format!("Bearer {raw}"))));
+    }
+
+    /// End-to-end through the real router + `auth_middleware`: a virtual key with `enabled: false`
+    /// must be rejected with 401, while the same secret on an enabled key is admitted. Guards the
+    /// `Some(key) if key.enabled => ... else 401` authz path, which had no test (a regression that
+    /// dropped the `if key.enabled` guard would otherwise pass CI — an authz bypass).
+    #[tokio::test]
+    async fn test_disabled_virtual_key_is_rejected_401() {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+        use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        crate::metrics::init();
+
+        // Mock upstream that returns a valid Anthropic-shaped body, so an ADMITTED request reaches
+        // 200 rather than failing for an unrelated reason.
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: axum::http::StatusCode::OK,
+            body: json!({
+                "model": "glm-4.5",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }),
+        });
+        let server = MockServer::new(state).await;
+
+        let disabled_secret = "sk-vk-disabled";
+        let enabled_secret = "sk-vk-enabled";
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mk = |id: &str, secret: &str, enabled: bool| VirtualKey {
+            id: id.to_string(),
+            key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
+            name: id.to_string(),
+            allowed_pools: vec!["pa".to_string()],
+            max_budget_cents: None,
+            budget_period: "total".to_string(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled,
+            created_at: 0,
+        };
+        store.put_key(&mk("kdis", disabled_secret, false)).unwrap();
+        store.put_key(&mk("kena", enabled_secret, true)).unwrap();
+        let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "glm-4.5",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("pa", &[(0, 1)])
+            .governance(gov)
+            .build();
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/pa/v1/messages");
+        let req =
+            json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+                .to_string();
+
+        // Disabled key → 401.
+        let r_dis = client
+            .post(&url)
+            .bearer_auth(disabled_secret)
+            .body(req.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r_dis.status().as_u16(),
+            401,
+            "a disabled virtual key must be rejected"
+        );
+
+        // Unknown secret → 401 (control: lookup miss is the same 401 path).
+        let r_bogus = client
+            .post(&url)
+            .bearer_auth("sk-vk-nope")
+            .body(req.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r_bogus.status().as_u16(),
+            401,
+            "unknown key must be rejected"
+        );
+
+        // Enabled key with the same shape → NOT 401 (admitted past auth).
+        let r_ena = client
+            .post(&url)
+            .bearer_auth(enabled_secret)
+            .body(req)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r_ena.status().as_u16(),
+            401,
+            "an enabled virtual key must pass auth (got {})",
+            r_ena.status()
+        );
+
+        handle.abort();
+        server.shutdown().await;
     }
 }

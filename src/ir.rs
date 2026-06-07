@@ -132,7 +132,11 @@ pub(crate) enum IrBlockMeta {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code, clippy::enum_variant_names)] // response/stream IR types (used by tests in proto.rs)
+// Every variant is live on the production egress path: `read_response_events` emits `IrDelta`s
+// inside `IrStreamEvent::BlockDelta`, and `StreamTranslate::feed` → `write_response_event` consumes
+// them (see proto/{bedrock,gemini,cohere}.rs). The `enum_variant_names` allow stays because all
+// variants share the `Delta` suffix by design (they mirror the wire delta-event names).
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum IrDelta {
     TextDelta(String),
     ThinkingDelta(String),
@@ -155,4 +159,72 @@ pub(crate) struct StreamDecodeState {
     pub reasoning_seen: bool,
     /// Whether the reasoning Thinking block (index 0) is currently open.
     pub thinking_block_open: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ir_usage_default_is_zero() {
+        // IrUsage has no derived Default; construct the documented zero baseline explicitly and
+        // assert the token fields read as zero / None, so a future field addition is caught here.
+        let u = IrUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.output_tokens, 0);
+        assert_eq!(u.cache_creation_input_tokens, None);
+        assert_eq!(u.cache_read_input_tokens, None);
+    }
+
+    #[test]
+    fn test_stream_decode_state_default() {
+        // The OpenAI flat-stream synthesizer relies on these initial values: nothing started, no
+        // blocks open, no tool indices, no reasoning yet.
+        let st = StreamDecodeState::default();
+        assert!(!st.started);
+        assert!(!st.text_block_open);
+        assert!(st.open_tools.is_empty());
+        assert!(!st.reasoning_seen);
+        assert!(!st.thinking_block_open);
+    }
+
+    #[test]
+    fn test_ir_role_partial_eq_distinguishes_variants() {
+        // PartialEq/Eq must treat all four roles as distinct (role confusion would mis-map
+        // system/user/assistant/tool turns across protocols).
+        let all = [
+            IrRole::System,
+            IrRole::User,
+            IrRole::Assistant,
+            IrRole::Tool,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(a == b, i == j, "role eq mismatch at ({i},{j})");
+            }
+        }
+    }
+
+    #[test]
+    fn test_ir_delta_variants_distinct() {
+        // Two different delta variants carrying the same string are NOT equal — the variant carries
+        // semantic meaning (text vs thinking vs tool-input-json vs signature) on the egress path.
+        assert_ne!(
+            IrDelta::TextDelta("x".into()),
+            IrDelta::ThinkingDelta("x".into())
+        );
+        assert_ne!(
+            IrDelta::InputJsonDelta("x".into()),
+            IrDelta::SignatureDelta("x".into())
+        );
+        assert_eq!(
+            IrDelta::TextDelta("x".into()),
+            IrDelta::TextDelta("x".into())
+        );
+    }
 }

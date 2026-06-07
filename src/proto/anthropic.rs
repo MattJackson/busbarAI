@@ -14,23 +14,25 @@ pub(crate) struct AnthropicReader;
 
 impl ProtocolReader for AnthropicReader {
     fn extract_error(&self, status: StatusCode, body: &[u8]) -> crate::breaker::RawUpstreamError {
-        let provider_code = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-            json.get("error")
-                .and_then(|e| e.get("code"))
-                .and_then(|c| c.as_str())
-                .map(String::from)
-        } else {
-            None
-        };
-
-        let structured_type = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-            json.get("error")
-                .and_then(|e| e.get("type"))
-                .and_then(|t| t.as_str())
-                .map(String::from)
-        } else {
-            None
-        };
+        // Parse the error body once and pull both fields from the single JSON tree, rather than
+        // re-parsing the same bytes per field (error paths are already degraded; avoid the extra
+        // parse+alloc on every non-2xx response).
+        let (provider_code, structured_type) =
+            match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(json) => {
+                    let error = json.get("error");
+                    let provider_code = error
+                        .and_then(|e| e.get("code"))
+                        .and_then(|c| c.as_str())
+                        .map(String::from);
+                    let structured_type = error
+                        .and_then(|e| e.get("type"))
+                        .and_then(|t| t.as_str())
+                        .map(String::from);
+                    (provider_code, structured_type)
+                }
+                Err(_) => (None, None),
+            };
 
         // Anthropic signals context-length via the error MESSAGE (no distinct code).
         // Surface the canonical code so the breaker pipeline (normalize_raw_error) → ContextLength.
@@ -778,18 +780,40 @@ impl ProtocolWriter for AnthropicWriter {
     }
 
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
-        // A key with bytes that aren't valid in an HTTP header (e.g. a stray newline in the env
-        // var) yields an empty header rather than panicking the worker — the upstream then returns
-        // a clean 401 that the breaker classifies normally.
+        // Anthropic authenticates via `x-api-key` (API keys) AND accepts `authorization: Bearer`
+        // (OAuth/short-lived tokens). Both are emitted because this one function serves two modes:
+        //   * static lane key  -> the configured API key,
+        //   * passthrough       -> the *caller's* credential (forward.rs feeds the caller token in
+        //                          as `key`), which callers present as `Authorization: Bearer`.
+        // The passthrough path REQUIRES the `authorization` header to round-trip a caller's Bearer
+        // token to the upstream (see test_support passthrough coverage), so it cannot be dropped
+        // without breaking a stable public path. Both headers carry the same single credential.
+        //
+        // A key with bytes that aren't valid in an HTTP header value (e.g. a stray newline in the
+        // env var) yields an empty header rather than panicking the worker — the upstream then
+        // returns a clean 401 that the breaker classifies normally. This empty-value fallback is
+        // strictly defense-in-depth: keys should be validated at config load. We emit one warning
+        // so the misconfig (which would otherwise masquerade as an auth failure) is diagnosable.
+        // The key bytes themselves are never logged.
+        let safe = |label: &'static str, raw: String| {
+            HeaderValue::from_str(&raw).unwrap_or_else(|_| {
+                tracing::warn!(
+                    header = label,
+                    "anthropic auth credential contains bytes invalid for an HTTP header value \
+                     (e.g. a trailing newline); sending an empty value, the upstream will return \
+                     401 — check the key configuration"
+                );
+                HeaderValue::from_static("")
+            })
+        };
         vec![
             (
                 HeaderName::from_static("x-api-key"),
-                HeaderValue::from_str(key).unwrap_or_else(|_| HeaderValue::from_static("")),
+                safe("x-api-key", key.to_string()),
             ),
             (
                 HeaderName::from_static("authorization"),
-                HeaderValue::from_str(&format!("Bearer {key}"))
-                    .unwrap_or_else(|_| HeaderValue::from_static("")),
+                safe("authorization", format!("Bearer {key}")),
             ),
             (
                 HeaderName::from_static("anthropic-version"),
@@ -1032,5 +1056,92 @@ impl ProtocolWriter for AnthropicWriter {
         obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
 
         serde_json::Value::Object(obj)
+    }
+}
+
+#[cfg(test)]
+mod anthropic_hardening_tests {
+    use super::*;
+
+    /// auth_headers carries the canonical x-api-key plus the passthrough-required authorization
+    /// header and the anthropic-version header, each with the configured credential verbatim.
+    #[test]
+    fn auth_headers_emits_x_api_key_authorization_and_version() {
+        let headers = AnthropicWriter.auth_headers("secret-key");
+        let names: Vec<&str> = headers.iter().map(|(n, _)| n.as_str()).collect();
+
+        assert!(names.contains(&"x-api-key"), "x-api-key must be present");
+        assert!(
+            names.contains(&"authorization"),
+            "authorization (passthrough Bearer) must be present"
+        );
+        assert!(
+            names.contains(&"anthropic-version"),
+            "anthropic-version must be present"
+        );
+
+        let value = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, _)| n.as_str() == name)
+                .map(|(_, v)| v.to_str().unwrap_or_default().to_string())
+        };
+        assert_eq!(value("x-api-key").as_deref(), Some("secret-key"));
+        assert_eq!(value("authorization").as_deref(), Some("Bearer secret-key"));
+    }
+
+    /// A key with bytes invalid for an HTTP header value (e.g. a trailing newline) must not panic
+    /// the worker; both credential headers fall back to empty so the upstream returns a clean 401.
+    #[test]
+    fn auth_headers_invalid_key_falls_back_to_empty_no_panic() {
+        let headers = AnthropicWriter.auth_headers("bad\nkey");
+        let value = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, _)| n.as_str() == name)
+                .map(|(_, v)| v.to_str().unwrap_or_default().to_string())
+        };
+        assert_eq!(value("x-api-key").as_deref(), Some(""));
+        assert_eq!(value("authorization").as_deref(), Some(""));
+        // anthropic-version is static and unaffected by the bad key.
+        assert_eq!(value("anthropic-version").as_deref(), Some("2023-06-01"));
+    }
+
+    /// extract_error parses the body once and surfaces both provider_code and structured_type.
+    #[test]
+    fn extract_error_parses_both_fields() {
+        let body = br#"{"error":{"type":"invalid_request_error","code":"some_code"}}"#;
+        let raw = AnthropicReader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(raw.http_status, 400);
+        assert_eq!(raw.provider_code.as_deref(), Some("some_code"));
+        assert_eq!(
+            raw.structured_type.as_deref(),
+            Some("invalid_request_error")
+        );
+    }
+
+    /// A non-JSON error body must not yield codes from the structured fields, but the
+    /// context-length text heuristic must still fire when the message indicates it.
+    #[test]
+    fn extract_error_non_json_body() {
+        let raw = AnthropicReader.extract_error(StatusCode::BAD_REQUEST, b"not json at all");
+        assert_eq!(raw.provider_code, None);
+        assert_eq!(raw.structured_type, None);
+    }
+
+    /// Context-length is signalled via the error message; the single-parse refactor must preserve
+    /// the canonical code synthesis from the body text.
+    #[test]
+    fn extract_error_context_length_from_message() {
+        let body = br#"{"error":{"type":"invalid_request_error","message":"prompt is too long"}}"#;
+        let raw = AnthropicReader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("context_length_exceeded")
+        );
+        assert_eq!(
+            raw.structured_type.as_deref(),
+            Some("invalid_request_error")
+        );
     }
 }

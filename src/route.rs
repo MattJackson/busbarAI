@@ -64,9 +64,11 @@ fn affinity_header_for<'a>(app: &'a Arc<App>, pool: &str) -> &'a str {
 
 /// reject (402) before forwarding when the resolved virtual key is already over its
 /// budget for the current window. No-op when governance is off or the key has no budget cap.
-fn budget_check(app: &Arc<App>, gov: &crate::governance::GovCtx) -> Option<Response> {
+/// Async: the budget read is a (blocking) SQLite query offloaded to the blocking pool inside
+/// `is_over_budget_async`, so the request path never stalls a Tokio worker thread.
+async fn budget_check(app: &Arc<App>, gov: &crate::governance::GovCtx) -> Option<Response> {
     if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
-        if g.is_over_budget(key, crate::store::now()) {
+        if g.is_over_budget_async(key, crate::store::now()).await {
             return Some(
                 (
                     StatusCode::PAYMENT_REQUIRED,
@@ -188,7 +190,7 @@ pub(crate) async fn openai_ingress(
         return resp;
     }
     // reject over-budget keys before forwarding.
-    if let Some(resp) = budget_check(&app, &gov) {
+    if let Some(resp) = budget_check(&app, &gov).await {
         return resp;
     }
     // reject rate-limited keys before forwarding.
@@ -257,7 +259,7 @@ pub(crate) async fn named(
         return resp;
     }
     // reject over-budget keys before forwarding.
-    if let Some(resp) = budget_check(&app, &gov) {
+    if let Some(resp) = budget_check(&app, &gov).await {
         return resp;
     }
     // reject rate-limited keys before forwarding.
@@ -321,7 +323,7 @@ pub(crate) async fn adhoc(
         return resp;
     }
     // reject over-budget keys before forwarding.
-    if let Some(resp) = budget_check(&app, &gov) {
+    if let Some(resp) = budget_check(&app, &gov).await {
         return resp;
     }
     // reject rate-limited keys before forwarding.
@@ -460,6 +462,87 @@ mod tests {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
         inner.pool_runtime = pr;
         assert_eq!(affinity_header_for(&app, "p"), "x-session-id");
+    }
+
+    /// Build a governance-enabled App with a single budgeted key, plus return the key so the test
+    /// can pass a matching GovCtx to `finish`. Runs without a Tokio runtime so the best-effort
+    /// `record_request` charge executes inline (observable synchronously).
+    fn governed_app_with_key() -> (Arc<App>, crate::governance::VirtualKey) {
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        // 30 cents flat per request, no per-token fee.
+        let gov = Arc::new(GovState::new(store, 30, 0, None).unwrap());
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(100_000),
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .unwrap();
+        let mut app = minimal_app();
+        Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov);
+        (app, key)
+    }
+
+    fn key_spend(app: &Arc<App>, key_id: &str) -> i64 {
+        app.governance
+            .as_ref()
+            .unwrap()
+            .usage_for(key_id, 1_700_000_000)
+            .unwrap()
+            .map(|u| u.spend_cents)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn test_finish_charges_flat_fee_only_on_2xx() {
+        crate::metrics::init();
+        let (app, key) = governed_app_with_key();
+        let gov = crate::governance::GovCtx {
+            key: Some(key.clone()),
+        };
+
+        // A 200 response charges the flat fee.
+        let resp = (StatusCode::OK, "ok").into_response();
+        let _ = finish(&app, &gov, "openai", "p", Instant::now(), resp);
+        assert_eq!(
+            key_spend(&app, &key.id),
+            30,
+            "2xx charges the flat per-request fee"
+        );
+
+        // A 503 (router-side exhaustion) must NOT charge again.
+        let resp = (StatusCode::SERVICE_UNAVAILABLE, "x").into_response();
+        let _ = finish(&app, &gov, "openai", "p", Instant::now(), resp);
+        assert_eq!(
+            key_spend(&app, &key.id),
+            30,
+            "503 does not charge the flat fee"
+        );
+
+        // An upstream 500 must NOT charge.
+        let resp = (StatusCode::INTERNAL_SERVER_ERROR, "x").into_response();
+        let _ = finish(&app, &gov, "openai", "p", Instant::now(), resp);
+        assert_eq!(
+            key_spend(&app, &key.id),
+            30,
+            "5xx does not charge the flat fee"
+        );
+
+        // A 4xx upstream error must NOT charge.
+        let resp = (StatusCode::BAD_REQUEST, "x").into_response();
+        let _ = finish(&app, &gov, "openai", "p", Instant::now(), resp);
+        assert_eq!(
+            key_spend(&app, &key.id),
+            30,
+            "4xx does not charge the flat fee"
+        );
     }
 
     #[test]

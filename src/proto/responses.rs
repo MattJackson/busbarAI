@@ -266,8 +266,11 @@ impl ProtocolReader for ResponsesReader {
                         _ => {}
                     }
 
-                    // Also handle role/content structured items (user/assistant messages)
-                    if item.get("role").is_some() {
+                    // Handle role/content structured items (user/assistant messages) ONLY when the
+                    // item carries no `type` field. A typed item (e.g. "output_text") that also
+                    // happens to include a `role` must NOT be re-processed here, or the turn would
+                    // be duplicated in the resulting conversation.
+                    if item.get("type").is_none() && item.get("role").is_some() {
                         let role_str = item.get("role").and_then(|r| r.as_str()).unwrap_or("");
                         let content_val = item.get("content");
 
@@ -431,18 +434,23 @@ impl ProtocolReader for ResponsesReader {
                     .and_then(|d| d.as_str())
                     .unwrap_or("")
                     .to_string();
-                if !state.text_block_open && !delta.is_empty() {
-                    state.text_block_open = true;
-                    out.push(IrStreamEvent::BlockStart {
-                        index: 0,
-                        block: crate::ir::IrBlockMeta::Text,
-                    });
-                }
-                if !delta.is_empty() || state.text_block_open {
+                // Drop empty keepalive deltas entirely: they neither open a block nor carry
+                // content, so emitting a zero-length TextDelta would be spurious noise.
+                if !delta.is_empty() {
+                    // Use the wire `output_index` for BOTH the lazy BlockStart and the BlockDelta so
+                    // the open/close pair stays index-matched even when the text part is not at
+                    // index 0 (e.g. it follows a tool call at index 0).
                     let idx = data
                         .get("output_index")
                         .and_then(|i| i.as_u64())
                         .map_or(0, |v| v as usize);
+                    if !state.text_block_open {
+                        state.text_block_open = true;
+                        out.push(IrStreamEvent::BlockStart {
+                            index: idx,
+                            block: crate::ir::IrBlockMeta::Text,
+                        });
+                    }
                     out.push(IrStreamEvent::BlockDelta {
                         index: idx,
                         delta: crate::ir::IrDelta::TextDelta(delta),
@@ -468,6 +476,12 @@ impl ProtocolReader for ResponsesReader {
 
             "response.output_item.done" | "response.content_part.done" => {
                 if let Some(output_index) = data.get("output_index").and_then(|i| i.as_u64()) {
+                    // The text block (if any) opened at this index is now closed; clear the flag so a
+                    // later text part can lazily re-open its own block instead of silently reusing a
+                    // stale "open" state.
+                    if state.text_block_open {
+                        state.text_block_open = false;
+                    }
                     out.push(IrStreamEvent::BlockStop {
                         index: output_index as usize,
                     });
@@ -527,7 +541,11 @@ impl ProtocolReader for ResponsesReader {
 
                     out.push(IrStreamEvent::MessageDelta { stop_reason, usage });
                     out.push(IrStreamEvent::MessageStop);
-                } else if event_type == "response.failed" {
+                } else {
+                    // Terminal event with no nested `response` object. Whether completed, failed, or
+                    // incomplete, we must still terminate the translated stream with a
+                    // MessageDelta + MessageStop so downstream consumers do not hang waiting for the
+                    // end of the message.
                     let stop_reason = Some("end_turn".to_string());
                     let usage = crate::ir::IrUsage {
                         input_tokens: 0,
@@ -1596,5 +1614,208 @@ mod tests {
     ) -> Vec<crate::ir::IrStreamEvent> {
         let reader = ResponsesReader;
         reader.read_response_events(event_type, data, state)
+    }
+
+    /// Regression: a text part arriving at a non-zero `output_index` must open AND write to the
+    /// same block index. Previously BlockStart was hard-coded to index 0 while BlockDelta used the
+    /// wire index, producing an unmatched open/write pair for downstream index-keyed consumers.
+    #[test]
+    fn test_text_delta_index_pairing_nonzero() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = reader_read_response_events(
+            "response.output_text.delta",
+            &serde_json::json!({"output_index": 2, "delta": "hello"}),
+            &mut state,
+        );
+        assert_eq!(events.len(), 2, "expected lazy BlockStart + BlockDelta");
+        let start_idx = match &events[0] {
+            crate::ir::IrStreamEvent::BlockStart { index, .. } => *index,
+            other => panic!("first event should be BlockStart, got {other:?}"),
+        };
+        let delta_idx = match &events[1] {
+            crate::ir::IrStreamEvent::BlockDelta { index, .. } => *index,
+            other => panic!("second event should be BlockDelta, got {other:?}"),
+        };
+        assert_eq!(start_idx, 2, "BlockStart must use the wire output_index");
+        assert_eq!(delta_idx, 2, "BlockDelta must use the wire output_index");
+        assert_eq!(start_idx, delta_idx, "open/write indices must match");
+    }
+
+    /// Regression: an empty-delta keepalive chunk must produce no events, even when a text block is
+    /// already open. Previously the guard `|| state.text_block_open` emitted a spurious zero-length
+    /// TextDelta for every keepalive after the block opened.
+    #[test]
+    fn test_empty_delta_keepalive_emits_nothing() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        // Open a block with a real delta first.
+        let opened = reader_read_response_events(
+            "response.output_text.delta",
+            &serde_json::json!({"output_index": 0, "delta": "x"}),
+            &mut state,
+        );
+        assert_eq!(opened.len(), 2);
+        assert!(state.text_block_open);
+        // Now an empty keepalive while the block is open -> nothing.
+        let keepalive = reader_read_response_events(
+            "response.output_text.delta",
+            &serde_json::json!({"output_index": 0, "delta": ""}),
+            &mut state,
+        );
+        assert!(
+            keepalive.is_empty(),
+            "empty keepalive delta must not emit events, got {keepalive:?}"
+        );
+        // And an empty delta before any block is open also emits nothing.
+        let mut fresh = crate::ir::StreamDecodeState::default();
+        let pre = reader_read_response_events(
+            "response.output_text.delta",
+            &serde_json::json!({"output_index": 0, "delta": ""}),
+            &mut fresh,
+        );
+        assert!(pre.is_empty());
+        assert!(!fresh.text_block_open);
+    }
+
+    /// Regression: output_item.done must clear `text_block_open` so a subsequent text part can
+    /// lazily re-open its own block instead of silently reusing stale open state.
+    #[test]
+    fn test_done_clears_text_block_open() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let _ = reader_read_response_events(
+            "response.output_text.delta",
+            &serde_json::json!({"output_index": 0, "delta": "a"}),
+            &mut state,
+        );
+        assert!(state.text_block_open);
+        let done = reader_read_response_events(
+            "response.output_item.done",
+            &serde_json::json!({"output_index": 0}),
+            &mut state,
+        );
+        assert_eq!(done.len(), 1);
+        assert!(matches!(
+            done[0],
+            crate::ir::IrStreamEvent::BlockStop { .. }
+        ));
+        assert!(!state.text_block_open, "done must clear text_block_open");
+        // A new text part at index 1 re-opens lazily.
+        let reopen = reader_read_response_events(
+            "response.output_text.delta",
+            &serde_json::json!({"output_index": 1, "delta": "b"}),
+            &mut state,
+        );
+        assert_eq!(reopen.len(), 2);
+        assert!(matches!(
+            reopen[0],
+            crate::ir::IrStreamEvent::BlockStart { index: 1, .. }
+        ));
+    }
+
+    /// Regression: content_part.done is also a terminal-of-part signal and must close its block.
+    #[test]
+    fn test_content_part_done_closes_block() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let _ = reader_read_response_events(
+            "response.output_text.delta",
+            &serde_json::json!({"output_index": 0, "delta": "a"}),
+            &mut state,
+        );
+        let done = reader_read_response_events(
+            "response.content_part.done",
+            &serde_json::json!({"output_index": 0}),
+            &mut state,
+        );
+        assert_eq!(done.len(), 1);
+        assert!(matches!(
+            done[0],
+            crate::ir::IrStreamEvent::BlockStop { .. }
+        ));
+        assert!(!state.text_block_open);
+    }
+
+    /// Regression: a minimal `response.completed` lacking a nested `response` object must still
+    /// terminate the stream with MessageDelta + MessageStop, not leave it hanging.
+    #[test]
+    fn test_completed_without_response_object_terminates() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events =
+            reader_read_response_events("response.completed", &serde_json::json!({}), &mut state);
+        assert_eq!(events.len(), 2, "must emit MessageDelta + MessageStop");
+        assert!(matches!(
+            events[0],
+            crate::ir::IrStreamEvent::MessageDelta { .. }
+        ));
+        assert!(matches!(events[1], crate::ir::IrStreamEvent::MessageStop));
+    }
+
+    /// Regression: same for `response.incomplete` with no nested response object.
+    #[test]
+    fn test_incomplete_without_response_object_terminates() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events =
+            reader_read_response_events("response.incomplete", &serde_json::json!({}), &mut state);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            crate::ir::IrStreamEvent::MessageDelta { .. }
+        ));
+        assert!(matches!(events[1], crate::ir::IrStreamEvent::MessageStop));
+
+        // response.failed without object still works (pre-existing behavior preserved).
+        let mut s2 = crate::ir::StreamDecodeState::default();
+        let failed =
+            reader_read_response_events("response.failed", &serde_json::json!({}), &mut s2);
+        assert_eq!(failed.len(), 2);
+        assert!(matches!(failed[1], crate::ir::IrStreamEvent::MessageStop));
+    }
+
+    /// Regression: an input item carrying BOTH a `type` and a `role` must be processed exactly once
+    /// (by the type arm), not duplicated by the role-keyed fallback.
+    #[test]
+    fn test_typed_item_with_role_not_duplicated() {
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [
+                {
+                    "type": "output_text",
+                    "role": "assistant",
+                    "text": "hello",
+                    "content": [{"type": "output_text", "text": "DUPLICATE"}]
+                }
+            ]
+        });
+        let reader = ResponsesReader;
+        let ir = reader
+            .read_request(&json)
+            .expect("read_request should succeed");
+        // Exactly one message: the type arm produced the assistant text turn; the role fallback
+        // must NOT have added a second turn from the `content` array.
+        assert_eq!(ir.messages.len(), 1, "typed+role item must not duplicate");
+        assert_eq!(ir.messages[0].role, crate::ir::IrRole::Assistant);
+        match &ir.messages[0].content[0] {
+            crate::ir::IrBlock::Text { text, .. } => assert_eq!(text, "hello"),
+            other => panic!("expected text turn, got {other:?}"),
+        }
+    }
+
+    /// A role-only item (no `type`) must still be processed via the role fallback.
+    #[test]
+    fn test_role_only_item_still_processed() {
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi there"}]}
+            ]
+        });
+        let reader = ResponsesReader;
+        let ir = reader
+            .read_request(&json)
+            .expect("read_request should succeed");
+        assert_eq!(ir.messages.len(), 1);
+        assert_eq!(ir.messages[0].role, crate::ir::IrRole::User);
+        match &ir.messages[0].content[0] {
+            crate::ir::IrBlock::Text { text, .. } => assert_eq!(text, "hi there"),
+            other => panic!("expected text turn, got {other:?}"),
+        }
     }
 }

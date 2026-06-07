@@ -171,10 +171,12 @@ async fn main() {
     // Resolve deployment + definitions into resolved RootCfg
     let cfg = config::resolve(&deploy, &defs)
         .unwrap_or_else(|errs| die(format!("config errors:\n  - {}", errs.join("\n  - "))));
+    // cfg.auth is ALREADY normalized: config::resolve calls AuthCfg::normalize() on the auth block
+    // (legacy single-token promotion). Normalizing again here would be redundant work and obscure
+    // the single-normalization invariant, so just clone the resolved value.
     let auth_cfg = cfg
         .auth
-        .as_ref()
-        .map(|a| a.clone().normalize())
+        .clone()
         .unwrap_or_else(config::AuthCfg::default_none);
 
     // Validate configuration before building lanes

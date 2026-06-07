@@ -34,21 +34,29 @@ pub(crate) struct BedrockReader;
 
 impl ProtocolReader for BedrockReader {
     fn extract_error(&self, status: StatusCode, body: &[u8]) -> crate::breaker::RawUpstreamError {
-        let provider_code = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-            json.get("message")
-                .and_then(|m| m.as_str())
-                .map(String::from)
-        } else {
-            None
-        };
-
-        let structured_type = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-            json.get("message")
-                .and_then(|m| m.as_str())
-                .map(String::from)
-        } else {
-            None
-        };
+        // Parse the body once. Bedrock error responses carry the human-readable
+        // text in `message` and the machine-readable error type in `__type`
+        // (e.g. `ValidationException`, `ThrottlingException`). The structured
+        // type is what the breaker's error_map keys on for fine-grained routing,
+        // so it must come from `__type`, not from `message`.
+        let (provider_code, structured_type) =
+            match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(json) => {
+                    let provider_code = json
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .map(String::from);
+                    // AWS may also serialise the type as `__type` containing a
+                    // shape ARN suffix (e.g. `com.amazon...#ThrottlingException`);
+                    // keep only the trailing type token in that case.
+                    let structured_type = json
+                        .get("__type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t.rsplit(['#', '/']).next().unwrap_or(t).to_string());
+                    (provider_code, structured_type)
+                }
+                Err(_) => (None, None),
+            };
 
         crate::breaker::RawUpstreamError {
             http_status: status.as_u16(),
@@ -441,9 +449,18 @@ impl ProtocolReader for BedrockReader {
                     .and_then(|s| s.as_str())
                     .map(stop_reason_map);
 
-                // Bedrock splits stop reason (messageStop) from usage (a following `metadata`
-                // event). Emit the stop_reason here with zero usage; `metadata` emits a second
-                // MessageDelta carrying the real usage, then the single terminating MessageStop.
+                // Bedrock splits stop reason (`messageStop`) from usage (a following `metadata`
+                // event). Emit the stop_reason here with zero usage, then emit the terminating
+                // MessageStop immediately so the downstream stream always receives its terminal
+                // frame. Previously the terminal MessageStop was emitted only from the `metadata`
+                // branch; a malformed/truncated upstream (or a provider variant) that ends after
+                // `messageStop` without a trailing `metadata` event left the client stream hanging
+                // with no terminal frame. The reader has no end-of-stream hook, so `messageStop`
+                // (the wire-guaranteed terminal event) is the correct place to terminate.
+                //
+                // Usage from a subsequent `metadata` event is still forwarded as a trailing
+                // MessageDelta (see below). `metadata` no longer emits its own MessageStop, so
+                // exactly one terminal frame is produced regardless of whether `metadata` arrives.
                 if let Some(reason) = stop_reason_val {
                     out.push(IrStreamEvent::MessageDelta {
                         stop_reason: Some(reason),
@@ -455,9 +472,14 @@ impl ProtocolReader for BedrockReader {
                         },
                     });
                 }
+                out.push(IrStreamEvent::MessageStop);
             }
 
             Some("metadata") => {
+                // Usage trails the terminal MessageStop (Bedrock sends `metadata` after
+                // `messageStop`). Emit it as a usage-only MessageDelta; the terminal frame was
+                // already produced by the `messageStop` branch, so we do NOT emit a second
+                // MessageStop here (that would duplicate the terminator).
                 if let Some(usage_obj) = data.get("usage").and_then(|u| u.as_object()) {
                     let usage = crate::ir::IrUsage {
                         input_tokens: usage_obj
@@ -477,8 +499,6 @@ impl ProtocolReader for BedrockReader {
                         usage,
                     });
                 }
-
-                out.push(IrStreamEvent::MessageStop);
             }
 
             _ => {}
@@ -657,18 +677,26 @@ impl ProtocolWriter for BedrockWriter {
         );
 
         // Headers to ADD to the wire request (content-type + host are set elsewhere / by the client).
+        // The authorization value embeds `access` (the AWS access key id) taken directly from the
+        // lane key config. A key id containing a control character (CR/LF) or any byte >= 0x80
+        // makes `HeaderValue::from_str` fail. This runs on the request hot path, so we must NOT
+        // panic: a malformed credential takes the same graceful "misconfigured key" path as the
+        // parse failure above (return an empty header set → request goes out unsigned → AWS 403,
+        // surfaced upstream as an auth failure) rather than aborting the request-handling task.
+        let (Ok(authorization_val), Ok(amzdate_val), Ok(payload_hash_val)) = (
+            HeaderValue::from_str(&authorization),
+            HeaderValue::from_str(&amzdate),
+            HeaderValue::from_str(&payload_hash),
+        ) else {
+            return vec![];
+        };
+
         let mut out = vec![
-            (
-                HeaderName::from_static("authorization"),
-                HeaderValue::from_str(&authorization).expect("valid auth header"),
-            ),
-            (
-                HeaderName::from_static("x-amz-date"),
-                HeaderValue::from_str(&amzdate).expect("valid date header"),
-            ),
+            (HeaderName::from_static("authorization"), authorization_val),
+            (HeaderName::from_static("x-amz-date"), amzdate_val),
             (
                 HeaderName::from_static("x-amz-content-sha256"),
-                HeaderValue::from_str(&payload_hash).expect("valid sha header"),
+                payload_hash_val,
             ),
         ];
         if let Some(t) = token {
@@ -1474,19 +1502,23 @@ mod tests {
             _ => panic!("event[5] should be MessageDelta"),
         }
 
-        // ...and the trailing `metadata` event carries the real usage (lossless), then MessageStop.
+        // ...and the terminating MessageStop is emitted immediately from the `messageStop` branch
+        // (the wire-guaranteed terminal event), so a missing/truncated `metadata` event can no
+        // longer leave the downstream stream without its terminal frame.
         match &events[6] {
+            IrStreamEvent::MessageStop => {}
+            _ => panic!("event[6] should be MessageStop"),
+        }
+
+        // The trailing `metadata` event still forwards the real usage (lossless) as a usage-only
+        // MessageDelta; it no longer emits a second (duplicate) MessageStop.
+        match &events[7] {
             IrStreamEvent::MessageDelta { stop_reason, usage } => {
                 assert!(stop_reason.is_none());
                 assert_eq!(usage.input_tokens, 10);
                 assert_eq!(usage.output_tokens, 5);
             }
-            _ => panic!("event[6] should be MessageDelta carrying usage"),
-        }
-
-        match &events[7] {
-            IrStreamEvent::MessageStop => {}
-            _ => panic!("event[7] should be MessageStop"),
+            _ => panic!("event[7] should be MessageDelta carrying usage"),
         }
     }
 
@@ -1536,5 +1568,163 @@ mod tests {
         } else {
             panic!("write_response_event should return Some for MessageDelta with tool_use");
         }
+    }
+
+    // --- Regression tests for the 1.0 hardening pass -------------------------------------------
+
+    /// Regression: a malformed lane credential (access key id containing a control char that
+    /// `HeaderValue::from_str` rejects) must NOT panic the request-handling task. It takes the
+    /// same graceful path as a structurally-misconfigured key: an empty header set, so the
+    /// request goes out unsigned and AWS surfaces a 403 auth error instead of aborting the task.
+    #[test]
+    fn test_bedrock_sigv4_control_char_in_access_key_no_panic() {
+        let writer = BedrockWriter;
+        let ctx = crate::proto::SigningContext {
+            host: "bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            canonical_uri: "/model/m/converse".to_string(),
+            body: b"{}",
+            timestamp_epoch: 1_440_938_160,
+        };
+        // CR/LF embedded in the access key id → invalid Authorization header value
+        // (HeaderValue::from_str rejects ASCII control chars, including CR/LF). This is the
+        // header-injection / misconfiguration vector the finding describes.
+        let headers = writer.sign_request("AKID\r\nINJECT:SECRET", &ctx);
+        assert!(
+            headers.is_empty(),
+            "control-char access key must yield no headers (graceful), not panic; got: {headers:?}"
+        );
+
+        // A bare NUL / control byte is likewise rejected gracefully rather than panicking.
+        let headers2 = writer.sign_request("AKID\u{0001}X:SECRET", &ctx);
+        assert!(
+            headers2.is_empty(),
+            "control-char access key must yield no headers; got: {headers2:?}"
+        );
+
+        // Sanity: a well-formed key still produces the full signed header set.
+        let ok = writer.sign_request("AKIDEXAMPLE:SECRETKEY", &ctx);
+        assert!(
+            ok.iter().any(|(k, _)| k.as_str() == "authorization"),
+            "valid key still signs"
+        );
+    }
+
+    /// Regression: `extract_error` must read the machine-readable error type from the AWS `__type`
+    /// field (used by the breaker's error_map for fine-grained routing), keeping the
+    /// human-readable text in `provider_code` from `message`. Previously both were set from
+    /// `message`, so error_map rules keyed on `structured_type` never matched.
+    #[test]
+    fn test_extract_error_structured_type_from_type_field() {
+        let reader = BedrockReader;
+        let body = br#"{"__type":"ThrottlingException","message":"Rate exceeded"}"#;
+        let raw = reader.extract_error(StatusCode::TOO_MANY_REQUESTS, body);
+        assert_eq!(raw.http_status, 429);
+        assert_eq!(raw.provider_code.as_deref(), Some("Rate exceeded"));
+        assert_eq!(
+            raw.structured_type.as_deref(),
+            Some("ThrottlingException"),
+            "structured_type must come from __type, not the message"
+        );
+    }
+
+    /// `__type` is sometimes serialised as a shape ARN suffix
+    /// (`com.amazon.coral.service#ValidationException`); only the trailing type token is kept.
+    #[test]
+    fn test_extract_error_strips_type_arn_prefix() {
+        let reader = BedrockReader;
+        let body =
+            br#"{"__type":"com.amazon.coral.service#ValidationException","message":"bad input"}"#;
+        let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(raw.provider_code.as_deref(), Some("bad input"));
+        assert_eq!(raw.structured_type.as_deref(), Some("ValidationException"));
+    }
+
+    /// When `__type` is absent, `structured_type` is None (no longer duplicated from `message`).
+    #[test]
+    fn test_extract_error_no_type_field_yields_none_structured_type() {
+        let reader = BedrockReader;
+        let body = br#"{"message":"something went wrong"}"#;
+        let raw = reader.extract_error(StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert_eq!(raw.provider_code.as_deref(), Some("something went wrong"));
+        assert!(
+            raw.structured_type.is_none(),
+            "structured_type must NOT be duplicated from message"
+        );
+    }
+
+    /// A non-JSON body parses gracefully to (None, None) — single parse, no panic.
+    #[test]
+    fn test_extract_error_non_json_body() {
+        let reader = BedrockReader;
+        let raw = reader.extract_error(StatusCode::BAD_GATEWAY, b"<html>502</html>");
+        assert_eq!(raw.http_status, 502);
+        assert!(raw.provider_code.is_none());
+        assert!(raw.structured_type.is_none());
+    }
+
+    /// Regression: a ConverseStream that ends after `messageStop` WITHOUT a trailing `metadata`
+    /// event (malformed/truncated upstream, or a provider variant) must still emit a terminal
+    /// MessageStop so the downstream client receives its terminator instead of hanging.
+    #[test]
+    fn test_stream_terminates_without_metadata() {
+        use crate::ir::IrStreamEvent;
+
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = BedrockReader;
+
+        let events: Vec<_> = vec![
+            serde_json::json!({"type": "messageStart", "role": "assistant"}),
+            serde_json::json!({
+                "type": "contentBlockDelta",
+                "contentBlockIndex": 0,
+                "delta": {"text": "Hi"}
+            }),
+            serde_json::json!({"type": "contentBlockStop", "contentBlockIndex": 0}),
+            serde_json::json!({"type": "messageStop", "stopReason": "end_turn"}),
+            // NOTE: no `metadata` event — the upstream truncated here.
+        ]
+        .into_iter()
+        .flat_map(|data| reader.read_response_events("", &data, &mut state))
+        .collect();
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, IrStreamEvent::MessageStop)),
+            "a terminal MessageStop must be emitted even without a metadata event; got: {events:?}"
+        );
+        // The terminal MessageStop is the last event of the stream.
+        assert!(
+            matches!(events.last(), Some(IrStreamEvent::MessageStop)),
+            "MessageStop must be the final event; got: {events:?}"
+        );
+    }
+
+    /// Exactly one terminal MessageStop is emitted across the full happy-path sequence
+    /// (messageStop + metadata) — no duplicate terminator.
+    #[test]
+    fn test_stream_emits_single_message_stop_with_metadata() {
+        use crate::ir::IrStreamEvent;
+
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = BedrockReader;
+
+        let events: Vec<_> = vec![
+            serde_json::json!({"type": "messageStart", "role": "assistant"}),
+            serde_json::json!({"type": "messageStop", "stopReason": "end_turn"}),
+            serde_json::json!({"type": "metadata", "usage": {"inputTokens": 3, "outputTokens": 1}}),
+        ]
+        .into_iter()
+        .flat_map(|data| reader.read_response_events("", &data, &mut state))
+        .collect();
+
+        let stop_count = events
+            .iter()
+            .filter(|e| matches!(e, IrStreamEvent::MessageStop))
+            .count();
+        assert_eq!(
+            stop_count, 1,
+            "exactly one terminal MessageStop expected; got: {events:?}"
+        );
     }
 }

@@ -10,32 +10,29 @@ pub(crate) struct GeminiReader;
 
 impl ProtocolReader for GeminiReader {
     fn extract_error(&self, status: StatusCode, body: &[u8]) -> crate::breaker::RawUpstreamError {
-        let provider_code = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-            json.get("error")
-                .and_then(|e| e.as_object())
-                .and_then(|e_obj| e_obj.get("code"))
-                .and_then(|c| c.as_str())
-                .map(String::from)
-                .or_else(|| {
-                    json.get("error")
-                        .and_then(|e| e.as_object())
-                        .and_then(|e_obj| e_obj.get("status"))
-                        .and_then(|s| s.as_str())
-                        .map(String::from)
-                })
-        } else {
-            None
-        };
+        // Parse the body once; both `provider_code` and `structured_type` are derived from the
+        // same parsed value to avoid deserializing the JSON twice on every error response.
+        let json = serde_json::from_slice::<serde_json::Value>(body).ok();
+        let error_obj = json
+            .as_ref()
+            .and_then(|j| j.get("error"))
+            .and_then(|e| e.as_object());
 
-        let structured_type = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-            json.get("error")
-                .and_then(|e| e.as_object())
-                .and_then(|e_obj| e_obj.get("status"))
-                .and_then(|t| t.as_str())
-                .map(String::from)
-        } else {
-            None
-        };
+        let provider_code = error_obj
+            .and_then(|e_obj| e_obj.get("code"))
+            .and_then(|c| c.as_str())
+            .map(String::from)
+            .or_else(|| {
+                error_obj
+                    .and_then(|e_obj| e_obj.get("status"))
+                    .and_then(|s| s.as_str())
+                    .map(String::from)
+            });
+
+        let structured_type = error_obj
+            .and_then(|e_obj| e_obj.get("status"))
+            .and_then(|t| t.as_str())
+            .map(String::from);
 
         crate::breaker::RawUpstreamError {
             http_status: status.as_u16(),
@@ -348,8 +345,10 @@ impl ProtocolReader for GeminiReader {
 
                     if role_val == "model" || role_val.is_empty() {
                         if let Some(parts_arr) = content.get("parts").and_then(|p| p.as_array()) {
-                            let mut ir_idx: usize = 0;
-
+                            // The text block always owns IR index 0. Tool blocks take indices 1..n.
+                            // The next tool index is derived from persistent state (`open_tools`)
+                            // rather than a per-chunk local, so indices stay stable across the
+                            // multiple SSE chunks of a single response.
                             for part in parts_arr {
                                 // Text block
                                 if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
@@ -357,12 +356,12 @@ impl ProtocolReader for GeminiReader {
                                         if !state.text_block_open {
                                             state.text_block_open = true;
                                             out.push(IrStreamEvent::BlockStart {
-                                                index: ir_idx,
+                                                index: 0,
                                                 block: crate::ir::IrBlockMeta::Text,
                                             });
                                         }
                                         out.push(IrStreamEvent::BlockDelta {
-                                            index: ir_idx,
+                                            index: 0,
                                             delta: crate::ir::IrDelta::TextDelta(text.to_string()),
                                         });
                                     }
@@ -377,8 +376,13 @@ impl ProtocolReader for GeminiReader {
                                         .to_string();
 
                                     if !name_val.is_empty() {
-                                        // Open tool block at next index (after text)
-                                        ir_idx += 1;
+                                        // Tool blocks follow the text block (index 0). The next
+                                        // index is 1 + however many tool blocks are already open.
+                                        // Record it in `open_tools` so the finishReason handler
+                                        // emits a matching BlockStop for every tool block.
+                                        let ir_idx = 1 + state.open_tools.len();
+                                        state.open_tools.insert(ir_idx);
+
                                         let args = func_call
                                             .get("args")
                                             .cloned()
@@ -781,8 +785,28 @@ impl ProtocolWriter for GeminiWriter {
             // MessageStart → None (no frame needed for start in Gemini)
             IrStreamEvent::MessageStart { .. } => None,
 
-            // BlockStart → None (Gemini has no block-start SSE frame; inline parts)
-            IrStreamEvent::BlockStart { .. } => None,
+            // BlockStart → for a tool block, emit a `functionCall` frame carrying the tool NAME.
+            // The IR carries the tool name only on BlockStart (IrBlockMeta::ToolUse{name}); the
+            // arguments arrive on the following InputJsonDelta(s). Mirroring the OpenAI writer,
+            // we split the Gemini frame the same way: name here, args on the delta. Dropping this
+            // frame (as before) silently lost the function name, producing an unusable tool call.
+            // Text blocks have no Gemini block-start frame (inline parts), so → None.
+            IrStreamEvent::BlockStart { block, .. } => match block {
+                crate::ir::IrBlockMeta::ToolUse { name, .. } => Some((
+                    "".to_string(),
+                    serde_json::json!({
+                        "candidates": [{
+                            "content": {
+                                "role": "model",
+                                "parts": [{"functionCall": {"name": name, "args": {}}}]
+                            }
+                        }]
+                    }),
+                )),
+                crate::ir::IrBlockMeta::Text
+                | crate::ir::IrBlockMeta::Thinking
+                | crate::ir::IrBlockMeta::Image => None,
+            },
 
             // TextDelta → chunk with text part
             IrStreamEvent::BlockDelta { index: _, delta } => match delta {
@@ -798,7 +822,9 @@ impl ProtocolWriter for GeminiWriter {
                     }),
                 )),
 
-                // InputJsonDelta → functionCall with args (best-effort, parse JSON string)
+                // InputJsonDelta → functionCall with args (best-effort, parse JSON string). The
+                // function NAME is emitted on the preceding BlockStart frame (above); the Gemini
+                // client merges the parts within `candidates[].content.parts`.
                 crate::ir::IrDelta::InputJsonDelta(json_str) => {
                     let args: serde_json::Value =
                         serde_json::from_str(json_str).unwrap_or(serde_json::json!({}));
@@ -808,7 +834,7 @@ impl ProtocolWriter for GeminiWriter {
                             "candidates": [{
                                 "content": {
                                     "role": "model",
-                                    "parts": [{"functionCall": {"name": "", "args": args}}]
+                                    "parts": [{"functionCall": {"args": args}}]
                                 }
                             }]
                         }),
@@ -930,5 +956,283 @@ impl ProtocolWriter for GeminiWriter {
 
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
         Box::new(self.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{IrBlockMeta, IrDelta, IrStreamEvent, StreamDecodeState};
+
+    fn collect_stream(chunks: &[serde_json::Value]) -> Vec<IrStreamEvent> {
+        let reader = GeminiReader;
+        let mut state = StreamDecodeState::default();
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(reader.read_response_events("", chunk, &mut state));
+        }
+        events
+    }
+
+    /// Regression: a streamed functionCall MUST produce a matching BlockStop for its tool block.
+    /// Previously the tool index was never recorded in `state.open_tools`, so the finishReason
+    /// drain (which is the only thing that closes tool blocks) left an orphaned BlockStart.
+    #[test]
+    fn test_stream_tool_block_is_closed() {
+        let events = collect_stream(&[serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "SF"}}}]
+                },
+                "finishReason": "STOP"
+            }]
+        })]);
+
+        // Find the tool BlockStart and capture its index.
+        let tool_start_idx = events.iter().find_map(|e| match e {
+            IrStreamEvent::BlockStart {
+                index,
+                block: IrBlockMeta::ToolUse { name, .. },
+            } if name == "get_weather" => Some(*index),
+            _ => None,
+        });
+        let idx = tool_start_idx.expect("tool BlockStart must be emitted");
+
+        // The same index MUST be closed by a BlockStop.
+        let closed = events
+            .iter()
+            .any(|e| matches!(e, IrStreamEvent::BlockStop { index } if *index == idx));
+        assert!(
+            closed,
+            "tool block {idx} was opened but never closed: {events:?}"
+        );
+
+        // Balance check: every BlockStart has a matching BlockStop.
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, IrStreamEvent::BlockStart { .. }))
+            .count();
+        let stops = events
+            .iter()
+            .filter(|e| matches!(e, IrStreamEvent::BlockStop { .. }))
+            .count();
+        assert_eq!(starts, stops, "unbalanced block events: {events:?}");
+    }
+
+    /// Regression: text + tool in the same response use distinct, stable indices (text=0, tool=1)
+    /// and BOTH are closed.
+    #[test]
+    fn test_stream_text_and_tool_indices_stable_and_closed() {
+        let events = collect_stream(&[serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "hello"},
+                        {"functionCall": {"name": "f", "args": {}}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        })]);
+
+        let text_start = events.iter().any(|e| {
+            matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::Text
+                }
+            )
+        });
+        assert!(text_start, "text block must open at index 0");
+
+        let tool_start = events.iter().any(|e| {
+            matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    index: 1,
+                    block: IrBlockMeta::ToolUse { .. }
+                }
+            )
+        });
+        assert!(tool_start, "tool block must open at index 1");
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, IrStreamEvent::BlockStop { index: 0 })),
+            "text block (0) must be closed"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, IrStreamEvent::BlockStop { index: 1 })),
+            "tool block (1) must be closed"
+        );
+    }
+
+    /// Regression: tool block indices stay stable when the functionCall arrives in a different
+    /// chunk than the finishReason (per-chunk local reset previously corrupted this).
+    #[test]
+    fn test_stream_tool_index_stable_across_chunks() {
+        let events = collect_stream(&[
+            serde_json::json!({
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [{"functionCall": {"name": "f", "args": {"a": 1}}}]
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "candidates": [{ "finishReason": "STOP" }]
+            }),
+        ]);
+
+        let start_idx = events.iter().find_map(|e| match e {
+            IrStreamEvent::BlockStart {
+                index,
+                block: IrBlockMeta::ToolUse { .. },
+            } => Some(*index),
+            _ => None,
+        });
+        let idx = start_idx.expect("tool BlockStart must be emitted");
+        assert_eq!(idx, 1, "tool block must take index 1 (text owns 0)");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, IrStreamEvent::BlockStop { index } if *index == idx)),
+            "tool block opened in chunk 1 must be closed by finishReason in chunk 2: {events:?}"
+        );
+    }
+
+    /// Regression: two functionCalls in one response get distinct indices (1 and 2) and both close.
+    #[test]
+    fn test_stream_two_tools_distinct_indices() {
+        let events = collect_stream(&[serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"functionCall": {"name": "a", "args": {}}},
+                        {"functionCall": {"name": "b", "args": {}}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        })]);
+
+        let mut tool_indices: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                IrStreamEvent::BlockStart {
+                    index,
+                    block: IrBlockMeta::ToolUse { .. },
+                } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        tool_indices.sort_unstable();
+        assert_eq!(tool_indices, vec![1, 2], "two tools must take indices 1,2");
+
+        for idx in [1usize, 2usize] {
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, IrStreamEvent::BlockStop { index } if *index == idx)),
+                "tool block {idx} must be closed"
+            );
+        }
+    }
+
+    /// Regression: the Gemini writer must NOT drop the tool name. The name is carried on the
+    /// BlockStart frame (mirroring the OpenAI writer); previously BlockStart returned None and the
+    /// InputJsonDelta frame emitted `"name": ""`, losing the function name entirely.
+    #[test]
+    fn test_writer_tool_blockstart_carries_name() {
+        let writer = GeminiWriter;
+        let ev = IrStreamEvent::BlockStart {
+            index: 1,
+            block: IrBlockMeta::ToolUse {
+                id: String::new(),
+                name: "get_weather".to_string(),
+            },
+        };
+        let (_, chunk) = writer
+            .write_response_event(&ev)
+            .expect("tool BlockStart must emit a functionCall frame carrying the name");
+
+        let name = chunk
+            .pointer("/candidates/0/content/parts/0/functionCall/name")
+            .and_then(|n| n.as_str());
+        assert_eq!(name, Some("get_weather"), "frame: {chunk}");
+    }
+
+    /// The text BlockStart still produces no frame (Gemini inlines text parts).
+    #[test]
+    fn test_writer_text_blockstart_is_none() {
+        let writer = GeminiWriter;
+        let ev = IrStreamEvent::BlockStart {
+            index: 0,
+            block: IrBlockMeta::Text,
+        };
+        assert!(writer.write_response_event(&ev).is_none());
+    }
+
+    /// The InputJsonDelta frame carries args (and no longer asserts an empty name).
+    #[test]
+    fn test_writer_input_json_delta_carries_args() {
+        let writer = GeminiWriter;
+        let ev = IrStreamEvent::BlockDelta {
+            index: 1,
+            delta: IrDelta::InputJsonDelta("{\"city\":\"SF\"}".to_string()),
+        };
+        let (_, chunk) = writer.write_response_event(&ev).expect("args frame");
+        let city = chunk
+            .pointer("/candidates/0/content/parts/0/functionCall/args/city")
+            .and_then(|c| c.as_str());
+        assert_eq!(city, Some("SF"), "frame: {chunk}");
+        // The args frame must NOT carry an empty/placeholder name.
+        assert!(
+            chunk
+                .pointer("/candidates/0/content/parts/0/functionCall/name")
+                .is_none(),
+            "args frame must not carry a name field: {chunk}"
+        );
+    }
+
+    /// extract_error parses the body once and derives both the provider code and structured type.
+    #[test]
+    fn test_extract_error_single_parse_fields() {
+        let reader = GeminiReader;
+        let body = br#"{"error":{"code":"429","status":"RESOURCE_EXHAUSTED"}}"#;
+        let raw = reader.extract_error(StatusCode::TOO_MANY_REQUESTS, body);
+        assert_eq!(raw.http_status, 429);
+        assert_eq!(raw.provider_code.as_deref(), Some("429"));
+        assert_eq!(raw.structured_type.as_deref(), Some("RESOURCE_EXHAUSTED"));
+        // classify()/extract_error do not see headers, so retry_after is sourced elsewhere.
+        assert_eq!(raw.retry_after_secs, None);
+    }
+
+    /// When `code` is absent, extract_error falls back to `status` for the provider code.
+    #[test]
+    fn test_extract_error_status_fallback() {
+        let reader = GeminiReader;
+        let body = br#"{"error":{"status":"PERMISSION_DENIED"}}"#;
+        let raw = reader.extract_error(StatusCode::FORBIDDEN, body);
+        assert_eq!(raw.provider_code.as_deref(), Some("PERMISSION_DENIED"));
+        assert_eq!(raw.structured_type.as_deref(), Some("PERMISSION_DENIED"));
+    }
+
+    /// Malformed (non-JSON) error bodies yield None fields without panicking.
+    #[test]
+    fn test_extract_error_non_json_body() {
+        let reader = GeminiReader;
+        let raw = reader.extract_error(StatusCode::INTERNAL_SERVER_ERROR, b"upstream exploded");
+        assert_eq!(raw.http_status, 500);
+        assert_eq!(raw.provider_code, None);
+        assert_eq!(raw.structured_type, None);
     }
 }

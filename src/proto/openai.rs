@@ -134,7 +134,7 @@ impl ProtocolReader for OpenAiReader {
                 retry_after: None,
             })?;
 
-            for (i, msg_val) in msgs_arr.iter().enumerate() {
+            for msg_val in msgs_arr.iter() {
                 let role_str = msg_val.get("role").and_then(|r| r.as_str()).unwrap_or("");
                 let content_val = msg_val.get("content");
 
@@ -152,21 +152,37 @@ impl ProtocolReader for OpenAiReader {
                     }
                 };
 
-                // Handle system as first message's content (OpenAI convention)
-                if role == crate::ir::IrRole::System && i == 0 {
+                // Promote EVERY system-role message to the top-level system field, regardless of
+                // position. OpenAI permits system turns anywhere in the array, but Anthropic (and
+                // the IR contract) require system content to live in the top-level `system` field —
+                // a System-role IrMessage placed inside the messages array would be rendered as
+                // `"role": "system"` by the Anthropic writer and rejected with a 400. We therefore
+                // never push a System IrMessage; we accumulate its content into system_blocks.
+                if role == crate::ir::IrRole::System {
+                    let blocks_before = system_blocks.len();
                     if let Some(content) = content_val {
-                        if content.is_string() {
-                            let text = content.as_str().unwrap_or("").to_string();
+                        if let Some(text) = content.as_str() {
                             system_blocks.push(crate::ir::IrBlock::Text {
-                                text,
+                                text: text.to_string(),
                                 cache_control: None,
                                 citations: Vec::new(),
                             });
-                        } else if content.is_array() {
-                            for block_val in content.as_array().unwrap() {
+                        } else if let Some(arr) = content.as_array() {
+                            for block_val in arr {
                                 system_blocks.push(read_openai_block(block_val)?);
                             }
                         }
+                    }
+                    // A present-but-degenerate system message (e.g. content omitted, null, or an
+                    // empty array) must not silently vanish: emit an empty Text block so the system
+                    // turn is preserved rather than dropped. `content_val.is_none()` (key absent)
+                    // also lands here, which matches treating an empty system turn as present.
+                    if system_blocks.len() == blocks_before {
+                        system_blocks.push(crate::ir::IrBlock::Text {
+                            text: String::new(),
+                            cache_control: None,
+                            citations: Vec::new(),
+                        });
                     }
                 } else {
                     let mut msg_content = Vec::new();
@@ -800,8 +816,8 @@ impl ProtocolWriter for OpenAiWriter {
                             name: _,
                             input: _,
                         } => {
-                            // ToolUse in user message content becomes part of tool_calls for assistant
-                            // This is handled by the assistant message structure below
+                            // ToolUse is not OpenAI message content; it is surfaced via the
+                            // `tool_calls` array built for this message below (any role).
                         }
 
                         _ => {}
@@ -816,8 +832,11 @@ impl ProtocolWriter for OpenAiWriter {
                 "content": content_val,
             });
 
-            // Handle tool_calls for assistant messages
-            if msg.role == crate::ir::IrRole::Assistant {
+            // Emit tool_calls for ANY message carrying ToolUse blocks, not only assistant ones.
+            // A ToolUse on a non-assistant role is unusual but legal in the IR; gating this on the
+            // assistant role silently dropped such tool calls. Building tool_calls for the block's
+            // own message is non-lossy and keeps the id/arguments round-tripping.
+            {
                 let mut tool_calls_arr: Vec<serde_json::Value> = Vec::new();
                 for block in &msg.content {
                     if let crate::ir::IrBlock::ToolUse { id, name, input } = block {
@@ -955,12 +974,16 @@ impl ProtocolWriter for OpenAiWriter {
                 });
                 Some(("".to_string(), chunk_obj))
             }
-            IrStreamEvent::BlockStart { block, .. } => match block {
+            IrStreamEvent::BlockStart { index, block } => match block {
                 crate::ir::IrBlockMeta::Text => None,
                 crate::ir::IrBlockMeta::ToolUse { id, name } => {
+                    // Use the IR block index (canonical) so parallel tool calls keep distinct,
+                    // stable indices. OpenAI SDKs route streaming argument fragments by
+                    // `tool_calls[n].index`; the BlockStart and its BlockDeltas must carry the
+                    // same value or the reconstructed arguments collide at index 0.
                     let delta_obj = serde_json::json!({
                         "tool_calls": [{
-                            "index": 0,
+                            "index": index,
                             "id": id,
                             "type": "function",
                             "function": { "name": name, "arguments": "" }
@@ -978,7 +1001,7 @@ impl ProtocolWriter for OpenAiWriter {
                 }
                 crate::ir::IrBlockMeta::Thinking | crate::ir::IrBlockMeta::Image => None,
             },
-            IrStreamEvent::BlockDelta { delta, .. } => match delta {
+            IrStreamEvent::BlockDelta { index, delta } => match delta {
                 crate::ir::IrDelta::TextDelta(text) => {
                     let delta_obj = serde_json::json!({ "content": text });
                     let chunk_obj = serde_json::json!({
@@ -992,9 +1015,11 @@ impl ProtocolWriter for OpenAiWriter {
                     Some(("".to_string(), chunk_obj))
                 }
                 crate::ir::IrDelta::InputJsonDelta(json) => {
+                    // Mirror the index emitted by the matching BlockStart so argument
+                    // fragments are routed to the correct parallel tool call.
                     let delta_obj = serde_json::json!({
                         "tool_calls": [{
-                            "index": 0,
+                            "index": index,
                             "function": { "arguments": json }
                         }]
                     });
@@ -1058,14 +1083,18 @@ impl ProtocolWriter for OpenAiWriter {
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
 
-        // Build choices array with one choice
-        let mut messages_array: Vec<serde_json::Value> = Vec::new();
-
-        for block in &resp.content {
-            if let crate::ir::IrBlock::Text { text, .. } = block {
-                messages_array.push(serde_json::json!({ "role": "assistant", "content": text }));
-            }
-        }
+        // Collect the assistant text parts exactly once: their presence decides whether
+        // `content` is null, and their join is the content string. (Previously a parallel Vec of
+        // discarded JSON objects was built solely to test emptiness — a dead allocation that
+        // duplicated the extraction logic.)
+        let text_parts: Vec<&str> = resp
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                crate::ir::IrBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
 
         // ToolUse blocks become tool_calls (not in content)
         let mut tool_calls_arr: Vec<serde_json::Value> = Vec::new();
@@ -1089,18 +1118,10 @@ impl ProtocolWriter for OpenAiWriter {
 
         let mut message_obj = serde_json::json!({
             "role": "assistant",
-            "content": if messages_array.is_empty() {
+            "content": if text_parts.is_empty() {
                 serde_json::Value::Null
             } else {
-                // Concatenate all Text blocks
-                let texts: Vec<String> = resp.content.iter().filter_map(|b| {
-                    if let crate::ir::IrBlock::Text { text, .. } = b {
-                        Some(text.clone())
-                    } else {
-                        None
-                    }
-                }).collect();
-                serde_json::json!(texts.join(""))
+                serde_json::json!(text_parts.concat())
             },
         });
 
@@ -1152,5 +1173,239 @@ impl ProtocolWriter for OpenAiWriter {
         obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
 
         serde_json::Value::Object(obj)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{IrBlock, IrBlockMeta, IrDelta, IrMessage, IrRole, IrStreamEvent, IrUsage};
+
+    fn text_block(text: &str) -> IrBlock {
+        IrBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+            citations: Vec::new(),
+        }
+    }
+
+    // --- Streaming: parallel tool calls must keep distinct, stable indices (fix: index passthrough)
+
+    #[test]
+    fn stream_tool_use_block_start_uses_ir_index() {
+        let w = OpenAiWriter;
+        let ev = IrStreamEvent::BlockStart {
+            index: 2,
+            block: IrBlockMeta::ToolUse {
+                id: "call_b".to_string(),
+                name: "lookup".to_string(),
+            },
+        };
+        let (_, chunk) = w
+            .write_response_event(&ev)
+            .expect("tool-use start emits a chunk");
+        let tc = &chunk["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tc["index"], serde_json::json!(2));
+        assert_eq!(tc["id"], serde_json::json!("call_b"));
+        assert_eq!(tc["function"]["name"], serde_json::json!("lookup"));
+    }
+
+    #[test]
+    fn stream_input_json_delta_uses_ir_index() {
+        let w = OpenAiWriter;
+        let ev = IrStreamEvent::BlockDelta {
+            index: 3,
+            delta: IrDelta::InputJsonDelta("{\"q\":1}".to_string()),
+        };
+        let (_, chunk) = w
+            .write_response_event(&ev)
+            .expect("json delta emits a chunk");
+        let tc = &chunk["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tc["index"], serde_json::json!(3));
+        assert_eq!(tc["function"]["arguments"], serde_json::json!("{\"q\":1}"));
+    }
+
+    #[test]
+    fn stream_parallel_tool_calls_do_not_collide_at_index_zero() {
+        let w = OpenAiWriter;
+        let mk_start = |idx: usize, id: &str| IrStreamEvent::BlockStart {
+            index: idx,
+            block: IrBlockMeta::ToolUse {
+                id: id.to_string(),
+                name: "f".to_string(),
+            },
+        };
+        let mk_delta = |idx: usize, frag: &str| IrStreamEvent::BlockDelta {
+            index: idx,
+            delta: IrDelta::InputJsonDelta(frag.to_string()),
+        };
+
+        let s1 = w.write_response_event(&mk_start(1, "a")).unwrap().1;
+        let s2 = w.write_response_event(&mk_start(2, "b")).unwrap().1;
+        let d1 = w.write_response_event(&mk_delta(1, "x")).unwrap().1;
+        let d2 = w.write_response_event(&mk_delta(2, "y")).unwrap().1;
+
+        let idx =
+            |v: &serde_json::Value| v["choices"][0]["delta"]["tool_calls"][0]["index"].clone();
+        // Two distinct tool calls keep distinct indices...
+        assert_ne!(idx(&s1), idx(&s2));
+        // ...and each argument fragment routes to the index of its matching start.
+        assert_eq!(idx(&s1), idx(&d1));
+        assert_eq!(idx(&s2), idx(&d2));
+    }
+
+    // --- read_request: system messages at any position promote to top-level system (fixes 2 & 3)
+
+    #[test]
+    fn read_request_promotes_non_leading_system_message() {
+        let body = serde_json::json!({
+            "model": "gpt-x",
+            "messages": [
+                { "role": "user", "content": "hello" },
+                { "role": "system", "content": "be terse" },
+                { "role": "assistant", "content": "ok" }
+            ]
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        // The mid-conversation system turn lands in the top-level system field...
+        assert_eq!(ir.system.len(), 1);
+        assert_eq!(ir.system[0], text_block("be terse"));
+        // ...and never appears as a System-role IrMessage inside the messages array.
+        assert!(ir.messages.iter().all(|m| m.role != IrRole::System));
+        assert_eq!(ir.messages.len(), 2);
+    }
+
+    #[test]
+    fn read_request_concatenates_multiple_system_messages() {
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "first" },
+                { "role": "user", "content": "hi" },
+                { "role": "system", "content": "second" }
+            ]
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        assert_eq!(ir.system, vec![text_block("first"), text_block("second")]);
+        assert!(ir.messages.iter().all(|m| m.role != IrRole::System));
+    }
+
+    // --- read_request: degenerate (content-less) system message must not vanish (fix 4)
+
+    #[test]
+    fn read_request_preserves_contentless_system_message() {
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "system" },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        assert_eq!(ir.system, vec![text_block("")]);
+    }
+
+    #[test]
+    fn read_request_preserves_empty_array_system_message() {
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": [] },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        assert_eq!(ir.system, vec![text_block("")]);
+    }
+
+    // --- write_request: ToolUse on a non-assistant message must not be dropped (fix 6)
+
+    #[test]
+    fn write_request_keeps_tool_use_on_user_message() {
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::ToolUse {
+                    id: "t9".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "rust"}),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = OpenAiWriter.write_request(&req);
+        let msgs = out["messages"].as_array().expect("messages array");
+        let user_msg = &msgs[0];
+        let tcs = user_msg["tool_calls"]
+            .as_array()
+            .expect("tool_calls preserved on user message");
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0]["id"], serde_json::json!("t9"));
+        assert_eq!(tcs[0]["function"]["name"], serde_json::json!("search"));
+        assert_eq!(
+            tcs[0]["function"]["arguments"],
+            serde_json::json!("{\"q\":\"rust\"}")
+        );
+    }
+
+    // --- write_response: content collected once; null when no text (fix 5 regression guard)
+
+    #[test]
+    fn write_response_joins_text_blocks_and_keeps_tool_calls() {
+        let resp = crate::ir::IrResponse {
+            role: IrRole::Assistant,
+            content: vec![
+                text_block("Hello "),
+                text_block("world"),
+                IrBlock::ToolUse {
+                    id: "c1".to_string(),
+                    name: "fn".to_string(),
+                    input: serde_json::json!({"a": 1}),
+                },
+            ],
+            stop_reason: Some("tool_use".to_string()),
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+        };
+        let out = OpenAiWriter.write_response(&resp);
+        let msg = &out["choices"][0]["message"];
+        assert_eq!(msg["content"], serde_json::json!("Hello world"));
+        assert_eq!(msg["tool_calls"][0]["id"], serde_json::json!("c1"));
+        assert_eq!(
+            out["choices"][0]["finish_reason"],
+            serde_json::json!("tool_calls")
+        );
+    }
+
+    #[test]
+    fn write_response_content_null_when_no_text() {
+        let resp = crate::ir::IrResponse {
+            role: IrRole::Assistant,
+            content: vec![IrBlock::ToolUse {
+                id: "c1".to_string(),
+                name: "fn".to_string(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: Some("tool_use".to_string()),
+            usage: IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+        };
+        let out = OpenAiWriter.write_response(&resp);
+        assert_eq!(
+            out["choices"][0]["message"]["content"],
+            serde_json::Value::Null
+        );
     }
 }

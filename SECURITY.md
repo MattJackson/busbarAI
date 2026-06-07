@@ -5,7 +5,9 @@
 **Please do not report security vulnerabilities through public issues, pull
 requests, or discussions.**
 
-Instead, email **matthew@pq.io** with:
+Instead, report privately through GitHub's
+[private vulnerability reporting](https://github.com/MattJackson/busbarAI/security/advisories/new)
+(the **Security** tab on the repository). Please include:
 
 - A description of the issue and its potential impact.
 - Steps to reproduce (proof-of-concept if available).
@@ -30,5 +32,5 @@ LLM providers. Issues of particular interest include:
 
 ## Supported versions
 
-Busbar is pre-1.0 and under active development. Security fixes are applied to the
+Busbar is at 1.0.0-rc.2 (release candidate). Security fixes are applied to the
 latest `main` and the most recent tagged release. Pin to a tag for production use.

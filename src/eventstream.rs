@@ -16,6 +16,11 @@
 //! Header: `[name_len: u8][name][value_type: u8][value]`. Bedrock uses string headers (type 7):
 //! `[value_len: u16 BE][value]`.
 
+/// Upper bound on a single event-stream frame. Bedrock ConverseStream frames are small JSON deltas
+/// (well under this), so a declared `total_len` above this cap can only be a malformed or hostile
+/// prelude. Bounding it stops a single frame's declared length from driving unbounded buffering.
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 /// Drain every COMPLETE frame from `buf`, returning `(event_type, payload_bytes)` per frame and
 /// leaving any trailing partial frame buffered. A malformed prelude clears the buffer (the stream
 /// is unrecoverable) rather than looping.
@@ -27,7 +32,12 @@ pub(crate) fn drain_frames(buf: &mut Vec<u8>) -> Vec<(String, Vec<u8>)> {
         }
         let total_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         let headers_len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-        if total_len < 16 || headers_len > total_len - 16 {
+        // `total_len` is attacker/upstream-controlled (up to ~4 GiB). Reject any frame larger than
+        // MAX_FRAME_BYTES BEFORE waiting for `buf.len() >= total_len`, otherwise a crafted prelude
+        // declaring an enormous internally-consistent length would force the caller to buffer
+        // unbounded bytes toward a frame that never arrives (memory-exhaustion DoS). An oversized
+        // length is treated like any other malformed prelude: abandon the (unrecoverable) stream.
+        if !(16..=MAX_FRAME_BYTES).contains(&total_len) || headers_len > total_len - 16 {
             buf.clear(); // malformed — abandon the stream rather than spin
             break;
         }
@@ -133,6 +143,36 @@ mod tests {
         let more = drain_frames(&mut buf);
         assert_eq!(more.len(), 1);
         assert_eq!(more[0].0, "metadata");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_oversized_total_len_is_abandoned_not_buffered() {
+        // A prelude declaring an enormous-but-internally-consistent total_len must be rejected
+        // immediately (buffer cleared, stream abandoned) rather than waiting to accumulate that many
+        // bytes — otherwise it is a memory-exhaustion DoS vector.
+        let mut buf = Vec::new();
+        let huge: u32 = u32::MAX; // ~4 GiB, far above MAX_FRAME_BYTES but >= 16 and self-consistent
+        buf.extend_from_slice(&huge.to_be_bytes()); // total_len
+        buf.extend_from_slice(&0u32.to_be_bytes()); // headers_len = 0 (<= total_len - 16)
+        buf.extend_from_slice(&[0, 0, 0, 0]); // prelude CRC
+        buf.extend_from_slice(b"trailing junk"); // a few extra bytes
+
+        let frames = drain_frames(&mut buf);
+        assert!(frames.is_empty(), "no frame should be emitted");
+        assert!(
+            buf.is_empty(),
+            "oversized frame must clear the buffer, not buffer toward total_len"
+        );
+    }
+
+    #[test]
+    fn test_frame_at_cap_still_decodes() {
+        // A normal, small frame (well under MAX_FRAME_BYTES) is unaffected by the cap.
+        let mut buf = encode_frame("contentBlockDelta", br#"{"delta":{"text":"ok"}}"#);
+        let frames = drain_frames(&mut buf);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, "contentBlockDelta");
         assert!(buf.is_empty());
     }
 }

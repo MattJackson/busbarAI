@@ -41,7 +41,15 @@ pub(crate) fn uri_encode_path(path: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
                 out.push(b as char)
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            // Percent-encode directly into the pre-allocated buffer (no per-byte heap allocation
+            // from `format!`). Index into a static hex table — a 4-bit nibble is always 0..=15, so
+            // the indexing can never go out of bounds and there is no panic on the request path.
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
         }
     }
     out
@@ -90,7 +98,17 @@ pub(crate) fn sign_v4(
 ) -> (String, String) {
     let mut h: Vec<(String, String)> = headers
         .iter()
-        .map(|(k, v)| (k.to_lowercase(), v.trim().to_string()))
+        // AWS SigV4 canonicalization of a (non-quoted) header value: trim leading/trailing
+        // whitespace AND collapse runs of internal whitespace to a single space. `split_whitespace`
+        // splits on any ASCII/Unicode whitespace run and drops empties, so joining with one space
+        // does both at once. Omitting the internal collapse risks a SignatureDoesNotMatch (403) if a
+        // signed header value ever carries doubled spaces.
+        .map(|(k, v)| {
+            (
+                k.to_lowercase(),
+                v.split_whitespace().collect::<Vec<_>>().join(" "),
+            )
+        })
         .collect();
     h.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -133,6 +151,54 @@ mod tests {
             uri_encode_path("/model/anthropic.claude-3:0/converse"),
             "/model/anthropic.claude-3%3A0/converse"
         );
+    }
+
+    #[test]
+    fn test_uri_encode_path_assorted_bytes() {
+        // The allocation-free encoder must produce uppercase two-digit hex for every reserved byte
+        // (regression for the `format!("%{b:02X}")` → static-table rewrite).
+        assert_eq!(uri_encode_path(" "), "%20"); // 0x20
+        assert_eq!(uri_encode_path("?a=b&c"), "%3Fa%3Db%26c");
+        assert_eq!(uri_encode_path("/"), "/"); // slash preserved
+                                               // Unreserved set passes through untouched.
+        assert_eq!(uri_encode_path("aZ0-_.~"), "aZ0-_.~");
+        // A high byte (0xC3 from the UTF-8 of 'Ã') still encodes uppercase, padded.
+        assert_eq!(uri_encode_path("\u{00c3}"), "%C3%83");
+    }
+
+    #[test]
+    fn test_sign_v4_collapses_internal_whitespace_in_header_value() {
+        // Two requests whose only difference is collapsible internal whitespace in a signed header
+        // value must produce the SAME signature, because SigV4 canonicalization collapses runs of
+        // internal whitespace to a single space. (Regression for v.trim()-only canonicalization.)
+        let payload_hash = sha256_hex(b"");
+        let mk = |v: &str| {
+            sign_v4(
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "us-east-1",
+                "iam",
+                "GET",
+                "/",
+                "",
+                &[
+                    ("host".to_string(), "iam.amazonaws.com".to_string()),
+                    ("x-amz-date".to_string(), "20150830T123600Z".to_string()),
+                    ("x-custom".to_string(), v.to_string()),
+                ],
+                &payload_hash,
+                "20150830T123600Z",
+                "20150830",
+            )
+        };
+        let (sig_single, _) = mk("a b c");
+        let (sig_double, _) = mk("a   b\t c"); // doubled spaces + tab collapse to single spaces
+        assert_eq!(
+            sig_single, sig_double,
+            "internal whitespace must be collapsed before signing"
+        );
+        // Leading/trailing whitespace must still be trimmed (the original behavior).
+        let (sig_padded, _) = mk("  a b c  ");
+        assert_eq!(sig_single, sig_padded);
     }
 
     /// AWS published worked example — GET iam ListUsers, 2015-08-30. If our canonical-request →

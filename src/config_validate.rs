@@ -33,13 +33,34 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 crate::proto::DEFAULT_MAX_TOKENS
             ));
         }
+        // A `max_concurrent: 0` lane builds a `Semaphore::new(0)` at startup (main.rs), which never
+        // grants a permit — every request to the lane is permanently capacity-exhausted with no
+        // boot-time diagnostic. Reject it loudly here rather than silently black-holing the lane.
+        if model_cfg.max_concurrent == 0 {
+            errors.push(format!(
+                "model '{}' has max_concurrent: 0; must be >= 1",
+                model_name
+            ));
+        }
     }
 
-    // Rule 1: Reject pool name == any provider name (disambiguation)
+    // All model names, used for the pool/model collision check below (the `named` route resolves
+    // pools before models, so a pool sharing a model's name would permanently shadow that model).
+    let model_names: HashSet<&str> = cfg.models.keys().map(|s| s.as_str()).collect();
+
+    // Rule 1: Reject a pool name that collides with any provider name OR any model name. Pools,
+    // providers, and models must all have distinct names: a pool named like a provider is
+    // ambiguous, and a pool named like a model silently shadows that model on the `named` route.
     for pool_name in cfg.pools.keys() {
         if provider_names.contains(pool_name.as_str()) {
             errors.push(format!(
                 "pool name '{}' conflicts with provider name '{}'; pools and providers must have distinct names",
+                pool_name, pool_name
+            ));
+        }
+        if model_names.contains(pool_name.as_str()) {
+            errors.push(format!(
+                "pool name '{}' conflicts with model name '{}'; pools and models must have distinct names",
                 pool_name, pool_name
             ));
         }
@@ -67,6 +88,18 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     provider_name, auth
                 ));
             }
+        }
+
+        // The resolved base_url is the actual upstream target for signed (API-key-bearing) calls.
+        // It is operator-controllable via a config.yaml override, so enforce `https://` at startup:
+        // a plaintext `http://` upstream leaks the API key on the wire, and an `http://169.254.169.254/`
+        // / `file://` / internal override is an SSRF target. Mirror the shipped-catalog test assertion
+        // as a hard validation rule rather than a test-only check.
+        if !provider_cfg.base_url.starts_with("https://") {
+            errors.push(format!(
+                "provider '{}' base_url must use https (got '{}')",
+                provider_name, provider_cfg.base_url
+            ));
         }
     }
 
@@ -99,18 +132,86 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 "heterogeneous pool: cross-protocol failover translates via the IR and may not preserve all provider features"
             );
         }
+
+        // Rule 6: Validate the per-pool breaker trip parameters. Pathological-but-parseable values
+        // produce a breaker that either never protects the backend or trips it open on the first
+        // hiccup, defeating the failure-handling guarantee. Reject them at startup (fail-loud).
+        if let Some(breaker) = &pool_cfg.breaker {
+            // The escalating cooldown clamps at max_cooldown_secs, so a max below the base would
+            // pin every cooldown below the configured base — reject the inversion.
+            if breaker.max_cooldown_secs < breaker.base_cooldown_secs {
+                errors.push(format!(
+                    "pool '{}' breaker max_cooldown_secs ({}) must be >= base_cooldown_secs ({})",
+                    pool_name, breaker.max_cooldown_secs, breaker.base_cooldown_secs
+                ));
+            }
+            if let Some(trip) = &breaker.trip {
+                // min_requests is the floor below which error-rate trips are suppressed; 0 makes the
+                // floor vacuous so a single error in an otherwise-empty window can trip.
+                if trip.min_requests == 0 {
+                    errors.push(format!(
+                        "pool '{}' breaker trip.min_requests must be >= 1 (got 0)",
+                        pool_name
+                    ));
+                }
+                // window_s is the sliding-window length; a 0 window holds no outcomes so the
+                // count is always below min_requests and the error-rate breaker never trips.
+                if trip.window_s == 0 {
+                    errors.push(format!(
+                        "pool '{}' breaker trip.window_s must be >= 1 (got 0)",
+                        pool_name
+                    ));
+                }
+                match trip.mode {
+                    crate::config::BreakerTripMode::ErrorRate => {
+                        // threshold is an error-rate fraction; the rate is capped at 1.0, so a
+                        // threshold > 1.0 can never trip and <= 0.0 trips on the first error.
+                        if !(trip.threshold > 0.0 && trip.threshold <= 1.0) {
+                            errors.push(format!(
+                                "pool '{}' breaker trip.threshold must be in (0.0, 1.0] for error_rate mode (got {})",
+                                pool_name, trip.threshold
+                            ));
+                        }
+                    }
+                    crate::config::BreakerTripMode::Consecutive => {
+                        // n is the consecutive-failure streak length; n == 0 makes `streak >= 0`
+                        // always true so the lane trips on every evaluation.
+                        if trip.n == 0 {
+                            errors.push(format!(
+                                "pool '{}' breaker trip.n must be >= 1 for consecutive mode (got 0)",
+                                pool_name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Rule 5: Validate the auth mode (otherwise AuthMiddleware::new would panic at startup).
     if let Some(auth) = &cfg.auth {
-        if crate::auth::AuthMode::from_config_str(&auth.mode).is_none() {
-            errors.push(format!(
-                "auth.mode '{}' is invalid: must be '{}', '{}', or '{}'",
-                auth.mode,
-                crate::auth::AuthMode::TOKEN,
-                crate::auth::AuthMode::PASSTHROUGH,
-                crate::auth::AuthMode::NONE
-            ));
+        match crate::auth::AuthMode::from_config_str(&auth.mode) {
+            None => {
+                errors.push(format!(
+                    "auth.mode '{}' is invalid: must be '{}', '{}', or '{}'",
+                    auth.mode,
+                    crate::auth::AuthMode::TOKEN,
+                    crate::auth::AuthMode::PASSTHROUGH,
+                    crate::auth::AuthMode::NONE
+                ));
+            }
+            Some(crate::auth::AuthMode::Token) => {
+                // Token mode with no client tokens rejects 100% of requests with no startup signal —
+                // the locked-out mirror of the loudly-warned open-relay (mode: none) case. `normalize()`
+                // promotes a single legacy `token:` into the allowlist, so account for it here too.
+                if effective_client_tokens_empty(auth) {
+                    errors.push(
+                        "auth.mode is 'token' but no client_tokens are configured; token mode requires at least one client token (otherwise every request is rejected)".to_string(),
+                    );
+                }
+            }
+            // Passthrough/None carry no token-allowlist requirement.
+            Some(crate::auth::AuthMode::Passthrough) | Some(crate::auth::AuthMode::None) => {}
         }
     }
 
@@ -119,6 +220,14 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
     } else {
         Err(errors)
     }
+}
+
+/// True when an `AuthCfg` would resolve to an empty client-token allowlist after `normalize()`.
+/// `normalize()` promotes a single legacy `token:` into the allowlist only when `client_tokens`
+/// is empty, so the effective set is empty iff `client_tokens` is empty AND no legacy token is set.
+#[allow(deprecated)] // intentionally reading the deprecated legacy-token field to mirror normalize()
+fn effective_client_tokens_empty(auth: &crate::config::AuthCfg) -> bool {
+    auth.client_tokens.is_empty() && auth._legacy_token.is_none()
 }
 
 #[cfg(test)]
@@ -488,5 +597,296 @@ mod tests {
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("orphan_model"));
         assert!(errs[0].contains("references unknown provider"));
+    }
+
+    #[allow(deprecated)] // exercising the deprecated legacy-token field on purpose
+    fn make_auth(mode: &str, client_tokens: Vec<&str>, legacy: Option<&str>) -> config::AuthCfg {
+        config::AuthCfg {
+            mode: mode.into(),
+            _legacy_token: legacy.map(|s| s.to_string()),
+            client_tokens: client_tokens.into_iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn make_breaker(
+        base_cooldown_secs: u64,
+        max_cooldown_secs: u64,
+        trip: Option<config::BreakerTripConfig>,
+    ) -> config::BreakerCfg {
+        config::BreakerCfg {
+            base_cooldown_secs,
+            max_cooldown_secs,
+            trip,
+        }
+    }
+
+    fn make_trip(
+        mode: config::BreakerTripMode,
+        window_s: u64,
+        threshold: f64,
+        min_requests: usize,
+        n: u32,
+    ) -> config::BreakerTripConfig {
+        config::BreakerTripConfig {
+            mode,
+            window_s,
+            threshold,
+            min_requests,
+            n,
+        }
+    }
+
+    // A minimal valid single-provider/single-model/single-pool config, returned as its three maps
+    // so individual tests can mutate one field and re-assemble via `make_root_cfg`.
+    fn valid_maps() -> (
+        HashMap<String, config::ProviderCfg>,
+        HashMap<String, config::ModelCfg>,
+        HashMap<String, config::PoolCfg>,
+    ) {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "myprovider".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        models.insert("mymodel".to_string(), make_model("myprovider", 10));
+        let mut pools = HashMap::new();
+        pools.insert(
+            "mypool".to_string(),
+            make_pool(vec![make_member("mymodel")]),
+        );
+        (providers, models, pools)
+    }
+
+    #[test]
+    fn test_validate_rejects_non_https_base_url() {
+        for bad in [
+            "http://api.example.com",
+            "http://169.254.169.254/latest/meta-data/",
+            "file:///etc/shadow",
+            "",
+        ] {
+            let mut providers = HashMap::new();
+            providers.insert("p".to_string(), make_provider("anthropic", bad, "API_KEY"));
+            let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+            let errs = validate(&cfg)
+                .unwrap_err_or_default(format!("non-https base_url '{bad}' must fail validation"));
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("base_url must use https") && e.contains('p')),
+                "expected an https base_url error for '{bad}'; got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_https_base_url() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        assert!(validate(&cfg).is_ok(), "an https base_url must validate");
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_max_concurrent() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "myprovider".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        models.insert("zeromodel".to_string(), make_model("myprovider", 0));
+        // A positive max_concurrent must NOT error.
+        models.insert("okmodel".to_string(), make_model("myprovider", 1));
+
+        let cfg = make_root_cfg(providers, models, HashMap::new());
+        let errs = validate(&cfg).expect_err("max_concurrent: 0 must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("zeromodel") && e.contains("max_concurrent: 0")),
+            "expected a max_concurrent:0 error for 'zeromodel'; got: {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("okmodel")),
+            "a positive max_concurrent must not error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_pool_name_equals_model_name() {
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        // Pool named identically to the model would shadow it on the `named` route.
+        pools.insert(
+            "mymodel".to_string(),
+            make_pool(vec![make_member("mymodel")]),
+        );
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg).expect_err("pool name == model name must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("conflicts with model name") && e.contains("mymodel")),
+            "expected a pool/model name-collision error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_breaker_params() {
+        // (description, breaker, substring expected in the error)
+        let cases: Vec<(&str, config::BreakerCfg, &str)> = vec![
+            (
+                "min_requests 0",
+                make_breaker(
+                    15,
+                    120,
+                    Some(make_trip(config::BreakerTripMode::ErrorRate, 30, 0.5, 0, 3)),
+                ),
+                "trip.min_requests must be >= 1",
+            ),
+            (
+                "window_s 0",
+                make_breaker(
+                    15,
+                    120,
+                    Some(make_trip(config::BreakerTripMode::ErrorRate, 0, 0.5, 5, 3)),
+                ),
+                "trip.window_s must be >= 1",
+            ),
+            (
+                "threshold > 1.0",
+                make_breaker(
+                    15,
+                    120,
+                    Some(make_trip(config::BreakerTripMode::ErrorRate, 30, 1.5, 5, 3)),
+                ),
+                "trip.threshold must be in (0.0, 1.0]",
+            ),
+            (
+                "threshold 0.0",
+                make_breaker(
+                    15,
+                    120,
+                    Some(make_trip(config::BreakerTripMode::ErrorRate, 30, 0.0, 5, 3)),
+                ),
+                "trip.threshold must be in (0.0, 1.0]",
+            ),
+            (
+                "consecutive n 0",
+                make_breaker(
+                    15,
+                    120,
+                    Some(make_trip(
+                        config::BreakerTripMode::Consecutive,
+                        30,
+                        0.5,
+                        5,
+                        0,
+                    )),
+                ),
+                "trip.n must be >= 1",
+            ),
+            (
+                "max_cooldown < base_cooldown",
+                make_breaker(
+                    100,
+                    50,
+                    Some(make_trip(config::BreakerTripMode::ErrorRate, 30, 0.5, 5, 3)),
+                ),
+                "max_cooldown_secs",
+            ),
+        ];
+
+        for (desc, breaker, expected) in cases {
+            let (providers, models, _) = valid_maps();
+            let mut pools = HashMap::new();
+            let mut pool = make_pool(vec![make_member("mymodel")]);
+            pool.breaker = Some(breaker);
+            pools.insert("mypool".to_string(), pool);
+            let cfg = make_root_cfg(providers, models, pools);
+            let errs = validate(&cfg)
+                .unwrap_err_or_default(format!("breaker case '{desc}' must fail validation"));
+            assert!(
+                errs.iter().any(|e| e.contains(expected)),
+                "case '{desc}': expected error containing '{expected}'; got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_good_breaker_params() {
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut pool = make_pool(vec![make_member("mymodel")]);
+        pool.breaker = Some(make_breaker(
+            15,
+            120,
+            Some(make_trip(
+                config::BreakerTripMode::ErrorRate,
+                30,
+                1.0, // boundary: rate-cap value is valid
+                1,   // boundary: minimum floor
+                3,
+            )),
+        ));
+        pools.insert("mypool".to_string(), pool);
+        let cfg = make_root_cfg(providers, models, pools);
+        assert!(
+            validate(&cfg).is_ok(),
+            "a well-formed breaker config must validate"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_token_mode_with_no_tokens() {
+        let (providers, models, pools) = valid_maps();
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.auth = Some(make_auth("token", vec![], None));
+        let errs = validate(&cfg).expect_err("token mode with no tokens must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("token mode requires at least one client token")),
+            "expected a token-mode lockout error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_token_mode_with_tokens_ok() {
+        // Both the allowlist form and the legacy single-token form satisfy the requirement.
+        for auth in [
+            make_auth("token", vec!["secret"], None),
+            make_auth("token", vec![], Some("legacy-secret")),
+        ] {
+            let (providers, models, pools) = valid_maps();
+            let mut cfg = make_root_cfg(providers, models, pools);
+            cfg.auth = Some(auth);
+            assert!(
+                validate(&cfg).is_ok(),
+                "token mode with at least one token must validate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_none_mode_with_no_tokens_ok() {
+        let (providers, models, pools) = valid_maps();
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.auth = Some(make_auth("none", vec![], None));
+        assert!(
+            validate(&cfg).is_ok(),
+            "mode 'none' carries no token requirement"
+        );
+    }
+
+    // Small ergonomic helper: like `expect_err` but with a custom message and returning the Vec.
+    trait UnwrapErrOrDefault {
+        fn unwrap_err_or_default(self, msg: String) -> Vec<String>;
+    }
+    impl UnwrapErrOrDefault for Result<(), Vec<String>> {
+        fn unwrap_err_or_default(self, msg: String) -> Vec<String> {
+            self.err().unwrap_or_else(|| panic!("{msg}"))
+        }
     }
 }

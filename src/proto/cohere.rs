@@ -261,8 +261,8 @@ impl ProtocolReader for CohereReader {
         }
 
         let mut tools: Vec<crate::ir::IrTool> = Vec::new();
-        if let Some(tools_val) = obj.get("tools") {
-            for tool_val in tools_val.as_array().unwrap_or(&Vec::new()) {
+        if let Some(tools_arr) = obj.get("tools").and_then(|v| v.as_array()) {
+            for tool_val in tools_arr {
                 if let Some(func_obj) = tool_val.get("function") {
                     let name = func_obj
                         .get("name")
@@ -618,29 +618,38 @@ impl ProtocolWriter for CohereWriter {
                 crate::ir::IrRole::Tool => "tool",
             };
 
-            let content_val = if msg.content.len() == 1 {
-                if let Some(crate::ir::IrBlock::Text { text, .. }) = msg.content.first() {
-                    serde_json::Value::String(text.clone())
-                } else {
-                    let mut arr: Vec<serde_json::Value> = Vec::new();
-                    if let Some(crate::ir::IrBlock::Text { text, .. }) = msg.content.first() {
-                        arr.push(serde_json::json!({ "type": "text", "text": text }));
+            // Build content from the text blocks actually present. A single text block is sent as
+            // a bare string (Cohere's preferred shape); multiple text blocks become a text-part
+            // array. A message whose only block(s) are non-Text (e.g. a sole ToolUse, surfaced
+            // separately via `tool_calls`) must NOT emit `content: []` — Cohere may reject that —
+            // so we omit the `content` key entirely in that case.
+            let text_blocks: Vec<&String> = msg
+                .content
+                .iter()
+                .filter_map(|b| {
+                    if let crate::ir::IrBlock::Text { text, .. } = b {
+                        Some(text)
+                    } else {
+                        None
                     }
-                    serde_json::Value::Array(arr)
-                }
-            } else {
-                let mut arr: Vec<serde_json::Value> = Vec::new();
-                for block in &msg.content {
-                    if let crate::ir::IrBlock::Text { text, .. } = block {
-                        arr.push(serde_json::json!({ "type": "text", "text": text }));
-                    }
-                }
-                serde_json::Value::Array(arr)
+                })
+                .collect();
+
+            let content_val: Option<serde_json::Value> = match text_blocks.as_slice() {
+                [] => None,
+                [single] => Some(serde_json::Value::String((*single).clone())),
+                many => Some(serde_json::Value::Array(
+                    many.iter()
+                        .map(|text| serde_json::json!({ "type": "text", "text": text }))
+                        .collect(),
+                )),
             };
 
             let mut msg_obj = serde_json::Map::new();
             msg_obj.insert("role".to_string(), serde_json::json!(role_str));
-            msg_obj.insert("content".to_string(), content_val);
+            if let Some(content_val) = content_val {
+                msg_obj.insert("content".to_string(), content_val);
+            }
 
             if msg.role == crate::ir::IrRole::Assistant {
                 let mut tool_calls_arr: Vec<serde_json::Value> = Vec::new();
@@ -825,6 +834,7 @@ impl ProtocolWriter for CohereWriter {
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
         let mut out = serde_json::Map::new();
         let mut content_arr: Vec<serde_json::Value> = Vec::new();
+        let mut tool_calls_arr: Vec<serde_json::Value> = Vec::new();
 
         for block in &resp.content {
             match block {
@@ -834,11 +844,20 @@ impl ProtocolWriter for CohereWriter {
                 crate::ir::IrBlock::ToolUse { id, name, input } => {
                     let args_str =
                         serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
-                    out.insert("tool_calls".to_string(), serde_json::json!([{ "id": id, "type": "function", "function": { "name": name, "arguments": args_str }}]));
+                    // Accumulate every tool call. Inserting per-iteration would overwrite the
+                    // key and silently drop all but the last call on parallel tool use.
+                    tool_calls_arr.push(serde_json::json!({ "id": id, "type": "function", "function": { "name": name, "arguments": args_str }}));
                 }
                 crate::ir::IrBlock::Thinking { .. } => {}
                 crate::ir::IrBlock::Image { .. } | crate::ir::IrBlock::ToolResult { .. } => {}
             }
+        }
+
+        if !tool_calls_arr.is_empty() {
+            out.insert(
+                "tool_calls".to_string(),
+                serde_json::Value::Array(tool_calls_arr),
+            );
         }
 
         let cohere_finish_reason = match resp.stop_reason.as_deref() {
@@ -1186,5 +1205,155 @@ mod tests {
                 .and_then(|c| c.as_str()),
             Some("hi")
         );
+    }
+
+    /// Regression: a response carrying several parallel `ToolUse` blocks must surface ALL of them
+    /// in `tool_calls`. The previous per-iteration `out.insert(...)` overwrote the key and silently
+    /// dropped every call but the last.
+    #[test]
+    fn test_write_response_preserves_parallel_tool_calls() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![
+                crate::ir::IrBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "get_weather".to_string(),
+                    input: serde_json::json!({"city": "SF"}),
+                },
+                crate::ir::IrBlock::ToolUse {
+                    id: "t2".to_string(),
+                    name: "get_time".to_string(),
+                    input: serde_json::json!({"tz": "PST"}),
+                },
+                crate::ir::IrBlock::ToolUse {
+                    id: "t3".to_string(),
+                    name: "get_news".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            stop_reason: Some("tool_use".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+        };
+
+        let json = CohereWriter.write_response(&resp);
+        let tool_calls = json
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .expect("tool_calls array must be present");
+        assert_eq!(tool_calls.len(), 3, "all parallel tool calls must survive");
+        let ids: Vec<&str> = tool_calls
+            .iter()
+            .filter_map(|c| c.get("id").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(ids, ["t1", "t2", "t3"]);
+    }
+
+    /// Regression: an assistant message whose only block is a `ToolUse` (surfaced via `tool_calls`)
+    /// must NOT emit `content: []`. The `content` key should be omitted entirely.
+    #[test]
+    fn test_write_request_sole_tooluse_omits_empty_content() {
+        let ir = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Assistant,
+                content: vec![crate::ir::IrBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "f".to_string(),
+                    input: serde_json::json!({"x": 1}),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: Some(64),
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+
+        let json = CohereWriter.write_request(&ir);
+        let msgs = json.get("messages").unwrap().as_array().unwrap();
+        let assistant = &msgs[0];
+        assert!(
+            assistant.get("content").is_none(),
+            "sole-ToolUse message must omit content rather than emit []"
+        );
+        assert!(
+            assistant.get("tool_calls").is_some(),
+            "the tool call must still be present"
+        );
+    }
+
+    /// Multiple text blocks in one message must serialize as a text-part array (not be collapsed),
+    /// while a single text block stays a bare string.
+    #[test]
+    fn test_write_request_text_block_shapes() {
+        let single = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let j = CohereWriter.write_request(&single);
+        assert_eq!(
+            j.get("messages").unwrap().as_array().unwrap()[0].get("content"),
+            Some(&serde_json::json!("hi"))
+        );
+
+        let multi = crate::ir::IrRequest {
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![
+                    crate::ir::IrBlock::Text {
+                        text: "a".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    },
+                    crate::ir::IrBlock::Text {
+                        text: "b".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    },
+                ],
+            }],
+            ..single
+        };
+        let j = CohereWriter.write_request(&multi);
+        let content = j.get("messages").unwrap().as_array().unwrap()[0]
+            .get("content")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0].get("text").and_then(|t| t.as_str()), Some("a"));
+        assert_eq!(content[1].get("text").and_then(|t| t.as_str()), Some("b"));
+    }
+
+    /// `read_request` must not allocate a temporary empty Vec when `tools` is absent, and must
+    /// produce no tools either way.
+    #[test]
+    fn test_read_request_missing_tools() {
+        let json = serde_json::json!({
+            "model": "command",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let ir = CohereReader
+            .read_request(&json)
+            .expect("read_request should succeed");
+        assert!(ir.tools.is_empty());
     }
 }

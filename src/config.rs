@@ -17,11 +17,22 @@ pub(crate) fn interpolate_env(s: &str) -> Result<String, String> {
         if ch == '$' && chars.peek() == Some(&'{') {
             chars.next(); // consume '{'
             let mut var_name = String::new();
+            let mut closed = false;
             for ch in chars.by_ref() {
                 if ch == '}' {
+                    closed = true;
                     break;
                 }
                 var_name.push(ch);
+            }
+            // The inner loop also exits when the iterator is exhausted, so a token with no closing
+            // brace (e.g. `${FOO`) would otherwise be treated as `${FOO}` — silently succeeding if
+            // FOO happens to be set, or reporting a misleading "unset variable" if it is not. Reject
+            // the malformed token loudly instead so config typos surface at boot.
+            if !closed {
+                return Err(format!(
+                    "unclosed variable reference starting at '${{{var_name}'"
+                ));
             }
             if var_name.is_empty() {
                 return Err("empty variable name in ${}".into());
@@ -650,6 +661,12 @@ models:
         assert!(cfg.pools.contains_key("smart"));
         assert!(cfg.pools.contains_key("overflow"));
         assert!(cfg.models.contains_key("claude-sonnet"));
+
+        // Env vars are process-global and tests run in parallel; clean up so this test cannot
+        // leave BUSBAR_CLIENT_TOKEN/BUSBAR_ADMIN_TOKEN set for the rest of the run (which could
+        // mask an "unset variable" assertion in another test).
+        std::env::remove_var("BUSBAR_CLIENT_TOKEN");
+        std::env::remove_var("BUSBAR_ADMIN_TOKEN");
     }
 
     /// The shipped providers.yaml catalog must parse, name only known protocols, and use HTTPS.
@@ -723,6 +740,39 @@ models:
         let input = "plain-text-no-vars";
         let result = interpolate_env(input).unwrap();
         assert_eq!(result, "plain-text-no-vars");
+    }
+
+    /// An unclosed `${FOO` (missing `}`) must fail loudly with an "unclosed" error rather than be
+    /// treated as `${FOO}` — regardless of whether FOO is set in the environment. Uses a unique
+    /// per-test var name (process-global env, parallel tests) and a guaranteed-unset name.
+    #[test]
+    fn test_interpolate_env_unclosed_brace_fails() {
+        // Unset variable, missing brace: must report "unclosed", NOT "unset environment variable".
+        let result = interpolate_env("prefix-${BUSBAR_T_UNCLOSED_UNSET");
+        assert!(result.is_err(), "unclosed token must error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unclosed"),
+            "error must mention 'unclosed', got: {err}"
+        );
+        assert!(
+            !err.contains("unset environment variable"),
+            "must not misreport as an unset-variable error, got: {err}"
+        );
+
+        // Set variable, missing brace: must STILL error (not silently interpolate the value).
+        std::env::set_var("BUSBAR_T_UNCLOSED_SET", "leaked-value");
+        let result2 = interpolate_env("https://${BUSBAR_T_UNCLOSED_SET/api");
+        std::env::remove_var("BUSBAR_T_UNCLOSED_SET");
+        assert!(
+            result2.is_err(),
+            "unclosed token must error even when the var is set"
+        );
+        let err2 = result2.unwrap_err();
+        assert!(
+            err2.contains("unclosed"),
+            "error must mention 'unclosed', got: {err2}"
+        );
     }
 
     // Two-file (providers.yaml + config.yaml) resolution tests
