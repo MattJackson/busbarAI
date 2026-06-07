@@ -7,7 +7,7 @@ is [ADR-0002](adr/0002-circuit-breaker.md).
 
 ## Shape of the suite
 
-All tests are **in-crate** and run under `cargo test` (~248 tests at time of
+All tests are **in-crate** and run under `cargo test` (267 tests at time of
 writing). There is no `tests/` directory of integration binaries. Two patterns:
 
 - **Per-module `#[cfg(test)] mod tests`** — unit tests next to the code they cover
@@ -103,7 +103,7 @@ async fn my_forwarding_test() {
     let lane_data = LaneData { model: "m".into(), provider: "p".into(), max: 10,
         sem: Arc::new(tokio::sync::Semaphore::new(10)), limited: false, budget: -1,
         cooldown_until: 0, streak: 0, dead: false, dead_reason: String::new(),
-        inflight: 0, ok: 0, err: 0, client_fault: 0 };
+        ok: 0, err: 0, client_fault: 0 };
     let lane = Lane { model: "m".into(), provider: "p".into(),
         base_url: server.base_url(), api_key: "k".into(),
         protocol: Arc::new(crate::proto::Protocol::anthropic()), max: 10,

@@ -47,12 +47,12 @@ Single Rust binary, stable toolchain, edition 2021.
 ```bash
 cargo build                                   # debug build
 cargo build --release                         # release binary -> target/release/busbar
-cargo test                                    # full suite (~248 tests)
+cargo test                                    # full suite (267 tests)
 cargo clippy --all-targets -- -D warnings     # lints must be clean (treat warnings as errors)
 cargo fmt --all                               # format (rustfmt.toml in repo)
 ```
 
-The test suite (~248 tests at time of writing) is **in-crate**: a shared
+The test suite (267 tests at time of writing) is **in-crate**: a shared
 `#[cfg(test)] mod test_support` provides the `MockServer` harness, and each module
 carries its own `#[cfg(test)] mod tests`. There are no `tests/` integration
 binaries — everything runs under `cargo test`. See [testing.md](testing.md).

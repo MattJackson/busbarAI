@@ -76,7 +76,7 @@ zai-api:
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `protocol` | string | no | `anthropic` | One of `anthropic`, `openai`, `gemini`, `bedrock`, `responses`, `cohere`. An unknown protocol is a startup panic. |
-| `base_url` | string | **yes** | — | Scheme + host (+ optional version prefix). Must be `https://`. Trailing slash is trimmed. |
+| `base_url` | string | **yes** | — | Scheme + host (+ optional version prefix). Should be `https://` for any external endpoint: the shipped catalog enforces this, but custom entries are not checked at startup, so an `http://` URL you supply will be used as-is. Trailing slash is trimmed. |
 | `error_map` | map<string,string> | no | `{}` | Maps a provider-specific JSON error **code** → canonical disposition. Recognized values: `billing`, `rate_limit`. HTTP-status errors (401/429/5xx/…) are classified by the breaker without an `error_map`; this is only for provider JSON codes. |
 | `path` | string | no | protocol's standard path | Overrides the upstream request path appended to `base_url`. Use it when the API version is in `base_url` and the endpoint is e.g. `/chat/completions` (no `/v1`), or to carry Azure's `?api-version=` + deployment. |
 | `auth` | string | no | protocol's native auth | `bearer` (default for openai/anthropic/responses/cohere), or `api-key` to send an `api-key: <key>` header instead of bearer (Azure OpenAI). Gemini (`x-goog-api-key`) and Bedrock (SigV4) auth is determined by their protocol. |
@@ -91,7 +91,8 @@ override).
 ### Per-provider deployment overrides
 
 In `config.yaml`, a provider entry may override the catalog's `protocol`,
-`base_url`, `error_map` (merged, deployment wins per code), `path`, and `auth`.
+`base_url`, `error_map` (merged, deployment wins per code), `path`, `auth`, and
+`health`.
 This is rarely needed; the common case is just `api_key_env`.
 
 ---
@@ -156,7 +157,7 @@ providers:
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `api_key_env` | string | **yes** | Name of the env var holding the credential. An empty/unset key logs a warning at startup; the lane runs but will fail auth. |
-| `protocol`, `base_url`, `error_map`, `path`, `auth` | — | no | Catalog overrides (see above). |
+| `protocol`, `base_url`, `error_map`, `path`, `auth`, `health` | — | no | Catalog overrides (see above). |
 
 **Auth shapes by protocol/provider:**
 
@@ -186,6 +187,7 @@ models:
 | `provider` | string | **yes** | — | Must name a provider in this file's `providers` map. |
 | `max_concurrent` | integer | **yes** | — | Concurrency cap (semaphore size) for this lane. In a pool, members' caps stack into one aggregate. |
 | `max_requests` | integer | no | `-1` | Lifetime request budget; `-1` = unlimited. When the budget reaches 0 the lane becomes unusable (cost cap). Decremented on success. |
+| `default_max_tokens` | integer | no | `4096` | Injected only on a cross-protocol hop to a backend that requires `max_tokens` (Anthropic) when the caller omitted it. Falls back to 4096 when unset. Must be > 0. |
 
 A model can be targeted directly (`POST /<model>/v1/messages`), ad-hoc
 (`POST /<provider>/<model>/v1/messages`), or via a pool.
@@ -260,8 +262,8 @@ After streaming has begun, an upstream failure cannot fail over (the client alre
 holds a partial response); busbar instead records the breaker failure and emits an
 SSE `error` event, and the client must retry.
 
-If no per-pool `failover` block is set, busbar uses the first pool's failover config
-that defines one, else the defaults (`deadline_secs: 120`, `cap: 3`).
+If no per-pool `failover` block is set, busbar falls back to the compiled-in defaults
+(`deadline_secs: 120`, `cap: 3`). There is no cross-pool inheritance of failover config.
 
 #### `on_exhausted`
 
