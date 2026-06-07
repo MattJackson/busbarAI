@@ -32,6 +32,34 @@ fn apply_required_max_tokens(ir: &mut crate::ir::IrRequest, lane: &Lane) {
     }
 }
 
+/// Build a native-format error response for the CLIENT. Every forward-layer error that is returned
+/// to the caller goes through here so the body is the INGRESS protocol's native error envelope
+/// (`application/json`) rather than `text/plain`, which an official SDK cannot decode (it raises a
+/// generic JSON-decode error — a deterministic proxy tell, design §8.1). The status code is
+/// preserved exactly; only the body shape changes. `kind` is the protocol-agnostic error category
+/// (e.g. `"invalid_request_error"`, `"overloaded"`); `msg` is the human-readable detail.
+/// When `ingress` does not resolve to a known protocol, falls back to the generic default envelope
+/// via the OpenAI writer (`protocol_for` only fails for an unknown literal, which is itself a 400
+/// the caller still needs shaped).
+fn ingress_error(ingress: &str, status: StatusCode, kind: &str, msg: &str) -> Response {
+    let envelope = match crate::proto::protocol_for(ingress) {
+        Some(p) => p.writer().write_error(status.as_u16(), kind, msg),
+        None => crate::proto::Protocol::openai()
+            .writer()
+            .write_error(status.as_u16(), kind, msg),
+    };
+    let body = serde_json::to_string(&envelope).unwrap_or_else(|_| {
+        // Envelope is built from serde_json::json! values and always serializes; this fallback only
+        // exists to avoid an unwrap on the request path.
+        format!("{{\"error\":{{\"message\":{msg:?},\"type\":{kind:?}}}}}")
+    });
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| status.into_response())
+}
+
 /// Non-buffering stream inspection tap for usage parsing.
 ///
 /// Extracts the final usage object from a streaming response without buffering the body: it scans
@@ -579,6 +607,22 @@ fn is_streaming_content_type(ct: &str) -> bool {
     ct.starts_with("text/event-stream") || ct.starts_with("application/vnd.amazon.eventstream")
 }
 
+/// The streaming `Content-Type` the INGRESS client expects, by ingress protocol. On a cross-protocol
+/// reframe the streamed body is re-encoded into the client's framing, so the response header must
+/// describe the CLIENT's wire format — copying the upstream CT verbatim would mislabel the body
+/// (e.g. a Bedrock-egress `application/vnd.amazon.eventstream` reaching an SSE client, or vice
+/// versa). SSE protocols (openai/anthropic/gemini/cohere/responses) get `text/event-stream`; bedrock
+/// ingress gets `application/vnd.amazon.eventstream` (the binary encoder lands in the next wave — we
+/// set the correct CT now). Returns `None` for an unrecognized literal so the caller keeps the
+/// upstream CT rather than guessing. §8.4.
+fn ingress_stream_content_type(ingress: &str) -> Option<&'static str> {
+    match ingress {
+        "openai" | "anthropic" | "gemini" | "cohere" | "responses" => Some("text/event-stream"),
+        "bedrock" => Some("application/vnd.amazon.eventstream"),
+        _ => None,
+    }
+}
+
 /// extract the host (no scheme, no trailing slash) from a base URL, for SigV4's signed `host`
 /// header. base_urls are already trailing-slash-trimmed and carry no path.
 pub(crate) fn host_from_base(base: &str) -> String {
@@ -669,7 +713,12 @@ pub(crate) async fn forward_with_pool(
     let mut v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("router: bad json: {e}")).into_response()
+            return ingress_error(
+                ingress_protocol,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("router: bad json: {e}"),
+            )
         }
     };
 
@@ -734,7 +783,12 @@ pub(crate) async fn forward_with_pool(
     for _attempt in 0..=max_cap {
         // Check deadline first (propagated across hops)
         if request_ctx.expired(now()) {
-            return (StatusCode::SERVICE_UNAVAILABLE, "router: deadline exceeded").into_response();
+            return ingress_error(
+                ingress_protocol,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded",
+                "router: deadline exceeded",
+            );
         }
 
         let (i, permit) = match pick_among(
@@ -750,8 +804,12 @@ pub(crate) async fn forward_with_pool(
             None => {
                 if cands.is_empty() {
                     // Pool has no members at all — nothing to do.
-                    return (StatusCode::SERVICE_UNAVAILABLE, "router: no usable lane")
-                        .into_response();
+                    return ingress_error(
+                        ingress_protocol,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "overloaded",
+                        "router: no usable lane",
+                    );
                 }
                 // No usable lane — whether the members were tripped before this request
                 // arrived or excluded during its failover attempts, apply the configured
@@ -793,11 +851,12 @@ pub(crate) async fn forward_with_pool(
             .increment(1);
             // Cross-protocol: translate the request body through the superset IR.
             let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) else {
-                return (
+                return ingress_error(
+                    ingress_protocol,
                     StatusCode::BAD_REQUEST,
-                    format!("router: unknown ingress protocol '{ingress_protocol}'"),
-                )
-                    .into_response();
+                    "invalid_request_error",
+                    &format!("router: unknown ingress protocol '{ingress_protocol}'"),
+                );
             };
             match ingress_proto.reader().read_request(&v) {
                 Ok(mut ir) => {
@@ -805,11 +864,12 @@ pub(crate) async fn forward_with_pool(
                     v = app.lanes[i].protocol.writer().write_request(&ir);
                 }
                 Err(_) => {
-                    return (
+                    return ingress_error(
+                        ingress_protocol,
                         StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
                         "router: request translation failed",
-                    )
-                        .into_response();
+                    );
                 }
             }
         }
@@ -1117,11 +1177,34 @@ pub(crate) async fn forward_with_pool(
                                   // Token accounting: no FirstByteBody on this buffered path, so tap here.
                     record_nonstream_usage(&bytes, &usage_sink);
                     if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                        if let Ok(ir) = app.lanes[i].protocol.reader().read_response(&v) {
+                        if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&v) {
                             if let Some(ingress_proto) =
                                 crate::proto::protocol_for(ingress_protocol)
                             {
+                                // Cross-protocol reframe: strip the backend's NATIVE-FORMAT identity
+                                // so the ingress writer mints values in the CLIENT's format. Without
+                                // this an OpenAI backend's `chatcmpl-...` id (or its opaque
+                                // `system_fingerprint` / a matched `stop_sequence`) would leak
+                                // verbatim to e.g. an Anthropic client — a foreign-format id is an
+                                // immediate proxy tell (§8.2). This seam only runs when ingress !=
+                                // egress; same-protocol passthrough never reaches here, so native ids
+                                // are preserved there.
+                                //
+                                // `created` is deliberately LEFT INTACT: it is a plain unix-epoch int
+                                // (no protocol-specific format to leak), and the ingress writers use
+                                // "is `created` populated?" as the signal that this response crossed a
+                                // protocol boundary and therefore SHOULD synthesize a native id
+                                // (anthropic `write_response` mints `msg_…` only when `created` is
+                                // `Some`). Clearing it here would suppress that synthesis and emit an
+                                // id-less body — the opposite of the goal. The anthropic writer omits
+                                // `created` from its wire shape entirely; the openai writer re-emits
+                                // it as an int, which is format-neutral.
+                                ir.id = None;
+                                ir.system_fingerprint = None;
+                                ir.stop_sequence = None;
                                 let translated = ingress_proto.writer().write_response(&ir);
+                                // Content-Type is the INGRESS JSON CT, not the upstream's — the body
+                                // is now in the client's native non-stream shape (§8.4).
                                 return Response::builder()
                                     .status(status)
                                     .header(CONTENT_TYPE, "application/json")
@@ -1163,8 +1246,22 @@ pub(crate) async fn forward_with_pool(
                 let axum_body = guarded_body.into_body();
 
                 let mut rb = Response::builder().status(status);
-                if let Some(ct) = ct {
-                    rb = rb.header(CONTENT_TYPE, ct);
+                // Cross-protocol streaming: the body is reframed to the client's format, so the CT
+                // must be the ingress client's, not the upstream's. Same-protocol passthrough keeps
+                // the upstream CT verbatim. §8.4.
+                let cross_protocol = ingress_protocol != app.lanes[i].protocol.name();
+                match (cross_protocol && is_sse)
+                    .then(|| ingress_stream_content_type(ingress_protocol))
+                    .flatten()
+                {
+                    Some(client_ct) => {
+                        rb = rb.header(CONTENT_TYPE, client_ct);
+                    }
+                    None => {
+                        if let Some(ct) = ct {
+                            rb = rb.header(CONTENT_TYPE, ct);
+                        }
+                    }
                 }
                 return rb.body(axum_body).unwrap();
             }
@@ -1225,7 +1322,7 @@ async fn handle_exhaustion_for_pool(
         .unwrap_or(OnExhausted::Status503);
 
     match mode {
-        OnExhausted::Status503 => handle_status_503(&app, cands, now, pool_name),
+        OnExhausted::Status503 => handle_status_503(&app, cands, now, pool_name, ingress_protocol),
         OnExhausted::FallbackPool(ref fallback_pool) => {
             handle_fallback_pool(
                 app.clone(),
@@ -1253,23 +1350,33 @@ async fn handle_exhaustion_for_pool(
     }
 }
 
-/// Status503 mode: return 503 with Retry-After header.
-fn handle_status_503(app: &Arc<App>, cands: &[WeightedLane], now: u64, pool: &str) -> Response {
+/// Status503 mode: return 503 with Retry-After header. The body is the ingress protocol's native
+/// JSON error envelope (not `text/plain`) so an official SDK can decode it; the `Retry-After`
+/// header is preserved so rate-aware clients still back off.
+fn handle_status_503(
+    app: &Arc<App>,
+    cands: &[WeightedLane],
+    now: u64,
+    pool: &str,
+    ingress_protocol: &str,
+) -> Response {
     let soonest_remaining = find_soonest_cooldown(&app.store, cands, now, pool)
         .map(|idx| app.store.cooldown_remaining_in(pool, idx, now))
         .unwrap_or(1);
 
     let retry_after = soonest_remaining.max(1); // Ensure at least 1 second
 
-    (
+    let mut resp = ingress_error(
+        ingress_protocol,
         StatusCode::SERVICE_UNAVAILABLE,
-        [
-            (axum::http::header::RETRY_AFTER, retry_after.to_string()),
-            (axum::http::header::CONTENT_TYPE, "text/plain".to_string()),
-        ],
-        format!("router: all lanes exhausted; retry after {}s", retry_after),
-    )
-        .into_response()
+        "overloaded",
+        &format!("router: all lanes exhausted; retry after {}s", retry_after),
+    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, v);
+    }
+    resp
 }
 
 /// Forward one request to a specific lane and relay the response. Shared by the degraded
@@ -1297,7 +1404,12 @@ async fn forward_once(
     let mut v: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
-            return Ok((StatusCode::BAD_REQUEST, format!("router: bad json: {e}")).into_response());
+            return Ok(ingress_error(
+                ingress_protocol,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("router: bad json: {e}"),
+            ));
         }
     };
 
@@ -1309,11 +1421,12 @@ async fn forward_once(
     let egress_name = app.lanes[i].protocol.name();
     if ingress_protocol != egress_name {
         let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) else {
-            return Ok((
+            return Ok(ingress_error(
+                ingress_protocol,
                 StatusCode::BAD_REQUEST,
-                format!("router: unknown ingress protocol '{ingress_protocol}'"),
-            )
-                .into_response());
+                "invalid_request_error",
+                &format!("router: unknown ingress protocol '{ingress_protocol}'"),
+            ));
         };
         match ingress_proto.reader().read_request(&v) {
             Ok(mut ir) => {
@@ -1321,11 +1434,12 @@ async fn forward_once(
                 v = app.lanes[i].protocol.writer().write_request(&ir);
             }
             Err(_) => {
-                return Ok((
+                return Ok(ingress_error(
+                    ingress_protocol,
                     StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
                     "router: request translation failed",
-                )
-                    .into_response())
+                ))
             }
         }
     }
@@ -1436,17 +1550,22 @@ async fn handle_fallback_pool(
 ) -> Response {
     // Deadline propagated across hops.
     if request_ctx.expired(now()) {
-        return (StatusCode::SERVICE_UNAVAILABLE, "router: deadline exceeded").into_response();
+        return ingress_error(
+            ingress_protocol,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded",
+            "router: deadline exceeded",
+        );
     }
 
     // Loop guard: if this request already routed through this pool, stop (A→B→A).
     if request_ctx.is_pool_visited(pool_name) {
-        return handle_status_503(&app, &[], now(), pool_name);
+        return handle_status_503(&app, &[], now(), pool_name, ingress_protocol);
     }
 
     let Some(fallback_cands) = app.fallback_pools.get(pool_name).cloned() else {
         // Fallback pool not configured — cascade to Status503.
-        return handle_status_503(&app, &[], now(), pool_name);
+        return handle_status_503(&app, &[], now(), pool_name, ingress_protocol);
     };
 
     // Mark before re-entering so a cycle back to this pool is detected.
@@ -1455,7 +1574,12 @@ async fn handle_fallback_pool(
     // Try the fallback pool's members (concurrency-aware, accumulating exclusions across hops).
     loop {
         if request_ctx.expired(now()) {
-            return (StatusCode::SERVICE_UNAVAILABLE, "router: deadline exceeded").into_response();
+            return ingress_error(
+                ingress_protocol,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded",
+                "router: deadline exceeded",
+            );
         }
 
         let Some((i, permit)) =
@@ -1513,7 +1637,7 @@ async fn handle_least_bad(
 ) -> Response {
     let Some(soonest_idx) = find_soonest_cooldown(&app.store, cands, now, pool) else {
         // No candidates at all - fall back to Status503.
-        return handle_status_503(app, cands, now, pool);
+        return handle_status_503(app, cands, now, pool, ingress_protocol);
     };
 
     tracing::warn!(
@@ -1525,7 +1649,7 @@ async fn handle_least_bad(
 
     // Bypass breaker usability for the last-resort path; grab the concurrency permit directly.
     let Some(permit) = app.store.try_acquire(soonest_idx) else {
-        return handle_status_503(app, cands, now, pool);
+        return handle_status_503(app, cands, now, pool, ingress_protocol);
     };
 
     match forward_once(
@@ -1540,7 +1664,7 @@ async fn handle_least_bad(
     .await
     {
         Ok(resp) => resp,
-        Err(()) => handle_status_503(app, cands, now, pool),
+        Err(()) => handle_status_503(app, cands, now, pool, ingress_protocol),
     }
 }
 
@@ -1695,5 +1819,209 @@ mod on_exhausted_tests {
     fn test_config_parsing_unknown_fails() {
         let result = config::OnExhausted::parse("invalid");
         assert!(result.is_err(), "Unknown action should fail parsing");
+    }
+}
+
+#[cfg(test)]
+mod ingress_indistinguishability_tests {
+    use super::{forward_with_pool, ingress_error, ingress_stream_content_type};
+    use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
+    use reqwest::StatusCode;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    /// A forward-layer error returned to the CLIENT must carry the INGRESS protocol's native JSON
+    /// error envelope (not `text/plain`), with the status code preserved. For an Anthropic ingress
+    /// the shape is `{"type":"error","error":{"type",...,"message"}}` — what `anthropic.APIStatusError`
+    /// decodes. (§8.1)
+    #[tokio::test]
+    async fn test_ingress_error_emits_native_envelope_with_status() {
+        use http_body_util::BodyExt as _;
+        let resp = ingress_error(
+            "anthropic",
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "router: bad json: trailing comma",
+        );
+        assert_eq!(resp.status().as_u16(), 400, "status code is preserved");
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "native error envelope is served as application/json, never text/plain"
+        );
+        // Body is the Anthropic-native error shape.
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["type"], "error",
+            "Anthropic error envelope: top-level type"
+        );
+        assert_eq!(
+            v["error"]["type"], "invalid_request_error",
+            "Anthropic typed error kind"
+        );
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("bad json"),
+            "human-readable detail preserved: {v}"
+        );
+
+        // OpenAI ingress gets the OpenAI envelope shape instead, same status.
+        let oai = ingress_error(
+            "openai",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded",
+            "router: all lanes exhausted; retry after 3s",
+        );
+        assert_eq!(oai.status().as_u16(), 503);
+        assert_eq!(
+            oai.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+    }
+
+    /// The streaming response Content-Type is driven by the ingress protocol, not the upstream:
+    /// SSE protocols → `text/event-stream`; bedrock → `application/vnd.amazon.eventstream`. (§8.4)
+    #[test]
+    fn test_ingress_stream_content_type_by_protocol() {
+        for p in ["openai", "anthropic", "gemini", "cohere", "responses"] {
+            assert_eq!(ingress_stream_content_type(p), Some("text/event-stream"));
+        }
+        assert_eq!(
+            ingress_stream_content_type("bedrock"),
+            Some("application/vnd.amazon.eventstream")
+        );
+        assert_eq!(ingress_stream_content_type("nonsense"), None);
+    }
+
+    /// Cross-protocol non-stream response: an OpenAI backend whose body carries a `chatcmpl-` id
+    /// must NOT leak that foreign id to an Anthropic client. The translation seam strips the IR
+    /// identity before the ingress writer runs, so the writer mints a NATIVE `msg_` id, and the
+    /// response is served with the INGRESS Content-Type (`application/json`). (§8.2, §8.4)
+    #[tokio::test]
+    async fn test_cross_protocol_response_carries_ingress_ct_and_native_id() {
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // OpenAI-shaped backend response with a foreign `chatcmpl-` id + created + fingerprint.
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "id": "chatcmpl-LEAK123",
+                "object": "chat.completion",
+                "created": 1234567890,
+                "system_fingerprint": "fp_backend",
+                "model": "glm-4.5",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        // Lane speaks OpenAI; ingress is Anthropic → cross-protocol translation hop.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "glm-4.5",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("pa", &[(0, 1)])
+            .build();
+
+        let body = serde_json::to_vec(
+            &json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50}),
+        )
+        .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            body.into(),
+            None,
+            "pa",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200);
+        // Ingress-driven Content-Type for a non-stream cross-protocol response.
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "non-stream cross-protocol response uses the ingress JSON Content-Type"
+        );
+
+        use http_body_util::BodyExt as _;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        // Native Anthropic message shape.
+        assert_eq!(v["type"], "message", "Anthropic message envelope");
+        let id = v["id"].as_str().unwrap_or("");
+        assert!(
+            id.starts_with("msg_"),
+            "Anthropic client must receive a NATIVE msg_ id, got: {id}"
+        );
+        assert!(
+            !id.contains("chatcmpl-"),
+            "the OpenAI backend's chatcmpl- id must NOT leak to the Anthropic client; got: {id}"
+        );
+        // The whole serialized body must be free of the leaked backend identity.
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(
+            !raw.contains("chatcmpl-LEAK123"),
+            "no foreign id anywhere in the translated response: {raw}"
+        );
+        assert!(
+            !raw.contains("fp_backend"),
+            "backend system_fingerprint must not leak across protocols: {raw}"
+        );
+        server.shutdown().await;
+    }
+
+    /// A forward error path through the real `forward_with_pool` (empty candidate pool → exhaustion)
+    /// returns the ingress protocol's native JSON envelope with the right status. (§8.1)
+    #[tokio::test]
+    async fn test_forward_error_path_returns_native_envelope() {
+        use http_body_util::BodyExt as _;
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        // No candidates → "no usable lane" 503, shaped to the ingress (OpenAI) envelope.
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![],
+            serde_json::to_vec(&json!({"model": "x", "messages": []}))
+                .unwrap()
+                .into(),
+            None,
+            "missingpool",
+            None,
+            "openai",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 503, "no usable lane → 503");
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "forward error envelope is JSON, not text/plain"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v.get("error").is_some(),
+            "OpenAI-native error envelope has a top-level error object: {v}"
+        );
     }
 }

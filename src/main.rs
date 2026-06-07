@@ -454,6 +454,18 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
         .route("/admin/keys/:id", axum::routing::delete(admin::delete_key))
         .route("/admin/keys/:id/usage", get(admin::key_usage))
         .route("/v1/chat/completions", post(route::openai_ingress))
+        // Cohere v2 + OpenAI Responses ingress: model+stream in the body (body-model protocols).
+        .route("/v2/chat", post(route::cohere_ingress))
+        .route("/v1/responses", post(route::responses_ingress))
+        // Gemini ingress: model+action packed into the last path segment with a colon. axum can't
+        // split on a `:` inside a segment, so capture the tail with a wildcard and split in-handler.
+        .route("/v1beta/models/*rest", post(route::gemini_ingress))
+        // Bedrock Converse ingress: model in the path, stream selected by the endpoint suffix.
+        .route("/model/:model_id/converse", post(route::bedrock_converse))
+        .route(
+            "/model/:model_id/converse-stream",
+            post(route::bedrock_converse_stream),
+        )
         .route("/:name/v1/messages", post(route::named))
         .route("/:provider/:model/v1/messages", post(route::adhoc))
         .layer(axum::middleware::from_fn_with_state(
