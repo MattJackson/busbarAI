@@ -4,6 +4,45 @@
 //! OpenAI protocol reader/writer implementation.
 
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Current unix time in seconds, used to synthesize `created` when the backend supplied none
+/// (cross-protocol). Falls back to 0 if the clock is before the epoch (never on a sane host) —
+/// `created: 0` is still a valid integer the SDK will accept, and we never panic on the request path.
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Process-local monotonic counter for synthesized id uniqueness. Combined with the timestamp it
+/// yields ids that don't collide within a process even when many responses are minted in the same
+/// second. No crate dependency — just `std`.
+static SYNTH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Synthesize a protocol-correct OpenAI completion id (`"chatcmpl-<token>"`) for cross-protocol
+/// responses where the backend supplied none. The official OpenAI SDKs treat `id` as an opaque
+/// string and only require it be present and a string (the `chatcmpl-` prefix is the documented
+/// shape for chat.completions); uniqueness here is a timestamp plus an atomic counter rendered in
+/// base-36, so it is collision-free within a process and needs no RNG crate.
+fn synth_completion_id() -> String {
+    let n = SYNTH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = unix_now_secs();
+    // base-36 of (ts<<24 ^ counter) keeps the token compact and alphanumeric like a real chatcmpl id.
+    let mut mixed = (ts.wrapping_shl(24)) ^ n;
+    if mixed == 0 {
+        mixed = 1;
+    }
+    let mut token = String::new();
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    while mixed > 0 {
+        token.push(ALPHABET[(mixed % 36) as usize] as char);
+        mixed /= 36;
+    }
+    format!("chatcmpl-{token}")
+}
 
 /// OpenAI reader implementation.
 #[derive(Clone)]
@@ -345,15 +384,18 @@ impl ProtocolReader for OpenAiReader {
             return out;
         }
 
-        // 1. MessageStart exactly once (on the first chunk, regardless of delta.role).
+        // 1. MessageStart exactly once (on the first chunk, regardless of delta.role). Capture the
+        //    chunk's top-level identity (`id` = "chatcmpl-...", `created` = unix secs, `model`) so a
+        //    same-protocol passthrough stream re-emits it verbatim. Every OpenAI chunk carries these;
+        //    we read them off whichever chunk happens to be first.
         if !state.started {
             state.started = true;
             out.push(IrStreamEvent::MessageStart {
                 role: crate::ir::IrRole::Assistant,
                 usage: None,
-                id: None,
-                created: None,
-                model: None,
+                id: data.get("id").and_then(|v| v.as_str()).map(String::from),
+                created: data.get("created").and_then(|v| v.as_u64()),
+                model: data.get("model").and_then(|v| v.as_str()).map(String::from),
             });
         }
 
@@ -660,15 +702,26 @@ impl ProtocolReader for OpenAiReader {
 
         let model = obj.get("model").and_then(|m| m.as_str()).map(String::from);
 
+        // Capture the upstream's response identity so same-protocol (OpenAI→OpenAI) passthrough
+        // preserves it exactly: `id` ("chatcmpl-..."), `created` (unix secs), `system_fingerprint`.
+        // (`object` is fixed "chat.completion" and re-emitted by the writer; `usage.total_tokens` is
+        // derivable from prompt+completion, so it is recomputed on write rather than stored.)
+        let id = obj.get("id").and_then(|v| v.as_str()).map(String::from);
+        let created = obj.get("created").and_then(|v| v.as_u64());
+        let system_fingerprint = obj
+            .get("system_fingerprint")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
         Ok(crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
             content,
             stop_reason,
             usage,
             model,
-            id: None,
-            created: None,
-            system_fingerprint: None,
+            id,
+            created,
+            system_fingerprint,
             stop_sequence: None,
         })
     }
@@ -965,21 +1018,41 @@ impl ProtocolWriter for OpenAiWriter {
 
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
         match ev {
-            IrStreamEvent::MessageStart { role, .. } => {
+            IrStreamEvent::MessageStart {
+                role,
+                id,
+                created,
+                model,
+                ..
+            } => {
                 let openai_role = match role {
                     crate::ir::IrRole::Assistant => "assistant",
-                    _ => return None,
+                    crate::ir::IrRole::User
+                    | crate::ir::IrRole::System
+                    | crate::ir::IrRole::Tool => return None,
                 };
                 let delta_obj = serde_json::json!({ "role": openai_role });
-                let chunk_obj = serde_json::json!({
+                // The opening chunk carries the stream's identity (`id`, `created`, `model`); an
+                // official OpenAI stream repeats these on every chunk, but emitting them on the first
+                // (role) chunk is sufficient for the SDKs, which latch the id/created/model from the
+                // first chunk that supplies them. When the backend supplied none (cross-protocol),
+                // SYNTHESIZE a protocol-correct id/created so a native SDK accepts the stream.
+                let chunk_id = id.clone().unwrap_or_else(synth_completion_id);
+                let chunk_created = created.unwrap_or_else(unix_now_secs);
+                let mut chunk = serde_json::json!({
+                    "id": chunk_id,
                     "object": "chat.completion.chunk",
+                    "created": chunk_created,
                     "choices": [{
                         "index": 0,
                         "delta": delta_obj,
                         "finish_reason": null
                     }]
                 });
-                Some(("".to_string(), chunk_obj))
+                if let Some(m) = model {
+                    chunk["model"] = serde_json::json!(m);
+                }
+                Some(("".to_string(), chunk))
             }
             IrStreamEvent::BlockStart { index, block } => match block {
                 crate::ir::IrBlockMeta::Text => None,
@@ -1087,6 +1160,55 @@ impl ProtocolWriter for OpenAiWriter {
         Box::new(self.clone())
     }
 
+    /// Native OpenAI error envelope, served as `application/json`:
+    /// `{"error":{"message":<msg>,"type":<type>,"param":null,"code":null}}`. This is the exact shape
+    /// the official OpenAI SDKs decode (`openai.APIError` reads `error.message`/`error.type`/
+    /// `error.code`/`error.param`), so a client on the native SDK gets a typed exception rather than
+    /// an undecodable body. The generic `kind` is mapped onto OpenAI's own error-`type` vocabulary
+    /// where one exists; otherwise it is passed through verbatim (still a valid string `type`).
+    fn write_error(&self, status: u16, kind: &str, message: &str) -> serde_json::Value {
+        // Map the protocol-agnostic `kind` onto OpenAI's documented error `type` values. OpenAI's
+        // vocabulary: "invalid_request_error", "authentication_error", "permission_error",
+        // "not_found_error", "rate_limit_error", "server_error", "api_error". HTTP 401/403/404/429
+        // categories and common generic kinds are normalized; anything unrecognized falls back to a
+        // status-derived bucket (4xx → invalid_request_error, 5xx → server_error) so the emitted
+        // `type` is always a real OpenAI type. No `_ =>` catch-all on the kind match: each known
+        // kind is listed, with the status-based fallback handled explicitly afterwards.
+        let error_type = match kind {
+            "invalid_request_error" | "invalid_request" | "bad_request" => "invalid_request_error",
+            "authentication_error" | "unauthorized" | "auth" => "authentication_error",
+            "permission_error" | "permission_denied" | "forbidden" => "permission_error",
+            "not_found_error" => "not_found_error",
+            "rate_limit_error" | "rate_limit" | "too_many_requests" => "rate_limit_error",
+            "server_error" | "internal_error" | "internal_server_error" => "server_error",
+            "api_error" => "api_error",
+            "context_length_exceeded" => "invalid_request_error",
+            // Empty kind: derive a valid OpenAI type from the HTTP status bucket rather than emitting
+            // an empty `type`, so the SDK still sees a real error type.
+            "" => {
+                if (500..600).contains(&status) {
+                    "server_error"
+                } else {
+                    "invalid_request_error"
+                }
+            }
+            // Any other caller-supplied kind (including the generic `not_found`) is passed through
+            // verbatim: OpenAI has no single canonical `type` for it (model-not-found is reported as
+            // `invalid_request_error` + `code: "model_not_found"` on some endpoints and
+            // `not_found_error` on others), so we preserve the caller's token rather than guess.
+            other => other,
+        };
+
+        serde_json::json!({
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": serde_json::Value::Null,
+                "code": serde_json::Value::Null,
+            }
+        })
+    }
+
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
 
@@ -1157,17 +1279,32 @@ impl ProtocolWriter for OpenAiWriter {
         }
         choices_array.push(serde_json::Value::Object(choice_obj));
 
+        // Identity fields, in the order an official OpenAI chat.completion object carries them
+        // ({"id","object","created","model","system_fingerprint","choices","usage"}). The Python and
+        // Node SDKs require `id` (str), `object` == "chat.completion", `created` (int), `model` (str),
+        // `choices`, and `usage`; `system_fingerprint` is optional. When the IR field is `None`
+        // (cross-protocol: the backend never minted one) we SYNTHESIZE a protocol-correct value so a
+        // native SDK can't tell this was translated.
+        let id = resp.id.clone().unwrap_or_else(synth_completion_id);
+        obj.insert("id".to_string(), serde_json::json!(id));
         obj.insert("object".to_string(), serde_json::json!("chat.completion"));
+        let created = resp.created.unwrap_or_else(unix_now_secs);
+        obj.insert("created".to_string(), serde_json::json!(created));
         // model that served the response (preserved across cross-protocol translation)
         if let Some(ref model) = resp.model {
             obj.insert("model".to_string(), serde_json::json!(model));
+        }
+        // system_fingerprint is only emitted when the upstream supplied one (same-protocol
+        // passthrough); we do not fabricate an opaque backend marker on cross-protocol responses.
+        if let Some(ref fp) = resp.system_fingerprint {
+            obj.insert("system_fingerprint".to_string(), serde_json::json!(fp));
         }
         obj.insert(
             "choices".to_string(),
             serde_json::Value::Array(choices_array),
         );
 
-        // Build usage
+        // Build usage, including the `total_tokens` an SDK expects (prompt + completion).
         let mut usage_map = serde_json::Map::new();
         usage_map.insert(
             "prompt_tokens".to_string(),
@@ -1176,6 +1313,10 @@ impl ProtocolWriter for OpenAiWriter {
         usage_map.insert(
             "completion_tokens".to_string(),
             serde_json::json!(resp.usage.output_tokens),
+        );
+        usage_map.insert(
+            "total_tokens".to_string(),
+            serde_json::json!(resp.usage.input_tokens + resp.usage.output_tokens),
         );
         obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
 
@@ -1422,5 +1563,217 @@ mod tests {
             out["choices"][0]["message"]["content"],
             serde_json::Value::Null
         );
+    }
+
+    // --- Task 1: native OpenAI error envelope shape ---
+
+    #[test]
+    fn write_error_native_openai_shape() {
+        let v = OpenAiWriter.write_error(404, "not_found_error", "model 'gpt-z' not found");
+        // Exact native shape: error.{message,type,param,code}, with param/code null.
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!("model 'gpt-z' not found")
+        );
+        assert_eq!(v["error"]["type"], serde_json::json!("not_found_error"));
+        assert_eq!(v["error"]["param"], serde_json::Value::Null);
+        assert_eq!(v["error"]["code"], serde_json::Value::Null);
+        // Must be JSON-serializable (served as application/json) and have exactly the error object.
+        let s = serde_json::to_string(&v).expect("serializes");
+        let re: serde_json::Value = serde_json::from_str(&s).expect("valid json");
+        assert!(re.get("error").is_some());
+    }
+
+    #[test]
+    fn write_error_maps_kind_vocabulary() {
+        // Known generic kinds map onto OpenAI's own error-type vocabulary.
+        for (kind, want) in [
+            ("auth", "authentication_error"),
+            ("rate_limit", "rate_limit_error"),
+            ("forbidden", "permission_error"),
+            ("invalid_request", "invalid_request_error"),
+            ("context_length_exceeded", "invalid_request_error"),
+        ] {
+            let v = OpenAiWriter.write_error(400, kind, "x");
+            assert_eq!(v["error"]["type"], serde_json::json!(want), "kind={kind}");
+        }
+    }
+
+    #[test]
+    fn write_error_empty_kind_falls_back_to_status_bucket() {
+        // Empty kind with a 5xx status derives "server_error"; with a 4xx, "invalid_request_error".
+        let v5 = OpenAiWriter.write_error(503, "", "down");
+        assert_eq!(v5["error"]["type"], serde_json::json!("server_error"));
+        let v4 = OpenAiWriter.write_error(400, "", "bad");
+        assert_eq!(
+            v4["error"]["type"],
+            serde_json::json!("invalid_request_error")
+        );
+    }
+
+    // --- Task 2: identity-field fidelity ---
+
+    #[test]
+    fn read_response_captures_upstream_identity() {
+        let body = serde_json::json!({
+            "id": "chatcmpl-abc123",
+            "object": "chat.completion",
+            "created": 1_700_000_000u64,
+            "model": "gpt-4o",
+            "system_fingerprint": "fp_deadbeef",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4}
+        });
+        let ir = OpenAiReader.read_response(&body).expect("read_response");
+        assert_eq!(ir.id.as_deref(), Some("chatcmpl-abc123"));
+        assert_eq!(ir.created, Some(1_700_000_000));
+        assert_eq!(ir.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(ir.system_fingerprint.as_deref(), Some("fp_deadbeef"));
+    }
+
+    #[test]
+    fn same_protocol_roundtrip_preserves_identity() {
+        // OpenAI → IR → OpenAI must preserve id/created/system_fingerprint/model exactly.
+        let body = serde_json::json!({
+            "id": "chatcmpl-xyz789",
+            "object": "chat.completion",
+            "created": 1_711_111_111u64,
+            "model": "gpt-4o-mini",
+            "system_fingerprint": "fp_cafef00d",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "pong"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+        });
+        let ir = OpenAiReader.read_response(&body).expect("read_response");
+        let out = OpenAiWriter.write_response(&ir);
+        assert_eq!(out["id"], serde_json::json!("chatcmpl-xyz789"));
+        assert_eq!(out["object"], serde_json::json!("chat.completion"));
+        assert_eq!(out["created"], serde_json::json!(1_711_111_111u64));
+        assert_eq!(out["model"], serde_json::json!("gpt-4o-mini"));
+        assert_eq!(out["system_fingerprint"], serde_json::json!("fp_cafef00d"));
+        // total_tokens is synthesized as prompt + completion.
+        assert_eq!(out["usage"]["total_tokens"], serde_json::json!(12));
+    }
+
+    #[test]
+    fn cross_protocol_write_synthesizes_valid_id() {
+        // IR with no identity (cross-protocol: backend supplied none) must still emit a
+        // protocol-correct id ("chatcmpl-...") and a created timestamp, without panicking.
+        let resp = crate::ir::IrResponse {
+            role: IrRole::Assistant,
+            content: vec![text_block("hello")],
+            stop_reason: Some("end_turn".to_string()),
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = OpenAiWriter.write_response(&resp);
+        let id = out["id"].as_str().expect("synthesized id is a string");
+        assert!(
+            id.starts_with("chatcmpl-"),
+            "synthesized id has the right prefix: {id}"
+        );
+        assert!(
+            id.len() > "chatcmpl-".len(),
+            "synthesized id has a token body"
+        );
+        assert!(
+            out["created"].as_u64().is_some(),
+            "created synthesized as unix secs"
+        );
+        // No system_fingerprint fabricated on cross-protocol responses.
+        assert!(out.get("system_fingerprint").is_none());
+    }
+
+    #[test]
+    fn synth_completion_ids_are_unique() {
+        // Two synthesized ids minted back-to-back must differ (atomic counter guarantees it).
+        let a = synth_completion_id();
+        let b = synth_completion_id();
+        assert_ne!(a, b);
+        assert!(a.starts_with("chatcmpl-") && b.starts_with("chatcmpl-"));
+    }
+
+    #[test]
+    fn stream_message_start_emits_identity() {
+        // Streaming MessageStart carries id/created/model into the opening chunk; synthesized when None.
+        let with_id = IrStreamEvent::MessageStart {
+            role: IrRole::Assistant,
+            usage: None,
+            id: Some("chatcmpl-stream1".to_string()),
+            created: Some(1_722_222_222),
+            model: Some("gpt-4o".to_string()),
+        };
+        let (_, chunk) = OpenAiWriter
+            .write_response_event(&with_id)
+            .expect("message start emits a chunk");
+        assert_eq!(chunk["id"], serde_json::json!("chatcmpl-stream1"));
+        assert_eq!(chunk["object"], serde_json::json!("chat.completion.chunk"));
+        assert_eq!(chunk["created"], serde_json::json!(1_722_222_222u64));
+        assert_eq!(chunk["model"], serde_json::json!("gpt-4o"));
+
+        // Cross-protocol: no identity → synthesized id + created, still a valid chunk.
+        let no_id = IrStreamEvent::MessageStart {
+            role: IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        };
+        let (_, chunk2) = OpenAiWriter
+            .write_response_event(&no_id)
+            .expect("message start emits a chunk");
+        assert!(chunk2["id"]
+            .as_str()
+            .map(|s| s.starts_with("chatcmpl-"))
+            .unwrap_or(false));
+        assert!(chunk2["created"].as_u64().is_some());
+    }
+
+    #[test]
+    fn stream_read_captures_chunk_identity() {
+        // The first streaming chunk's top-level id/created/model land in the MessageStart IR event.
+        let reader = OpenAiReader;
+        let mut st = crate::ir::StreamDecodeState::default();
+        let ev = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-stream9",
+                "object": "chat.completion.chunk",
+                "created": 1_733_333_333u64,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+            }),
+            &mut st,
+        );
+        let start = ev
+            .iter()
+            .find(|e| matches!(e, IrStreamEvent::MessageStart { .. }))
+            .expect("MessageStart emitted");
+        match start {
+            IrStreamEvent::MessageStart {
+                id, created, model, ..
+            } => {
+                assert_eq!(id.as_deref(), Some("chatcmpl-stream9"));
+                assert_eq!(*created, Some(1_733_333_333));
+                assert_eq!(model.as_deref(), Some("gpt-4o"));
+            }
+            _ => unreachable!(),
+        }
     }
 }

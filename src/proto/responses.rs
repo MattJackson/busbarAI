@@ -4,6 +4,30 @@
 //! OpenAI Responses API protocol reader/writer implementation.
 
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic per-process counter mixed into synthesized response ids so two responses minted in
+/// the same wall-clock second still get distinct `resp_` ids. Paired with the unix timestamp this
+/// gives a collision-free id without pulling in a UUID/random crate (no new dependency).
+static RESPONSE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Current unix epoch seconds, or 0 if the clock is before the epoch (never on a sane host).
+/// Kept panic-free for the request path: no `unwrap`/`expect` on `SystemTime`.
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Synthesize a protocol-correct Responses id (`resp_<hex>`) for cross-protocol responses where the
+/// backend supplied none. Uniqueness comes from `timestamp << 24 | counter` rendered as hex — no
+/// new crate dependency. Native passthrough never calls this: it carries the upstream id verbatim.
+fn synthesize_response_id() -> String {
+    let counter = RESPONSE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let seed = (now_unix_secs() << 24) ^ counter;
+    format!("resp_{seed:016x}")
+}
 
 #[derive(Clone)]
 pub(crate) struct ResponsesReader;
@@ -395,12 +419,27 @@ impl ProtocolReader for ResponsesReader {
             "response.created" | "response.in_progress" => {
                 if !state.started {
                     state.started = true;
+                    // Capture stream identity from the nested `response` object so a same-protocol
+                    // passthrough preserves it. `created_at` is the Responses field name (mapped to
+                    // the IR's `created`).
+                    let resp = data.get("response");
+                    let id = resp
+                        .and_then(|r| r.get("id"))
+                        .and_then(|i| i.as_str())
+                        .map(String::from);
+                    let created = resp
+                        .and_then(|r| r.get("created_at"))
+                        .and_then(|c| c.as_u64());
+                    let model = resp
+                        .and_then(|r| r.get("model"))
+                        .and_then(|m| m.as_str())
+                        .map(String::from);
                     out.push(IrStreamEvent::MessageStart {
                         role: crate::ir::IrRole::Assistant,
                         usage: None,
-                        id: None,
-                        created: None,
-                        model: None,
+                        id,
+                        created,
+                        model,
                     });
                 }
             }
@@ -689,14 +728,22 @@ impl ProtocolReader for ResponsesReader {
 
         let model = obj.get("model").and_then(|m| m.as_str()).map(String::from);
 
+        // Capture the upstream response's identity so a same-protocol (responses → responses)
+        // passthrough preserves `id`/`created_at` exactly. The Responses API names its creation
+        // timestamp `created_at` (NOT `created`, which is the Chat Completions field); we map it
+        // into the shared IR `created` slot. `system_fingerprint`/`stop_sequence` have no analog in
+        // the Responses shape, so they stay `None`.
+        let id = obj.get("id").and_then(|i| i.as_str()).map(String::from);
+        let created = obj.get("created_at").and_then(|c| c.as_u64());
+
         Ok(crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
             content,
             stop_reason,
             usage,
             model,
-            id: None,
-            created: None,
+            id,
+            created,
             system_fingerprint: None,
             stop_sequence: None,
         })
@@ -1127,7 +1174,15 @@ impl ProtocolWriter for ResponsesWriter {
         );
 
         let mut obj = serde_json::Map::new();
+        // Emit the SDK-required top-level identity. Same-protocol passthrough carries the captured
+        // upstream values verbatim; cross-protocol (backend supplied none) synthesizes a
+        // protocol-correct `resp_` id and the current unix time so the body stays SDK-valid.
+        // `created_at` is the Responses field name (the official SDK's `Response.created_at`).
+        let id = resp.id.clone().unwrap_or_else(synthesize_response_id);
+        let created_at = resp.created.unwrap_or_else(now_unix_secs);
+        obj.insert("id".to_string(), serde_json::json!(id));
         obj.insert("object".to_string(), serde_json::json!("response"));
+        obj.insert("created_at".to_string(), serde_json::json!(created_at));
         obj.insert("status".to_string(), serde_json::json!(status));
         // model that served the response (preserved across cross-protocol translation)
         if let Some(ref model) = resp.model {
@@ -1151,6 +1206,40 @@ impl ProtocolWriter for ResponsesWriter {
         }
 
         serde_json::Value::Object(obj)
+    }
+
+    /// Native OpenAI Responses error envelope. The Responses API shares the OpenAI error shape an
+    /// official SDK (`openai` Python / `openai-node`) decodes into a typed `APIError`:
+    /// `{"error":{"message":<msg>,"type":<type>,"code":<code|null>,"param":<param|null>}}`, served
+    /// as `application/json`. `code` and `param` are always present (null here — busbar's
+    /// router/auth/forward errors are not field-level validation errors). The generic `kind` is
+    /// mapped to the Responses `type` vocabulary where one exists.
+    fn write_error(&self, _status: u16, kind: &str, message: &str) -> serde_json::Value {
+        // Map busbar's generic error `kind` to the OpenAI/Responses `error.type` vocabulary. The
+        // canonical Responses/OpenAI types are `invalid_request_error`, `authentication_error`,
+        // `permission_error`, `not_found_error`, `rate_limit_error`, `server_error`, and
+        // `insufficient_quota`. Anything already in that vocabulary (or any unrecognized caller
+        // string) is passed through verbatim rather than swallowed by a catch-all, so a precise
+        // upstream type is never lost.
+        let error_type = match kind {
+            "invalid_request" | "invalid_request_error" => "invalid_request_error",
+            "authentication" | "authentication_error" | "auth" => "authentication_error",
+            "permission" | "permission_error" | "forbidden" => "permission_error",
+            "not_found" | "not_found_error" => "not_found_error",
+            "rate_limit" | "rate_limit_error" => "rate_limit_error",
+            "server_error" | "internal" | "internal_error" => "server_error",
+            "billing" | "insufficient_quota" => "insufficient_quota",
+            other => other,
+        };
+
+        serde_json::json!({
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": serde_json::Value::Null,
+                "param": serde_json::Value::Null,
+            }
+        })
     }
 
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
@@ -1462,8 +1551,12 @@ mod tests {
 
     #[test]
     fn test_write_response_roundtrip_text_only() {
+        // Carries `id`/`created_at` so same-protocol read→write is byte-identical: the writer now
+        // always emits the SDK-required top-level identity, and a native response carries both.
         let json = serde_json::json!({
+            "id": "resp_abc123",
             "object": "response",
+            "created_at": 1_700_000_000_u64,
             "status": "completed",
             "output": [
                 {
@@ -1482,6 +1575,181 @@ mod tests {
         let roundtrip_json = writer.write_response(&ir_resp);
 
         assert_eq!(roundtrip_json, json);
+    }
+
+    /// The native Responses error envelope an official SDK decodes: a JSON object whose `error`
+    /// carries `message`, a Responses-vocabulary `type`, and `code`/`param` keys (null here).
+    #[test]
+    fn test_write_error_native_responses_envelope() {
+        let writer = ResponsesWriter;
+        let v = writer.write_error(404, "not_found", "model 'x' not found");
+
+        // Round-trips as JSON without panic.
+        let serialized = serde_json::to_string(&v).expect("write_error output must serialize");
+        let reparsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("write_error output must be valid JSON");
+
+        let err = reparsed.get("error").expect("error object present");
+        assert_eq!(
+            err.get("message").and_then(|m| m.as_str()),
+            Some("model 'x' not found")
+        );
+        // Generic `not_found` maps to the Responses vocabulary `not_found_error`.
+        assert_eq!(
+            err.get("type").and_then(|t| t.as_str()),
+            Some("not_found_error")
+        );
+        // `code` and `param` keys are present and null (Responses/OpenAI always include them).
+        assert!(err.get("code").is_some(), "code key must be present");
+        assert!(err.get("param").is_some(), "param key must be present");
+        assert!(err.get("code").unwrap().is_null());
+        assert!(err.get("param").unwrap().is_null());
+    }
+
+    /// Each generic `kind` maps to the canonical Responses `error.type`; an unrecognized kind is
+    /// passed through verbatim (no catch-all swallowing of a precise upstream type).
+    #[test]
+    fn test_write_error_kind_mapping() {
+        let writer = ResponsesWriter;
+        for (kind, want) in [
+            ("invalid_request", "invalid_request_error"),
+            ("auth", "authentication_error"),
+            ("forbidden", "permission_error"),
+            ("not_found", "not_found_error"),
+            ("rate_limit", "rate_limit_error"),
+            ("server_error", "server_error"),
+            ("billing", "insufficient_quota"),
+            // Already-canonical and unknown types pass through unchanged.
+            ("authentication_error", "authentication_error"),
+            ("some_future_type", "some_future_type"),
+        ] {
+            let v = writer.write_error(400, kind, "m");
+            assert_eq!(
+                v.get("error")
+                    .and_then(|e| e.get("type"))
+                    .and_then(|t| t.as_str()),
+                Some(want),
+                "kind {kind} should map to {want}"
+            );
+        }
+    }
+
+    /// Same-protocol passthrough: `read_response` captures the upstream `id`/`created_at`, and
+    /// `write_response` emits them verbatim — identity is preserved exactly, not regenerated.
+    #[test]
+    fn test_same_protocol_roundtrip_preserves_identity() {
+        let json = serde_json::json!({
+            "id": "resp_0123456789abcdef",
+            "object": "response",
+            "created_at": 1_710_000_000_u64,
+            "status": "completed",
+            "model": "gpt-4o-2024-08-06",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hi"}]
+                }
+            ],
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        });
+
+        let reader = ResponsesReader;
+        let writer = ResponsesWriter;
+
+        let ir = reader.read_response(&json).expect("read should succeed");
+        assert_eq!(ir.id.as_deref(), Some("resp_0123456789abcdef"));
+        assert_eq!(ir.created, Some(1_710_000_000));
+
+        let out = writer.write_response(&ir);
+        assert_eq!(
+            out.get("id").and_then(|i| i.as_str()),
+            Some("resp_0123456789abcdef"),
+            "id must be preserved verbatim"
+        );
+        assert_eq!(
+            out.get("created_at").and_then(|c| c.as_u64()),
+            Some(1_710_000_000),
+            "created_at must be preserved verbatim"
+        );
+        assert_eq!(out.get("object").and_then(|o| o.as_str()), Some("response"));
+    }
+
+    /// The streaming start event captures the nested `response` identity for same-protocol
+    /// passthrough.
+    #[test]
+    fn test_stream_message_start_captures_identity() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = reader_read_response_events(
+            "response.created",
+            &serde_json::json!({
+                "response": {
+                    "id": "resp_streamid",
+                    "object": "response",
+                    "created_at": 1_720_000_000_u64,
+                    "model": "gpt-4o",
+                    "status": "in_progress"
+                }
+            }),
+            &mut state,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            crate::ir::IrStreamEvent::MessageStart {
+                id, created, model, ..
+            } => {
+                assert_eq!(id.as_deref(), Some("resp_streamid"));
+                assert_eq!(*created, Some(1_720_000_000));
+                assert_eq!(model.as_deref(), Some("gpt-4o"));
+            }
+            other => panic!("expected MessageStart, got {other:?}"),
+        }
+    }
+
+    /// Cross-protocol: when the IR carries no identity (the backend supplied none), `write_response`
+    /// synthesizes a valid `resp_`-prefixed id and a current `created_at` without panicking, and two
+    /// successive synthesized ids are distinct.
+    #[test]
+    fn test_cross_protocol_write_synthesizes_valid_id() {
+        let writer = ResponsesWriter;
+        let make_ir = || crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "answer".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+
+        let out1 = writer.write_response(&make_ir());
+        let id1 = out1
+            .get("id")
+            .and_then(|i| i.as_str())
+            .expect("synthesized id present");
+        assert!(
+            id1.starts_with("resp_"),
+            "synthesized id must use the resp_ prefix, got {id1}"
+        );
+        assert!(
+            out1.get("created_at").and_then(|c| c.as_u64()).is_some(),
+            "synthesized created_at must be present"
+        );
+
+        let out2 = writer.write_response(&make_ir());
+        let id2 = out2.get("id").and_then(|i| i.as_str()).unwrap();
+        assert_ne!(id1, id2, "successive synthesized ids must be unique");
     }
 
     #[test]

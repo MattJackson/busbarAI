@@ -4,6 +4,40 @@
 //! Bedrock Converse protocol reader/writer implementation.
 
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Map busbar's generic error `kind` vocabulary to the AWS Bedrock Converse exception name carried
+/// in `__type`. AWS's Converse error model is a fixed, closed set of exception shapes
+/// (`ValidationException`, `ThrottlingException`, `AccessDeniedException`, `ResourceNotFoundException`,
+/// `ModelTimeoutException`, `ServiceUnavailableException`, `InternalServerException`,
+/// `ServiceQuotaExceededException`, `ModelErrorException`); a native SDK matches on exactly these.
+/// Any kind without a Bedrock-native counterpart falls back to `ValidationException` (the generic
+/// client-error shape) — chosen deliberately over a catch-all so the wire `__type` is always a real
+/// AWS exception name. This is the inverse of the `__type` token `extract_error` reads back, so a
+/// same-protocol error round-trips its structured type.
+fn error_kind_to_bedrock_type(kind: &str) -> &'static str {
+    match kind {
+        "invalid_request_error" | "invalid_request" | "validation" | "bad_request" => {
+            "ValidationException"
+        }
+        "rate_limit_error" | "rate_limit" | "too_many_requests" | "throttling" => {
+            "ThrottlingException"
+        }
+        "authentication_error" | "permission_error" | "auth" | "forbidden" | "unauthorized" => {
+            "AccessDeniedException"
+        }
+        "not_found" | "not_found_error" | "model_not_found" => "ResourceNotFoundException",
+        "timeout" | "model_timeout" => "ModelTimeoutException",
+        "overloaded_error" | "service_unavailable" | "unavailable" => "ServiceUnavailableException",
+        "quota_exceeded" | "service_quota_exceeded" | "insufficient_quota" => {
+            "ServiceQuotaExceededException"
+        }
+        "api_error" | "internal_error" | "server_error" => "InternalServerException",
+        // No native Bedrock counterpart: fall back to the generic client-error exception so the
+        // wire `__type` is still a real AWS exception name a native SDK can decode.
+        _ => "ValidationException",
+    }
+}
 
 /// Bedrock stopReason → canonical IR stop_reason.
 fn stop_reason_map(ward: &str) -> String {
@@ -27,6 +61,38 @@ fn stop_reason_reverse(canonical: &str) -> String {
         "safety" => "content_filtered".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Monotonic per-process counter mixed into a synthesized response id so two responses minted in
+/// the same wall-clock second still get distinct ids. Stdlib-only (no new crate dependency).
+#[cfg_attr(not(test), allow(dead_code))]
+static SYNTH_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Current unix time in whole seconds. Stdlib-only. A clock before the epoch (impossible on a
+/// sane host, but `duration_since` is fallible) degrades to 0 rather than panicking on the
+/// request path. Only reachable via `synth_response_id` on the test path until the cross-protocol
+/// wiring lands.
+#[cfg_attr(not(test), allow(dead_code))]
+fn unix_now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Synthesize a unique, Bedrock-flavored response identity for the CROSS-protocol case (the egress
+/// backend was not Bedrock, so the IR carries no id). The AWS SDK shapes a Converse response id as
+/// the request id surfaced in the `x-amzn-RequestId` HTTP header; those are uppercase-hyphen UUIDs.
+/// We mint a syntactically-plausible, collision-resistant token from (unix seconds + a monotonic
+/// counter) — no UUID crate, no panic. Used only to populate the IR's `id` when a downstream
+/// cross-protocol writer needs one; see `write_response` for why it is NOT injected into Bedrock's
+/// own response body (the native Converse body has no id field). Only reachable on the test path
+/// until the cross-protocol wiring lands in a later wave.
+#[cfg_attr(not(test), allow(dead_code))]
+fn synth_response_id() -> String {
+    let n = SYNTH_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:016x}-{:016x}", unix_now_secs(), n)
 }
 
 #[derive(Clone)]
@@ -594,7 +660,13 @@ impl ProtocolReader for BedrockReader {
             content,
             stop_reason: stop_reason_val,
             usage,
-            // Bedrock's Converse response carries no model field (the model is in the request URL).
+            // Identity capture for same-protocol passthrough fidelity. The AWS Converse response
+            // body is deliberately minimal: it has NO `id`, NO `created`, NO `system_fingerprint`,
+            // and NO stop-sequence echo (`stopReason` is the discriminant, captured above; `usage`
+            // is captured above). The only identity AWS returns is the `x-amzn-RequestId` HTTP
+            // header, which is not part of the body this reader sees. So every body-level identity
+            // field is `None` here — that is the faithful capture of what Bedrock actually sends,
+            // and a bedrock→bedrock passthrough reproduces the native (id-less) body exactly.
             model: None,
             id: None,
             created: None,
@@ -957,6 +1029,17 @@ impl ProtocolWriter for BedrockWriter {
         let stop_reason_str = resp.stop_reason.as_deref().unwrap_or("end_turn");
         let reverse_reason = stop_reason_reverse(stop_reason_str);
 
+        // Identity emission. The native AWS Converse response body (the shape the official SDK
+        // deserializes — `output` / `stopReason` / `usage` / optional `metrics`) carries NO id or
+        // `created` field; AWS returns the request id only in the `x-amzn-RequestId` HTTP header.
+        // Injecting a synthesized `id`/`created` into the JSON body would therefore be a
+        // proxy-tell, not fidelity — so we deliberately do NOT add one. The cross-protocol
+        // synthesizer (`synth_response_id`) exists for the inverse direction (a Bedrock egress
+        // feeding an OpenAI/Anthropic ingress that DOES require a body id) and to populate the IR
+        // id when a downstream writer needs it; it is intentionally unused by Bedrock's own body
+        // writer. `stopReason` and `usage` (the only identity-bearing fields Bedrock emits) are
+        // reproduced exactly from the captured IR below, so a same-protocol round-trip is
+        // byte-identical.
         serde_json::json!({
             "output": {
                 "message": {
@@ -970,6 +1053,21 @@ impl ProtocolWriter for BedrockWriter {
                 "outputTokens": resp.usage.output_tokens,
                 "totalTokens": resp.usage.input_tokens + resp.usage.output_tokens
             }
+        })
+    }
+
+    /// Native AWS Bedrock Converse error envelope. The Converse error model (REST-JSON protocol)
+    /// serializes every modeled exception as a flat body whose human-readable detail lives in a
+    /// lowercase `"message"` member, with the machine-readable exception name in `"__type"` (the
+    /// exact two fields `BedrockReader::extract_error` reads back). A native AWS SDK deserializes
+    /// the typed exception from `__type` and surfaces the text from `message`; serving the generic
+    /// `{"error":{...}}` envelope here would make a Bedrock SDK fail to decode the error. We map
+    /// busbar's generic `kind` to the closed AWS exception set via `error_kind_to_bedrock_type` so
+    /// the `__type` is always a real Converse exception name. Served as `application/json`.
+    fn write_error(&self, _status: u16, kind: &str, message: &str) -> serde_json::Value {
+        serde_json::json!({
+            "__type": error_kind_to_bedrock_type(kind),
+            "message": message,
         })
     }
 
@@ -1735,5 +1833,140 @@ mod tests {
             stop_count, 1,
             "exactly one terminal MessageStop expected; got: {events:?}"
         );
+    }
+
+    // --- 1.0 ingress: native error envelope + response-identity fidelity ----------------------
+
+    /// The native Bedrock Converse error envelope is a flat `{"__type", "message"}` body (the exact
+    /// shape `extract_error` reads back) — NOT the generic `{"error":{...}}` default. A generic kind
+    /// maps to a real AWS exception name in `__type`, and the human text lands in lowercase
+    /// `message`. There must be no top-level `error` object (that would be a non-native tell).
+    #[test]
+    fn test_write_error_native_bedrock_shape() {
+        let writer = BedrockWriter;
+        let v = writer.write_error(400, "invalid_request_error", "bad input");
+        assert_eq!(
+            v.get("message").and_then(|m| m.as_str()),
+            Some("bad input"),
+            "human text must be in lowercase `message`"
+        );
+        assert_eq!(
+            v.get("__type").and_then(|t| t.as_str()),
+            Some("ValidationException"),
+            "generic kind must map to a native Converse exception name in `__type`"
+        );
+        assert!(
+            v.get("error").is_none(),
+            "must NOT carry the generic `{{\"error\":...}}` envelope (non-native tell)"
+        );
+        // Serializes cleanly (served as application/json).
+        let s = serde_json::to_string(&v).expect("error envelope must serialize");
+        assert!(s.contains("\"__type\""));
+    }
+
+    /// Kind → Bedrock exception-name mapping covers the common categories and falls back to a real
+    /// exception name (never an invented one) for anything unmapped.
+    #[test]
+    fn test_error_kind_to_bedrock_type_mapping() {
+        assert_eq!(
+            error_kind_to_bedrock_type("rate_limit_error"),
+            "ThrottlingException"
+        );
+        assert_eq!(error_kind_to_bedrock_type("auth"), "AccessDeniedException");
+        assert_eq!(
+            error_kind_to_bedrock_type("not_found"),
+            "ResourceNotFoundException"
+        );
+        assert_eq!(
+            error_kind_to_bedrock_type("overloaded_error"),
+            "ServiceUnavailableException"
+        );
+        assert_eq!(
+            error_kind_to_bedrock_type("api_error"),
+            "InternalServerException"
+        );
+        // Unmapped → still a real AWS exception name, not a catch-all literal.
+        assert_eq!(
+            error_kind_to_bedrock_type("some_future_kind"),
+            "ValidationException"
+        );
+    }
+
+    /// The native error envelope round-trips back through `extract_error`: a Bedrock SDK (and the
+    /// breaker's own reader) recovers both the structured type from `__type` and the text from
+    /// `message`. This is the indistinguishability check that ties the writer to the reader.
+    #[test]
+    fn test_write_error_roundtrips_through_extract_error() {
+        let writer = BedrockWriter;
+        let reader = BedrockReader;
+        let v = writer.write_error(429, "rate_limit_error", "Rate exceeded");
+        let body = serde_json::to_vec(&v).expect("serialize");
+        let raw = reader.extract_error(StatusCode::TOO_MANY_REQUESTS, &body);
+        assert_eq!(raw.provider_code.as_deref(), Some("Rate exceeded"));
+        assert_eq!(raw.structured_type.as_deref(), Some("ThrottlingException"));
+    }
+
+    /// Same-protocol passthrough fidelity: reading a native Converse response and writing it back
+    /// preserves stopReason + usage exactly, and the written body carries NO synthesized identity
+    /// (`id`/`created`) — the native Converse body has none, so injecting one would be a tell.
+    #[test]
+    fn test_response_identity_same_protocol_roundtrip_no_synth() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+
+        let j = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": "Hello, world!"}]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}
+        });
+
+        let resp = reader.read_response(&j).expect("read_response");
+        // Capture: Bedrock's minimal body yields no body-level identity.
+        assert_eq!(resp.id, None, "Converse body has no id to capture");
+        assert_eq!(
+            resp.created, None,
+            "Converse body has no created to capture"
+        );
+        assert_eq!(resp.system_fingerprint, None);
+        assert_eq!(resp.stop_sequence, None);
+        // stopReason + usage are present (the identity-bearing fields Bedrock does emit).
+        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(resp.usage.input_tokens, 10);
+        assert_eq!(resp.usage.output_tokens, 5);
+
+        let written = writer.write_response(&resp);
+        assert_eq!(
+            written, j,
+            "same-protocol round-trip must be byte-identical"
+        );
+        // No proxy-tell identity fields injected into the native body.
+        assert!(written.get("id").is_none(), "native body must carry no id");
+        assert!(
+            written.get("created").is_none(),
+            "native body must carry no created"
+        );
+    }
+
+    /// Cross-protocol synthesis: minting a Bedrock-flavored response id never panics and yields a
+    /// unique, non-empty token (so an OpenAI/Anthropic ingress fed by a Bedrock egress can always
+    /// get a valid body id). Uniqueness comes from the monotonic counter even within one second.
+    #[test]
+    fn test_synth_response_id_unique_and_nonempty() {
+        let a = synth_response_id();
+        let b = synth_response_id();
+        assert!(!a.is_empty(), "synthesized id must be non-empty");
+        assert!(!b.is_empty(), "synthesized id must be non-empty");
+        assert_ne!(a, b, "two synthesized ids minted back-to-back must differ");
+        // Shape sanity: `<hex16>-<hex16>` (no panic on parse of either half).
+        let (lhs, rhs) = a.split_once('-').expect("synth id has a `-` separator");
+        assert_eq!(lhs.len(), 16, "left half is 16 hex chars");
+        assert_eq!(rhs.len(), 16, "right half is 16 hex chars");
+        assert!(u64::from_str_radix(lhs, 16).is_ok());
+        assert!(u64::from_str_radix(rhs, 16).is_ok());
     }
 }

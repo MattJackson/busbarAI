@@ -4,6 +4,32 @@
 //! Cohere v2 protocol reader/writer implementation.
 
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Monotonic per-process counter mixed into a synthesized response id so two responses minted
+/// within the same wall-clock second still get distinct ids. Combined with the unix-second prefix
+/// this gives a collision-resistant id without pulling in a uuid/rand crate (a new dependency is
+/// out of scope for this wave). Cohere v2 ids are opaque strings — an official SDK reads `id` as a
+/// plain string and never parses its internal structure — so any unique, stable string is valid.
+static COHERE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Current unix epoch seconds, saturating to 0 if the clock is somehow before the epoch (never
+/// panics on the request path).
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Synthesize a Cohere-shaped response id for the cross-protocol case where the backend supplied
+/// none. Cohere v2 chat responses carry a UUID-like opaque `id`; the SDK treats it as an opaque
+/// string, so a `cohere-<unix_secs>-<counter>` value is shape-valid and unique within the process.
+fn synthesize_cohere_id() -> String {
+    let n = COHERE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("cohere-{}-{}", unix_now_secs(), n)
+}
 
 #[derive(Clone)]
 pub(crate) struct CohereReader;
@@ -345,10 +371,19 @@ impl ProtocolReader for CohereReader {
             "message-start" => {
                 if !state.started {
                     state.started = true;
+                    // Cohere v2 streams carry the response `id` on the top-level message-start
+                    // frame. Capture it for same-protocol stream passthrough; synthesize a
+                    // shape-valid id when the upstream omitted it. Cohere has no stream `created`.
+                    let id = data
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .or_else(|| Some(synthesize_cohere_id()));
                     out.push(IrStreamEvent::MessageStart {
                         role: crate::ir::IrRole::Assistant,
                         usage: None,
-                        id: None,
+                        id,
                         created: None,
                         model: None,
                     });
@@ -560,13 +595,25 @@ impl ProtocolReader for CohereReader {
 
         let model = obj.get("model").and_then(|m| m.as_str()).map(String::from);
 
+        // Capture the upstream response identity so same-protocol (Cohere → Cohere) passthrough
+        // preserves it exactly. Cohere v2 chat responses carry an opaque UUID-like `id`; if the
+        // upstream omitted it, synthesize a shape-valid one rather than carrying `None` (so a
+        // native SDK reading `.id` always sees a string). Cohere v2 has no `created`,
+        // `system_fingerprint`, or `stop_sequence` field — those stay `None`.
+        let id = obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| Some(synthesize_cohere_id()));
+
         Ok(crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
             content,
             stop_reason,
             usage,
             model,
-            id: None,
+            id,
             created: None,
             system_fingerprint: None,
             stop_sequence: None,
@@ -754,14 +801,21 @@ impl ProtocolWriter for CohereWriter {
 
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
         match ev {
-            IrStreamEvent::MessageStart { role, .. } => {
+            IrStreamEvent::MessageStart { role, id, .. } => {
                 let cohere_role = match role {
                     crate::ir::IrRole::Assistant => "assistant",
-                    _ => return None,
+                    crate::ir::IrRole::System
+                    | crate::ir::IrRole::User
+                    | crate::ir::IrRole::Tool => return None,
                 };
+                // Cohere v2 streams carry the response `id` on the message-start frame. Preserve a
+                // captured id; synthesize a shape-valid one for the cross-protocol case so the
+                // emitted stream is indistinguishable from a native Cohere stream.
+                let id = id.clone().unwrap_or_else(synthesize_cohere_id);
                 Some((
                     "".to_string(),
                     serde_json::json!({
+                        "id": id,
                         "type": "message-start",
                         "delta": { "message": { "role": cohere_role } }
                     }),
@@ -887,7 +941,12 @@ impl ProtocolWriter for CohereWriter {
             serde_json::json!(resp.usage.output_tokens),
         );
 
-        out.insert("id".to_string(), serde_json::Value::String(String::new()));
+        // Emit the response identity. Same-protocol passthrough preserves the captured upstream
+        // `id` exactly; the cross-protocol case (a non-Cohere backend that never supplied one)
+        // hits `None` and we synthesize a shape-valid Cohere id so a native SDK always reads a
+        // non-empty `.id` string.
+        let id = resp.id.clone().unwrap_or_else(synthesize_cohere_id);
+        out.insert("id".to_string(), serde_json::Value::String(id));
         // model that served the response (preserved across cross-protocol translation)
         if let Some(ref model) = resp.model {
             out.insert("model".to_string(), serde_json::json!(model));
@@ -906,6 +965,22 @@ impl ProtocolWriter for CohereWriter {
         out.insert("usage".to_string(), serde_json::Value::Object(usage_map));
 
         serde_json::Value::Object(out)
+    }
+
+    /// NATIVE Cohere v2 error envelope. The Cohere v2 chat API conveys the error *category* via the
+    /// HTTP status (400/401/404/429/5xx) and carries only a human-readable `{"message": <detail>}`
+    /// body — it has no typed `error.type`/`code` field the way OpenAI/Anthropic do. So the generic
+    /// `kind` is intentionally NOT surfaced in the body (it would be a field a native SDK never
+    /// sees); it is dropped here and conveyed solely by the caller's HTTP status. We also include an
+    /// `id` (some Cohere error responses carry one) so the envelope is indistinguishable from a real
+    /// Cohere error to a client on the official SDK. Served as `application/json` per the trait
+    /// contract.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn write_error(&self, _status: u16, _kind: &str, message: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": synthesize_cohere_id(),
+            "message": message,
+        })
     }
 
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
@@ -1064,12 +1139,15 @@ mod tests {
         assert_eq!(resp.role, crate::ir::IrRole::Assistant);
         assert_eq!(resp.stop_reason, Some("tool_use".to_string()));
         assert_eq!(resp.usage.input_tokens, 10);
+        // The upstream `id` is captured verbatim into the IR (same-protocol identity fidelity).
+        assert_eq!(resp.id.as_deref(), Some("msg_123"));
     }
 
     #[test]
     fn test_write_response_roundtrip() {
+        // Carries a real upstream id; same-protocol read→write must preserve it byte-identically.
         let json = serde_json::json!({
-            "id": "",
+            "id": "c14c80c3-18eb-4519-9460-6c92edd8cfb4",
             "finish_reason": "COMPLETE",
             "message": {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
             "usage": {"tokens": {"input_tokens": 10, "output_tokens": 5}}
@@ -1366,5 +1444,147 @@ mod tests {
             .read_request(&json)
             .expect("read_request should succeed");
         assert!(ir.tools.is_empty());
+    }
+
+    /// The NATIVE Cohere v2 error envelope is `{"message": <detail>, "id": <opaque>}` — NOT the
+    /// generic `{"error":{"message","type"}}`. The generic `kind` must NOT leak into the body (a
+    /// native SDK never reads a typed error category from a Cohere body; it reads `message`), and
+    /// the `id` must be a non-empty opaque string.
+    #[test]
+    fn test_write_error_native_cohere_envelope() {
+        let writer = CohereWriter;
+        let v = writer.write_error(404, "not_found", "model 'x' not found");
+
+        // Serializes (no panic) and re-parses as valid JSON.
+        let serialized = serde_json::to_string(&v).expect("write_error output must serialize");
+        let reparsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("write_error output must be valid JSON");
+
+        assert_eq!(
+            reparsed.get("message").and_then(|m| m.as_str()),
+            Some("model 'x' not found"),
+            "native Cohere error carries the detail under top-level `message`"
+        );
+        assert!(
+            reparsed.get("error").is_none(),
+            "must NOT use the generic `error` wrapper"
+        );
+        assert!(
+            reparsed.get("type").is_none() && reparsed.get("code").is_none(),
+            "Cohere conveys the error category via HTTP status, not a typed body field"
+        );
+        assert!(
+            reparsed
+                .get("id")
+                .and_then(|i| i.as_str())
+                .is_some_and(|s| !s.is_empty()),
+            "the synthesized id must be a non-empty opaque string"
+        );
+    }
+
+    /// Same-protocol (Cohere → Cohere) passthrough must preserve the upstream response `id` exactly
+    /// — capturing it on read and re-emitting the identical value on write.
+    #[test]
+    fn test_same_protocol_roundtrip_preserves_id() {
+        let upstream_id = "c14c80c3-18eb-4519-9460-6c92edd8cfb4";
+        let json = serde_json::json!({
+            "id": upstream_id,
+            "finish_reason": "COMPLETE",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            "usage": {"tokens": {"input_tokens": 3, "output_tokens": 1}}
+        });
+
+        let resp = CohereReader
+            .read_response(&json)
+            .expect("read_response should succeed");
+        assert_eq!(
+            resp.id.as_deref(),
+            Some(upstream_id),
+            "upstream id captured verbatim into the IR"
+        );
+
+        let out = CohereWriter.write_response(&resp);
+        assert_eq!(
+            out.get("id").and_then(|i| i.as_str()),
+            Some(upstream_id),
+            "the same id must be re-emitted on write (same-protocol fidelity)"
+        );
+    }
+
+    /// Same-protocol stream passthrough preserves the message-start `id`.
+    #[test]
+    fn test_same_protocol_stream_roundtrip_preserves_id() {
+        let upstream_id = "c14c80c3-18eb-4519-9460-6c92edd8cfb4";
+        let mut state = crate::ir::StreamDecodeState::default();
+        let evs = CohereReader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": upstream_id,
+                "type": "message-start",
+                "delta": {"message": {"role": "assistant"}}
+            }),
+            &mut state,
+        );
+        assert_eq!(evs.len(), 1);
+        let captured = match &evs[0] {
+            crate::ir::IrStreamEvent::MessageStart { id, .. } => id.clone(),
+            other => panic!("expected MessageStart, got {other:?}"),
+        };
+        assert_eq!(captured.as_deref(), Some(upstream_id));
+
+        let (_, frame) = CohereWriter
+            .write_response_event(&evs[0])
+            .expect("message-start must serialize");
+        assert_eq!(
+            frame.get("id").and_then(|i| i.as_str()),
+            Some(upstream_id),
+            "stream message-start id must round-trip verbatim"
+        );
+    }
+
+    /// Cross-protocol write (the backend supplied NO id — `IrResponse.id == None`) must SYNTHESIZE a
+    /// valid, non-empty Cohere id without panicking, so a native Cohere SDK still reads a string.
+    #[test]
+    fn test_cross_protocol_write_synthesizes_valid_id() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hello".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+
+        let out = CohereWriter.write_response(&resp);
+        let id = out
+            .get("id")
+            .and_then(|i| i.as_str())
+            .expect("synthesized id must be present as a string");
+        assert!(!id.is_empty(), "synthesized id must be non-empty");
+        assert!(
+            id.starts_with("cohere-"),
+            "synthesized id should carry the cohere prefix, got {id}"
+        );
+    }
+
+    /// Two successive synthesized ids within the same process must be distinct (the atomic counter
+    /// guarantees uniqueness even inside one wall-clock second).
+    #[test]
+    fn test_synthesized_ids_are_unique() {
+        let a = synthesize_cohere_id();
+        let b = synthesize_cohere_id();
+        assert_ne!(a, b, "the atomic counter must make synthesized ids unique");
     }
 }

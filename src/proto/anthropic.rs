@@ -9,6 +9,30 @@ use super::*;
 /// targets). Bump when adopting a newer Anthropic API version.
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
+/// Monotonic counter that disambiguates synthesized ids minted within the same clock second (or
+/// when the clock is non-monotonic). Combined with the unix timestamp it makes a collision between
+/// two synthesized ids astronomically unlikely without pulling in a uuid/rand crate.
+static SYNTH_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current unix time in whole seconds, or 0 if the system clock predates the epoch. Used as
+/// `created` synthesis and as the high bits of a synthesized id; never panics on a bad clock.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Mint a protocol-correct Anthropic message id (`msg_<rand>`) for the cross-protocol path, where
+/// the backend supplied none. An official Anthropic SDK only requires the `msg_` prefix and a
+/// non-empty unique suffix — it does not parse the body — so a timestamp+counter suffix is
+/// indistinguishable in shape from a native id. No new dependency: uniqueness comes from the unix
+/// second plus a process-global atomic counter.
+fn synth_message_id() -> String {
+    let seq = SYNTH_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("msg_{:x}{:x}", unix_now_secs(), seq)
+}
+
 #[derive(Clone)]
 pub(crate) struct AnthropicReader;
 
@@ -265,12 +289,19 @@ impl ProtocolReader for AnthropicReader {
                             .get("cache_read_input_tokens")
                             .and_then(|v| v.as_u64()),
                     });
+                // Capture the stream's native identity so an anthropic→anthropic passthrough
+                // re-emits the exact `message_start.message` an SDK expects (it reads
+                // `message.id`/`message.model` to populate the assembled `Message`). Anthropic's
+                // `message_start` has no `created` field, so `created` stays None on this path; the
+                // writer synthesizes one only when translating from a protocol that omitted it.
+                let id = msg.get("id").and_then(|i| i.as_str()).map(String::from);
+                let model = msg.get("model").and_then(|m| m.as_str()).map(String::from);
                 Some(IrStreamEvent::MessageStart {
                     role,
                     usage,
-                    id: None,
+                    id,
                     created: None,
-                    model: None,
+                    model,
                 })
             }
             "content_block_start" => {
@@ -463,16 +494,31 @@ impl ProtocolReader for AnthropicReader {
 
         let model = obj.get("model").and_then(|m| m.as_str()).map(String::from);
 
+        // Capture the native response identity so a same-protocol (anthropic→anthropic) passthrough
+        // preserves it byte-for-byte. An official SDK's `Message` carries `id` ("msg_<rand>"),
+        // `type` ("message"), `role`, `model`, `stop_reason`, `stop_sequence`, and `usage`; the
+        // first four plus `stop_sequence` round-trip through these IR fields (role/model/stop_reason
+        // are already parsed above; `type` is a constant the writer re-emits).
+        let id = obj.get("id").and_then(|i| i.as_str()).map(String::from);
+        // Anthropic's non-streaming `Message` has no `created` field, so there is nothing to carry
+        // through; the writer synthesizes one only on the cross-protocol path (where the IR field is
+        // None) for SDKs that read it. `system_fingerprint` is an OpenAI concept Anthropic never
+        // emits — left None so a same-protocol round-trip does not invent one.
+        let stop_sequence = obj
+            .get("stop_sequence")
+            .and_then(|s| s.as_str())
+            .map(String::from);
+
         Ok(crate::ir::IrResponse {
             role,
             content,
             stop_reason,
             usage,
             model,
-            id: None,
+            id,
             created: None,
             system_fingerprint: None,
-            stop_sequence: None,
+            stop_sequence,
         })
     }
 }
@@ -843,6 +889,46 @@ impl ProtocolWriter for AnthropicWriter {
         true
     }
 
+    fn write_error(&self, _status: u16, kind: &str, message: &str) -> serde_json::Value {
+        // Native Anthropic error envelope: `{"type":"error","error":{"type":<kind>,"message":<msg>}}`
+        // (see the Anthropic SDK / API error shape — the `anthropic.APIStatusError` family decodes
+        // `error.type` into the typed exception, e.g. `RateLimitError`, and surfaces `error.message`).
+        // Served as `application/json` by the caller, per the `ProtocolWriter::write_error` contract.
+        // The generic `kind` strings the router emits are mapped to Anthropic's own error-type
+        // vocabulary so a native SDK gets the exception it expects; an unrecognized `kind` is passed
+        // through verbatim (it is already an Anthropic-style type, or a value we don't want to
+        // silently rewrite — no `_ =>` swallow).
+        let anthropic_type = match kind {
+            // Generic router/auth/forward `kind`s → Anthropic's typed error vocabulary.
+            "invalid_request" | "bad_request" => "invalid_request_error",
+            "authentication" | "unauthorized" => "authentication_error",
+            "permission" | "forbidden" => "permission_error",
+            "not_found" => "not_found_error",
+            "request_too_large" | "payload_too_large" => "request_too_large",
+            "rate_limit" | "too_many_requests" => "rate_limit_error",
+            "overloaded" => "overloaded_error",
+            "timeout" => "timeout_error",
+            "api_error" | "server_error" | "internal" => "api_error",
+            // Already an Anthropic-native type (e.g. "invalid_request_error") or an unmapped value:
+            // emit it unchanged rather than collapsing every unknown into one bucket.
+            "invalid_request_error"
+            | "authentication_error"
+            | "permission_error"
+            | "not_found_error"
+            | "rate_limit_error"
+            | "overloaded_error"
+            | "timeout_error" => kind,
+            other => other,
+        };
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": anthropic_type,
+                "message": message,
+            }
+        })
+    }
+
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
         let mut out = serde_json::Map::new();
         if !req.system.is_empty() {
@@ -873,14 +959,44 @@ impl ProtocolWriter for AnthropicWriter {
 
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
         match ev {
-            IrStreamEvent::MessageStart { role, usage, .. } => {
+            IrStreamEvent::MessageStart {
+                role,
+                usage,
+                id,
+                model,
+                ..
+            } => {
                 let role_str = match role {
                     crate::ir::IrRole::User => "user",
                     crate::ir::IrRole::Assistant => "assistant",
                     _ => return None,
                 };
                 let mut msg_obj = serde_json::Map::new();
+                // The native `message_start.message` is a skeleton Message an SDK reads
+                // `id`/`type`/`role`/`model`/`content`/`usage` from (plus `stop_reason`/
+                // `stop_sequence`, null at stream start). We emit that full skeleton whenever we
+                // have identity to anchor it — i.e. the egress stream carried a native `id`/`model`
+                // (same-protocol passthrough) or the cross-protocol decode populated either field.
+                // When neither is present (a minimal `{role,usage}` event with no identity, which
+                // is what a bare same-protocol fixture round-trips), we emit only `role`+`usage` so
+                // the passthrough stays byte-faithful and does not fabricate a skeleton the source
+                // never sent. Synthesize `id` only on the identity-bearing path where it's missing
+                // (cross-protocol gave `model` but no Anthropic id), never on the bare path.
+                let has_identity = id.is_some() || model.is_some();
+                if has_identity {
+                    let msg_id = id.clone().unwrap_or_else(synth_message_id);
+                    msg_obj.insert("id".to_string(), serde_json::json!(msg_id));
+                    msg_obj.insert("type".to_string(), serde_json::json!("message"));
+                }
                 msg_obj.insert("role".to_string(), serde_json::json!(role_str));
+                if let Some(model_str) = model {
+                    msg_obj.insert("model".to_string(), serde_json::json!(model_str));
+                }
+                if has_identity {
+                    msg_obj.insert("content".to_string(), serde_json::Value::Array(Vec::new()));
+                    msg_obj.insert("stop_reason".to_string(), serde_json::Value::Null);
+                    msg_obj.insert("stop_sequence".to_string(), serde_json::Value::Null);
+                }
                 if let Some(usage_val) = usage {
                     let mut usage_map = serde_json::Map::new();
                     usage_map.insert(
@@ -1020,7 +1136,30 @@ impl ProtocolWriter for AnthropicWriter {
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
 
-        // role: "assistant" for responses
+        // id: an official SDK's `Message.id` is `"msg_<rand>"`. Three cases:
+        //   * same-protocol passthrough — the upstream id was captured into `resp.id`; re-emit it
+        //     verbatim so a native SDK sees the exact id its backend assigned.
+        //   * cross-protocol with a foreign id absent — `resp.id == None` AND `resp.created` is set
+        //     (every cross-protocol reader that lacks an Anthropic id still records `created`, e.g.
+        //     OpenAI's `created`), so synthesize a protocol-correct `msg_<rand>`. The SDK only
+        //     requires the `msg_` prefix + uniqueness, which `synth_message_id` guarantees with no
+        //     new crate.
+        //   * minimal same-protocol IR with neither id nor created (a body that carried no id) —
+        //     omit `id` rather than fabricate one, so a read→write→read round-trip is lossless
+        //     (synthesizing here would make the re-read IR carry an id the original lacked).
+        // This keys synthesis off "did we cross a protocol boundary" (proxied by `created` being
+        // populated) rather than off `id` alone, preserving same-protocol idempotence.
+        match (&resp.id, resp.created) {
+            (Some(id), _) => {
+                obj.insert("id".to_string(), serde_json::json!(id));
+            }
+            (None, Some(_)) => {
+                obj.insert("id".to_string(), serde_json::json!(synth_message_id()));
+            }
+            (None, None) => {}
+        }
+
+        // type/role are constant for a Messages API response ("message"/"assistant").
         obj.insert("type".to_string(), serde_json::json!("message"));
         obj.insert("role".to_string(), serde_json::json!("assistant"));
 
@@ -1036,9 +1175,16 @@ impl ProtocolWriter for AnthropicWriter {
             serde_json::Value::Array(content_array),
         );
 
-        // stop_reason (omit if None)
+        // stop_reason (omit if None — a native body omits it until the turn ends, and omitting
+        // keeps same-protocol round-trips lossless)
         if let Some(ref reason) = resp.stop_reason {
             obj.insert("stop_reason".to_string(), serde_json::json!(reason));
+        }
+
+        // stop_sequence: emit the captured value when a stop string actually matched; omit when
+        // None so a same-protocol round-trip of a body without one stays byte-faithful.
+        if let Some(ref seq) = resp.stop_sequence {
+            obj.insert("stop_sequence".to_string(), serde_json::json!(seq));
         }
 
         // usage
@@ -1153,5 +1299,229 @@ mod anthropic_hardening_tests {
             raw.structured_type.as_deref(),
             Some("invalid_request_error")
         );
+    }
+
+    /// write_error must produce the NATIVE Anthropic envelope
+    /// `{"type":"error","error":{"type":<mapped kind>,"message":<msg>}}`, mapping a generic router
+    /// `kind` into Anthropic's typed error vocabulary so a native SDK decodes the right exception.
+    #[test]
+    fn write_error_native_anthropic_envelope_shape() {
+        let v = AnthropicWriter.write_error(404, "not_found", "model 'x' not found");
+        // Top-level discriminator is "error" (Anthropic), NOT the generic `{"error":{...}}`.
+        assert_eq!(v.get("type").and_then(|t| t.as_str()), Some("error"));
+        let err = v.get("error").expect("error object present");
+        assert_eq!(
+            err.get("type").and_then(|t| t.as_str()),
+            Some("not_found_error"),
+            "generic `not_found` must map to Anthropic `not_found_error`"
+        );
+        assert_eq!(
+            err.get("message").and_then(|m| m.as_str()),
+            Some("model 'x' not found")
+        );
+        // Round-trips as JSON (the caller serves it as application/json) — no panic.
+        let s = serde_json::to_string(&v).expect("must serialize");
+        let _: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
+    }
+
+    /// A `kind` already in Anthropic's vocabulary passes through unchanged (no double-mapping, no
+    /// `_ =>` collapse), and a representative sample of generic kinds map to the right native type.
+    #[test]
+    fn write_error_kind_vocabulary_mapping() {
+        let map_of = |kind: &str| {
+            AnthropicWriter
+                .write_error(400, kind, "m")
+                .get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str())
+                .map(String::from)
+        };
+        assert_eq!(map_of("rate_limit").as_deref(), Some("rate_limit_error"));
+        assert_eq!(
+            map_of("authentication").as_deref(),
+            Some("authentication_error")
+        );
+        assert_eq!(
+            map_of("invalid_request").as_deref(),
+            Some("invalid_request_error")
+        );
+        // Already-native type is emitted verbatim.
+        assert_eq!(
+            map_of("invalid_request_error").as_deref(),
+            Some("invalid_request_error")
+        );
+        // Unknown/unmapped kind passes through rather than being swallowed into one bucket.
+        assert_eq!(
+            map_of("some_custom_kind").as_deref(),
+            Some("some_custom_kind")
+        );
+    }
+
+    /// Same-protocol (anthropic→anthropic) passthrough must preserve the upstream response identity:
+    /// `read_response` captures `id`/`stop_sequence` (and model/stop_reason), and `write_response`
+    /// re-emits them verbatim alongside the constant `type`/`role`. Mirrors the exact non-streaming
+    /// `Message` shape an official SDK assembles.
+    #[test]
+    fn read_then_write_response_preserves_identity() {
+        let body = serde_json::json!({
+            "id": "msg_01XYZabc123",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-4-8",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "stop_sequence",
+            "stop_sequence": "\n\nHuman:",
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        });
+        let ir = AnthropicReader.read_response(&body).expect("read_response");
+        assert_eq!(ir.id.as_deref(), Some("msg_01XYZabc123"));
+        assert_eq!(ir.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(ir.stop_reason.as_deref(), Some("stop_sequence"));
+        assert_eq!(ir.stop_sequence.as_deref(), Some("\n\nHuman:"));
+
+        let out = AnthropicWriter.write_response(&ir);
+        assert_eq!(
+            out.get("id").and_then(|v| v.as_str()),
+            Some("msg_01XYZabc123"),
+            "id must round-trip verbatim on same-protocol passthrough"
+        );
+        assert_eq!(out.get("type").and_then(|v| v.as_str()), Some("message"));
+        assert_eq!(out.get("role").and_then(|v| v.as_str()), Some("assistant"));
+        assert_eq!(
+            out.get("model").and_then(|v| v.as_str()),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(
+            out.get("stop_reason").and_then(|v| v.as_str()),
+            Some("stop_sequence")
+        );
+        assert_eq!(
+            out.get("stop_sequence").and_then(|v| v.as_str()),
+            Some("\n\nHuman:")
+        );
+    }
+
+    /// Same-protocol streaming `message_start` passthrough must preserve `id`/`model` and re-emit
+    /// the SDK-expected skeleton (`id`/`type`/`role`/`model`/`content`/`usage`).
+    #[test]
+    fn message_start_roundtrip_preserves_id_and_model() {
+        let data = serde_json::json!({
+            "message": {
+                "id": "msg_stream_01",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [],
+                "usage": {"input_tokens": 7, "output_tokens": 0}
+            }
+        });
+        let ev = AnthropicReader
+            .read_response_event("message_start", &data)
+            .expect("message_start parses");
+        match &ev {
+            IrStreamEvent::MessageStart { id, model, .. } => {
+                assert_eq!(id.as_deref(), Some("msg_stream_01"));
+                assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
+            }
+            _ => panic!("expected MessageStart"),
+        }
+        let (et, out) = AnthropicWriter
+            .write_response_event(&ev)
+            .expect("writes message_start");
+        assert_eq!(et, "message_start");
+        let msg = out.get("message").expect("message object");
+        assert_eq!(
+            msg.get("id").and_then(|v| v.as_str()),
+            Some("msg_stream_01")
+        );
+        assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("message"));
+        assert_eq!(msg.get("role").and_then(|v| v.as_str()), Some("assistant"));
+        assert_eq!(
+            msg.get("model").and_then(|v| v.as_str()),
+            Some("claude-opus-4-8")
+        );
+        assert!(
+            msg.get("content").and_then(|c| c.as_array()).is_some(),
+            "content[] must be present for an SDK to initialize its Message"
+        );
+    }
+
+    /// Cross-protocol write (the backend supplied no Anthropic id, but a non-Anthropic reader
+    /// recorded `created`) must SYNTHESIZE a protocol-correct `msg_`-prefixed id without panicking,
+    /// and the synthesized id must be unique across calls (timestamp + atomic counter).
+    #[test]
+    fn cross_protocol_write_synthesizes_valid_unique_id() {
+        let make = || crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "x".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("gpt-4o".to_string()),
+            id: None,
+            // `created` populated → marks a cross-protocol response → synthesis fires.
+            created: Some(1_700_000_000),
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out1 = AnthropicWriter.write_response(&make());
+        let out2 = AnthropicWriter.write_response(&make());
+        let id1 = out1.get("id").and_then(|v| v.as_str()).expect("synth id 1");
+        let id2 = out2.get("id").and_then(|v| v.as_str()).expect("synth id 2");
+        assert!(
+            id1.starts_with("msg_"),
+            "synthesized id must carry the Anthropic `msg_` prefix, got {id1}"
+        );
+        assert!(
+            id1.len() > "msg_".len(),
+            "synthesized id must have a suffix"
+        );
+        assert_ne!(id1, id2, "synthesized ids must be unique across calls");
+        // Shape stays SDK-valid: type/role/content present, no panic.
+        assert_eq!(out1.get("type").and_then(|v| v.as_str()), Some("message"));
+    }
+
+    /// A minimal same-protocol IR carrying neither `id` nor `created` must NOT fabricate an id —
+    /// omitting it keeps a read→write→read round-trip lossless (the synthesis is gated to the
+    /// cross-protocol path only).
+    #[test]
+    fn minimal_same_protocol_write_omits_synthesized_id() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![],
+            stop_reason: None,
+            usage: crate::ir::IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = AnthropicWriter.write_response(&resp);
+        assert!(
+            out.get("id").is_none(),
+            "no id must be fabricated when neither id nor created is set (loss-free passthrough)"
+        );
+    }
+
+    /// `synth_message_id` must never panic and always returns a non-empty `msg_`-prefixed id.
+    #[test]
+    fn synth_message_id_is_well_formed() {
+        let id = synth_message_id();
+        assert!(id.starts_with("msg_"));
+        assert!(id.len() > "msg_".len());
     }
 }
