@@ -332,6 +332,9 @@ impl ProtocolReader for GeminiReader {
             out.push(IrStreamEvent::MessageStart {
                 role: crate::ir::IrRole::Assistant,
                 usage: None,
+                id: None,
+                created: None,
+                model: None,
             });
         }
 
@@ -588,6 +591,10 @@ impl ProtocolReader for GeminiReader {
             stop_reason,
             usage,
             model,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
         })
     }
 

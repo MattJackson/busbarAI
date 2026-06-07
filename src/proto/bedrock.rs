@@ -356,6 +356,9 @@ impl ProtocolReader for BedrockReader {
                     out.push(IrStreamEvent::MessageStart {
                         role: crate::ir::IrRole::Assistant,
                         usage: None,
+                        id: None,
+                        created: None,
+                        model: None,
                     });
                 }
             }
@@ -593,6 +596,10 @@ impl ProtocolReader for BedrockReader {
             usage,
             // Bedrock's Converse response carries no model field (the model is in the request URL).
             model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
         })
     }
 
@@ -848,7 +855,9 @@ impl ProtocolWriter for BedrockWriter {
 
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
         match ev {
-            IrStreamEvent::MessageStart { role: _, usage: _ } => Some((
+            IrStreamEvent::MessageStart {
+                role: _, usage: _, ..
+            } => Some((
                 "messageStart".to_string(),
                 serde_json::json!({ "role": "assistant" }),
             )),
@@ -1448,7 +1457,7 @@ mod tests {
         assert_eq!(events.len(), 8);
 
         match &events[0] {
-            IrStreamEvent::MessageStart { role, usage } => {
+            IrStreamEvent::MessageStart { role, usage, .. } => {
                 assert_eq!(*role, crate::ir::IrRole::Assistant);
                 assert!(usage.is_none());
             }

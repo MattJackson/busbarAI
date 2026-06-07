@@ -265,7 +265,13 @@ impl ProtocolReader for AnthropicReader {
                             .get("cache_read_input_tokens")
                             .and_then(|v| v.as_u64()),
                     });
-                Some(IrStreamEvent::MessageStart { role, usage })
+                Some(IrStreamEvent::MessageStart {
+                    role,
+                    usage,
+                    id: None,
+                    created: None,
+                    model: None,
+                })
             }
             "content_block_start" => {
                 let index = data
@@ -463,6 +469,10 @@ impl ProtocolReader for AnthropicReader {
             stop_reason,
             usage,
             model,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
         })
     }
 }
@@ -863,7 +873,7 @@ impl ProtocolWriter for AnthropicWriter {
 
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
         match ev {
-            IrStreamEvent::MessageStart { role, usage } => {
+            IrStreamEvent::MessageStart { role, usage, .. } => {
                 let role_str = match role {
                     crate::ir::IrRole::User => "user",
                     crate::ir::IrRole::Assistant => "assistant",

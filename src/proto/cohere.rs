@@ -348,6 +348,9 @@ impl ProtocolReader for CohereReader {
                     out.push(IrStreamEvent::MessageStart {
                         role: crate::ir::IrRole::Assistant,
                         usage: None,
+                        id: None,
+                        created: None,
+                        model: None,
                     });
                 }
             }
@@ -563,6 +566,10 @@ impl ProtocolReader for CohereReader {
             stop_reason,
             usage,
             model,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
         })
     }
 }
@@ -1239,6 +1246,10 @@ mod tests {
                 cache_read_input_tokens: None,
             },
             model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
         };
 
         let json = CohereWriter.write_response(&resp);

@@ -398,6 +398,9 @@ impl ProtocolReader for ResponsesReader {
                     out.push(IrStreamEvent::MessageStart {
                         role: crate::ir::IrRole::Assistant,
                         usage: None,
+                        id: None,
+                        created: None,
+                        model: None,
                     });
                 }
             }
@@ -692,6 +695,10 @@ impl ProtocolReader for ResponsesReader {
             stop_reason,
             usage,
             model,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
         })
     }
 

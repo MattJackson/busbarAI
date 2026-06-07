@@ -132,6 +132,34 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// Write a whole (non-streaming) response to wire JSON.
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value;
 
+    /// Render a router/forward/auth-layer error as this protocol's NATIVE error envelope, so a
+    /// client on the vendor's official SDK gets the typed exception it expects instead of a
+    /// plain-text body it cannot decode (the §8.1 / Unit I transparency gap). `status` is the HTTP
+    /// status to be sent (informational; the envelope body may also embed it, e.g. Gemini's
+    /// `error.code`); `kind` is a protocol-appropriate error type/category string (e.g.
+    /// `"invalid_request_error"`, `"not_found"`); `message` is the human-readable detail.
+    ///
+    /// Regardless of protocol, the returned JSON MUST be served with
+    /// `content-type: application/json` (every vendor's error envelope is JSON — OpenAI, Anthropic,
+    /// Gemini, Cohere, Responses, and the Bedrock Converse error shape alike).
+    ///
+    /// The default returns a generic `{"error":{"message":message,"type":kind}}` so the crate
+    /// compiles before any per-protocol override exists. Per-protocol native envelopes (OpenAI
+    /// `{"error":{"message","type","code"}}`, Anthropic `{"type":"error","error":{"type","message"}}`,
+    /// Gemini `{"error":{"code","message","status"}}`, etc.) land in a later wave as overrides.
+    ///
+    /// Not yet wired to the router/auth/forward error sites (that is the next wave); the test build
+    /// exercises the default impl, so suppress the not-yet-called dead-code lint off the test path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn write_error(&self, _status: u16, kind: &str, message: &str) -> serde_json::Value {
+        serde_json::json!({
+            "error": {
+                "message": message,
+                "type": kind,
+            }
+        })
+    }
+
     /// Build a minimal, protocol-correct request body for an active health probe of `model`.
     /// Serializes a one-token "ping" through this protocol's own `write_request`, so every protocol
     /// gets a valid probe body for free — no per-protocol probe code, no extra dependency.
@@ -504,6 +532,74 @@ pub(crate) fn convert_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default `ProtocolWriter::write_error` (the only impl in this wave — no per-protocol
+    /// overrides yet) must produce valid JSON carrying the message and the `kind` as `error.type`,
+    /// so the §8.1 / Unit I plumbing exists before per-protocol envelopes land. (Content-type is a
+    /// caller concern; the doc contract says `application/json` for all protocols.)
+    #[test]
+    fn test_write_error_default_envelope_is_valid_json() {
+        // Any writer exercises the default impl since none override it yet.
+        let writer: Box<dyn ProtocolWriter> = Box::new(OpenAiWriter);
+        let v = writer.write_error(404, "not_found", "model 'x' not found");
+        // Round-trips as JSON (no panic) and has the generic envelope shape.
+        let serialized = serde_json::to_string(&v).expect("write_error output must serialize");
+        let reparsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("write_error output must be valid JSON");
+        assert_eq!(
+            reparsed["error"]["message"],
+            serde_json::json!("model 'x' not found")
+        );
+        assert_eq!(reparsed["error"]["type"], serde_json::json!("not_found"));
+    }
+
+    /// A fresh `IrResponse` constructed with the new identity fields left at their documented
+    /// default (`None`) must read back as `None` — guards the foundation that later waves populate.
+    #[test]
+    fn test_ir_response_identity_fields_default_none() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![],
+            stop_reason: None,
+            usage: crate::ir::IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        assert_eq!(resp.id, None);
+        assert_eq!(resp.created, None);
+        assert_eq!(resp.system_fingerprint, None);
+        assert_eq!(resp.stop_sequence, None);
+    }
+
+    /// The streaming-start IR event carries the new identity metadata, defaulting to `None`.
+    #[test]
+    fn test_ir_message_start_identity_fields_default_none() {
+        let ev = crate::ir::IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        };
+        match ev {
+            crate::ir::IrStreamEvent::MessageStart {
+                id, created, model, ..
+            } => {
+                assert_eq!(id, None);
+                assert_eq!(created, None);
+                assert_eq!(model, None);
+            }
+            _ => panic!("constructed a MessageStart"),
+        }
+    }
 
     /// Every protocol's writer must produce a non-empty, valid-JSON probe body that carries the
     /// requested model (or, for path-model protocols like Gemini/Bedrock, at least valid JSON) —
@@ -2221,6 +2317,9 @@ mod tests {
             let ev = crate::ir::IrStreamEvent::MessageStart {
                 role: crate::ir::IrRole::Assistant,
                 usage: None,
+                id: None,
+                created: None,
+                model: None,
             };
             let result = writer.write_response_event(&ev);
             assert!(result.is_some());
@@ -2405,7 +2504,10 @@ mod stream_fanout_tests {
             vec![
                 IrStreamEvent::MessageStart {
                     role: IrRole::Assistant,
-                    usage: None
+                    usage: None,
+                    id: None,
+                    created: None,
+                    model: None
                 },
                 IrStreamEvent::BlockStart {
                     index: 0,
@@ -2451,7 +2553,10 @@ mod stream_fanout_tests {
             vec![
                 IrStreamEvent::MessageStart {
                     role: IrRole::Assistant,
-                    usage: None
+                    usage: None,
+                    id: None,
+                    created: None,
+                    model: None
                 },
                 IrStreamEvent::BlockStart {
                     index: 1,
@@ -3497,7 +3602,8 @@ mod gemini_tests {
             events[0],
             IrStreamEvent::MessageStart {
                 role: IrRole::Assistant,
-                usage: None
+                usage: None,
+                ..
             }
         ));
 

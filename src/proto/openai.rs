@@ -351,6 +351,9 @@ impl ProtocolReader for OpenAiReader {
             out.push(IrStreamEvent::MessageStart {
                 role: crate::ir::IrRole::Assistant,
                 usage: None,
+                id: None,
+                created: None,
+                model: None,
             });
         }
 
@@ -663,6 +666,10 @@ impl ProtocolReader for OpenAiReader {
             stop_reason,
             usage,
             model,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
         })
     }
 }
@@ -1373,6 +1380,10 @@ mod tests {
                 cache_read_input_tokens: None,
             },
             model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
         };
         let out = OpenAiWriter.write_response(&resp);
         let msg = &out["choices"][0]["message"];
@@ -1401,6 +1412,10 @@ mod tests {
                 cache_read_input_tokens: None,
             },
             model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
         };
         let out = OpenAiWriter.write_response(&resp);
         assert_eq!(

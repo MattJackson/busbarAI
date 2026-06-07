@@ -25,6 +25,17 @@ pub(crate) enum IrStreamEvent {
     MessageStart {
         role: IrRole,
         usage: Option<IrUsage>,
+        /// Stream identity, carried through from the egress backend's stream-start metadata so a
+        /// writer can emit the SDK-required top-level identity fields a native stream carries
+        /// (Anthropic `message_start.message.id`; OpenAI `chat.completion.chunk` top-level
+        /// `id`/`created`/`model`). Default `None`; populated per-protocol in a later wave (and
+        /// synthesized when the backend supplies none). See `docs/DESIGN_universal_ingress.md` §8.2.
+        id: Option<String>,
+        /// Unix epoch seconds for the stream's creation time (OpenAI chunk top-level `created`).
+        created: Option<u64>,
+        /// The model that served the stream (OpenAI chunk top-level `model`; Anthropic
+        /// `message_start.message.model`). Mirrors `IrResponse::model`.
+        model: Option<String>,
     },
     BlockStart {
         index: usize,
@@ -55,6 +66,18 @@ pub(crate) struct IrResponse {
     /// cross-protocol translation so a pool route's response still names the member that served it
     /// (same as a direct route). `None` if the upstream body carried no model field.
     pub model: Option<String>,
+    /// Response identity, carried through from the egress backend's `read_response` so a writer can
+    /// emit the SDK-required identity field a native response carries (OpenAI `id` =
+    /// `"chatcmpl-..."`, Anthropic `id` = `"msg_..."`). Default `None`; populated per-protocol in a
+    /// later wave (and synthesized when the backend supplies none, so the shape stays SDK-valid).
+    /// See `docs/DESIGN_universal_ingress.md` §8.2 (Unit J).
+    pub id: Option<String>,
+    /// Unix epoch seconds for the response creation time (OpenAI `created`). Default `None`.
+    pub created: Option<u64>,
+    /// OpenAI's `system_fingerprint` (opaque backend config marker). Default `None`.
+    pub system_fingerprint: Option<String>,
+    /// Anthropic's `stop_sequence` (the matched stop string, or `null`). Default `None`.
+    pub stop_sequence: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
