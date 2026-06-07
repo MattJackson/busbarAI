@@ -313,6 +313,12 @@ pub(crate) struct StreamTranslate {
     emit_done: bool,
     /// egress == "bedrock" → frames are binary `application/vnd.amazon.eventstream`, not SSE.
     egress_eventstream: bool,
+    /// ingress == "bedrock" → the CLIENT is a native AWS SDK, so each translated event must be
+    /// packed into a binary `application/vnd.amazon.eventstream` frame (with valid CRC32) instead of
+    /// reframed as SSE. The stream's terminator is the `messageStop`/`metadata` frames themselves
+    /// (Bedrock has no `[DONE]`), so `finish()` stays empty. See `docs/DESIGN_universal_ingress.md`
+    /// §4.
+    ingress_eventstream: bool,
 }
 
 impl StreamTranslate {
@@ -331,19 +337,42 @@ impl StreamTranslate {
             aborted: false,
             emit_done: ingress == "openai",
             egress_eventstream: egress == "bedrock",
+            ingress_eventstream: ingress == "bedrock",
         })
     }
 
     /// Translate one egress event `(event_type, payload)` into ingress wire bytes, advancing the
     /// decode state. Shared by the SSE and event-stream feed paths.
     fn translate_event(&mut self, event_type: &str, data: &serde_json::Value, out: &mut Vec<u8>) {
-        for ev in self
+        for mut ev in self
             .egress
             .reader()
             .read_response_events(event_type, data, &mut self.decode)
         {
+            // Cross-protocol stream identity strip: a `StreamTranslate` only exists when
+            // ingress != egress (`new` returns None otherwise), so every event here crosses a
+            // protocol boundary. Clear the foreign-format `MessageStart` `id`/`created` (and `model`)
+            // so the INGRESS writer synthesizes NATIVE-format stream identity rather than leaking the
+            // backend's `chatcmpl-…`/`msg_…` id to a different-protocol client — mirrors the
+            // non-stream strip in forward.rs (`ir.id = None`). Same-protocol byte-exact round-trips
+            // never reach here, so they are untouched.
+            if let crate::ir::IrStreamEvent::MessageStart {
+                id, created, model, ..
+            } = &mut ev
+            {
+                *id = None;
+                *created = None;
+                *model = None;
+            }
             if let Some((out_et, out_data)) = self.ingress.writer().write_response_event(&ev) {
-                out.extend_from_slice(reframe_sse(&out_et, &out_data).as_bytes());
+                if self.ingress_eventstream {
+                    // ingress is a native AWS SDK Bedrock client: pack the logical event into a
+                    // binary `application/vnd.amazon.eventstream` frame with valid CRC32.
+                    let payload = serde_json::to_vec(&out_data).unwrap_or_default();
+                    out.extend_from_slice(&crate::eventstream::encode_frame(&out_et, &payload));
+                } else {
+                    out.extend_from_slice(reframe_sse(&out_et, &out_data).as_bytes());
+                }
             }
         }
     }
@@ -2693,6 +2722,83 @@ mod stream_translate_tests {
             "text delta; got:\n{out}"
         );
         assert!(out.contains("message_stop"), "terminator; got:\n{out}");
+    }
+
+    /// Bedrock *ingress* streaming: an Anthropic SSE backend stream → a native AWS SDK Bedrock
+    /// client. `StreamTranslate("bedrock", "anthropic")` must emit BINARY
+    /// `application/vnd.amazon.eventstream` frames (not SSE) that `drain_frames` decodes back into
+    /// the expected Converse event sequence. This is the encoder's cross-protocol acceptance test:
+    /// it exercises encode_frame on the live streaming path and round-trips through the production
+    /// decoder, proving CRC + framing validity end to end. No `data: [DONE]` terminator.
+    #[test]
+    fn test_translate_anthropic_egress_to_bedrock_ingress_binary_frames() {
+        let mut t =
+            StreamTranslate::new("bedrock", "anthropic").expect("bedrock ingress translator");
+        let mut raw: Vec<u8> = Vec::new();
+        for frame in [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_backend\",\"role\":\"assistant\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            raw.extend(t.feed(frame.as_bytes()));
+        }
+        // Bedrock has no `[DONE]`: the messageStop frame is the terminator, so finish() is empty.
+        assert!(
+            t.finish().is_empty(),
+            "bedrock ingress emits no terminator frame in finish()"
+        );
+
+        // The output must NOT be SSE text — it must be binary frames the decoder can parse.
+        assert!(
+            !raw.starts_with(b"event:") && !raw.starts_with(b"data:"),
+            "bedrock ingress output must be binary frames, not SSE"
+        );
+
+        let mut buf = raw.clone();
+        let frames = crate::eventstream::drain_frames(&mut buf);
+        assert!(
+            buf.is_empty(),
+            "all emitted frames must decode cleanly (valid CRC + lengths); {} bytes left",
+            buf.len()
+        );
+        let types: Vec<&str> = frames.iter().map(|(et, _)| et.as_str()).collect();
+        assert_eq!(
+            types.first().copied(),
+            Some("messageStart"),
+            "stream opens with messageStart; got {types:?}"
+        );
+        assert!(
+            types.contains(&"contentBlockDelta"),
+            "must carry a contentBlockDelta; got {types:?}"
+        );
+        assert!(
+            types.contains(&"messageStop"),
+            "must carry messageStop terminator; got {types:?}"
+        );
+
+        // The contentBlockDelta payload must round-trip the translated text.
+        let delta = frames
+            .iter()
+            .find(|(et, _)| et == "contentBlockDelta")
+            .expect("a contentBlockDelta frame");
+        let v: serde_json::Value = serde_json::from_slice(&delta.1).expect("valid JSON payload");
+        assert_eq!(
+            v.pointer("/delta/text").and_then(|x| x.as_str()),
+            Some("Hi"),
+            "delta text round-trips; got {v}"
+        );
+
+        // The foreign Anthropic `msg_backend` id must NOT appear anywhere in the binary stream
+        // (cross-protocol MessageStart identity strip). Bedrock's messageStart carries no id anyway,
+        // so this also guards against a regression that would leak it.
+        assert!(
+            !raw.windows(b"msg_backend".len())
+                .any(|w| w == b"msg_backend"),
+            "foreign backend stream id must be stripped on cross-protocol ingress"
+        );
     }
 
     /// Decoder also works when the binary frames arrive split across feed() calls (partial frame
