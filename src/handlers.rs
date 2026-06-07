@@ -55,7 +55,10 @@ pub(crate) async fn stats(State(app): State<Arc<App>>) -> Response {
 
 pub(crate) async fn healthz(State(app): State<Arc<App>>) -> Response {
     let t = now();
-    if (0..app.lanes.len()).any(|i| app.store.usable(i, t)) {
+    // Side-effect-FREE readiness check: `/healthz` is unauthenticated and high-frequency (k8s
+    // liveness, load balancers), so it must NOT transition expired-Open lanes to HalfOpen or steal
+    // the single-flight recovery probe from organic traffic — use `is_ready`, not `usable`.
+    if (0..app.lanes.len()).any(|i| app.store.is_ready(i, t)) {
         (StatusCode::OK, "ok").into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "no usable lanes").into_response()

@@ -30,6 +30,7 @@ impl ProtocolReader for CohereReader {
             http_status: status.as_u16(),
             provider_code,
             structured_type,
+            retry_after_secs: None,
         }
     }
 

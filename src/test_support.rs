@@ -30,6 +30,8 @@ pub(crate) enum MockResponse {
     RateLimit {
         status: StatusCode,
         provider_signal: Option<&'static str>,
+        /// When set, the mock emits a `Retry-After: <n>` response header (whole seconds).
+        retry_after: Option<u64>,
     },
     Billing {
         status: StatusCode,
@@ -169,6 +171,7 @@ async fn mock_handler(
         MockResponse::RateLimit {
             status,
             provider_signal,
+            retry_after,
         } => {
             let msg = if provider_signal == Some("1302") {
                 "rate_limit"
@@ -176,11 +179,13 @@ async fn mock_handler(
                 "Rate limit exceeded"
             };
             let body = serde_json::json!({ "error": { "message": msg, "code": provider_signal.unwrap_or("429") } });
-            Response::builder()
+            let mut rb = Response::builder()
                 .status(status)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap()
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(ra) = retry_after {
+                rb = rb.header(header::RETRY_AFTER, ra.to_string());
+            }
+            rb.body(Body::from(body.to_string())).unwrap()
         }
         MockResponse::Billing {
             status,
@@ -556,6 +561,7 @@ mod tests {
         state.push(MockResponse::RateLimit {
             status: StatusCode::TOO_MANY_REQUESTS,
             provider_signal: Some("1302"),
+            retry_after: None,
         });
         let server = MockServer::new(state).await;
         let res = Client::new()
@@ -2014,28 +2020,33 @@ mod tests {
             },
             "usage": {
                 "input_tokens": 10,
-                "output_tokens": 5,
-                "cache_creation_input_tokens": 2,
-                "cache_read_input_tokens": 3
+                "output_tokens": 5
             }
         });
         let delta_str = serde_json::to_string(&delta_json).unwrap();
         tap.feed(&Bytes::from(delta_str));
 
-        // Assert: all four usage fields extracted correctly
+        // Assert: input/output token fields extracted correctly. A clean message_delta (normal
+        // stop_reason, no error frame) must NOT set terminal_error — that's the signal the
+        // stream-end arm uses to distinguish a clean close from an aborted one.
         assert_eq!(tap.input_tokens, Some(10), "input_tokens should be 10");
         assert_eq!(tap.output_tokens, Some(5), "output_tokens should be 5");
-        assert_eq!(
-            tap.cache_creation_input_tokens,
-            Some(2),
-            "cache_creation_input_tokens should be 2"
-        );
-        assert_eq!(
-            tap.cache_read_input_tokens,
-            Some(3),
-            "cache_read_input_tokens should be 3"
+        assert!(
+            tap.terminal_error.is_none(),
+            "a clean stream (no error frame) must leave terminal_error None"
         );
         assert!(tap.has_usage(), "tap should have usage data");
+
+        // A genuine SSE error frame DOES set terminal_error (the abnormal-end signal).
+        let mut err_tap = UsageTap::new();
+        err_tap.feed(&Bytes::from(
+            r#"{"type":"error","error":{"message":"boom","source":"upstream"}}"#,
+        ));
+        assert_eq!(
+            err_tap.terminal_error.as_deref(),
+            Some("boom"),
+            "an SSE error frame must populate terminal_error"
+        );
 
         // Test 2: message_stop as fallback (when delta missing)
         let mut tap2 = UsageTap::new();
@@ -2185,6 +2196,7 @@ mod tests {
                 http_status: 402,
                 provider_code: Some("1113".to_string()),
                 structured_type: None,
+                retry_after_secs: None,
             };
             let sig = normalize_raw_error(&raw, &error_map);
             assert_eq!(sig.class, crate::breaker::StatusClass::Billing);
@@ -2194,6 +2206,7 @@ mod tests {
                 http_status: 500,
                 provider_code: Some("9999".to_string()),
                 structured_type: None,
+                retry_after_secs: None,
             };
             let sig2 = normalize_raw_error(&raw2, &error_map);
             assert_eq!(sig2.class, crate::breaker::StatusClass::ServerError);
@@ -2208,6 +2221,7 @@ mod tests {
                 http_status: 401,
                 provider_code: None,
                 structured_type: None,
+                retry_after_secs: None,
             };
             let sig = normalize_raw_error(&raw, &error_map);
             assert_eq!(sig.class, crate::breaker::StatusClass::Auth);
@@ -2217,6 +2231,7 @@ mod tests {
                 http_status: 429,
                 provider_code: None,
                 structured_type: None,
+                retry_after_secs: None,
             };
             let sig2 = normalize_raw_error(&raw2, &error_map);
             assert_eq!(sig2.class, crate::breaker::StatusClass::RateLimit);
@@ -2226,6 +2241,7 @@ mod tests {
                 http_status: 500,
                 provider_code: None,
                 structured_type: None,
+                retry_after_secs: None,
             };
             let sig3 = normalize_raw_error(&raw3, &error_map);
             assert_eq!(sig3.class, crate::breaker::StatusClass::ServerError);
@@ -2235,6 +2251,7 @@ mod tests {
                 http_status: 400,
                 provider_code: None,
                 structured_type: None,
+                retry_after_secs: None,
             };
             let sig4 = normalize_raw_error(&raw4, &error_map);
             assert_eq!(sig4.class, crate::breaker::StatusClass::ClientError);
@@ -2359,6 +2376,7 @@ mod tests {
             state.push(MockResponse::RateLimit {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 provider_signal: Some("1302"),
+                retry_after: None,
             });
 
             let server = MockServer::new(state.clone()).await;
@@ -2411,6 +2429,7 @@ mod tests {
             state.push(MockResponse::RateLimit {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 provider_signal: None, // No known code in error_map
+                retry_after: None,
             });
 
             let server = MockServer::new(state.clone()).await;
@@ -2537,7 +2556,7 @@ mod tests {
                 .build();
 
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
-            let _response = forward(
+            let response = forward(
                 app.clone(),
                 vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
                 req_body.into(),
@@ -2563,6 +2582,18 @@ mod tests {
                     "dead reason should mention auth"
                 );
             }
+
+            // The non-passthrough auth-error response must NOT leak the upstream's verbatim
+            // auth-rejection body (busbar's own credential context). It returns a normalized
+            // envelope instead.
+            assert_eq!(response.status().as_u16(), 401);
+            use http_body_util::BodyExt as _;
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            assert_eq!(
+                v["error"]["type"], "upstream_auth_error",
+                "non-passthrough auth error must be a normalized busbar envelope, not the raw upstream body"
+            );
 
             server.shutdown().await;
         }
@@ -2804,6 +2835,7 @@ mod tests {
                 http_status: 402,
                 provider_code: Some("1113".to_string()),
                 structured_type: None,
+                retry_after_secs: None,
             };
 
             // With WRONG mapping, code 1113 → rate_limit (wrong!)
@@ -2963,6 +2995,7 @@ mod tests {
             state.push(MockResponse::RateLimit {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 provider_signal: Some("1302"),
+                retry_after: None,
             });
         }
 
@@ -5367,6 +5400,184 @@ mod tests {
             );
         }
 
+        server.shutdown().await;
+    }
+
+    /// Regression (CRITICAL): a CLEAN SSE stream end records SUCCESS, not a failure. Serving several
+    /// back-to-back successful streams must NOT trip the lane's breaker — the old `Poll::Ready(None)`
+    /// arm recorded a spurious failure on every completed stream, tripping healthy streaming lanes.
+    #[tokio::test]
+    async fn test_clean_sse_end_records_success_not_failure() {
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+
+        // Push several clean SSE responses (each ends normally with message_stop + [DONE]).
+        const STREAMS: usize = 8;
+        for _ in 0..STREAMS {
+            state.push(MockResponse::Sse {
+                events: vec![
+                    r#"{"type":"message_start"}"#.to_string(),
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#.to_string(),
+                    r#"{"type":"message_delta","usage":{"input_tokens":3,"output_tokens":2}}"#.to_string(),
+                    r#"{"type":"message_stop"}"#.to_string(),
+                ],
+                abort_at_index: None,
+            });
+        }
+        let server = MockServer::new(state.clone()).await;
+
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "test-model",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            ))
+            .pool("default", &[(0, 1)])
+            .build();
+
+        use http_body_util::BodyExt as _;
+        for _ in 0..STREAMS {
+            let req_body = serde_json::to_vec(&json!({"model": "test-model", "stream": true, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50})).unwrap();
+            let resp = forward(
+                app.clone(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                req_body.into(),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(resp.status().as_u16(), 200);
+            // Fully drain the stream so FirstByteBody reaches Poll::Ready(None).
+            let _ = resp.into_body().collect().await.unwrap().to_bytes();
+        }
+
+        let t = now();
+        let snap = app.store.snapshot(0, t);
+        assert_eq!(
+            snap.err, 0,
+            "clean SSE stream ends must NOT record breaker failures (got err={})",
+            snap.err
+        );
+        assert_eq!(
+            snap.ok, STREAMS as u64,
+            "each clean stream must record exactly one success"
+        );
+        assert!(
+            app.store.usable(0, t),
+            "the lane must remain usable after {STREAMS} successful streams (not tripped)"
+        );
+        server.shutdown().await;
+    }
+
+    /// Regression (HIGH): an upstream 429 with `Retry-After: N` flowing through forward() must set a
+    /// cooldown floor of at least N seconds on the lane. Exercises the end-to-end extraction path
+    /// (header parsed in forward → RawUpstreamError.retry_after_secs → CanonicalSignal.retry_after →
+    /// store cooldown floor) that no test previously covered — the header was silently dropped.
+    #[tokio::test]
+    async fn test_429_retry_after_header_sets_cooldown_floor() {
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // Single lane; a 429 with Retry-After: 45. streak=0 → computed backoff is the base (15s),
+        // so a floor of 45 must dominate, proving the header was honored end-to-end.
+        state.push(MockResponse::RateLimit {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            provider_signal: None,
+            retry_after: Some(45),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "test-model",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            ))
+            .pool("default", &[(0, 1)])
+            .build();
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50})).unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+            "default",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+        // Only lane was rate-limited → 503 exhaustion.
+        assert_eq!(resp.status().as_u16(), 503);
+
+        let t = now();
+        let remaining = app.store.cooldown_remaining_in("default", 0, t);
+        assert!(
+            remaining >= 45,
+            "the upstream Retry-After: 45 must set a cooldown floor of >= 45s (got {remaining}s)"
+        );
+        server.shutdown().await;
+    }
+
+    /// Regression (HIGH): when a lane's concurrency permits are saturated, pick_among (inside
+    /// forward) must NOT spin forever — once the request deadline passes it must give up and the
+    /// request must resolve (503), bounded by the failover deadline. Previously the permit-wait was
+    /// an unbounded 1ms spin-loop with no deadline check (a head-of-line-blocking DoS surface).
+    #[tokio::test]
+    async fn test_saturated_lane_respects_deadline_no_infinite_spin() {
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        let server = MockServer::new(state.clone()).await;
+
+        // Single lane, max_concurrent = 1. Hold its only permit for the whole test so pick_among
+        // can never acquire one.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "busy-model",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .max(1),
+            )
+            .pool("default", &[(0, 1)])
+            // 1s failover deadline so the test is fast but still exercises the bounded wait.
+            .failover(crate::config::FailoverCfg {
+                deadline_secs: 1,
+                cap: 0,
+                exclusions: None,
+            })
+            .build();
+
+        // Take the lane's only permit and hold it.
+        let held = app.store.try_acquire(0).expect("first permit acquires");
+
+        let req_body = serde_json::to_vec(&json!({"model": "busy-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50})).unwrap();
+        let started = std::time::Instant::now();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+            "default",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        // Must give up (not hang) once the deadline passes — bounded by a few seconds, not forever.
+        assert_eq!(
+            resp.status().as_u16(),
+            503,
+            "a saturated lane past its deadline must 503, not spin forever"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "pick_among must honor the deadline and not block indefinitely (took {elapsed:?})"
+        );
+        drop(held);
         server.shutdown().await;
     }
 }

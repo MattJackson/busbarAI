@@ -131,7 +131,13 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
             tracing::info!(lane = %lane.model, "lane recovered via health probe");
         }
     } else {
+        // A failed probe must trip the SAME cells a successful probe (recover_lane) clears — the
+        // default cell AND every per-pool cell — because organic traffic routes against per-pool
+        // cells. Recording only the default cell (the previous behavior) meant `active` probing
+        // could never trip the per-pool breakers real traffic is selected against, so a silently
+        // dead upstream stayed Closed for named pools. (The single default BreakerCfg is used for
+        // all cells; per-pool trip-threshold nuance is a known limitation of the out-of-band prober.)
         app.store
-            .record_transient(i, "health-probe", &BreakerCfg::default(), None);
+            .record_probe_failure_all_cells(i, "health-probe", &BreakerCfg::default());
     }
 }

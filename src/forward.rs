@@ -43,11 +43,11 @@ pub(crate) struct UsageTap {
     pub input_tokens: Option<u64>,
     /// Extracted output tokens (from message_delta.usage.output_tokens or message_stop.usage.output_tokens)
     pub output_tokens: Option<u64>,
-    /// Extracted cache_creation_input_tokens if present in usage object
-    pub cache_creation_input_tokens: Option<u64>,
-    /// Extracted cache_read_input_tokens if present in usage object
-    pub cache_read_input_tokens: Option<u64>,
-    /// Terminal error frame captured from message_delta or message_stop
+    /// A genuine terminal ERROR frame seen mid-stream (an SSE `{"type":"error", ...}` event). This
+    /// is the signal that gates breaker failure recording at stream end: a clean stream ends with a
+    /// normal terminator (`message_stop` / `[DONE]`) and leaves this `None` (→ success, already
+    /// recorded synchronously), whereas a stream that carried an explicit error frame ended
+    /// abnormally (→ record one breaker failure). Holds the error message for observability.
     pub terminal_error: Option<String>,
 }
 
@@ -70,6 +70,7 @@ impl UsageTap {
                         self.extract_usage_from_delta(&obj);
                         self.extract_usage_from_stop(&obj);
                         self.extract_usage_any(&obj);
+                        self.extract_terminal_error(&obj);
                     }
                     pos = start + end;
                 } else {
@@ -86,28 +87,12 @@ impl UsageTap {
         if obj.get("type").and_then(|t| t.as_str()) != Some("message_delta") {
             return;
         }
-        let usage = obj.get("usage");
-        if let Some(u) = usage {
+        if let Some(u) = obj.get("usage") {
             if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
                 self.input_tokens = Some(v);
             }
             if let Some(v) = u.get("output_tokens").and_then(|v| v.as_u64()) {
                 self.output_tokens = Some(v);
-            }
-            if let Some(v) = u
-                .get("cache_creation_input_tokens")
-                .and_then(|v| v.as_u64())
-            {
-                self.cache_creation_input_tokens = Some(v);
-            }
-            if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
-                self.cache_read_input_tokens = Some(v);
-            }
-        }
-        // Capture terminal error from message_delta.reason if present
-        if let Some(reason) = obj.get("delta").and_then(|d| d.get("stop_reason")) {
-            if reason.is_string() || reason.is_null() {
-                self.terminal_error = reason.as_str().map(String::from);
             }
         }
     }
@@ -117,24 +102,29 @@ impl UsageTap {
         if obj.get("type").and_then(|t| t.as_str()) != Some("message_stop") {
             return;
         }
-        let usage = obj.get("usage");
-        if let Some(u) = usage {
+        if let Some(u) = obj.get("usage") {
             if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
                 self.input_tokens = Some(v);
             }
             if let Some(v) = u.get("output_tokens").and_then(|v| v.as_u64()) {
                 self.output_tokens = Some(v);
             }
-            if let Some(v) = u
-                .get("cache_creation_input_tokens")
-                .and_then(|v| v.as_u64())
-            {
-                self.cache_creation_input_tokens = Some(v);
-            }
-            if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
-                self.cache_read_input_tokens = Some(v);
-            }
         }
+    }
+
+    /// Detect a genuine terminal ERROR frame: an SSE event object of the form
+    /// `{"type":"error", "error": {...}}`. Sets `terminal_error` to the error message (or a generic
+    /// marker) so stream-end failure recording can distinguish a clean close from an aborted one.
+    fn extract_terminal_error(&mut self, obj: &Value) {
+        if obj.get("type").and_then(|t| t.as_str()) != Some("error") {
+            return;
+        }
+        let msg = obj
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("upstream stream error");
+        self.terminal_error = Some(msg.to_string());
     }
 
     /// Protocol-agnostic usage extraction: recognizes the `usage` / `usageMetadata` shapes across
@@ -345,6 +335,12 @@ where
                                 None,
                             );
                         }
+                        // Mark the stream ended so the subsequent `Poll::Ready(None)` arm returns
+                        // early instead of re-recording this same failure (the inner stream closes
+                        // with `None` right after the error). Without this, one mid-stream transport
+                        // failure double-counted against the breaker.
+                        drop(this.permit.take());
+                        this.ended = true;
                         let err_json = serde_json::json!({
                             "type": "error",
                             "error": {
@@ -360,13 +356,21 @@ where
                     }
                 }
                 Poll::Ready(None) => {
-                    // Stream ended - for SSE streams that sent at least one byte, record the failure
+                    // Stream ended. A clean `Poll::Ready(None)` is the NORMAL termination for both
+                    // clean and truncated streams and is NOT a failure — success was already
+                    // recorded synchronously (record_success_in) before streaming began. Only record
+                    // a breaker failure here if the tap actually saw a terminal ERROR frame
+                    // (`{"type":"error", ...}`) mid-stream. Previously this arm recorded a failure on
+                    // EVERY completed SSE stream, so healthy streaming lanes tripped after a handful
+                    // of successful requests.
                     if this.is_sse && this.first_byte_sent.load(Ordering::Relaxed) {
-                        if let Some(ref app) = this.app {
+                        if let (Some(app), Some(_err)) =
+                            (this.app.as_ref(), this.tap.terminal_error.as_ref())
+                        {
                             app.store.record_transient_in(
                                 &this.pool,
                                 this.lane_idx,
-                                "mid-stream-end",
+                                "stream-terminal-error",
                                 &this.breaker_cfg,
                                 None,
                             );
@@ -494,33 +498,76 @@ async fn pick_among(
         }
     }
 
-    // Filter out already-tried lanes (accumulated exclusions across hops)
-    let filtered_cands = request_ctx.filter_candidates(cands);
+    // Filter out already-tried lanes (accumulated exclusions across hops). A locally-tracked
+    // exclusion set lets us skip a lane we selected but couldn't probe-acquire (HalfOpen race),
+    // without mutating the caller's RequestCtx for what is a within-pick retry.
+    let mut local_excluded: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    if filtered_cands.is_empty() {
-        return None;
-    }
-
-    // Extract lane indices and weights for select_weighted call
-    let candidates: Vec<usize> = filtered_cands.iter().map(|wl| wl.idx).collect();
-    let weights: Vec<u32> = filtered_cands.iter().map(|wl| wl.weight).collect();
-
-    // Use SWRR selection over healthy members only (per this pool's breaker cells)
-    let picked_lane_idx = app
-        .store
-        .select_weighted_in(pool_name, &candidates, &weights, t)?;
-
-    // Try to acquire the selected lane immediately
-    if let Some(p) = app.store.try_acquire(picked_lane_idx) {
-        return Some((picked_lane_idx, p));
-    }
-
-    // If acquisition fails, await until first free (concurrency-aware fallback)
     loop {
+        // Deadline guard: never spin or re-select past the request deadline.
+        if request_ctx.expired(now()) {
+            return None;
+        }
+
+        let filtered_cands: Vec<&WeightedLane> = request_ctx
+            .filter_candidates(cands)
+            .into_iter()
+            .filter(|wl| !local_excluded.contains(&wl.idx))
+            .collect();
+        if filtered_cands.is_empty() {
+            return None;
+        }
+
+        // Extract lane indices and weights for select_weighted call
+        let candidates: Vec<usize> = filtered_cands.iter().map(|wl| wl.idx).collect();
+        let weights: Vec<u32> = filtered_cands.iter().map(|wl| wl.weight).collect();
+
+        // SWRR selection (side-effect-free filter) over healthy members only, per this pool's cells.
+        let picked_lane_idx =
+            match app
+                .store
+                .select_weighted_in(pool_name, &candidates, &weights, now())
+            {
+                Some(i) => i,
+                None => return None,
+            };
+
+        // The dispatched lane does the breaker probe acquisition exactly once here (Open→HalfOpen
+        // CAS). If it lost the single-flight probe race, drop it locally and re-select another lane.
+        if !app
+            .store
+            .acquire_for_dispatch_in(pool_name, picked_lane_idx, now())
+        {
+            local_excluded.insert(picked_lane_idx);
+            continue;
+        }
+
+        // Try to acquire the concurrency permit immediately.
         if let Some(p) = app.store.try_acquire(picked_lane_idx) {
             return Some((picked_lane_idx, p));
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+
+        // Permits saturated: park (not busy-spin) until a slot frees OR the deadline passes. A
+        // bounded `timeout` acquire yields the task efficiently and guarantees we never block past
+        // the request deadline (unbounded spinning here was a head-of-line-blocking DoS surface).
+        let remaining = request_ctx.remaining(now());
+        if remaining == 0 {
+            return None;
+        }
+        let sem = app.store.lane_semaphore(picked_lane_idx);
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(remaining),
+            sem.acquire_owned(),
+        )
+        .await
+        {
+            // Got a permit before the deadline.
+            Ok(Ok(permit)) => return Some((picked_lane_idx, Permit::new(permit))),
+            // Semaphore closed (shutdown) — treat as no lane available.
+            Ok(Err(_)) => return None,
+            // Deadline hit while waiting for a permit — give up so the caller can 503/failover.
+            Err(_) => return None,
+        }
     }
 }
 
@@ -842,8 +889,16 @@ pub(crate) async fn forward_with_pool(
                     let is_passthrough_40x = auth_mode == crate::auth::AuthMode::Passthrough
                         && (status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN);
 
-                    // Clone headers before consuming r with bytes()
+                    // Clone headers before consuming r with bytes(). The upstream `Retry-After`
+                    // header (whole seconds) must be captured here — the per-protocol
+                    // `extract_error` only sees the body, so the cooldown floor would otherwise be
+                    // silently dropped on a 429 carrying an explicit retry hint.
                     let ct = r.headers().get(CONTENT_TYPE).cloned();
+                    let retry_after_secs = r
+                        .headers()
+                        .get(axum::http::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.trim().parse::<u64>().ok());
                     let bytes = r.bytes().await.unwrap_or_default();
 
                     if is_passthrough_40x {
@@ -859,7 +914,11 @@ pub(crate) async fn forward_with_pool(
                     // Two-stage pipeline: Stage 1a (proto.extract_error) → RawUpstreamError
                     //                     Stage 1b (normalize_raw_error + error_map) → CanonicalSignal
                     //                     Stage 2 (breaker::classify_disposition) → Disposition
-                    let raw = app.lanes[i].protocol.reader().extract_error(status, &bytes);
+                    let mut raw = app.lanes[i].protocol.reader().extract_error(status, &bytes);
+                    // Inject the Retry-After header (which the body-only extract_error can't see) so
+                    // normalize_raw_error propagates it into CanonicalSignal.retry_after and the
+                    // store honors it as a cooldown floor.
+                    raw.retry_after_secs = retry_after_secs;
                     let sig = normalize_raw_error(&raw, &app.lanes[i].error_map);
                     let disposition = classify_disposition(&sig);
 
@@ -964,14 +1023,25 @@ pub(crate) async fn forward_with_pool(
                             .increment(1);
                             drop(permit);
 
-                            // For auth failures: return error to caller
+                            // For auth failures: return error to caller. In NON-passthrough mode the
+                            // rejected credential is busbar's OWN configured lane key, so the
+                            // upstream's auth-rejection body is busbar-internal context (account
+                            // ids, internal request ids, key hints) — do NOT leak it to an external
+                            // caller. Return a normalized envelope instead. (Passthrough 401/403 is
+                            // the caller's own key and is relayed verbatim earlier, before this.)
                             if matches!(sig.class, StatusClass::Auth) {
                                 use axum::body::Body;
-                                let mut rb = Response::builder().status(status);
-                                if let Some(ct) = ct {
-                                    rb = rb.header(CONTENT_TYPE, ct);
-                                }
-                                return rb.body(Body::from(bytes)).unwrap();
+                                let envelope = serde_json::json!({
+                                    "error": {
+                                        "type": "upstream_auth_error",
+                                        "message": "upstream rejected the lane credential",
+                                    }
+                                });
+                                return Response::builder()
+                                    .status(status)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Body::from(envelope.to_string()))
+                                    .unwrap();
                             }
 
                             // For billing hard downs: continue to next lane (failover)

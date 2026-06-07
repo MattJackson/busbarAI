@@ -92,6 +92,11 @@ pub(crate) struct RawUpstreamError {
     /// Provider-specific structured error *type* (e.g. a `type`/`error.type` string), checked
     /// against `error_map` as a second signal when the code doesn't match.
     pub structured_type: Option<String>,
+    /// Upstream `Retry-After` header value in whole seconds, when present. The per-protocol
+    /// `extract_error` methods only see the body (no headers), so the forwarding layer — which has
+    /// the response headers — parses and sets this after `extract_error` returns. `normalize_raw_error`
+    /// then propagates it into `CanonicalSignal.retry_after` so the cooldown floor is honored.
+    pub retry_after_secs: Option<u64>,
 }
 
 /// Classify a raw upstream error into a canonical signal using an error_map.
@@ -107,7 +112,7 @@ pub(crate) fn normalize_raw_error(
                 return CanonicalSignal {
                     class,
                     provider_signal: Some(code.clone()),
-                    retry_after: None,
+                    retry_after: raw.retry_after_secs,
                 };
             }
         }
@@ -118,7 +123,7 @@ pub(crate) fn normalize_raw_error(
             return CanonicalSignal {
                 class: StatusClass::ContextLength,
                 provider_signal: Some(code.clone()),
-                retry_after: None,
+                retry_after: raw.retry_after_secs,
             };
         }
         // Code not in map or invalid mapping — fall through to HTTP classification
@@ -135,7 +140,7 @@ pub(crate) fn normalize_raw_error(
             return CanonicalSignal {
                 class,
                 provider_signal: provider_signal.or_else(|| Some(ty.clone())),
-                retry_after: None,
+                retry_after: raw.retry_after_secs,
             };
         }
     }
@@ -153,16 +158,21 @@ pub(crate) fn normalize_raw_error(
     } else if (500..600).contains(&http_status) {
         StatusClass::ServerError
     } else if (400..500).contains(&http_status) {
+        // True 4xx (other than the 401/403/408/429 handled above) — caller's fault.
         StatusClass::ClientError
     } else {
-        // Default for non-error cases (2xx, 3xx) — safe default that won't trip breaker
+        // Unexpected non-error status (2xx/3xx) reaching the error path — e.g. a misconfigured
+        // base_url issuing redirects the client didn't follow. The LANE is not at fault, so we do
+        // NOT penalize the breaker; classifying as ClientError → ClientFault relays it verbatim and
+        // records nothing. (A 3xx is genuinely not a client error, but ClientFault is the closest
+        // "record nothing, relay as-is" disposition; revisit if a benign/Unknown class is added.)
         StatusClass::ClientError
     };
 
     CanonicalSignal {
         class,
         provider_signal,
-        retry_after: None,
+        retry_after: raw.retry_after_secs,
     }
 }
 
@@ -194,6 +204,7 @@ mod tests {
             http_status: 400, // would otherwise classify as ClientError
             provider_code: None,
             structured_type: Some("model_overloaded".to_string()),
+            retry_after_secs: None,
         };
         let map = err_map(&[("model_overloaded", "overloaded")]);
         let sig = normalize_raw_error(&raw, &map);
@@ -207,6 +218,7 @@ mod tests {
             http_status: 500,
             provider_code: Some("1302".to_string()),
             structured_type: Some("server_error".to_string()),
+            retry_after_secs: None,
         };
         // Both mapped; the explicit code takes precedence.
         let map = err_map(&[("1302", "rate_limit"), ("server_error", "server_error")]);
@@ -220,6 +232,7 @@ mod tests {
             http_status: 429,
             provider_code: None,
             structured_type: Some("something_unmapped".to_string()),
+            retry_after_secs: None,
         };
         let sig = normalize_raw_error(&raw, &HashMap::new());
         assert_eq!(sig.class, StatusClass::RateLimit); // from HTTP 429

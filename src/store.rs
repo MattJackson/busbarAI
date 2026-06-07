@@ -32,29 +32,36 @@ pub(crate) fn now() -> u64 {
         .as_secs()
 }
 
-/// Test helper to inject time for unit tests.
+// Test-clock storage, THREAD-LOCAL.
+//
+// CRITICAL #1: these must NOT be function-local statics. A `static` declared inside a function body
+// is scoped to that function, so `set_now_for_test` and `now_for_test` each declaring their own
+// identically-named locals got INDEPENDENT storage — the injected time was never observed by
+// `now_for_test` and every breaker timing test silently ran against the real wall clock.
+//
+// CRITICAL #2: they must be THREAD-LOCAL, not module-level statics. `cargo test` runs tests in
+// parallel threads sharing one process; a single global clock means a unit test that froze time
+// (e.g. set_now_for_test(1000)) would poison the clock for a concurrently-running forward
+// integration test that records breaker cooldowns against the real wall clock. Per-thread storage
+// isolates each test's injected time to its own thread while leaving real-time tests on real time.
+#[cfg(test)]
+thread_local! {
+    static TEST_NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test helper to inject time for unit tests (this thread only).
 #[cfg(test)]
 pub(crate) fn set_now_for_test(t: u64) {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    static TEST_NOW: AtomicU64 = AtomicU64::new(0);
-    static IN_TEST: AtomicBool = AtomicBool::new(false);
-
-    // Use SeqCst to ensure visibility across parallel test threads
-    TEST_NOW.store(t, Ordering::SeqCst);
-    IN_TEST.store(true, Ordering::Release);
+    TEST_NOW.with(|c| c.set(t));
+    IN_TEST.with(|c| c.set(true));
 }
 
 #[cfg(test)]
 pub(crate) fn now_for_test() -> u64 {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    static TEST_NOW: AtomicU64 = AtomicU64::new(0);
-    static IN_TEST: AtomicBool = AtomicBool::new(false);
-
-    let val = TEST_NOW.load(Ordering::Acquire);
-    // If test time is set and in_test flag is true, use it; otherwise fall back to real time
-    if IN_TEST.load(Ordering::Acquire) && val != 0 {
+    let val = TEST_NOW.with(|c| c.get());
+    // If test time is set on this thread, use it; otherwise fall back to real time.
+    if IN_TEST.with(|c| c.get()) && val != 0 {
         val
     } else {
         now()
@@ -114,6 +121,15 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     // budget) are identical across both — only the breaker FSM is isolated.
     fn usable(&self, lane: usize, now: u64) -> bool;
     fn usable_in(&self, pool: &str, lane: usize, now: u64) -> bool;
+    /// Side-effect-FREE readiness check: would this lane admit a request right now, WITHOUT
+    /// transitioning an expired-Open lane to HalfOpen or CAS-acquiring its single-flight probe.
+    /// `/healthz` and any non-dispatching observer must use this so they don't steal recovery
+    /// probes from organic traffic. The bare-lane (pool `""`) form covers the default cell.
+    fn is_ready(&self, lane: usize, now: u64) -> bool;
+    /// Mutating admission for a lane selection is about to DISPATCH to: performs the Open→HalfOpen
+    /// transition + single-flight probe CAS exactly once. Returns false if the probe was already
+    /// taken (lost the race) so the caller can pick another lane.
+    fn acquire_for_dispatch_in(&self, pool: &str, lane: usize, now: u64) -> bool;
     // The bare lane-default breaker mutators below are exercised by the unit tests; in release,
     // routing always goes through the `_in(pool, …)` variants, so they're unreachable there — hence
     // the not(test) dead-code allow (they remain a tested part of the lane-default API).
@@ -159,9 +175,18 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// A successful out-of-band health probe: recover the lane to Closed in EVERY cell (default and
     /// all pools), since the probe tests the shared upstream. No-op on cells already Closed.
     fn recover_lane(&self, lane: usize);
+    /// A FAILED out-of-band health probe: record a transient failure against EVERY cell for the
+    /// lane (the default cell AND every existing per-pool cell), mirroring `recover_lane`'s
+    /// all-cells iteration. The probe tests the shared upstream, and organic traffic routes against
+    /// per-pool cells, so a probe failure that only hit the default cell could never trip the
+    /// per-pool breakers real traffic is selected against. `cfg` drives the trip/cooldown decision.
+    fn record_probe_failure_all_cells(&self, lane: usize, what: &str, cfg: &BreakerCfg);
 
     // concurrency + budget — lane-global (shared across every pool fronting the lane).
     fn try_acquire(&self, lane: usize) -> Option<Permit>;
+    /// The lane's concurrency semaphore, for a bounded async (`timeout`) acquire on the dispatch
+    /// path — the task parks instead of busy-spinning when permits are saturated.
+    fn lane_semaphore(&self, lane: usize) -> Arc<Semaphore>;
     fn spend_budget(&self, lane: usize) -> bool; // false => exhausted
 
     // weighted member selection (SWRR algorithm)
@@ -468,11 +493,20 @@ impl InMemoryStore {
     ) -> u64 {
         let streak = c.streak().load(Ordering::Relaxed);
 
-        // Compute base cooldown from exponential backoff
-        let mut duration = cfg.base_cooldown_secs;
-        for _ in 1..=streak {
-            duration = (duration * 2).min(cfg.max_cooldown_secs);
-        }
+        // Exponential backoff capped at max_cooldown_secs, computed in O(1) (NOT an O(streak) loop —
+        // on a long-running hard-failing lane the streak grows unboundedly and this runs on every
+        // failure record, exactly when failure volume is highest). `base * 2^streak` saturates at
+        // max after a handful of doublings, so clamp the shift exponent to 63 (a u64 shift of >=64
+        // is UB / panics) and saturate the multiply before taking the min.
+        let mut duration = if streak == 0 {
+            cfg.base_cooldown_secs
+        } else {
+            let shift = streak.min(63);
+            cfg.base_cooldown_secs
+                .checked_shl(shift)
+                .unwrap_or(u64::MAX)
+                .min(cfg.max_cooldown_secs)
+        };
 
         // Add bounded jitter ±10% only if streak > 0
         if streak > 0 {
@@ -502,11 +536,15 @@ impl InMemoryStore {
             );
         }
 
-        // Honor Retry-After as cooldown floor if present and configured
+        // Honor Retry-After as cooldown floor if present and configured. Exhaustive on the bool —
+        // no `_` wildcard (breaker-match hard rule). When honoring, the server's explicit
+        // Retry-After is a FLOOR (max with the computed backoff), always respected even past the
+        // cap; when NOT honoring, the server value is ignored entirely and the computed backoff
+        // stands (returning `ra` verbatim there could SHORTEN the cooldown below the backoff floor).
         match (cfg.honor_retry_after, retry_after) {
-            (true, Some(ra)) => duration.max(ra), // Server's explicit Retry-After always respected
-            (_, Some(ra)) => ra,                  // If not honoring, still use server value
-            _ => duration,
+            (true, Some(ra)) => duration.max(ra),
+            (false, Some(_)) => duration,
+            (true, None) | (false, None) => duration,
         }
     }
 
@@ -522,6 +560,11 @@ impl InMemoryStore {
         c.cooldown_until()
             .store(now_time + duration, Ordering::Release);
         c.breaker_state().store(ST_OPEN, Ordering::Release);
+        // Opening releases the single-flight probe back to Open. A failed half-open probe routes
+        // here (ST_HALF_OPEN → cell_open); without this reset the flag stayed `true` forever, so the
+        // next cooldown expiry transitioned the cell to HalfOpen but no request could ever win the
+        // probe CAS — the lane was benched permanently. Clearing it lets the next cooldown re-probe.
+        c.probe_in_flight().store(false, Ordering::Release);
     }
 
     /// Transition the cell to Closed (full recovery): reset streak/err/window, clear the cooldown
@@ -535,9 +578,28 @@ impl InMemoryStore {
         c.probe_in_flight().store(false, Ordering::Release);
     }
 
-    /// The breaker portion of `usable`: Closed honors any pending cooldown; Open transitions to
-    /// HalfOpen on expiry and admits exactly one probe (CAS); HalfOpen admits nobody else.
-    fn cell_usable_breaker(c: &dyn BreakerCellAccess, now: u64) -> bool {
+    /// Side-effect-FREE readiness check (the breaker portion of `usable`): true if the cell would
+    /// admit a request right now, WITHOUT mutating any state. Closed honors any pending cooldown; an
+    /// Open lane whose cooldown has expired is "ready" (a probe could be admitted) but is NOT yet
+    /// transitioned here; HalfOpen admits nobody but the in-flight probe winner.
+    ///
+    /// This is the predicate used by the selection filter and by `/healthz` — neither should steal
+    /// the single-flight recovery probe. The Open→HalfOpen transition + probe CAS is performed
+    /// exactly once, on the single lane selection actually dispatches, via `cell_acquire_breaker`.
+    fn cell_ready_breaker(c: &dyn BreakerCellAccess, now: u64) -> bool {
+        match c.breaker_state().load(Ordering::Acquire) {
+            ST_CLOSED => now >= c.cooldown_until().load(Ordering::Acquire),
+            ST_OPEN => now >= c.cooldown_until().load(Ordering::Acquire),
+            ST_HALF_OPEN => false,
+            _ => unreachable!("Invalid breaker state"),
+        }
+    }
+
+    /// The mutating probe-acquisition step, run ONLY on the single lane a dispatch path actually
+    /// chose. Closed honors any pending cooldown; an expired-cooldown Open lane transitions to
+    /// HalfOpen and admits exactly one probe (CAS); HalfOpen admits nobody else. Returns true iff
+    /// this caller may proceed (Closed-and-ready, or the probe winner).
+    fn cell_acquire_breaker(c: &dyn BreakerCellAccess, now: u64) -> bool {
         match c.breaker_state().load(Ordering::Acquire) {
             ST_CLOSED => now >= c.cooldown_until().load(Ordering::Acquire),
             ST_OPEN => {
@@ -593,7 +655,14 @@ impl InMemoryStore {
                 }
             }
             ST_HALF_OPEN => Self::cell_open(c, now_time, cfg, retry_after), // probe failed → reopen
-            _ => {}
+            // Already Open: a failure while Open is an intentional no-op (the cooldown is already
+            // armed; we don't re-escalate on every failed request during a cooldown). Enumerated
+            // explicitly per the breaker-match hard rule — no `_ =>` catch-all.
+            ST_OPEN => {}
+            _ => unreachable!(
+                "invalid breaker state {}",
+                c.breaker_state().load(Ordering::Acquire)
+            ),
         }
     }
 
@@ -784,7 +853,28 @@ impl InMemoryStore {
         now()
     }
 
+    /// Mutating admission check used on the dispatch path (sticky-affinity preference + the single
+    /// lane SWRR selection returns): an expired-Open lane transitions to HalfOpen and the caller
+    /// CAS-acquires the single-flight probe. Only ever called for a lane about to receive a request.
     fn usable_for(&self, pool: &str, lane: usize, now: u64) -> bool {
+        if !self.lane_admissible(lane) {
+            return false;
+        }
+        Self::cell_acquire_breaker(self.cell(pool, lane).as_ref(), now)
+    }
+
+    /// Side-effect-FREE readiness check (lane-global gates + a non-mutating breaker peek). Used by
+    /// the selection filter and `/healthz` so neither steals the recovery probe nor wedges a lane.
+    fn ready_for(&self, pool: &str, lane: usize, now: u64) -> bool {
+        if !self.lane_admissible(lane) {
+            return false;
+        }
+        Self::cell_ready_breaker(self.cell(pool, lane).as_ref(), now)
+    }
+
+    /// Lane-global admission gates shared by both the mutating and read-only checks: a `dead` lane
+    /// (administratively down) or an exhausted budget is never admissible regardless of breaker FSM.
+    fn lane_admissible(&self, lane: usize) -> bool {
         let ls = self.get_lane(lane);
         if ls.dead.load(Ordering::Relaxed) {
             return false;
@@ -792,7 +882,7 @@ impl InMemoryStore {
         if ls.limited && ls.budget.load(Ordering::Relaxed) <= 0 {
             return false;
         }
-        Self::cell_usable_breaker(self.cell(pool, lane).as_ref(), now)
+        true
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // reached only via the test-exercised `breaker_state`
@@ -862,12 +952,20 @@ impl InMemoryStore {
         weights: &[u32],
         now: u64,
     ) -> Option<usize> {
-        // Filter to usable members and build (lane_idx, cell, effective_weight).
+        // Filter to usable members and build (lane_idx, cell, effective_weight). The filter uses
+        // the side-effect-FREE readiness check: a candidate enumeration must NOT transition lanes
+        // Open→HalfOpen or steal the single-flight probe (the dispatched lane does that once, in
+        // pick_among). We fetch the cell exactly once per candidate here (one pool_cells lock,
+        // not the two a usable+re-cell pattern took) and reuse the Arc for the readiness peek.
         let mut healthy: Vec<(usize, Arc<dyn BreakerCellAccess>, i64)> =
             Vec::with_capacity(candidates.len());
         for (&candidate, &weight) in candidates.iter().zip(weights.iter()) {
-            if self.usable_for(pool, candidate, now) {
-                healthy.push((candidate, self.cell(pool, candidate), weight as i64));
+            if !self.lane_admissible(candidate) {
+                continue;
+            }
+            let cell = self.cell(pool, candidate);
+            if Self::cell_ready_breaker(cell.as_ref(), now) {
+                healthy.push((candidate, cell, weight as i64));
             }
         }
         if healthy.is_empty() {
@@ -905,6 +1003,16 @@ impl StateStore for InMemoryStore {
     }
 
     fn usable_in(&self, pool: &str, lane: usize, now: u64) -> bool {
+        self.usable_for(pool, lane, now)
+    }
+
+    fn is_ready(&self, lane: usize, now: u64) -> bool {
+        self.ready_for("", lane, now)
+    }
+
+    fn acquire_for_dispatch_in(&self, pool: &str, lane: usize, now: u64) -> bool {
+        // Mutating: the single dispatched lane does the Open→HalfOpen + probe CAS here. Lane-global
+        // gates are re-checked (state may have changed since selection's read-only filter).
         self.usable_for(pool, lane, now)
     }
 
@@ -1006,6 +1114,24 @@ impl StateStore for InMemoryStore {
         }
     }
 
+    fn record_probe_failure_all_cells(&self, lane: usize, _what: &str, cfg: &BreakerCfg) {
+        // Administratively-dead lanes ignore failure recording (matches record_failure_for).
+        if self.get_lane(lane).dead.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = Self::now_secs();
+        // Default cell (direct/ad-hoc routes).
+        Self::cell_record_failure(self.get_lane(lane).as_ref(), now, cfg, None);
+        // Every existing per-pool cell for this lane — the cells organic traffic is selected
+        // against. (A cell not yet created inherits health lazily on first access via `cell`.)
+        let cells = self.pool_cells.lock().unwrap();
+        for ((_, l), cell) in cells.iter() {
+            if *l == lane {
+                Self::cell_record_failure(cell.as_ref(), now, cfg, None);
+            }
+        }
+    }
+
     fn lane_needs_probe(&self, lane: usize, now: u64) -> bool {
         let suppressed = |c: &dyn BreakerCellAccess| {
             c.breaker_state().load(Ordering::Acquire) != ST_CLOSED
@@ -1026,6 +1152,10 @@ impl StateStore for InMemoryStore {
             Ok(permit) => Some(Permit::new(permit)),
             Err(_) => None,
         }
+    }
+
+    fn lane_semaphore(&self, lane: usize) -> Arc<Semaphore> {
+        self.get_lane(lane).sem.clone()
     }
 
     fn spend_budget(&self, lane: usize) -> bool {
@@ -1155,15 +1285,24 @@ mod tests {
 
         set_now_for_test(1000);
 
-        // Record enough errors to trip (>= min_requests)
+        // Drive the actual record path (which evaluates should_trip) — the raw
+        // record_outcome_error_with_time helper only seeds the window and never trips. Default cfg:
+        // error-rate, min_requests=5, threshold=0.5. Five errors → 5/5 = 1.0 >= 0.5 → trip.
+        let cfg = BreakerCfg::default();
         for _ in 0..5 {
-            store.record_outcome_error_with_time(0, 1000);
+            store.record_transient(0, "5xx", &cfg, None);
         }
 
         let state = store.breaker_state(0);
-
-        // Should have tripped to Open due to err count >= 5
-        matches!(state, BreakerState::Open { .. });
+        assert!(
+            matches!(state, BreakerState::Open { .. }),
+            "error-rate breaker must trip Open once min_requests met and fraction >= threshold (got {state:?})"
+        );
+        // The tripped lane is unusable during its cooldown.
+        assert!(
+            !store.usable(0, 1000),
+            "a tripped (Open) lane must not be usable during its cooldown"
+        );
     }
 
     #[test]
@@ -1202,14 +1341,15 @@ mod tests {
             "should not be usable before cooldown"
         );
 
-        // At/after expiry: becomes HalfOpen via first call to usable()
-        let state = store.breaker_state(0);
-        matches!(state, BreakerState::HalfOpen);
-
-        // In HalfOpen, first request wins probe and is usable
+        // At/after expiry: the first call to usable() transitions Open→HalfOpen and wins the probe.
         assert!(
             store.usable(0, 2001),
             "first request in HalfOpen should win probe"
+        );
+        let state = store.breaker_state(0);
+        assert!(
+            matches!(state, BreakerState::HalfOpen),
+            "an expired-cooldown Open lane must transition to HalfOpen on admission (got {state:?})"
         );
     }
 
@@ -1314,7 +1454,10 @@ mod tests {
         );
 
         let state = store.breaker_state(0);
-        matches!(state, BreakerState::Closed);
+        assert!(
+            matches!(state, BreakerState::Closed),
+            "a successful probe must close the breaker (got {state:?})"
+        );
     }
 
     #[test]
@@ -1330,7 +1473,10 @@ mod tests {
         store.get_lane(0).breaker_state.store(2, Ordering::Relaxed);
 
         let state_before = store.breaker_state(0);
-        matches!(state_before, BreakerState::HalfOpen);
+        assert!(
+            matches!(state_before, BreakerState::HalfOpen),
+            "lane should start HalfOpen for this probe-failure scenario (got {state_before:?})"
+        );
 
         // Simulate probe failure via record_outcome_error_with_time + open_state
         store.record_outcome_error_with_time(0, 1500);
@@ -1411,16 +1557,37 @@ mod tests {
     #[test]
     fn test_consecutive_trip_mode() {
         let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(4000);
 
-        // Simulate consecutive failures by incrementing streak directly
-        for _ in 0..3 {
-            store.get_lane(0).streak.fetch_add(1, Ordering::Relaxed);
-        }
-
+        // Drive the actual record path with a Consecutive(n=3) config so should_trip genuinely
+        // fires (incrementing streak directly never evaluated the trip condition — vacuous before).
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 15,
+            max_cooldown_secs: 120,
+            honor_retry_after: true,
+            trip: TripConfig {
+                mode: TripMode::Consecutive,
+                window_s: 30,
+                threshold: 0.5,
+                min_requests: 5,
+                n: 3,
+            },
+        };
+        // Two failures: streak=2 < n=3 → still Closed.
+        store.record_transient(0, "5xx", &cfg, None);
+        store.record_transient(0, "5xx", &cfg, None);
+        assert_eq!(
+            store.breaker_state(0),
+            BreakerState::Closed,
+            "consecutive(n=3) must NOT trip before the 3rd failure"
+        );
+        // Third consecutive failure: streak=3 >= n=3 → Open.
+        store.record_transient(0, "5xx", &cfg, None);
         let state = store.breaker_state(0);
-
-        // With 3 consecutive errors (default n=3), should trip to Open
-        matches!(state, BreakerState::Open { .. });
+        assert!(
+            matches!(state, BreakerState::Open { .. }),
+            "with 3 consecutive errors (n=3) the breaker must trip Open (got {state:?})"
+        );
     }
 
     // --- configured-breaker wiring: the pool's BreakerCfg actually drives the trip decision ---
@@ -1890,14 +2057,15 @@ mod tests {
         // At time 1999: not usable (still in cooldown)
         assert!(!store.usable(0, 1999), "not usable before cooldown expires");
 
-        // At time 2500: becomes HalfOpen via first call to usable()
-        let state = store.breaker_state(0);
-        matches!(state, BreakerState::HalfOpen);
-
-        // First request in HalfOpen wins the probe and is usable
+        // At time 2500: the first usable() call transitions Open→HalfOpen and wins the probe.
         assert!(
             store.usable(0, 2500),
             "first request in HalfOpen should win probe"
+        );
+        let state = store.breaker_state(0);
+        assert!(
+            matches!(state, BreakerState::HalfOpen),
+            "an expired-cooldown Open lane must be HalfOpen after admission (got {state:?})"
         );
 
         // Second request sees unusable (probe already won by first)
@@ -2122,6 +2290,172 @@ mod tests {
         assert!(
             until >= 50060,
             "record_transient should honor retry_after as cooldown floor (got {until})"
+        );
+    }
+
+    /// When NOT honoring Retry-After, the server value is IGNORED and the computed exponential
+    /// backoff stands (returning the server value verbatim could SHORTEN the cooldown below the
+    /// backoff floor). Covers the `(false, Some(_))` branch of compute_cooldown_with_retry_after,
+    /// which was previously untested AND incorrectly returned the server value directly.
+    #[test]
+    fn test_retry_after_not_honored_ignores_server_value() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(80000);
+        store.get_lane(0).streak.store(0, Ordering::Relaxed);
+
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 15,
+            max_cooldown_secs: 120,
+            honor_retry_after: false, // do NOT honor
+            trip: TripConfig::default(),
+        };
+        // Server says Retry-After: 1, but not honoring → use computed backoff (15s for streak=0),
+        // NOT the (shorter) server value.
+        store.open_state_with_retry_after(0, 80000, &cfg, Some(1));
+        let until = store.get_lane(0).cooldown_until.load(Ordering::Relaxed);
+        assert_eq!(
+            until, 80015,
+            "honor_retry_after=false must ignore the server value and use the computed backoff"
+        );
+    }
+
+    /// Regression (CRITICAL): a FAILED half-open probe must NOT bench a lane forever. cell_open must
+    /// reset probe_in_flight; otherwise the next cooldown expiry transitions Open→HalfOpen but the
+    /// stale probe flag makes the CAS fail for every request, so no one can ever probe again.
+    #[test]
+    fn test_failed_probe_does_not_permanently_lock_lane() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        let cfg = BreakerCfg::default();
+
+        // Lane Open with an expired cooldown.
+        set_now_for_test(10_000);
+        store
+            .get_lane(0)
+            .cooldown_until
+            .store(9_000, Ordering::Relaxed);
+        store.get_lane(0).breaker_state.store(1, Ordering::Relaxed);
+
+        // First request wins the probe (Open→HalfOpen, probe acquired).
+        assert!(
+            store.usable(0, 10_000),
+            "first request wins the half-open probe"
+        );
+        assert!(
+            store.get_lane(0).probe_in_flight.load(Ordering::Relaxed),
+            "probe should be in flight"
+        );
+
+        // The probe FAILS → reopen with a fresh cooldown. The probe flag MUST be cleared here.
+        store.record_transient(0, "probe-failed", &cfg, None);
+        assert!(
+            matches!(store.breaker_state(0), BreakerState::Open { .. }),
+            "a failed probe reopens the breaker"
+        );
+        assert!(
+            !store.get_lane(0).probe_in_flight.load(Ordering::Relaxed),
+            "cell_open MUST release the probe (else the lane is locked out forever)"
+        );
+
+        // After the new cooldown expires, a request must again be able to win the probe — proving
+        // the lane is NOT permanently benched.
+        let until = store.get_lane(0).cooldown_until.load(Ordering::Relaxed);
+        set_now_for_test(until + 1);
+        assert!(
+            store.usable(0, until + 1),
+            "lane must be probeable again after the next cooldown (not locked out by a stale probe flag)"
+        );
+        assert_eq!(
+            store.breaker_state(0),
+            BreakerState::HalfOpen,
+            "the new probe re-enters HalfOpen"
+        );
+    }
+
+    /// Regression (HIGH): selection must NOT transition non-selected candidates Open→HalfOpen or
+    /// steal their single-flight probes. The filter is side-effect-free; only the one lane a caller
+    /// dispatches acquires the probe (via acquire_for_dispatch_in / usable). Here two lanes are Open
+    /// with expired cooldowns; running selection many times must leave the UNSELECTED lanes in Open
+    /// with no probe in flight.
+    #[test]
+    fn test_selection_does_not_steal_probes_from_unselected_lanes() {
+        let (lane0, w0) = make_lane_data_with_weight(0, 10);
+        let (lane1, w1) = make_lane_data_with_weight(1, 10);
+        let (lane2, w2) = make_lane_data_with_weight(2, 10);
+        let store = Arc::new(InMemoryStore::new(vec![lane0, lane1, lane2]));
+        set_now_for_test(20_000);
+
+        // All three Open with already-expired cooldowns (so all are "ready" but each would need a
+        // probe to actually dispatch).
+        for i in 0..3 {
+            store
+                .get_lane(i)
+                .cooldown_until
+                .store(19_000, Ordering::Relaxed);
+            store.get_lane(i).breaker_state.store(1, Ordering::Relaxed);
+        }
+
+        let candidates = vec![0usize, 1, 2];
+        let weights = vec![w0, w1, w2];
+
+        // Run selection many times WITHOUT dispatching (no usable()/acquire on the winner).
+        for _ in 0..50 {
+            let _ = store.select_weighted(&candidates, &weights, 20_000);
+        }
+
+        // No lane should have been transitioned to HalfOpen and no probe should be in flight —
+        // selection enumeration alone must not consume probe budget.
+        for i in 0..3 {
+            assert_eq!(
+                store.get_lane(i).breaker_state.load(Ordering::Relaxed),
+                1,
+                "lane {i} must remain Open after pure selection (no Open→HalfOpen side effect)"
+            );
+            assert!(
+                !store.get_lane(i).probe_in_flight.load(Ordering::Relaxed),
+                "lane {i} must NOT have a probe in flight from mere selection enumeration"
+            );
+        }
+
+        // And the dispatch path (usable) on a single chosen lane DOES acquire exactly one probe.
+        assert!(store.usable(0, 20_000), "dispatch on lane 0 wins its probe");
+        assert!(
+            store.get_lane(0).probe_in_flight.load(Ordering::Relaxed),
+            "the dispatched lane acquires the probe"
+        );
+        assert!(
+            !store.get_lane(1).probe_in_flight.load(Ordering::Relaxed),
+            "a non-dispatched lane still has no probe in flight"
+        );
+    }
+
+    /// `is_ready` is the side-effect-FREE readiness check `/healthz` uses: an expired-Open lane is
+    /// reported ready but is NOT transitioned to HalfOpen and its probe is NOT acquired (so healthz
+    /// polling can't steal recovery probes from organic traffic).
+    #[test]
+    fn test_is_ready_is_side_effect_free() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(30_000);
+        store
+            .get_lane(0)
+            .cooldown_until
+            .store(29_000, Ordering::Relaxed);
+        store.get_lane(0).breaker_state.store(1, Ordering::Relaxed); // Open, expired cooldown
+
+        // Many readiness probes must not mutate state.
+        for _ in 0..100 {
+            assert!(
+                store.is_ready(0, 30_000),
+                "expired-Open lane reads as ready"
+            );
+        }
+        assert_eq!(
+            store.get_lane(0).breaker_state.load(Ordering::Relaxed),
+            1,
+            "is_ready must NOT transition Open→HalfOpen"
+        );
+        assert!(
+            !store.get_lane(0).probe_in_flight.load(Ordering::Relaxed),
+            "is_ready must NOT acquire the single-flight probe"
         );
     }
 

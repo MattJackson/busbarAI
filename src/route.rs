@@ -138,10 +138,16 @@ fn finish(
         elapsed.as_millis() as u64,
     ));
 
-    // charge the flat per-request fee now; the response's token usage is charged separately at
-    // stream end via the UsageSink (token-accurate spend = per-request fee + token fee).
-    if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
-        g.record_request(key, crate::store::now(), 0);
+    // Charge the flat per-request fee only for requests that produced a usable upstream result
+    // (2xx). Router-side 503 exhaustion, upstream 5xx, and 4xx upstream errors produced nothing the
+    // caller can use, so billing the flat fee for them would over-charge keys for failures outside
+    // their control. (Token fees are likewise only charged on successful streams via UsageSink, so
+    // this keeps the flat-fee and token-fee policies consistent.)
+    let is_success = matches!(resp.status().as_u16(), 200..=299);
+    if is_success {
+        if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
+            g.record_request(key, crate::store::now(), 0);
+        }
     }
     resp
 }
