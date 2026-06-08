@@ -377,8 +377,18 @@ fn ssrf_blocked_host(url: &str) -> Option<String> {
                 || v6.is_unspecified()  // ::
                 || is_unique_local_v6(&v6)   // fc00::/7
                 || is_link_local_v6(&v6)     // fe80::/10
+                // An IPv4-mapped IPv6 literal (`[::ffff:a.b.c.d]`) reaches the same v4 target as the
+                // bare `a.b.c.d` form, so the mapped branch MUST apply the IDENTICAL block set as the
+                // direct IPv4 arm above — otherwise `https://[::ffff:100.64.0.1]/` slips past while
+                // `https://100.64.0.1/` is rejected (an SSRF credential-relay gap). Mirror every
+                // check, including the RFC 6598 CGNAT range and the explicit IMDS literal.
                 || v6.to_ipv4_mapped().is_some_and(|m| {
-                    m.is_loopback() || m.is_private() || m.is_link_local() || m.is_unspecified()
+                    m.is_loopback()
+                        || m.is_private()
+                        || m.is_link_local()
+                        || m.is_unspecified()
+                        || is_cgnat_shared_v4(&m)
+                        || m == Ipv4Addr::new(169, 254, 169, 254)
                 })
         }
         Err(_) => false,
@@ -1206,6 +1216,13 @@ mod tests {
             "https://100.64.0.1/",
             "https://100.64.1.1/",
             "https://100.127.255.255/",
+            // IPv4-mapped IPv6 forms of internal targets MUST be blocked identically to the bare v4
+            // form: the mapped branch reaches the same host, so a parity gap is an SSRF bypass.
+            "https://[::ffff:100.64.0.1]/", // CGNAT (RFC 6598) via mapped IPv6
+            "https://[::ffff:169.254.169.254]/", // IMDS via mapped IPv6
+            "https://[::ffff:127.0.0.1]/",  // loopback via mapped IPv6
+            "https://[::ffff:10.0.0.1]/",   // RFC-1918 private via mapped IPv6
+            "https://[::ffff:169.254.1.1]:8443/", // link-local via mapped IPv6, with port
             // Alternate IPv4 encodings the OS resolver maps to loopback / IMDS but `IpAddr` rejects.
             "https://2130706433/",          // decimal int = 127.0.0.1
             "https://0x7f000001/",          // hex = 127.0.0.1

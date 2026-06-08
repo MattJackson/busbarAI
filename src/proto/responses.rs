@@ -409,6 +409,11 @@ impl ProtocolReader for ResponsesReader {
         // The Responses API carries `stream` in the request body — read it (don't drop the intent).
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
+        // NOTE: `metadata` is deliberately NOT in this exclusion set. The Responses API accepts a
+        // top-level `metadata` object (user-defined key/value tagging used for audit logging and
+        // billing attribution); busbar does not model it on `IrRequest`, so it must flow through
+        // `extra` and be re-emitted verbatim by `write_request`'s extra-forwarding loop. Listing it
+        // here (as a prior revision did) silently dropped a stable public API field.
         let modeled_keys: std::collections::HashSet<&str> = [
             "model",
             "instructions",
@@ -416,7 +421,6 @@ impl ProtocolReader for ResponsesReader {
             "tools",
             "max_output_tokens",
             "temperature",
-            "metadata",
             "stream",
         ]
         .iter()
@@ -1120,6 +1124,15 @@ impl ProtocolWriter for ResponsesWriter {
                 if let Some(model) = model {
                     resp_obj.insert("model".to_string(), serde_json::json!(model));
                 }
+                // The native `response.created` carries the FULL Response skeleton, not just its
+                // identity: an official SDK constructs a `Response` object from this event and reads
+                // `usage`/`output`/`error` unconditionally. At stream start there are no tokens yet
+                // and no failure, so emit `usage: null`, an empty `output` array, and `error: null`
+                // — present-but-empty, NOT omitted. Omitting `usage` left the SDK's `Response.usage`
+                // unpopulated (or crashed strict decoders) on the opening chunk.
+                resp_obj.insert("output".to_string(), serde_json::json!([]));
+                resp_obj.insert("error".to_string(), serde_json::Value::Null);
+                resp_obj.insert("usage".to_string(), serde_json::Value::Null);
                 Some((
                     "response.created".to_string(),
                     serde_json::json!({ "response": resp_obj }),
@@ -2790,6 +2803,76 @@ mod tests {
             "all synthesized ids in a burst must be unique"
         );
         assert!(ids.iter().all(|id| id.starts_with("resp_")));
+    }
+
+    /// Regression (MEDIUM/correctness): a top-level `metadata` object must NOT be in the modeled-key
+    /// exclusion set, so it flows into `IrRequest.extra` on read and is re-emitted verbatim by
+    /// `write_request`. A prior revision listed `metadata` in `modeled_keys` while never emitting it,
+    /// silently dropping the caller's response tagging / billing-attribution field.
+    #[test]
+    fn test_metadata_round_trips_through_extra() {
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "metadata": {"trace_id": "abc-123", "team": "billing"}
+        });
+        let reader = ResponsesReader;
+        let writer = ResponsesWriter;
+
+        let ir = reader.read_request(&json).expect("read_request ok");
+        // metadata must have landed in extra (it is not a modeled IrRequest field).
+        assert_eq!(
+            ir.extra.get("metadata"),
+            Some(&serde_json::json!({"trace_id": "abc-123", "team": "billing"})),
+            "metadata must flow into extra, not be dropped"
+        );
+
+        // write_request forwards extra verbatim, so metadata survives to the upstream body.
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out.get("metadata"),
+            Some(&serde_json::json!({"trace_id": "abc-123", "team": "billing"})),
+            "metadata must be forwarded to the upstream Responses backend"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance, class: stream-start skeleton): the opening `response.created`
+    /// event must carry the FULL required Response skeleton an SDK reads unconditionally — `usage`,
+    /// `output`, and `error` must be PRESENT (empty/null), not omitted. Omitting `usage` left strict
+    /// SDK decoders without a `Response.usage` field on the first chunk.
+    #[test]
+    fn test_message_start_skeleton_carries_usage_output_error() {
+        let writer = ResponsesWriter;
+        let ev = crate::ir::IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        };
+        let (etype, payload) = writer.write_response_event(&ev).expect("should emit");
+        assert_eq!(etype, "response.created");
+        let resp = payload.get("response").expect("response object present");
+
+        // usage key MUST be present (null at stream start), not omitted.
+        assert!(
+            resp.get("usage").is_some(),
+            "usage key must be present on the opening chunk: {resp}"
+        );
+        assert!(
+            resp.get("usage").unwrap().is_null(),
+            "usage must be null (no tokens yet) at stream start"
+        );
+        // output array present-but-empty; error present-but-null.
+        assert_eq!(
+            resp.get("output"),
+            Some(&serde_json::json!([])),
+            "output must be present as an empty array"
+        );
+        assert!(
+            resp.get("error").map(|e| e.is_null()).unwrap_or(false),
+            "error key must be present and null at stream start"
+        );
     }
 
     /// A role-only item (no `type`) must still be processed via the role fallback.

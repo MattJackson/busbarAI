@@ -252,11 +252,52 @@ fn synth_amzn_request_id() -> Option<String> {
     ))
 }
 
+/// The auth-failure wire message for an inferred ingress protocol. This string lands verbatim in
+/// the native error body (`error.message` for anthropic/openai/gemini/responses, the bare top-level
+/// `message` for cohere, the `message` field alongside `__type` for bedrock — every writer echoes
+/// it unchanged). It MUST read like the copy the REAL vendor returns for a bad/missing credential,
+/// and carry NO busbar-internal vocabulary ("virtual key", "client token", "allowlist", "disabled",
+/// "passthrough", …): any such word is a deterministic protocol tell a native SDK / a human reading
+/// SDK error output would never see from the genuine endpoint, and it also discloses busbar's auth
+/// model. The wording is chosen PURELY from the inferred protocol and is deliberately independent of
+/// WHY auth failed (missing token vs. wrong token vs. disabled virtual key vs. admin-token
+/// mismatch) — surfacing that distinction on the wire is itself an oracle. Call sites therefore
+/// pass no reason string; the wording lives here, behind the protocol.
+///
+/// Strings mirror genuine vendor copy (sampled from real 401/403 bodies):
+///   anthropic  → "invalid x-api-key"
+///   openai     → "Incorrect API key provided."
+///   gemini     → "API key not valid. Please pass a valid API key."
+///   cohere     → "invalid api token"
+///   responses  → "Incorrect API key provided." (OpenAI-family)
+///   bedrock    → "" (AWS conveys AccessDenied via __type / x-amzn-errortype, not message prose)
+fn vendor_auth_failure_message(proto: &str) -> &'static str {
+    match proto {
+        "anthropic" => "invalid x-api-key",
+        "gemini" => "API key not valid. Please pass a valid API key.",
+        "cohere" => "invalid api token",
+        // AWS does not put a credential hint in the message; the modeled exception rides on
+        // `__type` / `x-amzn-errortype`. An empty message matches a native AccessDenied body.
+        "bedrock" => "",
+        // openai + responses (OpenAI-family) and any future/unknown proto: neutral credential copy
+        // with no busbar vocabulary. Not a disposition/breaker match, so a fallback arm is fine.
+        "openai" | "responses" => "Incorrect API key provided.",
+        _ => "authentication failed",
+    }
+}
+
 /// Build an auth-failure response carrying the inferred ingress protocol's NATIVE error envelope
 /// (design §8 BLOCKER #1). Auth runs before routing, so the protocol is inferred from the request
 /// path. A native vendor SDK hitting busbar in `token`/governance mode with a bad credential then
 /// gets the vendor's JSON error shape (`application/json`) instead of a bare `text/plain` 401 —
 /// removing a deterministic proxy tell. Falls back to the generic envelope for an unknown path.
+///
+/// The wire `message` comes from `vendor_auth_failure_message(proto)` — vendor-plausible copy keyed
+/// solely off the inferred protocol — NOT from the call site. Callers must never thread a
+/// busbar-internal reason ("invalid or disabled virtual key", "unauthorized", "admin unauthorized")
+/// onto the wire: that vocabulary is a protocol tell and an auth-model disclosure, and the
+/// invalid-vs-disabled / missing-vs-wrong distinction is itself an oracle. A caller may still log
+/// the real reason server-side; it just never reaches the client body.
 ///
 /// Status and headers are protocol-shaped too: a real AWS Bedrock SigV4 auth failure returns HTTP
 /// 403 (not 401) and carries `x-amzn-ErrorType` / `x-amzn-RequestId`, which a native AWS SDK keys
@@ -267,8 +308,9 @@ fn synth_amzn_request_id() -> Option<String> {
 ///
 /// No unwrap / expect / panic on this request path: a serialization failure degrades to an empty
 /// JSON object.
-fn unauthorized_response(path: &str, message: &str) -> Response {
+fn unauthorized_response(path: &str) -> Response {
     let proto = proto_for_path(path);
+    let message = vendor_auth_failure_message(proto);
     // `protocol_for` knows every name `proto_for_path` can return, so this is `Some` in practice;
     // the `?`-style fallback keeps the request path panic-free if that ever changes.
     let body = match crate::proto::protocol_for(proto) {
@@ -380,7 +422,7 @@ pub(crate) async fn auth_middleware(
             None => false,
         };
         if !authorized {
-            return Err(unauthorized_response(&path, "admin unauthorized"));
+            return Err(unauthorized_response(&path));
         }
         req.extensions_mut()
             .insert(crate::governance::GovCtx::default());
@@ -417,17 +459,12 @@ pub(crate) async fn auth_middleware(
                 req.extensions_mut()
                     .insert(crate::governance::GovCtx { key: Some(key) });
             }
-            _ => {
-                return Err(unauthorized_response(
-                    &path,
-                    "invalid or disabled virtual key",
-                ))
-            }
+            _ => return Err(unauthorized_response(&path)),
         }
     } else {
         // /stats requires auth by default (per spec decision).
         if !token_valid {
-            return Err(unauthorized_response(&path, "unauthorized"));
+            return Err(unauthorized_response(&path));
         }
         req.extensions_mut()
             .insert(crate::governance::GovCtx::default());
@@ -766,7 +803,7 @@ mod tests {
         // would choke on. One assertion per `proto_for_path` arm.
 
         // Gemini → {"error":{"code":401,"message":..,"status":"UNAUTHENTICATED"}}.
-        let resp = unauthorized_response("/v1beta/models/x:generateContent", "unauthorized");
+        let resp = unauthorized_response("/v1beta/models/x:generateContent");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
             resp.headers()
@@ -782,7 +819,7 @@ mod tests {
         );
 
         // Anthropic → top-level {"type":"error","error":{"type":"authentication_error",..}}.
-        let resp = unauthorized_response("/pa/v1/messages", "unauthorized");
+        let resp = unauthorized_response("/pa/v1/messages");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let body = decode_body(resp);
         assert_eq!(body["type"], "error", "anthropic top-level type: {body}");
@@ -792,7 +829,7 @@ mod tests {
         );
 
         // OpenAI → {"error":{"type":"authentication_error",..}} (no top-level type=error).
-        let resp = unauthorized_response("/v1/chat/completions", "unauthorized");
+        let resp = unauthorized_response("/v1/chat/completions");
         let body = decode_body(resp);
         assert!(
             body.get("type").is_none(),
@@ -804,7 +841,7 @@ mod tests {
         );
 
         // Responses → {"error":{"type":"authentication_error","code":null,"param":null,..}}.
-        let resp = unauthorized_response("/v1/responses", "unauthorized");
+        let resp = unauthorized_response("/v1/responses");
         let body = decode_body(resp);
         assert_eq!(
             body["error"]["type"], "authentication_error",
@@ -816,7 +853,7 @@ mod tests {
         );
 
         // Cohere → bare {"message":..} with NO `error` and NO `type`.
-        let resp = unauthorized_response("/v2/chat", "unauthorized");
+        let resp = unauthorized_response("/v2/chat");
         let body = decode_body(resp);
         assert!(
             body.get("message").is_some(),
@@ -828,7 +865,7 @@ mod tests {
         );
 
         // Bedrock → {"__type":"AccessDeniedException","message":..}, HTTP 403, x-amzn-* headers.
-        let resp = unauthorized_response("/model/anthropic.claude/converse", "unauthorized");
+        let resp = unauthorized_response("/model/anthropic.claude/converse");
         assert_eq!(
             resp.status(),
             StatusCode::FORBIDDEN,
@@ -858,6 +895,94 @@ mod tests {
         assert!(
             body.get("error").is_none(),
             "bedrock body uses __type, not an error object: {body}"
+        );
+    }
+
+    /// Recursively collect every JSON string value reachable in `v` (object values, array elements,
+    /// and the leaf string itself), so a leak-vocabulary scan covers the message regardless of the
+    /// field the per-protocol writer placed it on (`error.message` / top-level `message` / `__type`).
+    fn collect_strings(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(a) => a.iter().for_each(|e| collect_strings(e, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|e| collect_strings(e, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_unauthorized_body_carries_no_busbar_vocabulary() {
+        // Regression for the auth-model leak: the auth-failure wire body must NOT name busbar's
+        // internal auth concepts. Previously the literal "invalid or disabled virtual key" (and
+        // "unauthorized" / "admin unauthorized") were reflected verbatim into the native error body
+        // — a deterministic proxy tell that also discloses the per-virtual-key enable/disable model.
+        // Sweep EVERY supported ingress path (incl. the unknown-path fallback) and assert no leaked
+        // token appears anywhere in the JSON. The invalid-vs-disabled distinction must also be gone.
+        const FORBIDDEN: &[&str] = &[
+            "virtual key",
+            "client token",
+            "client_token",
+            "allowlist",
+            "disabled",
+            "passthrough",
+            "busbar",
+            "unauthorized", // busbar-internal reason wording, not vendor copy
+            "admin",
+        ];
+        let paths = [
+            "/v1beta/models/x:generateContent", // gemini
+            "/pa/v1/messages",                  // anthropic
+            "/v1/chat/completions",             // openai
+            "/v1/responses",                    // responses
+            "/v2/chat",                         // cohere
+            "/model/anthropic.claude/converse", // bedrock
+            "/admin/keys",                      // admin path → inferred-proto fallback (openai)
+            "/totally/unknown/path",            // unknown → openai fallback
+        ];
+        for path in paths {
+            let body = decode_body(unauthorized_response(path));
+            let mut strings = Vec::new();
+            collect_strings(&body, &mut strings);
+            for s in &strings {
+                let lc = s.to_ascii_lowercase();
+                for bad in FORBIDDEN {
+                    assert!(
+                        !lc.contains(bad),
+                        "auth-failure body for '{path}' leaked busbar vocabulary '{bad}': {body}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_vendor_auth_failure_message_is_plausible_per_proto() {
+        // The wire message is keyed PURELY off the inferred protocol (independent of the failure
+        // reason) and reads like genuine vendor copy. Lock the exact strings so a regression that
+        // reintroduces busbar wording — or distinguishes invalid-vs-disabled — is caught.
+        assert_eq!(
+            vendor_auth_failure_message("anthropic"),
+            "invalid x-api-key"
+        );
+        assert_eq!(
+            vendor_auth_failure_message("openai"),
+            "Incorrect API key provided."
+        );
+        assert_eq!(
+            vendor_auth_failure_message("responses"),
+            "Incorrect API key provided."
+        );
+        assert_eq!(
+            vendor_auth_failure_message("gemini"),
+            "API key not valid. Please pass a valid API key."
+        );
+        assert_eq!(vendor_auth_failure_message("cohere"), "invalid api token");
+        // AWS conveys AccessDenied via __type / x-amzn-errortype, not a message string.
+        assert_eq!(vendor_auth_failure_message("bedrock"), "");
+        // Any unknown future proto: a neutral credential message, never busbar vocabulary.
+        assert_eq!(
+            vendor_auth_failure_message("some-future-proto"),
+            "authentication failed"
         );
     }
 

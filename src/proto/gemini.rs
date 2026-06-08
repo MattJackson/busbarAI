@@ -18,10 +18,19 @@ impl ProtocolReader for GeminiReader {
             .and_then(|j| j.get("error"))
             .and_then(|e| e.as_object());
 
+        // The real Gemini REST API returns `error.code` as a JSON INTEGER (the HTTP status, per
+        // google.rpc.Status), e.g. `"code": 429`. `serde_json::Value::as_str()` returns None on a
+        // number, so reading it as a string silently dropped the numeric code and fell back to the
+        // gRPC status name — breaking any breaker/metrics comparison against numeric strings. Read
+        // the integer first and stringify it; tolerate a string-typed `code` (some proxies emit one)
+        // as a secondary path; fall back to `status` only when `code` is absent entirely.
         let provider_code = error_obj
             .and_then(|e_obj| e_obj.get("code"))
-            .and_then(|c| c.as_str())
-            .map(String::from)
+            .and_then(|c| {
+                c.as_u64()
+                    .map(|n| n.to_string())
+                    .or_else(|| c.as_str().map(String::from))
+            })
             .or_else(|| {
                 error_obj
                     .and_then(|e_obj| e_obj.get("status"))
@@ -220,7 +229,7 @@ impl ProtocolReader for GeminiReader {
                                 is_error: false,
                             });
                         }
-                        // InlineData (Image)
+                        // InlineData (Image, base64)
                         else if let Some(inline_data) = part.get("inlineData") {
                             let mime_type = inline_data
                                 .get("mimeType")
@@ -235,6 +244,21 @@ impl ProtocolReader for GeminiReader {
                             msg_content.push(crate::ir::IrBlock::Image {
                                 media_type: mime_type,
                                 data,
+                            });
+                        }
+                        // FileData (Image by URI) → carry the URI under the `"image_url"` sentinel so
+                        // it survives into the IR exactly as the OpenAI/Responses readers store a
+                        // remote image URL. The writer (and cross-protocol egress) re-emit the
+                        // sentinel as a native URL reference rather than mangling it into base64.
+                        else if let Some(file_data) = part.get("fileData") {
+                            let uri = file_data
+                                .get("fileUri")
+                                .and_then(|u| u.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            msg_content.push(crate::ir::IrBlock::Image {
+                                media_type: "image_url".to_string(),
+                                data: uri,
                             });
                         }
                     }
@@ -702,9 +726,14 @@ fn unix_now_secs() -> u64 {
 /// Mint a Gemini-shaped `responseId` for the cross-protocol path where the backend supplied none.
 /// Real `responseId`s are opaque strings with no documented prefix a native SDK could reject, so a
 /// timestamp+counter suffix is indistinguishable in shape. No new dependency.
+///
+/// The two components are joined by a `-` separator (NOT a bare hex concat). A bare `{:x}{:x}` of
+/// `(secs, seq)` is NOT collision-free: e.g. `(0x1ab, 0xc)` and `(0x1a, 0xbc)` both render as
+/// `"1abc"`, so two distinct (time, counter) pairs could mint the SAME id within a process. The
+/// separator makes the boundary unambiguous so every distinct pair yields a distinct id.
 fn synth_response_id() -> String {
     let seq = SYNTH_RESPONSE_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{:x}{:x}", unix_now_secs(), seq)
+    format!("{:x}-{:x}", unix_now_secs(), seq)
 }
 
 /// Synthesize a stable, non-empty tool-call id for a Gemini `functionCall`.
@@ -863,10 +892,24 @@ impl ProtocolWriter for GeminiWriter {
                         }))
                     }
                     crate::ir::IrBlock::Image { media_type, data } => {
-                        // Image → inlineData{mimeType, data}
-                        parts_arr.push(serde_json::json!({
-                            "inlineData": { "mimeType": media_type, "data": data }
-                        }))
+                        // Image → inlineData{mimeType, data} for base64 payloads. The cross-protocol
+                        // OpenAI/Responses readers store a non-data (https) image URL verbatim in
+                        // `data` under the `"image_url"` media_type SENTINEL (they cannot guess a MIME
+                        // type for a remote URL). Emitting that sentinel as `inlineData` would write
+                        // the URL string into the base64 `data` field with a bogus `mimeType:
+                        // "image_url"` — a corrupt part the model cannot decode. Gemini's native way to
+                        // reference an image by URI is `fileData{fileUri, mimeType}`, so route the
+                        // sentinel there (URL natively, not base64). `mimeType` is omitted: it is
+                        // unknown for a remote URL and is optional on `fileData`.
+                        if media_type == "image_url" {
+                            parts_arr.push(serde_json::json!({
+                                "fileData": { "fileUri": data }
+                            }))
+                        } else {
+                            parts_arr.push(serde_json::json!({
+                                "inlineData": { "mimeType": media_type, "data": data }
+                            }))
+                        }
                     }
                     _ => {} // Drop unsupported blocks (thinking, etc.)
                 }
@@ -1123,7 +1166,14 @@ impl ProtocolWriter for GeminiWriter {
                 stop_sequence: _,
             } => {
                 let finish_reason = match stop_reason.as_deref() {
-                    Some("end_turn") | Some("stop_sequence") => "STOP".to_string(),
+                    // Gemini reports STOP for a normal completion AND for a tool/function-call
+                    // completion (its `FinishReason` enum has NO TOOL_USE member). Every other
+                    // protocol's reader emits the canonical `tool_use` stop reason for a tool-call
+                    // turn, so it MUST map to STOP here — upper-casing it to "TOOL_USE" would emit an
+                    // invalid enum value a strict google-genai client rejects.
+                    Some("end_turn") | Some("stop_sequence") | Some("tool_use") => {
+                        "STOP".to_string()
+                    }
                     Some("max_tokens") => "MAX_TOKENS".to_string(),
                     Some("safety") => "SAFETY".to_string(),
                     Some(other) => other.to_uppercase(),
@@ -1217,21 +1267,45 @@ impl ProtocolWriter for GeminiWriter {
         }
 
         let finish_reason = match resp.stop_reason.as_deref() {
-            Some("end_turn") | Some("stop_sequence") => "STOP".to_string(),
+            // Gemini reports STOP for a normal completion AND for a tool/function-call completion
+            // (its `FinishReason` enum has NO TOOL_USE member). The canonical `tool_use` stop reason
+            // every other protocol's reader emits for a tool-call turn MUST map to STOP here — upper-
+            // casing it to "TOOL_USE" would emit an invalid enum value a strict google-genai client
+            // rejects on the most common cross-protocol tool-calling path.
+            Some("end_turn") | Some("stop_sequence") | Some("tool_use") => "STOP".to_string(),
             Some("max_tokens") => "MAX_TOKENS".to_string(),
             Some("safety") => "SAFETY".to_string(),
             Some(other) => other.to_uppercase(),
             None => "STOP".to_string(),
         };
 
-        // NB: `usageMetadata` here carries only the component counts and OMITS `totalTokenCount`,
-        // preserving the omit-don't-fabricate fidelity rule used for `responseId`/`created`: a native
-        // whole-response body that did not carry `totalTokenCount` round-trips without one
-        // (`read_response` does not capture it into the IR, so there is nothing to faithfully
-        // re-emit). The STREAM final-chunk frame (`write_response_event` MessageDelta) DOES emit
-        // `totalTokenCount` because that path runs only on cross-protocol egress (same-protocol
-        // Gemini streams pass through byte-for-byte and never reach the writer), where a native
-        // google-genai client expects the final SSE chunk's usage to carry the total.
+        // A native Gemini `generateContent` response ALWAYS carries
+        // `usageMetadata.totalTokenCount` (= promptTokenCount + candidatesTokenCount); the
+        // google-genai SDK surfaces it as `usage_metadata.total_token_count` for billing/accounting.
+        // On the CROSS-protocol egress path a native Gemini client therefore expects the sum, and the
+        // value is a faithfully DERIVED total from the IR counts — not a fabricated field — so we emit
+        // it (mirroring the stream final-chunk frame), closing a concrete token-accounting gap and a
+        // distinguishability tell. `saturating_add` avoids an overflow panic on the request path.
+        //
+        // We gate emission on the SAME cross-protocol boundary signal the `responseId` synthesis
+        // below keys on (`resp.created.is_some()` — Gemini bodies carry no `created`, so a populated
+        // `created` means a non-Gemini backend reader set it, i.e. we crossed a protocol boundary).
+        // This keeps a SAME-protocol read→write idempotent: a native Gemini body that carried only
+        // the component counts (no `totalTokenCount`, no `created`) round-trips byte-identically, so
+        // we never inject a field the upstream omitted. (`write_response` itself only ever runs on
+        // cross-protocol egress in production — same-protocol passthrough is byte-exact and bypasses
+        // the writer — but the gating preserves the in-IR read→write identity invariant too.)
+        let mut usage_metadata = serde_json::json!({
+            "promptTokenCount": resp.usage.input_tokens,
+            "candidatesTokenCount": resp.usage.output_tokens
+        });
+        if resp.created.is_some() {
+            let total = resp
+                .usage
+                .input_tokens
+                .saturating_add(resp.usage.output_tokens);
+            usage_metadata["totalTokenCount"] = serde_json::json!(total);
+        }
         let mut out = serde_json::json!({
             "candidates": [{
                 "content": {
@@ -1240,10 +1314,7 @@ impl ProtocolWriter for GeminiWriter {
                 },
                 "finishReason": finish_reason
             }],
-            "usageMetadata": {
-                "promptTokenCount": resp.usage.input_tokens,
-                "candidatesTokenCount": resp.usage.output_tokens
-            }
+            "usageMetadata": usage_metadata
         });
         // model that served the response (preserved across cross-protocol translation)
         if let Some(ref model) = resp.model {
@@ -1533,16 +1604,44 @@ mod tests {
     }
 
     /// extract_error parses the body once and derives both the provider code and structured type.
+    /// The real Gemini API returns `error.code` as a JSON INTEGER (google.rpc.Status), so the
+    /// fixture uses `429` (not `"429"`); `provider_code` must be the stringified integer.
     #[test]
     fn test_extract_error_single_parse_fields() {
         let reader = GeminiReader;
-        let body = br#"{"error":{"code":"429","status":"RESOURCE_EXHAUSTED"}}"#;
+        let body = br#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#;
         let raw = reader.extract_error(StatusCode::TOO_MANY_REQUESTS, body);
         assert_eq!(raw.http_status, 429);
         assert_eq!(raw.provider_code.as_deref(), Some("429"));
         assert_eq!(raw.structured_type.as_deref(), Some("RESOURCE_EXHAUSTED"));
         // classify()/extract_error do not see headers, so retry_after is sourced elsewhere.
         assert_eq!(raw.retry_after_secs, None);
+    }
+
+    /// Regression (R5): an integer `error.code` (the real Gemini shape) must be stringified into
+    /// `provider_code` — NOT silently dropped to the gRPC status name. Previously `code` was read
+    /// via `.as_str()`, which returns None on a number, so a real 429 surfaced as
+    /// "RESOURCE_EXHAUSTED" and broke breaker/metrics comparisons against numeric strings.
+    #[test]
+    fn test_extract_error_integer_code_is_stringified() {
+        let reader = GeminiReader;
+        let body = br#"{"error":{"code":503,"status":"UNAVAILABLE","message":"overloaded"}}"#;
+        let raw = reader.extract_error(StatusCode::SERVICE_UNAVAILABLE, body);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("503"),
+            "integer code must be stringified, not fall back to status"
+        );
+        assert_eq!(raw.structured_type.as_deref(), Some("UNAVAILABLE"));
+    }
+
+    /// A string-typed `code` (some proxies emit one) is still accepted as the secondary path.
+    #[test]
+    fn test_extract_error_string_code_still_accepted() {
+        let reader = GeminiReader;
+        let body = br#"{"error":{"code":"429","status":"RESOURCE_EXHAUSTED"}}"#;
+        let raw = reader.extract_error(StatusCode::TOO_MANY_REQUESTS, body);
+        assert_eq!(raw.provider_code.as_deref(), Some("429"));
     }
 
     /// When `code` is absent, extract_error falls back to `status` for the provider code.
@@ -2367,11 +2466,14 @@ mod tests {
         );
     }
 
-    /// Fidelity guard: the whole-body `write_response` usageMetadata OMITS `totalTokenCount`
-    /// (omit-don't-fabricate), so a native body that carried only the component counts round-trips
-    /// byte-identically. The total is emitted only on the cross-protocol STREAM frame.
+    /// Regression (R5): on the CROSS-protocol egress path (signalled by a populated `created` — the
+    /// boundary marker a non-Gemini backend reader leaves, since Gemini bodies carry no timestamp)
+    /// the whole-body `write_response` usageMetadata MUST include `totalTokenCount` (= prompt +
+    /// candidates). A native Gemini `generateContent` body always carries the sum, and the value is a
+    /// faithfully derived total (not a fabricated field). Earlier it was omitted, leaving the
+    /// google-genai SDK's `total_token_count` at None/0 for cross-protocol callers.
     #[test]
-    fn test_write_response_omits_total_token_count() {
+    fn test_write_response_includes_total_token_count_cross_protocol() {
         let writer = GeminiWriter;
         let ir = crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
@@ -2389,14 +2491,277 @@ mod tests {
             },
             model: None,
             id: None,
-            created: None,
+            created: Some(1_700_000_000), // cross-protocol boundary signal
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let wire = writer.write_response(&ir);
+        assert_eq!(
+            wire.pointer("/usageMetadata/totalTokenCount"),
+            Some(&serde_json::json!(8)),
+            "cross-protocol usage must carry totalTokenCount = prompt + candidates: {wire}"
+        );
+        assert_eq!(
+            wire.pointer("/usageMetadata/promptTokenCount"),
+            Some(&serde_json::json!(5))
+        );
+        assert_eq!(
+            wire.pointer("/usageMetadata/candidatesTokenCount"),
+            Some(&serde_json::json!(3))
+        );
+    }
+
+    /// Fidelity guard: a SAME-protocol read→write (no `created` — native Gemini bodies carry no
+    /// timestamp) must NOT inject `totalTokenCount` the upstream omitted, so the round-trip stays
+    /// byte-identical. (Production same-protocol passthrough bypasses the writer entirely; this
+    /// guards the in-IR read→write identity invariant `test_gemini_read_write_response_roundtrip`
+    /// in mod.rs depends on.)
+    #[test]
+    fn test_write_response_omits_total_token_count_same_protocol() {
+        let writer = GeminiWriter;
+        let ir = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 5,
+                output_tokens: 3,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None, // same-protocol: no boundary signal
             system_fingerprint: None,
             stop_sequence: None,
         };
         let wire = writer.write_response(&ir);
         assert!(
             wire.pointer("/usageMetadata/totalTokenCount").is_none(),
-            "whole-body usage must omit totalTokenCount for byte-identical round-trip: {wire}"
+            "same-protocol round-trip must omit totalTokenCount for byte-identity: {wire}"
         );
+    }
+
+    /// The cross-protocol whole-body total saturates (never overflow-panics) on pathological counts.
+    #[test]
+    fn test_write_response_total_token_count_saturates() {
+        let writer = GeminiWriter;
+        let ir = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: Vec::new(),
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: u64::MAX,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: Some(1_700_000_000), // cross-protocol
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let wire = writer.write_response(&ir);
+        assert_eq!(
+            wire.pointer("/usageMetadata/totalTokenCount"),
+            Some(&serde_json::json!(u64::MAX)),
+            "totalTokenCount must saturate, not wrap/panic: {wire}"
+        );
+    }
+
+    // --- Round 5 fix: tool_use stop reason maps to STOP (Gemini has no TOOL_USE enum member) ---
+
+    /// Regression: a buffered `write_response` with stop_reason=tool_use (the canonical value every
+    /// other protocol's reader emits for a tool-call turn) must emit finishReason "STOP", NOT the
+    /// invalid "TOOL_USE" the old upper-casing fallback produced.
+    #[test]
+    fn test_write_response_tool_use_maps_to_stop() {
+        let writer = GeminiWriter;
+        let ir = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "get_weather".to_string(),
+                input: serde_json::json!({"city": "SF"}),
+            }],
+            stop_reason: Some("tool_use".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let wire = writer.write_response(&ir);
+        assert_eq!(
+            wire.pointer("/candidates/0/finishReason")
+                .and_then(|f| f.as_str()),
+            Some("STOP"),
+            "tool_use must map to STOP, never TOOL_USE: {wire}"
+        );
+    }
+
+    /// Regression: the streamed `MessageDelta` with stop_reason=tool_use also emits finishReason
+    /// "STOP" (matching native Gemini, whose FinishReason enum has no TOOL_USE member).
+    #[test]
+    fn test_stream_message_delta_tool_use_maps_to_stop() {
+        let writer = GeminiWriter;
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: Some("tool_use".to_string()),
+            stop_sequence: None,
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (_, frame) = writer
+            .write_response_event(&ev)
+            .expect("MessageDelta must emit a frame");
+        assert_eq!(
+            frame
+                .pointer("/candidates/0/finishReason")
+                .and_then(|f| f.as_str()),
+            Some("STOP"),
+            "streamed tool_use must map to STOP, never TOOL_USE: {frame}"
+        );
+    }
+
+    // --- Round 5 fix: image_url sentinel emitted as native fileData URI, not corrupt base64 ---
+
+    /// Regression: an IR Image carrying the `"image_url"` media_type SENTINEL (a remote https URL
+    /// stored verbatim by the OpenAI/Responses readers) must be emitted as Gemini `fileData{fileUri}`
+    /// — the native URL reference — NOT as `inlineData` with the URL stuffed into the base64 `data`
+    /// field and a bogus `mimeType: "image_url"`.
+    #[test]
+    fn test_write_request_image_url_sentinel_emits_file_data() {
+        let writer = GeminiWriter;
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Image {
+                    media_type: "image_url".to_string(),
+                    data: "https://example.com/cat.png".to_string(),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let wire = writer.write_request(&req);
+        assert_eq!(
+            wire.pointer("/contents/0/parts/0/fileData/fileUri")
+                .and_then(|u| u.as_str()),
+            Some("https://example.com/cat.png"),
+            "image_url sentinel must emit native fileData.fileUri: {wire}"
+        );
+        assert!(
+            wire.pointer("/contents/0/parts/0/inlineData").is_none(),
+            "sentinel URL must NOT be emitted as base64 inlineData: {wire}"
+        );
+    }
+
+    /// A real base64 image (a genuine mimeType) still emits as `inlineData` — the sentinel branch
+    /// must not divert legitimate base64 payloads.
+    #[test]
+    fn test_write_request_base64_image_still_inline_data() {
+        let writer = GeminiWriter;
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "aGVsbG8=".to_string(),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let wire = writer.write_request(&req);
+        assert_eq!(
+            wire.pointer("/contents/0/parts/0/inlineData/mimeType")
+                .and_then(|m| m.as_str()),
+            Some("image/png"),
+            "base64 image must stay inlineData: {wire}"
+        );
+        assert_eq!(
+            wire.pointer("/contents/0/parts/0/inlineData/data")
+                .and_then(|d| d.as_str()),
+            Some("aGVsbG8="),
+        );
+    }
+
+    /// Round-trip: a native Gemini `fileData{fileUri}` part reads into the `"image_url"` sentinel IR
+    /// Image and the writer re-emits it as `fileData{fileUri}` verbatim (same-protocol fidelity).
+    #[test]
+    fn test_file_data_image_round_trips_via_sentinel() {
+        let reader = GeminiReader;
+        let writer = GeminiWriter;
+        let body = serde_json::json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{"fileData": {"fileUri": "gs://bucket/img.jpg"}}]
+            }]
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        let img = ir.messages[0].content.iter().find_map(|b| match b {
+            crate::ir::IrBlock::Image { media_type, data } => {
+                Some((media_type.clone(), data.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            img,
+            Some(("image_url".to_string(), "gs://bucket/img.jpg".to_string())),
+            "fileData must read into the image_url sentinel: {ir:?}"
+        );
+        let wire = writer.write_request(&ir);
+        assert_eq!(
+            wire.pointer("/contents/0/parts/0/fileData/fileUri")
+                .and_then(|u| u.as_str()),
+            Some("gs://bucket/img.jpg"),
+            "fileData must round-trip verbatim: {wire}"
+        );
+    }
+
+    // --- Round 5 fix: synth_response_id is collision-free (separator, not bare hex concat) ---
+
+    /// Regression: `synth_response_id` joins its (unix_secs, counter) components with a `-`
+    /// separator so distinct pairs cannot alias to the same string (a bare `{:x}{:x}` concat could:
+    /// e.g. (0x1ab, 0xc) and (0x1a, 0xbc) both render "1abc"). The id must contain a separator.
+    #[test]
+    fn test_synth_response_id_has_separator() {
+        let id = synth_response_id();
+        assert!(
+            id.contains('-'),
+            "synthesized responseId must carry a separator between time and counter: {id}"
+        );
+    }
+
+    /// Two consecutive synthesized ids (same process second) differ because the counter advances —
+    /// guards the collision-free property within a single unix second.
+    #[test]
+    fn test_synth_response_id_distinct_within_same_second() {
+        let a = synth_response_id();
+        let b = synth_response_id();
+        assert_ne!(a, b, "consecutive synthesized ids must differ: {a} vs {b}");
     }
 }

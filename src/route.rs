@@ -2698,11 +2698,42 @@ mod tests {
 
     // ---- HIGH/test-coverage: streaming integration for Cohere and Responses ingress ----
 
+    /// Collect the `data:` payloads of an SSE body into a Vec of `(event_name, data_json_text)`,
+    /// where `event_name` is the value of the frame's `event:` line (empty string for an
+    /// OpenAI/Cohere-style bare-`data:` frame). `[DONE]` sentinels are skipped. Used by the
+    /// native-shape stream assertions below so a regression that leaked the OpenAI egress chunks
+    /// verbatim (which also begin `data:`) is caught.
+    fn sse_frames(body: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for frame in body.split("\n\n") {
+            let mut event_name = String::new();
+            let mut data: Option<String> = None;
+            for line in frame.lines() {
+                if let Some(rest) = line.strip_prefix("event:") {
+                    event_name = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    data = Some(rest.trim().to_string());
+                }
+            }
+            if let Some(d) = data {
+                if d == "[DONE]" {
+                    continue;
+                }
+                out.push((event_name, d));
+            }
+        }
+        out
+    }
+
     /// A Cohere `/v2/chat` request with `"stream": true` must return `Content-Type:
-    /// text/event-stream` and an SSE body with at least one `data:` line. Routes cohere→openai
-    /// (cross-protocol) so the full ingress→forward→SSE-output reframe runs.
+    /// text/event-stream` AND a body framed as a NATIVE Cohere v2 stream — `data:` frames whose JSON
+    /// `type` walks `message-start` → `content-delta` → `message-end` — with NO leaked OpenAI
+    /// `chat.completion.chunk` objects. Routes cohere→openai (cross-protocol) so the full
+    /// ingress→forward→SSE-output reframe runs; a regression that passed the OpenAI egress chunks
+    /// through verbatim would still start `data:` but carries none of the Cohere vocabulary and is
+    /// caught here.
     #[tokio::test]
-    async fn test_cohere_ingress_stream_returns_sse() {
+    async fn test_cohere_ingress_stream_emits_native_cohere_frames() {
         crate::metrics::init();
         let state = StdArc::new(MockServerState::new());
         state.push(MockResponse::Sse {
@@ -2744,20 +2775,53 @@ mod tests {
             ct.starts_with("text/event-stream"),
             "cohere streaming ingress is SSE; got {ct}"
         );
-        let body = resp.bytes().await.unwrap();
-        let text = String::from_utf8_lossy(&body);
+        let text = resp.text().await.unwrap();
+
+        // No OpenAI egress object may leak through to a Cohere SDK.
         assert!(
-            text.contains("data:"),
-            "cohere SSE body has at least one data: line; got:\n{text}"
+            !text.contains("chat.completion.chunk"),
+            "cohere stream leaked an OpenAI chat.completion.chunk object; got:\n{text}"
+        );
+
+        // Collect the JSON `type` discriminants of every data frame, in order.
+        let types: Vec<String> = sse_frames(&text)
+            .into_iter()
+            .filter_map(|(_, d)| serde_json::from_str::<serde_json::Value>(&d).ok())
+            .filter_map(|v| {
+                v.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        assert!(
+            types.iter().any(|t| t == "message-start"),
+            "cohere stream must open with a message-start frame; got types {types:?}"
+        );
+        assert!(
+            types.iter().any(|t| t == "content-delta"),
+            "cohere stream must carry a content-delta frame; got types {types:?}"
+        );
+        assert!(
+            types.iter().any(|t| t == "message-end"),
+            "cohere stream must close with a message-end frame; got types {types:?}"
+        );
+        // Ordering: message-start strictly precedes message-end (native Cohere framing).
+        let start_at = types.iter().position(|t| t == "message-start");
+        let end_at = types.iter().rposition(|t| t == "message-end");
+        assert!(
+            matches!((start_at, end_at), (Some(s), Some(e)) if s < e),
+            "cohere message-start must precede message-end; got types {types:?}"
         );
         handle.abort();
         server.shutdown().await;
     }
 
-    /// A Responses `/v1/responses` request with `"stream": true` must return SSE framing with a
-    /// `data:` body. Routes responses→openai (cross-protocol).
+    /// A Responses `/v1/responses` request with `"stream": true` must return SSE framing whose typed
+    /// `event:` names are the NATIVE Responses vocabulary — a `response.created` opener, a
+    /// `response.output_text.delta`, and a `response.completed` terminator — with NO leaked OpenAI
+    /// `chat.completion.chunk` objects. Routes responses→openai (cross-protocol).
     #[tokio::test]
-    async fn test_responses_ingress_stream_returns_sse() {
+    async fn test_responses_ingress_stream_emits_native_responses_events() {
         crate::metrics::init();
         let state = StdArc::new(MockServerState::new());
         state.push(MockResponse::Sse {
@@ -2799,11 +2863,33 @@ mod tests {
             ct.starts_with("text/event-stream"),
             "responses streaming ingress is SSE; got {ct}"
         );
-        let body = resp.bytes().await.unwrap();
-        let text = String::from_utf8_lossy(&body);
+        let text = resp.text().await.unwrap();
+
+        // No OpenAI egress object may leak through to a Responses SDK.
         assert!(
-            text.contains("data:"),
-            "responses SSE body has at least one data: line; got:\n{text}"
+            !text.contains("chat.completion.chunk"),
+            "responses stream leaked an OpenAI chat.completion.chunk object; got:\n{text}"
+        );
+
+        let events: Vec<String> = sse_frames(&text).into_iter().map(|(e, _)| e).collect();
+        assert!(
+            events.iter().any(|e| e == "response.created"),
+            "responses stream must open with response.created; got events {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e == "response.output_text.delta"),
+            "responses stream must carry response.output_text.delta; got events {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e == "response.completed"),
+            "responses stream must terminate with response.completed; got events {events:?}"
+        );
+        // The completed terminator must be the LAST typed event (native Responses ordering).
+        let created_at = events.iter().position(|e| e == "response.created");
+        let completed_at = events.iter().rposition(|e| e == "response.completed");
+        assert!(
+            matches!((created_at, completed_at), (Some(c), Some(d)) if c < d),
+            "responses response.created must precede response.completed; got events {events:?}"
         );
         handle.abort();
         server.shutdown().await;

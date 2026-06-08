@@ -30,7 +30,12 @@ fn unix_now_secs() -> u64 {
 /// second plus a process-global atomic counter.
 fn synth_message_id() -> String {
     let seq = SYNTH_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("msg_{:x}{:x}", unix_now_secs(), seq)
+    // Zero-pad the counter to a fixed 16 hex digits so the (timestamp, seq) encoding is injective
+    // by construction (the responses.rs pattern). Bare hex concatenation — `{:x}{:x}` — collides:
+    // (ts=0x60c1a430, seq=0x10) and (ts=0x60c1a4301, seq=0x0) both render `...4301 0`, and analogous
+    // pairs arise whenever the counter advances by a power of 16 between two adjacent seconds. The
+    // fixed-width counter field removes the ambiguity without a uuid/rand dependency.
+    format!("msg_{:x}{:016x}", unix_now_secs(), seq)
 }
 
 /// Mint a protocol-correct Anthropic request id (`req_<hex>`) for the top level of an error
@@ -40,7 +45,9 @@ fn synth_message_id() -> String {
 /// `synth_message_id` (unix second + process-global atomic counter) — no new dependency.
 fn synth_request_id() -> String {
     let seq = SYNTH_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("req_{:x}{:x}", unix_now_secs(), seq)
+    // Same fixed-width-counter construction as `synth_message_id`: the 16-hex-digit zero-padded
+    // counter makes the (timestamp, seq) pair injective, eliminating the bare-`{:x}{:x}` collision.
+    format!("req_{:x}{:016x}", unix_now_secs(), seq)
 }
 
 #[derive(Clone)]
@@ -808,7 +815,17 @@ fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
             serde_json::Value::Object(obj)
         }
         crate::ir::IrBlock::Image { media_type, data } => {
-            serde_json::json!({ "type": "image", "source": { "type": "base64", "media_type": media_type, "data": data  } })
+            // The OpenAI and Responses readers record an https:// image reference with the
+            // "image_url" media_type sentinel (the raw URL lives in `data`, not base64 bytes).
+            // Anthropic's Messages API has a native URL image source — emit it as
+            // `{"type":"url","url":<url>}` rather than wrapping the URL in a base64 source with
+            // `media_type:"image_url"`, which Anthropic rejects with a 400. A genuine base64 image
+            // (any real `image/*` media_type) still takes the base64 source path below.
+            if media_type == "image_url" {
+                serde_json::json!({ "type": "image", "source": { "type": "url", "url": data } })
+            } else {
+                serde_json::json!({ "type": "image", "source": { "type": "base64", "media_type": media_type, "data": data } })
+            }
         }
     }
 }
@@ -1017,16 +1034,25 @@ impl ProtocolWriter for AnthropicWriter {
                 msg_obj.insert("content".to_string(), serde_json::Value::Array(Vec::new()));
                 msg_obj.insert("stop_reason".to_string(), serde_json::Value::Null);
                 msg_obj.insert("stop_sequence".to_string(), serde_json::Value::Null);
+                // `usage` is a REQUIRED field of `message_start.message`: a native Anthropic stream
+                // always carries `usage:{"input_tokens":N,"output_tokens":0}` at stream open, and the
+                // official TypeScript SDK types `message.usage` as `Usage` (not `Usage | undefined`) —
+                // a client that reads `event.message.usage.input_tokens` on the first event throws if
+                // it is absent. On the cross-protocol path (e.g. OpenAI→Anthropic) the first chunk
+                // carries no usage, so `usage` is `None`; emit a zero-valued skeleton in that case
+                // (which also matches native behavior: output_tokens is 0 at stream open) rather than
+                // omitting the key.
+                let mut usage_map = serde_json::Map::new();
+                let (input_tokens, output_tokens) = usage
+                    .as_ref()
+                    .map(|u| (u.input_tokens, u.output_tokens))
+                    .unwrap_or((0, 0));
+                usage_map.insert("input_tokens".to_string(), serde_json::json!(input_tokens));
+                usage_map.insert(
+                    "output_tokens".to_string(),
+                    serde_json::json!(output_tokens),
+                );
                 if let Some(usage_val) = usage {
-                    let mut usage_map = serde_json::Map::new();
-                    usage_map.insert(
-                        "input_tokens".to_string(),
-                        serde_json::json!(usage_val.input_tokens),
-                    );
-                    usage_map.insert(
-                        "output_tokens".to_string(),
-                        serde_json::json!(usage_val.output_tokens),
-                    );
                     if let Some(ccit) = usage_val.cache_creation_input_tokens {
                         usage_map.insert(
                             "cache_creation_input_tokens".to_string(),
@@ -1039,8 +1065,8 @@ impl ProtocolWriter for AnthropicWriter {
                             serde_json::json!(crit),
                         );
                     }
-                    msg_obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
                 }
+                msg_obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
                 let mut data_obj = serde_json::Map::new();
                 data_obj.insert("message".to_string(), serde_json::Value::Object(msg_obj));
                 Some((
@@ -1795,5 +1821,170 @@ mod anthropic_hardening_tests {
             .read_response(&body)
             .expect("array content must parse without panic");
         assert_eq!(ir.content.len(), 2);
+    }
+
+    /// Round-5 finding (id synthesis class): the fixed-width-counter encoding must be injective, so
+    /// no `(ts, seq)` pair collides with an adjacent-second pair the bare `{:x}{:x}` scheme would
+    /// merge. We can't control the real clock, but we CAN assert the synthesized ids are strictly
+    /// unique across many rapid calls (same second, monotonic counter) — the exact regime where the
+    /// old scheme collided. Also asserts the suffix is fixed-width (the counter padded to 16 hex).
+    #[test]
+    fn synth_message_id_no_collision_under_rapid_minting() {
+        let n = 10_000;
+        let ids: std::collections::HashSet<String> = (0..n).map(|_| synth_message_id()).collect();
+        assert_eq!(
+            ids.len(),
+            n,
+            "every synthesized message id must be unique (fixed-width counter is injective)"
+        );
+        // Every suffix after `msg_<ts-hex>` carries a 16-hex-digit zero-padded counter, so the
+        // timestamp and counter fields are unambiguously separable — the property that kills the
+        // bare-concat collision.
+        for id in &ids {
+            let suffix = id.strip_prefix("msg_").expect("msg_ prefix");
+            assert!(
+                suffix.len() >= 16,
+                "suffix must hold at least the 16-hex counter field, got {suffix}"
+            );
+        }
+    }
+
+    /// Round-5 finding (id synthesis class): request ids share the same fixed-width construction and
+    /// must likewise never collide across rapid minting.
+    #[test]
+    fn synth_request_id_no_collision_under_rapid_minting() {
+        let n = 10_000;
+        let ids: std::collections::HashSet<String> = (0..n).map(|_| synth_request_id()).collect();
+        assert_eq!(
+            ids.len(),
+            n,
+            "every synthesized request id must be unique (fixed-width counter is injective)"
+        );
+    }
+
+    /// Round-5 finding (image_url sentinel class): an IR Image carrying the "image_url" media_type
+    /// sentinel (an https:// URL recorded by the OpenAI/Responses reader) must be written as
+    /// Anthropic's native URL image source `{"type":"url","url":<url>}`, NOT as a base64 source with
+    /// `media_type:"image_url"` (which Anthropic 400s).
+    #[test]
+    fn write_block_image_url_sentinel_emits_native_url_source() {
+        let block = crate::ir::IrBlock::Image {
+            media_type: "image_url".to_string(),
+            data: "https://example.com/cat.png".to_string(),
+        };
+        let out = write_block(&block);
+        assert_eq!(out.get("type").and_then(|t| t.as_str()), Some("image"));
+        let source = out.get("source").expect("source present");
+        assert_eq!(
+            source.get("type").and_then(|t| t.as_str()),
+            Some("url"),
+            "image_url sentinel must map to Anthropic's url source type"
+        );
+        assert_eq!(
+            source.get("url").and_then(|u| u.as_str()),
+            Some("https://example.com/cat.png"),
+            "the URL must be emitted natively, not as base64 data"
+        );
+        assert!(
+            source.get("data").is_none(),
+            "no base64 `data` field for a URL image source"
+        );
+        assert!(
+            source.get("media_type").is_none(),
+            "no `media_type:image_url` leak into the wire body"
+        );
+    }
+
+    /// Round-5 finding (image_url sentinel class): a genuine base64 image (a real `image/*`
+    /// media_type) must still take the base64 source path unchanged — the sentinel handling must not
+    /// regress the common case.
+    #[test]
+    fn write_block_real_base64_image_unchanged() {
+        let block = crate::ir::IrBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
+        };
+        let out = write_block(&block);
+        let source = out.get("source").expect("source present");
+        assert_eq!(source.get("type").and_then(|t| t.as_str()), Some("base64"));
+        assert_eq!(
+            source.get("media_type").and_then(|m| m.as_str()),
+            Some("image/png")
+        );
+        assert_eq!(
+            source.get("data").and_then(|d| d.as_str()),
+            Some("iVBORw0KGgo=")
+        );
+    }
+
+    /// Round-5 finding (stream-start skeleton class): `message_start` must carry a `usage` object
+    /// even when the IR `MessageStart.usage` is None (the OpenAI→Anthropic case). The native API
+    /// always emits `usage:{input_tokens,output_tokens}` at stream open, and the TS SDK types it as
+    /// required — a missing key crashes a client that reads `message.usage.input_tokens`.
+    #[test]
+    fn message_start_emits_zero_usage_when_none() {
+        let ev = IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: Some(1_700_000_000),
+            model: Some("gpt-4o".to_string()),
+        };
+        let (et, out) = AnthropicWriter
+            .write_response_event(&ev)
+            .expect("message_start writes");
+        assert_eq!(et, "message_start");
+        let usage = out
+            .get("message")
+            .and_then(|m| m.get("usage"))
+            .expect("usage object must be present even when source usage is None");
+        assert_eq!(
+            usage.get("input_tokens").and_then(|v| v.as_u64()),
+            Some(0),
+            "input_tokens must default to 0, not be omitted"
+        );
+        assert_eq!(
+            usage.get("output_tokens").and_then(|v| v.as_u64()),
+            Some(0),
+            "output_tokens must be 0 at stream open (native behavior)"
+        );
+    }
+
+    /// Round-5 finding (stream-start skeleton class): when usage IS present, its values and the
+    /// optional cache fields must flow through verbatim.
+    #[test]
+    fn message_start_emits_present_usage_with_cache_fields() {
+        let ev = IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: Some(IrUsage {
+                input_tokens: 42,
+                output_tokens: 0,
+                cache_creation_input_tokens: Some(5),
+                cache_read_input_tokens: Some(7),
+            }),
+            id: Some("msg_x".to_string()),
+            created: None,
+            model: None,
+        };
+        let (_, out) = AnthropicWriter
+            .write_response_event(&ev)
+            .expect("message_start writes");
+        let usage = out
+            .get("message")
+            .and_then(|m| m.get("usage"))
+            .expect("usage present");
+        assert_eq!(usage.get("input_tokens").and_then(|v| v.as_u64()), Some(42));
+        assert_eq!(
+            usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64()),
+            Some(5)
+        );
+        assert_eq!(
+            usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64()),
+            Some(7)
+        );
     }
 }

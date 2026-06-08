@@ -38,26 +38,79 @@ pub(crate) fn error_kind_to_bedrock_type(kind: &str) -> &'static str {
     }
 }
 
-/// Map a mid-stream `IrError` to the native AWS Converse `(exception_name, message)` a Bedrock SDK
-/// expects. Shared by `write_response_exception` (the StreamTranslate exception-frame path) and the
-/// fallback `write_response_event` Error arm so the class→exception mapping has a single source of
-/// truth. The message prefers the upstream's `provider_signal`, falling back to the exception name.
-fn bedrock_exception_for(err: &crate::proto::IrError) -> (&'static str, String) {
-    let kind = match err.class {
-        StatusClass::RateLimit => "throttling",
-        StatusClass::Timeout => "model_timeout",
-        StatusClass::Auth => "auth",
-        StatusClass::Billing => "quota_exceeded",
-        StatusClass::ClientError | StatusClass::ContextLength => "invalid_request",
-        StatusClass::Overloaded => "service_unavailable",
-        StatusClass::ServerError | StatusClass::Network => "api_error",
+/// Map a mid-stream `IrError` to the native AWS Converse *ConverseStream output-union* member name
+/// the SDK's stream decoder recognizes, plus the human-readable message.
+///
+/// This is DISTINCT from `error_kind_to_bedrock_type` (which maps the full closed set of
+/// REQUEST-level / HTTP Converse exceptions). The ConverseStream response is a Smithy event stream
+/// whose modeled mid-stream error events are a SMALLER, fixed union of exactly five shapes:
+/// `InternalServerException`, `ModelStreamErrorException`, `ValidationException`,
+/// `ThrottlingException`, and `ServiceUnavailableException`. Request-level shapes such as
+/// `ModelTimeoutException`, `AccessDeniedException`, and `ServiceQuotaExceededException` are NOT
+/// members of that union: a native AWS SDK ConverseStream decoder sees such an `:exception-type`,
+/// fails to match it against the stream union, and treats it as an unknown/unmodeled event — so it
+/// can never raise the typed mid-stream exception (an indistinguishability tell). We therefore fold
+/// every error class onto one of the five legal stream members:
+///
+/// - `RateLimit` → `ThrottlingException`
+/// - `Overloaded` → `ServiceUnavailableException`
+/// - `ClientError` / `ContextLength` → `ValidationException`
+/// - `Timeout` → `ModelStreamErrorException` (the stream-internal failure shape)
+/// - `Auth` / `Billing` / `ServerError` / `Network` → `InternalServerException`
+///
+/// `Auth` and `Billing` have no stream-union counterpart, so they fold into the generic
+/// `InternalServerException` rather than leaking a request-level name onto the stream. Each class is
+/// matched explicitly — no catch-all — so a new `StatusClass` variant fails to compile here.
+///
+/// Shared by `write_response_exception` (the StreamTranslate exception-frame path) and the fallback
+/// `write_response_event` Error arm (also a stream-output context) so both stay consistent. The
+/// message prefers the upstream's `provider_signal`, falling back to the exception name.
+fn bedrock_stream_exception_for(err: &crate::proto::IrError) -> (&'static str, String) {
+    let exception_name = match err.class {
+        StatusClass::RateLimit => "ThrottlingException",
+        StatusClass::Overloaded => "ServiceUnavailableException",
+        StatusClass::ClientError | StatusClass::ContextLength => "ValidationException",
+        StatusClass::Timeout => "ModelStreamErrorException",
+        StatusClass::Auth
+        | StatusClass::Billing
+        | StatusClass::ServerError
+        | StatusClass::Network => "InternalServerException",
     };
-    let exception_name = error_kind_to_bedrock_type(kind);
     let message = err
         .provider_signal
         .clone()
         .unwrap_or_else(|| exception_name.to_string());
     (exception_name, message)
+}
+
+/// Build a native Bedrock Converse `image` block body (`{ "format", "source": { "bytes" } }`) from
+/// an IR `Image (media_type, data)` pair, or `None` when the image cannot be represented natively.
+///
+/// The IR uses an `"image_url"` media_type SENTINEL (set by the OpenAI / Responses readers) to mark
+/// that `data` holds a raw URL — an `https://…` reference, or a data: URI that could not be
+/// confidently split into a MIME type + base64 payload — rather than a base64 byte string. The
+/// Bedrock Converse `image` block has only two source shapes: `source.bytes` (base64) and
+/// `source.s3Location` (an S3 URI). It has NO arbitrary-URL source. The previous code stuffed the
+/// sentinel URL straight into `source.bytes` and labeled it `format: "png"` (the `strip_prefix`
+/// fallback), emitting a block whose "base64" payload is actually a URL — garbage a native Bedrock
+/// SDK rejects or mis-decodes, and a detectable proxy tell. There is no lossless native projection
+/// of an arbitrary-URL image onto Converse, so we DROP the block (with a trace) rather than emit a
+/// corrupt one — mirroring how non-representable Thinking blocks are dropped. A genuine base64 image
+/// (any `media_type` other than the sentinel) is emitted natively as before.
+fn bedrock_image_block(media_type: &str, data: &str) -> Option<serde_json::Value> {
+    if media_type == "image_url" {
+        tracing::warn!(
+            "dropping URL-source image (media_type=\"image_url\"): Bedrock Converse has no \
+             arbitrary-URL image source (only base64 `bytes` / `s3Location`), so emitting it as \
+             base64 would corrupt the block"
+        );
+        return None;
+    }
+    let format_str = media_type.strip_prefix("image/").unwrap_or("png");
+    Some(serde_json::json!({
+        "format": format_str,
+        "source": { "bytes": data }
+    }))
 }
 
 /// Bedrock stopReason → canonical IR stop_reason.
@@ -192,17 +245,21 @@ impl ProtocolReader for BedrockReader {
         // below; it is intentionally NOT echoed via `extra` (a native Bedrock body never carries it,
         // and re-emitting it would be a tell). All other modeled keys are re-serialised by
         // `write_request` from the structured IR, so excluding them here avoids a double-emit.
-        let modeled_keys: std::collections::HashSet<&str> = [
-            "system",
-            "messages",
-            "toolConfig",
-            "inferenceConfig",
-            "stream",
-            "model",
-        ]
-        .iter()
-        .cloned()
-        .collect();
+        // NOTE: `inferenceConfig` is DELIBERATELY NOT modeled-out here. This reader only typed two of
+        // its sub-fields (`maxTokens`, `temperature`); the rest — `stopSequences`, `topP`, `topK`,
+        // `stopCriteria`, and any future AWS-defined sub-field — were silently dropped on both
+        // same-protocol passthrough AND cross-protocol egress, changing model behaviour (no stop at
+        // the requested sequences, different sampling) and making the proxy behaviourally divergent
+        // from a direct AWS call. So we capture the WHOLE raw `inferenceConfig` object into `extra`
+        // (preserving every sub-field verbatim) and let `write_request` overlay the two typed fields
+        // (`maxTokens`/`temperature`) onto that raw object. The two typed fields are still parsed into
+        // the structured IR below for cross-protocol egress; the raw capture is what makes a
+        // Bedrock->Bedrock passthrough re-emit `stopSequences`/`topP`/`topK` faithfully.
+        let modeled_keys: std::collections::HashSet<&str> =
+            ["system", "messages", "toolConfig", "stream", "model"]
+                .iter()
+                .cloned()
+                .collect();
 
         let mut extra = serde_json::Map::new();
         for (key, value) in obj.iter() {
@@ -952,13 +1009,11 @@ impl ProtocolWriter for BedrockWriter {
                                 // the constant string `"{}"`: a JSON-string Text-equivalent or a
                                 // structured result that arrives via the IR is re-encoded faithfully.
                                 crate::ir::IrBlock::Image { media_type, data } => {
-                                    let format_str = media_type
-                                        .strip_prefix("image/")
-                                        .unwrap_or("png")
-                                        .to_string();
-                                    inner_content.push(serde_json::json!({
-                                        "image": { "format": format_str, "source": { "bytes": data } }
-                                    }));
+                                    if let Some(image_block) = bedrock_image_block(media_type, data)
+                                    {
+                                        inner_content
+                                            .push(serde_json::json!({ "image": image_block }));
+                                    }
                                 }
                                 crate::ir::IrBlock::ToolUse { id, name, input } => {
                                     // Nested ToolUse inside a tool result has no native Bedrock
@@ -995,11 +1050,9 @@ impl ProtocolWriter for BedrockWriter {
                         content_arr.push(serde_json::json!({"toolResult": {"toolUseId": tool_use_id, "content": inner_content, "status": status_str}}));
                     }
                     crate::ir::IrBlock::Image { media_type, data } => {
-                        let format_str = media_type
-                            .strip_prefix("image/")
-                            .unwrap_or("png")
-                            .to_string();
-                        content_arr.push(serde_json::json!({"image": {"format": format_str, "source": {"bytes": data}}}));
+                        if let Some(image_block) = bedrock_image_block(media_type, data) {
+                            content_arr.push(serde_json::json!({ "image": image_block }));
+                        }
                     }
                     crate::ir::IrBlock::Thinking { .. } => {}
                 }
@@ -1017,7 +1070,20 @@ impl ProtocolWriter for BedrockWriter {
             out.insert("messages".to_string(), serde_json::Value::Array(msgs_arr));
         }
 
-        let mut inference_config = serde_json::Map::new();
+        // Rebuild `inferenceConfig` by OVERLAYING the two typed fields (`maxTokens`/`temperature`)
+        // onto the RAW `inferenceConfig` object the reader captured into `extra`. This preserves
+        // every sub-field the reader does not model (`stopSequences`, `topP`, `topK`, `stopCriteria`,
+        // future AWS additions) on a same-protocol passthrough while still letting a cross-protocol
+        // egress (where `extra` carries no `inferenceConfig`) emit a config built purely from the
+        // typed IR. The typed fields WIN over any same-named raw entry so the structured IR remains
+        // the source of truth for the values it models. `extra`'s raw `inferenceConfig` is consumed
+        // here (not re-emitted by the trailing extra-merge), so there is no double-emit.
+        let mut inference_config = req
+            .extra
+            .get("inferenceConfig")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
         if let Some(max_tokens) = req.max_tokens {
             inference_config.insert("maxTokens".to_string(), serde_json::json!(max_tokens));
         }
@@ -1063,6 +1129,12 @@ impl ProtocolWriter for BedrockWriter {
         }
 
         for (key, value) in &req.extra {
+            // `inferenceConfig` was already consumed above (typed fields overlaid onto the raw
+            // object); re-inserting the raw copy here would clobber that overlay and drop the typed
+            // `maxTokens`/`temperature`. Every other unmodeled field passes through verbatim.
+            if key == "inferenceConfig" {
+                continue;
+            }
             out.insert(key.clone(), value.clone());
         }
 
@@ -1177,11 +1249,12 @@ impl ProtocolWriter for BedrockWriter {
             // `write_response_exception` + `eventstream::encode_exception_frame` BEFORE reaching this
             // arm (a Bedrock-ingress stream never routes an `Error` through `write_response_event`).
             // This arm therefore only fires if a non-eventstream consumer ever drives a Bedrock
-            // writer with an `Error` event; it falls back to a normal `event`-typed frame naming the
-            // real Converse exception so the type token is still a genuine AWS name rather than the
-            // literal `"error"`.
+            // writer with an `Error` event; it falls back to a normal `event`-typed frame naming a
+            // real ConverseStream-output exception (via `bedrock_stream_exception_for`, the five-member
+            // stream union — NOT the request-level HTTP set) so the type token is still a genuine AWS
+            // stream-event name rather than the literal `"error"` or a non-stream request shape.
             IrStreamEvent::Error(err) => {
-                let (exception_name, message) = bedrock_exception_for(err);
+                let (exception_name, message) = bedrock_stream_exception_for(err);
                 Some((
                     exception_name.to_string(),
                     serde_json::json!({ "message": message }),
@@ -1193,10 +1266,14 @@ impl ProtocolWriter for BedrockWriter {
     /// A Bedrock-ingress stream signals a mid-stream error with a MODELED-EXCEPTION event-stream
     /// frame (`:message-type: exception`), which `StreamTranslate` emits via
     /// `eventstream::encode_exception_frame`. This maps the IR error to that frame's
-    /// `(exception_name, message)`, sharing the class→exception mapping with the (fallback)
+    /// `(exception_name, message)` using `bedrock_stream_exception_for` — the FIVE-member
+    /// ConverseStream output-union (`InternalServerException`, `ModelStreamErrorException`,
+    /// `ValidationException`, `ThrottlingException`, `ServiceUnavailableException`), NOT the larger
+    /// request-level HTTP exception set — so a native AWS SDK stream decoder always recognizes the
+    /// `:exception-type` as a modeled stream event. Shares the mapping with the (fallback)
     /// `write_response_event` Error arm so both stay consistent.
     fn write_response_exception(&self, err: &crate::proto::IrError) -> Option<(String, String)> {
-        let (exception_name, message) = bedrock_exception_for(err);
+        let (exception_name, message) = bedrock_stream_exception_for(err);
         Some((exception_name.to_string(), message))
     }
 
@@ -1618,36 +1695,27 @@ mod tests {
         let reader = BedrockReader;
         let writer = BedrockWriter;
 
-        let ir = crate::ir::IrRequest {
-            system: vec![crate::ir::IrBlock::Text {
-                text: "You are helpful.".to_string(),
-                cache_control: None,
-                citations: Vec::new(),
-            }],
-            messages: vec![crate::ir::IrMessage {
-                role: crate::ir::IrRole::User,
-                content: vec![crate::ir::IrBlock::Text {
-                    text: "Hello!".to_string(),
-                    cache_control: None,
-                    citations: Vec::new(),
-                }],
-            }],
-            tools: vec![],
-            max_tokens: Some(512),
-            temperature: Some(0.7_f64),
-            stream: false,
-            extra: serde_json::Map::new(),
-        };
+        // Same-protocol passthrough fidelity is a WIRE->IR->WIRE byte-identity guarantee: a native
+        // Converse body read into the IR and written back must reproduce the original body exactly.
+        // (Note: an IR->WIRE->IR round-trip is intentionally NOT idempotent for the typed
+        // `inferenceConfig` sub-fields — the reader now captures the whole raw `inferenceConfig` into
+        // `extra` so unmodeled sub-fields survive passthrough (finding-2 fix), so reading a written
+        // body re-populates `extra.inferenceConfig`. The contract that matters is the wire round-trip
+        // below.)
+        let wire = serde_json::json!({
+            "system": [{"text": "You are helpful."}],
+            "messages": [{"role": "user", "content": [{"text": "Hello!"}]}],
+            "inferenceConfig": {"maxTokens": 512, "temperature": 0.7}
+        });
 
-        let ir_before = ir.clone();
-        let json = writer.write_request(&ir);
-        let ir_after = reader
-            .read_request(&json)
+        let ir = reader
+            .read_request(&wire)
             .expect("read round-trip should succeed");
+        let wire_after = writer.write_request(&ir);
 
         assert_eq!(
-            ir_before, ir_after,
-            "round-trip must be byte-identical for text-only IrRequest"
+            wire, wire_after,
+            "same-protocol wire round-trip must be byte-identical"
         );
     }
 
@@ -2545,9 +2613,11 @@ mod tests {
     /// extra-merge). Previously `extra` was built empty and every native Converse field this reader
     /// does not explicitly model — `topP`, `topK`, `stopSequences`, `guardrailConfig`,
     /// `additionalModelRequestFields`, etc. — was silently dropped, disabling guardrails / resetting
-    /// sampling on passthrough. The modeled keys (system/messages/toolConfig/inferenceConfig/stream)
-    /// must NOT leak into `extra` (they are re-serialised from the structured IR; a double-emit /
-    /// echoed `stream` would be a tell).
+    /// sampling on passthrough. The fully-modeled keys (system/messages/toolConfig/stream) must NOT
+    /// leak into `extra` (they are re-serialised from the structured IR; a double-emit / echoed
+    /// `stream` would be a tell). `inferenceConfig` is the exception: it is only PARTIALLY modeled
+    /// (just `maxTokens`/`temperature`), so the WHOLE raw object is now captured into `extra` to
+    /// preserve its unmodeled sub-fields (`stopSequences`/`topP`/`topK`/...) — see the finding-2 fix.
     #[test]
     fn test_read_request_collects_unmodeled_fields_into_extra() {
         let reader = BedrockReader;
@@ -2581,14 +2651,17 @@ mod tests {
             Some(&serde_json::json!({"foo": "bar"}))
         );
 
-        // Modeled keys must NOT be duplicated into `extra` (avoids double-emit / echoed `stream`).
-        for k in [
-            "system",
-            "messages",
-            "toolConfig",
-            "inferenceConfig",
-            "stream",
-        ] {
+        // `inferenceConfig` IS now captured verbatim into `extra` (it is only partially modeled, so
+        // its raw object preserves unmodeled sub-fields for passthrough; finding-2 fix).
+        assert_eq!(
+            ir.extra.get("inferenceConfig"),
+            Some(&serde_json::json!({"maxTokens": 10})),
+            "inferenceConfig must be captured into extra verbatim"
+        );
+
+        // Fully-modeled keys must NOT be duplicated into `extra` (avoids double-emit / echoed
+        // `stream`). `inferenceConfig` is intentionally absent from this list now (see above).
+        for k in ["system", "messages", "toolConfig", "stream"] {
             assert!(
                 ir.extra.get(k).is_none(),
                 "modeled key `{k}` must not leak into extra; got {:?}",
@@ -2925,6 +2998,370 @@ mod tests {
         assert_eq!(
             body.pointer("/usage/totalTokens").and_then(|v| v.as_u64()),
             Some(15)
+        );
+    }
+
+    // --- Round 5 regression tests --------------------------------------------------------------
+
+    /// Regression (finding 2 — reader+writer): an `inferenceConfig` carrying sub-fields this reader
+    /// does NOT type (`stopSequences`, `topP`, `topK`, future AWS additions) must survive a
+    /// same-protocol Bedrock->Bedrock passthrough, NOT be silently dropped. Previously
+    /// `inferenceConfig` was modeled-out wholesale and only `maxTokens`/`temperature` were
+    /// re-emitted, so `stopSequences` (a commonly-used generation-boundary control) and the
+    /// `topP`/`topK` sampling knobs vanished — changing model behaviour vs a direct AWS call.
+    #[test]
+    fn test_inference_config_passthrough_preserves_unmodeled_subfields() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let wire = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+            "inferenceConfig": {
+                "maxTokens": 256,
+                "temperature": 0.3,
+                "topP": 0.9,
+                "topK": 50,
+                "stopSequences": ["\n\nHuman:", "END"]
+            }
+        });
+
+        let ir = reader.read_request(&wire).expect("read_request");
+        // The typed fields still flow into the structured IR (for cross-protocol egress).
+        assert_eq!(ir.max_tokens, Some(256));
+        assert_eq!(ir.temperature, Some(0.3));
+        // The whole raw inferenceConfig is captured for passthrough fidelity.
+        assert!(ir.extra.contains_key("inferenceConfig"));
+
+        let out = writer.write_request(&ir);
+        // Every sub-field — modeled AND unmodeled — must round-trip onto the wire.
+        assert_eq!(
+            out.pointer("/inferenceConfig/maxTokens")
+                .and_then(|v| v.as_u64()),
+            Some(256)
+        );
+        assert_eq!(
+            out.pointer("/inferenceConfig/temperature")
+                .and_then(|v| v.as_f64()),
+            Some(0.3)
+        );
+        assert_eq!(
+            out.pointer("/inferenceConfig/topP")
+                .and_then(|v| v.as_f64()),
+            Some(0.9),
+            "topP must survive passthrough; got {out}"
+        );
+        assert_eq!(
+            out.pointer("/inferenceConfig/topK")
+                .and_then(|v| v.as_u64()),
+            Some(50),
+            "topK must survive passthrough; got {out}"
+        );
+        assert_eq!(
+            out.pointer("/inferenceConfig/stopSequences"),
+            Some(&serde_json::json!(["\n\nHuman:", "END"])),
+            "stopSequences must survive passthrough; got {out}"
+        );
+        // The whole body round-trips byte-identically (no `inferenceConfig` double-emit).
+        assert_eq!(out, wire, "full body must round-trip byte-identically");
+    }
+
+    /// Regression (finding 2): the typed IR fields WIN over a same-named raw `inferenceConfig` entry
+    /// (the structured IR is the source of truth for the values it models), and a cross-protocol
+    /// egress (no `inferenceConfig` in `extra`) still emits a config built purely from the typed IR.
+    #[test]
+    fn test_inference_config_typed_fields_override_raw_and_cross_protocol() {
+        let writer = BedrockWriter;
+
+        // Typed maxTokens overrides a stale raw value carried in extra.
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "inferenceConfig".to_string(),
+            serde_json::json!({"maxTokens": 1, "topP": 0.5}),
+        );
+        let ir = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: Some(999),
+            temperature: None,
+            stream: false,
+            extra,
+        };
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out.pointer("/inferenceConfig/maxTokens")
+                .and_then(|v| v.as_u64()),
+            Some(999),
+            "typed maxTokens must override the raw extra value; got {out}"
+        );
+        assert_eq!(
+            out.pointer("/inferenceConfig/topP")
+                .and_then(|v| v.as_f64()),
+            Some(0.5),
+            "unmodeled topP from raw config still survives"
+        );
+
+        // Cross-protocol egress: no inferenceConfig in extra → config built purely from typed IR.
+        let ir2 = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: Some(42),
+            temperature: Some(0.1),
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out2 = writer.write_request(&ir2);
+        assert_eq!(
+            out2.pointer("/inferenceConfig/maxTokens")
+                .and_then(|v| v.as_u64()),
+            Some(42)
+        );
+        assert_eq!(
+            out2.pointer("/inferenceConfig/temperature")
+                .and_then(|v| v.as_f64()),
+            Some(0.1)
+        );
+        // No stray topP/stopSequences appear from nowhere.
+        assert!(out2.pointer("/inferenceConfig/topP").is_none());
+    }
+
+    /// Regression (finding 3): a mid-stream `IrError` mapped for the ConverseStream output union must
+    /// only ever name one of the FIVE legal stream-event exceptions. Request-level shapes
+    /// (`ModelTimeoutException`, `AccessDeniedException`, `ServiceQuotaExceededException`) are NOT
+    /// members of the stream union and would be treated as unknown/unmodeled by a native AWS SDK
+    /// stream decoder — an indistinguishability tell. Both the exception-frame path
+    /// (`write_response_exception`) and the fallback `write_response_event` Error arm use this map.
+    #[test]
+    fn test_stream_exception_only_emits_converse_stream_union_members() {
+        let writer = BedrockWriter;
+        const STREAM_UNION: [&str; 5] = [
+            "InternalServerException",
+            "ModelStreamErrorException",
+            "ValidationException",
+            "ThrottlingException",
+            "ServiceUnavailableException",
+        ];
+
+        let cases = [
+            (StatusClass::RateLimit, "ThrottlingException"),
+            (StatusClass::Overloaded, "ServiceUnavailableException"),
+            (StatusClass::ClientError, "ValidationException"),
+            (StatusClass::ContextLength, "ValidationException"),
+            // Timeout folds onto the stream-internal failure shape, NOT request-level
+            // ModelTimeoutException (not a stream-union member).
+            (StatusClass::Timeout, "ModelStreamErrorException"),
+            // Auth / Billing have no stream-union counterpart → generic InternalServerException
+            // (NOT AccessDeniedException / ServiceQuotaExceededException, which are request-level).
+            (StatusClass::Auth, "InternalServerException"),
+            (StatusClass::Billing, "InternalServerException"),
+            (StatusClass::ServerError, "InternalServerException"),
+            (StatusClass::Network, "InternalServerException"),
+        ];
+
+        for (class, expected) in cases {
+            let err = crate::proto::IrError {
+                class,
+                provider_signal: Some("upstream detail".to_string()),
+                retry_after: None,
+            };
+            // Exception-frame path.
+            let (exc, msg) = writer
+                .write_response_exception(&err)
+                .expect("write_response_exception must map every class");
+            assert_eq!(
+                exc, expected,
+                "class {class:?} must map to {expected} on the exception frame"
+            );
+            assert!(
+                STREAM_UNION.contains(&exc.as_str()),
+                "{exc} is not a ConverseStream output-union member"
+            );
+            assert_eq!(msg, "upstream detail", "message prefers provider_signal");
+
+            // Fallback event-arm path uses the SAME stream union.
+            let ev = IrStreamEvent::Error(crate::proto::IrError {
+                class,
+                provider_signal: None,
+                retry_after: None,
+            });
+            let (et, payload) = writer
+                .write_response_event(&ev)
+                .expect("error event must emit a frame");
+            assert_eq!(
+                et, expected,
+                "event-arm class {class:?} must also map to {expected}"
+            );
+            assert!(
+                STREAM_UNION.contains(&et.as_str()),
+                "{et} is not a ConverseStream output-union member"
+            );
+            // Falls back to the exception name when no provider_signal is present.
+            assert_eq!(
+                payload.get("message").and_then(|m| m.as_str()),
+                Some(expected)
+            );
+        }
+
+        // Explicitly assert the request-level-only shapes never appear on the stream path.
+        for class in [
+            StatusClass::Timeout,
+            StatusClass::Auth,
+            StatusClass::Billing,
+        ] {
+            let err = crate::proto::IrError {
+                class,
+                provider_signal: None,
+                retry_after: None,
+            };
+            let (exc, _) = writer.write_response_exception(&err).unwrap();
+            assert_ne!(exc, "ModelTimeoutException");
+            assert_ne!(exc, "AccessDeniedException");
+            assert_ne!(exc, "ServiceQuotaExceededException");
+        }
+    }
+
+    /// Regression (class sweep — image `"image_url"` sentinel): a cross-protocol ingress
+    /// (OpenAI/Responses) parses an `https://…` image into the IR as
+    /// `Image{media_type: "image_url", data: <url>}`. The Bedrock Converse `image` block has no
+    /// arbitrary-URL source (only base64 `bytes` / `s3Location`), so the URL must NOT be stuffed into
+    /// `source.bytes` and labeled `format: "png"` (the old behavior — a corrupt block a native SDK
+    /// rejects). Such a block is DROPPED (with a trace), never mangled. A genuine base64 image is
+    /// still emitted natively.
+    #[test]
+    fn test_write_request_url_sentinel_image_not_emitted_as_base64() {
+        let writer = BedrockWriter;
+
+        // Top-level URL-sentinel image → dropped (no image block, no garbage bytes).
+        let url = "https://example.com/cat.png";
+        let req = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![
+                    crate::ir::IrBlock::Text {
+                        text: "look".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    },
+                    crate::ir::IrBlock::Image {
+                        media_type: "image_url".to_string(),
+                        data: url.to_string(),
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = writer.write_request(&req);
+        let wire = serde_json::to_string(&out).unwrap();
+        assert!(
+            !wire.contains(url),
+            "URL must NOT be emitted as base64 image bytes; got {wire}"
+        );
+        assert!(
+            !wire.contains("\"image\""),
+            "no image block must be emitted for a URL sentinel; got {wire}"
+        );
+        // The accompanying text block still survives.
+        assert_eq!(
+            out.pointer("/messages/0/content/0/text")
+                .and_then(|v| v.as_str()),
+            Some("look")
+        );
+
+        // A genuine base64 image is still emitted natively.
+        let req2 = crate::ir::IrRequest {
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "QkFTRTY0".to_string(),
+                }],
+            }],
+            ..req.clone()
+        };
+        let out2 = writer.write_request(&req2);
+        assert_eq!(
+            out2.pointer("/messages/0/content/0/image/format")
+                .and_then(|v| v.as_str()),
+            Some("png")
+        );
+        assert_eq!(
+            out2.pointer("/messages/0/content/0/image/source/bytes")
+                .and_then(|v| v.as_str()),
+            Some("QkFTRTY0")
+        );
+    }
+
+    /// Regression (class sweep — image sentinel inside a toolResult): the same URL-sentinel guard
+    /// applies to an `Image` nested in a `ToolResult`'s content — it must be dropped, not mangled
+    /// into a base64 `image` block, while a base64 image inside a toolResult is still emitted.
+    #[test]
+    fn test_write_request_tool_result_url_sentinel_image_dropped() {
+        let writer = BedrockWriter;
+        let url = "https://example.com/in-tool.png";
+        let req = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Tool,
+                content: vec![crate::ir::IrBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: vec![
+                        crate::ir::IrBlock::Text {
+                            text: "result".to_string(),
+                            cache_control: None,
+                            citations: Vec::new(),
+                        },
+                        crate::ir::IrBlock::Image {
+                            media_type: "image_url".to_string(),
+                            data: url.to_string(),
+                        },
+                    ],
+                    is_error: false,
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = writer.write_request(&req);
+        let wire = serde_json::to_string(&out).unwrap();
+        assert!(
+            !wire.contains(url),
+            "URL sentinel inside toolResult must not be emitted as base64; got {wire}"
+        );
+        // The text content of the toolResult still survives.
+        assert_eq!(
+            out.pointer("/messages/0/content/0/toolResult/content/0/text")
+                .and_then(|v| v.as_str()),
+            Some("result")
+        );
+        // Only the text inner block survives (the URL image was dropped).
+        assert_eq!(
+            out.pointer("/messages/0/content/0/toolResult/content")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1),
+            "URL-sentinel image inner block must be dropped; got {out}"
         );
     }
 }

@@ -1217,7 +1217,231 @@ mod tests {
             402,
             "over-budget key → payment required"
         );
+        // The 402 must carry the NATIVE Anthropic error envelope with the CANONICAL quota
+        // `error.type` ("insufficient_quota"), not merely the right status code. A regression that
+        // reverted the budget kind to the non-canonical `billing_error` token (which the writers pass
+        // through verbatim) would still be a 402 but would emit an `error.type` an SDK's typed
+        // exception mapping does not recognize — a router-side tell this assertion guards.
+        assert_eq!(
+            r.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|h| h.to_str().ok()),
+            Some("application/json"),
+            "402 budget rejection is application/json"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            body.get("type").and_then(|t| t.as_str()),
+            Some("error"),
+            "anthropic 402 envelope has top-level type:error; got {body}"
+        );
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("insufficient_quota"),
+            "anthropic 402 carries canonical insufficient_quota error.type; got {body}"
+        );
 
+        handle.abort();
+    }
+
+    /// Build a router whose ONLY virtual key is already over its (total-window) budget, so every
+    /// request is rejected with a 402 by `budget_check` before any forwarding. Returns the bound
+    /// address, the serve handle, and the secret to present. Shared by the per-protocol 402
+    /// envelope tests below: the rejection fires before resolution, so no lane/pool/backend is
+    /// needed — only a parseable body that carries `model` where the protocol expects it.
+    async fn over_budget_router() -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        &'static str,
+    ) {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let secret = "sk-vk-broke-multi";
+        store
+            .put_key(&VirtualKey {
+                id: "kbm".to_string(),
+                key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
+                name: "broke-multi".to_string(),
+                allowed_pools: vec![], // all pools
+                max_budget_cents: Some(100),
+                budget_period: "total".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        store.add_usage("kbm", 0, 250, 0, true).unwrap();
+        let gov = Arc::new(GovState::new(store, 1, 0, None).unwrap());
+
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (addr, handle, secret)
+    }
+
+    /// OpenAI ingress (`/v1/chat/completions`): an over-budget 402 must carry the native OpenAI error
+    /// envelope (`error.type == "insufficient_quota"`).
+    #[tokio::test]
+    async fn test_budget_402_openai_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) = over_budget_router().await;
+
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth(secret)
+            .body(json!({"model": "anything", "messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 402, "openai over-budget → 402");
+        assert_eq!(
+            r.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|h| h.to_str().ok()),
+            Some("application/json"),
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("insufficient_quota"),
+            "openai 402 carries insufficient_quota error.type; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Responses ingress (`/v1/responses`): an over-budget 402 must carry the native Responses error
+    /// envelope (`error.type == "insufficient_quota"`).
+    #[tokio::test]
+    async fn test_budget_402_responses_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) = over_budget_router().await;
+
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/responses"))
+            .bearer_auth(secret)
+            .body(json!({"model": "anything", "input": "hi"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 402, "responses over-budget → 402");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("insufficient_quota"),
+            "responses 402 carries insufficient_quota error.type; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Cohere ingress (`/v2/chat`): an over-budget 402 must carry the native Cohere error envelope —
+    /// a BARE top-level `message` with NO `error`/`type` wrapper.
+    #[tokio::test]
+    async fn test_budget_402_cohere_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) = over_budget_router().await;
+
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}/v2/chat"))
+            .bearer_auth(secret)
+            .body(json!({"model": "anything", "messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 402, "cohere over-budget → 402");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert!(
+            body.get("message").and_then(|m| m.as_str()).is_some(),
+            "cohere 402 envelope carries a bare top-level message; got {body}"
+        );
+        assert!(
+            body.get("error").is_none() && body.get("type").is_none(),
+            "cohere 402 envelope has NO error/type wrapper (native Cohere shape); got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Gemini ingress (`/v1beta/models/x:generateContent`): an over-budget 402 must carry the native
+    /// Gemini error envelope — `error.code == 402` and `error.status` set.
+    #[tokio::test]
+    async fn test_budget_402_gemini_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) = over_budget_router().await;
+
+        let r = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/v1beta/models/anything:generateContent"
+            ))
+            .bearer_auth(secret)
+            .body(json!({"contents": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 402, "gemini over-budget → 402");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_u64()),
+            Some(402),
+            "gemini 402 envelope carries error.code == 402; got {body}"
+        );
+        assert!(
+            body.get("error")
+                .and_then(|e| e.get("status"))
+                .and_then(|s| s.as_str())
+                .is_some(),
+            "gemini 402 envelope carries error.status; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Bedrock ingress (`/model/x/converse`): an over-budget 402 must carry the native AWS JSON-1.1
+    /// error envelope (`__type == "ServiceQuotaExceededException"`) AND the `x-amzn-errortype` /
+    /// `x-amzn-RequestId` headers a native Bedrock runtime response always carries.
+    #[tokio::test]
+    async fn test_budget_402_bedrock_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) = over_budget_router().await;
+
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}/model/anything/converse"))
+            .bearer_auth(secret)
+            .body(json!({"messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 402, "bedrock over-budget → 402");
+        // Headers: a native Bedrock error always carries x-amzn-RequestId and x-amzn-errortype.
+        let errortype_hdr = r
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        assert_eq!(
+            errortype_hdr.as_deref(),
+            Some("ServiceQuotaExceededException"),
+            "bedrock 402 carries x-amzn-errortype header matching __type"
+        );
+        assert!(
+            r.headers().get("x-amzn-requestid").is_some(),
+            "bedrock 402 carries an x-amzn-RequestId header"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            body.get("__type").and_then(|t| t.as_str()),
+            Some("ServiceQuotaExceededException"),
+            "bedrock 402 envelope carries __type == ServiceQuotaExceededException; got {body}"
+        );
         handle.abort();
     }
 
