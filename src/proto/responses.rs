@@ -139,6 +139,7 @@ impl ProtocolReader for ResponsesReader {
         }
     }
 
+    #[cfg(test)]
     fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal {
         let code_is_context = serde_json::from_slice::<serde_json::Value>(body)
             .ok()

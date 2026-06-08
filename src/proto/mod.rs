@@ -8,7 +8,11 @@
 use axum::http::{header::HeaderValue, HeaderName, StatusCode};
 use std::sync::Arc;
 
-// StatusClass and CanonicalSignal are defined in breaker.rs and re-exported here for compatibility
+// StatusClass and CanonicalSignal are defined in breaker.rs and re-exported here for compatibility.
+// The `CanonicalSignal` re-export is consumed only by the per-protocol `classify` test helpers (which
+// are themselves `#[cfg(test)]`), so it is gated to test builds to avoid an unused-import warning in
+// the 1.0 binary; production code refers to the canonical `crate::breaker::CanonicalSignal` directly.
+#[cfg(test)]
 pub(crate) use crate::breaker::CanonicalSignal;
 pub(crate) use crate::breaker::StatusClass;
 
@@ -147,9 +151,10 @@ pub(crate) trait ProtocolReader: Send + Sync {
 
     /// Classify a response into a canonical signal in one call (convenience over
     /// `extract_error` + `normalize_raw_error`). The release path runs those two stages explicitly
-    /// (so it can apply the lane's `error_map`); this all-in-one form is exercised by the
-    /// per-protocol classification unit tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// (so it can apply the lane's `error_map`); this all-in-one form has no production caller and
+    /// exists solely to back the per-protocol classification unit tests, so it is compiled only
+    /// under `#[cfg(test)]` and kept out of the 1.0 binary.
+    #[cfg(test)]
     fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal;
 
     /// Read an IR request from wire JSON.

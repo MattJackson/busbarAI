@@ -84,6 +84,7 @@ impl ProtocolReader for GeminiReader {
         }
     }
 
+    #[cfg(test)]
     fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal {
         let text = String::from_utf8_lossy(body);
         let lower = text.to_lowercase();

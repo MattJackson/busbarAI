@@ -131,6 +131,7 @@ impl ProtocolReader for OpenAiReader {
         }
     }
 
+    #[cfg(test)]
     fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal {
         // context-length-exceeded — the lane is healthy; this must fail over (to a
         // larger-context model), not penalize the breaker. Detect by OpenAI code/message first.
