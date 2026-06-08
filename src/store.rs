@@ -141,6 +141,19 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// transition + single-flight probe CAS exactly once. Returns false if the probe was already
     /// taken (lost the race) so the caller can pick another lane.
     fn acquire_for_dispatch_in(&self, pool: &str, lane: usize, now: u64) -> bool;
+    /// Release a single-flight recovery probe WON by `acquire_for_dispatch_in` but then NOT dispatched
+    /// (the chosen lane couldn't get a concurrency slot before the request deadline, the semaphore
+    /// closed on shutdown, etc.). The probe winner left the cell in HalfOpen with `probe_in_flight ==
+    /// true`; if it returns without ever recording success/failure, neither `cell_closed` nor
+    /// `cell_open` runs, so the flag stays `true` and the cell stays HalfOpen — `usable_for` then
+    /// refuses every subsequent request and the lane is benched until the out-of-band prober catches
+    /// it (a self-inflicted availability regression on the recovery path). This reverts the cell to
+    /// Open WITHOUT escalating the cooldown (treating an undispatched probe winner as a no-op rather
+    /// than a consumed probe): it clears `probe_in_flight` and only stores Open when the cell is still
+    /// HalfOpen, leaving the existing (already-expired) cooldown intact so the very next request can
+    /// re-win the probe. No-op when the cell is no longer HalfOpen (a concurrent success/failure
+    /// already transitioned it) or when the probe flag was already clear.
+    fn release_probe_in(&self, pool: &str, lane: usize);
     // The bare lane-default breaker mutators below are exercised by the unit tests; in release,
     // routing always goes through the `_in(pool, …)` variants, so they're unreachable there — hence
     // the not(test) dead-code allow (they remain a tested part of the lane-default API).
@@ -180,12 +193,13 @@ pub(crate) trait StateStore: Send + Sync + 'static {
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
     );
-    // `record_hard_down` (bare-lane form) IS live in release: the health prober's `HardDown` arm
-    // calls it at `health.rs` (the hard-down probe-reset path). It is NOT test-only, so it carries no
-    // dead-code suppression — unlike the genuinely release-dead bare mutators above
-    // (`record_success`/`record_rate_limit`), whose `_in` siblings are the production path.
+    // `record_hard_down` is the bare-lane (default-cell) hard-down primitive. The release hard-down
+    // paths (the organic forward `HardDown` arm and the health prober's `HardDown` arm) both now go
+    // through the all-cells `record_hard_down_all_cells` primitive (which inlines the per-cell trip to
+    // avoid re-locking `pool_cells`), so this bare form is exercised only by the unit tests in release
+    // — hence the not(test) dead-code allow, matching the other release-dead bare mutators above.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn record_hard_down(&self, lane: usize, reason: &str);
-    fn record_hard_down_in(&self, pool: &str, lane: usize, reason: &str);
     /// Hard-down the lane in EVERY cell (the default/direct-route cell AND every existing per-pool
     /// cell), mirroring the all-cells reach of `recover_lane` / `record_probe_failure_all_cells`. A
     /// hard-down (auth rejection / billing exhaustion) is a property of the SHARED upstream, not of
@@ -643,6 +657,26 @@ impl InMemoryStore {
         c.current_weight().store(0, Ordering::Release);
     }
 
+    /// Release an UNDISPATCHED single-flight probe: a probe winner (HalfOpen + `probe_in_flight ==
+    /// true`) that abandoned the dispatch before recording any outcome. Revert the cell to Open and
+    /// clear the probe flag WITHOUT escalating the cooldown — the existing cooldown is already expired
+    /// (that is why the cell was probe-eligible), so leaving it intact lets the next request re-win the
+    /// probe immediately. Only acts when the cell is still HalfOpen (a concurrent success/failure may
+    /// have already moved it); otherwise it just clears the flag defensively. The mirror of the
+    /// `cell_open` probe-release, but for the no-outcome abandon path rather than a recorded failure.
+    fn cell_release_probe(c: &dyn BreakerCellAccess) {
+        // CAS the state HalfOpen → Open so we don't clobber a concurrent transition (e.g. a success
+        // that already moved the cell to Closed). The probe flag is cleared regardless so a stale
+        // `true` can never wedge the lane.
+        let _ = c.breaker_state().compare_exchange(
+            ST_HALF_OPEN,
+            ST_OPEN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        c.probe_in_flight().store(false, Ordering::Release);
+    }
+
     /// Side-effect-FREE readiness check (the breaker portion of `usable`): true if the cell would
     /// admit a request right now, WITHOUT mutating any state. Closed honors any pending cooldown; an
     /// Open lane whose cooldown has expired is "ready" (a probe could be admitted) but is NOT yet
@@ -1008,13 +1042,20 @@ impl InMemoryStore {
             return; // administratively down — ignore
         }
         Self::cell_record_failure(self.cell(pool, lane).as_ref(), now_time, cfg, retry_after);
-        // Bump the lane-GLOBAL error counter as well. `cell_record_failure` only touches the per-pool
-        // `BreakerCell.err` (a per-pool diagnostic); the `/stats` snapshot reports `LaneState.err`,
-        // which would otherwise stay permanently 0 for any lane reached exclusively via named pools
-        // (production dispatch always passes the real pool name, never `""`). Mirrors how
-        // `record_success_for` always bumps `LaneState.ok` regardless of pool — keeps the
-        // success/error observability counters symmetric.
-        self.get_lane(lane).err.fetch_add(1, Ordering::Relaxed);
+        // Bump the lane-GLOBAL error counter as well — but ONLY for a NAMED pool. `cell_record_failure`
+        // bumps the cell's own `err()`; for a named pool that is the per-pool `BreakerCell.err` (a
+        // per-pool diagnostic, distinct from `LaneState.err`), so the `/stats` `LaneState.err` snapshot
+        // would otherwise stay permanently 0 for any lane reached exclusively via named pools
+        // (production dispatch always passes the real pool name). For the DEFAULT cell (`pool == ""`),
+        // however, `cell("", lane)` IS the `LaneState` itself, so `cell_record_failure` already bumped
+        // `LaneState.err` via `c.err()`; bumping it again here double-counted every failure recorded on
+        // the bare/default-cell path (degraded forward, direct/ad-hoc routes), inflating the public
+        // `/stats` `err` metric 2x. Guard on a non-empty pool so the default cell is counted exactly
+        // once. Still mirrors how `record_success_for` keeps the success/error counters symmetric (it
+        // bumps `LaneState.ok` separately because `cell_record_success` does NOT touch `err()`/`ok()`).
+        if !pool.is_empty() {
+            self.get_lane(lane).err.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn record_success_for(&self, pool: &str, lane: usize) {
@@ -1028,6 +1069,9 @@ impl InMemoryStore {
         ls.ok.fetch_add(1, Ordering::Relaxed);
     }
 
+    // Only the per-cell `record_hard_down`/`record_hard_down_in` trait wrappers call this, and those
+    // are test-only in release now (the all-cells primitive inlines the trip), so this is release-dead.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn record_hard_down_for(&self, pool: &str, lane: usize, reason: &str) {
         let ls = self.get_lane(lane);
         // Hard-down is RECOVERABLE — long sticky cooldown + Open, recovered via the half-open
@@ -1135,6 +1179,10 @@ impl StateStore for InMemoryStore {
         self.usable_for(pool, lane, now)
     }
 
+    fn release_probe_in(&self, pool: &str, lane: usize) {
+        Self::cell_release_probe(self.cell(pool, lane).as_ref());
+    }
+
     fn breaker_state(&self, lane: usize) -> BreakerState {
         self.breaker_state_for("", lane)
     }
@@ -1206,10 +1254,6 @@ impl StateStore for InMemoryStore {
 
     fn record_hard_down(&self, lane: usize, reason: &str) {
         self.record_hard_down_for("", lane, reason);
-    }
-
-    fn record_hard_down_in(&self, pool: &str, lane: usize, reason: &str) {
-        self.record_hard_down_for(pool, lane, reason);
     }
 
     fn record_hard_down_all_cells(&self, lane: usize, reason: &str) {
@@ -2042,6 +2086,69 @@ mod tests {
             store.snapshot(0, 1000).err,
             2,
             "named-pool failures must increment the lane-global err counter (/stats observability)"
+        );
+    }
+
+    /// Regression (store.rs:record_failure_for): a failure recorded via the BARE/default-cell path
+    /// (`pool == ""`, used by the degraded forward and direct/ad-hoc routes) must count the
+    /// lane-global `err` EXACTLY once, not twice. For `pool == ""`, `cell("", lane)` IS the LaneState
+    /// itself, so `cell_record_failure` already bumps `LaneState.err`; the previous unconditional
+    /// second bump in `record_failure_for` double-counted every default-cell failure, inflating the
+    /// public `/stats` err metric 2x. Symmetric to `test_named_pool_failure_bumps_lane_global_err`.
+    #[test]
+    fn test_default_cell_failure_counts_lane_global_err_once() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(1000);
+        let cfg = BreakerCfg::default();
+
+        assert_eq!(store.snapshot(0, 1000).err, 0, "starts at zero");
+        // Bare default-cell path (pool == "") — the degraded/direct-route record_transient.
+        store.record_transient(0, "5xx", &cfg, None);
+        store.record_transient(0, "5xx", &cfg, None);
+        store.record_transient(0, "5xx", &cfg, None);
+        assert_eq!(
+            store.snapshot(0, 1000).err,
+            3,
+            "default-cell failures must count err exactly once each (was 2x before the fix)"
+        );
+    }
+
+    /// HIGH (forward.rs pick_among): a single-flight recovery probe WON via
+    /// `acquire_for_dispatch_in` but then NOT dispatched (permit-wait timeout / shutdown) must be
+    /// RELEASED via `release_probe_in`, otherwise the cell stays HalfOpen with `probe_in_flight ==
+    /// true` and `usable_in` benches the lane forever. After release the lane must be re-probeable.
+    #[test]
+    fn test_release_probe_reverts_undispatched_probe_winner() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(1000);
+        let cfg = BreakerCfg::default();
+
+        // Trip the lane Open via failures, then advance past the cooldown so it is probe-eligible.
+        for _ in 0..50 {
+            store.record_transient_in("p", 0, "5xx", &cfg, None);
+        }
+        let cooled = 1000 + store.cooldown_remaining_in("p", 0, 1000) + 1;
+        set_now_for_test(cooled);
+
+        // Win the probe (Open → HalfOpen + probe CAS true→).
+        assert!(
+            store.acquire_for_dispatch_in("p", 0, cooled),
+            "first dispatch wins the recovery probe"
+        );
+        // While the probe is in flight, a second request cannot win it (HalfOpen admits only the winner).
+        assert!(
+            !store.acquire_for_dispatch_in("p", 0, cooled),
+            "HalfOpen with an in-flight probe admits nobody else"
+        );
+
+        // The dispatch was abandoned (e.g. permit-wait timed out) → release the probe.
+        store.release_probe_in("p", 0);
+
+        // The lane must now be re-probeable: the next request can re-win the probe rather than being
+        // permanently benched.
+        assert!(
+            store.acquire_for_dispatch_in("p", 0, cooled),
+            "after release_probe_in the lane must be re-probeable (not wedged HalfOpen)"
         );
     }
 

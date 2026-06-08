@@ -364,6 +364,125 @@ fn mid_stream_error_bytes(
     }
 }
 
+/// Wrap a SINGLE non-stream `IrResponse` into a Bedrock ConverseStream binary `eventstream` byte
+/// sequence (`application/vnd.amazon.eventstream`), for the case where a bedrock-ingress client
+/// requested `ConverseStream` (`wants_stream`) but the cross-protocol upstream answered with a
+/// BUFFERED (non-SSE) 2xx. Returning that single response as `application/json` + a non-stream
+/// Converse body is undecodable by the AWS SDK's eventstream decoder (it expects framed
+/// `messageStart`/`contentBlockDelta`/…/`messageStop`/`metadata` events) — a hard functional failure
+/// and a deterministic proxy tell on the headline bedrock-ingress surface. This synthesizes the
+/// native frame sequence a real ConverseStream emits for the same completion: one `messageStart`,
+/// then per content block a `contentBlockStart` + its `contentBlockDelta`(s) + `contentBlockStop`,
+/// then `messageStop` (carrying the stop reason) and a trailing `metadata` frame (carrying token
+/// usage) — matching the two-frame stop/usage split the Bedrock writer's `MessageDelta` arm expects.
+/// Each event is rendered through the SAME `bedrock` writer used on the live streaming path and
+/// encoded via `eventstream::encode_frame`, so the bytes are byte-for-byte what a native stream sends.
+/// Never panics on the request path: a frame whose payload fails to serialize is skipped.
+fn bedrock_response_to_eventstream(ir: &crate::ir::IrResponse) -> Vec<u8> {
+    use crate::ir::{IrBlock, IrBlockMeta, IrDelta, IrStreamEvent, IrUsage};
+    let writer = crate::proto::Protocol::bedrock();
+    let writer = writer.writer();
+    let mut out: Vec<u8> = Vec::new();
+    // Render one IR stream event through the bedrock writer and append the encoded frame (if the
+    // writer maps it to a native frame; some IR events have no Bedrock analog and yield None).
+    let push = |ev: &IrStreamEvent, out: &mut Vec<u8>| {
+        if let Some((event_type, payload)) = writer.write_response_event(ev) {
+            if let Ok(bytes) = serde_json::to_vec(&payload) {
+                out.extend_from_slice(&crate::eventstream::encode_frame(&event_type, &bytes));
+            }
+        }
+    };
+
+    // messageStart
+    push(
+        &IrStreamEvent::MessageStart {
+            role: ir.role,
+            usage: None,
+            id: None,
+            created: None,
+            model: ir.model.clone(),
+        },
+        &mut out,
+    );
+
+    // Per content block: contentBlockStart → contentBlockDelta(s) → contentBlockStop. Mirror the
+    // live streaming fan-out (`read_response_events`) so the SDK sees the same per-block framing.
+    for (index, block) in ir.content.iter().enumerate() {
+        match block {
+            IrBlock::Text { text, .. } => {
+                push(
+                    &IrStreamEvent::BlockStart {
+                        index,
+                        block: IrBlockMeta::Text,
+                    },
+                    &mut out,
+                );
+                push(
+                    &IrStreamEvent::BlockDelta {
+                        index,
+                        delta: IrDelta::TextDelta(text.clone()),
+                    },
+                    &mut out,
+                );
+                push(&IrStreamEvent::BlockStop { index }, &mut out);
+            }
+            IrBlock::ToolUse { id, name, input } => {
+                push(
+                    &IrStreamEvent::BlockStart {
+                        index,
+                        block: IrBlockMeta::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                        },
+                    },
+                    &mut out,
+                );
+                push(
+                    &IrStreamEvent::BlockDelta {
+                        index,
+                        delta: IrDelta::InputJsonDelta(input.to_string()),
+                    },
+                    &mut out,
+                );
+                push(&IrStreamEvent::BlockStop { index }, &mut out);
+            }
+            // Thinking/ToolResult/Image blocks have no native ConverseStream content-delta frame on
+            // this synthesized path (the Bedrock writer maps their start/delta to None); skip them
+            // rather than emit an orphaned/empty frame.
+            _ => {}
+        }
+    }
+
+    // messageStop (stop reason) then metadata (usage) — the writer's `MessageDelta` arm maps a
+    // stop_reason-bearing delta to `messageStop` and a usage-only delta to `metadata`, exactly the
+    // two native frames a real ConverseStream ends with.
+    push(
+        &IrStreamEvent::MessageDelta {
+            stop_reason: ir
+                .stop_reason
+                .clone()
+                .or_else(|| Some("end_turn".to_string())),
+            usage: IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            stop_sequence: None,
+        },
+        &mut out,
+    );
+    push(
+        &IrStreamEvent::MessageDelta {
+            stop_reason: None,
+            usage: ir.usage.clone(),
+            stop_sequence: None,
+        },
+        &mut out,
+    );
+    out
+}
+
 /// Non-buffering stream inspection tap for usage parsing.
 ///
 /// Extracts the final usage object from a streaming response without buffering the body: it scans
@@ -453,11 +572,30 @@ impl UsageTap {
         }
     }
 
-    /// Detect a genuine terminal ERROR frame: an SSE event object of the form
-    /// `{"type":"error", "error": {...}}`. Sets `terminal_error` to the error message (or a generic
-    /// marker) so stream-end failure recording can distinguish a clean close from an aborted one.
+    /// Detect a genuine terminal ERROR frame across the wire shapes a streamed mid-stream error can
+    /// take, so stream-end breaker recording can distinguish a clean close from an aborted one:
+    ///   - Anthropic SSE: a `{"type":"error", "error": {...}}` event. Also covers a CROSS-protocol
+    ///     stream reframed to Anthropic by `StreamTranslate` (the tap is fed the Anthropic-shaped
+    ///     output there).
+    ///   - OpenAI (and OpenAI-compatible) SAME-protocol passthrough: an in-band bare `data:` frame of
+    ///     the form `{"error":{...}}` with NO `type` discriminant. A native OpenAI stream never tags
+    ///     its in-band error with `"type":"error"` (that is the Anthropic shape), so the Anthropic
+    ///     branch above never fires for it; without this branch an OpenAI backend that emits an in-band
+    ///     `{"error":{...}}` terminal event and THEN closes the stream cleanly would not trip the
+    ///     breaker for that lane (the `Poll::Ready(None)` arm only records when `terminal_error` is
+    ///     set). This recognizes that shape so the per-lane breaker trip count is accurate for those
+    ///     backends too.
+    ///
+    /// Sets `terminal_error` to the error message (or a generic marker).
     fn extract_terminal_error(&mut self, obj: &Value) {
-        if obj.get("type").and_then(|t| t.as_str()) != Some("error") {
+        let is_anthropic_error = obj.get("type").and_then(|t| t.as_str()) == Some("error");
+        // OpenAI-style in-band error: a top-level `error` object with no `type` discriminant. Gate on
+        // the ABSENCE of `type` so a normal typed OpenAI chunk that merely carries a nested `error:
+        // null` (or any non-error event that happens to include an `error` key) does not false-trip;
+        // a real terminal error frame is `{"error":{...}}` alone.
+        let is_openai_error =
+            obj.get("type").is_none() && obj.get("error").map(|e| !e.is_null()).unwrap_or(false);
+        if !is_anthropic_error && !is_openai_error {
             return;
         }
         let msg = obj
@@ -989,6 +1127,16 @@ async fn pick_among(
             continue;
         }
 
+        // CLASS GUARD (single-flight recovery probe): from here on we have WON the probe
+        // (`acquire_for_dispatch_in` returned true, leaving the cell HalfOpen + `probe_in_flight ==
+        // true`). The probe is normally released only when an outcome is recorded (`record_success`
+        // → cell_closed, or a failure → cell_open). EVERY early return below this point abandons the
+        // probe WITHOUT recording an outcome, so each one MUST release it — otherwise the flag stays
+        // `true`, the cell stays HalfOpen, and `usable_for` benches the lane until the slow
+        // out-of-band prober resets it (the HIGH this fixes). The only paths that legitimately keep
+        // the probe are the two that actually DISPATCH a request: the immediate `try_acquire`
+        // success and the `Ok(Ok(permit))` permit-wait success below.
+
         // Try to acquire the concurrency permit immediately.
         if let Some(p) = app.store.try_acquire(picked_lane_idx) {
             return Some((picked_lane_idx, p));
@@ -999,6 +1147,9 @@ async fn pick_among(
         // the request deadline (unbounded spinning here was a head-of-line-blocking DoS surface).
         let remaining = request_ctx.remaining(now());
         if remaining == 0 {
+            // Deadline already passed before we could even park — release the won-but-undispatched
+            // probe so the lane stays re-probeable.
+            app.store.release_probe_in(pool_name, picked_lane_idx);
             return None;
         }
         let sem = app.store.lane_semaphore(picked_lane_idx);
@@ -1008,12 +1159,21 @@ async fn pick_among(
         )
         .await
         {
-            // Got a permit before the deadline.
+            // Got a permit before the deadline — this is a genuine dispatch; keep the probe (the
+            // request itself will record the success/failure that releases it).
             Ok(Ok(permit)) => return Some((picked_lane_idx, Permit::new(permit))),
-            // Semaphore closed (shutdown) — treat as no lane available.
-            Ok(Err(_)) => return None,
-            // Deadline hit while waiting for a permit — give up so the caller can 503/failover.
-            Err(_) => return None,
+            // Semaphore closed (shutdown) — no request dispatched; release the probe before bailing.
+            Ok(Err(_)) => {
+                app.store.release_probe_in(pool_name, picked_lane_idx);
+                return None;
+            }
+            // Deadline hit while waiting for a permit — no request dispatched; release the probe so
+            // the recovered lane isn't permanently benched, then give up so the caller can
+            // 503/failover.
+            Err(_) => {
+                app.store.release_probe_in(pool_name, picked_lane_idx);
+                return None;
+            }
         }
     }
 }
@@ -1300,6 +1460,18 @@ pub(crate) async fn forward_with_pool(
             match ingress_proto.reader().read_request(&hop_v) {
                 Ok(mut ir) => {
                     apply_required_max_tokens(&mut ir, &app.lanes[i]);
+                    // CROSS-PROTOCOL extra-key leak guard (the structural class fix). Every reader
+                    // sweeps unmodeled top-level request keys into `ir.extra`; on a SAME-protocol
+                    // round-trip the egress writer re-emits them verbatim (lossless passthrough, the
+                    // intended behavior). But on a CROSS-protocol hop those keys are source-protocol-
+                    // only passthrough fields, and the foreign egress writer would merge them onto the
+                    // backend body — leaking e.g. OpenAI `logprobs`/`top_logprobs`/`n` onto an
+                    // Anthropic or Gemini backend (a §8.2 foreign-format leak and a deterministic proxy
+                    // tell). Clear `extra` ONCE here, at the single translate seam, BEFORE handing the
+                    // IR to the egress `write_request`, so no individual writer can leak them and the
+                    // fix cannot be missed on any one writer. Same-protocol passthrough never enters
+                    // this branch (`ingress_protocol == egress_name`), so its `extra` stays intact.
+                    ir.extra.clear();
                     hop_v = app.lanes[i].protocol.writer().write_request(&ir);
                 }
                 Err(_) => {
@@ -1437,6 +1609,27 @@ pub(crate) async fn forward_with_pool(
                         .get(axum::http::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok())
                         .and_then(|s| s.trim().parse::<u64>().ok());
+                    // A real AWS Bedrock endpoint sends `x-amzn-requestid` and `x-amzn-errortype` on
+                    // EVERY response, including 4xx. First-party AWS SDKs read `x-amzn-errortype`
+                    // BEFORE the body `__type` for typed-exception dispatch; their absence on a
+                    // same-protocol Bedrock→Bedrock error relay is a detectable indistinguishability
+                    // tell. Capture them here (before `r` is consumed) so the same-protocol passthrough
+                    // branches below can forward them verbatim on a bedrock-ingress relay.
+                    let upstream_amzn_headers: Vec<(
+                        axum::http::HeaderName,
+                        axum::http::HeaderValue,
+                    )> = if ingress_protocol == "bedrock" {
+                        ["x-amzn-requestid", "x-amzn-errortype"]
+                            .iter()
+                            .filter_map(|name| {
+                                let v = r.headers().get(*name)?.clone();
+                                let n = axum::http::HeaderName::from_static(name);
+                                Some((n, v))
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     // Size-capped read: a hostile/misconfigured upstream must not force an unbounded
                     // heap allocation for a non-2xx body before the breaker classification runs.
                     let bytes = read_capped_body(r).await;
@@ -1462,6 +1655,12 @@ pub(crate) async fn forward_with_pool(
                         let mut rb = Response::builder().status(status);
                         if let Some(ct) = ct {
                             rb = rb.header(CONTENT_TYPE, ct);
+                        }
+                        // Forward the upstream's `x-amzn-requestid` / `x-amzn-errortype` on a
+                        // bedrock-ingress same-protocol relay so the SDK's header-first typed-exception
+                        // dispatch and `request_id()` match a native Bedrock 4xx (empty for non-bedrock).
+                        for (name, value) in &upstream_amzn_headers {
+                            rb = rb.header(name, value);
                         }
                         // Re-create response from bytes for same-protocol passthrough relay
                         return rb
@@ -1503,6 +1702,11 @@ pub(crate) async fn forward_with_pool(
                             let mut rb = Response::builder().status(status);
                             if let Some(ct) = ct {
                                 rb = rb.header(CONTENT_TYPE, ct);
+                            }
+                            // Same as the passthrough-40x branch: preserve the native Bedrock error
+                            // headers on a bedrock same-protocol client-fault relay (empty otherwise).
+                            for (name, value) in &upstream_amzn_headers {
+                                rb = rb.header(name, value);
                             }
                             return rb
                                 .body(Body::from(bytes))
@@ -1633,10 +1837,22 @@ pub(crate) async fn forward_with_pool(
                                 // the rejected key is busbar's OWN, so the upstream's auth-rejection
                                 // body must never be relayed either. The native error kind carries the
                                 // auth signal; the message just reads like the real vendor's copy.
+                                // Pass the INGRESS-protocol-native auth-failure status and kind, NOT
+                                // the upstream's raw HTTP status. A real Bedrock auth failure is HTTP
+                                // 403 AccessDeniedException and a real Gemini bad-key is HTTP 400
+                                // INVALID_ARGUMENT — neither vendor ever returns 401 for auth. Echoing
+                                // the egress backend's raw `status` (e.g. an Anthropic backend's 401)
+                                // to a Bedrock/Gemini ingress client is a protocol-distinguishability
+                                // tell and breaks SDK auth-retry/credential-refresh logic that keys off
+                                // the native status. The canonical mapping lives in `auth.rs`
+                                // (`auth_failure_status_and_kind`) so this path cannot drift from the
+                                // pre-routing auth path.
+                                let (auth_status, auth_kind) =
+                                    crate::auth::auth_failure_status_and_kind(ingress_protocol);
                                 return ingress_error(
                                     ingress_protocol,
-                                    status,
-                                    "authentication_error",
+                                    auth_status,
+                                    auth_kind,
                                     crate::proto::vendor_auth_failure_message(ingress_protocol),
                                 );
                             }
@@ -1774,6 +1990,27 @@ pub(crate) async fn forward_with_pool(
                                 ir.id = None;
                                 ir.system_fingerprint = None;
                                 ir.stop_sequence = None;
+                                // Bedrock ingress that requested ConverseStream (`wants_stream`) but
+                                // got a BUFFERED (non-SSE) 2xx upstream: a native AWS SDK
+                                // ConverseStream decoder expects binary `eventstream` frames, NOT an
+                                // `application/json` Converse (non-stream) body. Emitting JSON here is
+                                // a hard SDK-decode failure and a deterministic proxy tell. Synthesize
+                                // the native frame sequence from the single translated response and
+                                // emit it under `application/vnd.amazon.eventstream` instead. (Only
+                                // bedrock ingress has a binary stream wire; every other ingress
+                                // protocol streams SSE, which the FirstByteBody path handles when the
+                                // upstream is SSE — a non-SSE upstream to an SSE-stream request still
+                                // returns the translated JSON body, which their SDKs accept.)
+                                if ingress_protocol == "bedrock" && wants_stream {
+                                    let frames = bedrock_response_to_eventstream(&ir);
+                                    let rb = Response::builder()
+                                        .status(status)
+                                        .header(CONTENT_TYPE, "application/vnd.amazon.eventstream");
+                                    let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
+                                    return rb
+                                        .body(Body::from(frames))
+                                        .unwrap_or_else(|_| status.into_response());
+                                }
                                 let translated = ingress_proto.writer().write_response(&ir);
                                 // Content-Type is the INGRESS JSON CT, not the upstream's — the body
                                 // is now in the client's native non-stream shape (§8.4). A
@@ -2225,6 +2462,20 @@ async fn forward_once(
                             ir.id = None;
                             ir.system_fingerprint = None;
                             ir.stop_sequence = None;
+                            // Bedrock ConverseStream request answered by a buffered (non-SSE) 2xx:
+                            // emit the native binary eventstream frame sequence, not an
+                            // `application/json` Converse body the SDK's stream decoder cannot parse
+                            // (mirrors the main forward path; see `bedrock_response_to_eventstream`).
+                            if ingress_protocol == "bedrock" && wants_stream {
+                                let frames = bedrock_response_to_eventstream(&ir);
+                                let rb = Response::builder()
+                                    .status(status)
+                                    .header(CONTENT_TYPE, "application/vnd.amazon.eventstream");
+                                let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
+                                return Ok(rb
+                                    .body(Body::from(frames))
+                                    .unwrap_or_else(|_| status.into_response()));
+                            }
                             let translated = ingress_proto.writer().write_response(&ir);
                             // Bedrock-ingress 2xx carries `x-amzn-RequestId` (matching a real
                             // Converse response and the error path).
@@ -2521,6 +2772,154 @@ mod usage_tap_tests {
         ));
         assert_eq!(t.input_tokens, Some(7));
         assert_eq!(t.output_tokens, Some(3));
+    }
+
+    #[test]
+    fn test_tap_detects_terminal_error_across_shapes() {
+        // Anthropic SSE error event: {"type":"error", "error":{...}}.
+        let mut t = UsageTap::new();
+        t.feed(&Bytes::from(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"boom"}}"#,
+        ));
+        assert_eq!(t.terminal_error.as_deref(), Some("boom"));
+
+        // OpenAI / OpenAI-compatible in-band terminal error: bare {"error":{...}} with NO `type`
+        // discriminant. Previously undetected on a SAME-protocol OpenAI passthrough, so a backend
+        // that emitted this then closed cleanly never tripped the breaker.
+        let mut t = UsageTap::new();
+        t.feed(&Bytes::from(
+            r#"{"error":{"message":"upstream exploded","type":"server_error"}}"#,
+        ));
+        assert_eq!(t.terminal_error.as_deref(), Some("upstream exploded"));
+
+        // A normal OpenAI chunk (no top-level `error`) must NOT be flagged as terminal.
+        let mut t = UsageTap::new();
+        t.feed(&Bytes::from(
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"delta":{"content":"hi"}}]}"#,
+        ));
+        assert_eq!(t.terminal_error, None);
+
+        // A chunk that merely carries `error: null` must NOT false-trip.
+        let mut t = UsageTap::new();
+        t.feed(&Bytes::from(r#"{"choices":[],"error":null}"#));
+        assert_eq!(t.terminal_error, None);
+    }
+}
+
+#[cfg(test)]
+mod cross_protocol_extra_tests {
+    use crate::proto::Protocol;
+
+    /// Structural class fix: on a CROSS-protocol request hop the source-protocol-only passthrough
+    /// keys swept into `IrRequest.extra` (e.g. OpenAI `logprobs`/`top_logprobs`/`n`) must NOT reach
+    /// the foreign egress backend body. The seam in `forward_with_pool` clears `ir.extra` before the
+    /// egress `write_request`; this mirrors that exact sequence (reader → clear → writer).
+    #[test]
+    fn cross_protocol_strips_source_only_extra_keys() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "logprobs": true,
+            "top_logprobs": 5,
+            "n": 3
+        });
+        let openai = Protocol::openai();
+        let mut ir = openai.reader().read_request(&body).expect("read");
+        // Sanity: the reader DID sweep the source-only keys into extra.
+        assert!(ir.extra.contains_key("logprobs"));
+        assert!(ir.extra.contains_key("n"));
+
+        // The cross-protocol seam clears extra before handing to the foreign writer.
+        ir.extra.clear();
+        let anthropic = Protocol::anthropic();
+        let out = anthropic.writer().write_request(&ir);
+        let obj = out.as_object().expect("object body");
+        assert!(
+            !obj.contains_key("logprobs"),
+            "OpenAI logprobs must not leak onto an Anthropic backend body"
+        );
+        assert!(!obj.contains_key("top_logprobs"));
+        assert!(!obj.contains_key("n"));
+        // The modeled fields still translate across.
+        assert!(obj.contains_key("messages"));
+    }
+
+    /// SAME-protocol passthrough keeps `extra` intact (lossless): the seam only clears on a
+    /// cross-protocol hop, so an openai→openai round-trip must still carry `logprobs`.
+    #[test]
+    fn same_protocol_passthrough_preserves_extra_keys() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true,
+            "n": 3
+        });
+        let openai = Protocol::openai();
+        let ir = openai.reader().read_request(&body).expect("read");
+        // No clear() here — same-protocol passthrough never hits the cross-protocol seam.
+        let out = openai.writer().write_request(&ir);
+        let obj = out.as_object().expect("object body");
+        assert_eq!(
+            obj.get("logprobs"),
+            Some(&serde_json::json!(true)),
+            "same-protocol openai→openai must preserve logprobs (lossless passthrough)"
+        );
+        assert_eq!(obj.get("n"), Some(&serde_json::json!(3)));
+    }
+}
+
+#[cfg(test)]
+mod bedrock_eventstream_tests {
+    use super::bedrock_response_to_eventstream;
+    use crate::ir::{IrBlock, IrResponse, IrRole, IrUsage};
+
+    /// A bedrock-ingress ConverseStream request answered by a BUFFERED (non-SSE) 2xx is rewrapped
+    /// into the native binary eventstream frame sequence — not an `application/json` Converse body
+    /// the AWS SDK's stream decoder cannot parse. Assert the synthesized bytes decode into the
+    /// expected native ConverseStream frame sequence (messageStart … messageStop, metadata).
+    #[test]
+    fn buffered_response_wraps_into_converse_stream_frames() {
+        let ir = IrResponse {
+            role: IrRole::Assistant,
+            content: vec![IrBlock::Text {
+                text: "hello world".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: IrUsage {
+                input_tokens: 11,
+                output_tokens: 7,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("anthropic.claude-3".to_string()),
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let mut bytes = bedrock_response_to_eventstream(&ir);
+        assert!(!bytes.is_empty(), "must emit eventstream frames");
+
+        // Decode the frames using the same decoder the wire uses.
+        let frames = crate::eventstream::drain_frames(&mut bytes);
+        let names: Vec<&str> = frames.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(names.first(), Some(&"messageStart"));
+        assert!(names.contains(&"contentBlockStart"));
+        assert!(names.contains(&"contentBlockDelta"));
+        assert!(names.contains(&"contentBlockStop"));
+        assert!(names.contains(&"messageStop"));
+        // The trailing metadata frame carries token usage.
+        let metadata = frames
+            .iter()
+            .find(|(t, _)| t == "metadata")
+            .expect("metadata frame");
+        let payload: serde_json::Value = serde_json::from_slice(&metadata.1).expect("json");
+        assert_eq!(payload["usage"]["inputTokens"], 11);
+        assert_eq!(payload["usage"]["outputTokens"], 7);
+        assert_eq!(payload["usage"]["totalTokens"], 18);
     }
 }
 

@@ -175,18 +175,17 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
 
     match disposition {
         Disposition::HardDown => {
-            // Auth/Billing: the lane is definitively bad (e.g. invalid credential). Park it dead in
-            // EVERY cell organic traffic routes against — the default cell PLUS every configured
-            // pool that contains this lane — mirroring the all-cells reach of a successful probe's
-            // `recover_lane`. (No `record_hard_down_all_cells` exists; the per-cell `record_hard_down`
-            // / `record_hard_down_in` are the public primitives, so we iterate the pools ourselves.)
-            let reason = "health-probe hard-down (auth/billing)";
-            app.store.record_hard_down(i, reason);
-            for (pool_name, members) in app.pools.iter() {
-                if members.iter().any(|m| m.idx == i) {
-                    app.store.record_hard_down_in(pool_name, i, reason);
-                }
-            }
+            // Auth/Billing: the lane is definitively bad (e.g. invalid credential). Park it down in
+            // EVERY cell organic traffic routes against via the canonical all-cells primitive
+            // `record_hard_down_all_cells`, mirroring the all-cells reach of a successful probe's
+            // `recover_lane` and a failed probe's `record_probe_failure_all_cells`. All three probe
+            // outcomes (success / transient / hard-down) now derive their cell set from the SAME live
+            // `pool_cells` map under ONE lock — rather than this path uniquely iterating CONFIG pool
+            // membership (which took N per-pool locks and eagerly lazy-created a cell for every config
+            // member the lane may never be routed against). Using the shared primitive keeps the trip
+            // and recover bases in lockstep against any future change to how cells are materialized.
+            app.store
+                .record_hard_down_all_cells(i, "health-probe hard-down (auth/billing)");
             tracing::warn!(lane = %lane.model, "lane hard-down via health probe (parked dead, recovers on a 2xx probe)");
         }
         Disposition::TransientUpstream => {

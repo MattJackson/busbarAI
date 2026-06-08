@@ -248,7 +248,7 @@ fn vendor_auth_failure_message(proto: &str) -> &'static str {
 ///
 /// Not a disposition/breaker match, so a named fallback arm (treating an unknown future proto like
 /// the Anthropic-family 401 authentication_error) is fine and keeps the request path panic-free.
-fn auth_failure_status_and_kind(proto: &str) -> (StatusCode, &'static str) {
+pub(crate) fn auth_failure_status_and_kind(proto: &str) -> (StatusCode, &'static str) {
     match proto {
         "bedrock" => (StatusCode::FORBIDDEN, "auth"),
         "gemini" => (StatusCode::BAD_REQUEST, "invalid_request_error"),
