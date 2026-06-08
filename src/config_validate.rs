@@ -42,6 +42,17 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 model_name
             ));
         }
+        // The exact twin of the `max_concurrent: 0` foot-gun on the lifetime-budget axis. main.rs
+        // computes `limited = max_requests >= 0`, so `max_requests: 0` yields `limited=true,
+        // budget=0`; store::usable() then rejects any lane with `limited && budget <= 0`, making the
+        // lane permanently un-admissible from the first request with no boot diagnostic. A negative
+        // value (-1) means unlimited via neg1(), so only 0 is pathological. Reject it loudly here.
+        if model_cfg.max_requests == 0 {
+            errors.push(format!(
+                "model '{}' has max_requests: 0; a lane with a zero lifetime budget never admits a request — use a positive cap, or omit it (default -1 = unlimited)",
+                model_name
+            ));
+        }
     }
 
     // All model names, used for the pool/model collision check below (the `named` route resolves
@@ -323,8 +334,17 @@ fn ssrf_blocked_host(url: &str) -> Option<String> {
         return None;
     }
 
-    // Known cloud metadata / internal hostnames (case-insensitive).
-    const METADATA_HOSTS: &[&str] = &["metadata.google.internal", "metadata.internal"];
+    // Known cloud metadata / internal hostnames (case-insensitive). `localhost` (and its
+    // trailing-dot FQDN form `localhost.`) does NOT parse as an `IpAddr` and is not an alternate
+    // IPv4 encoding, so without listing it here it would slip past every IP-range check below and
+    // a `base_url: https://localhost:11434/` would forward inbound API keys to a loopback service
+    // (e.g. a local Ollama or metadata sidecar) — an SSRF credential-relay. Block both spellings.
+    const METADATA_HOSTS: &[&str] = &[
+        "metadata.google.internal",
+        "metadata.internal",
+        "localhost",
+        "localhost.",
+    ];
     let host_lc = host.to_ascii_lowercase();
     if METADATA_HOSTS.contains(&host_lc.as_str()) {
         return Some(host.to_string());
@@ -923,6 +943,79 @@ mod tests {
         assert!(
             !errs.iter().any(|e| e.contains("okmodel")),
             "a positive max_concurrent must not error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_max_requests() {
+        // Twin of the max_concurrent:0 foot-gun on the lifetime-budget axis: max_requests:0 yields
+        // limited=true, budget=0, which store::usable() rejects forever — must fail loud at boot.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "myprovider".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        let mut zero = make_model("myprovider", 10);
+        zero.max_requests = 0;
+        models.insert("zeroreq".to_string(), zero);
+        // -1 (unlimited, the default) and a positive cap must NOT error.
+        models.insert("unlimited".to_string(), make_model("myprovider", 10)); // max_requests = -1
+        let mut positive = make_model("myprovider", 10);
+        positive.max_requests = 100;
+        models.insert("capped".to_string(), positive);
+
+        let cfg = make_root_cfg(providers, models, HashMap::new());
+        let errs = validate(&cfg).expect_err("max_requests: 0 must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("zeroreq") && e.contains("max_requests: 0")),
+            "expected a max_requests:0 error for 'zeroreq'; got: {errs:?}"
+        );
+        // Exactly one error, naming only the zero-budget model — the -1 and positive lanes are clean.
+        assert_eq!(
+            errs.len(),
+            1,
+            "only the zero lane must error; got: {errs:?}"
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.contains("'unlimited'") || e.contains("'capped'")),
+            "a -1 (unlimited) or positive max_requests must not error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_ssrf_blocks_localhost() {
+        // `localhost` does not parse as an IpAddr and is not an alternate IPv4 encoding, so without
+        // an explicit entry it would slip past every IP-range check and forward inbound keys to a
+        // loopback service (SSRF credential-relay). Both `localhost` and the trailing-dot FQDN form
+        // must be flagged, case-insensitively, with or without a port.
+        for blocked in [
+            "https://localhost/",
+            "https://localhost:11434/",
+            "https://LOCALHOST/v1",
+            "https://localhost./",
+            "https://localhost.:443/api",
+        ] {
+            assert!(
+                ssrf_blocked_host(blocked).is_some(),
+                "expected '{blocked}' to be flagged as an SSRF target"
+            );
+        }
+        // A full validate() pass must reject a localhost base_url.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            make_provider("anthropic", "https://localhost:11434/", "API_KEY"),
+        );
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        let errs = validate(&cfg).expect_err("a localhost base_url must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("blocked internal/metadata host") && e.contains("localhost")),
+            "expected an SSRF/metadata-host error for localhost; got: {errs:?}"
         );
     }
 

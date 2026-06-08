@@ -1158,7 +1158,13 @@ impl ProtocolWriter for BedrockWriter {
                         "usage": {
                             "inputTokens": usage.input_tokens,
                             "outputTokens": usage.output_tokens,
-                            "totalTokens": usage.input_tokens + usage.output_tokens
+                            // Saturating add: token counts arrive from an untrusted upstream
+                            // (`as_u64().unwrap_or(0)` in the reader); a pathological/hostile pair
+                            // near `u64::MAX` would panic this request-path code under
+                            // overflow-checks (all debug builds, opt-in release) or silently wrap to
+                            // a nonsense `totalTokens` in plain release. Mirror the Gemini writer's
+                            // explicit `saturating_add` so the total clamps at `u64::MAX` instead.
+                            "totalTokens": usage.input_tokens.saturating_add(usage.output_tokens)
                         },
                         // A native Bedrock ConverseStream `metadata` event always carries a `metrics`
                         // object alongside `usage` (e.g. `{"latencyMs": N}`). Omitting it on every
@@ -1252,7 +1258,10 @@ impl ProtocolWriter for BedrockWriter {
             "usage": {
                 "inputTokens": resp.usage.input_tokens,
                 "outputTokens": resp.usage.output_tokens,
-                "totalTokens": resp.usage.input_tokens + resp.usage.output_tokens
+                // Saturating add, same rationale as the streaming `metadata` frame: token counts are
+                // upstream-derived and unbounded, so a bare `u64 + u64` here is an overflow-panic
+                // (overflow-checks) / silent-wrap (release) hazard on the buffered Converse body.
+                "totalTokens": resp.usage.input_tokens.saturating_add(resp.usage.output_tokens)
             }
         })
     }
@@ -2833,6 +2842,100 @@ mod tests {
                 .pointer("/usage/totalTokens")
                 .and_then(|v| v.as_u64()),
             Some(5)
+        );
+    }
+
+    /// Regression (writer, streaming `metadata` frame): `totalTokens` is computed with a saturating
+    /// add, so a pathological/hostile upstream sending token counts near `u64::MAX` clamps to
+    /// `u64::MAX` instead of panicking under overflow-checks (debug / opt-in release) or silently
+    /// wrapping to a near-zero nonsense total in plain release. Mirrors the Gemini writer's
+    /// `test_stream_message_delta_total_token_count_saturates`.
+    #[test]
+    fn test_write_response_event_total_tokens_saturates() {
+        let writer = BedrockWriter;
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: None,
+            stop_sequence: None,
+            usage: IrUsage {
+                input_tokens: u64::MAX,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (et, payload) = writer
+            .write_response_event(&ev)
+            .expect("usage-only delta emits a metadata frame");
+        assert_eq!(et, "metadata");
+        // No panic on the request path, and the total clamps at u64::MAX rather than wrapping to 0.
+        assert_eq!(
+            payload
+                .pointer("/usage/totalTokens")
+                .and_then(|v| v.as_u64()),
+            Some(u64::MAX),
+            "totalTokens must saturate, not wrap; got {payload}"
+        );
+        // Component counts are passed through untouched.
+        assert_eq!(
+            payload
+                .pointer("/usage/inputTokens")
+                .and_then(|v| v.as_u64()),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            payload
+                .pointer("/usage/outputTokens")
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
+    }
+
+    /// Regression (writer, non-stream `write_response` body): the buffered Converse `totalTokens`
+    /// uses the same saturating add as the streaming frame, so an upstream response carrying token
+    /// counts near `u64::MAX` does not panic (overflow-checks) or wrap (release).
+    #[test]
+    fn test_write_response_total_tokens_saturates() {
+        let writer = BedrockWriter;
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: IrUsage {
+                input_tokens: u64::MAX - 1,
+                output_tokens: 100,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let body = writer.write_response(&resp);
+        assert_eq!(
+            body.pointer("/usage/totalTokens").and_then(|v| v.as_u64()),
+            Some(u64::MAX),
+            "totalTokens must saturate, not wrap; got {body}"
+        );
+        // A normal (non-overflowing) pair still sums exactly.
+        let normal = crate::ir::IrResponse {
+            usage: IrUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            ..resp
+        };
+        let body = writer.write_response(&normal);
+        assert_eq!(
+            body.pointer("/usage/totalTokens").and_then(|v| v.as_u64()),
+            Some(15)
         );
     }
 }

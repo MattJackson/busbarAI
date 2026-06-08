@@ -267,8 +267,33 @@ impl ProtocolReader for CohereReader {
                         .to_string();
                     let content_text = if let Some(content_val) = msg_val.get("content") {
                         if let Some(arr) = content_val.as_array() {
+                            // Cohere v2 tool content is an array. Bare strings are accepted, but
+                            // the native (SDK-emitted) shape is an array of typed objects, e.g.
+                            // `[{"type":"text","text":"..."}]` or
+                            // `[{"type":"document","document":{...}}]`. Mirror the user/assistant
+                            // text-block decoding above: pull `text` from `type:"text"` blocks and
+                            // JSON-serialize any other typed object block (document, etc.) so its
+                            // content is preserved rather than silently dropped.
                             arr.iter()
-                                .filter_map(|b| b.as_str())
+                                .filter_map(|b| {
+                                    if let Some(s) = b.as_str() {
+                                        Some(s.to_string())
+                                    } else if let Some(bo) = b.as_object() {
+                                        if bo.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                            bo.get("text")
+                                                .and_then(|t| t.as_str())
+                                                .map(String::from)
+                                        } else {
+                                            // Preserve non-text typed blocks (document, etc.)
+                                            // verbatim rather than dropping them.
+                                            serde_json::to_string(b).ok()
+                                        }
+                                    } else {
+                                        // Non-string, non-object array element: serialize it so no
+                                        // content is lost.
+                                        serde_json::to_string(b).ok()
+                                    }
+                                })
                                 .collect::<Vec<_>>()
                                 .join(" ")
                         } else if let Some(s) = content_val.as_str() {
@@ -2253,5 +2278,97 @@ mod tests {
             Some(1),
             "native Cohere error body is a bare single-key {{\"message\": ...}}"
         );
+    }
+
+    /// Regression (MEDIUM/conformance): a Cohere v2 `tool`-role message whose `content` is the
+    /// native object-array shape (`[{"type":"text","text":...}]`, plus a typed `document` block)
+    /// must NOT be silently dropped. The previous `filter_map(|b| b.as_str())` returned None for
+    /// every object element, yielding empty tool-result content and corrupting the conversation on
+    /// passthrough/egress.
+    #[test]
+    fn test_read_request_tool_content_object_array_preserved() {
+        let body = serde_json::json!({
+            "model": "command-r",
+            "messages": [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": [
+                        {"type": "text", "text": "first part"},
+                        {"type": "text", "text": "second part"},
+                        {"type": "document", "document": {"id": "d1", "data": "doc body"}}
+                    ]
+                }
+            ]
+        });
+        let ir = CohereReader
+            .read_request(&body)
+            .expect("read_request should succeed");
+        let tool_msg = ir
+            .messages
+            .iter()
+            .find(|m| m.role == crate::ir::IrRole::Tool)
+            .expect("tool message present");
+        let tool_result = tool_msg
+            .content
+            .iter()
+            .find_map(|b| match b {
+                crate::ir::IrBlock::ToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .expect("ToolResult block present");
+        let text = match tool_result.first() {
+            Some(crate::ir::IrBlock::Text { text, .. }) => text.clone(),
+            other => panic!("expected text block in tool result, got {other:?}"),
+        };
+        assert!(
+            text.contains("first part"),
+            "text block text must be preserved: {text}"
+        );
+        assert!(
+            text.contains("second part"),
+            "all text blocks must be joined: {text}"
+        );
+        assert!(
+            text.contains("doc body"),
+            "non-text typed (document) block must be serialized, not dropped: {text}"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance): the bare-string tool-content array shape must keep working
+    /// alongside the new object-array handling.
+    #[test]
+    fn test_read_request_tool_content_string_array_still_works() {
+        let body = serde_json::json!({
+            "model": "command-r",
+            "messages": [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_2",
+                    "content": ["alpha", "beta"]
+                }
+            ]
+        });
+        let ir = CohereReader
+            .read_request(&body)
+            .expect("read_request should succeed");
+        let tool_msg = ir
+            .messages
+            .iter()
+            .find(|m| m.role == crate::ir::IrRole::Tool)
+            .expect("tool message present");
+        let tool_result = tool_msg
+            .content
+            .iter()
+            .find_map(|b| match b {
+                crate::ir::IrBlock::ToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .expect("ToolResult block present");
+        let text = match tool_result.first() {
+            Some(crate::ir::IrBlock::Text { text, .. }) => text.clone(),
+            other => panic!("expected text block in tool result, got {other:?}"),
+        };
+        assert_eq!(text, "alpha beta");
     }
 }

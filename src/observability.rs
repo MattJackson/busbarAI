@@ -44,11 +44,14 @@ impl Drop for InflightGuard {
 /// Validate the configured webhook URL. Two guarantees, both enforced (not just documented):
 ///   1. The scheme MUST be `https://` — a plaintext `http://` endpoint would expose per-request
 ///      metadata on the wire.
-///   2. The host MUST NOT be a loopback / link-local / private / unspecified address — i.e. the URL
+///   2. The host MUST NOT be an internal target — loopback / link-local / private (RFC1918) / RFC6598
+///      CGNAT / unspecified, whether written as a canonical IP literal, an IPv4-mapped IPv6 literal,
+///      or an alternate IPv4 encoding (decimal/hex/octal/short-dotted) the resolver still expands;
+///      nor a loopback (`localhost`) or cloud-metadata (`metadata.google.internal`) DNS name. The URL
 ///      may not point at `169.254.169.254` cloud-metadata, `127.0.0.1`, `10.x`/`192.168.x`/`172.16.x`
 ///      internal services, etc. The earlier scheme-only check did nothing for an `https://` SSRF
 ///      target (`https://169.254.169.254/...` passed unchanged); this closes that gap so the
-///      enforcement matches the documented protection.
+///      enforcement matches the documented protection (parity with `config_validate::ssrf_blocked_host`).
 ///
 /// `None` (webhook disabled) is always valid. Pure, so it is unit-testable without touching the
 /// process-wide `OnceLock`s.
@@ -65,21 +68,109 @@ fn validate_webhook_url(url: Option<String>) -> Result<Option<String>, String> {
         .map_err(|e| format!("observability.request_log_webhook_url is not a valid URL: {e}"))?;
     if host_is_internal(&parsed) {
         return Err(format!(
-            "observability.request_log_webhook_url must not target a loopback/link-local/private \
-             host (SSRF guard); got '{u}'"
+            "observability.request_log_webhook_url must not target a loopback/link-local/private/\
+             CGNAT/cloud-metadata host (SSRF guard); got '{u}'"
         ));
     }
     Ok(Some(u))
 }
 
+/// Well-known cloud-metadata / internal DNS names that must be blocked even though they are not IP
+/// literals (they resolve, at connect time, to the loopback/IMDS family). Kept in lock-step with the
+/// `METADATA_HOSTS` list in `config_validate::ssrf_blocked_host` so the parity the doc-comment on
+/// `host_is_internal` claims is real, not aspirational.
+const METADATA_HOSTS: &[&str] = &["metadata.google.internal", "metadata.internal"];
+
+/// RFC 6598 Shared Address Space `100.64.0.0/10` (a.k.a. CGNAT). NOT covered by
+/// `Ipv4Addr::is_private()`, yet routable inside AWS/GCP VPCs and many Kubernetes clusters where it
+/// fronts internal services — an SSRF target the private/link-local checks miss. The /10 is the set
+/// of addresses whose first octet is `100` and whose top two bits of the second octet are `01`.
+/// Mirrors `config_validate::is_cgnat_shared_v4`.
+fn is_cgnat_shared_v4(v4: &std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 100 && (o[1] & 0xC0) == 64
+}
+
+/// True for an IPv4 literal busbar must not POST telemetry to. Shared by the V4 arm and the
+/// IPv4-mapped-IPv6 arm so the two stay identical. Covers loopback, link-local (incl. the
+/// `169.254.169.254` IMDS endpoint), RFC1918 private, RFC6598 CGNAT, unspecified, and broadcast.
+fn is_internal_v4(v4: &std::net::Ipv4Addr) -> bool {
+    v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_private()
+        || is_cgnat_shared_v4(v4)
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+}
+
+/// True when `host` is an alternate (non-dotted-quad) IPv4 encoding that `IpAddr::from_str` rejects
+/// but the OS resolver (glibc `getaddrinfo`, used by reqwest's default resolver) still maps to an
+/// IPv4 address: a bare decimal integer (`2130706433` = 127.0.0.1), a `0x`/`0X` hex literal
+/// (`0x7f000001`), a leading-zero octal literal (`017700000001`), or a dotted form with FEWER than
+/// four octets (`127.1`, `10.0.1`). These bypass the canonical IP-literal checks while still
+/// resolving to loopback / link-local / private targets at connect time, so they must be treated as
+/// blocked. A canonical four-octet dotted-quad is NOT matched here (it is handled by the
+/// `parse::<IpAddr>()` path); a normal DNS hostname is not matched either. Mirrors
+/// `config_validate::is_alternate_ipv4_encoding`.
+fn is_alternate_ipv4_encoding(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+
+    // Whole-host `0x...` / `0X...` hex literal (e.g. `0x7f000001`). Only when there is no `.`; a
+    // dotted per-octet hex form (`0x7f.0.0.1`) is handled by the dotted branch below.
+    if !host.contains('.') {
+        if let Some(hex) = host.strip_prefix("0x").or_else(|| host.strip_prefix("0X")) {
+            return !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit());
+        }
+    }
+
+    // Dotted form: split on '.'. A canonical dotted-quad has exactly 4 parts and parses via
+    // `IpAddr` — leave it to that path. Fewer than 4 numeric parts (e.g. `127.1`, `10.0.1`) is an
+    // alternate short form getaddrinfo expands; flag it. Any part using a `0x` hex or leading-zero
+    // octal encoding is also an alternate form.
+    if host.contains('.') {
+        let parts: Vec<&str> = host.split('.').collect();
+        // Every part must be a numeric encoding (decimal, hex, or octal) for this to be an IP-ish
+        // host at all; if any part has a non-numeric character it's a DNS name → not our concern.
+        let all_numeric = parts.iter().all(|p| {
+            if let Some(hex) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
+                !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
+            } else {
+                !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())
+            }
+        });
+        if !all_numeric {
+            return false;
+        }
+        // Short dotted form (fewer than 4 parts) is an alternate encoding getaddrinfo expands.
+        if parts.len() < 4 {
+            return true;
+        }
+        // Four numeric parts: alternate iff any part is hex (`0x`) or leading-zero octal.
+        return parts.iter().any(|p| {
+            p.starts_with("0x")
+                || p.starts_with("0X")
+                || (p.len() > 1 && p.starts_with('0') && p.bytes().all(|b| b.is_ascii_digit()))
+        });
+    }
+
+    // No '.', not `0x`: a bare all-digits host is a decimal integer IP encoding (e.g. `2130706433`).
+    host.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// True if the URL's host is an address busbar must not POST telemetry to: a literal loopback,
-/// link-local (incl. `169.254.169.254` cloud-metadata), private (RFC1918 / unique-local), or
-/// unspecified IP. A hostname that does not parse as an IP literal is allowed (operators may name
-/// an external collector) EXCEPT the well-known loopback DNS name `localhost` (and its dotted
-/// subdomains), which is blocked case-insensitively so an `https://localhost:<port>/path` URL can't
-/// be used to POST request logs to a co-located process — matching `config_validate::ssrf_blocked_host`.
-/// Full DNS-rebinding is out of scope for a startup-validated, operator-supplied URL. Returns `true`
-/// (reject) when the host is missing entirely.
+/// link-local (incl. `169.254.169.254` cloud-metadata), private (RFC1918 / unique-local), RFC6598
+/// CGNAT, or unspecified IP — whether written as a canonical IP literal, an IPv4-mapped IPv6 literal,
+/// or one of the alternate IPv4 encodings the OS resolver still expands to an internal address
+/// (decimal `2130706433`, hex `0x7f000001`, octal, short-dotted `127.1`). A hostname that does not
+/// parse as an IP literal is allowed (operators may name an external collector) EXCEPT the
+/// well-known loopback DNS name `localhost` (and its dotted subdomains) and the cloud-metadata DNS
+/// names in `METADATA_HOSTS`, which are blocked case-insensitively so an `https://localhost:<port>/`
+/// or `https://metadata.google.internal/` URL can't be used to POST request logs to a co-located /
+/// metadata process — matching `config_validate::ssrf_blocked_host`. Full DNS-rebinding is out of
+/// scope for a startup-validated, operator-supplied URL. Returns `true` (reject) when the host is
+/// missing entirely.
 fn host_is_internal(url: &reqwest::Url) -> bool {
     use std::net::IpAddr;
     match url.host_str() {
@@ -88,14 +179,22 @@ fn host_is_internal(url: &reqwest::Url) -> bool {
             // `Url::host_str` keeps IPv6 literals bracketed; strip for `IpAddr` parsing.
             let host = host.strip_prefix('[').unwrap_or(host);
             let host = host.strip_suffix(']').unwrap_or(host);
+
+            // Cloud-metadata DNS names (e.g. `metadata.google.internal`) resolve to internal/IMDS
+            // targets but are not IP literals, so check them BEFORE the parse() fallthrough.
+            if METADATA_HOSTS.iter().any(|m| host.eq_ignore_ascii_case(m)) {
+                return true;
+            }
+
+            // Alternate IPv4 encodings that `parse::<IpAddr>()` rejects but the resolver expands to an
+            // internal address (decimal/hex/octal/short-dotted). Block BEFORE the parse() fallthrough,
+            // which would otherwise treat them as opaque (allowed) DNS names.
+            if is_alternate_ipv4_encoding(host) {
+                return true;
+            }
+
             match host.parse::<IpAddr>() {
-                Ok(IpAddr::V4(v4)) => {
-                    v4.is_loopback()
-                        || v4.is_link_local()
-                        || v4.is_private()
-                        || v4.is_unspecified()
-                        || v4.is_broadcast()
-                }
+                Ok(IpAddr::V4(v4)) => is_internal_v4(&v4),
                 Ok(IpAddr::V6(v6)) => {
                     // Canonicalize an IPv4-mapped address (`::ffff:a.b.c.d`) FIRST and apply the V4
                     // predicates: otherwise `[::ffff:127.0.0.1]` / `[::ffff:169.254.169.254]` parse as
@@ -103,11 +202,7 @@ fn host_is_internal(url: &reqwest::Url) -> bool {
                     // defeating the guard. `to_ipv4_mapped` only matches true `::ffff:0:0/96` mapped
                     // addresses (NOT `::1`), so the V6 predicates still cover genuine V6 literals.
                     if let Some(v4) = v6.to_ipv4_mapped() {
-                        return v4.is_loopback()
-                            || v4.is_link_local()
-                            || v4.is_private()
-                            || v4.is_unspecified()
-                            || v4.is_broadcast();
+                        return is_internal_v4(&v4);
                     }
                     v6.is_loopback()
                         || v6.is_unspecified()
@@ -418,6 +513,99 @@ mod tests {
             assert!(
                 res.is_err(),
                 "IPv4-mapped-IPv6 internal webhook URL '{bad}' must be rejected; got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_cgnat_v4() {
+        // Regression (SSRF, parity with config_validate::ssrf_blocked_host): RFC 6598 CGNAT
+        // 100.64.0.0/10 is NOT is_private(), yet routable inside cloud VPCs / k8s clusters where it
+        // fronts internal services. The V4 arm previously checked only loopback/link-local/private/
+        // unspecified/broadcast, so https://100.64.0.5/ slipped through.
+        for bad in [
+            "https://100.64.0.5/hook",      // bottom of the /10
+            "https://100.64.0.0/hook",      // network address
+            "https://100.96.0.1/hook",      // mid-range (second octet 0x60, top two bits 01)
+            "https://100.127.255.254/hook", // top of the /10
+        ] {
+            let res = validate_webhook_url(Some(bad.to_string()));
+            assert!(
+                res.is_err(),
+                "CGNAT (RFC6598) webhook URL '{bad}' must be rejected by the SSRF guard; got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_accepts_non_cgnat_100_block() {
+        // 100.0.0.0/8 outside the 100.64.0.0/10 CGNAT slice is ordinary public space and must NOT
+        // be over-blocked (top two bits of the second octet are not `01`).
+        for ok in [
+            "https://100.0.0.1/hook",      // second octet 0
+            "https://100.63.255.255/hook", // just below the /10
+            "https://100.128.0.1/hook",    // second octet 0x80, top two bits 10
+        ] {
+            assert!(
+                validate_webhook_url(Some(ok.to_string())).is_ok(),
+                "public 100.x address '{ok}' must be accepted (no CGNAT over-block)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_alternate_ipv4_encodings() {
+        // Regression (SSRF, parity with config_validate): non-canonical IPv4 encodings are rejected
+        // by IpAddr::from_str but the OS resolver still maps them to internal addresses. Previously
+        // they fell into the Err(_) DNS branch (which only blocked the localhost family) and passed.
+        for bad in [
+            "https://2130706433/log",   // decimal int = 127.0.0.1
+            "https://0x7f000001/log",   // hex = 127.0.0.1
+            "https://0X7F000001/log",   // hex, upper-case prefix
+            "https://017700000001/log", // octal = 127.0.0.1
+            "https://127.1/log",        // short-dotted = 127.0.0.1
+            "https://10.0.1/log",       // short-dotted = 10.0.0.1 (RFC1918)
+            "https://2852039166/meta",  // decimal = 169.254.169.254 (IMDS)
+            "https://0x7f.0.0.1/log",   // per-octet hex in a 4-part form
+            "https://0177.0.0.1/log",   // per-octet octal in a 4-part form
+        ] {
+            let res = validate_webhook_url(Some(bad.to_string()));
+            assert!(
+                res.is_err(),
+                "alternate IPv4 encoding webhook URL '{bad}' must be rejected by the SSRF guard; got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_cloud_metadata_dns_names() {
+        // Regression (SSRF, parity with config_validate::METADATA_HOSTS): the well-known cloud
+        // metadata DNS names resolve to internal/IMDS targets. They are not IP literals, so the
+        // Err(_) DNS branch (localhost-only) let them through previously.
+        for bad in [
+            "https://metadata.google.internal/computeMetadata/v1/",
+            "https://METADATA.GOOGLE.INTERNAL/x", // case-insensitive
+            "https://metadata.internal/x",
+        ] {
+            let res = validate_webhook_url(Some(bad.to_string()));
+            assert!(
+                res.is_err(),
+                "cloud-metadata DNS name webhook URL '{bad}' must be rejected by the SSRF guard; got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_accepts_metadata_lookalike_dns_names() {
+        // A registrable external name that merely contains a metadata label as a subdomain (not the
+        // exact reserved name) must NOT be over-blocked.
+        for ok in [
+            "https://metadata.google.internal.example.com/x", // distinct registrable name
+            "https://my-metadata.internal.example.org/x",
+        ] {
+            assert!(
+                validate_webhook_url(Some(ok.to_string())).is_ok(),
+                "metadata-lookalike external name '{ok}' must be accepted (no over-block)"
             );
         }
     }

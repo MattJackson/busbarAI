@@ -202,8 +202,8 @@ impl ProtocolReader for ResponsesReader {
                         citations: Vec::new(),
                     }],
                 });
-            } else if input_val.is_array() {
-                for item in input_val.as_array().unwrap() {
+            } else if let Some(arr) = input_val.as_array() {
+                for item in arr {
                     match item.get("type").and_then(|t| t.as_str()) {
                         Some("input_text") => {
                             let text = item
@@ -668,11 +668,23 @@ impl ProtocolReader for ResponsesReader {
                         usage,
                     });
                     out.push(IrStreamEvent::MessageStop);
+                } else if event_type == "response.failed" {
+                    // Terminal failure event with no nested `response` object (e.g. a truncated SSE
+                    // frame or a proxy that stripped the body). The wire `event_type` is the only
+                    // failure signal available — honour it. Surfacing this as a successful end_turn
+                    // would mask the upstream failure from downstream clients AND deny the breaker
+                    // the failure signal, so we mirror the body-present failure arm above: emit an
+                    // explicit Error followed by MessageStop.
+                    out.push(IrStreamEvent::Error(IrError {
+                        class: StatusClass::ServerError,
+                        provider_signal: Some("response_failed".to_string()),
+                        retry_after: None,
+                    }));
+                    out.push(IrStreamEvent::MessageStop);
                 } else {
-                    // Terminal event with no nested `response` object. Whether completed, failed, or
-                    // incomplete, we must still terminate the translated stream with a
-                    // MessageDelta + MessageStop so downstream consumers do not hang waiting for the
-                    // end of the message.
+                    // Terminal completed/incomplete event with no nested `response` object. We must
+                    // still terminate the translated stream with a MessageDelta + MessageStop so
+                    // downstream consumers do not hang waiting for the end of the message.
                     let stop_reason = Some("end_turn".to_string());
                     let usage = crate::ir::IrUsage {
                         input_tokens: 0,
@@ -1215,10 +1227,14 @@ impl ProtocolWriter for ResponsesWriter {
             IrStreamEvent::MessageStop => None,
 
             IrStreamEvent::Error(err) => {
-                // Emit the full Responses/OpenAI error object so an SDK that branches on
-                // `error.type`/`error.code` sees the same shape as a native error event, not a
-                // partial `{message}`. We have no typed code/param here, so default `type` to
-                // `server_error` and leave `code`/`param` explicitly null.
+                // The native OpenAI Responses `response.failed` event wraps the error inside a
+                // `response` object (`{"response":{"id":...,"status":"failed","error":{...}}}`); the
+                // official Python/Node streaming decoder reads `event.response` to build the failed
+                // Response, NOT a top-level `error` key. Emitting `{"error":{...}}` would leave a
+                // native SDK unable to locate `event.response` and it would crash or silently
+                // swallow the failure. Synthesize a `resp_` id so the SDK can correlate the failed
+                // response. We have no typed code/param here, so default `type` to `server_error`
+                // and leave `code`/`param` explicitly null.
                 let message = err
                     .provider_signal
                     .clone()
@@ -1226,11 +1242,16 @@ impl ProtocolWriter for ResponsesWriter {
                 Some((
                     "response.failed".to_string(),
                     serde_json::json!({
-                        "error": {
-                            "message": message,
-                            "type": "server_error",
-                            "code": serde_json::Value::Null,
-                            "param": serde_json::Value::Null,
+                        "response": {
+                            "id": synthesize_response_id(),
+                            "object": "response",
+                            "status": "failed",
+                            "error": {
+                                "message": message,
+                                "type": "server_error",
+                                "code": serde_json::Value::Null,
+                                "param": serde_json::Value::Null,
+                            }
                         }
                     }),
                 ))
@@ -2376,8 +2397,9 @@ mod tests {
     }
 
     /// Regression: the streaming error event must carry the full Responses error object
-    /// (`type`/`code`/`param`), not just `message`, so SDK clients that branch on `error.type`
-    /// see the native shape.
+    /// (`type`/`code`/`param`), not just `message`, AND nest it inside the `response` object the
+    /// official SDK streaming decoder reads via `event.response`, so SDK clients that branch on
+    /// `error.type` see the native shape.
     #[test]
     fn test_write_error_stream_event_full_shape() {
         let writer = ResponsesWriter;
@@ -2390,7 +2412,14 @@ mod tests {
             .write_response_event(&ev)
             .expect("error event should emit");
         assert_eq!(etype, "response.failed");
-        let err = payload.get("error").expect("error object present");
+        // The error is nested under `response` (SDK reads `event.response`), not top-level.
+        assert!(
+            payload.get("error").is_none(),
+            "error must not be top-level: {payload}"
+        );
+        let resp = payload.get("response").expect("response object present");
+        assert_eq!(resp.get("status").and_then(|s| s.as_str()), Some("failed"));
+        let err = resp.get("error").expect("nested error object present");
         assert_eq!(err.get("message").and_then(|m| m.as_str()), Some("boom"));
         assert_eq!(
             err.get("type").and_then(|t| t.as_str()),
@@ -2782,5 +2811,133 @@ mod tests {
             crate::ir::IrBlock::Text { text, .. } => assert_eq!(text, "hi there"),
             other => panic!("expected text turn, got {other:?}"),
         }
+    }
+
+    /// Regression (HIGH/correctness): an array `input` must be iterated without the prior
+    /// `is_array()` + `.as_array().unwrap()` pattern. Exercises the `if let Some(arr)` path and
+    /// confirms array items are still decoded into messages.
+    #[test]
+    fn test_read_request_array_input_no_unwrap() {
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "input_text", "text": "hello"},
+                {"type": "output_text", "text": "world"}
+            ]
+        });
+        let reader = ResponsesReader;
+        let ir = reader
+            .read_request(&json)
+            .expect("array input should decode");
+        assert_eq!(ir.messages.len(), 2);
+        assert_eq!(ir.messages[0].role, crate::ir::IrRole::User);
+        assert_eq!(ir.messages[1].role, crate::ir::IrRole::Assistant);
+    }
+
+    /// Regression (HIGH/correctness): a `response.failed` terminal event with NO nested `response`
+    /// object (truncated SSE frame / body-stripping proxy) must NOT be decoded as a successful
+    /// end_turn. It must surface as an explicit Error + MessageStop so downstream clients see the
+    /// failure and the breaker receives the failure signal.
+    #[test]
+    fn test_failed_event_without_body_surfaces_error() {
+        let reader = ResponsesReader;
+        let mut state = crate::ir::StreamDecodeState::default();
+        let data = serde_json::json!({});
+        let events = reader.read_response_events("response.failed", &data, &mut state);
+
+        assert_eq!(
+            events.len(),
+            2,
+            "expected Error + MessageStop, got {events:?}"
+        );
+        match &events[0] {
+            IrStreamEvent::Error(err) => {
+                assert_eq!(err.class, StatusClass::ServerError);
+                assert_eq!(err.provider_signal.as_deref(), Some("response_failed"));
+            }
+            other => panic!("expected Error first, got {other:?}"),
+        }
+        assert!(
+            matches!(events[1], IrStreamEvent::MessageStop),
+            "expected MessageStop, got {:?}",
+            events[1]
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, IrStreamEvent::MessageDelta { .. })),
+            "a bodyless failed event must not emit a success MessageDelta"
+        );
+    }
+
+    /// A `response.completed`/`response.incomplete` terminal event with no nested `response` object
+    /// must still terminate the stream with a success MessageDelta + MessageStop (must NOT become an
+    /// Error — only `response.failed` does).
+    #[test]
+    fn test_completed_event_without_body_emits_end_turn() {
+        let reader = ResponsesReader;
+        let mut state = crate::ir::StreamDecodeState::default();
+        let data = serde_json::json!({});
+        let events = reader.read_response_events("response.completed", &data, &mut state);
+
+        assert_eq!(events.len(), 2, "expected MessageDelta + MessageStop");
+        match &events[0] {
+            IrStreamEvent::MessageDelta { stop_reason, .. } => {
+                assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+            }
+            other => panic!("expected MessageDelta first, got {other:?}"),
+        }
+        assert!(matches!(events[1], IrStreamEvent::MessageStop));
+        assert!(
+            !events.iter().any(|e| matches!(e, IrStreamEvent::Error(_))),
+            "a bodyless completed event must not emit an Error"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance): the writer's `IrStreamEvent::Error` arm must emit a
+    /// `response.failed` event whose error lives inside a `response` object (the shape the official
+    /// SDK streaming decoder reads via `event.response`), with a synthesized `resp_` id and
+    /// `status: "failed"` — NOT a top-level `{"error":{...}}`.
+    #[test]
+    fn test_error_event_wraps_in_response_object() {
+        let writer = ResponsesWriter;
+        let ev = IrStreamEvent::Error(IrError {
+            class: StatusClass::ServerError,
+            provider_signal: Some("overloaded".to_string()),
+            retry_after: None,
+        });
+        let (etype, payload) = writer
+            .write_response_event(&ev)
+            .expect("error event should emit");
+        assert_eq!(etype, "response.failed");
+
+        // No top-level `error` key — the SDK reads `event.response`, not `event.error`.
+        assert!(
+            payload.get("error").is_none(),
+            "error must be nested under response, not top-level: {payload}"
+        );
+        let resp = payload
+            .get("response")
+            .expect("payload must carry a `response` object");
+        let id = resp
+            .get("id")
+            .and_then(|i| i.as_str())
+            .expect("synthesized resp_ id present");
+        assert!(
+            id.starts_with("resp_"),
+            "synthesized id must use resp_ prefix, got {id}"
+        );
+        assert_eq!(resp.get("status").and_then(|s| s.as_str()), Some("failed"));
+        let error = resp.get("error").expect("nested error object");
+        assert_eq!(
+            error.get("message").and_then(|m| m.as_str()),
+            Some("overloaded")
+        );
+        assert_eq!(
+            error.get("type").and_then(|t| t.as_str()),
+            Some("server_error")
+        );
+        assert!(error.get("code").expect("code key present").is_null());
+        assert!(error.get("param").expect("param key present").is_null());
     }
 }

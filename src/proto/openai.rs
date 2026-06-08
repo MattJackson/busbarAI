@@ -501,11 +501,31 @@ impl ProtocolReader for OpenAiReader {
             }
         }
 
+        // Read top-level `usage` INDEPENDENTLY of finish_reason. With
+        // `stream_options: {include_usage: true}` the OpenAI API emits usage in a SEPARATE trailing
+        // chunk whose `choices` array is EMPTY and which carries NO finish_reason — for that chunk
+        // `choice0` is None, so the finish_reason branch below never runs. Reading usage here (rather
+        // than only inside the finish_reason block, as the prior code did) ensures the trailing
+        // usage chunk is not silently discarded, preserving token accounting across translated /
+        // passthrough OpenAI streams that follow the spec'd trailing-usage convention.
+        let chunk_usage = data.get("usage").map(|u| IrUsage {
+            input_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            output_tokens: u
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: u
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64()),
+        });
+
         // 5. finish_reason → close open blocks (text first, then tools ascending), MessageDelta, MessageStop.
-        if let Some(fr) = choice0
+        let finish_reason = choice0
             .and_then(|c| c.get("finish_reason"))
-            .and_then(|r| r.as_str())
-        {
+            .and_then(|r| r.as_str());
+        if let Some(fr) = finish_reason {
             // Close in order: thinking (0, if it never yielded to text), then text, then tools.
             if state.thinking_block_open {
                 state.thinking_block_open = false;
@@ -526,26 +546,12 @@ impl ProtocolReader for OpenAiReader {
                 "tool_calls" => "tool_use".to_string(),
                 other => other.to_string(),
             });
-            let usage = data
-                .get("usage")
-                .map(|u| IrUsage {
-                    input_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                    output_tokens: u
-                        .get("completion_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    cache_creation_input_tokens: None,
-                    cache_read_input_tokens: u
-                        .get("prompt_tokens_details")
-                        .and_then(|d| d.get("cached_tokens"))
-                        .and_then(|v| v.as_u64()),
-                })
-                .unwrap_or(IrUsage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_creation_input_tokens: None,
-                    cache_read_input_tokens: None,
-                });
+            let usage = chunk_usage.unwrap_or(IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            });
             out.push(IrStreamEvent::MessageDelta {
                 stop_reason,
                 // OpenAI has no stop_sequence analog in its stream.
@@ -553,6 +559,18 @@ impl ProtocolReader for OpenAiReader {
                 usage,
             });
             out.push(IrStreamEvent::MessageStop);
+        } else if let Some(usage) = chunk_usage {
+            // Trailing usage-only chunk (include_usage convention): no finish_reason and no choices,
+            // but a top-level `usage` object. Fold it into a MessageDelta with `stop_reason: None`
+            // (in-progress finish per the chunk shape) so cross-protocol consumers — e.g. an
+            // Anthropic client reading `message_delta.usage` — see real input/output token counts
+            // instead of zeros. No MessageStop is emitted here: the terminal finish_reason chunk
+            // (or the stream's `[DONE]`) still ends the message; this only carries the late usage.
+            out.push(IrStreamEvent::MessageDelta {
+                stop_reason: None,
+                stop_sequence: None,
+                usage,
+            });
         }
 
         out
@@ -1243,8 +1261,17 @@ impl ProtocolWriter for OpenAiWriter {
                     | crate::breaker::StatusClass::Timeout
                     | crate::breaker::StatusClass::Network => "server_error",
                 };
+                // Include `code` and `param` as JSON null, matching BOTH the native OpenAI error
+                // shape and this writer's own non-stream `write_error` envelope. Omitting them made
+                // an in-stream error structurally different from a non-stream error (a detectable
+                // proxy tell) and broke clients that destructure `error.code` / `error.param`.
                 let error_obj = serde_json::json!({
-                    "error": { "message": message, "type": error_type }
+                    "error": {
+                        "message": message,
+                        "type": error_type,
+                        "code": serde_json::Value::Null,
+                        "param": serde_json::Value::Null,
+                    }
                 });
                 Some(("".to_string(), error_obj))
             }
@@ -1355,23 +1382,24 @@ impl ProtocolWriter for OpenAiWriter {
         }
 
         let mut choices_array: Vec<serde_json::Value> = Vec::new();
-        let finish_reason = match resp.stop_reason.as_deref() {
-            Some("end_turn") | Some("stop_sequence") => "stop",
-            Some("max_tokens") => "length",
-            Some("tool_use") => "tool_calls",
-            Some(reason) => reason,
-            None => "",
+        // The OpenAI chat.completion spec requires `finish_reason` to ALWAYS be present in a choice
+        // object — a valid enum string ("stop"/"length"/"tool_calls"/...) or JSON `null` when the
+        // upstream provided no stop reason (e.g. a cross-protocol Bedrock response whose
+        // `read_response` yields `stop_reason: None`). The prior code mapped `None` to "" and then
+        // omitted the key entirely; a missing `finish_reason` is not a valid choice shape and the
+        // Python SDK's Pydantic model raises a validation error on it. Emit null instead.
+        let finish_reason: serde_json::Value = match resp.stop_reason.as_deref() {
+            Some("end_turn") | Some("stop_sequence") => serde_json::json!("stop"),
+            Some("max_tokens") => serde_json::json!("length"),
+            Some("tool_use") => serde_json::json!("tool_calls"),
+            Some(reason) => serde_json::json!(reason),
+            None => serde_json::Value::Null,
         };
 
         let mut choice_obj = serde_json::Map::new();
         choice_obj.insert("index".to_string(), serde_json::json!(0));
         choice_obj.insert("message".to_string(), message_obj);
-        if !finish_reason.is_empty() {
-            choice_obj.insert(
-                "finish_reason".to_string(),
-                serde_json::json!(finish_reason),
-            );
-        }
+        choice_obj.insert("finish_reason".to_string(), finish_reason);
         choices_array.push(serde_json::Value::Object(choice_obj));
 
         // Identity fields, in the order an official OpenAI chat.completion object carries them
@@ -2273,5 +2301,219 @@ mod tests {
             .content
             .iter()
             .all(|b| !matches!(b, IrBlock::Text { .. })));
+    }
+
+    // --- Round 4 fix (correctness): trailing usage-only stream chunk is captured, not discarded ---
+
+    #[test]
+    fn stream_trailing_usage_only_chunk_emits_message_delta_with_usage() {
+        // include_usage convention: a SEPARATE trailing chunk carries top-level `usage` with an
+        // EMPTY `choices` array and no finish_reason. The prior code read usage only inside the
+        // finish_reason branch, so this chunk's usage was silently dropped. It must now surface as a
+        // MessageDelta carrying the real token counts.
+        let reader = OpenAiReader;
+        let mut st = crate::ir::StreamDecodeState::default();
+        // Prime the stream with a normal first chunk so `started` is set (MessageStart already out).
+        let _ = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-u1",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}]
+            }),
+            &mut st,
+        );
+        // Trailing usage-only chunk: empty choices, no finish_reason, top-level usage present.
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-u1",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "prompt_tokens_details": { "cached_tokens": 3 }
+                }
+            }),
+            &mut st,
+        );
+        let delta = evs
+            .iter()
+            .find(|e| matches!(e, IrStreamEvent::MessageDelta { .. }))
+            .expect("trailing usage chunk yields a MessageDelta");
+        match delta {
+            IrStreamEvent::MessageDelta {
+                stop_reason,
+                stop_sequence,
+                usage,
+            } => {
+                // In-progress finish per the chunk shape (no finish_reason on a usage-only chunk).
+                assert_eq!(*stop_reason, None);
+                assert_eq!(*stop_sequence, None);
+                assert_eq!(usage.input_tokens, 11);
+                assert_eq!(usage.output_tokens, 7);
+                assert_eq!(usage.cache_read_input_tokens, Some(3));
+            }
+            _ => unreachable!(),
+        }
+        // A usage-only chunk must NOT terminate the message (the finish chunk / [DONE] does that).
+        assert!(!evs.iter().any(|e| matches!(e, IrStreamEvent::MessageStop)));
+    }
+
+    #[test]
+    fn stream_usage_on_finish_chunk_still_captured() {
+        // The combined case (usage present on the finish_reason chunk) must keep working: usage
+        // flows into the terminal MessageDelta and a MessageStop closes the message.
+        let reader = OpenAiReader;
+        let mut st = crate::ir::StreamDecodeState::default();
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-u2",
+                "created": 1_700_000_001u64,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": { "prompt_tokens": 5, "completion_tokens": 2 }
+            }),
+            &mut st,
+        );
+        let delta = evs
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::MessageDelta {
+                    stop_reason, usage, ..
+                } => Some((stop_reason.clone(), usage.clone())),
+                _ => None,
+            })
+            .expect("finish chunk yields a MessageDelta");
+        assert_eq!(delta.0.as_deref(), Some("end_turn"));
+        assert_eq!(delta.1.input_tokens, 5);
+        assert_eq!(delta.1.output_tokens, 2);
+        assert!(evs.iter().any(|e| matches!(e, IrStreamEvent::MessageStop)));
+    }
+
+    // --- Round 4 fix (conformance): in-stream Error envelope includes code/param null ---
+
+    #[test]
+    fn stream_error_envelope_includes_null_code_and_param() {
+        // The in-stream error body must match the native OpenAI shape (and this writer's non-stream
+        // `write_error`): error.{message,type,code,param} with code/param JSON null.
+        let ev = IrStreamEvent::Error(crate::breaker::CanonicalSignal {
+            class: crate::breaker::StatusClass::RateLimit,
+            provider_signal: Some("slow down".to_string()),
+            retry_after: None,
+        });
+        let (_, chunk) = OpenAiWriter
+            .write_response_event(&ev)
+            .expect("error emits a chunk");
+        assert_eq!(chunk["error"]["message"], serde_json::json!("slow down"));
+        assert_eq!(
+            chunk["error"]["type"],
+            serde_json::json!("rate_limit_error")
+        );
+        // The two fields the prior code omitted, present and explicitly null.
+        assert_eq!(chunk["error"]["code"], serde_json::Value::Null);
+        assert_eq!(chunk["error"]["param"], serde_json::Value::Null);
+        // And present as KEYS (null value), not merely absent — strict destructuring relies on this.
+        let err_obj = chunk["error"].as_object().expect("error object");
+        assert!(err_obj.contains_key("code"));
+        assert!(err_obj.contains_key("param"));
+    }
+
+    #[test]
+    fn stream_error_shape_matches_write_error_shape() {
+        // The set of keys in the in-stream error object must equal the non-stream `write_error`
+        // envelope's key set — a divergence is itself a detectable proxy tell.
+        let ev = IrStreamEvent::Error(crate::breaker::CanonicalSignal {
+            class: crate::breaker::StatusClass::Auth,
+            provider_signal: Some("nope".to_string()),
+            retry_after: None,
+        });
+        let (_, stream_chunk) = OpenAiWriter
+            .write_response_event(&ev)
+            .expect("error emits a chunk");
+        let non_stream = OpenAiWriter.write_error(401, "auth", "nope");
+        let mut stream_keys: Vec<&String> = stream_chunk["error"]
+            .as_object()
+            .expect("stream error object")
+            .keys()
+            .collect();
+        let mut non_stream_keys: Vec<&String> = non_stream["error"]
+            .as_object()
+            .expect("non-stream error object")
+            .keys()
+            .collect();
+        stream_keys.sort();
+        non_stream_keys.sort();
+        assert_eq!(stream_keys, non_stream_keys);
+    }
+
+    // --- Round 4 fix (conformance): non-stream write_response always emits finish_reason ---
+
+    #[test]
+    fn write_response_emits_null_finish_reason_when_stop_reason_none() {
+        // A cross-protocol response whose upstream provided no stop reason (stop_reason: None) must
+        // still carry a `finish_reason` KEY, serialized as JSON null — never omitted.
+        let resp = crate::ir::IrResponse {
+            role: IrRole::Assistant,
+            content: vec![text_block("partial")],
+            stop_reason: None,
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = OpenAiWriter.write_response(&resp);
+        let choice = out["choices"][0].as_object().expect("choice object");
+        assert!(
+            choice.contains_key("finish_reason"),
+            "finish_reason key must always be present"
+        );
+        assert_eq!(choice["finish_reason"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn write_response_maps_finish_reason_enum_values() {
+        let cases = [
+            (Some("end_turn"), serde_json::json!("stop")),
+            (Some("stop_sequence"), serde_json::json!("stop")),
+            (Some("max_tokens"), serde_json::json!("length")),
+            (Some("tool_use"), serde_json::json!("tool_calls")),
+            (Some("content_filter"), serde_json::json!("content_filter")),
+            (None, serde_json::Value::Null),
+        ];
+        for (stop_reason, want) in cases {
+            let resp = crate::ir::IrResponse {
+                role: IrRole::Assistant,
+                content: vec![text_block("x")],
+                stop_reason: stop_reason.map(String::from),
+                usage: IrUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+                model: None,
+                id: None,
+                created: None,
+                system_fingerprint: None,
+                stop_sequence: None,
+            };
+            let out = OpenAiWriter.write_response(&resp);
+            assert_eq!(
+                out["choices"][0]["finish_reason"], want,
+                "stop_reason={stop_reason:?}"
+            );
+        }
     }
 }

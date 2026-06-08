@@ -228,19 +228,28 @@ fn proto_for_path(path: &str) -> &'static str {
     }
 }
 
-/// Mint a synthetic AWS-style request id (32 lowercase hex chars, the shape an AWS SDK reads off
-/// the `x-amzn-RequestId` header) for a busbar-synthesized Bedrock error response, where there is
-/// no upstream request to forward an id from. No new dependency: uniqueness comes from the unix
-/// second plus a process-global atomic counter. Never panics on a bad clock.
-fn synth_amzn_request_id() -> String {
-    static AMZN_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let seq = AMZN_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // 16 hex chars from the timestamp + 16 from the counter → a stable 32-char AWS-style id.
-    format!("{secs:016x}{seq:016x}")
+/// Mint a synthetic AWS request id for a busbar-synthesized Bedrock error response, where there is
+/// no upstream request to forward an id from. Real Bedrock runtime responses carry a UUID-v4-shaped
+/// value on `x-amzn-RequestId` (8-4-4-4-12 lowercase hex); a flat 32-hex string with no dashes is a
+/// protocol tell an AWS SDK that parses the header as a UUID would reject. This mirrors
+/// `route.rs::synth_amzn_request_id`: 16 CSPRNG bytes via `getrandom` with RFC 4122 v4 version +
+/// variant bits applied. Returns `None` when entropy is unavailable so the caller omits the header
+/// rather than emitting a malformed (non-random / non-UUID) id — never panics on the request path.
+fn synth_amzn_request_id() -> Option<String> {
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).ok()?;
+    // RFC 4122 v4 layout (version nibble = 4, variant bits = 10) so the value is a well-formed UUID.
+    buf[6] = (buf[6] & 0x0f) | 0x40;
+    buf[8] = (buf[8] & 0x3f) | 0x80;
+    let s: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &s[0..8],
+        &s[8..12],
+        &s[12..16],
+        &s[16..20],
+        &s[20..32]
+    ))
 }
 
 /// Build an auth-failure response carrying the inferred ingress protocol's NATIVE error envelope
@@ -286,8 +295,12 @@ fn unauthorized_response(path: &str, message: &str) -> Response {
             resp.headers_mut().insert("x-amzn-errortype", v);
         }
         // `x-amzn-RequestId`: AWS returns the request id only in this header (never in the body).
-        if let Ok(v) = HeaderValue::from_str(&synth_amzn_request_id()) {
-            resp.headers_mut().insert("x-amzn-requestid", v);
+        // `synth_amzn_request_id` returns None when entropy is unavailable; omit the header in that
+        // case rather than emitting a malformed id (matching the route.rs behaviour).
+        if let Some(id) = synth_amzn_request_id() {
+            if let Ok(v) = HeaderValue::from_str(&id) {
+                resp.headers_mut().insert("x-amzn-requestid", v);
+            }
         }
     }
     resp
@@ -380,6 +393,25 @@ pub(crate) async fn auth_middleware(
     // x-goog-api-key) — `client_token` already encodes that precedence. When governance is
     // disabled, the existing AuthMode (None/Token/Passthrough) applies unchanged.
     if let Some(gov) = &app.governance {
+        // governance enabled + `auth.mode: passthrough` is a self-contradictory deployment: the
+        // governance branch below requires every request to present a valid enabled busbar virtual
+        // key (superseding passthrough's "accept any caller credential and forward it upstream"
+        // intent), so a server an operator believes is in passthrough silently rejects every caller
+        // that lacks a virtual key. There is no place in `validate(&RootCfg)` to catch this —
+        // governance is read separately from the resolved config — so warn once here, at the first
+        // request that exercises the combination, rather than letting it pass unremarked.
+        if app.auth_mode == AuthMode::Passthrough {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    "auth.mode=passthrough with governance enabled: governance supersedes \
+                     passthrough — every request must present a valid enabled virtual key, and \
+                     passthrough's accept-and-forward-caller-credential semantics are NOT honoured. \
+                     This combination is unsupported; configure auth.mode=token (or omit auth) \
+                     alongside governance."
+                );
+            });
+        }
         match gov.lookup(client_token.as_deref().unwrap_or("")) {
             Some(key) if key.enabled => {
                 req.extensions_mut()
@@ -408,6 +440,45 @@ pub(crate) async fn auth_middleware(
 #[allow(deprecated)] // allow deprecated field access in tests
 mod tests {
     use super::*;
+
+    /// Assert a string is canonical UUID-v4 shaped: five dash-separated lowercase-hex groups of
+    /// lengths 8-4-4-4-12, with the version nibble == '4' and the variant nibble in {8,9,a,b}.
+    fn assert_uuid_v4_shaped(id: &str) {
+        let segs: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            segs.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12],
+            "x-amzn-requestid must be UUID-v4 shaped (8-4-4-4-12), got '{id}'"
+        );
+        assert!(
+            id.chars()
+                .all(|c| c == '-' || c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "UUID must be lowercase hex with dashes only, got '{id}'"
+        );
+        // Version nibble: first char of the third group.
+        assert_eq!(
+            segs[2].chars().next(),
+            Some('4'),
+            "UUID version nibble must be 4, got '{id}'"
+        );
+        // Variant nibble: first char of the fourth group must be one of 8,9,a,b.
+        assert!(
+            matches!(segs[3].chars().next(), Some('8' | '9' | 'a' | 'b')),
+            "UUID variant nibble must be 8/9/a/b, got '{id}'"
+        );
+    }
+
+    #[test]
+    fn test_synth_amzn_request_id_is_uuid_v4() {
+        // Regression for the flat-32-hex-no-dashes format: a Bedrock x-amzn-RequestId must be a
+        // CSPRNG UUID-v4, matching real AWS and the route.rs twin. Two consecutive ids must differ
+        // (entropy-sourced, not a predictable timestamp||counter).
+        let a = synth_amzn_request_id().expect("entropy must be available under test");
+        let b = synth_amzn_request_id().expect("entropy must be available under test");
+        assert_uuid_v4_shaped(&a);
+        assert_uuid_v4_shaped(&b);
+        assert_ne!(a, b, "consecutive synthetic request ids must differ");
+    }
 
     #[test]
     fn test_constant_time_eq_same() {
@@ -770,10 +841,15 @@ mod tests {
             Some("AccessDeniedException"),
             "Bedrock auth failure must carry x-amzn-errortype the AWS SDK types off"
         );
-        assert!(
-            resp.headers().get("x-amzn-requestid").is_some(),
-            "Bedrock auth failure must carry a synthetic x-amzn-requestid"
-        );
+        let req_id = resp
+            .headers()
+            .get("x-amzn-requestid")
+            .and_then(|v| v.to_str().ok())
+            .expect("Bedrock auth failure must carry a synthetic x-amzn-requestid")
+            .to_string();
+        // Real Bedrock x-amzn-RequestId is UUID-v4 shaped (8-4-4-4-12 lowercase hex). A flat
+        // 32-hex-no-dashes value is a protocol tell — assert the canonical shape, not just presence.
+        assert_uuid_v4_shaped(&req_id);
         let body = decode_body(resp);
         assert_eq!(
             body["__type"], "AccessDeniedException",
@@ -1055,6 +1131,171 @@ mod tests {
         assert_eq!(
             env["error"]["type"], "authentication_error",
             "responses 401 must carry error.type=authentication_error: {env}"
+        );
+
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// End-to-end through the real router + `auth_middleware` in TOKEN mode: a wrong token on the
+    /// Bedrock ingress path (`/model/<id>/converse`) must be rejected with HTTP 403 (NOT 401 —
+    /// a native SigV4 auth failure is 403) carrying `x-amzn-errortype: AccessDeniedException`, a
+    /// UUID-v4-shaped `x-amzn-requestid`, and a body whose `__type` is `AccessDeniedException`. The
+    /// existing end-to-end auth tests only cover anthropic/cohere/responses; the bedrock-specific
+    /// status + typing headers were exercised only by a direct `unauthorized_response` call that
+    /// bypasses the middleware → router stack, so a regression dropping the 403/headers in the full
+    /// pipeline would be uncaught.
+    #[tokio::test]
+    async fn test_bedrock_ingress_wrong_token_is_403_native_envelope() {
+        use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        crate::metrics::init();
+
+        // Auth rejects before routing, so no upstream call is made; TestApp still needs a lane/pool.
+        let state = Arc::new(MockServerState::new());
+        let server = MockServer::new(state).await;
+
+        let auth_cfg = crate::config::AuthCfg {
+            mode: "token".to_string(),
+            client_tokens: vec!["the-real-token".to_string()],
+            _legacy_token: None,
+        };
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "test-model",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .api_key("busbar-upstream-key"),
+            )
+            .pool("pa", &[(0, 1)])
+            .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+            .auth_mode(AuthMode::Token)
+            .build();
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let body = json!({"messages": [{"role": "user", "content": [{"text": "hi"}]}]}).to_string();
+
+        let r = client
+            .post(format!("http://{addr}/model/anthropic.claude/converse"))
+            .header("authorization", "Bearer wrong-token")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            r.status().as_u16(),
+            403,
+            "a Bedrock SigV4 auth failure must be 403, not 401 (got {})",
+            r.status()
+        );
+        assert_eq!(
+            r.headers()
+                .get("x-amzn-errortype")
+                .and_then(|v| v.to_str().ok()),
+            Some("AccessDeniedException"),
+            "Bedrock auth failure must carry x-amzn-errortype the AWS SDK types off"
+        );
+        let req_id = r
+            .headers()
+            .get("x-amzn-requestid")
+            .and_then(|v| v.to_str().ok())
+            .expect("Bedrock auth failure must carry x-amzn-requestid")
+            .to_string();
+        assert_uuid_v4_shaped(&req_id);
+        assert_eq!(
+            r.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+        );
+        let env: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            env["__type"], "AccessDeniedException",
+            "bedrock body must use __type=AccessDeniedException: {env}"
+        );
+
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// End-to-end through the real router + `auth_middleware` in TOKEN mode: a wrong token on the
+    /// Gemini ingress path (`/v1beta/models/<id>:generateContent`) must be rejected 401 with the
+    /// Gemini-native envelope (`error.code == 401`, `error.status == "UNAUTHENTICATED"`). Companion
+    /// to the bedrock test: the Gemini auth-boundary envelope was previously only checked via a
+    /// direct `unauthorized_response` call, not through the full router stack.
+    #[tokio::test]
+    async fn test_gemini_ingress_wrong_token_is_401_native_envelope() {
+        use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        crate::metrics::init();
+
+        let state = Arc::new(MockServerState::new());
+        let server = MockServer::new(state).await;
+
+        let auth_cfg = crate::config::AuthCfg {
+            mode: "token".to_string(),
+            client_tokens: vec!["the-real-token".to_string()],
+            _legacy_token: None,
+        };
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "test-model",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .api_key("busbar-upstream-key"),
+            )
+            .pool("pa", &[(0, 1)])
+            .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+            .auth_mode(AuthMode::Token)
+            .build();
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let body = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}).to_string();
+
+        let r = client
+            .post(format!(
+                "http://{addr}/v1beta/models/gemini-1.5:generateContent"
+            ))
+            .header("x-goog-api-key", "wrong-token")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            r.status().as_u16(),
+            401,
+            "a Gemini auth failure must be 401 (got {})",
+            r.status()
+        );
+        assert_eq!(
+            r.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+        );
+        let env: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(env["error"]["code"], 401, "gemini error.code: {env}");
+        assert_eq!(
+            env["error"]["status"], "UNAUTHENTICATED",
+            "gemini error.status must be UNAUTHENTICATED: {env}"
         );
 
         handle.abort();
