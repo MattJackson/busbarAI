@@ -25,6 +25,13 @@
 /// Upper bound on a single event-stream frame. Bedrock ConverseStream frames are small JSON deltas
 /// (well under this), so a declared `total_len` above this cap can only be a malformed or hostile
 /// prelude. Bounding it stops a single frame's declared length from driving unbounded buffering.
+///
+/// NOTE on the effective per-frame ceiling: the egress reassembly path in
+/// `StreamTranslate::feed` aborts a stream once its reassembly buffer exceeds
+/// `StreamTranslate::MAX_BUF`. The two caps are deliberately kept equal so that any frame the decoder
+/// here is willing to assemble can also be buffered to completion upstream — otherwise a frame
+/// between the two caps would be aborted before `drain_frames` ever saw it. Keep `MAX_FRAME_BYTES`
+/// and `StreamTranslate::MAX_BUF` in sync.
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Drain every COMPLETE frame from `buf`, returning `(event_type, payload_bytes)` per frame and
@@ -59,8 +66,13 @@ pub(crate) fn drain_frames(buf: &mut Vec<u8>) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// Find the `:event-type` string header value. Handles the u16-length-prefixed value types (string
-/// = 7, bytes = 6); bails on other types (Bedrock's framing headers are all strings).
+/// Find the `:event-type` string header value. Handles the u16-length-prefixed string/bytes value
+/// types (string = 7, bytes = 6) by reading their value, and the AWS-spec fixed-width types
+/// (bool/byte/short/int/long/timestamp/uuid) by SKIPPING the correct number of bytes so a non-string
+/// header appearing before `:event-type` no longer aborts the scan. Returns `None` only when the
+/// header block is truncated or carries a value-type byte with no defined width (a genuinely
+/// malformed frame), so a future AWS framing header (e.g. a timestamp correlation header) does not
+/// silently drop the event type.
 fn parse_event_type(mut h: &[u8]) -> Option<String> {
     while !h.is_empty() {
         let name_len = *h.first()? as usize;
@@ -70,7 +82,19 @@ fn parse_event_type(mut h: &[u8]) -> Option<String> {
         let name = &h[1..1 + name_len];
         let value_type = h[1 + name_len];
         let mut p = 1 + name_len + 1;
-        let value: &[u8] = match value_type {
+        // AWS event-stream value types. Fixed-width types carry no length prefix and are skipped by
+        // advancing `p`; the variable-width string/bytes types (6/7) carry a u16 length prefix.
+        let fixed_width: Option<usize> = match value_type {
+            0 | 1 => Some(0), // bool true / bool false — value is encoded in the type byte itself
+            2 => Some(1),     // byte
+            3 => Some(2),     // short
+            4 => Some(4),     // int
+            5 => Some(8),     // long
+            8 => Some(8),     // timestamp
+            9 => Some(16),    // uuid
+            _ => None,
+        };
+        let value: Option<&[u8]> = match value_type {
             6 | 7 => {
                 if h.len() < p + 2 {
                     return None;
@@ -82,12 +106,24 @@ fn parse_event_type(mut h: &[u8]) -> Option<String> {
                 }
                 let v = &h[p..p + vlen];
                 p += vlen;
-                v
+                Some(v)
             }
-            _ => return None, // unexpected non-string header before :event-type
+            _ => match fixed_width {
+                Some(w) => {
+                    if h.len() < p + w {
+                        return None;
+                    }
+                    p += w;
+                    None
+                }
+                // Unknown value-type byte with no defined width: the frame is malformed, bail.
+                None => return None,
+            },
         };
         if name == b":event-type" {
-            return std::str::from_utf8(value).ok().map(String::from);
+            // `:event-type` is always a string (type 7) in AWS framing; if it appeared with a
+            // fixed-width type there is no string value to return.
+            return value.and_then(|v| std::str::from_utf8(v).ok().map(String::from));
         }
         h = &h[p..];
     }
@@ -121,29 +157,59 @@ fn push_string_header(headers: &mut Vec<u8>, name: &str, value: &str) {
 /// ```
 /// A Bedrock ConverseStream frame carries three string headers — `:event-type` (the event name),
 /// `:content-type` (`application/json`) and `:message-type` (`event`). Runs in the streaming hot
-/// path: all arithmetic is `u64`-widened and the result is clamped to `MAX_FRAME_BYTES`, so no cast
+/// path: all arithmetic is `u64`-widened and the result is bounded by `MAX_FRAME_BYTES`, so no cast
 /// can wrap (frame lengths are bounded and this never panics on the request path).
 pub(crate) fn encode_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
     let mut headers = Vec::new();
     push_string_header(&mut headers, ":event-type", event_type);
     push_string_header(&mut headers, ":content-type", "application/json");
     push_string_header(&mut headers, ":message-type", "event");
+    encode_with_headers(headers, payload)
+}
 
+/// Encode a modeled-exception event-stream message for a native AWS SDK Bedrock client. AWS signals
+/// a mid-stream error with `:message-type: exception` and an `:exception-type` header naming the
+/// Converse exception (e.g. `InternalServerException`, `ModelStreamErrorException`); the payload is
+/// the JSON `{"message": ...}` body the SDK surfaces. This is what a Bedrock-ingress stream must emit
+/// on a mid-stream upstream failure instead of an SSE `event: error` text frame — writing SSE text
+/// into a binary eventstream body produces an undecodable prelude/CRC for the SDK's decoder.
+pub(crate) fn encode_exception_frame(exception_type: &str, message: &str) -> Vec<u8> {
+    let payload = serde_json::to_vec(&serde_json::json!({ "message": message }))
+        .unwrap_or_else(|_| b"{\"message\":\"upstream stream error\"}".to_vec());
+    let mut headers = Vec::new();
+    push_string_header(&mut headers, ":exception-type", exception_type);
+    push_string_header(&mut headers, ":content-type", "application/json");
+    push_string_header(&mut headers, ":message-type", "exception");
+    encode_with_headers(headers, &payload)
+}
+
+/// Frame a pre-built header block + payload into a complete event-stream message with real CRC32s.
+/// Shared by [`encode_frame`] and [`encode_exception_frame`].
+///
+/// A frame this encoder builds is always well under `MAX_FRAME_BYTES` (small JSON bodies). If the
+/// header+payload would exceed the cap, the frame is DROPPED (empty `Vec` returned) rather than
+/// byte-truncating the payload: a truncated JSON payload is syntactically invalid and a CRC-valid
+/// frame carrying unparseable JSON is worse for a native SDK than no frame at all. The caller appends
+/// the result to its output buffer, so an empty return simply emits nothing for this event.
+fn encode_with_headers(headers: Vec<u8>, payload: &[u8]) -> Vec<u8> {
     // total_len = prelude(12) + headers + payload + message_crc(4). Widen to u64 so the sum cannot
-    // overflow `usize` arithmetic, then bound it: a frame this encoder builds is always well under
-    // MAX_FRAME_BYTES (small JSON deltas), so an oversized result can only be a bug, and we refuse
-    // to emit a length field that would lie about the frame. Truncating the payload here keeps the
-    // declared total_len consistent with the bytes written so the decoder stays in sync.
+    // overflow `usize` arithmetic, then bound it against MAX_FRAME_BYTES.
     let prelude = 12u64;
     let trailer = 4u64;
     let headers_len = headers.len() as u64;
-    let max_payload = MAX_FRAME_BYTES as u64 - prelude - trailer - headers_len;
-    let payload = if payload.len() as u64 > max_payload {
-        &payload[..max_payload as usize]
-    } else {
-        payload
-    };
     let total_len = prelude + headers_len + payload.len() as u64 + trailer;
+    if total_len > MAX_FRAME_BYTES as u64 {
+        // Oversized: drop the frame rather than emit corrupt (truncated) JSON. Unreachable for any
+        // real Bedrock ConverseStream delta; this only guards a pathological multi-MiB single event.
+        // Dropping a frame is graceful (the caller appends the empty result and emits nothing for
+        // this event); a CRC-valid frame carrying truncated, unparseable JSON would be worse.
+        tracing::warn!(
+            total_len,
+            cap = MAX_FRAME_BYTES,
+            "event-stream frame exceeds MAX_FRAME_BYTES; dropping"
+        );
+        return Vec::new();
+    }
 
     let mut frame = Vec::with_capacity(total_len as usize);
     // Prelude: total_len + headers_len (both u32 BE). Bounded above, so the casts are exact.
@@ -298,6 +364,101 @@ mod tests {
             "message CRC is the real CRC32"
         );
         assert_ne!(message_crc, 0, "message CRC is not the zero placeholder");
+    }
+
+    /// `parse_event_type` must return `None` (rather than panic or misread) when it meets a header
+    /// whose value-type byte is genuinely unknown / has no defined width.
+    #[test]
+    fn test_parse_event_type_unknown_value_type_returns_none() {
+        // One header named "x" with value_type = 200 (not a real AWS type) → malformed → None.
+        let mut h = Vec::new();
+        h.push(1u8); // name_len
+        h.extend_from_slice(b"x"); // name
+        h.push(200u8); // value_type: unknown
+        assert_eq!(parse_event_type(&h), None);
+    }
+
+    /// A fixed-width header (e.g. a `timestamp`, type 8) appearing BEFORE `:event-type` must be
+    /// skipped by advancing the correct number of bytes, not abort the scan — so the event type is
+    /// still recovered.
+    #[test]
+    fn test_parse_event_type_skips_fixed_width_header() {
+        let mut h = Vec::new();
+        // Header 1: ":ts" timestamp (type 8, 8-byte value) — must be skipped.
+        h.push(3u8);
+        h.extend_from_slice(b":ts");
+        h.push(8u8); // timestamp
+        h.extend_from_slice(&0u64.to_be_bytes()); // 8 bytes
+                                                  // Header 2: ":event-type" string = "messageStart".
+        h.push(11u8);
+        h.extend_from_slice(b":event-type");
+        h.push(7u8); // string
+        let v = b"messageStart";
+        h.extend_from_slice(&(v.len() as u16).to_be_bytes());
+        h.extend_from_slice(v);
+        assert_eq!(parse_event_type(&h), Some("messageStart".to_string()));
+    }
+
+    /// A zero-length `:event-type` string value yields `Some("")`, not `None` — a present-but-empty
+    /// event type is distinct from an absent header.
+    #[test]
+    fn test_parse_event_type_empty_value() {
+        let mut h = Vec::new();
+        h.push(11u8);
+        h.extend_from_slice(b":event-type");
+        h.push(7u8); // string
+        h.extend_from_slice(&0u16.to_be_bytes()); // zero-length value
+        assert_eq!(parse_event_type(&h), Some(String::new()));
+    }
+
+    /// A modeled-exception frame is a valid event-stream message: real CRC32s, and a header block
+    /// carrying `:message-type: exception` + `:exception-type` + the JSON `{"message":...}` payload.
+    /// This is what a Bedrock-ingress stream emits on a mid-stream upstream failure.
+    #[test]
+    fn test_encode_exception_frame_is_valid() {
+        let frame = encode_exception_frame("InternalServerException", "upstream stream error");
+        // total_len must equal the bytes written.
+        let total_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+        assert_eq!(total_len, frame.len(), "total_len matches frame bytes");
+        // prelude CRC over [0..8] is real.
+        let prelude_crc = u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]);
+        assert_eq!(prelude_crc, crc32fast::hash(&frame[..8]));
+        // message CRC over [0..len-4] is real.
+        let len = frame.len();
+        let msg_crc = u32::from_be_bytes([
+            frame[len - 4],
+            frame[len - 3],
+            frame[len - 2],
+            frame[len - 1],
+        ]);
+        assert_eq!(msg_crc, crc32fast::hash(&frame[..len - 4]));
+        // Header block carries the exception markers.
+        let headers_len = u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
+        let headers = String::from_utf8_lossy(&frame[12..12 + headers_len]);
+        assert!(headers.contains(":message-type"));
+        assert!(headers.contains("exception"));
+        assert!(headers.contains(":exception-type"));
+        assert!(headers.contains("InternalServerException"));
+        // Payload is the JSON body the SDK surfaces.
+        let payload = &frame[12 + headers_len..len - 4];
+        let v: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(v["message"], "upstream stream error");
+        // It must NOT be SSE text.
+        assert!(!frame.starts_with(b"event:"));
+    }
+
+    /// An oversized payload (above `MAX_FRAME_BYTES`) must be DROPPED (empty frame), never emitted as
+    /// a CRC-valid frame carrying byte-truncated, unparseable JSON. Exercises the cap branch that the
+    /// round-trip test (64 KiB) never reaches.
+    #[test]
+    fn test_encode_frame_oversized_payload_drops_frame() {
+        // A payload comfortably above MAX_FRAME_BYTES.
+        let payload = vec![b'x'; MAX_FRAME_BYTES + 1024];
+        let frame = encode_frame("contentBlockDelta", &payload);
+        assert!(
+            frame.is_empty(),
+            "oversized payload must drop the frame, not truncate JSON into a CRC-valid corrupt frame"
+        );
     }
 
     /// The encoder carries the three Bedrock framing headers (`:event-type`, `:content-type`,

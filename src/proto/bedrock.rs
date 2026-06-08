@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// client-error shape) — chosen deliberately over a catch-all so the wire `__type` is always a real
 /// AWS exception name. This is the inverse of the `__type` token `extract_error` reads back, so a
 /// same-protocol error round-trips its structured type.
-fn error_kind_to_bedrock_type(kind: &str) -> &'static str {
+pub(crate) fn error_kind_to_bedrock_type(kind: &str) -> &'static str {
     match kind {
         "invalid_request_error" | "invalid_request" | "validation" | "bad_request" => {
             "ValidationException"

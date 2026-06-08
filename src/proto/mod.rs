@@ -143,14 +143,17 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// `content-type: application/json` (every vendor's error envelope is JSON — OpenAI, Anthropic,
     /// Gemini, Cohere, Responses, and the Bedrock Converse error shape alike).
     ///
-    /// The default returns a generic `{"error":{"message":message,"type":kind}}` so the crate
-    /// compiles before any per-protocol override exists. Per-protocol native envelopes (OpenAI
-    /// `{"error":{"message","type","code"}}`, Anthropic `{"type":"error","error":{"type","message"}}`,
-    /// Gemini `{"error":{"code","message","status"}}`, etc.) land in a later wave as overrides.
+    /// All six registered protocols (OpenAI `{"error":{"message","type","code"}}`, Anthropic
+    /// `{"type":"error","error":{"type","message"}}`, Gemini `{"error":{"code","message","status"}}`,
+    /// Cohere, Responses, Bedrock `{"__type","message"}`) OVERRIDE this default with their native
+    /// envelope. The default returns a generic `{"error":{"message":message,"type":kind}}` and is the
+    /// catch-all only for a future 7th protocol that omits an override (a maintainer adding one should
+    /// supply a native envelope, or a client on that protocol gets this generic — non-native — shape).
     ///
-    /// Not yet wired to the router/auth/forward error sites (that is the next wave); the test build
-    /// exercises the default impl, so suppress the not-yet-called dead-code lint off the test path.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// This method IS on the live request path: it is dispatched via the writer vtable from the
+    /// router/auth/forward error sites (`route::ingress_error`, `auth`, `forward::ingress_error`).
+    /// Only the default *body* is unreachable in release (every concrete writer overrides it), so no
+    /// dead-code suppression is needed here.
     fn write_error(&self, _status: u16, kind: &str, message: &str) -> serde_json::Value {
         serde_json::json!({
             "error": {
@@ -316,8 +319,7 @@ pub(crate) struct StreamTranslate {
     /// ingress == "bedrock" → the CLIENT is a native AWS SDK, so each translated event must be
     /// packed into a binary `application/vnd.amazon.eventstream` frame (with valid CRC32) instead of
     /// reframed as SSE. The stream's terminator is the `messageStop`/`metadata` frames themselves
-    /// (Bedrock has no `[DONE]`), so `finish()` stays empty. See `docs/DESIGN_universal_ingress.md`
-    /// §4.
+    /// (Bedrock has no `[DONE]`), so `finish()` stays empty. See `docs/architecture.md`.
     ingress_eventstream: bool,
 }
 
@@ -378,9 +380,12 @@ impl StreamTranslate {
     }
 
     /// Hard cap on the reassembly buffer. An upstream that streams bytes without ever emitting a
-    /// frame terminator must not grow `buf` indefinitely (memory-exhaustion DoS). A few MB is far
-    /// larger than any legitimate single SSE / event-stream frame from a chat completion.
-    const MAX_BUF: usize = 8 * 1024 * 1024;
+    /// frame terminator must not grow `buf` indefinitely (memory-exhaustion DoS). Kept equal to
+    /// `eventstream::MAX_FRAME_BYTES` (16 MiB) so any single frame the binary decoder is willing to
+    /// assemble can be buffered to completion here — a smaller cap would silently abort an
+    /// oversized-but-decoder-legal frame before `drain_frames` ever saw it. Far larger than any
+    /// legitimate single SSE / event-stream frame from a chat completion.
+    const MAX_BUF: usize = 16 * 1024 * 1024;
 
     /// Feed a chunk of EGRESS SSE bytes; return translated INGRESS SSE bytes for whatever
     /// COMPLETE frames are now available (empty if only a partial frame is buffered). Once the
@@ -415,17 +420,17 @@ impl StreamTranslate {
             return out;
         }
 
-        // Drain every complete `\n\n`-delimited SSE frame currently buffered. We only rescan the
-        // tail that has not been searched before (`scanned`), backing up one byte so a terminator
-        // straddling the previous chunk boundary is still found — this keeps `feed()` linear.
+        // Drain every complete blank-line-delimited SSE frame currently buffered. Both the LF-LF
+        // (`\n\n`) and the spec-legal CRLF (`\r\n\r\n`) terminators are recognized — some gateways /
+        // CDNs in front of model APIs emit CRLF SSE, which contains no `\n\n` adjacency, so an
+        // LF-only scanner would buffer the whole stream until MAX_BUF and silently abort it. We back
+        // up to cover a terminator straddling the previous chunk boundary (3 bytes, enough for the
+        // 4-byte CRLF terminator) and only rescan the unsearched tail, keeping `feed()` linear.
         loop {
-            let search_from = self.scanned.saturating_sub(1).min(self.buf.len());
-            match self.buf[search_from..]
-                .windows(2)
-                .position(|w| w == b"\n\n")
-            {
-                Some(rel) => {
-                    let end = search_from + rel + 2;
+            let search_from = self.scanned.saturating_sub(3).min(self.buf.len());
+            match find_frame_terminator(&self.buf[search_from..]) {
+                Some((rel, term_len)) => {
+                    let end = search_from + rel + term_len;
                     let frame: Vec<u8> = self.buf.drain(..end).collect();
                     self.scanned = 0;
 
@@ -473,6 +478,29 @@ impl StreamTranslate {
     }
 }
 
+/// Find the first SSE frame terminator (a blank line) in `buf`, returning `(offset, terminator_len)`
+/// where `offset` is the byte index of the first terminator byte. Recognizes both the LF-LF (`\n\n`,
+/// 2 bytes) and the spec-legal CRLF (`\r\n\r\n`, 4 bytes) blank-line terminators per WHATWG SSE.
+/// Returns `None` if no complete terminator is present yet.
+fn find_frame_terminator(buf: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == b'\n' {
+            // LF-LF: `\n\n`.
+            if buf.get(i + 1) == Some(&b'\n') {
+                return Some((i, 2));
+            }
+            // CRLF-CRLF: a `\n` followed by `\r\n` (the leading `\r` of this line was already
+            // consumed by the previous line's CRLF), i.e. `\n\r\n`.
+            if buf.get(i + 1) == Some(&b'\r') && buf.get(i + 2) == Some(&b'\n') {
+                return Some((i, 3));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Parse one SSE frame into `(event_type, data_payload)`. `event_type` is "" when the frame has
 /// no `event:` line (OpenAI style). Multiple `data:` lines in a single frame are concatenated with
 /// `\n` per the SSE spec (§9.2.6). Returns `None` if the frame carries no `data:` line (including a
@@ -516,7 +544,7 @@ mod openai;
 mod responses;
 
 pub(crate) use anthropic::{AnthropicReader, AnthropicWriter};
-pub(crate) use bedrock::{BedrockReader, BedrockWriter};
+pub(crate) use bedrock::{error_kind_to_bedrock_type, BedrockReader, BedrockWriter};
 pub(crate) use cohere::{CohereReader, CohereWriter};
 pub(crate) use gemini::{GeminiReader, GeminiWriter};
 pub(crate) use openai::{OpenAiReader, OpenAiWriter};
@@ -2801,6 +2829,94 @@ mod stream_translate_tests {
         );
     }
 
+    /// Bedrock *ingress* streaming, TOOL-CALL path: an Anthropic SSE `content_block_start` with a
+    /// `tool_use` block + `input_json_delta` + `content_block_stop` must translate through the binary
+    /// Bedrock encoder into a `contentBlockStart` frame carrying a `toolUse` start, a
+    /// `contentBlockDelta` carrying the tool input, and a `contentBlockStop`. Exercises
+    /// `BedrockWriter::write_response_event`'s `BlockStart(ToolUse)`/`InputJsonDelta` arms on the live
+    /// `StreamTranslate` path (previously only covered by the unit `test_write_response_event`).
+    #[test]
+    fn test_translate_anthropic_egress_to_bedrock_ingress_tool_call() {
+        let mut t =
+            StreamTranslate::new("bedrock", "anthropic").expect("bedrock ingress translator");
+        let mut raw: Vec<u8> = Vec::new();
+        for frame in [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"role\":\"assistant\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_abc\",\"name\":\"get_weather\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"SF\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            raw.extend(t.feed(frame.as_bytes()));
+        }
+
+        let mut buf = raw.clone();
+        let frames = crate::eventstream::drain_frames(&mut buf);
+        assert!(
+            buf.is_empty(),
+            "all emitted frames decode cleanly; {} bytes left",
+            buf.len()
+        );
+        let types: Vec<&str> = frames.iter().map(|(et, _)| et.as_str()).collect();
+        assert!(
+            types.contains(&"contentBlockStart"),
+            "tool_use must emit a contentBlockStart frame; got {types:?}"
+        );
+        assert!(
+            types.contains(&"contentBlockStop"),
+            "must emit a contentBlockStop frame; got {types:?}"
+        );
+
+        // The contentBlockStart frame must carry the toolUse start payload.
+        let start = frames
+            .iter()
+            .find(|(et, _)| et == "contentBlockStart")
+            .expect("a contentBlockStart frame");
+        let v: serde_json::Value = serde_json::from_slice(&start.1).expect("valid JSON payload");
+        assert_eq!(
+            v.pointer("/start/toolUse/name").and_then(|x| x.as_str()),
+            Some("get_weather"),
+            "toolUse name round-trips; got {v}"
+        );
+        assert_eq!(
+            v.pointer("/start/toolUse/toolUseId")
+                .and_then(|x| x.as_str()),
+            Some("toolu_abc"),
+            "toolUse id round-trips; got {v}"
+        );
+
+        // The contentBlockDelta frame must carry the tool input JSON.
+        let delta = frames
+            .iter()
+            .find(|(et, _)| et == "contentBlockDelta")
+            .expect("a contentBlockDelta frame");
+        let dv: serde_json::Value = serde_json::from_slice(&delta.1).expect("valid JSON payload");
+        assert!(
+            dv.pointer("/delta/toolUse/input").is_some(),
+            "tool input delta round-trips through the binary encoder; got {dv}"
+        );
+    }
+
+    /// A CRLF-delimited SSE upstream (`\r\n\r\n` frame terminators — spec-legal, emitted by some
+    /// gateways/CDNs) must reassemble and translate correctly. An LF-only scanner would never detect
+    /// a terminator and buffer the whole stream until MAX_BUF, then abort — stalling the client.
+    #[test]
+    fn test_translate_crlf_sse_frames() {
+        let mut t = StreamTranslate::new("anthropic", "openai").expect("translator");
+        // OpenAI-style bare `data:` frames with CRLF line endings and `\r\n\r\n` terminators.
+        let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"He\"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\r\n\r\n";
+        let out = String::from_utf8(t.feed(chunk.as_bytes())).unwrap();
+        assert!(
+            !out.is_empty(),
+            "CRLF SSE must produce translated output, not stall"
+        );
+        assert!(
+            out.contains("He") && out.contains("llo"),
+            "both CRLF-delimited deltas must translate; got:\n{out}"
+        );
+        assert!(!t.aborted, "CRLF stream must not be abandoned");
+    }
+
     /// Decoder also works when the binary frames arrive split across feed() calls (partial frame
     /// buffered, then completed) — the realistic chunked-transport case.
     #[test]
@@ -3008,7 +3124,8 @@ mod stream_translate_tests {
         let mut t = StreamTranslate::new("openai", "anthropic").expect("translator");
         let chunk = vec![b'x'; 1024 * 1024]; // 1 MiB of garbage, no `\n\n`
         let mut total = 0usize;
-        for _ in 0..16 {
+        // Feed past MAX_BUF (16 MiB) — the +1 iteration crosses the cap and triggers the abort.
+        for _ in 0..18 {
             let out = t.feed(&chunk);
             assert!(out.is_empty(), "garbage stream must produce no output");
             total += chunk.len();

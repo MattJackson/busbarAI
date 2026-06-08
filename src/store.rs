@@ -119,6 +119,10 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     // the `_in(pool, …)` variants operate on the per-(pool, lane) breaker cell so a lane shared
     // across pools carries independent Open/Closed status per pool. Lane-global checks (dead /
     // budget) are identical across both — only the breaker FSM is isolated.
+    // `usable` (mutating, lane-default cell) is exercised by the unit tests; in release, dispatch
+    // goes through `usable_in`/`acquire_for_dispatch_in` and observers use the side-effect-free
+    // `is_ready` (so /stats can't steal a recovery probe), leaving the bare form test-only.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn usable(&self, lane: usize, now: u64) -> bool;
     fn usable_in(&self, pool: &str, lane: usize, now: u64) -> bool;
     /// Side-effect-FREE readiness check: would this lane admit a request right now, WITHOUT
@@ -512,14 +516,27 @@ impl InMemoryStore {
         if streak > 0 {
             let jitter_range = duration / 10;
             #[cfg(test)]
-            let jitter_seed = crate::store::now_for_test() as u128;
+            let time_seed = crate::store::now_for_test() as u128;
             #[cfg(not(test))]
             use std::time::{SystemTime, UNIX_EPOCH};
             #[cfg(not(test))]
-            let jitter_seed = SystemTime::now()
+            let time_seed = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
+
+            // Decorrelate lanes that fail within nanoseconds of each other (a cascading upstream
+            // outage trips them ~simultaneously, so the wall-clock alone is near-identical across
+            // them and `% (2*jitter_range+1)` collapses to the same value → synchronized cooldowns →
+            // thundering-herd of half-open probes). Mix a per-CELL identity (its stable address) and
+            // the current streak into the seed so each lane's jitter is independent regardless of
+            // wall-clock proximity. FNV-1a folds the mixed inputs into a well-distributed value.
+            let cell_id = c as *const _ as *const () as usize as u128;
+            let mut seed = 0xcbf2_9ce4_8422_2325u128;
+            for part in [time_seed, cell_id, streak as u128] {
+                seed = (seed ^ part).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            let jitter_seed = seed;
 
             // Signed jitter in [-jitter_range, +jitter_range]; apply its sign so cooldowns are
             // spread both shorter AND longer (desyncing lanes). Using the absolute value here was a
@@ -576,6 +593,12 @@ impl InMemoryStore {
         c.cooldown_until().store(0, Ordering::Release);
         c.breaker_state().store(ST_CLOSED, Ordering::Release);
         c.probe_in_flight().store(false, Ordering::Release);
+        // Reset the SWRR accumulator. While the member was tripped it was dropped from the healthy
+        // set in `select_weighted_for` and stopped receiving fetch_add/fetch_sub, freezing its
+        // `current_weight` at a stale value. On recovery it rejoins selection; carrying that stale
+        // value biases the first few selections and violates the `Σ current_weight == 0` invariant
+        // over the (now-changed) healthy set. Zeroing it here keeps the SWRR invariant exact.
+        c.current_weight().store(0, Ordering::Release);
     }
 
     /// Side-effect-FREE readiness check (the breaker portion of `usable`): true if the cell would
@@ -943,6 +966,13 @@ impl InMemoryStore {
             Ordering::Release,
         );
         cell.breaker_state().store(ST_OPEN, Ordering::Release);
+        // Release the single-flight probe back to Open — mirrors `cell_open`. A hard-down can be
+        // classified while the cell is HalfOpen with a probe in flight (a recovering lane's half-open
+        // probe returns a billing/auth/hard-quota error). Without clearing this, the cell goes Open
+        // with `probe_in_flight == true`; after the (30 min) cooldown expires the cell transitions
+        // Open→HalfOpen but the probe CAS (false→true) fails forever, benching the lane permanently
+        // even after the operator fixes the credential/billing. Clearing it keeps hard-down RECOVERABLE.
+        cell.probe_in_flight().store(false, Ordering::Release);
     }
 
     fn select_weighted_for(
@@ -1182,7 +1212,12 @@ impl StateStore for InMemoryStore {
             ok: ls.ok.load(Ordering::Relaxed),
             err: ls.err.load(Ordering::Relaxed),
             client_fault: ls.client_fault.load(Ordering::Relaxed),
-            usable: self.usable(lane, t),
+            // Side-effect-FREE readiness peek, NOT the mutating `usable()`. `snapshot` feeds the
+            // /stats observer; the mutating path would transition an expired-Open default cell to
+            // HalfOpen and CAS-acquire the single-flight recovery probe, so a monitor polling /stats
+            // would steal the probe from organic traffic and falsely flip the reported state. `is_ready`
+            // reports the same admission verdict without touching the breaker FSM.
+            usable: self.is_ready(lane, t),
             dead: ls.dead.load(Ordering::Relaxed),
             dead_reason: ls.dead_reason.lock().unwrap().clone(),
             cooldown_remaining_s: self.cooldown_remaining(lane, t),
@@ -2368,6 +2403,59 @@ mod tests {
             store.breaker_state(0),
             BreakerState::HalfOpen,
             "the new probe re-enters HalfOpen"
+        );
+    }
+
+    /// Regression (HIGH): a lane that hard-downs WHILE a half-open probe is in flight must not be
+    /// benched forever. `record_hard_down_for` transitions the cell to Open with the long sticky
+    /// cooldown; if it failed to clear `probe_in_flight` (the same bug class fixed in `cell_open`),
+    /// the next cooldown expiry would enter HalfOpen but the probe CAS would fail for every request,
+    /// so the operator could fix the credential/billing and the lane would still never recover.
+    #[test]
+    fn test_hard_down_while_probing_does_not_wedge_lane() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+
+        // Lane Open with an expired cooldown → a request wins the half-open probe.
+        set_now_for_test(50_000);
+        store
+            .get_lane(0)
+            .cooldown_until
+            .store(49_000, Ordering::Relaxed);
+        store.get_lane(0).breaker_state.store(1, Ordering::Relaxed);
+        assert!(store.usable(0, 50_000), "request wins the half-open probe");
+        assert!(
+            store.get_lane(0).probe_in_flight.load(Ordering::Relaxed),
+            "probe is in flight (HalfOpen)"
+        );
+
+        // The probe returns a hard-down error (billing/auth/hard-quota) → record_hard_down.
+        store.record_hard_down(0, "billing / insufficient balance");
+        assert!(
+            matches!(store.breaker_state(0), BreakerState::Open { .. }),
+            "hard-down opens the breaker with a sticky cooldown"
+        );
+        // The probe flag MUST be cleared so the lane can recover.
+        assert!(
+            !store.get_lane(0).probe_in_flight.load(Ordering::Relaxed),
+            "record_hard_down MUST release the probe (else the lane is locked out forever)"
+        );
+
+        // After the sticky cooldown expires (operator fixed the key/billing), a request must again
+        // be able to win the probe — proving hard-down is RECOVERABLE, not a permanent kill.
+        let until = store.get_lane(0).cooldown_until.load(Ordering::Relaxed);
+        set_now_for_test(until + 1);
+        assert!(
+            store.usable(0, until + 1),
+            "lane must be probeable again after the sticky cooldown (not wedged by a stale probe flag)"
+        );
+        assert_eq!(
+            store.breaker_state(0),
+            BreakerState::HalfOpen,
+            "the recovery probe re-enters HalfOpen"
+        );
+        assert!(
+            store.get_lane(0).probe_in_flight.load(Ordering::Relaxed),
+            "the recovery request holds the single-flight probe"
         );
     }
 

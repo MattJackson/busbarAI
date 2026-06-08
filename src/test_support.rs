@@ -2553,14 +2553,28 @@ mod tests {
 
             // The non-passthrough auth-error response must NOT leak the upstream's verbatim
             // auth-rejection body (busbar's own credential context). It returns a normalized
-            // envelope instead.
+            // envelope shaped to the INGRESS protocol's native error shape (here Anthropic, the
+            // `forward` default) via `ingress_error` — not a hard-coded OpenAI-flavored shape, which
+            // a native Anthropic/Bedrock/Gemini SDK could not decode (R2 conformance fix).
             assert_eq!(response.status().as_u16(), 401);
             use http_body_util::BodyExt as _;
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             assert_eq!(
-                v["error"]["type"], "upstream_auth_error",
-                "non-passthrough auth error must be a normalized busbar envelope, not the raw upstream body"
+                v["type"], "error",
+                "Anthropic-native error envelope: top-level type"
+            );
+            assert_eq!(
+                v["error"]["type"], "authentication_error",
+                "non-passthrough auth error is a normalized native envelope, not the raw upstream body"
+            );
+            // The generic non-leaking message is preserved.
+            assert!(
+                v["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("lane credential"),
+                "generic non-leaking auth message: {v}"
             );
 
             server.shutdown().await;
