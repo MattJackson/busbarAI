@@ -186,6 +186,17 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     // (`record_success`/`record_rate_limit`), whose `_in` siblings are the production path.
     fn record_hard_down(&self, lane: usize, reason: &str);
     fn record_hard_down_in(&self, pool: &str, lane: usize, reason: &str);
+    /// Hard-down the lane in EVERY cell (the default/direct-route cell AND every existing per-pool
+    /// cell), mirroring the all-cells reach of `recover_lane` / `record_probe_failure_all_cells`. A
+    /// hard-down (auth rejection / billing exhaustion) is a property of the SHARED upstream, not of
+    /// one routing pool: a credential billing-suspended for a pool-routed request is equally dead for
+    /// the default-cell `named`/`adhoc` routes and every other pool fronting the lane. Tripping only
+    /// the routing pool's cell (the old organic-forward behavior) left the same upstream Closed in the
+    /// other cells, so legacy/cross-protocol routes kept hammering a known-dead lane until the
+    /// out-of-band prober caught it. This is the lane-global sibling of the per-cell
+    /// `record_hard_down`/`record_hard_down_in` primitives, used on the organic forward path so any
+    /// route through `forward_with_pool` trips the lane in every namespace at once.
+    fn record_hard_down_all_cells(&self, lane: usize, reason: &str);
     /// A successful out-of-band health probe: recover the lane to Closed in EVERY cell (default and
     /// all pools), since the probe tests the shared upstream. No-op on cells already Closed.
     fn recover_lane(&self, lane: usize);
@@ -201,6 +212,11 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// The lane's concurrency semaphore, for a bounded async (`timeout`) acquire on the dispatch
     /// path — the task parks instead of busy-spinning when permits are saturated.
     fn lane_semaphore(&self, lane: usize) -> Arc<Semaphore>;
+    /// Atomically consume one unit of the lane's lifetime request budget. Returns `false` when the
+    /// budget was already exhausted (the spend was a no-op — the budget is never driven negative).
+    /// `#[must_use]`: the bool is the over-spend signal; a silent discard hid the prior concurrent
+    /// over-spend bug, so call sites that intentionally ignore it must say so with `let _ =`.
+    #[must_use]
     fn spend_budget(&self, lane: usize) -> bool; // false => exhausted
 
     // weighted member selection (SWRR algorithm)
@@ -1167,6 +1183,46 @@ impl StateStore for InMemoryStore {
         self.record_hard_down_for(pool, lane, reason);
     }
 
+    fn record_hard_down_all_cells(&self, lane: usize, reason: &str) {
+        // Mirror `record_probe_failure_all_cells` exactly: operate on the per-pool cell Arcs while
+        // holding the `pool_cells` lock, applying the SAME cell mutation `record_hard_down_for` does
+        // (sticky Open + cooldown, probe released) — NOT by re-calling `record_hard_down_for`, which
+        // re-locks `pool_cells` via `self.cell()` and would deadlock here.
+        let ls = self.get_lane(lane);
+        // Hard-down is RECOVERABLE: a sticky cooldown + Open, recovered via the half-open probe; do
+        // NOT set `dead` (that would block recovery). Record the reason once, lane-wide.
+        *ls.dead_reason.lock().unwrap() = reason.to_string();
+        tracing::warn!(
+            model = %ls.model,
+            reason,
+            cooldown_secs = HARD_DOWN_COOLDOWN_SECS,
+            "lane hard-down (all cells); sticky cooldown (recovers via half-open probe)"
+        );
+        let now = Self::now_secs();
+        let trip = |c: &dyn BreakerCellAccess| {
+            c.cooldown_until().store(
+                now.saturating_add(HARD_DOWN_COOLDOWN_SECS),
+                Ordering::Release,
+            );
+            c.breaker_state().store(ST_OPEN, Ordering::Release);
+            // Release any in-flight single-flight probe back to Open (see `record_hard_down_for`):
+            // without this a hard-down classified while HalfOpen leaves the cell Open with
+            // `probe_in_flight == true`, benching the lane permanently after cooldown.
+            c.probe_in_flight().store(false, Ordering::Release);
+        };
+        // Default cell (direct/`named`/`adhoc` routes that read the "" cell).
+        trip(ls.as_ref());
+        // Every existing per-pool cell for this lane — the cells organic pool-routed traffic is
+        // selected against. (A cell not yet created inherits the lane default lazily on first
+        // access.)
+        let cells = self.pool_cells.lock().unwrap();
+        for ((_, l), cell) in cells.iter() {
+            if *l == lane {
+                trip(cell.as_ref());
+            }
+        }
+    }
+
     fn recover_lane(&self, lane: usize) {
         // A health probe tests the UPSTREAM, which is shared across pools — so a successful probe
         // recovers EVERY cell for this lane (the default/direct-route cell and all per-pool cells),
@@ -1237,10 +1293,29 @@ impl StateStore for InMemoryStore {
         if !ls.limited {
             return true; // unlimited budget
         }
-        // Consume one unit of the lifetime request budget (cost cap). Returns false when the lane
-        // was already exhausted. Once budget reaches 0, `usable()` stops admitting the lane.
-        let prev = ls.budget.fetch_sub(1, Ordering::Relaxed);
-        prev > 0
+        // Consume one unit of the lifetime request budget (the `max_requests` cost cap). The prior
+        // implementation did an unconditional `fetch_sub(1)`: under a concurrent burst, up to
+        // `max_concurrent` requests pass `lane_admissible` (which READS the budget without consuming
+        // it) before any of them spends, then all `fetch_sub`, driving the budget NEGATIVE and
+        // exceeding `max_requests` by up to `max_concurrent`. A compare-and-swap loop makes the gate
+        // and the decrement ATOMIC: decrement ONLY while the budget is strictly positive, so the cap
+        // is a hard ceiling — the (N+1)th concurrent spender loses the CAS once the budget hits 0 and
+        // returns `false` without underflowing. Returns `false` when the lane is already exhausted.
+        let mut cur = ls.budget.load(Ordering::Relaxed);
+        loop {
+            if cur <= 0 {
+                return false; // already exhausted — never drive the budget negative
+            }
+            match ls.budget.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => cur = observed, // racing spender won; retry with the fresh value
+            }
+        }
     }
 
     fn snapshot(&self, lane: usize, t: u64) -> LaneSnapshot {
@@ -2020,6 +2095,88 @@ mod tests {
         assert!(
             !store.usable(0, 8100),
             "exhausted budget blocks direct route"
+        );
+    }
+
+    /// HIGH/correctness (forward.rs:1398): a hard-down trips the lane in EVERY cell — the default
+    /// ("") cell AND every existing per-pool cell — mirroring `recover_lane`'s all-cells reach. The
+    /// organic forward path previously tripped only the routing pool's cell, leaving the same dead
+    /// upstream Closed in the default cell (read by `named`/`adhoc`/direct routes) and other pools.
+    #[test]
+    fn test_record_hard_down_all_cells_trips_default_and_every_pool() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(9000);
+
+        // Materialize per-pool cells for two pools by touching them (a successful op creates the
+        // cell lazily), so the lane has a default cell PLUS pool "A" and pool "B" cells, all Closed.
+        store.record_success_in("A", 0);
+        store.record_success_in("B", 0);
+        assert!(store.usable(0, 9000), "default cell starts usable");
+        assert!(store.usable_in("A", 0, 9000), "pool A starts usable");
+        assert!(store.usable_in("B", 0, 9000), "pool B starts usable");
+
+        // A hard-down classified on a pool-routed request must trip ALL cells, not just one pool.
+        store.record_hard_down_all_cells(0, "billing / insufficient balance");
+
+        assert!(
+            !store.usable(0, 9000),
+            "default cell (named/adhoc/direct routes) MUST be tripped by an all-cells hard-down"
+        );
+        assert!(
+            !store.usable_in("A", 0, 9000),
+            "pool A cell MUST be tripped"
+        );
+        assert!(
+            !store.usable_in("B", 0, 9000),
+            "pool B cell MUST be tripped"
+        );
+        // Recoverable (not administratively dead) — the core hard-down invariant.
+        assert!(
+            !store.get_lane(0).dead.load(Ordering::Relaxed),
+            "hard-down must NOT set dead — it recovers via the half-open probe"
+        );
+    }
+
+    /// MEDIUM/correctness (store.rs spend_budget): under a concurrent burst, the `max_requests`
+    /// lifetime cap must be a HARD ceiling — the CAS gate may never drive the budget negative. The
+    /// pre-fix unconditional `fetch_sub` let up to `max_concurrent` extra requests over-spend.
+    #[test]
+    fn test_spend_budget_concurrent_never_over_spends() {
+        use std::thread;
+        const BUDGET: i64 = 50;
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 100;
+
+        let mut ld = make_lane_data(0, 10_000);
+        ld.limited = true;
+        ld.budget = BUDGET;
+        let store = Arc::new(InMemoryStore::new(vec![ld]));
+
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let s = store.clone();
+            handles.push(thread::spawn(move || {
+                let mut wins = 0usize;
+                for _ in 0..PER_THREAD {
+                    if s.spend_budget(0) {
+                        wins += 1;
+                    }
+                }
+                wins
+            }));
+        }
+        let total_wins: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+
+        // Exactly BUDGET successful spends — never more (no over-spend) and never fewer (no lost
+        // decrements). The budget atomic lands at exactly 0, never negative.
+        assert_eq!(
+            total_wins, BUDGET as usize,
+            "exactly {BUDGET} spends may succeed under contention; got {total_wins}"
+        );
+        assert_eq!(
+            store.get_lane(0).budget.load(Ordering::Relaxed),
+            0,
+            "budget must settle at exactly 0 — never driven negative by a concurrent burst"
         );
     }
 

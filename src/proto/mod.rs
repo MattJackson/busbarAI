@@ -25,6 +25,30 @@ pub(crate) type IrError = crate::breaker::CanonicalSignal;
 /// not to truncate typical completions, small enough not to be refused.
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 4096;
 
+/// Mint a UUID-v4-shaped request id (`8-4-4-4-12` lowercase hex) for the `x-amzn-RequestId` header a
+/// native AWS Bedrock response always carries — on EVERY response, success and error, stream and
+/// non-stream (the AWS SDK exposes it via `*Output::request_id()`; an absent header makes that return
+/// `None`, which is impossible with a real endpoint and a deterministic proxy tell). Uses the OS
+/// CSPRNG; returns `None` (so the caller simply OMITS the header) if entropy is unavailable — this is
+/// on the request path and must never panic. Shared by the success paths (`forward.rs`) and the error
+/// paths (`route.rs`/`auth.rs` keep wire-identical private copies pending a wider refactor).
+pub(crate) fn synth_amzn_request_id() -> Option<String> {
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).ok()?;
+    // RFC 4122 v4 layout (version + variant bits) so the value is a well-formed UUID.
+    buf[6] = (buf[6] & 0x0f) | 0x40;
+    buf[8] = (buf[8] & 0x3f) | 0x80;
+    let s: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &s[0..8],
+        &s[8..12],
+        &s[12..16],
+        &s[16..20],
+        &s[20..32]
+    ))
+}
+
 /// ProtocolReader extracts signals from wire responses (Stage 1a + 1b).
 /// Methods are provider-specific normalizers that feed the breaker's Stage 2 classifier.
 pub(crate) trait ProtocolReader: Send + Sync {
@@ -349,6 +373,16 @@ pub(crate) struct StreamTranslate {
     /// shape divergence from a genuine OpenAI stream. Reuses the stream's id (never mints a fresh one
     /// per chunk). `None` until the first MessageStart is translated.
     openai_chunk_identity: Option<OpenAiChunkIdentity>,
+    /// ingress == "bedrock" → whether a `metadata` (usage) frame has ALREADY been emitted for this
+    /// stream. A native ConverseStream emits EXACTLY ONE `metadata` frame. But an OpenAI backend
+    /// using `stream_options.include_usage` splits its terminal information across TWO chunks: a
+    /// `finish_reason` chunk that carries NO usage (→ IR `MessageDelta{stop_reason:Some, usage=0}`)
+    /// followed by a usage-only chunk (→ `MessageDelta{stop_reason:None, usage=real}`). Without this
+    /// guard the fan-out emitted a zero-usage `metadata` for the first AND a real `metadata` for the
+    /// second — TWO metadata frames (one reporting 0 tokens), a deterministic tell and corrupt token
+    /// accounting. This flag lets us emit the metadata exactly once: defer it when the stop chunk
+    /// carries no usage, and suppress a duplicate if usage already rode with the stop.
+    bedrock_metadata_emitted: bool,
 }
 
 /// The OpenAI stream-start identity replayed onto every `chat.completion.chunk` (see
@@ -381,6 +415,7 @@ impl StreamTranslate {
             ingress_eventstream: ingress == "bedrock",
             started_at: None,
             openai_chunk_identity: None,
+            bedrock_metadata_emitted: false,
         })
     }
 
@@ -445,7 +480,7 @@ impl StreamTranslate {
                     stop_sequence,
                 } = &ev
                 {
-                    // Frame 1: stop-only delta → `messageStop` (zero usage; usage rides frame 2).
+                    // Frame 1: stop-only delta → `messageStop` (usage, if any, rides frame 2).
                     let stop_only = crate::ir::IrStreamEvent::MessageDelta {
                         stop_reason: Some(reason.clone()),
                         stop_sequence: stop_sequence.clone(),
@@ -456,15 +491,38 @@ impl StreamTranslate {
                             cache_read_input_tokens: None,
                         },
                     };
-                    // Frame 2: usage-only delta → `metadata` (real `metrics.latencyMs` injected in
-                    // `emit_ir_event`).
-                    let usage_only = crate::ir::IrStreamEvent::MessageDelta {
-                        stop_reason: None,
-                        stop_sequence: stop_sequence.clone(),
-                        usage: usage.clone(),
-                    };
                     self.emit_ir_event(&stop_only, out);
-                    self.emit_ir_event(&usage_only, out);
+                    // Frame 2: `metadata` carrying the token usage — but a native ConverseStream emits
+                    // EXACTLY ONE `metadata`. Emit it here ONLY if real usage rode WITH the stop (the
+                    // native Bedrock→Bedrock case AND any egress that bundles usage into the stop
+                    // delta). If usage is all-zero, this is an OpenAI `include_usage` stop chunk whose
+                    // tokens arrive in a SEPARATE trailing usage-only delta — DEFER the metadata to
+                    // that delta so we emit it once with the REAL tokens, never a zero-usage frame.
+                    let has_usage = usage.input_tokens != 0 || usage.output_tokens != 0;
+                    if has_usage {
+                        let usage_only = crate::ir::IrStreamEvent::MessageDelta {
+                            stop_reason: None,
+                            stop_sequence: stop_sequence.clone(),
+                            usage: usage.clone(),
+                        };
+                        self.emit_ir_event(&usage_only, out);
+                        self.bedrock_metadata_emitted = true;
+                    }
+                    continue;
+                }
+                // A usage-only delta (`stop_reason: None`) → a `metadata` frame. This is the trailing
+                // OpenAI `include_usage` chunk (or a native usage frame). Emit at most once: suppress
+                // it if a `metadata` already rode with the stop above, so the stream carries exactly
+                // one metadata frame regardless of how the egress backend split stop vs usage.
+                if let crate::ir::IrStreamEvent::MessageDelta {
+                    stop_reason: None, ..
+                } = &ev
+                {
+                    if self.bedrock_metadata_emitted {
+                        continue;
+                    }
+                    self.bedrock_metadata_emitted = true;
+                    self.emit_ir_event(&ev, out);
                     continue;
                 }
             }
@@ -3640,6 +3698,140 @@ mod stream_translate_tests {
             out.contains("event: message_stop"),
             "missing message_stop; got {out}"
         );
+    }
+
+    // HIGH/test-coverage (proto/mod.rs:368): StreamTranslate with COHERE as the ingress side. Cohere
+    // uses a bare `data:` envelope keyed on `type` and must NEVER emit a `[DONE]` sentinel
+    // (`emit_done` is false for cohere). Exercises CohereWriter::write_delta/write_stop through the
+    // translator end-to-end.
+    #[test]
+    fn test_translate_anthropic_egress_to_cohere_ingress() {
+        let mut t = StreamTranslate::new("cohere", "anthropic").expect("cohere ingress translator");
+        let mut out = String::new();
+        for frame in [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            out.push_str(&String::from_utf8(t.feed(frame.as_bytes())).unwrap());
+        }
+        out.push_str(&String::from_utf8(t.finish()).unwrap());
+
+        // Cohere v2 native stream: bare `data:` frames, no `event:` lines.
+        assert!(
+            !out.contains("event:"),
+            "Cohere output must have no event: lines; got {out}"
+        );
+        // Cohere must NEVER emit a `[DONE]` sentinel (emit_done is false for cohere ingress).
+        assert!(
+            !out.contains("[DONE]"),
+            "Cohere stream must NOT emit a [DONE] sentinel; got {out}"
+        );
+        let payloads = data_payloads(&out);
+        // The translated text rides at delta.message.content.text in a `content-delta` frame.
+        assert!(
+            payloads.iter().any(|p| p["type"] == "content-delta"
+                && p.pointer("/delta/message/content/text")
+                    .and_then(|v| v.as_str())
+                    == Some("hi")),
+            "missing cohere content-delta carrying 'hi'; got {out}"
+        );
+        // The terminal `message-end` carries the finish reason and usage.
+        assert!(
+            payloads.iter().any(|p| p["type"] == "message-end"
+                && p.pointer("/delta/finish_reason").and_then(|v| v.as_str()) == Some("COMPLETE")),
+            "missing cohere message-end COMPLETE; got {out}"
+        );
+    }
+
+    // HIGH/test-coverage (proto/mod.rs:368): StreamTranslate with RESPONSES as the ingress side.
+    // The Responses API uses NAMED SSE events (`event: response.created` ... `response.completed`),
+    // not bare `data:` frames, and never a `[DONE]`. Exercises ResponsesWriter::write_delta/write_stop
+    // through the translator end-to-end.
+    #[test]
+    fn test_translate_anthropic_egress_to_responses_ingress() {
+        let mut t =
+            StreamTranslate::new("responses", "anthropic").expect("responses ingress translator");
+        let mut out = String::new();
+        for frame in [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            out.push_str(&String::from_utf8(t.feed(frame.as_bytes())).unwrap());
+        }
+        out.push_str(&String::from_utf8(t.finish()).unwrap());
+
+        // Responses uses named events for the stream boundaries.
+        assert!(
+            out.contains("event: response.created"),
+            "missing Responses event: response.created; got {out}"
+        );
+        assert!(
+            out.contains("event: response.completed"),
+            "missing Responses event: response.completed; got {out}"
+        );
+        // Never a `[DONE]` (emit_done is only true for openai ingress).
+        assert!(
+            !out.contains("[DONE]"),
+            "Responses stream must NOT emit a [DONE] sentinel; got {out}"
+        );
+    }
+
+    // MEDIUM/conformance (proto/mod.rs:441 fan-out): OpenAI egress with `stream_options.include_usage`
+    // splits its terminal info across TWO chunks — a finish_reason chunk with NO usage, then a
+    // usage-only chunk. A native ConverseStream emits EXACTLY ONE `metadata` frame; the pre-fix
+    // fan-out emitted a zero-usage metadata for the first AND a real metadata for the second. Assert
+    // exactly one `metadata` frame, carrying the REAL tokens.
+    #[test]
+    fn test_translate_openai_include_usage_egress_to_bedrock_ingress_single_metadata() {
+        let mut t = StreamTranslate::new("bedrock", "openai").expect("bedrock ingress translator");
+        let mut raw: Vec<u8> = Vec::new();
+        for frame in [
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            // include_usage: terminal finish chunk carries NO usage...
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            // ...usage rides a SEPARATE trailing chunk (empty choices).
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":11}}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            raw.extend_from_slice(&t.feed(frame.as_bytes()));
+        }
+        raw.extend_from_slice(&t.finish());
+
+        // Decode the binary eventstream frames.
+        let mut buf = raw.clone();
+        let frames = crate::eventstream::drain_frames(&mut buf);
+        assert!(buf.is_empty(), "all frames must decode cleanly");
+
+        // Exactly ONE `metadata` frame (a native ConverseStream emits exactly one), carrying the
+        // REAL tokens — NOT the pre-fix pair (a zero-usage frame + a real frame).
+        let metadata: Vec<&(String, Vec<u8>)> =
+            frames.iter().filter(|(et, _)| et == "metadata").collect();
+        assert_eq!(
+            metadata.len(),
+            1,
+            "a native ConverseStream emits exactly ONE metadata frame; got {}",
+            metadata.len()
+        );
+        let md: serde_json::Value =
+            serde_json::from_slice(&metadata[0].1).expect("metadata payload is JSON");
+        assert_eq!(
+            md["usage"]["inputTokens"], 7,
+            "metadata must carry the REAL input tokens, not a zero frame; got {md}"
+        );
+        assert_eq!(
+            md["usage"]["outputTokens"], 11,
+            "metadata must carry the REAL output tokens; got {md}"
+        );
+        // And exactly one messageStop frame (the stop discriminant).
+        let stops = frames.iter().filter(|(et, _)| et == "messageStop").count();
+        assert_eq!(stops, 1, "exactly one messageStop frame");
     }
 
     // A frame split across two feeds yields no output until complete, then translates.

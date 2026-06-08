@@ -6,18 +6,26 @@
 // protecting each backend with a circuit breaker. The name is electrical: a busbar takes one feed
 // and fans it out across many breakered circuits.
 //
-// Routing (clients append the protocol path themselves):
-//   POST /<model>/v1/messages            a single model (Anthropic-format ingress)
-//   POST /<pool>/v1/messages             a config-defined pool (weighted selection + failover)
-//   POST /<provider>/<model>/v1/messages ad-hoc: a specific configured provider+model
-//   POST /v1/chat/completions            OpenAI-format ingress (model from the body)
+// Routing — all SIX ingress protocols are first-class; a native SDK can point its base URL at
+// busbar unmodified (clients append the protocol path themselves). Mirrors the `--help` ENDPOINTS
+// block and the README routing table:
+//   POST /<model>/v1/messages              Anthropic-format ingress (single model)
+//   POST /<pool>/v1/messages               a config-defined pool (weighted selection + failover)
+//   POST /<provider>/<model>/v1/messages   ad-hoc: a specific configured provider+model
+//   POST /v1/chat/completions              OpenAI-format ingress (model from the body)
+//   POST /v2/chat                          Cohere-format ingress (model from the body)
+//   POST /v1/responses                     OpenAI Responses-API ingress (model from the body)
+//   POST /v1/models/<model>:<action>       Gemini-format ingress (stable v1 alias)
+//   POST /v1beta/models/<model>:<action>   Gemini-format ingress (v1beta)
+//   POST /model/<modelId>/converse[-stream] Bedrock Converse / ConverseStream ingress
 //   GET  /stats  /healthz  /metrics
 //
 // Each model is a "lane" with its own concurrency semaphore, optional lifetime request budget, and
 // per-(pool,lane) circuit-breaker health. A pool stacks its members' concurrency into one aggregate
 // and distributes via smooth weighted round-robin. Ingress and backend protocols may differ: the
 // request and response are translated through a superset intermediate representation (see
-// `proto`/`ir`), so e.g. an OpenAI-format client can drive a Gemini or Bedrock backend.
+// `proto`/`ir`), so e.g. an OpenAI-format client can drive a Gemini or Bedrock backend, or a native
+// Responses/Cohere/Gemini/Bedrock client can drive any configured backend.
 //
 // Failure handling (see `breaker`): transient upstream faults (5xx / overload / rate-limit /
 // timeout / network) arm an escalating cooldown; billing and auth faults open the breaker with a
@@ -564,6 +572,97 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received; draining in-flight requests");
 }
 
+/// Infer the INGRESS protocol from a request path so an unmatched/wrong-method request can be
+/// answered in the protocol the client was speaking, not a generic shape. The prefixes mirror the
+/// route table: OpenAI (`/v1/chat/completions`), Responses (`/v1/responses`), Cohere (`/v2/chat`),
+/// Gemini (`/v1/models/...`, `/v1beta/models/...`), Bedrock (`/model/...`), and Anthropic
+/// (`.../v1/messages`). When nothing matches we default to `openai` — its envelope is the most
+/// widely understood and is what a generic HTTP client probing `/` is most likely to parse. This is
+/// inference for ERROR shaping only; it never routes a real request.
+fn proto_for_path(path: &str) -> &'static str {
+    if path == "/v1/responses" {
+        "responses"
+    } else if path == "/v1/chat/completions" {
+        "openai"
+    } else if path == "/v2/chat" {
+        "cohere"
+    } else if path.starts_with("/v1/models/") || path.starts_with("/v1beta/models/") {
+        "gemini"
+    } else if path.starts_with("/model/") {
+        "bedrock"
+    } else if path.ends_with("/v1/messages") {
+        "anthropic"
+    } else {
+        "openai"
+    }
+}
+
+/// Render a native ingress-protocol error envelope (`application/json`) for the fallback handlers,
+/// attaching the `x-amzn-*` headers when the inferred protocol is Bedrock so the response is
+/// indistinguishable from a real vendor 404/405. Shared by [`fallback_handler`] (404, unmatched
+/// path) and [`method_not_allowed_handler`] (405, wrong method on a valid path).
+fn fallback_error_response(
+    path: &str,
+    status: axum::http::StatusCode,
+    kind: &str,
+    message: &str,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let proto = proto_for_path(path);
+    let body = match proto::protocol_for(proto) {
+        Some(p) => p.writer().write_error(status.as_u16(), kind, message),
+        // proto_for_path only ever returns a registered protocol literal, so this is unreachable in
+        // practice; shape a generic OpenAI-style envelope rather than panic on the request path.
+        None => serde_json::json!({ "error": { "message": message, "type": kind } }),
+    };
+    let mut resp = (
+        status,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        )],
+        body.to_string(),
+    )
+        .into_response();
+    if proto == "bedrock" {
+        let headers = resp.headers_mut();
+        if let Some(id) = proto::synth_amzn_request_id() {
+            if let Ok(hv) = axum::http::HeaderValue::from_str(&id) {
+                headers.insert(axum::http::HeaderName::from_static("x-amzn-requestid"), hv);
+            }
+        }
+        let errortype = proto::error_kind_to_bedrock_type(kind);
+        if let Ok(hv) = axum::http::HeaderValue::from_str(errortype) {
+            headers.insert(axum::http::HeaderName::from_static("x-amzn-errortype"), hv);
+        }
+    }
+    resp
+}
+
+/// 404 fallback: an unmatched path. A real vendor backend answers an unknown route with its native
+/// JSON error envelope, never axum's empty body — so reshape to the inferred protocol's `not_found`
+/// shape (see [`fallback_error_response`]).
+async fn fallback_handler(uri: axum::http::Uri) -> axum::response::Response {
+    fallback_error_response(
+        uri.path(),
+        axum::http::StatusCode::NOT_FOUND,
+        "not_found",
+        "the requested resource was not found",
+    )
+}
+
+/// 405 fallback: a valid ingress path hit with the wrong method (e.g. GET on a POST-only ingress).
+/// axum's built-in 405 is an `Allow`-header-only empty body; reshape to the protocol-native envelope
+/// so an SDK sees a vendor-shaped error instead of a bare proxy tell.
+async fn method_not_allowed_handler(uri: axum::http::Uri) -> axum::response::Response {
+    fallback_error_response(
+        uri.path(),
+        axum::http::StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "method not allowed for this resource",
+    )
+}
+
 /// Build the busbar HTTP router for a given `App` state. Factored out of `main` so the full
 /// route table + auth middleware can be exercised end-to-end in tests.
 pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
@@ -581,6 +680,10 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
         .route("/v1/responses", post(route::responses_ingress))
         // Gemini ingress: model+action packed into the last path segment with a colon. axum can't
         // split on a `:` inside a segment, so capture the tail with a wildcard and split in-handler.
+        // Both the stable `v1` and the `v1beta` surfaces are wire-identical for generateContent /
+        // streamGenerateContent; the google-generativeai / Gen AI SDKs use either, so a client pinned
+        // to the stable `v1` endpoint must also resolve here rather than fall through to a bare 404.
+        .route("/v1/models/*rest", post(route::gemini_ingress))
         .route("/v1beta/models/*rest", post(route::gemini_ingress))
         // Bedrock Converse ingress: model in the path, stream selected by the endpoint suffix.
         .route("/model/:model_id/converse", post(route::bedrock_converse))
@@ -590,6 +693,15 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
         )
         .route("/:name/v1/messages", post(route::named))
         .route("/:provider/:model/v1/messages", post(route::adhoc))
+        // Global fallback for unmatched paths (404) and wrong-method hits on a valid path (405).
+        // axum's built-in responses are an EMPTY body (404) or an `Allow`-header-only 405 — both bare
+        // text, which a native vendor SDK cannot decode and which fingerprint busbar as a router/proxy
+        // (the §8.1 transparency gap). Reshape into the inferred ingress protocol's native JSON error
+        // envelope so a client probing an unsupported edge still sees a vendor-shaped error.
+        .fallback(fallback_handler)
+        // Wrong-method hits on a VALID path (axum's built-in 405) get the same native-envelope
+        // treatment as the 404 fallback above.
+        .method_not_allowed_fallback(method_not_allowed_handler)
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),
             auth::auth_middleware,
@@ -695,5 +807,79 @@ mod tests {
         assert!(open_relay_banner(Some(auth::AuthMode::Token), true).is_none());
         assert!(open_relay_banner(Some(auth::AuthMode::Passthrough), true).is_none());
         assert!(open_relay_banner(None, true).is_none());
+    }
+
+    /// MEDIUM/conformance (main.rs:569): the fallback handlers infer the ingress protocol from the
+    /// request path so a 404/405 is shaped in the client's own protocol, not a bare axum body.
+    #[test]
+    fn test_proto_for_path_inference() {
+        assert_eq!(proto_for_path("/v1/chat/completions"), "openai");
+        assert_eq!(proto_for_path("/v1/responses"), "responses");
+        assert_eq!(proto_for_path("/v2/chat"), "cohere");
+        // Both the stable v1 and v1beta Gemini surfaces infer gemini.
+        assert_eq!(
+            proto_for_path("/v1/models/gemini-pro:generateContent"),
+            "gemini"
+        );
+        assert_eq!(
+            proto_for_path("/v1beta/models/gemini-pro:streamGenerateContent"),
+            "gemini"
+        );
+        assert_eq!(
+            proto_for_path("/model/anthropic.claude/converse"),
+            "bedrock"
+        );
+        assert_eq!(proto_for_path("/my-model/v1/messages"), "anthropic");
+        // Unknown path defaults to the widely-understood OpenAI envelope.
+        assert_eq!(proto_for_path("/totally/unknown"), "openai");
+    }
+
+    /// A 404 fallback on a Bedrock path must carry the native `__type` envelope AND the `x-amzn-*`
+    /// headers a real AWS endpoint always emits — never axum's empty body (a proxy tell).
+    #[test]
+    fn test_fallback_bedrock_404_is_native_envelope_with_amzn_headers() {
+        let resp = fallback_error_response(
+            "/model/some.model/converse",
+            axum::http::StatusCode::NOT_FOUND,
+            "not_found",
+            "missing",
+        );
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|h| h.to_str().ok()),
+            Some("application/json"),
+            "fallback must be application/json, not bare text"
+        );
+        assert!(
+            resp.headers().get("x-amzn-requestid").is_some(),
+            "bedrock fallback must carry x-amzn-RequestId"
+        );
+        assert!(
+            resp.headers().get("x-amzn-errortype").is_some(),
+            "bedrock fallback must carry x-amzn-errortype"
+        );
+    }
+
+    /// A 404 fallback on the OpenAI path is shaped as the OpenAI error envelope (no amzn headers).
+    #[test]
+    fn test_fallback_openai_404_is_json_no_amzn_headers() {
+        let resp = fallback_error_response(
+            "/v1/chat/completions",
+            axum::http::StatusCode::NOT_FOUND,
+            "not_found",
+            "missing",
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|h| h.to_str().ok()),
+            Some("application/json")
+        );
+        assert!(
+            resp.headers().get("x-amzn-requestid").is_none(),
+            "non-bedrock fallback must NOT carry x-amzn-* headers"
+        );
     }
 }

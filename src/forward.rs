@@ -32,6 +32,28 @@ fn apply_required_max_tokens(ir: &mut crate::ir::IrRequest, lane: &Lane) {
     }
 }
 
+/// Attach the `x-amzn-RequestId` header to a SUCCESS response builder when the ingress client is a
+/// native AWS Bedrock SDK. A genuine Bedrock `Converse`/`ConverseStream` 2xx ALWAYS carries this
+/// header (the SDK surfaces it via `*Output::request_id()`); omitting it on the proxied success path
+/// makes `request_id()` return `None`, which is impossible with a real endpoint and a deterministic
+/// proxy tell. The error path already synthesizes it (`route::attach_bedrock_error_headers`,
+/// `auth::unauthorized_response`); this closes the SUCCESS gap so every bedrock-ingress response —
+/// success and error, stream and non-stream — carries the id. No-op for non-bedrock ingress (those
+/// protocols never emit an `x-amzn-*` header). Best-effort: if entropy or header encoding fails the
+/// header is simply omitted (never panics on the request path).
+fn maybe_attach_bedrock_amzn_id(
+    rb: axum::http::response::Builder,
+    ingress_protocol: &str,
+) -> axum::http::response::Builder {
+    if ingress_protocol != "bedrock" {
+        return rb;
+    }
+    match crate::proto::synth_amzn_request_id() {
+        Some(id) => rb.header("x-amzn-requestid", id),
+        None => rb,
+    }
+}
+
 /// Build a native-format error response for the CLIENT. Every forward-layer error that is returned
 /// to the caller goes through here so the body is the INGRESS protocol's native error envelope
 /// (`application/json`) rather than `text/plain`, which an official SDK cannot decode (it raises a
@@ -170,11 +192,13 @@ fn extract_error_message(bytes: &[u8]) -> Option<String> {
 ///     modeled-exception frame (`:message-type: exception`, `:exception-type: InternalServerException`)
 ///     with valid CRC32. Writing SSE `event:`/`data:` text into a binary eventstream body produces an
 ///     undecodable prelude/CRC for the SDK's decoder — the bug this guards against.
-///   - SSE ingress (openai/anthropic/gemini/cohere/responses): an SSE error frame shaped in the
-///     ingress protocol's OWN convention — bare `data:` for openai/cohere (no `event:` line, which
-///     native streams of those protocols never emit), `event: error` for anthropic/gemini,
-///     `event: response.failed` for responses — whose `data:` payload is the ingress protocol's
-///     NATIVE error envelope, so the official SDK decodes it rather than seeing a foreign frame shape.
+///   - SSE ingress (openai/anthropic/gemini/cohere/responses): the ingress writer's OWN streaming
+///     error event (`write_response_event(&IrStreamEvent::Error(..))`), framed exactly as the
+///     happy-path SSE framer does — bare `data:` for openai/cohere/gemini (no `event:` line, which
+///     native streams of those protocols never emit), `event: error` for anthropic, and
+///     `event: response.failed` for responses whose payload is the SDK-required
+///     `{"response":{...,"error":{...}}}` STREAM shape (NOT the non-stream `{"error":...}` HTTP
+///     envelope), so the official SDK's stream decoder finds `event.response` instead of crashing.
 fn mid_stream_error_bytes(
     ingress_protocol: &str,
     ingress_eventstream: bool,
@@ -186,36 +210,53 @@ fn mid_stream_error_bytes(
         let exc = crate::proto::error_kind_to_bedrock_type("api_error");
         return crate::eventstream::encode_exception_frame(exc, message);
     }
-    // SSE client: shape the error body to the ingress protocol's native envelope.
-    let envelope = match crate::proto::protocol_for(ingress_protocol) {
-        Some(p) => p.writer().write_error(
-            StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            "api_error",
-            message,
-        ),
-        None => crate::proto::Protocol::openai().writer().write_error(
-            StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            "api_error",
-            message,
-        ),
+    // SSE client: build the terminal error frame through the ingress protocol writer's STREAMING
+    // error path (`write_response_event(&IrStreamEvent::Error(..))`), NOT the non-stream
+    // `write_error()` HTTP envelope. The two are genuinely different shapes for some protocols and a
+    // native SDK decodes the STREAM event, not the HTTP body:
+    //   - Responses: the stream `response.failed` event wraps the error in a `response` object
+    //     (`{"response":{...,"error":{...}}}`); the HTTP envelope is a top-level `{"error":...}` the
+    //     SDK's stream decoder cannot locate via `event.response` (it would crash / silently swallow).
+    //   - Anthropic: the stream `error` event is `{"type":"error","error":{...}}` (no HTTP-only
+    //     `request_id`); the writer's event arm produces exactly that.
+    //   - OpenAI/Cohere/Gemini: bare `data:` frame in each protocol's native in-band error shape.
+    // The writer returns `(event_type, data)`; we frame it identically to the happy-path SSE framer
+    // (`proto::reframe_sse`): a non-empty `event_type` becomes an `event:` line, an empty one is a
+    // bare `data:` frame. This guarantees the mid-stream error is byte-for-byte the same framing the
+    // ingress protocol uses for every other event. The error carries `StatusClass::ServerError`
+    // (mid-stream transport failure ≈ internal/5xx) with the human detail as `provider_signal`, which
+    // each writer maps to its native error `type`/`message`.
+    let err = crate::proto::IrError {
+        class: crate::breaker::StatusClass::ServerError,
+        provider_signal: Some(message.to_string()),
+        retry_after: None,
     };
-    let data = serde_json::to_string(&envelope).unwrap_or_else(|_| {
-        serde_json::json!({ "error": { "message": message, "type": "api_error" } }).to_string()
-    });
-    // Frame the SSE error in the INGRESS protocol's OWN convention, matching how the happy-path
-    // frames every other event for that protocol (proto::reframe_sse): protocols whose native stream
-    // uses bare `data:` frames (openai, cohere) get NO `event:` line — prepending `event: error` is a
-    // structural deviation native streams of those protocols never emit, and the official SDK parsers
-    // key off bare `data:`. Anthropic/Gemini use named SSE events (`event: error`). Responses uses
-    // event names; its terminal error event is `response.failed`. An unknown ingress falls back to the
-    // bare OpenAI shape.
-    let event_line = match ingress_protocol {
-        "anthropic" | "gemini" => "event: error\n",
-        "responses" => "event: response.failed\n",
-        "openai" | "cohere" => "",
-        _ => "",
-    };
-    format!("{event_line}data: {data}\n\n").into_bytes()
+    let ev = crate::ir::IrStreamEvent::Error(err);
+    // Bind the Protocol so the writer borrow outlives the call (an unknown ingress falls back to the
+    // OpenAI writer, mirroring `ingress_error`).
+    let proto =
+        crate::proto::protocol_for(ingress_protocol).unwrap_or_else(crate::proto::Protocol::openai);
+    // Every SSE-framed writer (openai/anthropic/gemini/cohere/responses) returns `Some` for an
+    // `Error` event; the `None` fallback only guards a hypothetical future writer that declines to
+    // frame errors in-band, in which case we still emit a decodable bare `data:` error.
+    match proto.writer().write_response_event(&ev) {
+        Some((event_type, data)) => {
+            let data = serde_json::to_string(&data).unwrap_or_else(|_| {
+                serde_json::json!({ "error": { "message": message, "type": "api_error" } })
+                    .to_string()
+            });
+            if event_type.is_empty() {
+                format!("data: {data}\n\n").into_bytes()
+            } else {
+                format!("event: {event_type}\ndata: {data}\n\n").into_bytes()
+            }
+        }
+        None => {
+            let data = serde_json::json!({ "error": { "message": message, "type": "api_error" } })
+                .to_string();
+            format!("data: {data}\n\n").into_bytes()
+        }
+    }
 }
 
 /// Non-buffering stream inspection tap for usage parsing.
@@ -1195,17 +1236,28 @@ pub(crate) async fn forward_with_pool(
         };
         let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 
-        let res = app
+        let mut req = app
             .client
             .post(format!("{base}{url_path}"))
             .headers(convert_headers(auth))
             .header(CONTENT_TYPE, "application/json")
-            .timeout(std::time::Duration::from_secs(
+            .body(payload);
+        // reqwest's per-request `.timeout()` bounds the ENTIRE request lifecycle, INCLUDING reading
+        // the response body. For a STREAMING response that body is a long-lived generation stream
+        // (SSE / Bedrock eventstream) that a real vendor holds open for as long as the model emits
+        // tokens — routinely far beyond the failover deadline (~120s). Applying the failover deadline
+        // here would force-terminate a healthy long stream at that wall-clock, truncating the
+        // completion, recording a SPURIOUS mid-stream breaker failure against an otherwise-healthy
+        // lane, and producing a deterministic ~120s cut a native SDK never sees (an indistinguishability
+        // tell). So: bound only the NON-streaming request with the failover deadline (time-to-first-byte
+        // / failover selection). A streaming request runs under the shared client-level ceiling
+        // (`UPSTREAM_REQUEST_TIMEOUT_SECS`, 300s) instead, letting the body run to natural completion.
+        if !wants_stream {
+            req = req.timeout(std::time::Duration::from_secs(
                 request_ctx.remaining(now()).max(1),
-            )) // min 1s timeout
-            .body(payload)
-            .send()
-            .await;
+            )); // min 1s timeout
+        }
+        let res = req.send().await;
 
         match res {
             Err(e) => {
@@ -1395,7 +1447,14 @@ pub(crate) async fn forward_with_pool(
                                 StatusClass::ClientError => unreachable!(),
                                 StatusClass::ContextLength => unreachable!(),
                             };
-                            app.store.record_hard_down_in(pool_name, i, &reason);
+                            // A hard-down (auth rejection / billing exhaustion) is a property of the
+                            // SHARED upstream, not of one routing pool: trip the lane in EVERY cell
+                            // (default "" cell that `named`/`adhoc`/direct routes read AND every
+                            // per-pool cell), mirroring `recover_lane`'s all-cells reach. Tripping
+                            // only `pool_name`'s cell left the same dead upstream Closed in the other
+                            // cells, so legacy/cross-protocol routes kept hammering it until the
+                            // out-of-band prober caught it (the asymmetry this fixes).
+                            app.store.record_hard_down_all_cells(i, &reason);
                             // a hard-down is a breaker trip for this lane.
                             metrics::counter!(
                                 crate::metrics::BREAKER_TRIPS_TOTAL,
@@ -1488,10 +1547,26 @@ pub(crate) async fn forward_with_pool(
                 // of its lifetime request budget (the `max_requests` cost cap; `usable()` stops
                 // admitting the lane once it reaches 0).
                 app.store.record_success_in(pool_name, i);
-                app.store.spend_budget(i);
+                // Discard intentional: the post-success spend is the COST accounting, not the
+                // admission gate (that was `lane_admissible`/`usable` before dispatch). The CAS-based
+                // `spend_budget` can no longer over-spend; a `false` here only means this lane was
+                // already at 0, which the next admission check rejects. Explicit `let _ =` per
+                // `#[must_use]`.
+                let _ = app.store.spend_budget(i);
 
                 // stream the response body incrementally with first-byte boundary tracking
                 let ct = r.headers().get(CONTENT_TYPE).cloned();
+                // Capture the upstream's `x-amzn-RequestId` (if any) BEFORE consuming `r` into the
+                // body stream. On a SAME-PROTOCOL bedrock streaming passthrough we forward the real
+                // upstream id verbatim (a native ConverseStream response carries it); on a
+                // CROSS-PROTOCOL bedrock-ingress stream the backend supplied none, so we synthesize
+                // one below. Either way a bedrock-ingress stream must carry the header (matching a
+                // real endpoint and the error path).
+                let upstream_amzn_id = r
+                    .headers()
+                    .get("x-amzn-requestid")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_string());
                 let is_sse = ct
                     .as_ref()
                     .map(|h| is_streaming_content_type(h.to_str().unwrap_or("")))
@@ -1535,10 +1610,14 @@ pub(crate) async fn forward_with_pool(
                                 ir.stop_sequence = None;
                                 let translated = ingress_proto.writer().write_response(&ir);
                                 // Content-Type is the INGRESS JSON CT, not the upstream's — the body
-                                // is now in the client's native non-stream shape (§8.4).
-                                return Response::builder()
+                                // is now in the client's native non-stream shape (§8.4). A
+                                // bedrock-ingress 2xx also carries `x-amzn-RequestId` (matching a real
+                                // Converse response and the error path).
+                                let rb = Response::builder()
                                     .status(status)
-                                    .header(CONTENT_TYPE, "application/json")
+                                    .header(CONTENT_TYPE, "application/json");
+                                let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
+                                return rb
                                     .body(Body::from(translated.to_string()))
                                     .unwrap_or_else(|_| status.into_response());
                             }
@@ -1619,6 +1698,15 @@ pub(crate) async fn forward_with_pool(
                                 rb = rb.header(CONTENT_TYPE, ct);
                             }
                         }
+                    }
+                }
+                // Bedrock-ingress streaming 2xx must carry `x-amzn-RequestId` (a real ConverseStream
+                // always does). Prefer the upstream's real id when this is a same-protocol bedrock
+                // passthrough (it captured one); otherwise synthesize. Non-bedrock ingress: omit.
+                if ingress_protocol == "bedrock" {
+                    if let Some(id) = upstream_amzn_id.or_else(crate::proto::synth_amzn_request_id)
+                    {
+                        rb = rb.header("x-amzn-requestid", id);
                     }
                 }
                 return rb
@@ -1858,20 +1946,32 @@ async fn forward_once(
     };
     let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 
-    let res = app
+    let mut req = app
         .client
         .post(format!("{base}{url_path}"))
         .headers(convert_headers(auth))
         .header(CONTENT_TYPE, "application/json")
-        .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
-        .body(payload)
-        .send()
-        .await;
+        .body(payload);
+    // See the main forward path: reqwest's `.timeout()` bounds the whole body read, so applying the
+    // failover deadline to a STREAMING request truncates a healthy long generation at that wall-clock
+    // and trips a spurious mid-stream breaker failure. Bound only the non-streaming request; a stream
+    // runs under the shared client-level ceiling (`UPSTREAM_REQUEST_TIMEOUT_SECS`).
+    if !wants_stream {
+        req = req.timeout(std::time::Duration::from_secs(timeout_secs.max(1)));
+    }
+    let res = req.send().await;
 
     match res {
         Ok(r) => {
             let status = r.status();
             let ct = r.headers().get(CONTENT_TYPE).cloned();
+            // Capture the upstream `x-amzn-RequestId` before `r` is consumed (same-protocol bedrock
+            // passthrough forwards the real one; cross-protocol bedrock ingress synthesizes below).
+            let upstream_amzn_id = r
+                .headers()
+                .get("x-amzn-requestid")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string());
             let cross_protocol = ingress_protocol != egress_name;
 
             if !status.is_success() {
@@ -1909,7 +2009,9 @@ async fn forward_once(
             // these, a HalfOpen lane that ONLY ever serves traffic through the exhaustion paths never
             // self-recovers and its `max_requests` budget never depletes.
             app.store.record_success(i);
-            app.store.spend_budget(i);
+            // Discard intentional (see the main path): post-success cost accounting, not admission;
+            // the CAS spend can't over-spend. Explicit `let _ =` per `#[must_use]`.
+            let _ = app.store.spend_budget(i);
 
             // SUCCESS: stream the response body incrementally (permit held for stream life).
             let is_sse = ct
@@ -1935,9 +2037,13 @@ async fn forward_once(
                             ir.system_fingerprint = None;
                             ir.stop_sequence = None;
                             let translated = ingress_proto.writer().write_response(&ir);
-                            return Ok(Response::builder()
+                            // Bedrock-ingress 2xx carries `x-amzn-RequestId` (matching a real
+                            // Converse response and the error path).
+                            let rb = Response::builder()
                                 .status(status)
-                                .header(CONTENT_TYPE, "application/json")
+                                .header(CONTENT_TYPE, "application/json");
+                            let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
+                            return Ok(rb
                                 .body(Body::from(translated.to_string()))
                                 .unwrap_or_else(|_| status.into_response()));
                         }
@@ -2001,6 +2107,13 @@ async fn forward_once(
                             rb = rb.header(CONTENT_TYPE, ct);
                         }
                     }
+                }
+            }
+            // Bedrock-ingress streaming 2xx carries `x-amzn-RequestId`: forward the upstream's real
+            // id on same-protocol passthrough, else synthesize. Non-bedrock ingress: omit.
+            if ingress_protocol == "bedrock" {
+                if let Some(id) = upstream_amzn_id.or_else(crate::proto::synth_amzn_request_id) {
+                    rb = rb.header("x-amzn-requestid", id);
                 }
             }
             Ok(rb
@@ -2367,16 +2480,18 @@ mod mid_stream_error_tests {
         assert_eq!(v["message"], "connection reset by peer");
     }
 
-    /// HIGH/conformance (forward.rs:186): the SSE mid-stream error frame must be shaped in the
-    /// INGRESS protocol's OWN convention, matching the happy path. Bare-`data:` protocols
-    /// (openai/cohere) get NO `event:` line — native streams of those protocols never emit one, and
-    /// the official SDK parsers key off bare `data:`. Anthropic/Gemini get `event: error`; Responses
-    /// gets `event: response.failed`. The `data:` payload is always the ingress protocol's native
-    /// error envelope.
+    /// HIGH/conformance (forward.rs:~190): the SSE mid-stream error frame must be the ingress
+    /// writer's OWN STREAMING error event (`write_response_event(&Error)`), framed exactly as the
+    /// happy path — NOT the non-stream `write_error()` HTTP envelope. Bare-`data:` protocols
+    /// (openai/cohere/gemini, whose native streams emit `data:`-only frames) get NO `event:` line;
+    /// anthropic gets `event: error`; responses gets `event: response.failed` with the SDK-required
+    /// `{"response":{...,"error":{...}}}` STREAM shape.
     #[test]
     fn test_sse_ingress_mid_stream_error_uses_native_framing() {
-        // openai / cohere: bare `data:`, NO event line, native JSON envelope.
-        for proto in ["openai", "cohere"] {
+        // openai / cohere / gemini: bare `data:`, NO event line, native JSON envelope. (Gemini's
+        // native streaming error is a bare `data:` frame — its writer returns an empty event name —
+        // NOT `event: error`; emitting an event line for gemini was the pre-fix bug.)
+        for proto in ["openai", "cohere", "gemini"] {
             let bytes = mid_stream_error_bytes(proto, false, "boom");
             let text = String::from_utf8(bytes).expect("SSE error is utf-8 text");
             assert!(
@@ -2392,27 +2507,62 @@ mod mid_stream_error_tests {
                 .find_map(|l| l.strip_prefix("data: "))
                 .expect("a data: line");
             let v: Value = serde_json::from_str(data).expect("native JSON envelope");
-            // OpenAI wraps in `error`; Cohere uses a flat `message`. Either way it carries the detail.
+            // OpenAI/Gemini wrap in `error`; Cohere uses a flat `type`+`message`. Either way the
+            // detail is carried in the protocol's native streaming-error shape.
             let has_native_shape = v.get("error").is_some() || v.get("message").is_some();
             assert!(has_native_shape, "{proto} native envelope: {v}");
         }
 
-        // anthropic / gemini: named `event: error`.
-        for proto in ["anthropic", "gemini"] {
-            let bytes = mid_stream_error_bytes(proto, false, "boom");
-            let text = String::from_utf8(bytes).expect("SSE error is utf-8 text");
-            assert!(
-                text.starts_with("event: error\n"),
-                "{proto}: named event: error frame; got: {text}"
-            );
-        }
+        // anthropic: named `event: error`, payload `{"type":"error","error":{"type","message"}}`.
+        let bytes = mid_stream_error_bytes("anthropic", false, "boom");
+        let text = String::from_utf8(bytes).expect("SSE error is utf-8 text");
+        assert!(
+            text.starts_with("event: error\n"),
+            "anthropic: named event: error frame; got: {text}"
+        );
+        let data = text
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .expect("a data: line");
+        let v: Value = serde_json::from_str(data).expect("native JSON envelope");
+        // The `error` discriminant is the SSE event NAME (`event: error`); the data payload is
+        // `{"error":{"type","message"}}` (the native Anthropic in-stream error event body).
+        assert!(
+            v["error"]["message"].is_string(),
+            "anthropic error.message present: {v}"
+        );
 
-        // responses: terminal error event is `response.failed`.
+        // responses: terminal error event is `response.failed`, and the payload MUST be the STREAM
+        // shape `{"response":{...,"error":{...}}}` (the SDK reads `event.response`), NOT the
+        // non-stream `{"error":{...}}` HTTP envelope. This is the core of the finding.
         let bytes = mid_stream_error_bytes("responses", false, "boom");
         let text = String::from_utf8(bytes).expect("SSE error is utf-8 text");
         assert!(
             text.starts_with("event: response.failed\n"),
             "responses: event: response.failed frame; got: {text}"
+        );
+        let data = text
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .expect("a data: line");
+        let v: Value = serde_json::from_str(data).expect("native JSON envelope");
+        assert!(
+            v.get("response").is_some(),
+            "responses stream error MUST wrap in a `response` object (SDK reads event.response), \
+             not a top-level `error`; got: {v}"
+        );
+        assert_eq!(
+            v["response"]["status"], "failed",
+            "responses failed-event status: {v}"
+        );
+        assert!(
+            v["response"]["error"]["message"].is_string(),
+            "responses error.message present inside response object: {v}"
+        );
+        assert!(
+            v.get("error").is_none(),
+            "responses stream error must NOT carry a top-level `error` (that is the HTTP envelope, \
+             which the stream decoder cannot locate): {v}"
         );
     }
 
@@ -2633,6 +2783,68 @@ mod ingress_indistinguishability_tests {
             !raw.contains("fp_backend"),
             "backend system_fingerprint must not leak across protocols: {raw}"
         );
+        server.shutdown().await;
+    }
+
+    /// HIGH/conformance (forward.rs:1539): a Bedrock-INGRESS 2xx (non-stream, cross-protocol) must
+    /// carry `x-amzn-RequestId` — a real Converse response always does (the AWS SDK reads it via
+    /// `request_id()`); the error path already synthesizes it, this closes the SUCCESS gap.
+    #[tokio::test]
+    async fn test_bedrock_ingress_success_carries_amzn_request_id() {
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // OpenAI-shaped backend 2xx; ingress is bedrock → cross-protocol translation to Converse.
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "id": "chatcmpl-ok",
+                "object": "chat.completion",
+                "created": 1234567890,
+                "model": "glm-4.5",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "glm-4.5",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("pa", &[(0, 1)])
+            .build();
+        let body = serde_json::to_vec(
+            &json!({"model": "pa", "messages": [{"role": "user", "content": [{"text": "hi"}]}]}),
+        )
+        .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            body.into(),
+            None,
+            "pa",
+            None,
+            "bedrock",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let amzn = resp
+            .headers()
+            .get("x-amzn-requestid")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            !amzn.is_empty(),
+            "bedrock-ingress 2xx MUST carry a non-empty x-amzn-RequestId (matching a real Converse \
+             response and the error path); got: {amzn:?}"
+        );
+        // UUID-v4 shaped: 36 chars, 8-4-4-4-12.
+        assert_eq!(amzn.len(), 36, "x-amzn-RequestId is a UUID; got {amzn}");
         server.shutdown().await;
     }
 
