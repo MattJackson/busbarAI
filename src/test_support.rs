@@ -2832,13 +2832,19 @@ mod tests {
                 v["error"]["type"], "authentication_error",
                 "non-passthrough auth error is a normalized native envelope, not the raw upstream body"
             );
-            // The generic non-leaking message is preserved.
+            // The wire message is the VENDOR-PLAUSIBLE auth-failure copy for the ingress protocol
+            // (here Anthropic → "invalid x-api-key"), NOT busbar-internal vocabulary. The previous
+            // "upstream rejected the lane credential" leaked the internal "lane" concept — a word no
+            // real vendor uses — which was a deterministic proxy tell (R7 indistinguishability fix).
+            let msg = v["error"]["message"].as_str().unwrap_or("");
+            assert_eq!(
+                msg,
+                crate::proto::vendor_auth_failure_message("anthropic"),
+                "auth message must be vendor-plausible copy, not busbar-internal vocabulary: {v}"
+            );
             assert!(
-                v["error"]["message"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("lane credential"),
-                "generic non-leaking auth message: {v}"
+                !msg.contains("lane"),
+                "auth message must never contain the busbar-internal word 'lane': {v}"
             );
 
             server.shutdown().await;
@@ -3385,6 +3391,144 @@ mod tests {
             "forward_once must spend_budget on 2xx (was the bug: unlimited requests via fallback)"
         );
         server.shutdown().await;
+    }
+
+    /// REGRESSION (R7 MEDIUM, forward.rs gemini-json-array gating): a BODY-MODEL client (openai) that
+    /// sends `__busbar_gemini_json_array:true` in its own fully-controlled body must NOT have its SSE
+    /// stream reframed as a JSON array under `Content-Type: application/json`. The framing is gated on
+    /// `ingress_protocol == "gemini"`, so an openai-ingress streaming response stays `text/event-stream`
+    /// and the smuggled shim key never reaches the backend.
+    #[tokio::test]
+    async fn test_gemini_json_array_shim_ignored_for_body_model_ingress() {
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Sse {
+            events: vec![
+                json!({"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}).to_string(),
+                json!({"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}).to_string(),
+            ],
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("gpt", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("openai"),
+            )
+            .pool("p", &[(0, 1)])
+            .build();
+
+        // openai ingress; SAME-protocol (openai egress) so the response is a passthrough SSE stream.
+        let req_body = serde_json::to_vec(&json!({
+            "model": "p",
+            "stream": true,
+            "__busbar_gemini_json_array": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let response = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+            "p",
+            None,
+            "openai",
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 200);
+        let ct = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "openai SSE must NOT be reframed as application/json JSON-array by a smuggled shim key; got CT {ct}"
+        );
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+
+        // And the smuggled shim key must never reach the backend.
+        let upstream = state.get_last_request_body().expect("upstream body");
+        let uv: serde_json::Value = serde_json::from_slice(&upstream).unwrap();
+        assert!(
+            uv.get("__busbar_gemini_json_array").is_none(),
+            "smuggled gemini array shim key must be stripped before forwarding; got {uv}"
+        );
+        server.shutdown().await;
+    }
+
+    /// REGRESSION (R7 MEDIUM, forward_once): the DEGRADED path (LeastBad/FallbackPool → `forward_once`)
+    /// must shape a CROSS-protocol upstream 401/403 into the ingress protocol's native error envelope
+    /// with the SAME kind the main `forward_with_pool` path uses — `authentication_error` for 401,
+    /// `permission_error` for 403 — NOT the old degraded-path `invalid_request_error`. Anthropic
+    /// ingress, OpenAI egress lane (cross-protocol), lane in cooldown so LeastBad routes through
+    /// `forward_once`.
+    #[tokio::test]
+    async fn test_forward_once_cross_protocol_auth_kinds_match_main_path() {
+        use crate::store::now as store_now;
+        for (upstream_status, want_kind) in [
+            (StatusCode::UNAUTHORIZED, "authentication_error"),
+            (StatusCode::FORBIDDEN, "permission_error"),
+        ] {
+            let state = Arc::new(MockServerState::new());
+            state.push(MockResponse::Auth {
+                status: upstream_status,
+            });
+            let server = MockServer::new(state.clone()).await;
+            let t0 = store_now();
+            // Lane speaks OpenAI; ingress is Anthropic → cross-protocol. Lane in long cooldown so
+            // normal selection finds nothing and LeastBad serves via forward_once.
+            let app = TestApp::new()
+                .lane(
+                    LaneSpec::new(
+                        "lane0",
+                        crate::proto::Protocol::openai(),
+                        &server.base_url(),
+                    )
+                    .provider("zai")
+                    .cooldown_until(t0 + 600)
+                    .streak(3)
+                    .err(5),
+                )
+                .pool("leastbad", &[(0, 1)])
+                .on_exhausted("leastbad", crate::config::OnExhausted::LeastBad)
+                .build();
+
+            let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+            let response = forward_with_pool(
+                app.clone(),
+                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                req_body.into(),
+                None,
+                "leastbad",
+                None,
+                "anthropic",
+                None,
+            )
+            .await;
+
+            assert_eq!(
+                response.status(),
+                upstream_status,
+                "degraded path preserves the upstream status ({upstream_status})"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: serde_json::Value =
+                serde_json::from_slice(&body).expect("degraded cross-protocol error is JSON");
+            // Anthropic-native envelope: top-level type "error", error.type the canonical kind.
+            assert_eq!(v["type"], "error", "anthropic-native error envelope: {v}");
+            assert_eq!(
+                v["error"]["type"], want_kind,
+                "degraded path {upstream_status} must map to {want_kind} (matching the main path), not invalid_request_error: {v}"
+            );
+            server.shutdown().await;
+        }
     }
 
     /// FallbackPool loop guard — an A→B→A config (pool_a→pool_b→pool_a), every member

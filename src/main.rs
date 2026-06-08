@@ -580,35 +580,12 @@ async fn shutdown_signal() {
 /// widely understood and is what a generic HTTP client probing `/` is most likely to parse. This is
 /// inference for ERROR shaping only; it never routes a real request.
 fn proto_for_path(path: &str) -> &'static str {
-    if path == "/v1/responses" {
-        "responses"
-    } else if path == "/v1/chat/completions" {
-        "openai"
-    } else if path == "/v2/chat" {
-        "cohere"
-    } else if path.starts_with("/v1beta/models/") {
-        // `/v1beta/models/...` is a Gemini-only surface (OpenAI has no v1beta), so always Gemini.
-        "gemini"
-    } else if path.starts_with("/v1/models/") {
-        // `/v1/models/...` is ambiguous: Gemini packs a `:<action>` into the LAST path segment
-        // (`/v1/models/gemini-pro:generateContent`), whereas the OpenAI SDK's `model.retrieve`
-        // issues `GET /v1/models/{model_id}` with NO colon action. Shape the error in the protocol
-        // the client is actually speaking: a colon in the final segment → Gemini; otherwise OpenAI
-        // (so an OpenAI SDK probing model availability gets an OpenAI-decodable error envelope, not
-        // an undecodable Gemini one — the indistinguishability fix).
-        let last_segment = path.rsplit('/').next().unwrap_or("");
-        if last_segment.contains(':') {
-            "gemini"
-        } else {
-            "openai"
-        }
-    } else if path.starts_with("/model/") {
-        "bedrock"
-    } else if path.ends_with("/v1/messages") {
-        "anthropic"
-    } else {
-        "openai"
-    }
+    // Delegate to the CANONICAL classifier in `proto` so the fallback/405 handlers and
+    // `auth.rs::unauthorized_response` cannot drift for the same path (the bug this fixes: a
+    // non-Converse `/model/foo/bar` path was shaped as bedrock here but openai by auth — contradictory
+    // error envelopes for one path, a protocol indistinguishability gap). The canonical version
+    // requires the `/converse`/`/converse-stream` suffix before classifying `/model/...` as bedrock.
+    proto::proto_for_path(path)
 }
 
 /// Render a native ingress-protocol error envelope (`application/json`) for the fallback handlers,
@@ -660,7 +637,11 @@ async fn fallback_handler(uri: axum::http::Uri) -> axum::response::Response {
     fallback_error_response(
         uri.path(),
         axum::http::StatusCode::NOT_FOUND,
-        "not_found",
+        // CANONICAL kind: `not_found_error` (matches `route.rs`'s 404s and what every writer expects).
+        // The previous `not_found` passed through the OpenAI writer verbatim, so a 404 on an
+        // OpenAI-inferred path emitted `{"error":{"type":"not_found"}}` — a non-canonical type that
+        // breaks native SDK exception mapping and is a distinguishability tell.
+        "not_found_error",
         "the requested resource was not found",
     )
 }
@@ -855,9 +836,54 @@ mod tests {
             proto_for_path("/model/anthropic.claude/converse"),
             "bedrock"
         );
+        assert_eq!(
+            proto_for_path("/model/anthropic.claude/converse-stream"),
+            "bedrock"
+        );
         assert_eq!(proto_for_path("/my-model/v1/messages"), "anthropic");
+        // REGRESSION (R7 MEDIUM): a NON-Converse `/model/...` path must NOT be classified as bedrock
+        // (it lacks the `/converse`/`/converse-stream` suffix). The previous unconditional
+        // `starts_with("/model/")` shaped it as bedrock here while auth shaped it as openai —
+        // contradictory error envelopes for one path. The canonical classifier now requires the
+        // suffix, so a bare `/model/foo/bar` falls through to the OpenAI default, matching auth.rs.
+        assert_eq!(
+            proto_for_path("/model/foo/bar"),
+            "openai",
+            "non-Converse /model/ path must align with auth.rs (openai), not bedrock"
+        );
+        assert_eq!(proto_for_path("/model/foo/predict"), "openai");
         // Unknown path defaults to the widely-understood OpenAI envelope.
         assert_eq!(proto_for_path("/totally/unknown"), "openai");
+    }
+
+    /// REGRESSION (R7 MEDIUM): the two `proto_for_path` classifiers (main.rs fallback/405 handlers
+    /// and `auth.rs` 401 shaping) must agree for EVERY path — they now share one canonical
+    /// implementation in `proto`, so this guards that main.rs's delegate matches the canonical source
+    /// across the full table including the previously-divergent non-Converse `/model/` paths.
+    #[test]
+    fn test_proto_for_path_matches_canonical() {
+        for path in [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v2/chat",
+            "/v1/models/gemini-pro:generateContent",
+            "/v1beta/models/gemini-pro:streamGenerateContent",
+            "/v1/models/gpt-4o",
+            "/v1/models",
+            "/model/anthropic.claude/converse",
+            "/model/anthropic.claude/converse-stream",
+            "/model/foo/bar",
+            "/model/foo/predict",
+            "/my-model/v1/messages",
+            "/v1/messages",
+            "/totally/unknown",
+        ] {
+            assert_eq!(
+                proto_for_path(path),
+                proto::proto_for_path(path),
+                "main.rs proto_for_path must equal the canonical proto::proto_for_path for {path}"
+            );
+        }
     }
 
     /// A 404 fallback on a Bedrock path must carry the native `__type` envelope AND the `x-amzn-*`
@@ -867,7 +893,7 @@ mod tests {
         let resp = fallback_error_response(
             "/model/some.model/converse",
             axum::http::StatusCode::NOT_FOUND,
-            "not_found",
+            "not_found_error",
             "missing",
         );
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
@@ -889,12 +915,14 @@ mod tests {
     }
 
     /// A 404 fallback on the OpenAI path is shaped as the OpenAI error envelope (no amzn headers).
-    #[test]
-    fn test_fallback_openai_404_is_json_no_amzn_headers() {
+    #[tokio::test]
+    async fn test_fallback_openai_404_is_json_no_amzn_headers() {
         let resp = fallback_error_response(
             "/v1/chat/completions",
             axum::http::StatusCode::NOT_FOUND,
-            "not_found",
+            // REGRESSION (R7 MEDIUM): the fallback 404 emits the CANONICAL `not_found_error` kind, so
+            // an OpenAI-inferred 404 carries `{"error":{"type":"not_found_error"}}`, not `not_found`.
+            "not_found_error",
             "missing",
         );
         assert_eq!(
@@ -902,6 +930,20 @@ mod tests {
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|h| h.to_str().ok()),
             Some("application/json")
+        );
+        // Guard the canonical kind reaches the body via the OpenAI writer's verbatim passthrough.
+        use http_body_util::BodyExt as _;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["error"]["type"], "not_found_error",
+            "OpenAI-inferred 404 must carry the canonical not_found_error type, not not_found"
+        );
+        let resp = fallback_error_response(
+            "/v1/chat/completions",
+            axum::http::StatusCode::NOT_FOUND,
+            "not_found_error",
+            "missing",
         );
         assert!(
             resp.headers().get("x-amzn-requestid").is_none(),

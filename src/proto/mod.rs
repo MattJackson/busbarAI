@@ -49,6 +49,95 @@ pub(crate) fn synth_amzn_request_id() -> Option<String> {
     ))
 }
 
+/// The CANONICAL ingress-protocol classifier: infer the wire protocol a request targets from its
+/// path prefix. This is the single source of truth shared by every site that must shape an error
+/// (or otherwise reason about protocol) from a path alone — `auth.rs::unauthorized_response`,
+/// `main.rs`'s fallback/405 handlers — so the auth-time and routing-time classifiers CANNOT drift
+/// (a divergence here means the same `/model/foo/bar` path gets a Bedrock-shaped error from one
+/// handler and an OpenAI-shaped error from another — an indistinguishability tell). Check order is
+/// significant: the more specific Gemini/Bedrock surfaces are tested before the generic
+/// `/v1/messages` / `/v1/chat/completions` suffixes.
+///
+/// The `/model/...` arm REQUIRES the `/converse` or `/converse-stream` suffix before classifying as
+/// bedrock: Bedrock's Converse API is `/model/<id>/converse[-stream]`, so a non-Converse `/model/...`
+/// path (e.g. `/model/foo/bar`, or a pool literally named "model" hitting `/model/v1/messages`) must
+/// NOT be handed a Bedrock-shaped envelope — it falls through to the `/v1/messages` (anthropic) arm
+/// or the OpenAI default, matching what a real client speaking that protocol expects.
+pub(crate) fn proto_for_path(path: &str) -> &'static str {
+    if path.starts_with("/v1beta/models") {
+        // `/v1beta/models/...` is a Gemini-only surface (OpenAI has no v1beta), so always Gemini.
+        "gemini"
+    } else if path.starts_with("/v1/models/") {
+        // `/v1/models/...` is ambiguous: Gemini packs a `:<action>` into the LAST path segment
+        // (`/v1/models/gemini-pro:generateContent`), whereas the OpenAI SDK's `model.retrieve`
+        // issues `GET /v1/models/{id}` with NO colon action. A colon in the final segment → Gemini;
+        // otherwise OpenAI (so an OpenAI SDK probing model availability gets an OpenAI-decodable
+        // envelope, not an undecodable Gemini one).
+        let last_segment = path.rsplit('/').next().unwrap_or("");
+        if last_segment.contains(':') {
+            "gemini"
+        } else {
+            "openai"
+        }
+    } else if path.starts_with("/model/")
+        && (path.ends_with("/converse") || path.ends_with("/converse-stream"))
+    {
+        "bedrock"
+    } else if path == "/v1/messages" || path.ends_with("/v1/messages") {
+        "anthropic"
+    } else if path == "/v1/chat/completions" {
+        "openai"
+    } else if path == "/v2/chat" {
+        "cohere"
+    } else if path == "/v1/responses" {
+        "responses"
+    } else {
+        // Unknown ingress: fall back to the widely-understood OpenAI envelope.
+        "openai"
+    }
+}
+
+/// The vendor-plausible auth-failure wire MESSAGE for an ingress protocol. This string lands verbatim
+/// in the native error body (`error.message` for anthropic/openai/gemini/responses, the bare
+/// top-level `message` for cohere, the `message` beside `__type` for bedrock). It MUST read like the
+/// copy the REAL vendor returns for a bad/missing credential and carry NO busbar-internal vocabulary
+/// ("lane", "virtual key", "passthrough", …): any such word is a deterministic protocol tell that
+/// also discloses busbar's auth model. Canonical source of truth; `auth.rs` keeps a wire-identical
+/// private copy pending migration. Strings sampled from real 401/403 bodies:
+///   anthropic → "invalid x-api-key"; openai/responses → "Incorrect API key provided.";
+///   gemini → "API key not valid. Please pass a valid API key."; cohere → "invalid api token";
+///   bedrock → "" (AWS conveys AccessDenied via __type / x-amzn-errortype, not message prose).
+pub(crate) fn vendor_auth_failure_message(proto: &str) -> &'static str {
+    match proto {
+        "anthropic" => "invalid x-api-key",
+        "gemini" => "API key not valid. Please pass a valid API key.",
+        "cohere" => "invalid api token",
+        "bedrock" => "",
+        "openai" | "responses" => "Incorrect API key provided.",
+        _ => "authentication failed",
+    }
+}
+
+/// Attach the `x-amzn-RequestId` and `x-amzn-errortype` headers a native AWS Bedrock error response
+/// ALWAYS carries to an already-built response. `x-amzn-errortype` mirrors the body `__type` (via
+/// `error_kind_to_bedrock_type`, the single source of truth) so header and body agree; the request
+/// id is the only request-id surface the AWS SDK exposes via `*Output::request_id()`. This is the
+/// canonical helper so `forward.rs::ingress_error`, `route.rs`, and `auth.rs` cannot drift on which
+/// headers a Bedrock error must carry. Best-effort: if entropy or header encoding fails we skip that
+/// header rather than panic — this runs on the request path. No-op caller responsibility: only call
+/// when the ingress protocol is bedrock.
+pub(crate) fn attach_bedrock_error_headers(headers: &mut axum::http::HeaderMap, kind: &str) {
+    if let Some(id) = synth_amzn_request_id() {
+        if let Ok(hv) = HeaderValue::from_str(&id) {
+            headers.insert(HeaderName::from_static("x-amzn-requestid"), hv);
+        }
+    }
+    let errortype = error_kind_to_bedrock_type(kind);
+    if let Ok(hv) = HeaderValue::from_str(errortype) {
+        headers.insert(HeaderName::from_static("x-amzn-errortype"), hv);
+    }
+}
+
 /// ProtocolReader extracts signals from wire responses (Stage 1a + 1b).
 /// Methods are provider-specific normalizers that feed the breaker's Stage 2 classifier.
 pub(crate) trait ProtocolReader: Send + Sync {
@@ -392,6 +481,15 @@ pub(crate) struct StreamTranslate {
     /// flush a single best-effort (zero-usage) `metadata` frame at end-of-stream when the deferral was
     /// never resolved, so the stream is never missing its terminal metadata frame.
     bedrock_metadata_pending: bool,
+    /// ingress == "bedrock" → a side-channel carrying the JSON payload of EVERY frame emitted on this
+    /// stream, BEFORE it is packed into binary `application/vnd.amazon.eventstream` framing. The
+    /// forward-layer `UsageTap` extracts token usage by brace-scanning JSON text, which is correct for
+    /// the five SSE ingress protocols (whose `feed` output IS the JSON-bearing SSE text) but WRONG for
+    /// bedrock ingress (whose output is binary frames whose length-prefixes/CRC32s/`{`-containing
+    /// preludes mislead the scanner, so token accounting is unreliable or zeroed). The tap reads this
+    /// pre-encode JSON instead, decoupling its input from the `ingress_eventstream` framing. Empty for
+    /// non-bedrock ingress (the tap reads the SSE output directly there). Drained by `take_tap_json`.
+    tap_json: Vec<u8>,
 }
 
 /// The OpenAI stream-start identity replayed onto every `chat.completion.chunk` (see
@@ -426,6 +524,7 @@ impl StreamTranslate {
             openai_chunk_identity: None,
             bedrock_metadata_emitted: false,
             bedrock_metadata_pending: false,
+            tap_json: Vec::new(),
         })
     }
 
@@ -580,6 +679,21 @@ impl StreamTranslate {
                 }
             }
             let payload = serde_json::to_vec(&out_data).unwrap_or_default();
+            // Tap side-channel: record the pre-encode JSON payload (with its `type` event name folded
+            // in, so the tap's `message_delta`/`message_stop`/`metadata`-keyed extractors fire) so the
+            // forward-layer `UsageTap` can scan JSON text rather than the binary frame bytes below.
+            // This is the bedrock-ingress token-accounting fix: brace-scanning the encoded binary
+            // frame (length prefix / CRC32 / header block) mis-parses or zeroes usage.
+            if let Some(obj) = out_data.as_object().cloned() {
+                let mut tap_obj = obj;
+                tap_obj.insert(
+                    "type".to_string(),
+                    serde_json::Value::String(out_et.clone()),
+                );
+                if let Ok(tap_bytes) = serde_json::to_vec(&serde_json::Value::Object(tap_obj)) {
+                    self.tap_json.extend_from_slice(&tap_bytes);
+                }
+            }
             out.extend_from_slice(&crate::eventstream::encode_frame(&out_et, &payload));
         } else {
             if self.emit_done {
@@ -722,6 +836,21 @@ impl StreamTranslate {
             self.abort_overflow();
         }
         out
+    }
+
+    /// Drain the pre-encode JSON the most recent `feed`/`finish` emitted for the forward-layer
+    /// `UsageTap` (bedrock ingress only — see `tap_json`). Returns the accumulated JSON-payload bytes
+    /// and clears the buffer so each chunk is tapped exactly once. Always empty for non-bedrock
+    /// ingress (there the tap reads the SSE output directly). The caller feeds this into the tap
+    /// INSTEAD of the binary frame output on the bedrock-ingress path.
+    pub(crate) fn take_tap_json(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.tap_json)
+    }
+
+    /// True when this translator's ingress is a binary event-stream client (bedrock), i.e. its
+    /// `feed`/`finish` OUTPUT is binary frames and the `UsageTap` must read `take_tap_json` instead.
+    pub(crate) fn ingress_is_eventstream(&self) -> bool {
+        self.ingress_eventstream
     }
 
     /// Abandon a stream whose reassembly buffer grew past [`Self::MAX_BUF`] without a frame
@@ -5249,6 +5378,63 @@ mod gemini_tests {
             sv.get("stopReason").and_then(|x| x.as_str()),
             Some("end_turn"),
             "stop reason maps to end_turn; got {sv}"
+        );
+    }
+
+    /// REGRESSION (R7 MEDIUM, forward.rs tap on bedrock ingress): on a BEDROCK-ingress cross-protocol
+    /// stream the translator's OUTPUT is binary eventstream framing, so the forward-layer `UsageTap`
+    /// (a JSON `{`-scanner) would mis-parse the length-prefixes/CRC32s and zero token accounting.
+    /// `take_tap_json` exposes the PRE-ENCODE JSON instead. This asserts that JSON (a) is text the tap
+    /// can parse, (b) carries the real usage, and (c) the tap reads `inputTokens`/`outputTokens` from
+    /// it — while the binary `feed`/`finish` OUTPUT does NOT (the bug it fixes).
+    #[test]
+    fn test_bedrock_ingress_tap_json_carries_usage_not_binary() {
+        let mut t = StreamTranslate::new("bedrock", "openai").expect("bedrock ingress translator");
+        let mut binary_out: Vec<u8> = Vec::new();
+        let mut tap_json: Vec<u8> = Vec::new();
+        for frame in [
+            "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            binary_out.extend(t.feed(frame.as_bytes()));
+            tap_json.extend(t.take_tap_json());
+        }
+        binary_out.extend(t.finish());
+        tap_json.extend(t.take_tap_json());
+
+        assert!(t.ingress_is_eventstream(), "bedrock ingress is eventstream");
+
+        // The tap-JSON side-channel parses with the forward-layer UsageTap and yields the real usage.
+        let mut tap = crate::forward::UsageTap::new();
+        tap.feed(&bytes::Bytes::from(tap_json));
+        assert_eq!(
+            tap.input_tokens,
+            Some(11),
+            "tap reads inputTokens from the pre-encode JSON"
+        );
+        assert_eq!(
+            tap.output_tokens,
+            Some(4),
+            "tap reads outputTokens from the pre-encode JSON"
+        );
+
+        // The translator OUTPUT really is binary eventstream framing (NOT the JSON text the tap is
+        // built for): it carries the AWS frame prelude/CRC bytes, so it is not parseable as a whole
+        // JSON document. The point of the side-channel is that token accounting reads the clean JSON
+        // above instead of brace-scanning these binary frames (where stray `{` bytes in the
+        // prelude/CRC/length fields mislead the scanner — the unreliability the finding describes).
+        assert!(!binary_out.is_empty(), "binary frames were emitted");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&binary_out).is_err(),
+            "translator output is binary eventstream framing, not a JSON document"
+        );
+        // The frames decode as real AWS eventstream frames (proving they are binary-framed, not SSE).
+        let mut buf = binary_out.clone();
+        let frames = crate::eventstream::drain_frames(&mut buf);
+        assert!(
+            frames.iter().any(|(et, _)| et == "metadata"),
+            "binary output contains the eventstream metadata frame"
         );
     }
 }

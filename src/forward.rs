@@ -54,16 +54,23 @@ fn maybe_attach_bedrock_amzn_id(
     }
 }
 
-/// Build a native-format error response for the CLIENT. Every forward-layer error that is returned
-/// to the caller goes through here so the body is the INGRESS protocol's native error envelope
+/// The CANONICAL per-protocol error-response builder. Every forward-layer error returned to the
+/// caller goes through here so the body is the INGRESS protocol's native error envelope
 /// (`application/json`) rather than `text/plain`, which an official SDK cannot decode (it raises a
 /// generic JSON-decode error — a deterministic proxy tell, design §8.1). The status code is
 /// preserved exactly; only the body shape changes. `kind` is the protocol-agnostic error category
-/// (e.g. `"invalid_request_error"`, `"overloaded"`); `msg` is the human-readable detail.
-/// When `ingress` does not resolve to a known protocol, falls back to the generic default envelope
-/// via the OpenAI writer (`protocol_for` only fails for an unknown literal, which is itself a 400
-/// the caller still needs shaped).
-fn ingress_error(ingress: &str, status: StatusCode, kind: &str, msg: &str) -> Response {
+/// (e.g. `"invalid_request_error"`, `"overloaded"`, `"authentication_error"`); `msg` is the
+/// human-readable detail. When `ingress` does not resolve to a known protocol, falls back to the
+/// generic default envelope via the OpenAI writer (`protocol_for` only fails for an unknown literal,
+/// which is itself a 400 the caller still needs shaped).
+///
+/// `pub(crate)` and the single source of truth for native error shaping: it attaches the
+/// protocol-appropriate headers (Bedrock `x-amzn-RequestId` / `x-amzn-errortype` via the shared
+/// `proto::attach_bedrock_error_headers`; Gemini code/status ride the body envelope the writer
+/// builds). `route.rs::ingress_error` and `auth.rs::unauthorized_response` keep wire-identical
+/// private copies pending their migration to this function next round — once they call it, the
+/// degraded path, the main path, and the auth/route paths cannot diverge on error shape or headers.
+pub(crate) fn ingress_error(ingress: &str, status: StatusCode, kind: &str, msg: &str) -> Response {
     let envelope = match crate::proto::protocol_for(ingress) {
         Some(p) => p.writer().write_error(status.as_u16(), kind, msg),
         None => crate::proto::Protocol::openai()
@@ -77,26 +84,103 @@ fn ingress_error(ingress: &str, status: StatusCode, kind: &str, msg: &str) -> Re
         // valid JSON escaping for all inputs (e.g. it differs on `/` and some control sequences).
         serde_json::json!({ "error": { "message": msg, "type": kind } }).to_string()
     });
-    Response::builder()
+    let mut resp = Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(body))
-        .unwrap_or_else(|_| status.into_response())
+        .unwrap_or_else(|_| status.into_response());
+    // Bedrock ingress: a real AWS Bedrock runtime response ALWAYS carries `x-amzn-RequestId` (the
+    // only request-id surface the AWS SDK exposes via `*Output::request_id()`) and an
+    // `x-amzn-errortype` header equal to the body `__type`. A forward-layer error that omitted both
+    // was distinguishable from native Bedrock and left the SDK's request id empty — the most-
+    // exercised error surface under failover. Attach them via the shared helper so this path cannot
+    // drift from `route.rs`/`auth.rs`.
+    if ingress == "bedrock" {
+        crate::proto::attach_bedrock_error_headers(resp.headers_mut(), kind);
+    }
+    resp
 }
 
-/// Remove the router-internal shim keys the route layer injects into the request body for PATH-MODEL
+/// CANONICAL mapping from an upstream HTTP status to the protocol-agnostic error `kind`, for shaping
+/// a CROSS-PROTOCOL non-2xx upstream response into the ingress protocol's native error envelope.
+/// Shared by BOTH the main forward loop (`forward_with_pool`) and the degraded last-resort path
+/// (`forward_once`) so they cannot drift on which kind a given status maps to (the bug this closes:
+/// the degraded path labeled a 401/403 `invalid_request_error` while the main path correctly used
+/// `authentication_error`/`permission_error`, an SDK-visible typed-exception mismatch and an
+/// indistinguishability leak). The mapping mirrors the native discriminant a real vendor uses for
+/// each status.
+fn cross_protocol_error_kind(status: StatusCode) -> &'static str {
+    if status == StatusCode::UNAUTHORIZED {
+        "authentication_error"
+    } else if status == StatusCode::FORBIDDEN {
+        "permission_error"
+    } else if status == StatusCode::TOO_MANY_REQUESTS {
+        "rate_limit_error"
+    } else if status.is_server_error() {
+        "api_error"
+    } else {
+        "invalid_request_error"
+    }
+}
+
+/// Shared finalizer for a cross-protocol NON-2xx upstream response, used by BOTH `forward_with_pool`
+/// and `forward_once`. Lifts the upstream's human message where present, maps the status to the
+/// canonical ingress `kind` (`cross_protocol_error_kind`), and reshapes into the ingress protocol's
+/// native error envelope via `ingress_error`. Relaying the EGRESS provider's native error body to a
+/// different-protocol client is a foreign-format leak (§8.2) the SDK cannot decode into its typed
+/// exception — an immediate proxy tell — so a crossed boundary NEVER relays verbatim.
+fn shape_cross_protocol_error(
+    ingress_protocol: &str,
+    status: StatusCode,
+    bytes: &[u8],
+) -> Response {
+    let kind = cross_protocol_error_kind(status);
+    let msg =
+        extract_error_message(bytes).unwrap_or_else(|| "upstream rejected the request".to_string());
+    ingress_error(ingress_protocol, status, kind, &msg)
+}
+
+/// Remove the router-internal SHIM KEYS the route layer injects into the request body for PATH-MODEL
 /// ingress protocols (`gemini`, `bedrock`), where the native wire carries the model in the URL and
-/// stream intent in the path, not the body. The shared resolve/forward plumbing reads `model` and
-/// `stream` from the body, so the route layer injects them; they must NOT reach the backend on the
-/// same-protocol passthrough path (a Bedrock Converse request rejects an unexpected `model`/`stream`,
-/// and either way it is an indistinguishability leak). No-op for body-model protocols (openai etc.),
-/// whose `model`/`stream` are GENUINE caller fields.
+/// stream intent in the path, not the body. Two keys, handled differently relative to `rewrite_model`
+/// because their correct egress treatment differs:
+///
+///   - `stream` and the gemini JSON-array key are NEVER native egress body fields for ANY backend:
+///     stream intent is conveyed via the upstream path (`upstream_path_for_stream`), and the array
+///     key only influences RESPONSE framing. They must be stripped on EVERY branch — same- AND
+///     cross-protocol — because the cross-protocol `read_request`/`write_request` rebuild does NOT
+///     reliably drop them (the reader can sweep `stream`/the array key into IR `extra`, which the
+///     egress writer re-emits, leaking a router fingerprint to a foreign backend). `model` is the
+///     genuine egress field on a body-model backend, so it is handled separately.
+///   - `model` is stripped ONLY on the same-protocol branch (by [`strip_same_protocol_model_shim`],
+///     after `rewrite_model`), never cross-protocol: a body-model egress REQUIRES `model` and
+///     `rewrite_model` installs the authoritative one.
+///
+/// No-op for body-model ingress (openai etc.), whose `model`/`stream` are GENUINE caller fields — but
+/// the gemini array key is stripped for them too (it is never native to any protocol).
 fn strip_router_shim_keys(v: &mut Value, ingress_protocol: &str) {
+    if let Some(obj) = v.as_object_mut() {
+        // The gemini JSON-array key is never native to ANY protocol → strip on every ingress (also
+        // closes the leak where a body-model client smuggles the key in its own controlled body).
+        obj.remove(GEMINI_JSON_ARRAY_SHIM_KEY);
+        // `stream` is a path-model shim only for gemini/bedrock; for body-model ingress it is the
+        // caller's genuine field and must be preserved.
+        if matches!(ingress_protocol, "gemini" | "bedrock") {
+            obj.remove("stream");
+        }
+    }
+}
+
+/// Remove the SHIM `model` key on the SAME-PROTOCOL gemini/bedrock passthrough path, AFTER
+/// `rewrite_model` has run. On same-protocol gemini/bedrock the model rides the URL, not the body, so
+/// a native Converse / generateContent backend must NOT see a body `model`; but the gemini writer's
+/// `rewrite_model` re-inserts one, so this strip must run AFTER it to remove both the route layer's
+/// shim and the re-inserted copy. NEVER call this on the cross-protocol branch: there the body-model
+/// egress requires the `model` that `rewrite_model` installed. No-op for body-model ingress.
+fn strip_same_protocol_model_shim(v: &mut Value, ingress_protocol: &str) {
     if matches!(ingress_protocol, "gemini" | "bedrock") {
         if let Some(obj) = v.as_object_mut() {
             obj.remove("model");
-            obj.remove("stream");
-            obj.remove(GEMINI_JSON_ARRAY_SHIM_KEY);
         }
     }
 }
@@ -595,14 +679,24 @@ where
                     // cross-protocol → translate egress SSE bytes to the ingress format.
                     if let Some(t) = this.translate.as_mut() {
                         let out = t.feed(&chunk);
-                        // Feed the tap from the TRANSLATED output, not the raw upstream `chunk`. On a
-                        // Bedrock-EGRESS upstream the raw chunk is binary eventstream framing, not JSON
-                        // text — the tap's `{`-scanner would match CRC/length/header bytes and parse
-                        // garbage. The translated `out` is the ingress SSE/JSON shape the tap is built
-                        // for (and a same-protocol passthrough — translate=None — still feeds the raw
-                        // chunk below, which IS already the right shape there).
                         let out_bytes = Bytes::from(out);
-                        this.tap.feed(&out_bytes);
+                        // Feed the tap with JSON TEXT, never binary frames. For the five SSE ingress
+                        // protocols the translated `out` IS the JSON-bearing SSE text the tap's
+                        // `{`-scanner is built for. But for BEDROCK ingress the translated `out` is
+                        // binary `application/vnd.amazon.eventstream` framing (u32 length prefixes,
+                        // CRC32s, header blocks whose stray `{` bytes would mislead the scanner into
+                        // parsing garbage or zeroing usage). On that path read the pre-encode JSON the
+                        // translator captured (`take_tap_json`) instead, so token accounting is
+                        // reliable. (A same-protocol passthrough — translate=None — feeds the raw chunk
+                        // below, already the right shape there.)
+                        if t.ingress_is_eventstream() {
+                            let tap_json = t.take_tap_json();
+                            if !tap_json.is_empty() {
+                                this.tap.feed(&Bytes::from(tap_json));
+                            }
+                        } else {
+                            this.tap.feed(&out_bytes);
+                        }
                         // Gemini non-`alt=sse` ingress: reframe the (now gemini-SSE) bytes into the
                         // JSON-array streaming shape. Run AFTER tap+translate so accounting is
                         // unaffected.
@@ -716,6 +810,18 @@ where
                             .map(|t| t.finish())
                             .unwrap_or_default()
                     };
+                    // Bedrock ingress: `finish()` may emit a deferred terminal `metadata` frame (the
+                    // default-OpenAI-streaming case carries usage there). Tap its pre-encode JSON so
+                    // end-of-stream token usage is still captured — the binary `done` bytes would not
+                    // be scannable by the tap's `{`-scanner.
+                    if let Some(t) = this.translate.as_mut() {
+                        if t.ingress_is_eventstream() {
+                            let tap_json = t.take_tap_json();
+                            if !tap_json.is_empty() {
+                                this.tap.feed(&Bytes::from(tap_json));
+                            }
+                        }
+                    }
                     drop(this.permit.take());
                     this.ended = true;
                     // Charge this request's token usage to the virtual key's budget (once) — but ONLY
@@ -1046,9 +1152,14 @@ pub(crate) async fn forward_with_pool(
     let wants_stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     // Gemini ingress streaming WITHOUT `?alt=sse`: the native client expects a JSON-array streamed
-    // body, not SSE. The route layer signals this via a router shim key (read + stripped here, like
-    // `model`/`stream`). False for every other protocol and for the `?alt=sse` gemini variant.
-    let gemini_json_array = wants_gemini_json_array(&v);
+    // body, not SSE. The route layer signals this via a router shim key (read here; stripped from the
+    // body unconditionally before forwarding). GATED on `ingress_protocol == "gemini"`: only a
+    // genuine Gemini client can want JSON-array response framing. Without the gate a body-model client
+    // (openai/cohere/responses) that sent `{"__busbar_gemini_json_array":true}` in its own
+    // fully-controlled body would have its SSE stream silently reframed as a JSON array under
+    // `Content-Type: application/json` — undecodable by the official SDK and a router behavior no
+    // native backend exhibits. False for every other protocol and for the `?alt=sse` gemini variant.
+    let gemini_json_array = ingress_protocol == "gemini" && wants_gemini_json_array(&v);
 
     // Derive affinity key early (before any mutations to v)
     let _affinity_key_str: Option<String> = if let Some(k) = affinity_key {
@@ -1201,22 +1312,25 @@ pub(crate) async fn forward_with_pool(
                 }
             }
         }
-        // existing rewrite_model sets the lane's model on the (possibly translated) body:
+        // Remove the never-native shim keys (gemini JSON-array key on every protocol; `stream` for
+        // path-model gemini/bedrock ingress) on EVERY branch — same- AND cross-protocol — because the
+        // cross-protocol rebuild does not reliably drop them (they can ride IR `extra` to the egress
+        // writer). `model` is handled below, ordered relative to `rewrite_model`.
+        strip_router_shim_keys(&mut hop_v, ingress_protocol);
+        // `rewrite_model` installs the authoritative lane model. ORDERING (critical): on a
+        // cross-protocol hop to a BODY-MODEL egress (gemini/bedrock → openai/anthropic/cohere/
+        // responses) the backend REQUIRES this `model` body field; the previous code stripped `model`
+        // UNCONDITIONALLY *after* this rewrite, deleting it and making the backend 400 — the headline
+        // cross-protocol break this fixes. So `model` is now stripped ONLY on the same-protocol
+        // passthrough (below), where the model rides the URL and a body `model` is an indistinguishability
+        // leak; the cross-protocol body keeps the model the rewrite installed.
         app.lanes[i]
             .protocol
             .writer()
             .rewrite_model(&mut hop_v, &app.lanes[i].model);
-        // PATH-MODEL ingress (gemini/bedrock): the route layer injected `model`/`stream`/
-        // `__busbar_gemini_json_array` shim keys into the body so the shared resolve/forward plumbing
-        // (which reads them from the body) works. Strip them UNCONDITIONALLY — on BOTH the
-        // same-protocol and cross-protocol branches — before the body reaches any backend. The strip
-        // previously ran only on the same-protocol branch on the assumption the cross-protocol
-        // read/write_request rebuild had already dropped them; that was false for Gemini (the
-        // `__busbar_gemini_json_array` shim was swept into IR `extra` and re-emitted by the egress
-        // writer), leaking a router fingerprint to a foreign backend. (The Gemini reader now also
-        // excludes both keys from `extra`, so this is defense in depth.) No-op for body-model
-        // ingress (openai etc.), whose `model`/`stream` are genuine caller fields.
-        strip_router_shim_keys(&mut hop_v, ingress_protocol);
+        if ingress_protocol == egress_name {
+            strip_same_protocol_model_shim(&mut hop_v, ingress_protocol);
+        }
         let payload = match serde_json::to_vec(&hop_v) {
             Ok(p) => p,
             // Re-serializing a Value that was parsed from valid JSON and only rewritten with
@@ -1339,14 +1453,10 @@ pub(crate) async fn forward_with_pool(
                         // ClientFault branch does the same). The passthrough breaker invariant is
                         // unchanged either way: no breaker penalty for a caller-key auth failure.
                         if ingress_protocol != egress_name {
-                            let kind = if status == StatusCode::UNAUTHORIZED {
-                                "authentication_error"
-                            } else {
-                                "permission_error"
-                            };
-                            let msg = extract_error_message(&bytes)
-                                .unwrap_or_else(|| "upstream rejected the request".to_string());
-                            return ingress_error(ingress_protocol, status, kind, &msg);
+                            // Reshape via the shared finalizer so the kind→native-envelope mapping
+                            // (401→authentication_error, 403→permission_error, …) is identical on the
+                            // main path, the degraded path, and the ClientFault branch below.
+                            return shape_cross_protocol_error(ingress_protocol, status, &bytes);
                         }
                         use axum::body::Body;
                         let mut rb = Response::builder().status(status);
@@ -1515,13 +1625,19 @@ pub(crate) async fn forward_with_pool(
                                 // Route through ingress_error so the body is the INGRESS protocol's
                                 // NATIVE error envelope (Bedrock `{"__type":"AccessDeniedException",...}`,
                                 // Gemini `{"error":{"status":"UNAUTHENTICATED",...}}`, etc.), not a
-                                // hard-coded OpenAI-shaped body. The generic message still avoids
-                                // leaking busbar's internal upstream auth-rejection body.
+                                // hard-coded OpenAI-shaped body. The wire MESSAGE is the
+                                // vendor-plausible auth-failure copy for the ingress protocol — NOT
+                                // busbar-internal vocabulary. The previous "upstream rejected the lane
+                                // credential" leaked the internal "lane" concept (no real vendor uses
+                                // that word), a deterministic proxy tell; and in non-passthrough mode
+                                // the rejected key is busbar's OWN, so the upstream's auth-rejection
+                                // body must never be relayed either. The native error kind carries the
+                                // auth signal; the message just reads like the real vendor's copy.
                                 return ingress_error(
                                     ingress_protocol,
                                     status,
                                     "authentication_error",
-                                    "upstream rejected the lane credential",
+                                    crate::proto::vendor_auth_failure_message(ingress_protocol),
                                 );
                             }
 
@@ -1921,8 +2037,10 @@ async fn forward_once(
 
     // stream intent for the stream-aware upstream path (Gemini).
     let wants_stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-    // Gemini ingress streaming WITHOUT `?alt=sse` → JSON-array streamed body (see main path).
-    let gemini_json_array = wants_gemini_json_array(&v);
+    // Gemini ingress streaming WITHOUT `?alt=sse` → JSON-array streamed body (see main path). GATED
+    // on `ingress_protocol == "gemini"` so a body-model client cannot smuggle the shim key to force
+    // JSON-array reframing of its SSE stream.
+    let gemini_json_array = ingress_protocol == "gemini" && wants_gemini_json_array(&v);
 
     // Cross-protocol translation through the superset IR — same as the main path — so this degraded
     // route is correct when the chosen lane speaks a different protocol than the caller.
@@ -1952,13 +2070,19 @@ async fn forward_once(
         }
     }
 
+    // Shim-key handling, ordered relative to `rewrite_model` exactly as the main `forward_with_pool`
+    // path (see there for the full rationale): strip the never-native shim keys (gemini array key /
+    // `stream`) on every branch; install the authoritative model via `rewrite_model`; then strip the
+    // `model` shim ONLY on the same-protocol branch (stripping `model` cross-protocol would delete the
+    // egress model a body-model backend requires — the cross-protocol break this fixes).
+    strip_router_shim_keys(&mut v, ingress_protocol);
     app.lanes[i]
         .protocol
         .writer()
         .rewrite_model(&mut v, &app.lanes[i].model);
-    // Strip router-internal shim keys UNCONDITIONALLY (same- AND cross-protocol) before the body
-    // reaches any backend — see forward_with_pool for why the cross-protocol branch must strip too.
-    strip_router_shim_keys(&mut v, ingress_protocol);
+    if ingress_protocol == egress_name {
+        strip_same_protocol_model_shim(&mut v, ingress_protocol);
+    }
     let payload = match serde_json::to_vec(&v) {
         Ok(p) => p,
         // Effectively infallible (Value parsed from valid JSON); return a shaped 500 rather than
@@ -2031,16 +2155,13 @@ async fn forward_once(
                 // protocol's native error envelope, lifting the upstream's human message where
                 // present. Same-protocol passthrough relays verbatim (already the client's shape).
                 if cross_protocol {
-                    let msg = extract_error_message(&bytes)
-                        .unwrap_or_else(|| "upstream rejected the request".to_string());
-                    let kind = if status == StatusCode::TOO_MANY_REQUESTS {
-                        "rate_limit_error"
-                    } else if status.is_server_error() {
-                        "api_error"
-                    } else {
-                        "invalid_request_error"
-                    };
-                    return Ok(ingress_error(ingress_protocol, status, kind, &msg));
+                    // Shared finalizer: the kind→native-envelope mapping (401→authentication_error,
+                    // 403→permission_error, 429→rate_limit_error, 5xx→api_error, else
+                    // invalid_request_error) is now IDENTICAL to the main `forward_with_pool` path, so
+                    // this degraded route can no longer drift (the bug it fixes: a 401/403 on the
+                    // degraded path was labeled `invalid_request_error`, the wrong typed-exception
+                    // discriminant for an Anthropic SDK and a proxy tell).
+                    return Ok(shape_cross_protocol_error(ingress_protocol, status, &bytes));
                 }
                 // Same-protocol degraded path: relay the upstream error verbatim (no classification).
                 let mut rb = Response::builder().status(status);
@@ -2499,6 +2620,7 @@ mod on_exhausted_tests {
 mod mid_stream_error_tests {
     use super::{
         client_fault_kind, extract_error_message, mid_stream_error_bytes, strip_router_shim_keys,
+        strip_same_protocol_model_shim, GEMINI_JSON_ARRAY_SHIM_KEY,
     };
     use crate::proto::StatusClass;
     use serde_json::{json, Value};
@@ -2663,38 +2785,233 @@ mod mid_stream_error_tests {
         assert_eq!(extract_error_message(br#"{"foo":1}"#), None);
     }
 
-    /// PATH-MODEL ingress (gemini/bedrock) must have the router-injected `model`/`stream` shim keys
-    /// stripped before same-protocol forwarding; body-model ingress (openai) keeps them (genuine).
+    /// `strip_router_shim_keys` removes the NEVER-NATIVE shim keys on every branch: the gemini
+    /// JSON-array key for ALL protocols, and `stream` for path-model gemini/bedrock ingress. It does
+    /// NOT remove `model` (that is `strip_same_protocol_model_shim`'s job, on the same-protocol branch
+    /// only) so a cross-protocol hop keeps the authoritative model `rewrite_model` installs.
     #[test]
     fn test_strip_router_shim_keys() {
-        let mut v = json!({"model": "p", "stream": true, "messages": []});
+        let mut v =
+            json!({"model": "p", "stream": true, GEMINI_JSON_ARRAY_SHIM_KEY: true, "messages": []});
         strip_router_shim_keys(&mut v, "bedrock");
-        assert!(v.get("model").is_none(), "bedrock: model shim stripped");
+        assert_eq!(
+            v["model"], "p",
+            "model NOT stripped here (rewrite_model owns it)"
+        );
         assert!(v.get("stream").is_none(), "bedrock: stream shim stripped");
+        assert!(
+            v.get(GEMINI_JSON_ARRAY_SHIM_KEY).is_none(),
+            "gemini array shim key stripped on every protocol"
+        );
         assert!(v.get("messages").is_some(), "real fields retained");
 
-        let mut v = json!({"model": "p", "stream": true});
+        let mut v = json!({"stream": true, GEMINI_JSON_ARRAY_SHIM_KEY: true});
         strip_router_shim_keys(&mut v, "gemini");
-        assert!(v.get("model").is_none() && v.get("stream").is_none());
+        assert!(v.get("stream").is_none() && v.get(GEMINI_JSON_ARRAY_SHIM_KEY).is_none());
 
-        // OpenAI is a BODY-MODEL protocol: model/stream are genuine caller fields, never stripped.
-        let mut v = json!({"model": "gpt-4o", "stream": true});
+        // OpenAI is a BODY-MODEL protocol: model/stream are genuine caller fields, never stripped —
+        // but the gemini array key is never native to ANY protocol, so a client-smuggled copy is
+        // still removed (closes the body-model framing-smuggle leak).
+        let mut v = json!({"model": "gpt-4o", "stream": true, GEMINI_JSON_ARRAY_SHIM_KEY: true});
         strip_router_shim_keys(&mut v, "openai");
         assert_eq!(
             v["model"], "gpt-4o",
             "openai model is genuine, not stripped"
         );
-        assert_eq!(v["stream"], true);
+        assert_eq!(v["stream"], true, "openai stream is genuine, not stripped");
+        assert!(
+            v.get(GEMINI_JSON_ARRAY_SHIM_KEY).is_none(),
+            "gemini array key stripped even for body-model ingress"
+        );
+    }
+
+    /// `strip_same_protocol_model_shim` removes the body `model` for same-protocol gemini/bedrock
+    /// passthrough (model rides the URL there), and is a no-op for body-model ingress.
+    #[test]
+    fn test_strip_same_protocol_model_shim() {
+        let mut v = json!({"model": "p", "messages": []});
+        strip_same_protocol_model_shim(&mut v, "gemini");
+        assert!(
+            v.get("model").is_none(),
+            "gemini same-protocol: model stripped"
+        );
+        assert!(v.get("messages").is_some());
+
+        let mut v = json!({"model": "gpt-4o"});
+        strip_same_protocol_model_shim(&mut v, "openai");
+        assert_eq!(v["model"], "gpt-4o", "openai model never stripped");
+    }
+
+    /// REGRESSION (R7 CRITICAL, forward.rs shim-strip ordering): a PATH-MODEL ingress (gemini/bedrock)
+    /// crossing to a BODY-MODEL egress (openai/anthropic/cohere/responses) must reach the backend WITH
+    /// the authoritative egress `model`. The bug: `rewrite_model` ran, then an UNCONDITIONAL strip
+    /// removed `model`, so the cross-protocol body hit the backend with no `model` (a guaranteed 400).
+    /// This exercises the exact strip→rewrite ordering on a value, asserting the cross-protocol body
+    /// keeps `model` while `stream`/the array key are gone, and the same-protocol body drops `model`.
+    #[test]
+    fn test_shim_strip_ordering_cross_protocol_keeps_model() {
+        // Cross-protocol gemini→openai: strip (never-native keys) → rewrite_model installs the lane
+        // model → NO same-protocol model strip. Body must carry the egress model.
+        let mut v = json!({"model": "router-placeholder", "stream": true, GEMINI_JSON_ARRAY_SHIM_KEY: true});
+        let ingress = "gemini";
+        let egress = "openai";
+        strip_router_shim_keys(&mut v, ingress);
+        crate::proto::Protocol::openai()
+            .writer()
+            .rewrite_model(&mut v, "gpt-4o");
+        if ingress == egress {
+            strip_same_protocol_model_shim(&mut v, ingress);
+        }
+        assert_eq!(
+            v["model"], "gpt-4o",
+            "cross-protocol egress body MUST carry the authoritative model (the critical fix)"
+        );
+        assert!(
+            v.get("stream").is_none(),
+            "shim stream stripped cross-protocol"
+        );
+        assert!(
+            v.get(GEMINI_JSON_ARRAY_SHIM_KEY).is_none(),
+            "gemini array key stripped cross-protocol"
+        );
+
+        // Same-protocol gemini→gemini: model rides the URL, so the body must NOT carry `model` even
+        // though the gemini writer's rewrite_model re-inserts one — the same-protocol strip runs after.
+        let mut v = json!({"model": "router-placeholder", "stream": true, "contents": []});
+        let ingress = "gemini";
+        let egress = "gemini";
+        strip_router_shim_keys(&mut v, ingress);
+        crate::proto::Protocol::gemini()
+            .writer()
+            .rewrite_model(&mut v, "gemini-1.5-pro");
+        if ingress == egress {
+            strip_same_protocol_model_shim(&mut v, ingress);
+        }
+        assert!(
+            v.get("model").is_none(),
+            "same-protocol gemini passthrough must NOT leak a body model (rides the URL)"
+        );
+        assert!(
+            v.get("stream").is_none(),
+            "shim stream stripped same-protocol"
+        );
     }
 }
 
 #[cfg(test)]
 mod ingress_indistinguishability_tests {
-    use super::{forward_with_pool, ingress_error, ingress_stream_content_type};
+    use super::{
+        cross_protocol_error_kind, forward_with_pool, ingress_error, ingress_stream_content_type,
+        shape_cross_protocol_error,
+    };
     use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
     use reqwest::StatusCode;
     use serde_json::{json, Value};
     use std::sync::Arc;
+
+    /// CANONICAL status→kind mapping shared by the main and degraded cross-protocol error shaping.
+    /// REGRESSION (R7 MEDIUM, forward_once): a 401/403 must map to authentication_error/
+    /// permission_error, NOT invalid_request_error (the degraded-path bug). Exhaustive over the
+    /// status arms the mapping distinguishes.
+    #[test]
+    fn test_cross_protocol_error_kind_mapping() {
+        assert_eq!(
+            cross_protocol_error_kind(StatusCode::UNAUTHORIZED),
+            "authentication_error"
+        );
+        assert_eq!(
+            cross_protocol_error_kind(StatusCode::FORBIDDEN),
+            "permission_error"
+        );
+        assert_eq!(
+            cross_protocol_error_kind(StatusCode::TOO_MANY_REQUESTS),
+            "rate_limit_error"
+        );
+        assert_eq!(
+            cross_protocol_error_kind(StatusCode::INTERNAL_SERVER_ERROR),
+            "api_error"
+        );
+        assert_eq!(
+            cross_protocol_error_kind(StatusCode::BAD_GATEWAY),
+            "api_error"
+        );
+        assert_eq!(
+            cross_protocol_error_kind(StatusCode::BAD_REQUEST),
+            "invalid_request_error"
+        );
+        assert_eq!(
+            cross_protocol_error_kind(StatusCode::NOT_FOUND),
+            "invalid_request_error"
+        );
+    }
+
+    /// `shape_cross_protocol_error` (the shared finalizer used by BOTH `forward_with_pool` and
+    /// `forward_once`) reshapes a crossed-boundary non-2xx into the ingress-native envelope with the
+    /// canonical kind. REGRESSION: a 401 from an OpenAI backend reaching an Anthropic client must be
+    /// `authentication_error`, a 403 `permission_error` — matching the main path, not the old
+    /// degraded-path `invalid_request_error`.
+    #[tokio::test]
+    async fn test_shape_cross_protocol_error_auth_kinds() {
+        use http_body_util::BodyExt as _;
+        for (status, want_kind) in [
+            (StatusCode::UNAUTHORIZED, "authentication_error"),
+            (StatusCode::FORBIDDEN, "permission_error"),
+        ] {
+            let resp =
+                shape_cross_protocol_error("anthropic", status, br#"{"error":{"message":"nope"}}"#);
+            assert_eq!(resp.status(), status, "status preserved");
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                v["error"]["type"], want_kind,
+                "cross-protocol {status} must map to {want_kind} (matches the main path)"
+            );
+            assert_eq!(
+                v["error"]["message"], "nope",
+                "upstream human message is lifted into the native envelope"
+            );
+        }
+    }
+
+    /// REGRESSION (R7 HIGH, forward.rs ingress_error): a Bedrock-ingress forward-layer error must
+    /// carry BOTH `x-amzn-RequestId` and `x-amzn-errortype` (mirroring the body `__type`), exactly
+    /// like a real AWS Bedrock runtime error and like route.rs/auth.rs. Non-bedrock ingress must NOT
+    /// carry them.
+    #[test]
+    fn test_ingress_error_bedrock_amzn_headers() {
+        let resp = ingress_error(
+            "bedrock",
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "slow down",
+        );
+        assert!(
+            resp.headers().get("x-amzn-requestid").is_some(),
+            "bedrock error must carry x-amzn-RequestId"
+        );
+        let errtype = resp
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|h| h.to_str().ok());
+        assert_eq!(
+            errtype,
+            Some(crate::proto::error_kind_to_bedrock_type("rate_limit_error")),
+            "x-amzn-errortype mirrors the body __type"
+        );
+
+        // Non-bedrock ingress: no amzn headers.
+        let oai = ingress_error(
+            "openai",
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "x",
+        );
+        assert!(
+            oai.headers().get("x-amzn-requestid").is_none()
+                && oai.headers().get("x-amzn-errortype").is_none(),
+            "non-bedrock ingress error must NOT carry x-amzn-* headers"
+        );
+    }
 
     /// A forward-layer error returned to the CLIENT must carry the INGRESS protocol's native JSON
     /// error envelope (not `text/plain`), with the status code preserved. For an Anthropic ingress
