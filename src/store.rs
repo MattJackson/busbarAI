@@ -656,7 +656,17 @@ impl InMemoryStore {
             ST_CLOSED => now >= c.cooldown_until().load(Ordering::Acquire),
             ST_OPEN => now >= c.cooldown_until().load(Ordering::Acquire),
             ST_HALF_OPEN => false,
-            _ => unreachable!("Invalid breaker state"),
+            // The breaker state is an atomic `u64` only ever set to one of the three ST_* sentinels,
+            // so this is not reachable today. But this runs on the request-path selection filter:
+            // `unreachable!()` would panic the task (no-panic-on-request-path invariant). Fail SAFE
+            // by reporting "not ready" (deny admission) for any unexpected encoding instead.
+            other => {
+                tracing::error!(
+                    state = other,
+                    "unexpected breaker state; treating cell as not ready"
+                );
+                false
+            }
         }
     }
 
@@ -679,7 +689,16 @@ impl InMemoryStore {
                 }
             }
             ST_HALF_OPEN => false,
-            _ => unreachable!("Invalid breaker state"),
+            // Request-path probe acquisition: fail SAFE (admit nobody) on an unexpected state rather
+            // than `unreachable!()`-panicking the dispatching task. Not reachable under today's
+            // atomic-sentinel invariant; this only guards a future/corrupt encoding gracefully.
+            other => {
+                tracing::error!(
+                    state = other,
+                    "unexpected breaker state; refusing probe acquisition"
+                );
+                false
+            }
         }
     }
 
@@ -692,7 +711,12 @@ impl InMemoryStore {
                 until: c.cooldown_until().load(Ordering::Acquire),
             },
             ST_HALF_OPEN => BreakerState::HalfOpen,
-            _ => unreachable!("Invalid breaker state"),
+            // Not reachable under the atomic-sentinel invariant; report the benign Closed default
+            // rather than panic, keeping this read total and side-effect-free for any encoding.
+            other => {
+                tracing::error!(state = other, "unexpected breaker state; reporting Closed");
+                BreakerState::Closed
+            }
         }
     }
 
@@ -726,10 +750,15 @@ impl InMemoryStore {
             // armed; we don't re-escalate on every failed request during a cooldown). Enumerated
             // explicitly per the breaker-match hard rule — no `_ =>` catch-all.
             ST_OPEN => {}
-            _ => unreachable!(
-                "invalid breaker state {}",
-                c.breaker_state().load(Ordering::Acquire)
-            ),
+            // Request-path failure recording: an unexpected state encoding is treated as a no-op
+            // (like the already-Open case) rather than `unreachable!()`-panicking the task. Not
+            // reachable under the atomic-sentinel invariant; this is the graceful backstop.
+            other => {
+                tracing::error!(
+                    state = other,
+                    "unexpected breaker state in record_failure; no-op"
+                );
+            }
         }
     }
 

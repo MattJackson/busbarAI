@@ -383,6 +383,15 @@ pub(crate) struct StreamTranslate {
     /// accounting. This flag lets us emit the metadata exactly once: defer it when the stop chunk
     /// carries no usage, and suppress a duplicate if usage already rode with the stop.
     bedrock_metadata_emitted: bool,
+    /// ingress == "bedrock" → set when a combined stop-delta arrived with all-zero usage and the
+    /// `metadata` frame was therefore DEFERRED (awaiting a trailing usage-only delta). In the OpenAI
+    /// `include_usage` case that trailing delta arrives and emits the metadata; but in the DEFAULT
+    /// OpenAI streaming case (no `include_usage`) there is NO trailing usage delta, so the metadata
+    /// would never be emitted and the ConverseStream would end with messageStop but NO `metadata`
+    /// frame — a genuine Bedrock ConverseStream ALWAYS terminates with one. This flag lets `finish()`
+    /// flush a single best-effort (zero-usage) `metadata` frame at end-of-stream when the deferral was
+    /// never resolved, so the stream is never missing its terminal metadata frame.
+    bedrock_metadata_pending: bool,
 }
 
 /// The OpenAI stream-start identity replayed onto every `chat.completion.chunk` (see
@@ -416,6 +425,7 @@ impl StreamTranslate {
             started_at: None,
             openai_chunk_identity: None,
             bedrock_metadata_emitted: false,
+            bedrock_metadata_pending: false,
         })
     }
 
@@ -507,6 +517,14 @@ impl StreamTranslate {
                         };
                         self.emit_ir_event(&usage_only, out);
                         self.bedrock_metadata_emitted = true;
+                    } else {
+                        // Deferred: the stop carried no usage. The trailing usage-only delta (OpenAI
+                        // `include_usage`) will emit the metadata if it arrives — but in DEFAULT
+                        // OpenAI streaming (no `include_usage`) it never does, so mark the metadata
+                        // pending and let `finish()` flush a single zero-usage `metadata` frame at
+                        // end-of-stream. A native ConverseStream ALWAYS ends with a metadata frame;
+                        // its total absence is a proxy tell and loses token accounting.
+                        self.bedrock_metadata_pending = true;
                     }
                     continue;
                 }
@@ -522,6 +540,7 @@ impl StreamTranslate {
                         continue;
                     }
                     self.bedrock_metadata_emitted = true;
+                    self.bedrock_metadata_pending = false; // the deferral is now resolved
                     self.emit_ir_event(&ev, out);
                     continue;
                 }
@@ -717,11 +736,35 @@ impl StreamTranslate {
     /// Call once at end-of-stream. Returns the INGRESS terminator (OpenAI → `data: [DONE]\n\n`,
     /// Anthropic → empty: its `message_stop` event already carries termination).
     pub(crate) fn finish(&mut self) -> Vec<u8> {
-        if self.emit_done {
-            b"data: [DONE]\n\n".to_vec()
-        } else {
-            Vec::new()
+        let mut out: Vec<u8> = Vec::new();
+        // Bedrock-INGRESS: if a combined stop-delta deferred the `metadata` frame (zero usage,
+        // expecting a trailing usage-only delta) and that delta never arrived — the DEFAULT OpenAI
+        // streaming case (no `stream_options.include_usage`) — flush a single best-effort zero-usage
+        // `metadata` frame now. A genuine Bedrock ConverseStream ALWAYS ends with a `metadata` frame;
+        // emitting a zero-usage one is far closer to native than omitting it entirely (which loses
+        // the AWS SDK's `ConverseStreamMetadataEvent` callback and is a deterministic proxy tell).
+        if self.ingress_eventstream
+            && self.bedrock_metadata_pending
+            && !self.bedrock_metadata_emitted
+        {
+            self.bedrock_metadata_emitted = true;
+            self.bedrock_metadata_pending = false;
+            let usage_only = crate::ir::IrStreamEvent::MessageDelta {
+                stop_reason: None,
+                stop_sequence: None,
+                usage: crate::ir::IrUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            };
+            self.emit_ir_event(&usage_only, &mut out);
         }
+        if self.emit_done {
+            out.extend_from_slice(b"data: [DONE]\n\n");
+        }
+        out
     }
 }
 
@@ -894,7 +937,10 @@ impl GeminiJsonArrayFramer {
             return self.finish_with_error(
                 500,
                 "INTERNAL",
-                "busbar: upstream stream exceeded the reassembly buffer and was truncated",
+                // Client-facing wire body: must carry NO product/internal vocabulary (the
+                // protocol-indistinguishability promise). A real Gemini client only ever sees a
+                // generic upstream-error message here.
+                "upstream stream was truncated due to an internal error",
             );
         }
         self.finished = true;
@@ -3305,6 +3351,39 @@ mod stream_translate_tests {
         f
     }
 
+    /// HIGH/conformance regression (eventstream.rs:64): a Bedrock EGRESS that sends a mid-stream
+    /// MODELED-EXCEPTION frame (`:message-type: exception` + `:exception-type`, NO `:event-type`)
+    /// must surface as a translated ERROR event on the ingress stream, not be silently dropped. Before
+    /// the fix, `drain_frames` returned `("", payload)` for the exception frame, the folded `type:""`
+    /// fell into the reader's no-op arm, and the ingress client saw an abrupt EOF with no error.
+    #[test]
+    fn test_translate_bedrock_egress_exception_frame_surfaces_error_to_ingress() {
+        let mut st =
+            StreamTranslate::new("anthropic", "bedrock").expect("bedrock egress translator");
+        let mut bytes = es_frame("messageStart", br#"{"role":"assistant"}"#);
+        // A real AWS modeled-exception frame built by the production encoder: ThrottlingException
+        // carries `:message-type: exception` + `:exception-type: ThrottlingException` and no
+        // `:event-type`. `drain_frames` must normalize it to `throttlingException` so the reader's
+        // exception arm fires and emits an IR Error → the Anthropic ingress writes an error event.
+        bytes.extend(crate::eventstream::encode_exception_frame(
+            "ThrottlingException",
+            "rate exceeded mid-stream",
+        ));
+
+        let out = String::from_utf8(st.feed(&bytes)).unwrap();
+        // The mid-stream exception must reach the client as an Anthropic-native error event, NOT be
+        // dropped (which would leave the client on a hanging / EOF-without-terminator stream).
+        assert!(
+            out.contains("event: error") || out.contains("\"type\":\"error\""),
+            "bedrock-egress mid-stream exception must translate to an ingress error event; got:\n{out}"
+        );
+        // The human message rides through.
+        assert!(
+            out.contains("rate exceeded mid-stream"),
+            "the exception message must reach the ingress error body; got:\n{out}"
+        );
+    }
+
     /// a Bedrock ConverseStream (binary event-stream egress) translates to Anthropic SSE for
     /// the caller — proving the eventstream decoder → IR → ingress-writer path end to end.
     #[test]
@@ -3929,6 +4008,65 @@ mod stream_translate_tests {
         // And exactly one messageStop frame (the stop discriminant).
         let stops = frames.iter().filter(|(et, _)| et == "messageStop").count();
         assert_eq!(stops, 1, "exactly one messageStop frame");
+    }
+
+    // MEDIUM/conformance (proto/mod.rs fan-out): DEFAULT OpenAI streaming — NO
+    // `stream_options.include_usage` — the finish chunk carries no usage AND there is NO trailing
+    // usage-only chunk. The pre-fix fan-out DEFERRED the `metadata` frame to a trailing delta that
+    // never arrived, so the ConverseStream ended with messageStop but NO `metadata` frame at all (a
+    // deterministic proxy tell + lost token accounting). `finish()` must now flush exactly one
+    // (zero-usage) `metadata` frame so the stream is never missing its terminal metadata.
+    #[test]
+    fn test_translate_openai_no_include_usage_egress_to_bedrock_ingress_emits_metadata() {
+        let mut t = StreamTranslate::new("bedrock", "openai").expect("bedrock ingress translator");
+        let mut raw: Vec<u8> = Vec::new();
+        for frame in [
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            // Default streaming: terminal finish chunk carries NO usage, and NO trailing usage chunk.
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            raw.extend_from_slice(&t.feed(frame.as_bytes()));
+        }
+        // finish() must flush the deferred metadata frame.
+        raw.extend_from_slice(&t.finish());
+
+        let mut buf = raw.clone();
+        let frames = crate::eventstream::drain_frames(&mut buf);
+        assert!(buf.is_empty(), "all frames must decode cleanly");
+
+        // EXACTLY ONE metadata frame — present (the fix), never the pre-fix total absence.
+        let metadata: Vec<&(String, Vec<u8>)> =
+            frames.iter().filter(|(et, _)| et == "metadata").collect();
+        assert_eq!(
+            metadata.len(),
+            1,
+            "default OpenAI stream (no include_usage) must STILL terminate with exactly one \
+             metadata frame; got {} frames: {:?}",
+            metadata.len(),
+            frames.iter().map(|(et, _)| et.as_str()).collect::<Vec<_>>()
+        );
+        // It carries zero tokens (no usage was reported) — far closer to native than no frame.
+        let md: serde_json::Value =
+            serde_json::from_slice(&metadata[0].1).expect("metadata payload is JSON");
+        assert_eq!(md["usage"]["inputTokens"], 0);
+        assert_eq!(md["usage"]["outputTokens"], 0);
+
+        // messageStop must precede the flushed metadata (native order).
+        let types: Vec<&str> = frames.iter().map(|(et, _)| et.as_str()).collect();
+        let stop_pos = types.iter().position(|t| *t == "messageStop");
+        let meta_pos = types.iter().position(|t| *t == "metadata");
+        assert!(
+            stop_pos.is_some() && meta_pos.is_some() && stop_pos < meta_pos,
+            "messageStop must precede metadata (native order); got {types:?}"
+        );
+        // Exactly one messageStop.
+        assert_eq!(
+            frames.iter().filter(|(et, _)| et == "messageStop").count(),
+            1,
+            "exactly one messageStop frame"
+        );
     }
 
     // A frame split across two feeds yields no output until complete, then translates.

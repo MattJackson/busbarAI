@@ -586,8 +586,22 @@ fn proto_for_path(path: &str) -> &'static str {
         "openai"
     } else if path == "/v2/chat" {
         "cohere"
-    } else if path.starts_with("/v1/models/") || path.starts_with("/v1beta/models/") {
+    } else if path.starts_with("/v1beta/models/") {
+        // `/v1beta/models/...` is a Gemini-only surface (OpenAI has no v1beta), so always Gemini.
         "gemini"
+    } else if path.starts_with("/v1/models/") {
+        // `/v1/models/...` is ambiguous: Gemini packs a `:<action>` into the LAST path segment
+        // (`/v1/models/gemini-pro:generateContent`), whereas the OpenAI SDK's `model.retrieve`
+        // issues `GET /v1/models/{model_id}` with NO colon action. Shape the error in the protocol
+        // the client is actually speaking: a colon in the final segment → Gemini; otherwise OpenAI
+        // (so an OpenAI SDK probing model availability gets an OpenAI-decodable error envelope, not
+        // an undecodable Gemini one — the indistinguishability fix).
+        let last_segment = path.rsplit('/').next().unwrap_or("");
+        if last_segment.contains(':') {
+            "gemini"
+        } else {
+            "openai"
+        }
     } else if path.starts_with("/model/") {
         "bedrock"
     } else if path.ends_with("/v1/messages") {
@@ -825,6 +839,18 @@ mod tests {
             proto_for_path("/v1beta/models/gemini-pro:streamGenerateContent"),
             "gemini"
         );
+        // REGRESSION (MEDIUM/conformance, main.rs:589): an OpenAI-SDK `model.retrieve` hits
+        // `GET /v1/models/{model_id}` — NO `:<action>` colon. That must infer OpenAI (so the 405/404
+        // error is OpenAI-decodable), not Gemini, even though it shares the `/v1/models/` prefix.
+        assert_eq!(proto_for_path("/v1/models/gpt-4o"), "openai");
+        assert_eq!(proto_for_path("/v1/models"), "openai"); // list-models (no trailing id)
+                                                            // A `/v1/models/` path WITH a colon action is still the Gemini surface.
+        assert_eq!(
+            proto_for_path("/v1/models/gemini-1.5-pro:generateContent"),
+            "gemini"
+        );
+        // `/v1beta/models/...` is Gemini-only even without a colon (OpenAI has no v1beta surface).
+        assert_eq!(proto_for_path("/v1beta/models/gemini-pro"), "gemini");
         assert_eq!(
             proto_for_path("/model/anthropic.claude/converse"),
             "bedrock"

@@ -477,7 +477,20 @@ pub(crate) fn budget_window(period: &str, now: u64) -> u64 {
             let (y, m, _) = civil_from_days(days);
             (days_from_civil(y, m, 1) as u64) * 86_400
         }
-        _ => 0, // "total" (and any unknown period) = one all-time window
+        "total" => 0, // explicit all-time window (the documented sentinel)
+        // An unrecognized period (typo such as `monthlly`, or an unsupported value such as
+        // `weekly`) is NOT silently accepted as `total`: it almost always means a misconfigured
+        // key. We fail safe to the all-time window (0) — the tightest enforcement, never wider —
+        // but emit a diagnostic so the misconfiguration is visible instead of silent. (Rejecting
+        // the value at key-creation time is the admin handler's job; this is the evaluation-path
+        // backstop.) Misconfiguration is rare, so the per-evaluation warn is acceptable.
+        other => {
+            tracing::warn!(
+                budget_period = other,
+                "unrecognized budget_period; enforcing as all-time ('total') window"
+            );
+            0
+        }
     }
 }
 

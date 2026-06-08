@@ -3,10 +3,18 @@
 
 //! AWS event-stream (`application/vnd.amazon.eventstream`) frame codec.
 //!
-//! [`drain_frames`] is the DECODER — just enough to pull `(:event-type, payload)` pairs out of
+//! [`drain_frames`] is the DECODER — just enough to pull `(event_type, payload)` pairs out of
 //! Bedrock ConverseStream responses so they can feed the Bedrock reader's existing
 //! `read_response_events`. Incremental: leaves a trailing partial frame in the buffer. CRCs are not
 //! validated on decode (we are a client decoder consuming well-formed AWS frames).
+//!
+//! The returned `event_type` is normally the frame's `:event-type` header. AWS, however, signals a
+//! mid-stream MODELED EXCEPTION with a frame that carries `:message-type: exception` plus an
+//! `:exception-type: <ExceptionName>` header and NO `:event-type` (e.g. a `ThrottlingException` or
+//! `InternalServerException` mid ConverseStream). For those frames [`drain_frames`] returns the
+//! exception name normalized to the Smithy union-member form (leading letter lowercased, e.g.
+//! `internalServerException`) so it matches the `read_response_events` exception arms and is surfaced
+//! as an error event rather than being silently dropped as a typeless no-op frame.
 //!
 //! [`encode_frame`] is the production ENCODER (the exact inverse of [`drain_frames`]) used for
 //! Bedrock *ingress* streaming: a native AWS SDK Bedrock client consumes the binary framing, so the
@@ -61,7 +69,7 @@ pub(crate) fn drain_frames(buf: &mut Vec<u8>) -> Vec<(String, Vec<u8>)> {
         // a single `drain` — rather than `drain(..total_len).collect()` into a throwaway per-frame
         // Vec (which was a SECOND heap allocation per frame on the hot streaming-decode path).
         let headers = &buf[12..12 + headers_len];
-        let event_type = parse_event_type(headers).unwrap_or_default();
+        let event_type = event_type_for_frame(headers);
         let payload = buf[12 + headers_len..total_len - 4].to_vec();
         out.push((event_type, payload));
         buf.drain(..total_len);
@@ -69,18 +77,67 @@ pub(crate) fn drain_frames(buf: &mut Vec<u8>) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// Find the `:event-type` string header value. Handles the u16-length-prefixed string/bytes value
-/// types (string = 7, bytes = 6) by reading their value, and the AWS-spec fixed-width types
-/// (bool/byte/short/int/long/timestamp/uuid) by SKIPPING the correct number of bytes so a non-string
-/// header appearing before `:event-type` no longer aborts the scan. Returns `None` only when the
-/// header block is truncated or carries a value-type byte with no defined width (a genuinely
-/// malformed frame), so a future AWS framing header (e.g. a timestamp correlation header) does not
-/// silently drop the event type.
-fn parse_event_type(mut h: &[u8]) -> Option<String> {
+/// The framing headers `drain_frames` cares about: the normal `:event-type`, plus the
+/// `:message-type` discriminator and `:exception-type` name that an AWS mid-stream modeled-exception
+/// frame carries INSTEAD of an `:event-type`. All three are optional string headers.
+#[derive(Default)]
+struct FrameHeaders {
+    event_type: Option<String>,
+    message_type: Option<String>,
+    exception_type: Option<String>,
+}
+
+/// Resolve the event-type token `drain_frames` returns for one frame.
+///
+/// For a normal `event`-typed frame this is the `:event-type` header verbatim. For an AWS modeled
+/// EXCEPTION frame (`:message-type: exception`, which carries `:exception-type: <ExceptionName>` and
+/// NO `:event-type`), it is the exception name normalized to the Smithy union-member form (leading
+/// letter lowercased) — `InternalServerException` → `internalServerException` — so it matches the
+/// `read_response_events` exception arms instead of being dropped as a typeless no-op frame. Falls
+/// back to the empty string when neither header is present (a genuinely typeless / malformed frame),
+/// preserving the previous `unwrap_or_default()` behavior for that case.
+fn event_type_for_frame(headers: &[u8]) -> String {
+    let parsed = parse_frame_headers(headers);
+    // An exception frame is identified by `:message-type: exception`. Prefer its `:exception-type`
+    // (AWS does not set `:event-type` on these), normalized to the union-member token the reader
+    // matches. This is what was previously lost: such a frame yielded `""` and was silently dropped.
+    if parsed.message_type.as_deref() == Some("exception") {
+        if let Some(exc) = parsed.exception_type {
+            return lowercase_first(&exc);
+        }
+    }
+    parsed.event_type.unwrap_or_default()
+}
+
+/// Lowercase only the FIRST character of an exception name (`InternalServerException` →
+/// `internalServerException`), mapping the AWS PascalCase `:exception-type` header to the Smithy
+/// union-member token the `read_response_events` exception arms key off. ASCII-only by construction
+/// (Converse exception names are ASCII identifiers); leaves the remainder untouched.
+fn lowercase_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_lowercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Scan the header block for the `:event-type`, `:message-type` and `:exception-type` string headers.
+/// Handles the u16-length-prefixed string/bytes value types (string = 7, bytes = 6) by reading their
+/// value, and the AWS-spec fixed-width types (bool/byte/short/int/long/timestamp/uuid) by SKIPPING
+/// the correct number of bytes so a non-string header appearing before the ones we want no longer
+/// aborts the scan. Stops early (returning whatever was found) only when the header block is
+/// truncated or carries a value-type byte with no defined width (a genuinely malformed frame), so a
+/// future AWS framing header (e.g. a timestamp correlation header) does not silently drop the
+/// recognized headers that preceded it.
+fn parse_frame_headers(mut h: &[u8]) -> FrameHeaders {
+    let mut found = FrameHeaders::default();
     while !h.is_empty() {
-        let name_len = *h.first()? as usize;
+        let Some(&name_len_byte) = h.first() else {
+            break;
+        };
+        let name_len = name_len_byte as usize;
         if h.len() < 1 + name_len + 1 {
-            return None;
+            break;
         }
         let name = &h[1..1 + name_len];
         let value_type = h[1 + name_len];
@@ -100,12 +157,12 @@ fn parse_event_type(mut h: &[u8]) -> Option<String> {
         let value: Option<&[u8]> = match value_type {
             6 | 7 => {
                 if h.len() < p + 2 {
-                    return None;
+                    break;
                 }
                 let vlen = u16::from_be_bytes([h[p], h[p + 1]]) as usize;
                 p += 2;
                 if h.len() < p + vlen {
-                    return None;
+                    break;
                 }
                 let v = &h[p..p + vlen];
                 p += vlen;
@@ -114,23 +171,28 @@ fn parse_event_type(mut h: &[u8]) -> Option<String> {
             _ => match fixed_width {
                 Some(w) => {
                     if h.len() < p + w {
-                        return None;
+                        break;
                     }
                     p += w;
                     None
                 }
                 // Unknown value-type byte with no defined width: the frame is malformed, bail.
-                None => return None,
+                None => break,
             },
         };
-        if name == b":event-type" {
-            // `:event-type` is always a string (type 7) in AWS framing; if it appeared with a
-            // fixed-width type there is no string value to return.
-            return value.and_then(|v| std::str::from_utf8(v).ok().map(String::from));
+        // These framing headers are always type-7 strings in AWS framing; capture each value when it
+        // is one. A fixed-width-typed value carries no string to record.
+        if let Some(v) = value.and_then(|v| std::str::from_utf8(v).ok()) {
+            match name {
+                b":event-type" => found.event_type = Some(v.to_string()),
+                b":message-type" => found.message_type = Some(v.to_string()),
+                b":exception-type" => found.exception_type = Some(v.to_string()),
+                _ => {}
+            }
         }
         h = &h[p..];
     }
-    None
+    found
 }
 
 /// Append one `[name_len:u8][name][value_type:u8 = 7 string][value_len:u16 BE][value]` string
@@ -386,23 +448,35 @@ mod tests {
         assert_ne!(message_crc, 0, "message CRC is not the zero placeholder");
     }
 
-    /// `parse_event_type` must return `None` (rather than panic or misread) when it meets a header
-    /// whose value-type byte is genuinely unknown / has no defined width.
+    /// Build a header block with one type-7 string header `[name][value]`.
+    fn string_header(name: &str, value: &str) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(name.len() as u8);
+        h.extend_from_slice(name.as_bytes());
+        h.push(7u8); // string
+        h.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        h.extend_from_slice(value.as_bytes());
+        h
+    }
+
+    /// `event_type_for_frame` returns `""` (rather than panic or misread) when it meets a header
+    /// whose value-type byte is genuinely unknown / has no defined width before any recognized
+    /// header.
     #[test]
-    fn test_parse_event_type_unknown_value_type_returns_none() {
-        // One header named "x" with value_type = 200 (not a real AWS type) → malformed → None.
+    fn test_event_type_unknown_value_type_yields_empty() {
+        // One header named "x" with value_type = 200 (not a real AWS type) → malformed → no headers.
         let mut h = Vec::new();
         h.push(1u8); // name_len
         h.extend_from_slice(b"x"); // name
         h.push(200u8); // value_type: unknown
-        assert_eq!(parse_event_type(&h), None);
+        assert_eq!(event_type_for_frame(&h), "");
     }
 
     /// A fixed-width header (e.g. a `timestamp`, type 8) appearing BEFORE `:event-type` must be
     /// skipped by advancing the correct number of bytes, not abort the scan — so the event type is
     /// still recovered.
     #[test]
-    fn test_parse_event_type_skips_fixed_width_header() {
+    fn test_event_type_skips_fixed_width_header() {
         let mut h = Vec::new();
         // Header 1: ":ts" timestamp (type 8, 8-byte value) — must be skipped.
         h.push(3u8);
@@ -410,25 +484,65 @@ mod tests {
         h.push(8u8); // timestamp
         h.extend_from_slice(&0u64.to_be_bytes()); // 8 bytes
                                                   // Header 2: ":event-type" string = "messageStart".
-        h.push(11u8);
-        h.extend_from_slice(b":event-type");
-        h.push(7u8); // string
-        let v = b"messageStart";
-        h.extend_from_slice(&(v.len() as u16).to_be_bytes());
-        h.extend_from_slice(v);
-        assert_eq!(parse_event_type(&h), Some("messageStart".to_string()));
+        h.extend_from_slice(&string_header(":event-type", "messageStart"));
+        assert_eq!(event_type_for_frame(&h), "messageStart");
     }
 
-    /// A zero-length `:event-type` string value yields `Some("")`, not `None` — a present-but-empty
-    /// event type is distinct from an absent header.
+    /// A zero-length `:event-type` string value yields `""` — a present-but-empty event type is
+    /// indistinguishable from absent at the `drain_frames` boundary, which is fine (the reader
+    /// treats both as a no-op frame).
     #[test]
-    fn test_parse_event_type_empty_value() {
-        let mut h = Vec::new();
-        h.push(11u8);
-        h.extend_from_slice(b":event-type");
-        h.push(7u8); // string
-        h.extend_from_slice(&0u16.to_be_bytes()); // zero-length value
-        assert_eq!(parse_event_type(&h), Some(String::new()));
+    fn test_event_type_empty_value() {
+        let h = string_header(":event-type", "");
+        assert_eq!(event_type_for_frame(&h), "");
+    }
+
+    /// REGRESSION (HIGH/conformance, eventstream.rs:64): an AWS modeled-exception frame carries
+    /// `:message-type: exception` + `:exception-type: <Name>` and NO `:event-type`. `drain_frames`
+    /// must surface the exception name (normalized to the Smithy union-member token the reader
+    /// matches) rather than the old empty string that fell into the no-op arm and silently dropped
+    /// the mid-stream error.
+    #[test]
+    fn test_event_type_exception_frame_returns_normalized_exception_name() {
+        // Header order deliberately puts :exception-type before :message-type to prove the parser
+        // does not depend on ordering.
+        let mut h = string_header(":exception-type", "InternalServerException");
+        h.extend_from_slice(&string_header(":content-type", "application/json"));
+        h.extend_from_slice(&string_header(":message-type", "exception"));
+        assert_eq!(event_type_for_frame(&h), "internalServerException");
+
+        // A ThrottlingException maps the same way.
+        let mut h2 = string_header(":message-type", "exception");
+        h2.extend_from_slice(&string_header(":exception-type", "ThrottlingException"));
+        assert_eq!(event_type_for_frame(&h2), "throttlingException");
+    }
+
+    /// A frame with `:message-type: event` (the normal case) must still report its `:event-type`,
+    /// never an exception name, even if a stray `:exception-type` somehow rode along.
+    #[test]
+    fn test_event_type_event_message_type_prefers_event_type() {
+        let mut h = string_header(":message-type", "event");
+        h.extend_from_slice(&string_header(":event-type", "contentBlockDelta"));
+        assert_eq!(event_type_for_frame(&h), "contentBlockDelta");
+    }
+
+    /// End-to-end through `drain_frames`: a real binary exception frame (built by the production
+    /// `encode_exception_frame`) decodes to the normalized exception event-type, so the egress
+    /// decode path (`StreamTranslate::feed`) folds a matchable `type` into the JSON and the reader
+    /// surfaces an error instead of dropping a typeless frame.
+    #[test]
+    fn test_drain_frames_surfaces_exception_event_type() {
+        let mut buf =
+            encode_exception_frame("ServiceUnavailableException", "upstream temporarily down");
+        let frames = drain_frames(&mut buf);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].0, "serviceUnavailableException",
+            "exception frame decodes to the normalized union-member token"
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&frames[0].1).unwrap();
+        assert_eq!(payload["message"], "upstream temporarily down");
+        assert!(buf.is_empty());
     }
 
     /// A modeled-exception frame is a valid event-stream message: real CRC32s, and a header block

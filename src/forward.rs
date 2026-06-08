@@ -115,40 +115,61 @@ fn wants_gemini_json_array(v: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Upper bound on a buffered UPSTREAM response body (error 4xx/5xx bodies and buffered cross-protocol
-/// non-stream JSON). Any error envelope or single non-stream completion is far smaller than this; the
-/// cap stops a hostile or misconfigured upstream from forcing an unbounded heap allocation per
-/// in-flight non-2xx/non-stream response (the inbound request body is already capped separately).
+/// Upper bound on a buffered UPSTREAM ERROR body (4xx/5xx envelopes). Any error envelope is far
+/// smaller than this; the cap stops a hostile or misconfigured upstream from forcing an unbounded
+/// heap allocation per in-flight non-2xx response (the inbound request body is already capped
+/// separately). This is the TIGHT cap — it is deliberately NOT reused for buffering a legitimate
+/// cross-protocol 2xx completion (see [`MAX_TRANSLATED_BODY_BYTES`]).
 const MAX_UPSTREAM_BUFFERED_BYTES: usize = 256 * 1024;
 
-/// Read an upstream response body, buffering at most [`MAX_UPSTREAM_BUFFERED_BYTES`] and discarding
-/// the rest. Streams chunks with a running byte counter rather than `r.bytes()` (which would buffer
-/// the entire — possibly multi-gigabyte — body before any cap could apply). A truncated body still
-/// classifies/relays correctly: error envelopes and completions are well under the cap, and a body
-/// that overruns it can only be malformed/hostile.
-async fn read_capped_body(r: reqwest::Response) -> Bytes {
+/// Upper bound on a buffered cross-protocol non-stream SUCCESS (2xx) body that must be parsed and
+/// translated egress→IR→ingress. A real completion (large `max_tokens` output, big tool-call
+/// arguments, embedded content) can far exceed the tight error-body cap; truncating it would make
+/// `serde_json` parsing fail and the request would be reported to the client as a spurious 500 for
+/// what was actually an upstream success (the caller may even have been token-charged). This cap is
+/// aligned with the inbound request-body limit (32 MiB) so any completion the gateway would accept
+/// inbound can also be buffered for translation, while still bounding the per-response allocation.
+const MAX_TRANSLATED_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Read an upstream response body, buffering at most `cap` bytes. Streams chunks with a running byte
+/// counter rather than `r.bytes()` (which would buffer the entire — possibly multi-gigabyte — body
+/// before any cap could apply). Returns the buffered prefix and whether the body was TRUNCATED (more
+/// bytes remained at the cap), so a caller that must parse the whole body (cross-protocol 2xx
+/// translation) can distinguish "too large to translate" from "genuinely unparseable" instead of
+/// silently mis-reporting a truncated success as an untranslatable error.
+async fn read_capped(r: reqwest::Response, cap: usize) -> (Bytes, bool) {
     let mut buf: Vec<u8> = Vec::new();
     let mut r = r;
+    let mut truncated = false;
     loop {
         match r.chunk().await {
             Ok(Some(chunk)) => {
-                let remaining = MAX_UPSTREAM_BUFFERED_BYTES.saturating_sub(buf.len());
+                let remaining = cap.saturating_sub(buf.len());
                 if remaining == 0 {
-                    // Cap reached — stop reading; the connection is dropped when `r` falls out of
-                    // scope. We keep exactly the capped prefix.
+                    // Cap already full but more bytes arrived — the body overran the cap. Stop
+                    // reading; the connection is dropped when `r` falls out of scope.
+                    truncated = true;
                     break;
                 }
                 let take = remaining.min(chunk.len());
                 buf.extend_from_slice(&chunk[..take]);
                 if take < chunk.len() {
-                    break; // this chunk filled the cap
+                    truncated = true; // this chunk filled the cap with bytes left over
+                    break;
                 }
             }
             Ok(None) => break, // end of body
             Err(_) => break, // transport error mid-body — keep what we have (was unwrap_or_default)
         }
     }
-    Bytes::from(buf)
+    (Bytes::from(buf), truncated)
+}
+
+/// Read an upstream ERROR / verbatim-relay body under the tight [`MAX_UPSTREAM_BUFFERED_BYTES`] cap.
+/// A truncated error body still classifies/relays correctly (error envelopes are well under the cap,
+/// and a body that overruns it can only be malformed/hostile), so the truncation flag is discarded.
+async fn read_capped_body(r: reqwest::Response) -> Bytes {
+    read_capped(r, MAX_UPSTREAM_BUFFERED_BYTES).await.0
 }
 
 /// Map the classified `StatusClass` of a CLIENT-fault upstream 4xx to a protocol-agnostic error
@@ -1394,15 +1415,21 @@ pub(crate) async fn forward_with_pool(
                                     StatusClass::Timeout => "timeout",
                                     StatusClass::Network => "network",
                                     StatusClass::Overloaded => "overloaded",
-                                    // Exhaustive: these variants cannot reach HardDown or ClientFault arms
-                                    StatusClass::Auth => unreachable!(),
-                                    StatusClass::Billing => unreachable!(),
-                                    StatusClass::ClientError => unreachable!(),
-                                    StatusClass::ContextLength => unreachable!(),
                                     StatusClass::RateLimit => {
                                         // Should have been handled above but Rust needs exhaustive match
                                         "rate_limit"
                                     }
+                                    // No-panic-on-request-path invariant: `breaker::classify` does not
+                                    // currently map Auth/Billing/ClientError/ContextLength to
+                                    // TransientUpstream, but encoding that as `unreachable!()` would
+                                    // panic a Tokio worker (dropping every in-flight request on it) the
+                                    // first time a future classifier change made one of them reachable.
+                                    // Record a generic transient label instead — correct under today's
+                                    // mapping and graceful if it ever changes.
+                                    StatusClass::Auth
+                                    | StatusClass::Billing
+                                    | StatusClass::ClientError
+                                    | StatusClass::ContextLength => "transient",
                                 };
                                 app.store.record_transient_in(
                                     pool_name,
@@ -1438,14 +1465,20 @@ pub(crate) async fn forward_with_pool(
                                 StatusClass::Auth => {
                                     format!("auth rejected (HTTP {})", status.as_u16())
                                 }
-                                // Exhaustive: these variants cannot reach HardDown arm
-                                StatusClass::RateLimit => unreachable!(),
-                                StatusClass::Overloaded => unreachable!(),
-                                StatusClass::ServerError => unreachable!(),
-                                StatusClass::Timeout => unreachable!(),
-                                StatusClass::Network => unreachable!(),
-                                StatusClass::ClientError => unreachable!(),
-                                StatusClass::ContextLength => unreachable!(),
+                                // No-panic-on-request-path invariant: `breaker::classify` only maps
+                                // Auth/Billing to HardDown today, but `unreachable!()` here would panic
+                                // the worker the first time a classifier change routed another class to
+                                // HardDown. Fall back to a generic reason (carrying the HTTP status for
+                                // diagnostics) instead — graceful and robust to future mapping changes.
+                                StatusClass::RateLimit
+                                | StatusClass::Overloaded
+                                | StatusClass::ServerError
+                                | StatusClass::Timeout
+                                | StatusClass::Network
+                                | StatusClass::ClientError
+                                | StatusClass::ContextLength => {
+                                    format!("upstream rejected request (HTTP {})", status.as_u16())
+                                }
                             };
                             // A hard-down (auth rejection / billing exhaustion) is a property of the
                             // SHARED upstream, not of one routing pool: trip the lane in EVERY cell
@@ -1576,12 +1609,29 @@ pub(crate) async fn forward_with_pool(
                 // translate egress.read_response → IR → ingress.write_response. (Streaming
                 // cross-protocol is handled in FirstByteBody below; same-protocol passes through.)
                 if ingress_protocol != app.lanes[i].protocol.name() && !is_sse {
-                    // Size-capped buffer: a non-stream completion body is far under the cap; this
-                    // bounds a hostile/misconfigured upstream's allocation on the buffered path.
-                    let bytes = read_capped_body(r).await;
+                    // Size-capped buffer under the COMPLETION cap (not the tight error-body cap): a
+                    // legitimate 2xx completion can far exceed 256 KiB and must be buffered WHOLE to
+                    // parse+translate. `truncated` distinguishes "too large to translate" from
+                    // "genuinely unparseable" so a too-large success is not mis-reported as a 500.
+                    let (bytes, truncated) = read_capped(r, MAX_TRANSLATED_BODY_BYTES).await;
                     drop(permit); // upstream call complete; a non-streamed response holds no permit
                                   // Token accounting: no FirstByteBody on this buffered path, so tap here.
                     record_nonstream_usage(&bytes, &usage_sink);
+                    if truncated {
+                        tracing::warn!(
+                            ingress = %ingress_protocol,
+                            egress = %app.lanes[i].protocol.name(),
+                            cap = MAX_TRANSLATED_BODY_BYTES,
+                            "cross-protocol non-stream success body exceeded the translation cap; \
+                             cannot translate, returning ingress-native error"
+                        );
+                        return ingress_error(
+                            ingress_protocol,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "api_error",
+                            "upstream response was too large to translate",
+                        );
+                    }
                     if let Ok(rv) = serde_json::from_slice::<Value>(&bytes) {
                         if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&rv) {
                             if let Some(ingress_proto) =
@@ -2023,11 +2073,29 @@ async fn forward_once(
             // the main forward_with_pool path so this degraded route does not leak the egress wire
             // format to a different-protocol client.
             if cross_protocol && !is_sse {
-                let bytes = read_capped_body(r).await;
+                // COMPLETION cap (not the tight error-body cap): a legitimate 2xx can far exceed
+                // 256 KiB and must be buffered whole to translate; `truncated` lets us return a
+                // clear error instead of mis-reporting a too-large success as untranslatable.
+                let (bytes, truncated) = read_capped(r, MAX_TRANSLATED_BODY_BYTES).await;
                 drop(permit); // a buffered (non-streamed) response holds no permit
                               // Token accounting: no FirstByteBody on this buffered path, so tap the
                               // usage here and charge it to the key's budget (mirrors the main path).
                 record_nonstream_usage(&bytes, &usage_sink);
+                if truncated {
+                    tracing::warn!(
+                        ingress = %ingress_protocol,
+                        egress = %egress_name,
+                        cap = MAX_TRANSLATED_BODY_BYTES,
+                        "cross-protocol non-stream success body exceeded the translation cap; \
+                         cannot translate, returning ingress-native error"
+                    );
+                    return Ok(ingress_error(
+                        ingress_protocol,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "api_error",
+                        "upstream response was too large to translate",
+                    ));
+                }
                 if let Ok(rv) = serde_json::from_slice::<Value>(&bytes) {
                     if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&rv) {
                         if let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) {
