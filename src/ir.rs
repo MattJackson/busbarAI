@@ -198,6 +198,13 @@ pub(crate) struct StreamDecodeState {
     pub reasoning_seen: bool,
     /// Whether the reasoning Thinking block (index 0) is currently open.
     pub thinking_block_open: bool,
+    /// Stop reason buffered across two Bedrock stream frames. Native Bedrock ConverseStream splits
+    /// the stop reason (`messageStop` frame) from the token usage (a following `metadata` frame). To
+    /// emit ONE combined `MessageDelta{stop_reason, usage}` (so a cross-protocol ingress sees the
+    /// single `message_delta`/usage event a native non-Bedrock stream carries, not two) the Bedrock
+    /// reader stashes the `messageStop` stop_reason here and pairs it with the usage when `metadata`
+    /// arrives. Used by the Bedrock reader only; other protocols leave it `None`.
+    pub pending_stop_reason: Option<String>,
 }
 
 #[cfg(test)]
@@ -230,6 +237,7 @@ mod tests {
         assert!(st.open_tools.is_empty());
         assert!(!st.reasoning_seen);
         assert!(!st.thinking_block_open);
+        assert!(st.pending_stop_reason.is_none());
     }
 
     #[test]

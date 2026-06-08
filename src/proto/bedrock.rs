@@ -553,44 +553,36 @@ impl ProtocolReader for BedrockReader {
             }
 
             Some("messageStop") => {
-                let stop_reason_val = data
+                // Bedrock splits the stop reason (`messageStop` frame) from the token usage (a
+                // following `metadata` frame). To emit ONE combined `MessageDelta{stop_reason, usage}`
+                // — so a cross-protocol ingress (e.g. Anthropic) sees the SINGLE `message_delta` a
+                // native non-Bedrock stream carries, instead of two (the previous behavior was a
+                // detectable tell) — we BUFFER the stop_reason here and pair it with the usage when
+                // `metadata` arrives (see below). The combined delta is emitted from the `metadata`
+                // branch.
+                //
+                // The terminating MessageStop is still emitted here, on the wire-guaranteed terminal
+                // event, so a malformed/truncated upstream that ends after `messageStop` without a
+                // trailing `metadata` frame still terminates the downstream stream (the reader has no
+                // end-of-stream hook). In that truncated case the buffered stop_reason is simply
+                // dropped — exactly as usage was already dropped on a metadata-less stream — but the
+                // client still receives its terminal frame.
+                state.pending_stop_reason = data
                     .get("stopReason")
                     .and_then(|s| s.as_str())
                     .map(stop_reason_map);
-
-                // Bedrock splits stop reason (`messageStop`) from usage (a following `metadata`
-                // event). Emit the stop_reason here with zero usage, then emit the terminating
-                // MessageStop immediately so the downstream stream always receives its terminal
-                // frame. Previously the terminal MessageStop was emitted only from the `metadata`
-                // branch; a malformed/truncated upstream (or a provider variant) that ends after
-                // `messageStop` without a trailing `metadata` event left the client stream hanging
-                // with no terminal frame. The reader has no end-of-stream hook, so `messageStop`
-                // (the wire-guaranteed terminal event) is the correct place to terminate.
-                //
-                // Usage from a subsequent `metadata` event is still forwarded as a trailing
-                // MessageDelta (see below). `metadata` no longer emits its own MessageStop, so
-                // exactly one terminal frame is produced regardless of whether `metadata` arrives.
-                if let Some(reason) = stop_reason_val {
-                    out.push(IrStreamEvent::MessageDelta {
-                        stop_reason: Some(reason),
-                        // Bedrock has no stop_sequence analog in its stream.
-                        stop_sequence: None,
-                        usage: crate::ir::IrUsage {
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            cache_creation_input_tokens: None,
-                            cache_read_input_tokens: None,
-                        },
-                    });
-                }
                 out.push(IrStreamEvent::MessageStop);
             }
 
             Some("metadata") => {
                 // Usage trails the terminal MessageStop (Bedrock sends `metadata` after
-                // `messageStop`). Emit it as a usage-only MessageDelta; the terminal frame was
-                // already produced by the `messageStop` branch, so we do NOT emit a second
-                // MessageStop here (that would duplicate the terminator).
+                // `messageStop`). Pair it with the stop_reason buffered from the preceding
+                // `messageStop` frame into ONE combined MessageDelta, so a cross-protocol ingress
+                // emits a single `message_delta`/usage event (native fidelity) rather than two. The
+                // terminal frame was already produced by the `messageStop` branch, so we do NOT emit
+                // a second MessageStop here. A bedrock->bedrock round-trip re-splits this combined
+                // delta back into the native `messageStop` + `metadata` frame pair in the writer
+                // (`BedrockWriter::write_response_event` fan-out, driven by `StreamTranslate`).
                 if let Some(usage_obj) = data.get("usage").and_then(|u| u.as_object()) {
                     let usage = crate::ir::IrUsage {
                         input_tokens: usage_obj
@@ -606,7 +598,7 @@ impl ProtocolReader for BedrockReader {
                     };
 
                     out.push(IrStreamEvent::MessageDelta {
-                        stop_reason: None,
+                        stop_reason: state.pending_stop_reason.take(),
                         stop_sequence: None,
                         usage,
                     });
@@ -1133,15 +1125,22 @@ impl ProtocolWriter for BedrockWriter {
                 serde_json::json!({ "contentBlockIndex": index }),
             )),
 
-            // The IR splits a stop event from a usage event (mirroring the native Bedrock wire,
-            // which carries `stopReason` in `messageStop` and token `usage` in a separate `metadata`
-            // frame that FOLLOWS `messageStop`). Map each IR MessageDelta to the matching native
-            // frame so a native AWS SDK Bedrock client sees the real two-frame sequence:
-            //   - stop_reason = Some(...)  → `messageStop` (the stop discriminant)
-            //   - stop_reason = None       → `metadata` carrying the real token usage
-            // Previously EVERY MessageDelta became a `messageStop` and usage was discarded (`usage: _`),
-            // so (a) a native SDK reading usage from the `metadata` frame got zero, and (b) a trailing
-            // usage-only delta produced a SECOND `messageStop` frame — both distinguishable tells.
+            // The native Bedrock ConverseStream wire carries `stopReason` in a `messageStop` frame
+            // and token `usage` in a SEPARATE `metadata` frame that FOLLOWS it. The IR, however,
+            // carries ONE combined `MessageDelta{stop_reason, usage}` (the reader collapses the two
+            // native frames into one so a cross-protocol ingress sees a single `message_delta`/usage
+            // event). A single `(event_type, json)` return cannot emit two frames, so the two-frame
+            // FAN-OUT for a Bedrock INGRESS lives in `StreamTranslate::translate_event` (proto/mod.rs),
+            // which splits a combined delta into a stop-only delta (→ here, `messageStop`) and a
+            // usage-only delta (→ here, `metadata`) before calling this writer, and injects the real
+            // `metrics.latencyMs` onto the `metadata` frame.
+            //
+            // This arm therefore maps each (already-split) MessageDelta to its single native frame:
+            //   - stop_reason = Some(...)  → `messageStop` (the stop discriminant; usage ignored)
+            //   - stop_reason = None       → `metadata` carrying the real token usage (no `metrics`
+            //                                here — the StreamTranslate fan-out adds it with the real
+            //                                elapsed wall-clock, or omits it when timing is absent;
+            //                                fabricating a `latencyMs: 0` was itself a detectable tell).
             // Bedrock has no stop_sequence field in its stream, so `stop_sequence` is ignored here.
             IrStreamEvent::MessageDelta {
                 stop_reason,
@@ -1165,13 +1164,7 @@ impl ProtocolWriter for BedrockWriter {
                             // a nonsense `totalTokens` in plain release. Mirror the Gemini writer's
                             // explicit `saturating_add` so the total clamps at `u64::MAX` instead.
                             "totalTokens": usage.input_tokens.saturating_add(usage.output_tokens)
-                        },
-                        // A native Bedrock ConverseStream `metadata` event always carries a `metrics`
-                        // object alongside `usage` (e.g. `{"latencyMs": N}`). Omitting it on every
-                        // busbar-minted cross-protocol stream is a consistent, detectable difference
-                        // from genuine Bedrock output. The AWS SDK does not require `metrics`, so a
-                        // zero placeholder is shape-faithful without fabricating a misleading latency.
-                        "metrics": { "latencyMs": 0 }
+                        }
                     }),
                 )),
             },
@@ -1789,7 +1782,13 @@ mod tests {
         .flat_map(|data| reader.read_response_events("", &data, &mut state))
         .collect();
 
-        assert_eq!(events.len(), 8);
+        // Seven events: MessageStart, text BlockStart, 2×BlockDelta, BlockStop, the terminal
+        // MessageStop (from `messageStop`, which now only BUFFERS the stop_reason), and ONE combined
+        // MessageDelta{stop_reason, usage} (from `metadata`). Previously this was eight events because
+        // `messageStop` emitted a separate stop-only MessageDelta and `metadata` emitted a second
+        // usage-only one — two deltas, a tell for non-Bedrock ingress. The combined delta is now the
+        // single source of both stop_reason and usage (finding: combined MessageDelta).
+        assert_eq!(events.len(), 7);
 
         match &events[0] {
             IrStreamEvent::MessageStart { role, usage, .. } => {
@@ -1836,37 +1835,29 @@ mod tests {
             _ => panic!("event[4] should be BlockStop"),
         }
 
-        // messageStop carries the stop reason with zero usage...
+        // The terminating MessageStop is emitted from the `messageStop` branch (the wire-guaranteed
+        // terminal event), so a missing/truncated `metadata` event can no longer leave the downstream
+        // stream without its terminal frame. The stop_reason is BUFFERED (not emitted here) so it can
+        // be combined with the usage that arrives on the next frame.
         match &events[5] {
+            IrStreamEvent::MessageStop => {}
+            _ => panic!("event[5] should be MessageStop"),
+        }
+
+        // The trailing `metadata` event emits ONE combined MessageDelta carrying BOTH the buffered
+        // stop_reason AND the real usage — a single `message_delta`-equivalent event, matching what a
+        // native non-Bedrock stream emits (finding: combined MessageDelta, no second delta).
+        match &events[6] {
             IrStreamEvent::MessageDelta {
                 stop_reason, usage, ..
             } => {
                 assert_eq!(stop_reason.as_deref(), Some("end_turn"));
-                assert_eq!(usage.input_tokens, 0);
-                assert_eq!(usage.output_tokens, 0);
-            }
-            _ => panic!("event[5] should be MessageDelta"),
-        }
-
-        // ...and the terminating MessageStop is emitted immediately from the `messageStop` branch
-        // (the wire-guaranteed terminal event), so a missing/truncated `metadata` event can no
-        // longer leave the downstream stream without its terminal frame.
-        match &events[6] {
-            IrStreamEvent::MessageStop => {}
-            _ => panic!("event[6] should be MessageStop"),
-        }
-
-        // The trailing `metadata` event still forwards the real usage (lossless) as a usage-only
-        // MessageDelta; it no longer emits a second (duplicate) MessageStop.
-        match &events[7] {
-            IrStreamEvent::MessageDelta {
-                stop_reason, usage, ..
-            } => {
-                assert!(stop_reason.is_none());
                 assert_eq!(usage.input_tokens, 10);
                 assert_eq!(usage.output_tokens, 5);
             }
-            _ => panic!("event[7] should be MessageDelta carrying usage"),
+            _ => {
+                panic!("event[6] should be the combined MessageDelta carrying stop_reason + usage")
+            }
         }
     }
 
@@ -2805,11 +2796,15 @@ mod tests {
         );
     }
 
-    /// Regression (writer): the synthesized cross-protocol `metadata` frame carries a `metrics`
-    /// object (`{"latencyMs": N}`) alongside `usage`, matching the native Bedrock ConverseStream
-    /// metadata shape — its absence on every busbar-minted stream was a detectable tell.
+    /// Regression (writer): a usage-only delta's `metadata` frame carries the real `usage` but does
+    /// NOT fabricate a `metrics` object at the writer layer. The native ConverseStream `metrics`
+    /// object reports the stream's REAL `latencyMs`, which the writer cannot know — so it is injected
+    /// (with the elapsed wall-clock) by `StreamTranslate::emit_ir_event` on the Bedrock-ingress path,
+    /// or OMITTED when timing is unavailable. Emitting a hard-coded `latencyMs: 0` here (the old
+    /// behavior) was itself a detectable tell (a real stream never reports exactly 0). The live
+    /// latency injection is covered by the StreamTranslate test in proto/mod.rs.
     #[test]
-    fn test_write_response_event_metadata_carries_metrics() {
+    fn test_write_response_event_metadata_no_fabricated_metrics() {
         let writer = BedrockWriter;
         let usage_only = IrStreamEvent::MessageDelta {
             stop_reason: None,
@@ -2826,15 +2821,9 @@ mod tests {
             .expect("usage-only delta emits a metadata frame");
         assert_eq!(et, "metadata");
         assert!(
-            payload.pointer("/metrics").is_some(),
-            "metadata frame must carry a `metrics` object; got {payload}"
-        );
-        assert_eq!(
-            payload
-                .pointer("/metrics/latencyMs")
-                .and_then(|v| v.as_u64()),
-            Some(0),
-            "metrics must carry a latencyMs field; got {payload}"
+            payload.pointer("/metrics").is_none(),
+            "writer must NOT fabricate a `metrics` object (latency is injected by StreamTranslate \
+             or omitted); got {payload}"
         );
         // usage is still present and correct.
         assert_eq!(

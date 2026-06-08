@@ -337,6 +337,29 @@ pub(crate) struct StreamTranslate {
     /// reframed as SSE. The stream's terminator is the `messageStop`/`metadata` frames themselves
     /// (Bedrock has no `[DONE]`), so `finish()` stays empty. See `docs/architecture.md`.
     ingress_eventstream: bool,
+    /// Wall-clock instant the first byte was fed, used to report a real `metrics.latencyMs` on a
+    /// Bedrock-INGRESS `metadata` frame (finding: a native ConverseStream reports actual latency; a
+    /// hard-coded `0` was a detectable tell). Set lazily on the first `feed`. `None` until then (and
+    /// for non-Bedrock ingress, where it is never read).
+    started_at: Option<std::time::Instant>,
+    /// ingress == "openai" → the stream-start identity (`id`/`created`/`model`) captured from the
+    /// first translated `MessageStart`, replayed onto EVERY subsequent `chat.completion.chunk`. The
+    /// real OpenAI API repeats these top-level fields on every chunk; the writer emits them only on
+    /// the opening (role) chunk, so without this replay the later content/finish chunks omit them — a
+    /// shape divergence from a genuine OpenAI stream. Reuses the stream's id (never mints a fresh one
+    /// per chunk). `None` until the first MessageStart is translated.
+    openai_chunk_identity: Option<OpenAiChunkIdentity>,
+}
+
+/// The OpenAI stream-start identity replayed onto every `chat.completion.chunk` (see
+/// `StreamTranslate::openai_chunk_identity`). Captured from the opening chunk the OpenAI writer
+/// emits for the IR `MessageStart` (which already synthesizes a stable `id`/`created` when the
+/// cross-protocol backend supplied none), so the whole stream shares ONE identity.
+#[derive(Clone)]
+struct OpenAiChunkIdentity {
+    id: serde_json::Value,
+    created: serde_json::Value,
+    model: Option<serde_json::Value>,
 }
 
 impl StreamTranslate {
@@ -356,6 +379,8 @@ impl StreamTranslate {
             emit_done: ingress == "openai",
             egress_eventstream: egress == "bedrock",
             ingress_eventstream: ingress == "bedrock",
+            started_at: None,
+            openai_chunk_identity: None,
         })
     }
 
@@ -401,14 +426,135 @@ impl StreamTranslate {
                     }
                 }
             }
-            if let Some((out_et, out_data)) = self.ingress.writer().write_response_event(&ev) {
-                if self.ingress_eventstream {
-                    // ingress is a native AWS SDK Bedrock client: pack the logical event into a
-                    // binary `application/vnd.amazon.eventstream` frame with valid CRC32.
-                    let payload = serde_json::to_vec(&out_data).unwrap_or_default();
-                    out.extend_from_slice(&crate::eventstream::encode_frame(&out_et, &payload));
-                } else {
-                    out.extend_from_slice(reframe_sse(&out_et, &out_data).as_bytes());
+
+            // Bedrock-INGRESS combined-delta fan-out: the IR carries ONE combined
+            // `MessageDelta{stop_reason: Some, usage}` (the egress reader collapses Bedrock's native
+            // two-frame stop/usage split — or any other protocol's single message_delta — into one).
+            // A native AWS SDK Bedrock client, however, expects the real TWO-frame sequence: a
+            // `messageStop` frame carrying the stop reason FOLLOWED by a `metadata` frame carrying the
+            // token usage (and a `metrics` object). The single-`(String,Value)`-return writer trait
+            // cannot emit two frames, so we fan the combined delta into two synthetic single-purpose
+            // deltas here — a stop-only delta → `messageStop`, then a usage-only delta → `metadata` —
+            // and inject the real `metrics.latencyMs` onto the metadata frame (see below). This
+            // reproduces exactly what `BedrockReader::read_response_events` consumed, so a
+            // bedrock->bedrock stream still round-trips frame-for-frame.
+            if self.ingress_eventstream {
+                if let crate::ir::IrStreamEvent::MessageDelta {
+                    stop_reason: Some(reason),
+                    usage,
+                    stop_sequence,
+                } = &ev
+                {
+                    // Frame 1: stop-only delta → `messageStop` (zero usage; usage rides frame 2).
+                    let stop_only = crate::ir::IrStreamEvent::MessageDelta {
+                        stop_reason: Some(reason.clone()),
+                        stop_sequence: stop_sequence.clone(),
+                        usage: crate::ir::IrUsage {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_creation_input_tokens: None,
+                            cache_read_input_tokens: None,
+                        },
+                    };
+                    // Frame 2: usage-only delta → `metadata` (real `metrics.latencyMs` injected in
+                    // `emit_ir_event`).
+                    let usage_only = crate::ir::IrStreamEvent::MessageDelta {
+                        stop_reason: None,
+                        stop_sequence: stop_sequence.clone(),
+                        usage: usage.clone(),
+                    };
+                    self.emit_ir_event(&stop_only, out);
+                    self.emit_ir_event(&usage_only, out);
+                    continue;
+                }
+            }
+
+            self.emit_ir_event(&ev, out);
+        }
+    }
+
+    /// Write a single IR event through the ingress writer and append its framed bytes to `out`.
+    /// Handles the eventstream-vs-SSE framing split, the Bedrock-INGRESS `metadata`-frame
+    /// `metrics.latencyMs` injection (finding: a native ConverseStream reports real latency), and the
+    /// OpenAI-INGRESS per-chunk identity replay (finding: the real OpenAI API repeats
+    /// `id`/`created`/`model` on EVERY `chat.completion.chunk`, not just the opening one).
+    fn emit_ir_event(&mut self, ev: &crate::ir::IrStreamEvent, out: &mut Vec<u8>) {
+        let Some((out_et, mut out_data)) = self.ingress.writer().write_response_event(ev) else {
+            return;
+        };
+        if self.ingress_eventstream {
+            // ingress is a native AWS SDK Bedrock client: pack the logical event into a
+            // binary `application/vnd.amazon.eventstream` frame with valid CRC32.
+            if out_et == "metadata" {
+                // A native ConverseStream `metadata` frame carries a `metrics` object with the
+                // stream's real `latencyMs`. Inject the elapsed wall-clock since the first byte was
+                // fed; if timing is somehow unavailable, OMIT `metrics` entirely rather than emit a
+                // tell-tale `0`. The writer leaves `metrics` off so this is the single source of it.
+                if let Some(start) = self.started_at {
+                    let elapsed_ms = start.elapsed().as_millis();
+                    // u128 → u64 for JSON; saturate (elapsed never realistically exceeds u64 ms).
+                    let elapsed_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
+                    if let Some(obj) = out_data.as_object_mut() {
+                        obj.insert(
+                            "metrics".to_string(),
+                            serde_json::json!({ "latencyMs": elapsed_ms }),
+                        );
+                    }
+                }
+            }
+            let payload = serde_json::to_vec(&out_data).unwrap_or_default();
+            out.extend_from_slice(&crate::eventstream::encode_frame(&out_et, &payload));
+        } else {
+            if self.emit_done {
+                // ingress == "openai" (the only ingress that emits a `[DONE]` terminator): every
+                // `chat.completion.chunk` repeats the stream's top-level `id`/`created`/`model`.
+                // Capture them from the opening chunk (the MessageStart the writer rendered, which
+                // already synthesized stable values when the cross-protocol backend supplied none)
+                // and replay them onto every later chunk so the stream is shape-faithful to a genuine
+                // OpenAI stream (and the chunks share ONE id — never a freshly minted per-chunk id).
+                self.apply_openai_chunk_identity(&mut out_data);
+            }
+            out.extend_from_slice(reframe_sse(&out_et, &out_data).as_bytes());
+        }
+    }
+
+    /// Capture-or-replay the OpenAI stream identity on a `chat.completion.chunk` body. On the first
+    /// chunk that carries an `id` (the opening role chunk), latch `id`/`created`/`model`; on every
+    /// subsequent chunk (which the writer emits WITHOUT them), inject the latched values. Only called
+    /// for OpenAI ingress. The `[DONE]` sentinel is a separate `finish()` literal, not routed here.
+    fn apply_openai_chunk_identity(&mut self, chunk: &mut serde_json::Value) {
+        let Some(obj) = chunk.as_object_mut() else {
+            return;
+        };
+        // Only `chat.completion.chunk` bodies carry stream identity. An in-band error envelope
+        // (`{"error":{...}}`) the writer may emit has no `object` field — leave it untouched.
+        if obj.get("object").and_then(|v| v.as_str()) != Some("chat.completion.chunk") {
+            return;
+        }
+        match &self.openai_chunk_identity {
+            None => {
+                // First chunk: latch its identity (the writer put id/created on the role chunk, and
+                // model when the lane supplied one).
+                if obj.contains_key("id") {
+                    self.openai_chunk_identity = Some(OpenAiChunkIdentity {
+                        id: obj.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        created: obj
+                            .get("created")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        model: obj.get("model").cloned(),
+                    });
+                }
+            }
+            Some(identity) => {
+                // Subsequent chunk: replay the latched identity (the writer omitted it).
+                obj.entry("id".to_string())
+                    .or_insert_with(|| identity.id.clone());
+                obj.entry("created".to_string())
+                    .or_insert_with(|| identity.created.clone());
+                if let Some(model) = &identity.model {
+                    obj.entry("model".to_string())
+                        .or_insert_with(|| model.clone());
                 }
             }
         }
@@ -431,6 +577,12 @@ impl StreamTranslate {
     pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
         if self.aborted {
             return Vec::new();
+        }
+        // Stamp the stream's wall-clock start on the first byte fed, so a Bedrock-INGRESS `metadata`
+        // frame can report a real `metrics.latencyMs` (elapsed since the stream began) instead of a
+        // tell-tale hard-coded 0. Cheap monotonic clock read; only read on the bedrock-ingress path.
+        if self.started_at.is_none() {
+            self.started_at = Some(std::time::Instant::now());
         }
         self.buf.extend_from_slice(chunk);
         let mut out: Vec<u8> = Vec::new();
@@ -3157,6 +3309,46 @@ mod stream_translate_tests {
             types.contains(&"messageStop"),
             "must carry messageStop terminator; got {types:?}"
         );
+        // The combined IR MessageDelta (stop_reason + usage) must FAN OUT into BOTH a `messageStop`
+        // frame AND a following `metadata` frame carrying the real usage — the native two-frame
+        // ConverseStream sequence (finding: messageStop+metadata fan-out). A single Anthropic
+        // `message_delta` thus reproduces the genuine Bedrock pair.
+        assert!(
+            types.contains(&"metadata"),
+            "combined delta must fan out a `metadata` usage frame; got {types:?}"
+        );
+        // messageStop must precede metadata (native order).
+        let stop_pos = types.iter().position(|t| *t == "messageStop");
+        let meta_pos = types.iter().position(|t| *t == "metadata");
+        assert!(
+            stop_pos < meta_pos,
+            "messageStop must precede metadata (native order); got {types:?}"
+        );
+        // The metadata frame carries the real token usage from the Anthropic message_delta.
+        let meta = frames
+            .iter()
+            .find(|(et, _)| et == "metadata")
+            .expect("a metadata frame");
+        let mv: serde_json::Value =
+            serde_json::from_slice(&meta.1).expect("valid metadata JSON payload");
+        assert_eq!(
+            mv.pointer("/usage/inputTokens").and_then(|x| x.as_u64()),
+            Some(5),
+            "metadata usage inputTokens round-trips; got {mv}"
+        );
+        assert_eq!(
+            mv.pointer("/usage/outputTokens").and_then(|x| x.as_u64()),
+            Some(2),
+            "metadata usage outputTokens round-trips; got {mv}"
+        );
+        // The metadata frame carries a real `metrics.latencyMs` (a u64), never the tell-tale absent /
+        // fabricated-0 of the old writer; it is injected by StreamTranslate from the stream wall-clock.
+        assert!(
+            mv.pointer("/metrics/latencyMs")
+                .and_then(|x| x.as_u64())
+                .is_some(),
+            "metadata must carry a real metrics.latencyMs; got {mv}"
+        );
 
         // The contentBlockDelta payload must round-trip the translated text.
         let delta = frames
@@ -4453,6 +4645,183 @@ mod gemini_tests {
         assert!(
             found_tool_args_delta,
             "should have InputJsonDelta with args"
+        );
+    }
+
+    // --- 1.0 streaming-conformance regression tests (cross-protocol seam) ----------------------
+
+    /// Helper: split a concatenated OpenAI SSE byte stream into its per-frame JSON chunk objects
+    /// (skipping the `[DONE]` sentinel and any keepalive). Mirrors `parse_sse_frame`'s framing.
+    fn openai_sse_chunks(bytes: &[u8]) -> Vec<serde_json::Value> {
+        let text = std::str::from_utf8(bytes).expect("openai SSE is utf-8");
+        let mut chunks = Vec::new();
+        for frame in text.split("\n\n") {
+            let Some(rest) = frame.lines().find_map(|l| l.strip_prefix("data:")) else {
+                continue;
+            };
+            let payload = rest.strip_prefix(' ').unwrap_or(rest).trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                chunks.push(v);
+            }
+        }
+        chunks
+    }
+
+    /// Finding (OpenAI per-chunk identity): the real OpenAI API repeats the top-level
+    /// `id`/`created`/`model` on EVERY `chat.completion.chunk`, not just the opening role chunk. An
+    /// Anthropic egress stream translated to an OpenAI ingress must therefore carry the SAME
+    /// `id`/`created`/`model` on every emitted chunk — a single stream identity, never a fresh id per
+    /// chunk and never an identity-less later chunk (a detectable shape divergence).
+    #[test]
+    fn test_openai_ingress_per_chunk_identity_repeated() {
+        let mut t = StreamTranslate::new("openai", "anthropic").expect("openai ingress translator");
+        let mut raw: Vec<u8> = Vec::new();
+        for frame in [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_backend\",\"role\":\"assistant\",\"model\":\"claude-x\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            raw.extend(t.feed(frame.as_bytes()));
+        }
+        raw.extend(t.finish());
+
+        let chunks = openai_sse_chunks(&raw);
+        assert!(
+            chunks.len() >= 2,
+            "expected multiple chunks; got {}",
+            chunks.len()
+        );
+        // Every chunk is a chat.completion.chunk carrying the SAME id/created/model.
+        let first_id = chunks[0]
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("first chunk has an id")
+            .to_string();
+        // Synthesized (cross-protocol) id must be a native chatcmpl- shape, NOT the foreign msg_.
+        assert!(
+            first_id.starts_with("chatcmpl-"),
+            "cross-protocol id must be a native chatcmpl- id; got {first_id}"
+        );
+        let first_created = chunks[0].get("created").and_then(|v| v.as_u64());
+        assert!(first_created.is_some(), "first chunk has a created");
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(
+                c.get("object").and_then(|v| v.as_str()),
+                Some("chat.completion.chunk"),
+                "chunk {i} object; got {c}"
+            );
+            assert_eq!(
+                c.get("id").and_then(|v| v.as_str()),
+                Some(first_id.as_str()),
+                "chunk {i} must repeat the SAME stream id; got {c}"
+            );
+            assert_eq!(
+                c.get("created").and_then(|v| v.as_u64()),
+                first_created,
+                "chunk {i} must repeat the SAME created; got {c}"
+            );
+            assert_eq!(
+                c.get("model").and_then(|v| v.as_str()),
+                Some("claude-x"),
+                "chunk {i} must repeat the stream model; got {c}"
+            );
+        }
+        // The foreign backend id must never leak to the OpenAI client.
+        assert!(
+            !raw.windows(b"msg_backend".len())
+                .any(|w| w == b"msg_backend"),
+            "foreign backend id must be stripped on cross-protocol ingress"
+        );
+    }
+
+    /// Finding (bedrock messageStop+metadata fan-out, real latencyMs): a bedrock->bedrock stream must
+    /// round-trip — the egress reader collapses the native two-frame stop/usage split into ONE
+    /// combined IR MessageDelta, and the ingress writer fan-out RE-SPLITS it back into the native
+    /// `messageStop` + `metadata` frame pair (metadata carrying the real usage AND a real
+    /// `metrics.latencyMs`). This proves the reader collapse and writer fan-out are exact inverses.
+    #[test]
+    fn test_bedrock_to_bedrock_stream_roundtrips_stop_and_metadata() {
+        // Same-protocol returns None (native passthrough), so drive the cross-protocol seam with a
+        // foreign egress that still produces the combined delta. Use openai egress → bedrock ingress:
+        // a single OpenAI final chunk carries finish_reason + usage, the reader emits ONE combined
+        // MessageDelta, and the bedrock-ingress fan-out must produce messageStop + metadata.
+        assert!(
+            StreamTranslate::new("bedrock", "bedrock").is_none(),
+            "bedrock->bedrock needs no translator (native passthrough)"
+        );
+
+        let mut t = StreamTranslate::new("bedrock", "openai").expect("bedrock ingress translator");
+        let mut raw: Vec<u8> = Vec::new();
+        for frame in [
+            "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            raw.extend(t.feed(frame.as_bytes()));
+        }
+        raw.extend(t.finish());
+
+        let mut buf = raw.clone();
+        let frames = crate::eventstream::drain_frames(&mut buf);
+        assert!(
+            buf.is_empty(),
+            "all frames decode cleanly; {} left",
+            buf.len()
+        );
+        let types: Vec<&str> = frames.iter().map(|(et, _)| et.as_str()).collect();
+        // The combined delta fans out to a messageStop FOLLOWED by a metadata frame.
+        let stop_pos = types
+            .iter()
+            .position(|t| *t == "messageStop")
+            .expect("messageStop frame present");
+        let meta_pos = types
+            .iter()
+            .position(|t| *t == "metadata")
+            .expect("metadata frame present");
+        assert!(
+            stop_pos < meta_pos,
+            "messageStop must precede metadata (native order); got {types:?}"
+        );
+        // The metadata frame carries the real usage and a real latencyMs (not a fabricated 0-tell).
+        let meta = frames
+            .iter()
+            .find(|(et, _)| et == "metadata")
+            .expect("metadata frame");
+        let mv: serde_json::Value = serde_json::from_slice(&meta.1).expect("valid metadata JSON");
+        assert_eq!(
+            mv.pointer("/usage/inputTokens").and_then(|x| x.as_u64()),
+            Some(7),
+            "usage inputTokens; got {mv}"
+        );
+        assert_eq!(
+            mv.pointer("/usage/outputTokens").and_then(|x| x.as_u64()),
+            Some(3),
+            "usage outputTokens; got {mv}"
+        );
+        assert!(
+            mv.pointer("/metrics/latencyMs")
+                .and_then(|x| x.as_u64())
+                .is_some(),
+            "metadata must carry a real metrics.latencyMs; got {mv}"
+        );
+        // The messageStop frame carries the mapped stop reason.
+        let stop = frames
+            .iter()
+            .find(|(et, _)| et == "messageStop")
+            .expect("messageStop frame");
+        let sv: serde_json::Value =
+            serde_json::from_slice(&stop.1).expect("valid messageStop JSON");
+        assert_eq!(
+            sv.get("stopReason").and_then(|x| x.as_str()),
+            Some("end_turn"),
+            "stop reason maps to end_turn; got {sv}"
         );
     }
 }
