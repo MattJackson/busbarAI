@@ -521,6 +521,8 @@ impl ProtocolReader for GeminiReader {
 
                     out.push(IrStreamEvent::MessageDelta {
                         stop_reason: Some(stop_reason.to_string()),
+                        // Gemini has no stop_sequence analog in its stream.
+                        stop_sequence: None,
                         usage,
                     });
                     out.push(IrStreamEvent::MessageStop);
@@ -1107,7 +1109,11 @@ impl ProtocolWriter for GeminiWriter {
             IrStreamEvent::BlockStop { .. } => None,
 
             // MessageDelta → chunk with finishReason + usageMetadata
-            IrStreamEvent::MessageDelta { stop_reason, usage } => {
+            IrStreamEvent::MessageDelta {
+                stop_reason,
+                usage,
+                stop_sequence: _,
+            } => {
                 let finish_reason = match stop_reason.as_deref() {
                     Some("end_turn") | Some("stop_sequence") => "STOP".to_string(),
                     Some("max_tokens") => "MAX_TOKENS".to_string(),
@@ -2302,6 +2308,7 @@ mod tests {
         let writer = GeminiWriter;
         let ev = IrStreamEvent::MessageDelta {
             stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 7,
                 output_tokens: 5,
@@ -2334,6 +2341,7 @@ mod tests {
         let writer = GeminiWriter;
         let ev = IrStreamEvent::MessageDelta {
             stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: u64::MAX,
                 output_tokens: 1,

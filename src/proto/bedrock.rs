@@ -573,6 +573,8 @@ impl ProtocolReader for BedrockReader {
                 if let Some(reason) = stop_reason_val {
                     out.push(IrStreamEvent::MessageDelta {
                         stop_reason: Some(reason),
+                        // Bedrock has no stop_sequence analog in its stream.
+                        stop_sequence: None,
                         usage: crate::ir::IrUsage {
                             input_tokens: 0,
                             output_tokens: 0,
@@ -605,6 +607,7 @@ impl ProtocolReader for BedrockReader {
 
                     out.push(IrStreamEvent::MessageDelta {
                         stop_reason: None,
+                        stop_sequence: None,
                         usage,
                     });
                 }
@@ -1139,7 +1142,12 @@ impl ProtocolWriter for BedrockWriter {
             // Previously EVERY MessageDelta became a `messageStop` and usage was discarded (`usage: _`),
             // so (a) a native SDK reading usage from the `metadata` frame got zero, and (b) a trailing
             // usage-only delta produced a SECOND `messageStop` frame — both distinguishable tells.
-            IrStreamEvent::MessageDelta { stop_reason, usage } => match stop_reason {
+            // Bedrock has no stop_sequence field in its stream, so `stop_sequence` is ignored here.
+            IrStreamEvent::MessageDelta {
+                stop_reason,
+                usage,
+                stop_sequence: _,
+            } => match stop_reason {
                 Some(reason) => Some((
                     "messageStop".to_string(),
                     serde_json::json!({ "stopReason": stop_reason_reverse(reason) }),
@@ -1821,7 +1829,9 @@ mod tests {
 
         // messageStop carries the stop reason with zero usage...
         match &events[5] {
-            IrStreamEvent::MessageDelta { stop_reason, usage } => {
+            IrStreamEvent::MessageDelta {
+                stop_reason, usage, ..
+            } => {
                 assert_eq!(stop_reason.as_deref(), Some("end_turn"));
                 assert_eq!(usage.input_tokens, 0);
                 assert_eq!(usage.output_tokens, 0);
@@ -1840,7 +1850,9 @@ mod tests {
         // The trailing `metadata` event still forwards the real usage (lossless) as a usage-only
         // MessageDelta; it no longer emits a second (duplicate) MessageStop.
         match &events[7] {
-            IrStreamEvent::MessageDelta { stop_reason, usage } => {
+            IrStreamEvent::MessageDelta {
+                stop_reason, usage, ..
+            } => {
                 assert!(stop_reason.is_none());
                 assert_eq!(usage.input_tokens, 10);
                 assert_eq!(usage.output_tokens, 5);
@@ -1878,6 +1890,7 @@ mod tests {
 
         let delta_ev2 = IrStreamEvent::MessageDelta {
             stop_reason: Some("tool_use".to_string()),
+            stop_sequence: None,
             usage: IrUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -2205,6 +2218,7 @@ mod tests {
         // Usage-only delta → `metadata` frame with the real usage (and a derived totalTokens).
         let usage_only = IrStreamEvent::MessageDelta {
             stop_reason: None,
+            stop_sequence: None,
             usage: IrUsage {
                 input_tokens: 11,
                 output_tokens: 7,
@@ -2242,6 +2256,7 @@ mod tests {
         // Stop-reason delta still maps to `messageStop` (the stop discriminant).
         let stop = IrStreamEvent::MessageDelta {
             stop_reason: Some("tool_use".to_string()),
+            stop_sequence: None,
             usage: IrUsage {
                 input_tokens: 0,
                 output_tokens: 0,
@@ -2789,6 +2804,7 @@ mod tests {
         let writer = BedrockWriter;
         let usage_only = IrStreamEvent::MessageDelta {
             stop_reason: None,
+            stop_sequence: None,
             usage: IrUsage {
                 input_tokens: 3,
                 output_tokens: 2,

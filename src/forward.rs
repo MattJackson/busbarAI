@@ -74,8 +74,24 @@ fn strip_router_shim_keys(v: &mut Value, ingress_protocol: &str) {
         if let Some(obj) = v.as_object_mut() {
             obj.remove("model");
             obj.remove("stream");
+            obj.remove(GEMINI_JSON_ARRAY_SHIM_KEY);
         }
     }
+}
+
+/// Router-internal shim key the gemini ingress route injects into the request body when the client
+/// sent a streaming `:streamGenerateContent` request WITHOUT `?alt=sse` (so the response must be the
+/// JSON-array streaming format, not SSE). It rides alongside the `model`/`stream` shims and is
+/// stripped by [`strip_router_shim_keys`] before the upstream call. A leading `__busbar` makes an
+/// accidental collision with a real provider field impossible.
+const GEMINI_JSON_ARRAY_SHIM_KEY: &str = "__busbar_gemini_json_array";
+
+/// True when the body carries the gemini JSON-array shim key set to `true` (see
+/// [`GEMINI_JSON_ARRAY_SHIM_KEY`]).
+fn wants_gemini_json_array(v: &Value) -> bool {
+    v.get(GEMINI_JSON_ARRAY_SHIM_KEY)
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false)
 }
 
 /// Upper bound on a buffered UPSTREAM response body (error 4xx/5xx bodies and buffered cross-protocol
@@ -443,6 +459,11 @@ struct FirstByteBody<S, P> {
     /// when Some, translate each egress SSE chunk to the caller's ingress protocol.
     /// None = native passthrough (same-protocol or non-SSE).
     translate: Option<crate::proto::StreamTranslate>,
+    /// When set (gemini ingress streaming WITHOUT `?alt=sse`), the SSE bytes — whether from a
+    /// same-protocol passthrough or the cross-protocol `translate` stage above, both of which are
+    /// gemini SSE here — are reframed into the JSON-array streaming format the native non-`alt=sse`
+    /// `:streamGenerateContent` request expects (`[{...},{...}]`). Runs AFTER `translate`.
+    json_array: Option<crate::proto::GeminiJsonArrayFramer>,
     /// When set, the token usage tapped from this response is charged to a virtual key's budget at
     /// stream end (token-accurate accounting). Taken (fired) exactly once when the stream completes.
     usage_sink: Option<UsageSink>,
@@ -466,6 +487,7 @@ where
         breaker_cfg: Arc<crate::store::BreakerCfg>,
         pool: &str,
         translate: Option<crate::proto::StreamTranslate>,
+        json_array: Option<crate::proto::GeminiJsonArrayFramer>,
         usage_sink: Option<UsageSink>,
     ) -> Self {
         Self {
@@ -481,6 +503,7 @@ where
             pool: Box::from(pool),
             tap: UsageTap::new(),
             translate,
+            json_array,
             usage_sink,
             ended: false,
         }
@@ -518,6 +541,16 @@ where
                         // chunk below, which IS already the right shape there).
                         let out_bytes = Bytes::from(out);
                         this.tap.feed(&out_bytes);
+                        // Gemini non-`alt=sse` ingress: reframe the (now gemini-SSE) bytes into the
+                        // JSON-array streaming shape. Run AFTER tap+translate so accounting is
+                        // unaffected.
+                        if let Some(framer) = this.json_array.as_mut() {
+                            let framed = framer.feed(&out_bytes);
+                            if framed.is_empty() {
+                                continue; // no complete object yet; poll inner again
+                            }
+                            return Poll::Ready(Some(Ok(Bytes::from(framed))));
+                        }
                         if out_bytes.is_empty() {
                             continue; // only a partial frame buffered; poll inner again
                         }
@@ -525,6 +558,16 @@ where
                     }
                     // Passthrough (same-protocol): the raw chunk is already in the client's shape.
                     this.tap.feed(&chunk);
+                    // Gemini same-protocol passthrough WITHOUT `?alt=sse`: the upstream chunk is
+                    // gemini SSE (busbar always requests `?alt=sse` upstream); reframe it into the
+                    // JSON-array streaming shape the native client expects.
+                    if let Some(framer) = this.json_array.as_mut() {
+                        let framed = framer.feed(&chunk);
+                        if framed.is_empty() {
+                            continue; // no complete object yet; poll inner again
+                        }
+                        return Poll::Ready(Some(Ok(Bytes::from(framed))));
+                    }
                     return Poll::Ready(Some(Ok(chunk)));
                 }
                 Poll::Ready(Some(Err(e))) => {
@@ -584,12 +627,20 @@ where
                             );
                         }
                     }
-                    // emit the ingress terminator (e.g. OpenAI `data: [DONE]`) before close.
-                    let done = this
-                        .translate
-                        .as_mut()
-                        .map(|t| t.finish())
-                        .unwrap_or_default();
+                    // emit the ingress terminator before close. For a gemini JSON-array stream the
+                    // terminator is the closing `]` from the framer; the SSE `translate.finish()`
+                    // terminator (e.g. OpenAI `data: [DONE]`) must NOT be emitted into a JSON-array
+                    // body — drain the translate buffer (so its decode side-effects run) but discard
+                    // its SSE terminator bytes, then append the framer close.
+                    let done = if let Some(framer) = this.json_array.as_mut() {
+                        let _ = this.translate.as_mut().map(|t| t.finish());
+                        framer.finish()
+                    } else {
+                        this.translate
+                            .as_mut()
+                            .map(|t| t.finish())
+                            .unwrap_or_default()
+                    };
                     drop(this.permit.take());
                     this.ended = true;
                     // Charge this request's token usage to the virtual key's budget (once) — but ONLY
@@ -918,6 +969,11 @@ pub(crate) async fn forward_with_pool(
     // capture the caller's stream intent from the ingress body BEFORE any cross-protocol
     // translation rewrites `v` (Gemini routes streaming requests to a different upstream endpoint).
     let wants_stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+
+    // Gemini ingress streaming WITHOUT `?alt=sse`: the native client expects a JSON-array streamed
+    // body, not SSE. The route layer signals this via a router shim key (read + stripped here, like
+    // `model`/`stream`). False for every other protocol and for the `?alt=sse` gemini variant.
+    let gemini_json_array = wants_gemini_json_array(&v);
 
     // Derive affinity key early (before any mutations to v)
     let _affinity_key_str: Option<String> = if let Some(k) = affinity_key {
@@ -1485,6 +1541,11 @@ pub(crate) async fn forward_with_pool(
                 } else {
                     None
                 };
+                // Gemini non-`alt=sse` ingress: engage the JSON-array framer (only when this is in
+                // fact a streamed SSE response — a same-protocol non-stream gemini response never
+                // reaches the streaming builder).
+                let json_array =
+                    (gemini_json_array && is_sse).then(crate::proto::GeminiJsonArrayFramer::new);
                 let upstream_stream = r.bytes_stream();
                 let guarded_body = FirstByteBody::new(
                     upstream_stream,
@@ -1496,6 +1557,7 @@ pub(crate) async fn forward_with_pool(
                     breaker_cfg.clone(),
                     pool_name,
                     translate,
+                    json_array,
                     usage_sink,
                 );
                 let axum_body = guarded_body.into_body();
@@ -1505,16 +1567,21 @@ pub(crate) async fn forward_with_pool(
                 // must be the ingress client's, not the upstream's. Same-protocol passthrough keeps
                 // the upstream CT verbatim. §8.4.
                 let cross_protocol = ingress_protocol != app.lanes[i].protocol.name();
-                match (cross_protocol && is_sse)
-                    .then(|| ingress_stream_content_type(ingress_protocol))
-                    .flatten()
-                {
-                    Some(client_ct) => {
-                        rb = rb.header(CONTENT_TYPE, client_ct);
-                    }
-                    None => {
-                        if let Some(ct) = ct {
-                            rb = rb.header(CONTENT_TYPE, ct);
+                if gemini_json_array && is_sse {
+                    // JSON-array streaming body: a `[ {...}, {...} ]` document, not SSE.
+                    rb = rb.header(CONTENT_TYPE, "application/json");
+                } else {
+                    match (cross_protocol && is_sse)
+                        .then(|| ingress_stream_content_type(ingress_protocol))
+                        .flatten()
+                    {
+                        Some(client_ct) => {
+                            rb = rb.header(CONTENT_TYPE, client_ct);
+                        }
+                        None => {
+                            if let Some(ct) = ct {
+                                rb = rb.header(CONTENT_TYPE, ct);
+                            }
                         }
                     }
                 }
@@ -1674,6 +1741,8 @@ async fn forward_once(
 
     // stream intent for the stream-aware upstream path (Gemini).
     let wants_stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    // Gemini ingress streaming WITHOUT `?alt=sse` → JSON-array streamed body (see main path).
+    let gemini_json_array = wants_gemini_json_array(&v);
 
     // Cross-protocol translation through the superset IR — same as the main path — so this degraded
     // route is correct when the chosen lane speaks a different protocol than the caller.
@@ -1844,6 +1913,8 @@ async fn forward_once(
             } else {
                 None
             };
+            let json_array =
+                (gemini_json_array && is_sse).then(crate::proto::GeminiJsonArrayFramer::new);
             let upstream_stream = r.bytes_stream();
             let guarded_body = FirstByteBody::new(
                 upstream_stream,
@@ -1855,22 +1926,27 @@ async fn forward_once(
                 Arc::new(crate::store::BreakerCfg::default()),
                 "", // degraded path: lane-default breaker cell
                 translate,
+                json_array,
                 None,
             );
             let mut rb = Response::builder().status(status);
             // Cross-protocol streaming: the body is reframed to the client's format, so the CT must
             // describe the ingress client's wire, not the upstream's. Same-protocol keeps the upstream
             // CT verbatim.
-            match (cross_protocol && is_sse)
-                .then(|| ingress_stream_content_type(ingress_protocol))
-                .flatten()
-            {
-                Some(client_ct) => {
-                    rb = rb.header(CONTENT_TYPE, client_ct);
-                }
-                None => {
-                    if let Some(ct) = ct {
-                        rb = rb.header(CONTENT_TYPE, ct);
+            if gemini_json_array && is_sse {
+                rb = rb.header(CONTENT_TYPE, "application/json");
+            } else {
+                match (cross_protocol && is_sse)
+                    .then(|| ingress_stream_content_type(ingress_protocol))
+                    .flatten()
+                {
+                    Some(client_ct) => {
+                        rb = rb.header(CONTENT_TYPE, client_ct);
+                    }
+                    None => {
+                        if let Some(ct) = ct {
+                            rb = rb.header(CONTENT_TYPE, ct);
+                        }
                     }
                 }
             }

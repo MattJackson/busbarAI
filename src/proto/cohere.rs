@@ -510,7 +510,12 @@ impl ProtocolReader for CohereReader {
                         cache_read_input_tokens: None,
                     });
 
-                out.push(IrStreamEvent::MessageDelta { stop_reason, usage });
+                out.push(IrStreamEvent::MessageDelta {
+                    stop_reason,
+                    // Cohere has no stop_sequence analog in its stream.
+                    stop_sequence: None,
+                    usage,
+                });
                 out.push(IrStreamEvent::MessageStop);
             }
             // Cohere v2 streams a tool call as a tool-call-start / tool-call-delta(s) /
@@ -996,7 +1001,11 @@ impl ProtocolWriter for CohereWriter {
                 serde_json::json!({ "type": "content-end", "index": 0 }),
             )),
 
-            IrStreamEvent::MessageDelta { stop_reason, usage } => {
+            IrStreamEvent::MessageDelta {
+                stop_reason,
+                usage,
+                stop_sequence: _,
+            } => {
                 let cohere_finish_reason = match stop_reason.as_deref() {
                     Some("end_turn") | Some("stop_sequence") => "COMPLETE".to_string(),
                     Some("max_tokens") => "MAX_TOKENS".to_string(),
@@ -1386,6 +1395,7 @@ mod tests {
         if let crate::ir::IrStreamEvent::MessageDelta {
             stop_reason: Some(ref s),
             ref usage,
+            ..
         } = &evs[0]
         {
             assert_eq!(s, "end_turn");
@@ -2054,6 +2064,7 @@ mod tests {
     fn test_write_response_event_message_end_carries_usage() {
         let ev = IrStreamEvent::MessageDelta {
             stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 42,
                 output_tokens: 7,
@@ -2089,6 +2100,7 @@ mod tests {
     fn test_write_response_event_message_end_zero_usage_present() {
         let ev = IrStreamEvent::MessageDelta {
             stop_reason: None,
+            stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 0,
                 output_tokens: 0,
@@ -2124,6 +2136,7 @@ mod tests {
         let (_, frame) = CohereWriter
             .write_response_event(&IrStreamEvent::MessageDelta {
                 stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
                 usage: usage.clone(),
             })
             .expect("message-end must serialize");

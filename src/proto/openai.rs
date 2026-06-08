@@ -546,7 +546,12 @@ impl ProtocolReader for OpenAiReader {
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
                 });
-            out.push(IrStreamEvent::MessageDelta { stop_reason, usage });
+            out.push(IrStreamEvent::MessageDelta {
+                stop_reason,
+                // OpenAI has no stop_sequence analog in its stream.
+                stop_sequence: None,
+                usage,
+            });
             out.push(IrStreamEvent::MessageStop);
         }
 
@@ -2118,6 +2123,7 @@ mod tests {
     fn stream_message_delta_none_stop_reason_serializes_null_not_empty_string() {
         let ev = IrStreamEvent::MessageDelta {
             stop_reason: None,
+            stop_sequence: None,
             usage: IrUsage {
                 input_tokens: 0,
                 output_tokens: 0,
@@ -2146,6 +2152,7 @@ mod tests {
         for (stop_reason, want) in cases {
             let ev = IrStreamEvent::MessageDelta {
                 stop_reason: stop_reason.map(String::from),
+                stop_sequence: None,
                 usage: IrUsage {
                     input_tokens: 0,
                     output_tokens: 0,

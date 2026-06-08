@@ -261,21 +261,10 @@ pub(crate) fn init_logging(otlp_endpoint: Option<&str>) {
 }
 
 /// Flush and shut down the OTLP tracer provider's batched span buffer. Idempotent and a no-op when
-/// OTLP was never configured. Call this on graceful shutdown so the final spans (often the most
-/// diagnostic) are exported rather than dropped when the runtime tears down.
-///
-/// TODO(graceful-shutdown): wire this into the server's shutdown path so the buffer flushes on exit.
-/// busbar currently runs `axum::serve(...).await` with no graceful-shutdown future, and the `tokio`
-/// `signal` feature is not enabled, so there is no in-process hook to call this from yet; adding one
-/// (e.g. `axum::serve(...).with_graceful_shutdown(sig)` followed by `shutdown_tracing()`) is the
-/// remaining step. The mechanism (retained provider + idempotent `shutdown()`) is complete and
-/// covered by `test_shutdown_tracing_is_noop_when_unconfigured`.
-///
-/// The annotation is the crate's standard idiom for a real-but-not-yet-wired hook — the same
-/// `#[cfg_attr(not(test), allow(dead_code))]` used on the store's `record_hard_down` /
-/// `record_rate_limit` until their call sites land. This replaces the previous blanket
-/// `#[allow(dead_code)]` whose doc-comment falsely claimed a live `main.rs` call site existed.
-#[cfg_attr(not(test), allow(dead_code))]
+/// OTLP was never configured. Wired into the server's graceful-shutdown path (`main.rs`:
+/// `axum::serve(...).with_graceful_shutdown(shutdown_signal())` then `shutdown_tracing()`) so the
+/// final spans (often the most diagnostic) are exported rather than dropped when the runtime tears
+/// down. Covered by `test_shutdown_tracing_is_noop_when_unconfigured`.
 pub(crate) fn shutdown_tracing() {
     if let Some(provider) = TRACER_PROVIDER.get() {
         if let Err(e) = provider.shutdown() {

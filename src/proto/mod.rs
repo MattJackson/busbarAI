@@ -518,7 +518,7 @@ impl StreamTranslate {
 /// where `offset` is the byte index of the first terminator byte. Recognizes both the LF-LF (`\n\n`,
 /// 2 bytes) and the spec-legal CRLF (`\r\n\r\n`, 4 bytes) blank-line terminators per WHATWG SSE.
 /// Returns `None` if no complete terminator is present yet.
-fn find_frame_terminator(buf: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn find_frame_terminator(buf: &[u8]) -> Option<(usize, usize)> {
     let mut i = 0;
     while i < buf.len() {
         if buf[i] == b'\n' {
@@ -541,7 +541,7 @@ fn find_frame_terminator(buf: &[u8]) -> Option<(usize, usize)> {
 /// no `event:` line (OpenAI style). Multiple `data:` lines in a single frame are concatenated with
 /// `\n` per the SSE spec (§9.2.6). Returns `None` if the frame carries no `data:` line (including a
 /// frame with only an `event:` line) or is invalid UTF-8.
-fn parse_sse_frame(frame: &[u8]) -> Option<(String, String)> {
+pub(crate) fn parse_sse_frame(frame: &[u8]) -> Option<(String, String)> {
     let text = std::str::from_utf8(frame).ok()?;
     let mut event_type = String::new();
     let mut data_lines: Vec<&str> = Vec::new();
@@ -568,6 +568,110 @@ fn reframe_sse(event_type: &str, data: &serde_json::Value) -> String {
         format!("data: {data}\n\n")
     } else {
         format!("event: {event_type}\ndata: {data}\n\n")
+    }
+}
+
+/// Re-frame a Gemini SSE response stream as the JSON-ARRAY streaming format a native
+/// `:streamGenerateContent` request WITHOUT `?alt=sse` expects: a leading `[`, the per-chunk
+/// `GenerateContentResponse` JSON objects separated by `,`, and a trailing `]`. (The SSE variant —
+/// `?alt=sse` — emits `data:`-framed chunks instead; busbar always requests `?alt=sse` UPSTREAM, so
+/// the bytes reaching this framer are Gemini SSE frames either way, whether the egress is gemini
+/// same-protocol passthrough or a cross-protocol `StreamTranslate` whose ingress writer is gemini.)
+///
+/// This framer is the JSON-array sibling of [`StreamTranslate`]'s SSE path: it consumes the SSE
+/// bytes (already in the gemini ingress wire shape), strips the `data:` framing, and re-emits the
+/// payloads as one streaming JSON array. The output is ALWAYS a syntactically valid JSON array
+/// (`finish` emits `]`, or `[]` when no chunk was seen) so a client that buffers and `JSON.parse`s
+/// the whole body still succeeds.
+pub(crate) struct GeminiJsonArrayFramer {
+    buf: Vec<u8>,
+    /// How far into `buf` the SSE terminator scan has already advanced (keeps `feed` linear; mirrors
+    /// `StreamTranslate::scanned`).
+    scanned: usize,
+    /// Whether the opening `[` (and, for every object after the first, the separating `,`) has been
+    /// emitted yet.
+    started: bool,
+    /// Set once `finish` has emitted the closing `]`, so a second `finish` is a no-op.
+    finished: bool,
+    /// Abandon the stream if the reassembly buffer grows past the cap with no complete frame.
+    aborted: bool,
+}
+
+impl GeminiJsonArrayFramer {
+    const MAX_BUF: usize = crate::eventstream::MAX_FRAME_BYTES;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            scanned: 0,
+            started: false,
+            finished: false,
+            aborted: false,
+        }
+    }
+
+    /// Feed a chunk of GEMINI SSE bytes; return JSON-array bytes for whatever complete SSE frames are
+    /// now available (empty if only a partial frame is buffered, or if the buffered frames carried no
+    /// data payload yet). Each emitted object is preceded by `[` (first) or `,` (subsequent).
+    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if self.aborted || self.finished {
+            return Vec::new();
+        }
+        self.buf.extend_from_slice(chunk);
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let search_from = self.scanned.saturating_sub(3).min(self.buf.len());
+            match find_frame_terminator(&self.buf[search_from..]) {
+                Some((rel, term_len)) => {
+                    let end = search_from + rel + term_len;
+                    let frame: Vec<u8> = self.buf.drain(..end).collect();
+                    self.scanned = 0;
+                    let Some((_event_type, data_str)) = parse_sse_frame(&frame) else {
+                        continue; // no data: line — keepalive/comment frame
+                    };
+                    if data_str.is_empty() || data_str == "[DONE]" {
+                        continue; // egress terminator/keepalive — the array close is finish()'s job
+                    }
+                    // Validate the payload is JSON before forwarding so a malformed frame cannot
+                    // corrupt the array; re-serialize from the parsed Value to normalize whitespace.
+                    let Ok(data) = serde_json::from_str::<serde_json::Value>(&data_str) else {
+                        continue;
+                    };
+                    if self.started {
+                        out.push(b',');
+                    } else {
+                        out.push(b'[');
+                        self.started = true;
+                    }
+                    out.extend_from_slice(data.to_string().as_bytes());
+                }
+                None => {
+                    self.scanned = self.buf.len();
+                    break;
+                }
+            }
+        }
+        if self.buf.len() > Self::MAX_BUF {
+            self.aborted = true;
+            self.buf.clear();
+            self.buf.shrink_to_fit();
+            self.scanned = 0;
+        }
+        out
+    }
+
+    /// Call once at end-of-stream. Emits the closing `]` (and the opening `[` too, as `[]`, when the
+    /// stream carried no chunk) so the body is always a complete, parseable JSON array.
+    pub(crate) fn finish(&mut self) -> Vec<u8> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        if self.started {
+            b"]".to_vec()
+        } else {
+            b"[]".to_vec()
+        }
     }
 }
 
@@ -1265,6 +1369,7 @@ mod tests {
         if let crate::ir::IrStreamEvent::MessageDelta {
             stop_reason: _,
             usage,
+            ..
         } = ev
         {
             assert_eq!(usage.input_tokens, 100);
@@ -1279,6 +1384,7 @@ mod tests {
 
         let roundtrip = writer.write_response_event(&crate::ir::IrStreamEvent::MessageDelta {
             stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 100,
                 output_tokens: 50,
@@ -2252,7 +2358,9 @@ mod tests {
                 );
             }
 
-            // 5. message_delta w/ usage
+            // 5. message_delta w/ usage, no matched stop_sequence (the common case). The source
+            // carried no `stop_sequence`, so the IR's `stop_sequence` is `None` and the writer omits
+            // the key — the round-trip stays byte-identical.
             let data = serde_json::json!({
                 "delta": {"stop_reason": "end_turn"},
                 "usage": {
@@ -2265,6 +2373,38 @@ mod tests {
             let ev = reader.read_response_event("message_delta", &data);
             assert!(ev.is_some());
             if let Some(e) = ev {
+                // The IR must carry stop_sequence = None for a delta whose wire had none.
+                if let crate::ir::IrStreamEvent::MessageDelta { stop_sequence, .. } = &e {
+                    assert_eq!(*stop_sequence, None);
+                } else {
+                    panic!("expected MessageDelta");
+                }
+                assert_eq!(
+                    writer.write_response_event(&e),
+                    Some(("message_delta".to_string(), data))
+                );
+            }
+
+            // 5b. message_delta WHERE a stop_sequence matched (`stop_reason: "stop_sequence"` carries
+            // the matched string). The reader now captures `stop_sequence` and the writer re-emits it,
+            // so this same-protocol round-trip is byte-faithful — previously the field was dropped.
+            let data = serde_json::json!({
+                "delta": {"stop_reason": "stop_sequence", "stop_sequence": "\n\nHuman:"},
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "cache_creation_input_tokens": 5,
+                    "cache_read_input_tokens": 15
+                }
+            });
+            let ev = reader.read_response_event("message_delta", &data);
+            assert!(ev.is_some());
+            if let Some(e) = ev {
+                if let crate::ir::IrStreamEvent::MessageDelta { stop_sequence, .. } = &e {
+                    assert_eq!(stop_sequence.as_deref(), Some("\n\nHuman:"));
+                } else {
+                    panic!("expected MessageDelta");
+                }
                 assert_eq!(
                     writer.write_response_event(&e),
                     Some(("message_delta".to_string(), data))
@@ -2313,6 +2453,7 @@ mod tests {
             if let crate::ir::IrStreamEvent::MessageDelta {
                 stop_reason: _,
                 usage,
+                ..
             } = ev
             {
                 // Assert each field == exact value (natural values only)
@@ -2439,6 +2580,7 @@ mod tests {
             // end_turn -> stop
             let ev1 = crate::ir::IrStreamEvent::MessageDelta {
                 stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
                 usage: crate::ir::IrUsage {
                     input_tokens: 0,
                     output_tokens: 0,
@@ -2458,6 +2600,7 @@ mod tests {
             // max_tokens -> length
             let ev2 = crate::ir::IrStreamEvent::MessageDelta {
                 stop_reason: Some("max_tokens".to_string()),
+                stop_sequence: None,
                 usage: crate::ir::IrUsage {
                     input_tokens: 0,
                     output_tokens: 0,
@@ -2477,6 +2620,7 @@ mod tests {
             // tool_use -> tool_calls
             let ev3 = crate::ir::IrStreamEvent::MessageDelta {
                 stop_reason: Some("tool_use".to_string()),
+                stop_sequence: None,
                 usage: crate::ir::IrUsage {
                     input_tokens: 0,
                     output_tokens: 0,
@@ -2617,6 +2761,7 @@ mod stream_fanout_tests {
                 IrStreamEvent::BlockStop { index: 0 },
                 IrStreamEvent::MessageDelta {
                     stop_reason: Some("end_turn".to_string()),
+                    stop_sequence: None,
                     usage: IrUsage {
                         input_tokens: 10,
                         output_tokens: 5,
@@ -2669,6 +2814,7 @@ mod stream_fanout_tests {
                 IrStreamEvent::BlockStop { index: 1 },
                 IrStreamEvent::MessageDelta {
                     stop_reason: Some("tool_use".to_string()),
+                    stop_sequence: None,
                     usage: IrUsage {
                         input_tokens: 0,
                         output_tokens: 0,
@@ -2740,6 +2886,38 @@ mod stream_fanout_tests {
 #[cfg(test)]
 mod stream_translate_tests {
     use super::*;
+
+    /// The gemini JSON-array framer turns gemini SSE `data:` frames into one streaming JSON array
+    /// (`[obj,obj,...]`). The concatenated output must be a syntactically valid JSON array whose
+    /// elements are the per-chunk payloads, in order.
+    #[test]
+    fn test_gemini_json_array_framer_basic() {
+        let mut f = GeminiJsonArrayFramer::new();
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(&f.feed(b"data: {\"candidates\":[{\"index\":0}]}\n\n"));
+        // A split frame yields nothing until the terminator arrives.
+        out.extend_from_slice(&f.feed(b"data: {\"candi"));
+        out.extend_from_slice(&f.feed(b"dates\":[{\"index\":1}]}\n\n"));
+        out.extend_from_slice(&f.finish());
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&out).expect("framer output must be a valid JSON array");
+        let arr = parsed.as_array().expect("must be an array");
+        assert_eq!(arr.len(), 2, "two chunks → two array elements");
+        assert_eq!(arr[0]["candidates"][0]["index"], 0);
+        assert_eq!(arr[1]["candidates"][0]["index"], 1);
+    }
+
+    /// An empty stream (no data frame) still finishes as a valid empty JSON array `[]`, and the
+    /// `[DONE]`/keepalive SSE sentinels are dropped (the array close is `finish`'s job).
+    #[test]
+    fn test_gemini_json_array_framer_empty_and_done() {
+        let mut f = GeminiJsonArrayFramer::new();
+        let mid = f.feed(b"data: [DONE]\n\n");
+        let end = f.finish();
+        let mut out = mid;
+        out.extend_from_slice(&end);
+        assert_eq!(out, b"[]", "empty stream → empty JSON array");
+    }
 
     /// Encode one AWS event-stream frame (`:event-type` string header + JSON payload) for tests.
     fn es_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
@@ -3974,7 +4152,10 @@ mod gemini_tests {
 
         assert!(matches!(events[4], IrStreamEvent::BlockStop { index: 0 }));
 
-        if let IrStreamEvent::MessageDelta { stop_reason, usage } = &events[5] {
+        if let IrStreamEvent::MessageDelta {
+            stop_reason, usage, ..
+        } = &events[5]
+        {
             assert_eq!(stop_reason.as_deref(), Some("end_turn"));
             assert_eq!(usage.input_tokens, 10);
             assert_eq!(usage.output_tokens, 5);
@@ -4023,6 +4204,7 @@ mod gemini_tests {
 
         let ev = IrStreamEvent::MessageDelta {
             stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 10,
                 output_tokens: 5,

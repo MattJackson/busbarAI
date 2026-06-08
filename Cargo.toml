@@ -12,11 +12,12 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.7"
 # Only the subsystems busbar actually touches: the multi-thread runtime (#[tokio::main],
-# spawn/JoinHandle), macros (main/test), net (TcpListener), time (sleep/interval), and sync
-# (Semaphore/OwnedSemaphorePermit). The "full" meta-feature additionally pulls fs/process/signal/
-# io-util/io-std/test-util — none referenced in src/ — so it is dropped to shrink the request-path
-# binary's compile + attack surface.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+# spawn/JoinHandle), macros (main/test), net (TcpListener), time (sleep/interval), sync
+# (Semaphore/OwnedSemaphorePermit), and signal (graceful-shutdown ctrl_c/SIGTERM, so OTLP spans
+# flush on exit). The "full" meta-feature additionally pulls fs/process/io-util/io-std/test-util —
+# none referenced in src/ — so it is dropped to shrink the request-path binary's compile + attack
+# surface.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

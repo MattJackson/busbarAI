@@ -392,6 +392,13 @@ impl ProtocolReader for AnthropicReader {
                     .get("stop_reason")
                     .and_then(|r| r.as_str())
                     .map(String::from);
+                // `message_delta.delta.stop_sequence` — the matched stop string, present (as a
+                // string) only when a stop sequence actually triggered the stop, `null`/absent
+                // otherwise. Carry it through so the same-protocol writer can re-emit it.
+                let stop_sequence = delta
+                    .get("stop_sequence")
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
                 let usage_val = data.get("usage")?;
                 let usage = IrUsage {
                     input_tokens: usage_val
@@ -409,7 +416,11 @@ impl ProtocolReader for AnthropicReader {
                         .get("cache_read_input_tokens")
                         .and_then(|v| v.as_u64()),
                 };
-                Some(IrStreamEvent::MessageDelta { stop_reason, usage })
+                Some(IrStreamEvent::MessageDelta {
+                    stop_reason,
+                    stop_sequence,
+                    usage,
+                })
             }
             "message_stop" => Some(IrStreamEvent::MessageStop),
             "error" => {
@@ -1094,12 +1105,23 @@ impl ProtocolWriter for AnthropicWriter {
                     serde_json::Value::Object(data_obj),
                 ))
             }
-            IrStreamEvent::MessageDelta { stop_reason, usage } => {
+            IrStreamEvent::MessageDelta {
+                stop_reason,
+                stop_sequence,
+                usage,
+            } => {
                 let mut delta_obj = serde_json::Map::new();
                 if let Some(reason) = stop_reason {
                     delta_obj.insert("stop_reason".to_string(), serde_json::json!(reason));
                 } else {
                     delta_obj.insert("stop_reason".to_string(), serde_json::Value::Null);
+                }
+                // `stop_sequence`: emit the matched stop string when the source carried one (a
+                // same-protocol Anthropic delta whose stop sequence actually fired). Omitted when
+                // `None` — both a native `null`/absent stop_sequence and any cross-protocol source —
+                // so we never add a field a non-Anthropic source's output never had.
+                if let Some(seq) = stop_sequence {
+                    delta_obj.insert("stop_sequence".to_string(), serde_json::json!(seq));
                 }
                 let mut usage_map = serde_json::Map::new();
                 usage_map.insert(

@@ -55,6 +55,12 @@ pub(crate) enum IrStreamEvent {
     },
     MessageDelta {
         stop_reason: Option<String>,
+        /// Anthropic's streaming `message_delta.delta.stop_sequence` — the matched stop string, or
+        /// `None` when no stop sequence matched (or the source protocol has no analog). Only the
+        /// Anthropic reader populates it and only the Anthropic writer emits it (and only when the
+        /// source carried it), so a same-protocol Anthropic passthrough stays byte-faithful while
+        /// other protocols' output is unchanged.
+        stop_sequence: Option<String>,
         usage: IrUsage,
     },
     MessageStop,

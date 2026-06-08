@@ -517,9 +517,51 @@ async fn main() {
         .await
         .unwrap_or_else(|e| die(format!("cannot bind listen address '{listen}': {e}")));
     tracing::info!(%listen, "busbar listening");
-    if let Err(e) = axum::serve(listener, router).await {
+    // Graceful shutdown: on ctrl_c (SIGINT) or SIGTERM, stop accepting new connections, let
+    // in-flight requests drain, then flush the OTLP tracer so the final (most diagnostic) spans are
+    // exported rather than dropped when the runtime tears down. The signal future is panic-free —
+    // a failed registration logs and parks forever (so a missing signal facility degrades to "no
+    // graceful shutdown", never a crash), and `shutdown_tracing()` is a no-op when OTLP is off.
+    let serve = axum::serve(listener, router).with_graceful_shutdown(shutdown_signal());
+    if let Err(e) = serve.await {
         die(format!("server error: {e}"));
     }
+    observability::shutdown_tracing();
+}
+
+/// Resolve when the process receives a shutdown signal (SIGINT/ctrl_c, or SIGTERM on Unix). Used as
+/// the `axum::serve(...).with_graceful_shutdown` future. Never panics: a signal-handler
+/// registration error is logged and the corresponding branch parks forever, so the other branch
+/// still triggers shutdown and a registration failure can never abort a worker.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "failed to install ctrl_c handler; SIGINT shutdown disabled");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGTERM handler; SIGTERM shutdown disabled");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received; draining in-flight requests");
 }
 
 /// Build the busbar HTTP router for a given `App` state. Factored out of `main` so the full

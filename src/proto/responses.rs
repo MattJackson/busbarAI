@@ -661,7 +661,12 @@ impl ProtocolReader for ResponsesReader {
                             cache_read_input_tokens: None,
                         });
 
-                    out.push(IrStreamEvent::MessageDelta { stop_reason, usage });
+                    out.push(IrStreamEvent::MessageDelta {
+                        stop_reason,
+                        // Responses API has no stop_sequence analog in its stream.
+                        stop_sequence: None,
+                        usage,
+                    });
                     out.push(IrStreamEvent::MessageStop);
                 } else {
                     // Terminal event with no nested `response` object. Whether completed, failed, or
@@ -675,7 +680,11 @@ impl ProtocolReader for ResponsesReader {
                         cache_creation_input_tokens: None,
                         cache_read_input_tokens: None,
                     };
-                    out.push(IrStreamEvent::MessageDelta { stop_reason, usage });
+                    out.push(IrStreamEvent::MessageDelta {
+                        stop_reason,
+                        stop_sequence: None,
+                        usage,
+                    });
                     out.push(IrStreamEvent::MessageStop);
                 }
             }
@@ -1149,7 +1158,11 @@ impl ProtocolWriter for ResponsesWriter {
                 }),
             )),
 
-            IrStreamEvent::MessageDelta { stop_reason, usage } => {
+            IrStreamEvent::MessageDelta {
+                stop_reason,
+                usage,
+                stop_sequence: _,
+            } => {
                 // Map IR stop reasons to Responses statuses. An unknown/None reason defaults to
                 // `completed` (the safe choice) rather than `failed`: a future IR reason (e.g. a
                 // new `refusal`) that did NOT explicitly signal an error must not be misclassified
@@ -1983,6 +1996,7 @@ mod tests {
         // MessageDelta{end_turn} → ("response.completed", status maps to completed)
         let ev2 = crate::ir::IrStreamEvent::MessageDelta {
             stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -2396,6 +2410,7 @@ mod tests {
         // Streaming MessageDelta path.
         let ev = crate::ir::IrStreamEvent::MessageDelta {
             stop_reason: Some("refusal".to_string()),
+            stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
                 output_tokens: 1,

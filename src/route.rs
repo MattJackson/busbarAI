@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -354,6 +354,10 @@ async fn ingress_body_model(
 /// `ingress_body_model`. Both injected fields are consumed downstream: `forward_with_pool` reads
 /// `"stream"` for the egress endpoint/translation and the per-protocol reader reads `"model"` for
 /// the IR. This is the only piece of "new code" the path-model protocols need.
+/// `gemini_json_array`: when `true` the route layer injects the gemini JSON-array streaming shim key
+/// (`__busbar_gemini_json_array`) so the streaming response builder emits the JSON-array framing a
+/// native non-`alt=sse` `:streamGenerateContent` request expects (instead of SSE). Always `false`
+/// for bedrock and for non-streaming / `?alt=sse` gemini requests.
 #[allow(clippy::too_many_arguments)]
 async fn ingress_path_model(
     app: &Arc<App>,
@@ -363,6 +367,7 @@ async fn ingress_path_model(
     body: Bytes,
     model: &str,
     stream: bool,
+    gemini_json_array: bool,
     proto: &'static str,
 ) -> Response {
     let caller_token = caller.0.as_deref();
@@ -386,6 +391,12 @@ async fn ingress_path_model(
         Some(obj) => {
             obj.insert("model".to_string(), Value::String(model.to_string()));
             obj.insert("stream".to_string(), Value::Bool(stream));
+            // Gemini-only: signal a non-`alt=sse` streaming request so the response is framed as a
+            // JSON array rather than SSE. The shim is stripped before the upstream call
+            // (`forward::strip_router_shim_keys`); cross-protocol egress drops it via the IR.
+            if gemini_json_array {
+                obj.insert("__busbar_gemini_json_array".to_string(), Value::Bool(true));
+            }
         }
         None => {
             return ingress_error(
@@ -541,6 +552,7 @@ pub(crate) async fn responses_ingress(
 pub(crate) async fn gemini_ingress(
     State(app): State<Arc<App>>,
     Path(rest): Path<String>,
+    RawQuery(query): RawQuery,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
     axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
     headers: HeaderMap,
@@ -578,7 +590,35 @@ pub(crate) async fn gemini_ingress(
         }
     };
 
-    ingress_path_model(&app, &gov, &caller, &headers, body, model, stream, "gemini").await
+    // `?alt=sse` selects SSE framing for a STREAMING request; its ABSENCE means the native client
+    // expects the JSON-array streaming format. `alt` is the documented Gemini query param; treat any
+    // `alt=sse` token in the raw query as the SSE request (matching the Gemini SDKs, which append
+    // exactly `?alt=sse`). The param is meaningless on a non-stream request, so only a streaming
+    // request without `alt=sse` engages the JSON-array framing.
+    let alt_sse = query.as_deref().map(query_has_alt_sse).unwrap_or(false);
+    let gemini_json_array = stream && !alt_sse;
+
+    ingress_path_model(
+        &app,
+        &gov,
+        &caller,
+        &headers,
+        body,
+        model,
+        stream,
+        gemini_json_array,
+        "gemini",
+    )
+    .await
+}
+
+/// True when the raw query string carries an `alt=sse` pair (the Gemini SSE-streaming selector).
+/// Scans `&`-separated `key=value` pairs so it is not fooled by another param whose value contains
+/// the substring `alt=sse`.
+fn query_has_alt_sse(query: &str) -> bool {
+    query
+        .split('&')
+        .any(|pair| matches!(pair.split_once('='), Some(("alt", "sse"))))
 }
 
 // POST /model/:modelId/converse — Bedrock Converse ingress (non-streaming). The model lives in the
@@ -633,7 +673,11 @@ async fn bedrock_ingress(
     model_id: &str,
     stream: bool,
 ) -> Response {
-    ingress_path_model(app, gov, caller, headers, body, model_id, stream, "bedrock").await
+    // Bedrock never uses the gemini JSON-array framing.
+    ingress_path_model(
+        app, gov, caller, headers, body, model_id, stream, false, "bedrock",
+    )
+    .await
 }
 
 /// Minimal percent-decoding for a single path segment (no external dependency). Decodes `%XX`
@@ -774,6 +818,21 @@ pub(crate) async fn adhoc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `query_has_alt_sse` recognizes the gemini SSE selector only as a genuine `alt=sse` pair, not
+    /// a substring of another param's value, and ignores order / other params.
+    #[test]
+    fn test_query_has_alt_sse() {
+        assert!(query_has_alt_sse("alt=sse"));
+        assert!(query_has_alt_sse("key=abc&alt=sse"));
+        assert!(query_has_alt_sse("alt=sse&key=abc"));
+        assert!(!query_has_alt_sse("alt=json"));
+        assert!(!query_has_alt_sse(""));
+        // Not fooled by a different param whose VALUE merely contains "alt=sse".
+        assert!(!query_has_alt_sse("foo=alt=sse"));
+        // `alt` with no value is not the SSE selector.
+        assert!(!query_has_alt_sse("alt"));
+    }
 
     /// Minimal governance-off App for exercising `finish` in isolation.
     fn minimal_app() -> Arc<App> {
@@ -1650,10 +1709,67 @@ mod tests {
     }
 
     /// MEDIUM/test-coverage: the `streamGenerateContent` action injects `stream:true` and routes to a
-    /// streaming backend. Routes gemini→openai (cross-protocol) so the request reaches the backend and
-    /// the response is SSE (text/event-stream) for the gemini SSE ingress contract.
+    /// streaming backend. WITH `?alt=sse` the gemini ingress contract is SSE (text/event-stream).
+    /// Routes gemini→openai (cross-protocol) so the request reaches the backend and is reframed.
     #[tokio::test]
-    async fn test_gemini_stream_generate_content_routes() {
+    async fn test_gemini_stream_generate_content_alt_sse_is_event_stream() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Sse {
+            events: openai_stream_events(),
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/v1beta/models/foo:streamGenerateContent?alt=sse"
+            ))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "contents": [{"role": "user", "parts": [{"text": "hello"}]}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "gemini :streamGenerateContent?alt=sse resolves and 2xx round-trips"
+        );
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "gemini streaming ingress WITH ?alt=sse is SSE-framed; got {ct}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// HIGH/conformance: a native gemini `:streamGenerateContent` request WITHOUT `?alt=sse` must
+    /// receive the JSON-ARRAY streaming format (`Content-Type: application/json`, a `[{...},{...}]`
+    /// body), NOT SSE. Routes gemini→openai (cross-protocol) so the upstream SSE is reframed to
+    /// gemini SSE by `StreamTranslate` and then to a JSON array by the framer; the body must parse
+    /// as a JSON array whose elements are gemini `GenerateContentResponse` objects.
+    #[tokio::test]
+    async fn test_gemini_stream_generate_content_no_alt_sse_is_json_array() {
         crate::metrics::init();
         let state = StdArc::new(MockServerState::new());
         state.push(MockResponse::Sse {
@@ -1685,11 +1801,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            resp.status().as_u16(),
-            200,
-            "gemini :streamGenerateContent resolves and 2xx round-trips"
-        );
+        assert_eq!(resp.status().as_u16(), 200, "no-alt=sse stream 2xx");
         let ct = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -1697,8 +1809,23 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("text/event-stream"),
-            "gemini streaming ingress is SSE-framed; got {ct}"
+            ct.starts_with("application/json"),
+            "gemini streaming ingress WITHOUT ?alt=sse is JSON-array framed; got {ct}"
+        );
+        let body = resp.text().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("JSON-array body must parse; got {body:?} ({e})"));
+        let arr = parsed
+            .as_array()
+            .unwrap_or_else(|| panic!("body must be a JSON array; got {body:?}"));
+        assert!(
+            !arr.is_empty(),
+            "array carries at least one chunk; got {body:?}"
+        );
+        // Each element is a gemini GenerateContentResponse (has `candidates`).
+        assert!(
+            arr.iter().any(|c| c.get("candidates").is_some()),
+            "at least one chunk is a gemini GenerateContentResponse; got {body:?}"
         );
         handle.abort();
         server.shutdown().await;
