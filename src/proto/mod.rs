@@ -1502,8 +1502,13 @@ mod tests {
             );
         }
 
-        // content_block_start for tool_use
+        // content_block_start for tool_use. Fixtures carry the top-level `type` field that native
+        // Anthropic SSE data bodies include and that `AnthropicWriter::write_response_event` now emits
+        // (the reader dispatches on the SSE `event:` header, not `data.type`, so the field is dropped
+        // on read and re-synthesized by the writer — exact-equality holds with `type` present in the
+        // fixture).
         let data = serde_json::json!({
+            "type": "content_block_start",
             "index": 0,
             "content_block": {
                 "type": "tool_use",
@@ -1522,6 +1527,7 @@ mod tests {
 
         // content_block_delta - text_delta
         let data = serde_json::json!({
+            "type": "content_block_delta",
             "index": 0,
             "delta": {
                 "type": "text_delta",
@@ -1539,6 +1545,7 @@ mod tests {
 
         // content_block_delta - thinking_delta
         let data = serde_json::json!({
+            "type": "content_block_delta",
             "index": 1,
             "delta": {
                 "type": "thinking_delta",
@@ -1556,6 +1563,7 @@ mod tests {
 
         // content_block_delta - input_json_delta
         let data = serde_json::json!({
+            "type": "content_block_delta",
             "index": 2,
             "delta": {
                 "type": "input_json_delta",
@@ -1573,6 +1581,7 @@ mod tests {
 
         // content_block_delta - signature_delta
         let data = serde_json::json!({
+            "type": "content_block_delta",
             "index": 1,
             "delta": {
                 "type": "signature_delta",
@@ -1589,7 +1598,7 @@ mod tests {
         }
 
         // content_block_stop
-        let data = serde_json::json!({ "index": 0 });
+        let data = serde_json::json!({ "type": "content_block_stop", "index": 0 });
         let ev = reader.read_response_event("content_block_stop", &data);
         assert!(ev.is_some());
         if let Some(e) = ev {
@@ -1601,6 +1610,7 @@ mod tests {
 
         // message_delta with usage
         let data = serde_json::json!({
+            "type": "message_delta",
             "delta": { "stop_reason": "end_turn" },
             "usage": {
                 "input_tokens": 10,
@@ -1619,7 +1629,7 @@ mod tests {
         }
 
         // message_stop
-        let data = serde_json::json!({});
+        let data = serde_json::json!({ "type": "message_stop" });
         let ev = reader.read_response_event("message_stop", &data);
         assert!(ev.is_some());
         if let Some(e) = ev {
@@ -2582,8 +2592,12 @@ mod tests {
                 );
             }
 
-            // 2. content_block_start tool_use
+            // 2. content_block_start tool_use. Fixtures carry the native top-level `type` field
+            // (matching the SSE `event:` header) that `AnthropicWriter` now emits; the reader drops it
+            // (it dispatches on the header, not `data.type`) and the writer re-synthesizes it, so the
+            // same-protocol round-trip stays byte-identical with `type` present in the fixture.
             let data = serde_json::json!({
+                "type": "content_block_start",
                 "index": 0,
                 "content_block": {
                     "type": "tool_use",
@@ -2602,6 +2616,7 @@ mod tests {
 
             // 3. content_block_delta ×4 delta kinds (text, thinking, input_json, signature)
             let text_data = serde_json::json!({
+                "type": "content_block_delta",
                 "index": 0,
                 "delta": {"type": "text_delta", "text": "hello"}
             });
@@ -2615,6 +2630,7 @@ mod tests {
             }
 
             let thinking_data = serde_json::json!({
+                "type": "content_block_delta",
                 "index": 1,
                 "delta": {"type": "thinking_delta", "thinking": "I need to think"}
             });
@@ -2628,6 +2644,7 @@ mod tests {
             }
 
             let json_data = serde_json::json!({
+                "type": "content_block_delta",
                 "index": 2,
                 "delta": {"type": "input_json_delta", "partial_json": "{\"loc"}
             });
@@ -2641,6 +2658,7 @@ mod tests {
             }
 
             let sig_data = serde_json::json!({
+                "type": "content_block_delta",
                 "index": 1,
                 "delta": {"type": "signature_delta", "signature": "sig_thinking_xyz"}
             });
@@ -2654,7 +2672,7 @@ mod tests {
             }
 
             // 4. content_block_stop
-            let data = serde_json::json!({"index": 0});
+            let data = serde_json::json!({"type": "content_block_stop", "index": 0});
             let ev = reader.read_response_event("content_block_stop", &data);
             assert!(ev.is_some());
             if let Some(e) = ev {
@@ -2668,6 +2686,7 @@ mod tests {
             // carried no `stop_sequence`, so the IR's `stop_sequence` is `None` and the writer omits
             // the key — the round-trip stays byte-identical.
             let data = serde_json::json!({
+                "type": "message_delta",
                 "delta": {"stop_reason": "end_turn"},
                 "usage": {
                     "input_tokens": 10,
@@ -2695,6 +2714,7 @@ mod tests {
             // the matched string). The reader now captures `stop_sequence` and the writer re-emits it,
             // so this same-protocol round-trip is byte-faithful — previously the field was dropped.
             let data = serde_json::json!({
+                "type": "message_delta",
                 "delta": {"stop_reason": "stop_sequence", "stop_sequence": "\n\nHuman:"},
                 "usage": {
                     "input_tokens": 10,
@@ -2718,7 +2738,7 @@ mod tests {
             }
 
             // 6. message_stop
-            let data = serde_json::json!({});
+            let data = serde_json::json!({"type": "message_stop"});
             let ev = reader.read_response_event("message_stop", &data);
             assert!(ev.is_some());
             if let Some(e) = ev {
@@ -3311,6 +3331,83 @@ mod stream_translate_tests {
             "text delta; got:\n{out}"
         );
         assert!(out.contains("message_stop"), "terminator; got:\n{out}");
+
+        // Finding 1 (delta-before-stop): Bedrock splits stop_reason (`messageStop`) from usage
+        // (`metadata`); the egress reader collapses them into ONE combined IR `MessageDelta` emitted
+        // BEFORE the terminal `MessageStop`. The Anthropic ingress writer must therefore emit
+        // `message_delta` BEFORE `message_stop` — the native non-eventstream order. (Before the fix
+        // the IR order was MessageStop-then-MessageDelta, so the writer emitted them reversed.)
+        let delta_pos = out.find("event: message_delta");
+        let stop_pos = out.find("event: message_stop");
+        assert!(
+            delta_pos.is_some() && stop_pos.is_some() && delta_pos < stop_pos,
+            "message_delta must precede message_stop (native order); got:\n{out}"
+        );
+
+        // Finding 2: each translated Anthropic SSE data body carries the native top-level `type`
+        // field matching its `event:` header. Assert it for the delta and the terminal stop produced
+        // on this cross-protocol path.
+        assert!(
+            out.contains("\"type\":\"message_delta\""),
+            "message_delta data body must carry top-level type; got:\n{out}"
+        );
+        assert!(
+            out.contains("\"type\":\"message_stop\""),
+            "message_stop data body must carry top-level type; got:\n{out}"
+        );
+        // The combined delta carries the usage that arrived in the Bedrock `metadata` frame.
+        assert!(
+            out.contains("\"input_tokens\":5") && out.contains("\"output_tokens\":2"),
+            "combined message_delta must carry the Bedrock metadata usage; got:\n{out}"
+        );
+    }
+
+    /// Finding 1 regression at the reader→writer level (independent of eventstream framing): the
+    /// Bedrock reader must emit the combined `MessageDelta` BEFORE the terminal `MessageStop`, so the
+    /// Anthropic writer maps them to `message_delta` then `message_stop` — the native order. Guards
+    /// against a reorder regressing back to MessageStop-then-MessageDelta (which made the Anthropic
+    /// ingress write `message_stop` first).
+    #[test]
+    fn test_bedrock_reader_emits_delta_before_stop_for_anthropic_ingress() {
+        use crate::ir::IrStreamEvent;
+        let reader = BedrockReader;
+        let writer = AnthropicWriter;
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        // The terminal pair of the Bedrock wire: `messageStop` (stop_reason) then `metadata` (usage).
+        let mut events: Vec<IrStreamEvent> = Vec::new();
+        events.extend(reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "messageStop", "stopReason": "end_turn"}),
+            &mut state,
+        ));
+        events.extend(reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "metadata", "usage": {"inputTokens": 5, "outputTokens": 2}}),
+            &mut state,
+        ));
+
+        // IR order: combined MessageDelta first, terminal MessageStop second.
+        assert!(
+            matches!(events.first(), Some(IrStreamEvent::MessageDelta { .. })),
+            "combined MessageDelta must come first; got {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(IrStreamEvent::MessageStop)),
+            "terminal MessageStop must come last; got {events:?}"
+        );
+
+        // The Anthropic writer maps that order to `message_delta` then `message_stop`.
+        let wire: Vec<String> = events
+            .iter()
+            .filter_map(|e| writer.write_response_event(e).map(|(et, _)| et))
+            .collect();
+        let delta_pos = wire.iter().position(|t| t == "message_delta");
+        let stop_pos = wire.iter().position(|t| t == "message_stop");
+        assert!(
+            delta_pos.is_some() && stop_pos.is_some() && delta_pos < stop_pos,
+            "Anthropic writer must emit message_delta before message_stop; got {wire:?}"
+        );
     }
 
     /// Bedrock *ingress* streaming: an Anthropic SSE backend stream → a native AWS SDK Bedrock

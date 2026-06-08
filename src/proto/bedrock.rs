@@ -618,28 +618,35 @@ impl ProtocolReader for BedrockReader {
                 // `metadata` arrives (see below). The combined delta is emitted from the `metadata`
                 // branch.
                 //
-                // The terminating MessageStop is still emitted here, on the wire-guaranteed terminal
-                // event, so a malformed/truncated upstream that ends after `messageStop` without a
-                // trailing `metadata` frame still terminates the downstream stream (the reader has no
-                // end-of-stream hook). In that truncated case the buffered stop_reason is simply
-                // dropped — exactly as usage was already dropped on a metadata-less stream — but the
-                // client still receives its terminal frame.
+                // The terminal `MessageStop` is also DEFERRED to the `metadata` branch and emitted
+                // AFTER the combined `MessageDelta`. The combined delta carries stop_reason + usage and
+                // must precede the terminal stop in IR order, so that a non-eventstream ingress writer
+                // (e.g. Anthropic) emits `message_delta` BEFORE `message_stop` — the native order. If
+                // the `MessageStop` were emitted here (on `messageStop`, which arrives BEFORE
+                // `metadata`), the IR order would be MessageStop-then-MessageDelta and the Anthropic
+                // ingress would write `message_stop` before `message_delta` — a wrong, detectable
+                // ordering. A bedrock->bedrock round-trip is unaffected: the `MessageStop` IR event
+                // maps to no wire frame (`BedrockWriter` returns `None`), and the combined delta is
+                // re-split into the native `messageStop` + `metadata` frame pair by `StreamTranslate`.
                 state.pending_stop_reason = data
                     .get("stopReason")
                     .and_then(|s| s.as_str())
                     .map(stop_reason_map);
-                out.push(IrStreamEvent::MessageStop);
             }
 
             Some("metadata") => {
-                // Usage trails the terminal MessageStop (Bedrock sends `metadata` after
-                // `messageStop`). Pair it with the stop_reason buffered from the preceding
-                // `messageStop` frame into ONE combined MessageDelta, so a cross-protocol ingress
-                // emits a single `message_delta`/usage event (native fidelity) rather than two. The
-                // terminal frame was already produced by the `messageStop` branch, so we do NOT emit
-                // a second MessageStop here. A bedrock->bedrock round-trip re-splits this combined
-                // delta back into the native `messageStop` + `metadata` frame pair in the writer
-                // (`BedrockWriter::write_response_event` fan-out, driven by `StreamTranslate`).
+                // Usage trails the stop reason (Bedrock sends `metadata` after `messageStop`). Pair it
+                // with the stop_reason buffered from the preceding `messageStop` frame into ONE
+                // combined MessageDelta, so a cross-protocol ingress emits a single `message_delta`/
+                // usage event (native fidelity) rather than two. A bedrock->bedrock round-trip re-splits
+                // this combined delta back into the native `messageStop` + `metadata` frame pair in the
+                // writer (`BedrockWriter::write_response_event` fan-out, driven by `StreamTranslate`).
+                //
+                // The terminal `MessageStop` is emitted HERE, AFTER the combined delta, so the IR order
+                // is delta-then-stop and the ingress writer emits its native `message_delta` then
+                // `message_stop` (Finding: delta-before-stop ordering). It is pushed unconditionally
+                // (even when `metadata` carries no `usage`) so the downstream stream always receives its
+                // terminal frame once `metadata` arrives.
                 if let Some(usage_obj) = data.get("usage").and_then(|u| u.as_object()) {
                     let usage = crate::ir::IrUsage {
                         input_tokens: usage_obj
@@ -660,6 +667,7 @@ impl ProtocolReader for BedrockReader {
                         usage,
                     });
                 }
+                out.push(IrStreamEvent::MessageStop);
             }
 
             // Bedrock-documented mid-stream exception event shapes. The ConverseStream wire can
@@ -1850,12 +1858,13 @@ mod tests {
         .flat_map(|data| reader.read_response_events("", &data, &mut state))
         .collect();
 
-        // Seven events: MessageStart, text BlockStart, 2×BlockDelta, BlockStop, the terminal
-        // MessageStop (from `messageStop`, which now only BUFFERS the stop_reason), and ONE combined
-        // MessageDelta{stop_reason, usage} (from `metadata`). Previously this was eight events because
-        // `messageStop` emitted a separate stop-only MessageDelta and `metadata` emitted a second
-        // usage-only one — two deltas, a tell for non-Bedrock ingress. The combined delta is now the
-        // single source of both stop_reason and usage (finding: combined MessageDelta).
+        // Seven events: MessageStart, text BlockStart, 2×BlockDelta, BlockStop, ONE combined
+        // MessageDelta{stop_reason, usage} (from `metadata`, which BUFFERS the stop_reason from the
+        // preceding `messageStop` frame), and the terminal MessageStop (also from `metadata`, emitted
+        // AFTER the delta). The combined delta precedes the terminal stop so a non-eventstream ingress
+        // (e.g. Anthropic) writes `message_delta` then `message_stop` — the native order (finding:
+        // delta-before-stop). Previously the order was stop-then-delta (MessageStop on `messageStop`,
+        // MessageDelta on `metadata`), which made the Anthropic ingress emit `message_stop` first.
         assert_eq!(events.len(), 7);
 
         match &events[0] {
@@ -1903,19 +1912,12 @@ mod tests {
             _ => panic!("event[4] should be BlockStop"),
         }
 
-        // The terminating MessageStop is emitted from the `messageStop` branch (the wire-guaranteed
-        // terminal event), so a missing/truncated `metadata` event can no longer leave the downstream
-        // stream without its terminal frame. The stop_reason is BUFFERED (not emitted here) so it can
-        // be combined with the usage that arrives on the next frame.
+        // The `metadata` event emits ONE combined MessageDelta carrying BOTH the buffered stop_reason
+        // (from the preceding `messageStop` frame) AND the real usage — a single
+        // `message_delta`-equivalent event, matching what a native non-Bedrock stream emits (finding:
+        // combined MessageDelta). It precedes the terminal MessageStop so the ingress writer emits the
+        // delta before the stop.
         match &events[5] {
-            IrStreamEvent::MessageStop => {}
-            _ => panic!("event[5] should be MessageStop"),
-        }
-
-        // The trailing `metadata` event emits ONE combined MessageDelta carrying BOTH the buffered
-        // stop_reason AND the real usage — a single `message_delta`-equivalent event, matching what a
-        // native non-Bedrock stream emits (finding: combined MessageDelta, no second delta).
-        match &events[6] {
             IrStreamEvent::MessageDelta {
                 stop_reason, usage, ..
             } => {
@@ -1924,8 +1926,16 @@ mod tests {
                 assert_eq!(usage.output_tokens, 5);
             }
             _ => {
-                panic!("event[6] should be the combined MessageDelta carrying stop_reason + usage")
+                panic!("event[5] should be the combined MessageDelta carrying stop_reason + usage")
             }
+        }
+
+        // The terminal MessageStop is emitted from the `metadata` branch AFTER the combined delta, so
+        // the IR order is delta-then-stop. The ingress writer therefore emits `message_delta` then the
+        // terminal `message_stop` — the native order a non-Bedrock stream carries.
+        match &events[6] {
+            IrStreamEvent::MessageStop => {}
+            _ => panic!("event[6] should be the terminal MessageStop"),
         }
     }
 
@@ -2070,11 +2080,19 @@ mod tests {
         assert!(raw.structured_type.is_none());
     }
 
-    /// Regression: a ConverseStream that ends after `messageStop` WITHOUT a trailing `metadata`
-    /// event (malformed/truncated upstream, or a provider variant) must still emit a terminal
-    /// MessageStop so the downstream client receives its terminator instead of hanging.
+    /// A ConverseStream that ends after `messageStop` WITHOUT a trailing `metadata` event
+    /// (malformed/truncated upstream) emits NO terminal MessageStop and NO combined MessageDelta:
+    /// both are deferred to the `metadata` frame so the combined `MessageDelta{stop_reason, usage}`
+    /// can precede the terminal `MessageStop` in IR order (Finding: delta-before-stop, so a
+    /// non-eventstream ingress writes `message_delta` then `message_stop` — the native order). The
+    /// stop_reason from `messageStop` is buffered but, absent the `metadata` it pairs with, is
+    /// dropped on truncation — exactly as token usage was already dropped on a metadata-less stream.
+    /// Native ConverseStream always sends `metadata` after `messageStop`; a genuine mid-stream
+    /// truncation also drops the downstream HTTP connection, so the client already sees a broken
+    /// stream rather than a clean terminator. Modeled mid-stream errors take the separate
+    /// `*Exception` → `IrStreamEvent::Error` path, which is unaffected.
     #[test]
-    fn test_stream_terminates_without_metadata() {
+    fn test_stream_metadata_less_defers_terminator() {
         use crate::ir::IrStreamEvent;
 
         let mut state = crate::ir::StreamDecodeState::default();
@@ -2095,17 +2113,22 @@ mod tests {
         .flat_map(|data| reader.read_response_events("", &data, &mut state))
         .collect();
 
+        // `messageStop` only BUFFERS the stop_reason now; without the trailing `metadata` neither the
+        // combined MessageDelta nor the terminal MessageStop is emitted.
         assert!(
-            events
+            !events
                 .iter()
                 .any(|e| matches!(e, IrStreamEvent::MessageStop)),
-            "a terminal MessageStop must be emitted even without a metadata event; got: {events:?}"
+            "no terminal MessageStop is emitted on a metadata-less stream (deferred to metadata); got: {events:?}"
         );
-        // The terminal MessageStop is the last event of the stream.
         assert!(
-            matches!(events.last(), Some(IrStreamEvent::MessageStop)),
-            "MessageStop must be the final event; got: {events:?}"
+            !events
+                .iter()
+                .any(|e| matches!(e, IrStreamEvent::MessageDelta { .. })),
+            "no combined MessageDelta is emitted without metadata; got: {events:?}"
         );
+        // The buffered stop_reason is retained in decode state (it would pair with `metadata`).
+        assert_eq!(state.pending_stop_reason.as_deref(), Some("end_turn"));
     }
 
     /// Exactly one terminal MessageStop is emitted across the full happy-path sequence

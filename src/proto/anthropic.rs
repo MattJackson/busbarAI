@@ -1068,6 +1068,11 @@ impl ProtocolWriter for AnthropicWriter {
                 }
                 msg_obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
                 let mut data_obj = serde_json::Map::new();
+                // Native Anthropic SSE data bodies carry a top-level `type` matching the SSE `event:`
+                // header (e.g. `{"type":"message_start",...}`). The SDK streaming decoder accepts the
+                // event off the header, but native parity (and any consumer that dispatches on
+                // `data.type`) requires the field — emit it on every event body.
+                data_obj.insert("type".to_string(), serde_json::json!("message_start"));
                 data_obj.insert("message".to_string(), serde_json::Value::Object(msg_obj));
                 Some((
                     "message_start".to_string(),
@@ -1090,6 +1095,7 @@ impl ProtocolWriter for AnthropicWriter {
                     }
                 };
                 let mut data_obj = serde_json::Map::new();
+                data_obj.insert("type".to_string(), serde_json::json!("content_block_start"));
                 data_obj.insert("index".to_string(), serde_json::json!(index));
                 data_obj.insert("content_block".to_string(), content_block);
                 Some((
@@ -1113,6 +1119,7 @@ impl ProtocolWriter for AnthropicWriter {
                     }
                 };
                 let mut data_obj = serde_json::Map::new();
+                data_obj.insert("type".to_string(), serde_json::json!("content_block_delta"));
                 data_obj.insert("index".to_string(), serde_json::json!(index));
                 data_obj.insert("delta".to_string(), delta_val);
                 Some((
@@ -1122,6 +1129,7 @@ impl ProtocolWriter for AnthropicWriter {
             }
             IrStreamEvent::BlockStop { index } => {
                 let mut data_obj = serde_json::Map::new();
+                data_obj.insert("type".to_string(), serde_json::json!("content_block_stop"));
                 data_obj.insert("index".to_string(), serde_json::json!(index));
                 Some((
                     "content_block_stop".to_string(),
@@ -1168,6 +1176,7 @@ impl ProtocolWriter for AnthropicWriter {
                     );
                 }
                 let mut data_obj = serde_json::Map::new();
+                data_obj.insert("type".to_string(), serde_json::json!("message_delta"));
                 data_obj.insert("delta".to_string(), serde_json::Value::Object(delta_obj));
                 data_obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
                 Some((
@@ -1175,7 +1184,10 @@ impl ProtocolWriter for AnthropicWriter {
                     serde_json::Value::Object(data_obj),
                 ))
             }
-            IrStreamEvent::MessageStop => Some(("message_stop".to_string(), serde_json::json!({}))),
+            IrStreamEvent::MessageStop => Some((
+                "message_stop".to_string(),
+                serde_json::json!({ "type": "message_stop" }),
+            )),
             IrStreamEvent::Error(err) => {
                 // Native Anthropic in-stream error event:
                 // `{"type":"error","error":{"type":<type>,"message":<msg>}}`. The SDK's streaming
