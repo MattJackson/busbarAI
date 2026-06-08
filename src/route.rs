@@ -88,6 +88,32 @@ async fn budget_check(
     None
 }
 
+/// Run the three governance guards (pool-allowed / over-budget / rate-limited) for a request that
+/// is about to be forwarded. Returns the protocol-native rejection response (403/402/429) already
+/// passed through `finish` — so a governance-rejected request still emits `REQUESTS_TOTAL`, the
+/// `REQUEST_DURATION_SECONDS` histogram, and the request-log webhook (no flat-fee charge: `finish`
+/// only bills 2xx). Returns `None` when every guard passes and the caller should proceed to
+/// resolve+forward. Without this, the early returns from `forward_resolved`/`named`/`adhoc` made
+/// every governance-rejected request invisible to Prometheus and the webhook (Round-3 finding).
+async fn governance_guard(
+    app: &Arc<App>,
+    gov: &crate::governance::GovCtx,
+    proto: &'static str,
+    pool: &str,
+    started: Instant,
+) -> Option<Response> {
+    if let Some(resp) = pool_authorized(gov, pool, proto) {
+        return Some(finish(app, gov, proto, pool, started, resp));
+    }
+    if let Some(resp) = budget_check(app, gov, proto).await {
+        return Some(finish(app, gov, proto, pool, started, resp));
+    }
+    if let Some(resp) = rate_check(app, gov, proto) {
+        return Some(finish(app, gov, proto, pool, started, resp));
+    }
+    None
+}
+
 /// reject (429 + Retry-After) before forwarding when the resolved virtual key is over
 /// its RPM/TPM for the current window. No-op when governance is off or the key has no rate cap.
 fn rate_check(app: &Arc<App>, gov: &crate::governance::GovCtx, proto: &str) -> Option<Response> {
@@ -177,7 +203,7 @@ fn ingress_error(proto: &str, status: StatusCode, kind: &str, message: &str) -> 
     match crate::proto::protocol_for(proto) {
         Some(p) => {
             let body = p.writer().write_error(status.as_u16(), kind, message);
-            (
+            let mut resp = (
                 status,
                 [(
                     axum::http::header::CONTENT_TYPE,
@@ -185,10 +211,86 @@ fn ingress_error(proto: &str, status: StatusCode, kind: &str, message: &str) -> 
                 )],
                 body.to_string(),
             )
-                .into_response()
+                .into_response();
+            // Bedrock ingress: a real AWS Bedrock runtime response ALWAYS carries an
+            // `x-amzn-RequestId` header (the only request-id surface the AWS SDK exposes via
+            // `request_id()`) and — for the JSON-1.1 error protocol — an `x-amzn-errortype` header
+            // equal to the body `__type`. A busbar-synthesized error (auth/validation/rate
+            // limit/exhaustion) that omits both is distinguishable from native Bedrock and leaves
+            // the SDK's request id empty. Attach them so the error is Bedrock-shaped end-to-end.
+            if proto == "bedrock" {
+                attach_bedrock_error_headers(&mut resp, kind);
+            }
+            resp
         }
         None => (status, message.to_string()).into_response(),
     }
+}
+
+/// Attach the `x-amzn-RequestId` and `x-amzn-errortype` headers a native AWS Bedrock error response
+/// always carries. `x-amzn-errortype` mirrors the body `__type` (via `error_kind_to_bedrock_type`,
+/// the single source of truth) so header and body agree. Best-effort: if entropy or header encoding
+/// fails we skip that header rather than panic — this runs on the request path.
+fn attach_bedrock_error_headers(resp: &mut Response, kind: &str) {
+    let headers = resp.headers_mut();
+    if let Some(id) = synth_amzn_request_id() {
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&id) {
+            headers.insert(axum::http::HeaderName::from_static("x-amzn-requestid"), hv);
+        }
+    }
+    let errortype = bedrock_errortype_for(kind);
+    if let Ok(hv) = axum::http::HeaderValue::from_str(errortype) {
+        headers.insert(axum::http::HeaderName::from_static("x-amzn-errortype"), hv);
+    }
+}
+
+/// Map a router error `kind` to the AWS Bedrock exception name used for the `x-amzn-errortype`
+/// header. Must stay in lock-step with the bedrock writer's body `__type`
+/// (`error_kind_to_bedrock_type` in `proto::bedrock`) so the header and the JSON body agree — the
+/// bedrock module is private to `proto`, so the mapping is mirrored here for the only `kind` values
+/// this router actually emits (`permission_error`/`insufficient_quota`/`rate_limit_error`/
+/// `not_found_error`/`invalid_request_error`), with the same generic `ValidationException` fallback.
+fn bedrock_errortype_for(kind: &str) -> &'static str {
+    match kind {
+        "invalid_request_error" | "invalid_request" | "validation" | "bad_request" => {
+            "ValidationException"
+        }
+        "rate_limit_error" | "rate_limit" | "too_many_requests" | "throttling" => {
+            "ThrottlingException"
+        }
+        "authentication_error" | "permission_error" | "auth" | "forbidden" | "unauthorized" => {
+            "AccessDeniedException"
+        }
+        "not_found" | "not_found_error" | "model_not_found" => "ResourceNotFoundException",
+        "timeout" | "model_timeout" => "ModelTimeoutException",
+        "overloaded_error" | "service_unavailable" | "unavailable" => "ServiceUnavailableException",
+        "quota_exceeded" | "service_quota_exceeded" | "insufficient_quota" => {
+            "ServiceQuotaExceededException"
+        }
+        "api_error" | "internal_error" | "server_error" => "InternalServerException",
+        _ => "ValidationException",
+    }
+}
+
+/// Mint a UUID-v4-shaped request id (`8-4-4-4-12` lowercase hex) for `x-amzn-RequestId`. Uses the
+/// OS CSPRNG; returns `None` (so the caller simply omits the header) if entropy is unavailable —
+/// this is on the request path, so it must never panic the way key-minting may.
+fn synth_amzn_request_id() -> Option<String> {
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).ok()?;
+    // RFC 4122 v4 layout (version + variant bits) so the value is a well-formed UUID.
+    buf[6] = (buf[6] & 0x0f) | 0x40;
+    buf[8] = (buf[8] & 0x3f) | 0x80;
+    let h = |b: u8| format!("{b:02x}");
+    let s: String = buf.iter().map(|b| h(*b)).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &s[0..8],
+        &s[8..12],
+        &s[12..16],
+        &s[16..20],
+        &s[20..32]
+    ))
 }
 
 /// Shared ingress core for the BODY-MODEL protocols (`openai`, `cohere`, `responses`): the model
@@ -334,16 +436,9 @@ async fn forward_resolved(
     caller_token: Option<&str>,
     started: Instant,
 ) -> Response {
-    // enforce the virtual key's allowed-pools against the requested model/pool.
-    if let Some(resp) = pool_authorized(gov, model, proto) {
-        return resp;
-    }
-    // reject over-budget keys before forwarding.
-    if let Some(resp) = budget_check(app, gov, proto).await {
-        return resp;
-    }
-    // reject rate-limited keys before forwarding.
-    if let Some(resp) = rate_check(app, gov, proto) {
+    // Governance guards (pool-allowed / budget / rate). A rejection is finished through `finish`
+    // so it is still counted in metrics and the request-log webhook.
+    if let Some(resp) = governance_guard(app, gov, proto, model, started).await {
         return resp;
     }
 
@@ -518,9 +613,17 @@ pub(crate) async fn bedrock_converse_stream(
     bedrock_ingress(&app, &gov, &caller, &headers, body, &model_id, true).await
 }
 
-/// Shared body for both Bedrock ingress routes: URL-decode the `modelId` path segment (Bedrock
-/// model ids carry `.`/`:` and the AWS SDK percent-encodes them in the path) then delegate to the
-/// path-model core with the route-selected stream intent.
+/// Shared body for both Bedrock ingress routes: delegate to the path-model core with the
+/// route-selected stream intent.
+///
+/// The `modelId` path segment arrives ALREADY percent-decoded: axum 0.7 runs
+/// `PercentDecodedStr` on every `Path` param before the handler is called (axum-0.7.9
+/// `src/routing/url_params.rs` → `util.rs`), so an AWS SDK's `%3A`-encoded colon is already a
+/// literal `:` here. Re-decoding (the previous `percent_decode(model_id)` call) was wrong: it was a
+/// harmless no-op for today's Bedrock id shapes (which contain `:`/`/`/`.` but no surviving `%`),
+/// but a model id whose first (axum) decode legitimately yielded a literal `%XX` sequence would be
+/// corrupted by a second pass. We therefore use axum's decoded value verbatim. (`percent_decode`
+/// remains as a tested helper for any caller that holds a still-encoded segment.)
 async fn bedrock_ingress(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
@@ -530,15 +633,17 @@ async fn bedrock_ingress(
     model_id: &str,
     stream: bool,
 ) -> Response {
-    // URL-decode the model id. On a malformed percent-encoding, fall back to the raw segment rather
-    // than failing — a raw (already-decoded) id is the common case and still resolves.
-    let model = percent_decode(model_id);
-    ingress_path_model(app, gov, caller, headers, body, &model, stream, "bedrock").await
+    ingress_path_model(app, gov, caller, headers, body, model_id, stream, "bedrock").await
 }
 
 /// Minimal percent-decoding for a single path segment (no external dependency). Decodes `%XX`
-/// escapes as UTF-8; on any malformed escape it leaves the bytes as-is. Used to recover a Bedrock
-/// `modelId` (e.g. `anthropic.claude-3%3A0`) from the URL path.
+/// escapes as UTF-8; on any malformed escape it leaves the bytes as-is.
+///
+/// No longer on the request path: axum percent-decodes `Path` params before the handler runs, so
+/// `bedrock_ingress` uses the already-decoded segment directly (decoding twice corrupts ids whose
+/// first decode yields a literal `%XX`). Retained as a `#[cfg(test)]` helper documenting the
+/// decode semantics and guarding against accidental reintroduction of a double-decode.
+#[cfg(test)]
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -571,21 +676,14 @@ pub(crate) async fn named(
 ) -> Response {
     // Caller's bearer token (for passthrough-mode forwarding); None falls back to the lane's key.
     let caller_token = caller.0.as_deref();
-
-    // enforce the virtual key's allowed-pools against the named pool/model.
-    if let Some(resp) = pool_authorized(&gov, &name, "anthropic") {
-        return resp;
-    }
-    // reject over-budget keys before forwarding.
-    if let Some(resp) = budget_check(&app, &gov, "anthropic").await {
-        return resp;
-    }
-    // reject rate-limited keys before forwarding.
-    if let Some(resp) = rate_check(&app, &gov, "anthropic") {
-        return resp;
-    }
-
+    // `started` is taken BEFORE the governance guards so a governance-rejected request still
+    // records a (small) wall-clock duration and is counted via `finish`.
     let started = Instant::now();
+
+    // Governance guards (pool-allowed / budget / rate); a rejection is finished through `finish`.
+    if let Some(resp) = governance_guard(&app, &gov, "anthropic", &name, started).await {
+        return resp;
+    }
 
     if let Some(cands) = app.pools.get(&name) {
         let affinity_key = headers
@@ -637,16 +735,8 @@ pub(crate) async fn adhoc(
     let caller_token = caller.0.as_deref();
     let started = Instant::now();
 
-    // enforce the virtual key's allowed-pools against the ad-hoc model target.
-    if let Some(resp) = pool_authorized(&gov, &model, "anthropic") {
-        return resp;
-    }
-    // reject over-budget keys before forwarding.
-    if let Some(resp) = budget_check(&app, &gov, "anthropic").await {
-        return resp;
-    }
-    // reject rate-limited keys before forwarding.
-    if let Some(resp) = rate_check(&app, &gov, "anthropic") {
+    // Governance guards (pool-allowed / budget / rate); a rejection is finished through `finish`.
+    if let Some(resp) = governance_guard(&app, &gov, "anthropic", &model, started).await {
         return resp;
     }
 
@@ -1781,5 +1871,628 @@ mod tests {
             "404 carries the canonical OpenAI not_found_error type; got {body}"
         );
         handle.abort();
+    }
+
+    // ---- MEDIUM/correctness: governance-rejection requests must still be `finish`ed ----
+
+    /// Build a governance-enabled App whose only key is allowed ONLY on pool `allowed-only` (so a
+    /// request to any other pool is pool-rejected with 403). Returns the key for the GovCtx.
+    fn governed_app_pool_restricted() -> (Arc<App>, crate::governance::VirtualKey) {
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 30, 0, None).unwrap());
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "restricted".to_string(),
+                    allowed_pools: vec!["allowed-only".to_string()],
+                    max_budget_cents: Some(100_000),
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .unwrap();
+        let mut app = minimal_app();
+        Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov);
+        (app, key)
+    }
+
+    /// A pool-authorization rejection (403) must flow through `finish`, so it is counted in
+    /// `REQUESTS_TOTAL` (as `outcome=client_error`) and the duration histogram — not silently
+    /// early-returned. Regression for the Round-3 finding that governance rejections bypassed
+    /// `finish` and were invisible to Prometheus / the request-log webhook.
+    #[tokio::test]
+    async fn test_governance_rejection_is_counted_via_finish() {
+        crate::metrics::init();
+        let (app, key) = governed_app_pool_restricted();
+        let gov = crate::governance::GovCtx {
+            key: Some(key.clone()),
+        };
+
+        // Request a pool the key is NOT allowed on → 403, and the guard returns Some(response).
+        let rejected = governance_guard(&app, &gov, "openai", "denied-pool", Instant::now())
+            .await
+            .expect("a disallowed pool must be rejected by the governance guard");
+        assert_eq!(
+            rejected.status(),
+            StatusCode::FORBIDDEN,
+            "pool-not-allowed ⇒ 403"
+        );
+
+        // The rejection went through `finish`: a client_error outcome is now in the scrape.
+        let scrape = crate::metrics::render();
+        assert!(
+            scrape.contains(crate::metrics::REQUESTS_TOTAL),
+            "governance rejection still emits requests_total; got:\n{scrape}"
+        );
+        assert!(
+            scrape.contains("outcome=\"client_error\""),
+            "a 403 governance rejection maps to outcome=client_error; got:\n{scrape}"
+        );
+        assert!(
+            scrape.contains(crate::metrics::REQUEST_DURATION_SECONDS),
+            "governance rejection still emits the duration histogram; got:\n{scrape}"
+        );
+
+        // No flat fee is charged for a rejected (non-2xx) request.
+        assert_eq!(
+            key_spend(&app, &key.id),
+            0,
+            "a governance-rejected request charges no flat fee"
+        );
+    }
+
+    /// When the key is allowed on the requested pool (and within budget/rate), the guard returns
+    /// `None` so the caller proceeds to resolve+forward.
+    #[tokio::test]
+    async fn test_governance_guard_passes_when_allowed() {
+        crate::metrics::init();
+        let (app, key) = governed_app_pool_restricted();
+        let gov = crate::governance::GovCtx {
+            key: Some(key.clone()),
+        };
+        let passed = governance_guard(&app, &gov, "openai", "allowed-only", Instant::now()).await;
+        assert!(
+            passed.is_none(),
+            "an allowed, in-budget, in-rate request is not rejected"
+        );
+    }
+
+    // ---- MEDIUM/conformance: bedrock ingress errors carry the x-amzn-* native headers ----
+
+    /// `ingress_error("bedrock", ...)` must attach `x-amzn-RequestId` (a UUID-shaped value) and
+    /// `x-amzn-errortype` (equal to the body `__type`), matching what a real AWS Bedrock runtime
+    /// error response always carries. Regression for the finding that busbar-synthesized Bedrock
+    /// errors had no `x-amzn-*` headers and left the SDK's request id empty.
+    #[test]
+    fn test_bedrock_ingress_error_has_amzn_headers() {
+        let resp = ingress_error(
+            "bedrock",
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "router: unknown model 'x'",
+        );
+        let req_id = resp
+            .headers()
+            .get("x-amzn-requestid")
+            .and_then(|h| h.to_str().ok())
+            .expect("bedrock error carries x-amzn-RequestId");
+        // UUID-v4 shape: 8-4-4-4-12 lowercase hex.
+        let segs: Vec<&str> = req_id.split('-').collect();
+        assert_eq!(segs.len(), 5, "request id is dash-grouped: {req_id}");
+        assert_eq!(
+            segs.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12],
+            "request id is UUID-shaped: {req_id}"
+        );
+        assert!(
+            req_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "request id is hex: {req_id}"
+        );
+        let errortype = resp
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|h| h.to_str().ok())
+            .expect("bedrock error carries x-amzn-errortype");
+        assert_eq!(
+            errortype, "ResourceNotFoundException",
+            "x-amzn-errortype maps not_found_error → ResourceNotFoundException"
+        );
+    }
+
+    /// The `x-amzn-errortype` header must agree with the body `__type` for the kinds this router
+    /// emits, and a NON-bedrock protocol must NOT get the `x-amzn-*` headers (they are a Bedrock
+    /// tell only).
+    #[test]
+    fn test_bedrock_errortype_header_matches_body_and_others_omit() {
+        for (kind, status, expected) in [
+            (
+                "invalid_request_error",
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+            ),
+            (
+                "rate_limit_error",
+                StatusCode::TOO_MANY_REQUESTS,
+                "ThrottlingException",
+            ),
+            (
+                "permission_error",
+                StatusCode::FORBIDDEN,
+                "AccessDeniedException",
+            ),
+            (
+                "insufficient_quota",
+                StatusCode::PAYMENT_REQUIRED,
+                "ServiceQuotaExceededException",
+            ),
+        ] {
+            let resp = ingress_error("bedrock", status, kind, "m");
+            let hdr = resp
+                .headers()
+                .get("x-amzn-errortype")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+            assert_eq!(hdr, expected, "x-amzn-errortype for kind {kind}");
+            assert_eq!(
+                bedrock_errortype_for(kind),
+                expected,
+                "header mapping for {kind}"
+            );
+        }
+        // An OpenAI-ingress error must not carry the Bedrock-only headers.
+        let openai = ingress_error("openai", StatusCode::NOT_FOUND, "not_found_error", "m");
+        assert!(
+            openai.headers().get("x-amzn-requestid").is_none(),
+            "non-bedrock protocol does not emit x-amzn-RequestId"
+        );
+        assert!(
+            openai.headers().get("x-amzn-errortype").is_none(),
+            "non-bedrock protocol does not emit x-amzn-errortype"
+        );
+    }
+
+    // ---- MEDIUM/test-coverage: 400 native error envelopes on the new ingress routes ----
+
+    /// Bad JSON on a Cohere `/v2/chat` request ⇒ 400 with the Cohere-native error envelope
+    /// (`{"message": ...}`), served as application/json — not a plain-text 400 or a foreign shape.
+    #[tokio::test]
+    async fn test_cohere_bad_json_is_400_native_envelope() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v2/chat"))
+            .bearer_auth("t")
+            .body("not json{".to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "cohere bad json ⇒ 400");
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "cohere error is JSON; got {ct}"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body.get("message").is_some(),
+            "cohere native error envelope has a message field; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Bad JSON on a Responses `/v1/responses` request ⇒ 400 with the Responses/OpenAI-native
+    /// error envelope (`{"error":{"type":...}}`).
+    #[tokio::test]
+    async fn test_responses_bad_json_is_400_native_envelope() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/responses"))
+            .bearer_auth("t")
+            .body("not json{".to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "responses bad json ⇒ 400");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body.get("error").and_then(|e| e.get("type")).is_some(),
+            "responses native error envelope has error.type; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// An OpenAI `/v1/chat/completions` body that omits `model` ⇒ 400 with the OpenAI-native error
+    /// envelope (`{"error":{"type":"invalid_request_error",...}}`).
+    #[tokio::test]
+    async fn test_openai_missing_model_is_400_native_envelope() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("t")
+            .body(json!({"messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "missing model ⇒ 400");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("invalid_request_error"),
+            "missing-model 400 carries the OpenAI invalid_request_error type; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// A top-level JSON ARRAY body to a Gemini ingress path hits the non-object branch in
+    /// `ingress_path_model` and must return a Gemini-native 400 (not panic, not 500). Gemini's
+    /// envelope is `{"error":{"code":...,"status":...}}`.
+    #[tokio::test]
+    async fn test_gemini_non_object_body_is_400() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1beta/models/foo:generateContent"))
+            .bearer_auth("t")
+            .body(json!([1, 2]).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "gemini non-object body ⇒ 400 (not panic/500)"
+        );
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "gemini error is JSON; got {ct}"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body.get("error").and_then(|e| e.get("code")).is_some(),
+            "gemini native error envelope has error.code; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// A top-level JSON ARRAY body to a Bedrock ingress path hits the non-object branch and must
+    /// return a Bedrock-native 400 (`{"__type":"ValidationException",...}`) plus the x-amzn-*
+    /// headers — not a panic or a 500.
+    #[tokio::test]
+    async fn test_bedrock_non_object_body_is_400() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/model/foo/converse"))
+            .bearer_auth("t")
+            .body(json!([1, 2]).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "bedrock non-object body ⇒ 400 (not panic/500)"
+        );
+        assert!(
+            resp.headers().get("x-amzn-errortype").is_some(),
+            "bedrock 400 still carries x-amzn-errortype"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("__type").and_then(|t| t.as_str()),
+            Some("ValidationException"),
+            "bedrock non-object body ⇒ ValidationException; got {body}"
+        );
+        handle.abort();
+    }
+
+    // ---- MEDIUM/test-coverage: unknown-model 404 native envelope per protocol ----
+
+    /// Gemini unknown-model 404 must carry the Gemini-native NOT_FOUND envelope
+    /// (`error.status == "NOT_FOUND"`), produced by `forward_resolved`'s resolution-miss path.
+    #[tokio::test]
+    async fn test_gemini_unknown_model_404_native_shape() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/v1beta/models/no-such:generateContent"
+            ))
+            .bearer_auth("t")
+            .body(json!({"contents": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 404, "gemini unknown model ⇒ 404");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("status"))
+                .and_then(|s| s.as_str()),
+            Some("NOT_FOUND"),
+            "gemini 404 carries error.status NOT_FOUND; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Bedrock unknown-model 404 must carry the Bedrock-native `ResourceNotFoundException` body and
+    /// the x-amzn-* headers.
+    #[tokio::test]
+    async fn test_bedrock_unknown_model_404_native_shape() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/model/no-such/converse"))
+            .bearer_auth("t")
+            .body(json!({"messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 404, "bedrock unknown model ⇒ 404");
+        assert_eq!(
+            resp.headers()
+                .get("x-amzn-errortype")
+                .and_then(|h| h.to_str().ok()),
+            Some("ResourceNotFoundException"),
+            "bedrock 404 x-amzn-errortype is ResourceNotFoundException"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("__type").and_then(|t| t.as_str()),
+            Some("ResourceNotFoundException"),
+            "bedrock 404 body __type is ResourceNotFoundException; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Cohere unknown-model 404 must carry the Cohere-native envelope (`{"message": ...}`).
+    #[tokio::test]
+    async fn test_cohere_unknown_model_404_native_shape() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v2/chat"))
+            .bearer_auth("t")
+            .body(json!({"model": "no-such-model", "messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 404, "cohere unknown model ⇒ 404");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body.get("message").and_then(|m| m.as_str()).is_some(),
+            "cohere 404 carries a native message field; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Responses unknown-model 404 must carry the OpenAI-identical envelope
+    /// (`{"error":{"type":"not_found_error",...}}`).
+    #[tokio::test]
+    async fn test_responses_unknown_model_404_native_shape() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/responses"))
+            .bearer_auth("t")
+            .body(json!({"model": "no-such-model", "input": "hi"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 404, "responses unknown model ⇒ 404");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("not_found_error"),
+            "responses 404 carries not_found_error type; got {body}"
+        );
+        handle.abort();
+    }
+
+    // ---- HIGH/test-coverage: streaming integration for Cohere and Responses ingress ----
+
+    /// A Cohere `/v2/chat` request with `"stream": true` must return `Content-Type:
+    /// text/event-stream` and an SSE body with at least one `data:` line. Routes cohere→openai
+    /// (cross-protocol) so the full ingress→forward→SSE-output reframe runs.
+    #[tokio::test]
+    async fn test_cohere_ingress_stream_returns_sse() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Sse {
+            events: openai_stream_events(),
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("co", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("co", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v2/chat"))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "model": "co",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "hello"}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "cohere stream ⇒ 200");
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "cohere streaming ingress is SSE; got {ct}"
+        );
+        let body = resp.bytes().await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("data:"),
+            "cohere SSE body has at least one data: line; got:\n{text}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// A Responses `/v1/responses` request with `"stream": true` must return SSE framing with a
+    /// `data:` body. Routes responses→openai (cross-protocol).
+    #[tokio::test]
+    async fn test_responses_ingress_stream_returns_sse() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Sse {
+            events: openai_stream_events(),
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("re", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("re", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/responses"))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "model": "re",
+                    "stream": true,
+                    "input": "hello"
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "responses stream ⇒ 200");
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "responses streaming ingress is SSE; got {ct}"
+        );
+        let body = resp.bytes().await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("data:"),
+            "responses SSE body has at least one data: line; got:\n{text}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    // ---- MEDIUM/test-coverage: percent-encoded Bedrock model id end-to-end ----
+
+    /// A percent-encoded Bedrock model id (`anthropic.claude-3%3Ahaiku` → `anthropic.claude-3:haiku`)
+    /// must be decoded by axum, resolved, and the converse-stream response re-encoded as a binary
+    /// AWS eventstream. This exercises the real HTTP decode + routing + binary re-encode end-to-end
+    /// (the unit `percent_decode` tests bypass axum's own first decode).
+    #[tokio::test]
+    async fn test_bedrock_percent_encoded_model_id_converse_stream() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Sse {
+            events: openai_stream_events(),
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+        // The lane is named with the DECODED colon-bearing id so a correct end-to-end decode is the
+        // only way it resolves.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "anthropic.claude-3:haiku",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("anthropic.claude-3:haiku", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/model/anthropic.claude-3%3Ahaiku/converse-stream"
+            ))
+            .bearer_auth("t")
+            .body(json!({"messages": [{"role": "user", "content": [{"text": "hi"}]}]}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "percent-encoded model id decodes, resolves, and 2xx round-trips"
+        );
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/vnd.amazon.eventstream"),
+            "decoded model resolves to a binary eventstream; got {ct}"
+        );
+        let body = resp.bytes().await.unwrap();
+        let mut buf = body.to_vec();
+        let frames = crate::eventstream::drain_frames(&mut buf);
+        assert!(
+            !frames.is_empty(),
+            "at least one binary eventstream frame decodes for the percent-encoded model"
+        );
+        handle.abort();
+        server.shutdown().await;
     }
 }

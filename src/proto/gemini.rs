@@ -110,6 +110,12 @@ impl ProtocolReader for GeminiReader {
         let mut extra = serde_json::Map::new();
         let mut system_blocks: Vec<crate::ir::IrBlock> = Vec::new();
 
+        // Per-request tool-call index. Gemini `functionCall` parts carry no id, so we synthesize a
+        // deterministic, non-empty one (see `synth_tool_call_id`). The index makes each synthesized
+        // id distinct even when two calls in the same request share a function name, so a downstream
+        // Anthropic/OpenAI egress block gets a unique, non-empty `id`/`tool_use_id`.
+        let mut tool_call_index: usize = 0;
+
         // Handle systemInstruction (Gemini uses this for system content)
         if let Some(sys_instr) = obj.get("systemInstruction") {
             if let Some(parts_arr) = sys_instr.get("parts").and_then(|p| p.as_array()) {
@@ -167,8 +173,14 @@ impl ProtocolReader for GeminiReader {
                                 .get("args")
                                 .cloned()
                                 .unwrap_or(serde_json::Value::Null);
+                            // Gemini carries no tool-call id; synthesize a stable, non-empty one
+                            // keyed by (index, name). The Gemini writer ignores the ToolUse `id`
+                            // (it round-trips `name`), so this is safe for same-protocol passthrough
+                            // and gives cross-protocol Anthropic/OpenAI egress a non-empty id.
+                            let id = synth_tool_call_id(tool_call_index, &name);
+                            tool_call_index += 1;
                             msg_content.push(crate::ir::IrBlock::ToolUse {
-                                id: String::new(),
+                                id,
                                 name,
                                 input: args,
                             });
@@ -188,14 +200,16 @@ impl ProtocolReader for GeminiReader {
                             let response_text = serde_json::to_string(&response_val)
                                 .unwrap_or_else(|_| "unknown".to_string());
                             // ACCEPTED GEMINI-PROTOCOL LIMITATION: a Gemini `functionResponse`
-                            // carries only a `name` (no call id), and the corresponding
-                            // `functionCall` ToolUse blocks are themselves read with an empty id
-                            // (`id: String::new()` above), so there is no id to correlate back to.
-                            // We therefore set `tool_use_id` to the function name — the only stable
-                            // correlation key Gemini provides. Cross-protocol egress (Anthropic
-                            // `tool_use_id` / OpenAI `tool_call_id`) that correlates strictly by id
-                            // will see the name; same-protocol Gemini passthrough is unaffected
-                            // because the writer round-trips `name` back into `functionResponse.name`.
+                            // carries only a `name` (no call id). We set `tool_use_id` to the
+                            // function name — the only correlation handle Gemini provides on the
+                            // RESULT side. This is deliberate and load-bearing for SAME-PROTOCOL
+                            // (Gemini→Gemini) passthrough: the writer round-trips `tool_use_id`
+                            // straight back into `functionResponse.name`, so it MUST stay the name
+                            // (NOT the synthetic id we mint for the `functionCall` ToolUse above —
+                            // the writer ignores the ToolUse `id`, so synthesizing it there is safe,
+                            // but it must not leak onto the result name here). Cross-protocol egress
+                            // that correlates strictly by id is the pre-existing Gemini limitation:
+                            // the result still carries the name as its handle.
                             msg_content.push(crate::ir::IrBlock::ToolResult {
                                 tool_use_id: name,
                                 content: vec![crate::ir::IrBlock::Text {
@@ -284,20 +298,28 @@ impl ProtocolReader for GeminiReader {
         // the explicit pre-insert below (preventing the silent duplicate insert the loop used to
         // perform, which would be discarded the moment the two writes ever diverged).
         //
-        // `stream` is deliberately NOT modeled here. The writer never injects a `stream` member
-        // unconditionally any more (the native GenerateContentRequest has no such field — streaming
-        // is URL-selected), so the only way `stream` reaches the wire is if the SOURCE request
-        // literally carried it: such a value is preserved verbatim through `extra` and echoed back,
-        // making a read→write round-trip lossless. A native Gemini client never sends `stream`, so
-        // for real traffic `extra` carries no `stream` and the egress body carries none either —
-        // the indistinguishability goal. `IrRequest.stream` (captured above) is read ONLY by
-        // path-selection (`upstream_path_for_stream`), never serialised into the body.
+        // `stream` is NOT in `modeled_keys` and therefore, when the SOURCE body carries it, it IS
+        // preserved through `extra` and echoed back by the writer — exactly mirroring how `model`
+        // (also captured into a typed field) is round-tripped, so a read→write of a body that
+        // carried `stream` stays byte-identical. `IrRequest.stream` (captured above) is read ONLY by
+        // path-selection (`upstream_path_for_stream`) and is the source of truth for the URL choice;
+        // the `extra` copy exists purely for round-trip fidelity. Two distinct cases reach the wire:
+        //   * Same-protocol Gemini→Gemini: `forward::strip_router_shim_keys` removes `model`/`stream`
+        //     from the egress body before the upstream call, so the router-injected shim never lands
+        //     on a real Gemini request regardless of the `extra` copy.
+        //   * Cross-protocol egress: a downstream writer may write `stream` from both its typed field
+        //     AND this `extra` copy; because both derive from the same intent they coincide, and a
+        //     `serde_json::Map::insert` overwrite means one wire key (not a duplicate). This is a
+        //     duplicated WRITE, not a duplicate KEY — fragile only if a future writer's two values
+        //     ever diverge, which is a property of that writer, not of this reader.
+        // (The earlier comment that claimed `stream` is excluded from `extra` was false; this is the
+        // accurate description. The native Gemini GenerateContentRequest has no `stream` field —
+        // streaming is URL-selected — so on a NATIVE request `extra` carries no `stream` at all.)
         let modeled_keys: std::collections::HashSet<&str> = [
             "contents",
             "tools",
             "systemInstruction",
             "generationConfig",
-            "tool_config",
             "model",
         ]
         .iter()
@@ -425,10 +447,16 @@ impl ProtocolReader for GeminiReader {
                                             .cloned()
                                             .unwrap_or(serde_json::Value::Null);
 
+                                        // Gemini streams carry no tool-call id; synthesize a stable,
+                                        // non-empty one keyed by (tool-position, name) so the
+                                        // Anthropic/OpenAI stream writers emit a non-empty id on the
+                                        // content_block_start. Tool blocks occupy indices 1..n, so
+                                        // `ir_idx - 1` is the 0-based tool position.
+                                        let id = synth_tool_call_id(ir_idx - 1, &name_val);
                                         out.push(IrStreamEvent::BlockStart {
                                             index: ir_idx,
                                             block: crate::ir::IrBlockMeta::ToolUse {
-                                                id: String::new(),
+                                                id,
                                                 name: name_val.clone(),
                                             },
                                         });
@@ -540,6 +568,8 @@ impl ProtocolReader for GeminiReader {
         })?;
 
         let mut content: Vec<crate::ir::IrBlock> = Vec::new();
+        // Per-response tool-call index feeding `synth_tool_call_id` (Gemini carries no tool id).
+        let mut tool_call_index: usize = 0;
         if let Some(parts_arr) = content_val.get("parts").and_then(|p| p.as_array()) {
             for part in parts_arr {
                 // Text part → IrBlock::Text
@@ -553,7 +583,9 @@ impl ProtocolReader for GeminiReader {
                     }
                 }
 
-                // FunctionCall → IrBlock::ToolUse (id="", name from functionCall.name, input=funcCall.args)
+                // FunctionCall → IrBlock::ToolUse. Gemini carries no id, so synthesize a stable,
+                // non-empty one keyed by (index, name) — the writer ignores the ToolUse `id`, and
+                // cross-protocol Anthropic/OpenAI egress requires a non-empty id for correlation.
                 if let Some(func_call) = part.get("functionCall") {
                     let name_val = func_call
                         .get("name")
@@ -565,8 +597,10 @@ impl ProtocolReader for GeminiReader {
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
 
+                    let id = synth_tool_call_id(tool_call_index, &name_val);
+                    tool_call_index += 1;
                     content.push(crate::ir::IrBlock::ToolUse {
-                        id: String::new(),
+                        id,
                         name: name_val,
                         input: args,
                     });
@@ -667,6 +701,28 @@ fn unix_now_secs() -> u64 {
 fn synth_response_id() -> String {
     let seq = SYNTH_RESPONSE_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("{:x}{:x}", unix_now_secs(), seq)
+}
+
+/// Synthesize a stable, non-empty tool-call id for a Gemini `functionCall`.
+///
+/// The Gemini wire format carries no tool-call id on `functionCall` parts, so reading them with
+/// `id: String::new()` (the old behavior) produced an empty `tool_use_id`/`id` on cross-protocol
+/// egress (Anthropic / OpenAI), both of which REQUIRE a non-empty id to correlate the later
+/// `tool_result`/`tool` message. With an empty id, two tool calls sharing a function name could not
+/// be told apart and `tool_result` routing broke.
+///
+/// We derive a deterministic id from `(call_index, function_name)` via the FNV-1a hash of the
+/// stdlib (no new dependency). The id only needs to be stable WITHIN a single request so the
+/// synthesized `tool_result` (which the reader keys by function name — Gemini's only correlation
+/// handle) and the `tool_use` agree; including the call index disambiguates repeated function
+/// names. The `call_` prefix keeps it visibly synthetic and matches no native id shape we must
+/// preserve. An empty `name` still yields a non-empty id (the index disambiguates).
+fn synth_tool_call_id(call_index: usize, function_name: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    call_index.hash(&mut hasher);
+    function_name.hash(&mut hasher);
+    format!("call_{:016x}", hasher.finish())
 }
 
 /// Map a canonical `StatusClass` onto the `(HTTP code, google.rpc.Code name)` pair Gemini uses in
@@ -866,12 +922,15 @@ impl ProtocolWriter for GeminiWriter {
 
         // NB: the native Gemini GenerateContentRequest schema has NO top-level `stream` field —
         // streaming is selected entirely by the URL endpoint (`:generateContent` vs
-        // `:streamGenerateContent?alt=sse`, produced by `upstream_path_for_stream`). Injecting a
-        // `stream` member here would make every egress request non-native (a backend could tell it
-        // wasn't a real client) and the Google Generative Language API rejects unknown top-level
-        // fields with INVALID_ARGUMENT. `req.stream` is therefore read only by path selection and
-        // never serialised into the body. It is also kept out of the `extra` passthrough below: the
-        // reader lists `stream` in `modeled_keys`, so a `stream` key is never echoed from `extra`.
+        // `:streamGenerateContent?alt=sse`, produced by `upstream_path_for_stream`). This writer
+        // therefore NEVER synthesizes a `stream` member from `req.stream`; the streaming intent is
+        // read only by path selection. The ONLY way a `stream` key appears on the egress body is if
+        // the SOURCE request carried one and it was preserved verbatim through `extra` (the reader
+        // does NOT model `stream`, mirroring how it round-trips `model` for byte-identity). For a
+        // NATIVE Gemini request `extra` carries no `stream`, so the egress body carries none either.
+        // On same-protocol passthrough `forward::strip_router_shim_keys` removes any router-injected
+        // `stream` before the upstream call. (An earlier version of this comment wrongly claimed the
+        // reader excludes `stream` via `modeled_keys`; it does not — the accurate behavior is here.)
 
         // Merge extra fields (may override, but that's expected behavior)
         for (key, value) in &req.extra {
@@ -1057,6 +1116,15 @@ impl ProtocolWriter for GeminiWriter {
                     None => "STOP".to_string(),
                 };
 
+                // Native Gemini SSE carries `usageMetadata` (incl. `totalTokenCount`) on the final
+                // chunk; a strict google-genai client computing totals reads `totalTokenCount`.
+                // Emit it (= prompt + candidates, saturating) alongside the component counts so the
+                // streamed usage frame matches the native final-chunk shape. This path runs only on
+                // cross-protocol egress (same-protocol Gemini streams pass through byte-for-byte and
+                // never reach this writer), so emitting the total here cannot disturb a same-protocol
+                // round-trip. Saturating add avoids an overflow panic on the request path for
+                // pathological/garbage counts.
+                let total = usage.input_tokens.saturating_add(usage.output_tokens);
                 Some((
                     "".to_string(),
                     serde_json::json!({
@@ -1065,7 +1133,8 @@ impl ProtocolWriter for GeminiWriter {
                         }],
                         "usageMetadata": {
                             "promptTokenCount": usage.input_tokens,
-                            "candidatesTokenCount": usage.output_tokens
+                            "candidatesTokenCount": usage.output_tokens,
+                            "totalTokenCount": total
                         }
                     }),
                 ))
@@ -1141,6 +1210,14 @@ impl ProtocolWriter for GeminiWriter {
             None => "STOP".to_string(),
         };
 
+        // NB: `usageMetadata` here carries only the component counts and OMITS `totalTokenCount`,
+        // preserving the omit-don't-fabricate fidelity rule used for `responseId`/`created`: a native
+        // whole-response body that did not carry `totalTokenCount` round-trips without one
+        // (`read_response` does not capture it into the IR, so there is nothing to faithfully
+        // re-emit). The STREAM final-chunk frame (`write_response_event` MessageDelta) DOES emit
+        // `totalTokenCount` because that path runs only on cross-protocol egress (same-protocol
+        // Gemini streams pass through byte-for-byte and never reach the writer), where a native
+        // google-genai client expects the final SSE chunk's usage to carry the total.
         let mut out = serde_json::json!({
             "candidates": [{
                 "content": {
@@ -1974,6 +2051,336 @@ mod tests {
                 .is_some_and(|s| !s.is_empty()),
             "no id → responseId synthesized so the SDK still sees one: {}",
             frame.1
+        );
+    }
+
+    // --- Round 3 fix 1: functionCall ToolUse blocks must carry a non-empty, stable id ---
+
+    /// Regression: a Gemini `functionCall` in `read_request` must produce a NON-EMPTY tool-use id
+    /// (Gemini carries none). Previously `id: String::new()` made cross-protocol Anthropic/OpenAI
+    /// egress emit an empty `id`/`tool_use_id`, which those APIs reject / mis-correlate.
+    #[test]
+    fn test_read_request_functioncall_gets_nonempty_id() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "contents": [{
+                "role": "model",
+                "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "SF"}}}]
+            }]
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        let id = ir.messages[0].content.iter().find_map(|b| match b {
+            crate::ir::IrBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        });
+        let id = id.expect("ToolUse block must be present");
+        assert!(!id.is_empty(), "synthesized tool-use id must be non-empty");
+    }
+
+    /// Regression: two `functionCall`s sharing the SAME function name in one request must get
+    /// DISTINCT non-empty ids (the call index disambiguates) so `tool_result` routing cannot
+    /// collapse them on cross-protocol egress.
+    #[test]
+    fn test_read_request_same_name_tool_calls_get_distinct_ids() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "contents": [{
+                "role": "model",
+                "parts": [
+                    {"functionCall": {"name": "search", "args": {"q": "a"}}},
+                    {"functionCall": {"name": "search", "args": {"q": "b"}}}
+                ]
+            }]
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        let ids: Vec<String> = ir.messages[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                crate::ir::IrBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2, "two tool-use blocks expected");
+        assert!(ids.iter().all(|i| !i.is_empty()), "ids must be non-empty");
+        assert_ne!(
+            ids[0], ids[1],
+            "repeated function name must still yield distinct ids: {ids:?}"
+        );
+    }
+
+    /// Regression: the synthesized id is DETERMINISTIC for a given (index, name) — two reads of the
+    /// same request body produce the same ids (stable within a request lifetime).
+    #[test]
+    fn test_read_request_tool_call_id_is_deterministic() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "contents": [{
+                "role": "model",
+                "parts": [{"functionCall": {"name": "f", "args": {}}}]
+            }]
+        });
+        let id_of = |r: &GeminiReader| {
+            r.read_request(&body).unwrap().messages[0]
+                .content
+                .iter()
+                .find_map(|b| match b {
+                    crate::ir::IrBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(id_of(&reader), id_of(&reader), "id must be deterministic");
+    }
+
+    /// Regression: the same-protocol ToolResult correlation key stays the function NAME (the writer
+    /// round-trips it into `functionResponse.name`), NOT the synthetic ToolUse id. Guards against a
+    /// regression where the synth id leaks onto the result name and breaks Gemini→Gemini passthrough.
+    #[test]
+    fn test_read_request_functionresponse_tool_use_id_is_name() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{"functionResponse": {"name": "get_weather", "response": {"t": 21}}}]
+            }]
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        let tid = ir.messages[0].content.iter().find_map(|b| match b {
+            crate::ir::IrBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            tid.as_deref(),
+            Some("get_weather"),
+            "result correlation key must remain the function name for same-protocol round-trip"
+        );
+    }
+
+    /// Regression: a `functionCall` in `read_response` (non-stream) must also carry a non-empty id.
+    #[test]
+    fn test_read_response_functioncall_gets_nonempty_id() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"functionCall": {"name": "f", "args": {}}}]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
+        });
+        let ir = reader.read_response(&body).expect("read_response");
+        let id = ir.content.iter().find_map(|b| match b {
+            crate::ir::IrBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        });
+        assert!(
+            id.is_some_and(|i| !i.is_empty()),
+            "response ToolUse must carry a non-empty id"
+        );
+    }
+
+    /// Regression: the streaming `BlockStart` for a tool block must carry a non-empty synthesized
+    /// id (Gemini streams carry none) so the Anthropic/OpenAI stream writers emit a usable id.
+    #[test]
+    fn test_stream_tool_blockstart_id_is_nonempty() {
+        let events = collect_stream(&[serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"functionCall": {"name": "f", "args": {}}}]
+                },
+                "finishReason": "STOP"
+            }]
+        })]);
+        let id = events.iter().find_map(|e| match e {
+            IrStreamEvent::BlockStart {
+                block: IrBlockMeta::ToolUse { id, .. },
+                ..
+            } => Some(id.clone()),
+            _ => None,
+        });
+        assert!(
+            id.is_some_and(|i| !i.is_empty()),
+            "stream tool BlockStart must carry a non-empty id"
+        );
+    }
+
+    // --- Round 3 fix 2: `stream` round-trip semantics + accurate comment ---
+
+    /// Regression / documentation guard for the corrected `stream` comment. A source `stream` is
+    /// captured into the typed `IrRequest.stream` (used only by path selection) AND preserved in
+    /// `extra` for byte-identical round-trip (exactly like `model`), so the writer echoes it back.
+    /// This is the behavior `src/proto/mod.rs::test_gemini_roundtrip_identity` (a non-owned test)
+    /// enforces. The Round-3 finding's prescribed "drop stream from extra" would break that
+    /// byte-identity invariant; the real defect (a FALSE comment claiming stream was excluded from
+    /// extra) is fixed by making the comment accurate instead.
+    #[test]
+    fn test_read_request_source_stream_round_trips_via_extra() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "stream": true
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        assert!(ir.stream, "stream must be captured into IrRequest.stream");
+        assert_eq!(
+            ir.extra.get("stream"),
+            Some(&serde_json::json!(true)),
+            "a source `stream` is preserved in extra for round-trip identity (like model): {:?}",
+            ir.extra
+        );
+        let wire = GeminiWriter.write_request(&ir);
+        assert_eq!(
+            wire.get("stream"),
+            Some(&serde_json::json!(true)),
+            "source `stream` round-trips onto the egress body via extra: {wire}"
+        );
+    }
+
+    /// Regression: a NATIVE Gemini request carries no `stream`, so neither `extra` nor the egress
+    /// body gains one even when the caller wants streaming (URL-selected). Guards the writer's
+    /// "never synthesizes a stream member from req.stream" invariant.
+    #[test]
+    fn test_read_request_native_no_stream_stays_absent() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        });
+        let mut ir = reader.read_request(&body).expect("read_request");
+        ir.stream = true; // caller wants streaming; must not reach the body
+        assert!(
+            !ir.extra.contains_key("stream"),
+            "native request carries no stream in extra: {:?}",
+            ir.extra
+        );
+        let wire = GeminiWriter.write_request(&ir);
+        assert!(
+            wire.get("stream").is_none(),
+            "stream intent must not be synthesized onto a native body: {wire}"
+        );
+    }
+
+    // --- Round 3 fix 3: bogus snake_case `tool_config` removed; native `toolConfig` round-trips ---
+
+    /// Regression: native Gemini `toolConfig` (camelCase) is NOT in `modeled_keys`, so it
+    /// round-trips through `extra` and back onto the wire unchanged. The old bogus snake_case
+    /// `tool_config` modeled-key entry (which matched no real field) has been removed.
+    #[test]
+    fn test_read_request_native_tool_config_round_trips_via_extra() {
+        let reader = GeminiReader;
+        let tool_config = serde_json::json!({
+            "functionCallingConfig": {"mode": "ANY"}
+        });
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "toolConfig": tool_config.clone()
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        assert_eq!(
+            ir.extra.get("toolConfig"),
+            Some(&tool_config),
+            "native toolConfig must round-trip through extra: {:?}",
+            ir.extra
+        );
+        let wire = GeminiWriter.write_request(&ir);
+        assert_eq!(
+            wire.get("toolConfig"),
+            Some(&tool_config),
+            "toolConfig must be re-emitted on the wire: {wire}"
+        );
+    }
+
+    // --- Round 3 fix 4: streamed and whole-body usageMetadata include totalTokenCount ---
+
+    /// Regression: the streamed `MessageDelta` usage frame must include `totalTokenCount`
+    /// (= prompt + candidates), matching the native final-chunk shape.
+    #[test]
+    fn test_stream_message_delta_includes_total_token_count() {
+        let writer = GeminiWriter;
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 7,
+                output_tokens: 5,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (_, frame) = writer
+            .write_response_event(&ev)
+            .expect("MessageDelta must emit a frame");
+        assert_eq!(
+            frame.pointer("/usageMetadata/totalTokenCount"),
+            Some(&serde_json::json!(12)),
+            "streamed usage must carry totalTokenCount = prompt + candidates: {frame}"
+        );
+        assert_eq!(
+            frame.pointer("/usageMetadata/promptTokenCount"),
+            Some(&serde_json::json!(7))
+        );
+        assert_eq!(
+            frame.pointer("/usageMetadata/candidatesTokenCount"),
+            Some(&serde_json::json!(5))
+        );
+    }
+
+    /// The streamed total saturates (never overflow-panics) on pathological counts — guards the
+    /// `saturating_add` on the request path.
+    #[test]
+    fn test_stream_message_delta_total_token_count_saturates() {
+        let writer = GeminiWriter;
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: u64::MAX,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (_, frame) = writer
+            .write_response_event(&ev)
+            .expect("MessageDelta must emit a frame");
+        assert_eq!(
+            frame.pointer("/usageMetadata/totalTokenCount"),
+            Some(&serde_json::json!(u64::MAX)),
+            "totalTokenCount must saturate, not wrap/panic: {frame}"
+        );
+    }
+
+    /// Fidelity guard: the whole-body `write_response` usageMetadata OMITS `totalTokenCount`
+    /// (omit-don't-fabricate), so a native body that carried only the component counts round-trips
+    /// byte-identically. The total is emitted only on the cross-protocol STREAM frame.
+    #[test]
+    fn test_write_response_omits_total_token_count() {
+        let writer = GeminiWriter;
+        let ir = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 5,
+                output_tokens: 3,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let wire = writer.write_response(&ir);
+        assert!(
+            wire.pointer("/usageMetadata/totalTokenCount").is_none(),
+            "whole-body usage must omit totalTokenCount for byte-identical round-trip: {wire}"
         );
     }
 }

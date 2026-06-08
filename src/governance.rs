@@ -145,8 +145,19 @@ impl GovState {
     ) -> StoreResult<(VirtualKey, String)> {
         let secret = generate_secret();
         let hash = crate::sigv4::sha256_hex(secret.as_bytes());
+        // `id` is a 64-bit prefix of the 256-bit secret hash, while `key_hash` is the full hash with
+        // a UNIQUE constraint. Two distinct secrets sharing the same 64-bit prefix would produce the
+        // same `id` but different `key_hash`; since `put_key` UPSERTs on the PRIMARY KEY `id`, the
+        // second mint would silently OVERWRITE the first key's row (replacing its `key_hash`),
+        // invalidating the previously-issued secret with no error. Birthday-bound at ~2^32 keys, but
+        // the failure is silent, so guard it explicitly: if the derived id already exists for a
+        // DIFFERENT key_hash, refuse rather than clobber an unrelated key. (A genuine retry that
+        // somehow reproduces the same secret — and thus the same key_hash — is idempotent and allowed
+        // through, since it overwrites the row with identical data.)
+        let id = format!("vk_{}", &hash[..16]);
+        self.ensure_id_free_for_hash(&id, &hash)?;
         let key = VirtualKey {
-            id: format!("vk_{}", &hash[..16]),
+            id,
             key_hash: hash,
             name: spec.name,
             allowed_pools: spec.allowed_pools,
@@ -160,6 +171,23 @@ impl GovState {
         self.store.put_key(&key)?;
         self.refresh()?;
         Ok((key, secret))
+    }
+
+    /// Guard against the silent UPSERT-overwrite described in `create_key`: the PRIMARY KEY `id` is
+    /// only a 64-bit prefix of the full `key_hash`, so two distinct secrets can collide on `id`
+    /// while differing on `key_hash`. If `id` already exists under a DIFFERENT `key_hash`, refuse
+    /// (rather than let `put_key` overwrite an unrelated key's row). An `id` that is free, or that
+    /// already holds the SAME `key_hash` (an idempotent re-mint of the identical secret), is allowed.
+    fn ensure_id_free_for_hash(&self, id: &str, hash: &str) -> StoreResult<()> {
+        if let Some(existing) = self.store.get_key(id)? {
+            if existing.key_hash != hash {
+                return Err(StoreError(format!(
+                    "virtual-key id collision: derived id '{id}' already belongs to a different key; \
+                     retry to mint with fresh entropy (this is a ~2^-64 birthday event)"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// all virtual keys (metadata; callers must strip `key_hash` before returning).
@@ -205,20 +233,30 @@ impl GovState {
         }
         let window = now / RATE_WINDOW_SECS * RATE_WINDOW_SECS;
         let retry = (window + RATE_WINDOW_SECS).saturating_sub(now).max(1);
-        let mut map = self.rate.write().unwrap();
         // Bounded eviction of stale entries (keys that have gone silent in older windows) keeps the
         // map from leaking entries forever. This is an O(active-key-count) scan, so we DO NOT run it
         // on every admission — it is purely a memory bound and is not required for correctness (the
-        // per-key staleness reset just below already resets the looked-up key's own entry). Instead
-        // we amortize it: only every `RATE_SWEEP_INTERVAL`th call pays the sweep, keeping the
-        // per-request cost of the hot path independent of the number of concurrently-active keys.
+        // per-key staleness reset below already resets the looked-up key's own entry). Instead we
+        // amortize it: only every `RATE_SWEEP_INTERVAL`th call pays the sweep.
+        //
+        // CONTENTION: the sweep is held in its OWN short write-lock scope, SEPARATE from the per-key
+        // check/increment below. Previously both ran under a single guard, so on a sweep call every
+        // other concurrent `check_rate`/`add_rate_tokens` blocked for the full O(N) retain. Splitting
+        // them means the common (non-sweep) admission takes only the fast per-key critical section,
+        // and the rare sweep does not extend the lock hold of the per-key work. The two scopes are
+        // independent for correctness: the sweep only evicts entries whose `window_start != window`,
+        // and the per-key resolution below re-checks/refreshes this key's own entry for `window`
+        // regardless of whether the sweep ran, so nothing the sweep does (or skips) can admit a
+        // request that should be rejected or vice versa.
         if self
             .rate_sweep_ticker
             .fetch_add(1, Ordering::Relaxed)
             .is_multiple_of(RATE_SWEEP_INTERVAL)
         {
-            map.retain(|_, st| st.window_start == window);
+            let mut sweep = self.rate.write().unwrap();
+            sweep.retain(|_, st| st.window_start == window);
         }
+        let mut map = self.rate.write().unwrap();
         // Resolve this key's entry for the CURRENT window. Three cases:
         //  - present & current-window  -> mutate in place (fast path; no key clone).
         //  - present but STALE         -> reset it in place to the current window (counters back to
@@ -363,7 +401,12 @@ impl GovState {
     pub(crate) fn record_request(&self, key: &VirtualKey, now: u64, tokens: u64) {
         let window = budget_window(&key.budget_period, now);
         let key_id = key.id.clone();
-        let fee = self.price_per_request_cents;
+        // Clamp the per-request fee at >= 0, symmetric with `record_tokens` (which already clamps the
+        // per-1k-token price). A negative `price_per_request_cents` (operator/hostile-admin
+        // misconfiguration; the field is a plain signed i64 with no range check at config load) would
+        // otherwise DECREMENT a key's accrued spend on every successful request, driving spend below
+        // zero and defeating the budget cap (`is_over_budget` compares `spend_cents >= limit`).
+        let fee = self.price_per_request_cents.max(0);
         // count_request = true: this is the once-per-request accounting call.
         self.offload_store_write("usage record failed", &key.id, move |store| {
             store.add_usage(&key_id, window, fee, tokens, true)
@@ -1075,6 +1118,96 @@ mod tests {
 
         // And the async budget gate observes it.
         assert!(!gov.is_over_budget_async(&k, 1_700_000_000).await);
+    }
+
+    #[test]
+    fn test_record_request_clamps_negative_per_request_price() {
+        // A negative per-request price must NOT decrement accrued spend (which would drive spend
+        // below zero and defeat the budget cap). The fee is clamped at >= 0, symmetric with the
+        // per-1k-token price clamp in record_tokens.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut k = sample_key("k1", "h1");
+        k.max_budget_cents = Some(100);
+        k.budget_period = "total".to_string();
+        let gov = GovState::new(store.clone(), -50, 0, None).unwrap(); // hostile negative price
+
+        for _ in 0..5 {
+            gov.record_request(&k, 1_700_000_000, 0);
+        }
+        let u = store.get_usage("k1", 0).unwrap();
+        assert_eq!(
+            u.spend_cents, 0,
+            "negative per-request price must clamp to 0, never decrement spend"
+        );
+        assert_eq!(u.requests, 5, "requests are still counted");
+        // Spend can never be driven below zero to evade the cap.
+        assert!(!gov.is_over_budget(&k, 1_700_000_000));
+    }
+
+    #[test]
+    fn test_record_tokens_clamps_negative_per_1k_price() {
+        // Mirror assertion for the token-price path (already clamped pre-fix; lock it in).
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store.clone(), 0, -100, None).unwrap();
+        gov.record_tokens("k1", "total", 1_700_000_000, 5000);
+        let u = store.get_usage("k1", 0).unwrap();
+        assert_eq!(u.spend_cents, 0, "negative token price must clamp to 0");
+        assert_eq!(u.tokens, 5000, "tokens are still counted");
+    }
+
+    #[test]
+    fn test_create_key_minted_id_is_free_so_mint_succeeds() {
+        // A normal mint derives a fresh id and the collision guard does not fire (the id is free).
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store.clone(), 1, 0, None).unwrap();
+        let spec = NewKeySpec {
+            name: "first".to_string(),
+            allowed_pools: vec![],
+            max_budget_cents: None,
+            budget_period: "total".to_string(),
+            rpm_limit: None,
+            tpm_limit: None,
+        };
+        let (key, secret) = gov.create_key(spec, 1_700_000_000).unwrap();
+        assert!(key.id.starts_with("vk_"));
+        // The minted key resolves by its own secret.
+        assert_eq!(gov.lookup(&secret).unwrap().id, key.id);
+    }
+
+    #[test]
+    fn test_ensure_id_free_for_hash_guards_silent_overwrite() {
+        // The PRIMARY KEY `id` is a 64-bit prefix of the full key_hash, so a collision can put a new
+        // secret's id atop an unrelated key. The guard must REFUSE when the id already holds a
+        // DIFFERENT key_hash (rather than let put_key UPSERT-overwrite and invalidate the incumbent),
+        // while allowing a free id or an idempotent same-hash re-mint.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store.clone(), 1, 0, None).unwrap();
+
+        // A free id is allowed.
+        gov.ensure_id_free_for_hash("vk_freshid", "HASH_A")
+            .expect("a free id must be allowed");
+
+        // Seed an incumbent key occupying that id under HASH_A.
+        let incumbent = sample_key("vk_freshid", "HASH_A");
+        store.put_key(&incumbent).unwrap();
+        gov.refresh().unwrap();
+
+        // Same id, SAME hash: idempotent re-mint is allowed.
+        gov.ensure_id_free_for_hash("vk_freshid", "HASH_A")
+            .expect("same-hash re-mint must be allowed");
+
+        // Same id, DIFFERENT hash: must be rejected (the collision the fix guards against).
+        let err = gov
+            .ensure_id_free_for_hash("vk_freshid", "HASH_B_DIFFERENT")
+            .expect_err("colliding id with a different hash must be rejected");
+        assert!(
+            err.to_string().contains("id collision"),
+            "error must explain the id collision; got: {err}"
+        );
+
+        // The incumbent row is untouched (never overwritten).
+        let still = store.get_key("vk_freshid").unwrap().unwrap();
+        assert_eq!(still.key_hash, "HASH_A", "incumbent must not be clobbered");
     }
 
     #[test]

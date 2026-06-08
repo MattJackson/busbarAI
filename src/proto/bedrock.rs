@@ -181,7 +181,35 @@ impl ProtocolReader for BedrockReader {
             retry_after: None,
         })?;
 
-        let extra = serde_json::Map::new();
+        // Collect every unmodeled top-level request field into `extra` so a same-protocol
+        // Bedrock->Bedrock passthrough re-emits them faithfully (see `write_request`, which merges
+        // `req.extra`). Without this, native Converse fields this reader does not explicitly model —
+        // `topP`, `topK`, `stopSequences`, `additionalModelRequestFields`, `guardrailConfig`,
+        // `additionalModelResponseFieldPaths`, `performanceConfig`, `promptVariables`, etc. — are
+        // silently dropped, changing model behaviour (guardrails disabled, sampling reset) and making
+        // the proxy behaviourally divergent from a direct AWS call. Mirrors the Gemini/Cohere readers.
+        // `stream` is the route-injected streaming discriminant captured into `IrRequest.stream`
+        // below; it is intentionally NOT echoed via `extra` (a native Bedrock body never carries it,
+        // and re-emitting it would be a tell). All other modeled keys are re-serialised by
+        // `write_request` from the structured IR, so excluding them here avoids a double-emit.
+        let modeled_keys: std::collections::HashSet<&str> = [
+            "system",
+            "messages",
+            "toolConfig",
+            "inferenceConfig",
+            "stream",
+            "model",
+        ]
+        .iter()
+        .cloned()
+        .collect();
+
+        let mut extra = serde_json::Map::new();
+        for (key, value) in obj.iter() {
+            if !modeled_keys.contains(key.as_str()) {
+                extra.insert(key.clone(), value.clone());
+            }
+        }
 
         let mut system_blocks: Vec<crate::ir::IrBlock> = Vec::new();
         if let Some(system_arr) = obj.get("system").and_then(|s| s.as_array()) {
@@ -448,7 +476,13 @@ impl ProtocolReader for BedrockReader {
                             index: idx,
                             block: crate::ir::IrBlockMeta::ToolUse { id: tu_id, name },
                         });
-                    } else if state.started && !state.text_block_open {
+                    } else if start_obj.is_empty() && state.started && !state.text_block_open {
+                        // The native Bedrock ConverseStream wire sends `contentBlockStart` with an
+                        // empty `start: {}` for a text block. Only that empty-object shape opens a
+                        // Text block. A `start` object carrying an unrecognized key (e.g. a future
+                        // `image`/`reasoningContent` block type) is NOT a text block: skip it rather
+                        // than mis-opening a spurious Text block (forward-compatibility). Mirrors the
+                        // defensive Gemini/Cohere readers.
                         state.text_block_open = true;
                         out.push(IrStreamEvent::BlockStart {
                             index: idx,
@@ -456,6 +490,7 @@ impl ProtocolReader for BedrockReader {
                         });
                     }
                 } else if state.started && !state.text_block_open {
+                    // No `start` object at all → a text block (the absent-`start` text shape).
                     state.text_block_open = true;
                     out.push(IrStreamEvent::BlockStart {
                         index: idx,
@@ -501,7 +536,16 @@ impl ProtocolReader for BedrockReader {
                     .and_then(|i| i.as_u64())
                     .unwrap_or(0) as usize;
 
-                if state.text_block_open && idx == 0 {
+                // Clear `text_block_open` on ANY contentBlockStop while a text block is open, not
+                // only at index 0. Bedrock indexes text blocks that follow a tool-use block at
+                // index > 0 (reachable via cross-protocol ingress where a tool-use precedes text).
+                // The old `idx == 0` guard left the flag set for a text block opened at index N>0,
+                // so the `!state.text_block_open` guard in contentBlockStart stayed true-blocked and
+                // every subsequent text block was suppressed — silently dropping the rest of the
+                // text content. At most one text block is open at a time on this wire (a new text
+                // block only opens once the prior is closed), so the open flag unambiguously belongs
+                // to the block whose stop we are processing; tool-use stops never set the flag.
+                if state.text_block_open {
                     state.text_block_open = false;
                 }
 
@@ -762,6 +806,30 @@ impl ProtocolWriter for BedrockWriter {
         let (amzdate, datestamp) = crate::sigv4::format_amz_time(ctx.timestamp_epoch);
         let payload_hash = crate::sigv4::sha256_hex(ctx.body);
 
+        // Validate the session token as a wire HeaderValue BEFORE adding it to the SIGNED set, so
+        // the signed header set and the emitted header set can never diverge. If a session (STS)
+        // token contains a byte `HeaderValue::from_str` rejects (e.g. an ASCII control char),
+        // the previous code signed `x-amz-security-token` (committing the signature to it) but then
+        // silently dropped the header on the wire — yielding a request whose signature claims the
+        // token header is present while it is absent, which AWS rejects with SignatureDoesNotMatch
+        // (a confusing 403, not the intended graceful "misconfigured credential" path). Instead,
+        // bail to the same empty-header path used for a structurally-misconfigured key (request goes
+        // out unsigned → AWS 403 surfaced as auth), with a diagnostic so the operator can see why.
+        let token_header = match token {
+            Some(t) => match HeaderValue::from_str(t) {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    tracing::warn!(
+                        "Bedrock lane session token contains a byte rejected by HeaderValue \
+                         (e.g. a control char); skipping signing to avoid a signed-but-absent \
+                         x-amz-security-token header. Request goes out unsigned (AWS will 403)."
+                    );
+                    return vec![];
+                }
+            },
+            None => None,
+        };
+
         let mut signed = vec![
             ("content-type".to_string(), "application/json".to_string()),
             ("host".to_string(), ctx.host.clone()),
@@ -812,10 +880,10 @@ impl ProtocolWriter for BedrockWriter {
                 payload_hash_val,
             ),
         ];
-        if let Some(t) = token {
-            if let Ok(v) = HeaderValue::from_str(t) {
-                out.push((HeaderName::from_static("x-amz-security-token"), v));
-            }
+        // Use the HeaderValue validated up front (above): the signed set and the wire set are now
+        // gated by the same check, so they can never diverge into a signed-but-absent token header.
+        if let Some(v) = token_header {
+            out.push((HeaderName::from_static("x-amz-security-token"), v));
         }
         out
     }
@@ -1083,7 +1151,13 @@ impl ProtocolWriter for BedrockWriter {
                             "inputTokens": usage.input_tokens,
                             "outputTokens": usage.output_tokens,
                             "totalTokens": usage.input_tokens + usage.output_tokens
-                        }
+                        },
+                        // A native Bedrock ConverseStream `metadata` event always carries a `metrics`
+                        // object alongside `usage` (e.g. `{"latencyMs": N}`). Omitting it on every
+                        // busbar-minted cross-protocol stream is a consistent, detectable difference
+                        // from genuine Bedrock output. The AWS SDK does not require `metrics`, so a
+                        // zero placeholder is shape-faithful without fabricating a misleading latency.
+                        "metrics": { "latencyMs": 0 }
                     }),
                 )),
             },
@@ -2446,6 +2520,303 @@ mod tests {
         assert_eq!(
             payload2.get("message").and_then(|m| m.as_str()),
             Some("InternalServerException")
+        );
+    }
+
+    // --- Round 3 regression tests --------------------------------------------------------------
+
+    /// Regression (reader): unmodeled top-level request fields must be collected into `extra` so a
+    /// same-protocol Bedrock->Bedrock passthrough re-emits them faithfully (via `write_request`'s
+    /// extra-merge). Previously `extra` was built empty and every native Converse field this reader
+    /// does not explicitly model — `topP`, `topK`, `stopSequences`, `guardrailConfig`,
+    /// `additionalModelRequestFields`, etc. — was silently dropped, disabling guardrails / resetting
+    /// sampling on passthrough. The modeled keys (system/messages/toolConfig/inferenceConfig/stream)
+    /// must NOT leak into `extra` (they are re-serialised from the structured IR; a double-emit /
+    /// echoed `stream` would be a tell).
+    #[test]
+    fn test_read_request_collects_unmodeled_fields_into_extra() {
+        let reader = BedrockReader;
+        let j = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+            "inferenceConfig": {"maxTokens": 10},
+            "system": [{"text": "sys"}],
+            "toolConfig": {"tools": []},
+            "stream": true,
+            "topP": 0.95,
+            "topK": 40,
+            "stopSequences": ["STOP"],
+            "guardrailConfig": {"guardrailIdentifier": "gr-1", "guardrailVersion": "1"},
+            "additionalModelRequestFields": {"foo": "bar"}
+        });
+        let ir = reader.read_request(&j).expect("read_request");
+
+        // Unmodeled fields are preserved verbatim.
+        assert_eq!(ir.extra.get("topP"), Some(&serde_json::json!(0.95)));
+        assert_eq!(ir.extra.get("topK"), Some(&serde_json::json!(40)));
+        assert_eq!(
+            ir.extra.get("stopSequences"),
+            Some(&serde_json::json!(["STOP"]))
+        );
+        assert_eq!(
+            ir.extra.get("guardrailConfig"),
+            Some(&serde_json::json!({"guardrailIdentifier": "gr-1", "guardrailVersion": "1"}))
+        );
+        assert_eq!(
+            ir.extra.get("additionalModelRequestFields"),
+            Some(&serde_json::json!({"foo": "bar"}))
+        );
+
+        // Modeled keys must NOT be duplicated into `extra` (avoids double-emit / echoed `stream`).
+        for k in [
+            "system",
+            "messages",
+            "toolConfig",
+            "inferenceConfig",
+            "stream",
+        ] {
+            assert!(
+                ir.extra.get(k).is_none(),
+                "modeled key `{k}` must not leak into extra; got {:?}",
+                ir.extra
+            );
+        }
+        // `stream` is still captured in the structured field.
+        assert!(
+            ir.stream,
+            "injected stream flag still captured structurally"
+        );
+    }
+
+    /// Regression (reader + writer): a full passthrough — read a native Converse request carrying
+    /// unmodeled fields, then write it back — must re-emit `topP`/`stopSequences`/`guardrailConfig`
+    /// onto the wire, never strip them. Uses the existing rich fixture (which carries `top_p`).
+    #[test]
+    fn test_request_passthrough_preserves_unmodeled_fields() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let j = bedrock_rich_fixture(); // carries a top-level `top_p`
+        let ir = reader.read_request(&j).expect("read_request");
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out.get("top_p").and_then(|v| v.as_f64()),
+            Some(0.95),
+            "unmodeled `top_p` must survive a Bedrock->Bedrock passthrough; got {out}"
+        );
+    }
+
+    /// Regression (reader): a text block that opens at index > 0 (after a preceding tool-use block,
+    /// reachable via cross-protocol ingress) must have its `text_block_open` flag cleared on its
+    /// contentBlockStop, so a LATER text block still emits a fresh BlockStart. The old `idx == 0`
+    /// guard left the flag set for a text block at index N>0, suppressing all subsequent text
+    /// BlockStarts and silently dropping the rest of the text content.
+    #[test]
+    fn test_stream_text_block_after_tool_not_dropped() {
+        use crate::ir::IrStreamEvent;
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = BedrockReader;
+
+        let events: Vec<_> = vec![
+            serde_json::json!({"type": "messageStart", "role": "assistant"}),
+            // tool-use block at index 0
+            serde_json::json!({
+                "type": "contentBlockStart",
+                "contentBlockIndex": 0,
+                "start": {"toolUse": {"toolUseId": "t1", "name": "f"}}
+            }),
+            serde_json::json!({"type": "contentBlockStop", "contentBlockIndex": 0}),
+            // text block at index 1 (start has no `start` object → text)
+            serde_json::json!({"type": "contentBlockStart", "contentBlockIndex": 1}),
+            serde_json::json!({
+                "type": "contentBlockDelta",
+                "contentBlockIndex": 1,
+                "delta": {"text": "first"}
+            }),
+            serde_json::json!({"type": "contentBlockStop", "contentBlockIndex": 1}),
+            // a SECOND text block at index 2 — must still open (flag was cleared at idx 1 stop)
+            serde_json::json!({"type": "contentBlockStart", "contentBlockIndex": 2}),
+            serde_json::json!({
+                "type": "contentBlockDelta",
+                "contentBlockIndex": 2,
+                "delta": {"text": "second"}
+            }),
+            serde_json::json!({"type": "contentBlockStop", "contentBlockIndex": 2}),
+        ]
+        .into_iter()
+        .flat_map(|d| reader.read_response_events("", &d, &mut state))
+        .collect();
+
+        // Two text BlockStarts must appear (at index 1 and index 2).
+        let text_starts: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                IrStreamEvent::BlockStart {
+                    index,
+                    block: crate::ir::IrBlockMeta::Text,
+                } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text_starts,
+            vec![1, 2],
+            "both text blocks (idx 1 and idx 2) must emit a BlockStart; got {events:?}"
+        );
+        // Both text deltas survive.
+        let deltas: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                IrStreamEvent::BlockDelta {
+                    delta: crate::ir::IrDelta::TextDelta(t),
+                    ..
+                } => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    /// Regression (reader): a `contentBlockStart` whose `start` object carries an UNRECOGNIZED key
+    /// (not `toolUse`, and not the empty `{}` text shape — e.g. a future `image`/`reasoningContent`
+    /// block) must NOT be mis-opened as a Text block. Only an empty `start: {}` (or an absent
+    /// `start`) opens text. Forward-compatibility / defensive parsing.
+    #[test]
+    fn test_stream_unrecognized_start_does_not_open_text() {
+        use crate::ir::IrStreamEvent;
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = BedrockReader;
+
+        let _ = reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "messageStart", "role": "assistant"}),
+            &mut state,
+        );
+        // A `start` with an unrecognized key — must emit nothing (no spurious Text BlockStart).
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "contentBlockStart",
+                "contentBlockIndex": 0,
+                "start": {"reasoningContent": {"foo": "bar"}}
+            }),
+            &mut state,
+        );
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    block: crate::ir::IrBlockMeta::Text,
+                    ..
+                }
+            )),
+            "an unrecognized `start` key must not open a Text block; got {evs:?}"
+        );
+        assert!(
+            !state.text_block_open,
+            "text_block_open must remain false for an unrecognized start shape"
+        );
+
+        // The empty `start: {}` text shape still opens a Text block (sanity).
+        let evs2 = reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "contentBlockStart", "contentBlockIndex": 0, "start": {}}),
+            &mut state,
+        );
+        assert!(
+            evs2.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    block: crate::ir::IrBlockMeta::Text,
+                    ..
+                }
+            )),
+            "an empty `start: {{}}` must still open a Text block; got {evs2:?}"
+        );
+    }
+
+    /// Regression (writer): a session (STS) token containing a byte `HeaderValue` rejects (control
+    /// char / >= 0x80) must NOT produce a request signed over `x-amz-security-token` with the header
+    /// absent (which AWS rejects with SignatureDoesNotMatch). The signed set and the wire set are
+    /// gated by the same up-front validation, so an un-encodable token bails to the graceful
+    /// empty-header path (unsigned request → AWS 403 as auth) — no panic, no divergence.
+    #[test]
+    fn test_bedrock_sigv4_unencodable_session_token_bails_gracefully() {
+        let writer = BedrockWriter;
+        let ctx = crate::proto::SigningContext {
+            host: "bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            canonical_uri: "/model/m/converse".to_string(),
+            body: b"{}",
+            timestamp_epoch: 1_440_938_160,
+        };
+        // Session token with an embedded control char → un-encodable HeaderValue.
+        let headers = writer.sign_request("AKID:SECRET:TOK\r\nEN", &ctx);
+        assert!(
+            headers.is_empty(),
+            "un-encodable session token must yield no headers (graceful), not a signed-but-absent \
+             token header; got {headers:?}"
+        );
+        // A bare control byte (e.g. NUL / U+0001) likewise bails — `HeaderValue::from_str` rejects
+        // ASCII control characters, the same vector as the misconfigured access-key path.
+        let headers2 = writer.sign_request("AKID:SECRET:TOK\u{0001}EN", &ctx);
+        assert!(
+            headers2.is_empty(),
+            "control-byte token must bail; got {headers2:?}"
+        );
+
+        // Sanity: a clean token still signs AND emits the token header, and the signed set commits
+        // to it (so the two never diverge in the success case either).
+        let ok = writer.sign_request("AKID:SECRET:CLEANTOKEN", &ctx);
+        let auth = ok
+            .iter()
+            .find(|(k, _)| k.as_str() == "authorization")
+            .map(|(_, v)| v.to_str().unwrap().to_string())
+            .expect("authorization header");
+        assert!(
+            auth.contains("x-amz-security-token"),
+            "clean token must be in the signed header set"
+        );
+        assert!(
+            ok.iter().any(|(k, v)| k.as_str() == "x-amz-security-token"
+                && v.to_str().unwrap() == "CLEANTOKEN"),
+            "clean token must be emitted on the wire; got {ok:?}"
+        );
+    }
+
+    /// Regression (writer): the synthesized cross-protocol `metadata` frame carries a `metrics`
+    /// object (`{"latencyMs": N}`) alongside `usage`, matching the native Bedrock ConverseStream
+    /// metadata shape — its absence on every busbar-minted stream was a detectable tell.
+    #[test]
+    fn test_write_response_event_metadata_carries_metrics() {
+        let writer = BedrockWriter;
+        let usage_only = IrStreamEvent::MessageDelta {
+            stop_reason: None,
+            usage: IrUsage {
+                input_tokens: 3,
+                output_tokens: 2,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (et, payload) = writer
+            .write_response_event(&usage_only)
+            .expect("usage-only delta emits a metadata frame");
+        assert_eq!(et, "metadata");
+        assert!(
+            payload.pointer("/metrics").is_some(),
+            "metadata frame must carry a `metrics` object; got {payload}"
+        );
+        assert_eq!(
+            payload
+                .pointer("/metrics/latencyMs")
+                .and_then(|v| v.as_u64()),
+            Some(0),
+            "metrics must carry a latencyMs field; got {payload}"
+        );
+        // usage is still present and correct.
+        assert_eq!(
+            payload
+                .pointer("/usage/totalTokens")
+                .and_then(|v| v.as_u64()),
+            Some(5)
         );
     }
 }

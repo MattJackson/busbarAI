@@ -118,6 +118,18 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         let mut member_protocols: HashSet<&str> = HashSet::new();
 
         for member in &pool_cfg.members {
+            // A `weight: 0` member is silently mis-balanced by the SWRR selector: it contributes 0
+            // to the running total and its current_weight never increases, so it is never selected
+            // while peers are healthy; an all-zero pool degenerates to always returning the first
+            // candidate with no load distribution — and no boot diagnostic. Reject it (mirroring the
+            // max_concurrent:0 / breaker n:0 fail-loud rules). Excluding a member is expressed via
+            // `exclusions`, not weight 0.
+            if member.weight == 0 {
+                errors.push(format!(
+                    "pool '{}' member '{}' weight must be >= 1 (got 0)",
+                    pool_name, member.target
+                ));
+            }
             // Check if member references a known model
             if !model_protocols.contains_key(member.target.as_str()) {
                 errors.push(format!(
@@ -318,6 +330,17 @@ fn ssrf_blocked_host(url: &str) -> Option<String> {
         return Some(host.to_string());
     }
 
+    // Alternate / non-canonical IP encodings that Rust's `IpAddr::from_str` REJECTS but the OS
+    // resolver (glibc getaddrinfo, used by reqwest's default resolver) still interprets as an
+    // IPv4 address — decimal int (`2130706433` = 127.0.0.1), hex (`0x7f000001`), octal
+    // (`017700000001`), and short dotted forms (`127.1`, `10.0.1`). A canonical-only `parse()`
+    // would treat these as opaque DNS hostnames (allowed), yet they connect to loopback / the IMDS
+    // endpoint (`2852039166` = 169.254.169.254) at request time — defeating the SSRF guard. Flag
+    // any host that looks like one of these alternate IPv4 encodings as blocked.
+    if is_alternate_ipv4_encoding(host) {
+        return Some(host.to_string());
+    }
+
     // IP-literal checks. A hostname that does not parse as an IP is allowed (DNS targets are not
     // resolved here; the metadata-host list above covers the well-known names).
     let blocked = match host.parse::<IpAddr>() {
@@ -326,6 +349,7 @@ fn ssrf_blocked_host(url: &str) -> Option<String> {
                 || v4.is_private()      // 10/8, 172.16/12, 192.168/16
                 || v4.is_link_local()   // 169.254.0.0/16 (covers IMDS 169.254.169.254)
                 || v4.is_unspecified()  // 0.0.0.0
+                || is_cgnat_shared_v4(&v4) // 100.64.0.0/10 (RFC 6598 CGNAT, routable in cloud VPCs)
                 || v4 == Ipv4Addr::new(169, 254, 169, 254)
         }
         Ok(IpAddr::V6(v6)) => {
@@ -341,6 +365,70 @@ fn ssrf_blocked_host(url: &str) -> Option<String> {
     };
 
     blocked.then(|| host.to_string())
+}
+
+/// RFC 6598 Shared Address Space `100.64.0.0/10` (a.k.a. CGNAT). Not covered by
+/// `Ipv4Addr::is_private()`, yet routable inside AWS/GCP VPCs and many Kubernetes clusters where it
+/// fronts internal services — so it is an SSRF target the private/link-local checks miss. The /10
+/// is the addresses whose first octet is 100 and whose top two bits of the second octet are `01`.
+fn is_cgnat_shared_v4(v4: &std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 100 && (o[1] & 0xC0) == 64
+}
+
+/// True when `host` is an alternate (non-dotted-quad) IPv4 encoding that `IpAddr::from_str` rejects
+/// but the OS resolver still maps to an IPv4 address: a bare decimal integer (`2130706433`), a
+/// `0x`/`0X` hex literal (`0x7f000001`), a leading-zero octal literal (`017700000001`), or a dotted
+/// form with FEWER than four octets (`127.1`, `10.0.1`). These bypass the canonical IP-literal
+/// checks while still resolving to loopback / link-local / private targets at connect time, so they
+/// must be treated as blocked. A canonical four-octet dotted-quad is NOT matched here (it is handled
+/// by the `parse::<IpAddr>()` path); a normal DNS hostname (containing a non-digit, non-`.` char in
+/// a way that isn't all-hex-after-`0x`) is not matched either.
+fn is_alternate_ipv4_encoding(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+
+    // Whole-host `0x...` / `0X...` hex literal (e.g. `0x7f000001`). Only when there is no `.`;
+    // a dotted per-octet hex form (`0x7f.0.0.1`) is handled by the dotted branch below.
+    if !host.contains('.') {
+        if let Some(hex) = host.strip_prefix("0x").or_else(|| host.strip_prefix("0X")) {
+            return !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit());
+        }
+    }
+
+    // Dotted form: split on '.'. A canonical dotted-quad has exactly 4 parts and parses via
+    // `IpAddr` — leave it to that path. Fewer than 4 numeric parts (e.g. `127.1`, `10.0.1`) is an
+    // alternate short form getaddrinfo expands; flag it. Any part using a `0x` hex or leading-zero
+    // octal encoding is also an alternate form.
+    if host.contains('.') {
+        let parts: Vec<&str> = host.split('.').collect();
+        // Every part must be a numeric encoding (decimal, hex, or octal) for this to be an IP-ish
+        // host at all; if any part has a non-numeric character it's a DNS name → not our concern.
+        let all_numeric = parts.iter().all(|p| {
+            if let Some(hex) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
+                !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
+            } else {
+                !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())
+            }
+        });
+        if !all_numeric {
+            return false;
+        }
+        // Short dotted form (fewer than 4 parts) is an alternate encoding getaddrinfo expands.
+        if parts.len() < 4 {
+            return true;
+        }
+        // Four numeric parts: alternate iff any part is hex (`0x`) or leading-zero octal.
+        return parts.iter().any(|p| {
+            p.starts_with("0x")
+                || p.starts_with("0X")
+                || (p.len() > 1 && p.starts_with('0') && p.bytes().all(|b| b.is_ascii_digit()))
+        });
+    }
+
+    // No '.', not `0x`: a bare all-digits host is a decimal integer IP encoding (e.g. `2130706433`).
+    host.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// IPv6 unique-local range `fc00::/7` (the first 7 bits are `1111110`).
@@ -1021,12 +1109,91 @@ mod tests {
             "https://METADATA.INTERNAL/",
             "https://0.0.0.0/",
             "https://user:pass@10.0.0.5/path",
+            // RFC 6598 CGNAT shared address space (100.64.0.0/10) — routable in cloud VPCs.
+            "https://100.64.0.1/",
+            "https://100.64.1.1/",
+            "https://100.127.255.255/",
+            // Alternate IPv4 encodings the OS resolver maps to loopback / IMDS but `IpAddr` rejects.
+            "https://2130706433/",          // decimal int = 127.0.0.1
+            "https://0x7f000001/",          // hex = 127.0.0.1
+            "https://017700000001/",        // octal-ish leading-zero = 127.0.0.1
+            "https://127.1/",               // short dotted form = 127.0.0.1
+            "https://10.0.1/",              // short dotted form = 10.0.0.1
+            "https://2852039166/",          // decimal int = 169.254.169.254 (IMDS)
+            "https://0x0a.0x00.0x00.0x01/", // per-octet hex
         ] {
             assert!(
                 ssrf_blocked_host(blocked).is_some(),
                 "expected '{blocked}' to be flagged as an SSRF target"
             );
         }
+    }
+
+    #[test]
+    fn test_ssrf_cgnat_boundary() {
+        // 100.64.0.0/10 spans 100.64.0.0 .. 100.127.255.255. Just outside the /10 must be allowed:
+        // 100.63.255.255 (below) and 100.128.0.1 (above) are public.
+        assert!(ssrf_blocked_host("https://100.64.0.0/").is_some());
+        assert!(ssrf_blocked_host("https://100.127.255.255/").is_some());
+        assert!(
+            ssrf_blocked_host("https://100.63.255.255/").is_none(),
+            "100.63.255.255 is below the CGNAT /10 and is a public address"
+        );
+        assert!(
+            ssrf_blocked_host("https://100.128.0.1/").is_none(),
+            "100.128.0.1 is above the CGNAT /10 and is a public address"
+        );
+    }
+
+    #[test]
+    fn test_alternate_ipv4_encoding_detection() {
+        // Alternate encodings of loopback / internal addresses are flagged.
+        assert!(is_alternate_ipv4_encoding("2130706433")); // decimal 127.0.0.1
+        assert!(is_alternate_ipv4_encoding("0x7f000001")); // hex
+        assert!(is_alternate_ipv4_encoding("0X7F000001")); // hex, uppercase prefix
+        assert!(is_alternate_ipv4_encoding("017700000001")); // leading-zero octal
+        assert!(is_alternate_ipv4_encoding("127.1")); // short dotted
+        assert!(is_alternate_ipv4_encoding("10.0.1")); // short dotted
+        assert!(is_alternate_ipv4_encoding("0x7f.0.0.1")); // per-octet hex
+        assert!(is_alternate_ipv4_encoding("0177.0.0.1")); // per-octet octal
+                                                           // A canonical dotted-quad is NOT flagged here (handled by the IpAddr parse path).
+        assert!(!is_alternate_ipv4_encoding("127.0.0.1"));
+        assert!(!is_alternate_ipv4_encoding("8.8.8.8"));
+        // A real DNS hostname is not flagged.
+        assert!(!is_alternate_ipv4_encoding("api.openai.com"));
+        assert!(!is_alternate_ipv4_encoding("example.com"));
+        assert!(!is_alternate_ipv4_encoding(""));
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_weight_member() {
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut zero = make_member("mymodel");
+        zero.weight = 0;
+        pools.insert("mypool".to_string(), make_pool(vec![zero]));
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg).expect_err("a weight:0 pool member must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("weight must be >= 1") && e.contains("mymodel")),
+            "expected a weight:0 rejection for 'mymodel'; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_positive_weight_member() {
+        // The default weight (1) and any positive weight must validate.
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut w = make_member("mymodel");
+        w.weight = 5;
+        pools.insert("mypool".to_string(), make_pool(vec![w]));
+        let cfg = make_root_cfg(providers, models, pools);
+        assert!(
+            validate(&cfg).is_ok(),
+            "a positive-weight pool member must validate"
+        );
     }
 
     #[test]

@@ -106,7 +106,13 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
 
 `auth_middleware` (`src/auth.rs`) runs before routing:
 
-- `/healthz` and `/metrics` are always open.
+- `/healthz` is always open (liveness probes must not require a token).
+- `/metrics` is **not** exempted — Prometheus telemetry (lane/pool topology,
+  per-protocol counters, error rates) is an information-disclosure surface, so it
+  goes through the same auth check as any other route. It requires a valid client
+  token in `token` mode (or a virtual key under governance), and is admitted
+  unconditionally only in `none`/`passthrough` mode. Restrict at the network layer
+  if you need unauthenticated scraping.
 - `/admin/*` requires the governance **admin token** (as `Authorization: Bearer` or
   `X-Admin-Token`); disabled (401) if no admin token is configured.
 - With **governance enabled**, the caller's bearer token must resolve to an enabled
@@ -219,15 +225,18 @@ On success, the response is streamed (SSE or Bedrock event-stream) or buffered:
   `egress.reader().read_response_events` with
   `ingress.writer().write_response_event`, re-framing each upstream event into the
   caller's wire format. It reassembles frames split across chunks, threads stream
-  decode state, decodes Bedrock's binary `application/vnd.amazon.eventstream`, and
-  emits the correct ingress terminator (`data: [DONE]` for OpenAI; Anthropic's
+  decode state, decodes Bedrock's binary `application/vnd.amazon.eventstream` on
+  egress and re-encodes it (CRC32-valid frames) for Bedrock ingress, and emits the
+  correct ingress terminator (`data: [DONE]` for OpenAI; Anthropic's
   `message_stop` carries its own).
 
 In both cases a usage tap reads token counts from the response (protocol-agnostic
 extraction across all six wire shapes), and — when governance is on — charges the
 resolved virtual key's budget at stream completion. Failover is only possible
 *before the first byte* reaches the client; a mid-stream upstream failure records
-the breaker fault and emits an SSE `error` event instead.
+the breaker fault and emits a native error in the caller's protocol — an SSE
+`error` event for SSE clients, a binary `:message-type: exception` frame for
+Bedrock-ingress (AWS eventstream) clients.
 
 ## Circuit-breaker state
 

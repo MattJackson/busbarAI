@@ -108,7 +108,7 @@ async fn my_forwarding_test() {
         base_url: server.base_url(), api_key: "k".into(),
         protocol: Arc::new(crate::proto::Protocol::anthropic()), max: 10,
         error_map: Arc::new(HashMap::new()), context_max: None,
-        path: None, auth: None, health: None };
+        path: None, auth: None, health: None, default_max_tokens: None };
 
     // 2. assemble App (store from the lane_data, governance/observability off)
     let app = Arc::new(App {

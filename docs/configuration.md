@@ -129,8 +129,9 @@ auth:
 Modes:
 
 - **`token`** — clients must send `Authorization: Bearer <token>` matching the
-  allowlist. `/stats` requires a valid token; `/healthz` and `/metrics` are always
-  open.
+  allowlist. `/stats` and `/metrics` require a valid token (telemetry is an
+  information-disclosure surface); only `/healthz` is always open. In
+  `none`/`passthrough` mode `/metrics` is admitted unconditionally.
 - **`passthrough`** — the client's own bearer token is forwarded to the upstream
   provider as the credential. Useful when busbar should not hold keys. Upstream
   `401`/`403` is attributed to the caller and relayed verbatim (the lane is not
@@ -380,8 +381,9 @@ larger (or unknown-context) member.
 
 ### `observability`
 
-All sinks optional; absent = disabled. Prometheus `/metrics` is always on and needs
-no config.
+All sinks optional; absent = disabled. The Prometheus `/metrics` endpoint is always
+enabled and needs no config (it is auth-gated like `/stats`, not publicly open — see
+[Auth](#auth)).
 
 ```yaml
 observability:

@@ -211,8 +211,8 @@ impl ProtocolReader for AnthropicReader {
                     cache_control: None,
                     citations: Vec::new(),
                 });
-            } else if system_val.is_array() {
-                for block_val in system_val.as_array().unwrap() {
+            } else if let Some(arr) = system_val.as_array() {
+                for block_val in arr {
                     system_blocks.push(read_block(block_val)?);
                 }
             }
@@ -474,8 +474,8 @@ impl ProtocolReader for AnthropicReader {
             retry_after: None,
         })?;
         let mut content: Vec<crate::ir::IrBlock> = Vec::new();
-        if content_val.is_array() {
-            for block_val in content_val.as_array().unwrap() {
+        if let Some(arr) = content_val.as_array() {
+            for block_val in arr {
                 content.push(read_block(block_val)?);
             }
         }
@@ -624,13 +624,8 @@ fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrErr
                 .unwrap_or("")
                 .to_string();
             let content_val = obj.get("content").unwrap_or(&serde_json::Value::Null);
-            let content = if content_val.is_array() {
-                content_val
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(read_block)
-                    .collect::<Result<_, _>>()?
+            let content = if let Some(arr) = content_val.as_array() {
+                arr.iter().map(read_block).collect::<Result<_, _>>()?
             } else {
                 vec![crate::ir::IrBlock::Text {
                     text: content_val.as_str().unwrap_or("").to_string(),
@@ -704,13 +699,8 @@ fn read_message(msg_val: &serde_json::Value) -> Result<crate::ir::IrMessage, IrE
     };
 
     let content_val = obj.get("content").unwrap_or(&serde_json::Value::Null);
-    let content = if content_val.is_array() {
-        content_val
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(read_block)
-            .collect::<Result<_, _>>()?
+    let content = if let Some(arr) = content_val.as_array() {
+        arr.iter().map(read_block).collect::<Result<_, _>>()?
     } else {
         vec![crate::ir::IrBlock::Text {
             text: content_val.as_str().unwrap_or("").to_string(),
@@ -1697,5 +1687,94 @@ mod anthropic_hardening_tests {
                 .and_then(|t| t.as_str()),
             Some("rate_limit_error")
         );
+    }
+
+    /// Finding #3 regression: a `system` field in ARRAY form must be read via `as_array()` (no
+    /// `is_array()`/`unwrap()` pair on the request path) and yield one IR block per element without
+    /// panicking. Guards that the unwrap-removal refactor preserves array-system behavior.
+    #[test]
+    fn read_request_array_system_parses_blocks() {
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "system": [
+                {"type": "text", "text": "you are helpful"},
+                {"type": "text", "text": "be concise"}
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16
+        });
+        let ir = AnthropicReader
+            .read_request(&body)
+            .expect("array system must parse without panic");
+        assert_eq!(ir.system.len(), 2, "both system text blocks must be read");
+        match &ir.system[0] {
+            crate::ir::IrBlock::Text { text, .. } => assert_eq!(text, "you are helpful"),
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    /// Finding #3 regression: a non-array, non-string `system` value (e.g. a number) must NOT panic
+    /// — the refactored `as_array()`/`is_string()` guards simply produce no system blocks rather
+    /// than reaching a `.unwrap()`. Direct guard that the unwrap is gone from the request path.
+    #[test]
+    fn read_request_non_array_non_string_system_is_ignored_no_panic() {
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "system": 12345,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16
+        });
+        let ir = AnthropicReader
+            .read_request(&body)
+            .expect("unexpected system shape must not panic the request path");
+        assert!(
+            ir.system.is_empty(),
+            "a non-array/non-string system yields no blocks (no unwrap panic)"
+        );
+    }
+
+    /// Finding #3 regression: a `tool_result` block whose `content` is an ARRAY of nested blocks
+    /// must be read via `as_array()` (no `is_array()`/`unwrap()`) and recurse into each nested
+    /// block without panic. Exercises the read_block tool_result array branch.
+    #[test]
+    fn read_block_tool_result_array_content_parses() {
+        let block = serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_01",
+            "content": [
+                {"type": "text", "text": "result line 1"},
+                {"type": "text", "text": "result line 2"}
+            ]
+        });
+        let ir = read_block(&block).expect("tool_result array content must parse without panic");
+        match ir {
+            crate::ir::IrBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "toolu_01");
+                assert_eq!(content.len(), 2, "both nested blocks must be read");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    /// Finding #3 regression: a `read_response` body whose top-level `content` is an array must be
+    /// read via `as_array()` without the removed `unwrap()`. Guards the response-path array read.
+    #[test]
+    fn read_response_array_content_parses_no_unwrap() {
+        let body = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"}
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let ir = AnthropicReader
+            .read_response(&body)
+            .expect("array content must parse without panic");
+        assert_eq!(ir.content.len(), 2);
     }
 }

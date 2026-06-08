@@ -46,9 +46,9 @@ Streaming uses a parallel set of IR types: `IrStreamEvent`
 (OpenAI) must synthesize the IR's block boundaries: one OpenAI chunk fans out to
 `0..n` IR events via `read_response_events(.., &mut state)`, whereas Anthropic's
 events are 1:1 and ignore the state. See `StreamTranslate` in `src/proto/mod.rs`
-for the live wiring (frame reassembly, Bedrock binary `eventstream` decode, and
-the per-ingress terminator: OpenAI emits `data: [DONE]`, Anthropic's
-`message_stop` carries its own).
+for the live wiring (frame reassembly, Bedrock binary `eventstream` decode
+(egress) and re-encode (ingress), and the per-ingress terminator: OpenAI emits
+`data: [DONE]`, Anthropic's `message_stop` carries its own).
 
 ---
 

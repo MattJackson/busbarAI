@@ -10,9 +10,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Monotonic per-process counter mixed into a synthesized response id so two responses minted
 /// within the same wall-clock second still get distinct ids. Combined with the unix-second prefix
 /// this gives a collision-resistant id without pulling in a uuid/rand crate (a new dependency is
-/// out of scope for this wave). Cohere v2 ids are opaque strings — an official SDK reads `id` as a
-/// plain string and never parses its internal structure — so any unique, stable string is valid.
+/// out of scope for this wave).
 static COHERE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Format 128 bits as a UUID-shaped (8-4-4-4-12 lowercase hex) token. Real Cohere v2 chat response
+/// ids are bare UUIDs (e.g. `c14c80c3-18eb-4519-9460-6c92edd8cfb4`) with NO literal prefix, so a
+/// synthesized id must match that hex layout to stay shape-indistinguishable from a native one.
+fn format_uuid_layout(hi: u64, lo: u64) -> String {
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (hi >> 32) as u32,
+        ((hi >> 16) & 0xffff) as u16,
+        (hi & 0xffff) as u16,
+        ((lo >> 48) & 0xffff) as u16,
+        lo & 0x0000_ffff_ffff_ffff,
+    )
+}
 
 /// Current unix epoch seconds, saturating to 0 if the clock is somehow before the epoch (never
 /// panics on the request path).
@@ -24,11 +37,19 @@ fn unix_now_secs() -> u64 {
 }
 
 /// Synthesize a Cohere-shaped response id for the cross-protocol case where the backend supplied
-/// none. Cohere v2 chat responses carry a UUID-like opaque `id`; the SDK treats it as an opaque
-/// string, so a `cohere-<unix_secs>-<counter>` value is shape-valid and unique within the process.
+/// none. Native Cohere v2 ids are bare UUIDs (8-4-4-4-12 hex, no prefix), so we emit that exact
+/// shape — seeded from the unix-second and the atomic counter — rather than a `cohere-<…>` token
+/// that a client comparing against the documented UUID shape could use as a proxy tell. The
+/// unix-second seeds the high bits and the monotonic counter the low bits, so two ids minted in the
+/// same second remain distinct without pulling in a uuid/rand crate.
 fn synthesize_cohere_id() -> String {
     let n = COHERE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("cohere-{}-{}", unix_now_secs(), n)
+    let secs = unix_now_secs();
+    // Mix the second and counter across both 64-bit halves so neither half is trivially zero and
+    // the layout fills all 32 hex nibbles like a real UUID.
+    let hi = (secs << 32) ^ (n.rotate_left(17));
+    let lo = (n << 16) ^ secs.rotate_left(31);
+    format_uuid_layout(hi, lo)
 }
 
 #[derive(Clone)]
@@ -186,8 +207,8 @@ impl ProtocolReader for CohereReader {
                             cache_control: None,
                             citations: Vec::new(),
                         });
-                    } else if content_val.is_array() {
-                        for block_val in content_val.as_array().unwrap() {
+                    } else if let Some(arr) = content_val.as_array() {
+                        for block_val in arr {
                             if let Some(block_obj) = block_val.as_object() {
                                 if block_obj.get("type").and_then(|t| t.as_str()) == Some("text") {
                                     if let Some(text) =
@@ -245,16 +266,13 @@ impl ProtocolReader for CohereReader {
                         .unwrap_or("")
                         .to_string();
                     let content_text = if let Some(content_val) = msg_val.get("content") {
-                        if content_val.is_array() {
-                            content_val
-                                .as_array()
-                                .unwrap()
-                                .iter()
+                        if let Some(arr) = content_val.as_array() {
+                            arr.iter()
                                 .filter_map(|b| b.as_str())
                                 .collect::<Vec<_>>()
                                 .join(" ")
-                        } else if content_val.is_string() {
-                            content_val.as_str().unwrap_or("").to_string()
+                        } else if let Some(s) = content_val.as_str() {
+                            s.to_string()
                         } else {
                             serde_json::to_string(content_val).unwrap_or_default()
                         }
@@ -785,6 +803,63 @@ impl ProtocolWriter for CohereWriter {
                 )),
             };
 
+            if msg.role == crate::ir::IrRole::Tool {
+                // Tool-role messages emit one Cohere tool message per ToolResult block. Any plain
+                // text carried alongside the tool results (and the degenerate case of a Tool turn
+                // with NO ToolResult block at all) must NOT be silently dropped: fold that text in
+                // — onto the first tool message if there is one, otherwise as a standalone tool
+                // message — so the turn is never lossy.
+                let mut emitted_tool_result = false;
+                for block in &msg.content {
+                    if let crate::ir::IrBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error: _,
+                    } = block
+                    {
+                        let mut tool_result_obj = serde_json::Map::new();
+                        tool_result_obj.insert("role".to_string(), serde_json::json!("tool"));
+                        tool_result_obj.insert(
+                            "tool_call_id".to_string(),
+                            serde_json::Value::String(tool_use_id.clone()),
+                        );
+                        let mut text_parts: Vec<String> = content
+                            .iter()
+                            .filter_map(|b| {
+                                if let crate::ir::IrBlock::Text { text, .. } = b {
+                                    Some(text.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        // Prepend any message-level text onto the first tool result so it survives.
+                        if !emitted_tool_result {
+                            for t in text_blocks.iter().rev() {
+                                text_parts.insert(0, (*t).clone());
+                            }
+                        }
+                        tool_result_obj.insert(
+                            "content".to_string(),
+                            serde_json::Value::String(text_parts.join(" ")),
+                        );
+                        messages_arr.push(serde_json::Value::Object(tool_result_obj));
+                        emitted_tool_result = true;
+                    }
+                }
+                // Degenerate Tool turn with text but no ToolResult: emit the text as a tool message
+                // rather than dropping it entirely.
+                if !emitted_tool_result {
+                    if let Some(content_val) = content_val {
+                        let mut tool_obj = serde_json::Map::new();
+                        tool_obj.insert("role".to_string(), serde_json::json!("tool"));
+                        tool_obj.insert("content".to_string(), content_val);
+                        messages_arr.push(serde_json::Value::Object(tool_obj));
+                    }
+                }
+                continue;
+            }
+
             let mut msg_obj = serde_json::Map::new();
             msg_obj.insert("role".to_string(), serde_json::json!(role_str));
             if let Some(content_val) = content_val {
@@ -808,40 +883,7 @@ impl ProtocolWriter for CohereWriter {
                 }
             }
 
-            if msg.role == crate::ir::IrRole::Tool {
-                for block in &msg.content {
-                    if let crate::ir::IrBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error: _,
-                    } = block
-                    {
-                        let mut tool_result_obj = serde_json::Map::new();
-                        tool_result_obj.insert("role".to_string(), serde_json::json!("tool"));
-                        tool_result_obj.insert(
-                            "tool_call_id".to_string(),
-                            serde_json::Value::String(tool_use_id.clone()),
-                        );
-                        let text_parts: Vec<String> = content
-                            .iter()
-                            .filter_map(|b| {
-                                if let crate::ir::IrBlock::Text { text, .. } = b {
-                                    Some(text.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        tool_result_obj.insert(
-                            "content".to_string(),
-                            serde_json::Value::String(text_parts.join(" ")),
-                        );
-                        messages_arr.push(serde_json::Value::Object(tool_result_obj));
-                    }
-                }
-            } else if msg.role != crate::ir::IrRole::Tool {
-                messages_arr.push(serde_json::Value::Object(msg_obj));
-            }
+            messages_arr.push(serde_json::Value::Object(msg_obj));
         }
 
         out.insert(
@@ -877,7 +919,14 @@ impl ProtocolWriter for CohereWriter {
         if let Some(temperature) = req.temperature {
             out.insert("temperature".to_string(), serde_json::json!(temperature));
         }
-        out.insert("stream".to_string(), serde_json::json!(req.stream));
+        // Only emit `stream` when streaming is requested. A native Cohere client omitting `stream`
+        // (relying on the `false` default) produces a body WITHOUT the field; always injecting
+        // `"stream": false` is a proxy tell and a same-protocol passthrough fidelity break (the
+        // reader treats `stream` as a modeled key, so it is never echoed via `extra`). The Gemini
+        // writer likewise never emits `stream` in the body.
+        if req.stream {
+            out.insert("stream".to_string(), serde_json::json!(true));
+        }
         for (key, value) in &req.extra {
             out.insert(key.clone(), value.clone());
         }
@@ -947,10 +996,7 @@ impl ProtocolWriter for CohereWriter {
                 serde_json::json!({ "type": "content-end", "index": 0 }),
             )),
 
-            IrStreamEvent::MessageDelta {
-                stop_reason,
-                usage: _,
-            } => {
+            IrStreamEvent::MessageDelta { stop_reason, usage } => {
                 let cohere_finish_reason = match stop_reason.as_deref() {
                     Some("end_turn") | Some("stop_sequence") => "COMPLETE".to_string(),
                     Some("max_tokens") => "MAX_TOKENS".to_string(),
@@ -959,11 +1005,24 @@ impl ProtocolWriter for CohereWriter {
                     Some(reason) => reason.to_uppercase(),
                     None => "COMPLETE".to_string(),
                 };
+                // Native Cohere v2 message-end frames carry token usage inside
+                // delta.usage.tokens.{input_tokens,output_tokens}. Surface it so a Cohere SDK
+                // client tracking billing/rate-limit data from the stream is not silently zeroed.
+                // IrUsage is always present (not Option); when upstream supplied nothing it is
+                // zero-valued, which serializes here as a safe `{input_tokens:0,output_tokens:0}`.
                 Some((
                     "".to_string(),
                     serde_json::json!({
                         "type": "message-end",
-                        "delta": { "finish_reason": cohere_finish_reason }
+                        "delta": {
+                            "finish_reason": cohere_finish_reason,
+                            "usage": {
+                                "tokens": {
+                                    "input_tokens": usage.input_tokens,
+                                    "output_tokens": usage.output_tokens
+                                }
+                            }
+                        }
                     }),
                 ))
             }
@@ -1072,7 +1131,12 @@ impl ProtocolWriter for CohereWriter {
     /// own `extract_error` reads only `message`/`error_type` and never `id`, so emitting an `id`
     /// here was both a proxy tell and internally inconsistent with the reader. Served as
     /// `application/json` per the trait contract.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// This is a LIVE production code path, not test-only scaffolding: it is reached at runtime via
+    /// the `ProtocolWriter` trait object on every Cohere-ingress error response (e.g. route.rs,
+    /// forward.rs, and auth.rs all dispatch `p.writer().write_error(...)`). It carries no
+    /// `allow(dead_code)` suppression — matching every other protocol writer — because the
+    /// dead-code lint never fires on vtable-dispatched trait method implementations.
     fn write_error(&self, _status: u16, _kind: &str, message: &str) -> serde_json::Value {
         serde_json::json!({
             "message": message,
@@ -1687,8 +1751,35 @@ mod tests {
             .expect("synthesized id must be present as a string");
         assert!(!id.is_empty(), "synthesized id must be non-empty");
         assert!(
-            id.starts_with("cohere-"),
-            "synthesized id should carry the cohere prefix, got {id}"
+            is_uuid_shaped(id),
+            "synthesized id must be a bare UUID (no `cohere-` prefix), got {id}"
+        );
+    }
+
+    /// Test helper: validate the 8-4-4-4-12 lowercase-hex UUID layout that native Cohere ids use.
+    fn is_uuid_shaped(s: &str) -> bool {
+        let groups: Vec<&str> = s.split('-').collect();
+        let expected_lens = [8usize, 4, 4, 4, 12];
+        groups.len() == 5
+            && groups
+                .iter()
+                .zip(expected_lens.iter())
+                .all(|(g, &len)| g.len() == len && g.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
+
+    /// Regression (MEDIUM/conformance): the synthesized id must be a bare UUID (8-4-4-4-12 hex),
+    /// indistinguishable from a native Cohere id — NOT a `cohere-<secs>-<counter>` token, which a
+    /// client comparing against the documented UUID shape could use as a proxy tell.
+    #[test]
+    fn test_synthesized_id_is_uuid_shaped() {
+        let id = synthesize_cohere_id();
+        assert!(
+            is_uuid_shaped(&id),
+            "synthesized id must match the UUID layout, got {id}"
+        );
+        assert!(
+            !id.starts_with("cohere-"),
+            "synthesized id must NOT carry a literal prefix, got {id}"
         );
     }
 
@@ -1894,5 +1985,260 @@ mod tests {
         assert_eq!(err.provider_code.as_deref(), Some("boom"));
         assert_eq!(err.structured_type.as_deref(), Some("invalid_request"));
         assert_eq!(err.http_status, 400);
+    }
+
+    /// Regression (MEDIUM/conformance): a non-streaming request must OMIT the `stream` key entirely
+    /// (matching a native client relying on the `false` default), and a streaming request must emit
+    /// `"stream": true`. Always injecting `"stream": false` was a proxy tell and a same-protocol
+    /// passthrough fidelity break.
+    #[test]
+    fn test_write_request_stream_field_conditional() {
+        let base = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+
+        let non_streaming = CohereWriter.write_request(&base);
+        assert!(
+            non_streaming.get("stream").is_none(),
+            "non-streaming request must omit the `stream` key, got {non_streaming}"
+        );
+
+        let streaming = CohereWriter.write_request(&crate::ir::IrRequest {
+            stream: true,
+            ..base
+        });
+        assert_eq!(
+            streaming.get("stream"),
+            Some(&serde_json::json!(true)),
+            "streaming request must emit `\"stream\": true`"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance): a non-streaming Cohere -> Cohere passthrough must NOT GAIN a
+    /// `stream` field the native client never sent. Reading a body without `stream` then writing it
+    /// must yield a body still without `stream`.
+    #[test]
+    fn test_stream_field_roundtrip_omitted() {
+        let native = serde_json::json!({
+            "model": "command",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let ir = CohereReader
+            .read_request(&native)
+            .expect("read_request should succeed");
+        assert!(!ir.stream, "absent `stream` reads as false");
+        let out = CohereWriter.write_request(&ir);
+        assert!(
+            out.get("stream").is_none(),
+            "round-trip must not inject a `stream` field, got {out}"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance): the streaming `message-end` frame must carry token usage at
+    /// `delta.usage.tokens.{input_tokens,output_tokens}` (native Cohere v2 shape) so a Cohere SDK
+    /// client tracking billing/rate-limit data is not silently zeroed.
+    #[test]
+    fn test_write_response_event_message_end_carries_usage() {
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 42,
+                output_tokens: 7,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (_, frame) = CohereWriter
+            .write_response_event(&ev)
+            .expect("message-end must serialize");
+        assert_eq!(
+            frame.get("type").and_then(|t| t.as_str()),
+            Some("message-end")
+        );
+        let tokens = frame
+            .get("delta")
+            .and_then(|d| d.get("usage"))
+            .and_then(|u| u.get("tokens"))
+            .expect("delta.usage.tokens must be present");
+        assert_eq!(
+            tokens.get("input_tokens").and_then(|v| v.as_u64()),
+            Some(42)
+        );
+        assert_eq!(
+            tokens.get("output_tokens").and_then(|v| v.as_u64()),
+            Some(7)
+        );
+    }
+
+    /// Regression (MEDIUM/conformance): when upstream usage is zero (no data), the message-end frame
+    /// still emits the `tokens` object with zero values rather than omitting the key.
+    #[test]
+    fn test_write_response_event_message_end_zero_usage_present() {
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: None,
+            usage: crate::ir::IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (_, frame) = CohereWriter
+            .write_response_event(&ev)
+            .expect("message-end must serialize");
+        let tokens = frame
+            .get("delta")
+            .and_then(|d| d.get("usage"))
+            .and_then(|u| u.get("tokens"))
+            .expect("delta.usage.tokens must be present even with zero usage");
+        assert_eq!(tokens.get("input_tokens").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(
+            tokens.get("output_tokens").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+    }
+
+    /// The message-end stream frame round-trips usage through this protocol's own reader: the usage
+    /// written into `delta.usage.tokens` is read back identically.
+    #[test]
+    fn test_message_end_usage_stream_roundtrip() {
+        let usage = crate::ir::IrUsage {
+            input_tokens: 11,
+            output_tokens: 3,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        let (_, frame) = CohereWriter
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                usage: usage.clone(),
+            })
+            .expect("message-end must serialize");
+
+        let mut state = crate::ir::StreamDecodeState::default();
+        let evs = CohereReader.read_response_events("", &frame, &mut state);
+        let back = evs
+            .iter()
+            .find_map(|e| {
+                if let IrStreamEvent::MessageDelta { usage, .. } = e {
+                    Some(usage.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("a MessageDelta must come back");
+        assert_eq!(back.input_tokens, 11);
+        assert_eq!(back.output_tokens, 3);
+    }
+
+    /// Regression (LOW/correctness): a Tool-role message carrying plain text ALONGSIDE a ToolResult
+    /// must not silently drop the text — it is folded into the emitted tool message content.
+    #[test]
+    fn test_tool_role_text_alongside_result_not_dropped() {
+        let ir = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Tool,
+                content: vec![
+                    crate::ir::IrBlock::Text {
+                        text: "note".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    },
+                    crate::ir::IrBlock::ToolResult {
+                        tool_use_id: "t1".to_string(),
+                        content: vec![crate::ir::IrBlock::Text {
+                            text: "result".to_string(),
+                            cache_control: None,
+                            citations: Vec::new(),
+                        }],
+                        is_error: false,
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = CohereWriter.write_request(&ir);
+        let msgs = out.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "one tool message emitted");
+        let content = msgs[0].get("content").and_then(|c| c.as_str()).unwrap();
+        assert!(
+            content.contains("note") && content.contains("result"),
+            "both the message-level text and the tool result text must survive, got {content}"
+        );
+        assert_eq!(
+            msgs[0].get("tool_call_id").and_then(|v| v.as_str()),
+            Some("t1")
+        );
+    }
+
+    /// Regression (LOW/correctness): a degenerate Tool-role message with text but NO ToolResult
+    /// block must still emit its text rather than producing nothing at all.
+    #[test]
+    fn test_tool_role_text_without_result_not_dropped() {
+        let ir = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Tool,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "orphan tool text".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = CohereWriter.write_request(&ir);
+        let msgs = out.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(
+            msgs.len(),
+            1,
+            "a Tool turn with text but no ToolResult must still emit a message"
+        );
+        assert_eq!(msgs[0].get("role").and_then(|r| r.as_str()), Some("tool"));
+        assert_eq!(
+            msgs[0].get("content").and_then(|c| c.as_str()),
+            Some("orphan tool text")
+        );
+    }
+
+    /// Regression (HIGH/dead-code): `write_error` is a LIVE vtable-dispatched trait method, not
+    /// test-only scaffolding. Reaching it via a `&dyn ProtocolWriter` (the exact runtime path used
+    /// at the Cohere-ingress error sites) must produce the native bare `{"message": ...}` envelope.
+    #[test]
+    fn test_write_error_via_trait_object_is_live_path() {
+        let writer: Box<dyn ProtocolWriter> = Box::new(CohereWriter);
+        let v = writer.write_error(401, "authentication_error", "bad key");
+        assert_eq!(
+            v.get("message").and_then(|m| m.as_str()),
+            Some("bad key"),
+            "the vtable-dispatched write_error must emit the native Cohere envelope"
+        );
+        assert_eq!(
+            v.as_object().map(|o| o.len()),
+            Some(1),
+            "native Cohere error body is a bare single-key {{\"message\": ...}}"
+        );
     }
 }

@@ -21,12 +21,49 @@ fn now_unix_secs() -> u64 {
 }
 
 /// Synthesize a protocol-correct Responses id (`resp_<hex>`) for cross-protocol responses where the
-/// backend supplied none. Uniqueness comes from `timestamp << 24 | counter` rendered as hex — no
-/// new crate dependency. Native passthrough never calls this: it carries the upstream id verbatim.
+/// backend supplied none. Uniqueness comes from concatenating the unix timestamp and a monotonic
+/// per-process counter as separate hex fields — no XOR folding (which would collide once the counter
+/// advances by 2^24 within a second) and no new crate dependency. Native passthrough never calls
+/// this: it carries the upstream id verbatim.
 fn synthesize_response_id() -> String {
     let counter = RESPONSE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let seed = (now_unix_secs() << 24) ^ counter;
-    format!("resp_{seed:016x}")
+    format!("resp_{:x}{:016x}", now_unix_secs(), counter)
+}
+
+/// Parse a Responses `image_url` string into an IR `(media_type, data)` pair.
+///
+/// A base64 data URI (`data:<mime>;base64,<payload>`) is split on the FIRST comma — the single `;`
+/// canonical shape has only two `;`-delimited fields, so the previous `splitn(3, ';')` logic could
+/// never recover the payload and silently dropped every image. We take the MIME type from the
+/// metadata before the comma and the base64 payload after it, matching `openai.rs`'s
+/// `parse_image_url`. Any non-data URL (an https reference, or a data URI we cannot confidently
+/// split) is preserved verbatim in `data` with the `image_url` media_type sentinel so the writer can
+/// reconstruct the exact original `image_url` on a same-protocol round-trip — never a human-readable
+/// comment embedded in the payload.
+fn parse_image_url(url: &str) -> (String, String) {
+    if let Some(rest) = url.strip_prefix("data:") {
+        if let Some((meta, payload)) = rest.split_once(',') {
+            // meta is e.g. "image/png;base64" or "image/png" — keep only the MIME type.
+            let media_type = meta.split(';').next().unwrap_or("").to_string();
+            if meta.contains("base64") && !media_type.is_empty() {
+                return (media_type, payload.to_string());
+            }
+        }
+    }
+    // Non-data URL (https://...) or an unrecognized data URI: keep it verbatim under the
+    // `image_url` sentinel so the writer round-trips it as-is rather than mangling it.
+    ("image_url".to_string(), url.to_string())
+}
+
+/// Reconstruct a Responses `image_url` string from the IR `Image` (media_type, data) pair — the
+/// inverse of [`parse_image_url`]. A URL-sentinel image is emitted verbatim; a base64 image is
+/// re-wrapped into a `data:<mime>;base64,<payload>` URI.
+fn image_url_from_ir(media_type: &str, data: &str) -> String {
+    if media_type == "image_url" {
+        data.to_string()
+    } else {
+        format!("data:{media_type};base64,{data}")
+    }
 }
 
 #[derive(Clone)]
@@ -186,27 +223,7 @@ impl ProtocolReader for ResponsesReader {
                         Some("input_image") => {
                             let image_url =
                                 item.get("image_url").and_then(|u| u.as_str()).unwrap_or("");
-                            let (media_type, data) = if image_url.starts_with("data:") {
-                                let parts: Vec<&str> = image_url.splitn(3, ';').collect();
-                                if parts.len() >= 2 && parts[0].starts_with("data:") {
-                                    let mt =
-                                        parts[0].strip_prefix("data:").unwrap_or("image/unknown");
-                                    let full_base64 = parts
-                                        .get(2)
-                                        .map(|s| s.trim_start_matches(',').to_string())
-                                        .or_else(|| {
-                                            image_url
-                                                .split(';')
-                                                .nth(2)
-                                                .map(|s| s.trim_start_matches(',').to_string())
-                                        });
-                                    (mt.to_string(), full_base64.unwrap_or_default())
-                                } else {
-                                    ("image/unknown".to_string(), image_url.to_string())
-                                }
-                            } else {
-                                ("image/unknown".to_string(), image_url.to_string())
-                            };
+                            let (media_type, data) = parse_image_url(image_url);
                             messages.push(crate::ir::IrMessage {
                                 role: crate::ir::IrRole::User,
                                 content: vec![crate::ir::IrBlock::Image { media_type, data }],
@@ -290,8 +307,36 @@ impl ProtocolReader for ResponsesReader {
                                 }],
                             });
                         }
+                        Some("message") => {
+                            // The official OpenAI Responses SDK emits conversation turns as typed
+                            // `{"type":"message","role":...,"content":[...]}` items. The role-keyed
+                            // fallback below only fires for UNTYPED items, so without this arm a
+                            // typed message turn would be silently dropped. Read role+content and
+                            // map the content blocks via `responses_block`, mirroring the untyped
+                            // branch.
+                            let role_str = item.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                            let role = match role_str {
+                                "user" => Some(crate::ir::IrRole::User),
+                                "assistant" => Some(crate::ir::IrRole::Assistant),
+                                _ => None,
+                            };
+                            if let Some(role) = role {
+                                if let Some(content_arr) =
+                                    item.get("content").and_then(|c| c.as_array())
+                                {
+                                    let msg_content: Vec<crate::ir::IrBlock> = content_arr
+                                        .iter()
+                                        .filter_map(|b| responses_block(b).ok())
+                                        .collect();
+                                    messages.push(crate::ir::IrMessage {
+                                        role,
+                                        content: msg_content,
+                                    });
+                                }
+                            }
+                        }
                         Some("reasoning") => {}
-                        _ => {}
+                        Some(_) | None => {}
                     }
 
                     // Handle role/content structured items (user/assistant messages) ONLY when the
@@ -812,35 +857,8 @@ fn responses_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, 
         }
         "input_image" => {
             let image_url = obj.get("image_url").and_then(|v| v.as_str()).unwrap_or("");
-            if image_url.starts_with("data:") {
-                let parts: Vec<&str> = image_url.splitn(3, ';').collect();
-                if parts.len() >= 2 && parts[0].starts_with("data:") {
-                    let mt = parts[0].strip_prefix("data:").unwrap_or("image/unknown");
-                    let full_base64 = parts
-                        .get(2)
-                        .map(|s| s.trim_start_matches(',').to_string())
-                        .or_else(|| {
-                            image_url
-                                .split(';')
-                                .nth(2)
-                                .map(|s| s.trim_start_matches(',').to_string())
-                        });
-                    Ok(crate::ir::IrBlock::Image {
-                        media_type: mt.to_string(),
-                        data: full_base64.unwrap_or_default(),
-                    })
-                } else {
-                    Ok(crate::ir::IrBlock::Image {
-                        media_type: "image/unknown".to_string(),
-                        data: image_url.to_string(),
-                    })
-                }
-            } else {
-                Ok(crate::ir::IrBlock::Image {
-                    media_type: "image/unknown".to_string(),
-                    data: format!("// note: non-data URL - {}", image_url),
-                })
-            }
+            let (media_type, data) = parse_image_url(image_url);
+            Ok(crate::ir::IrBlock::Image { media_type, data })
         }
         _ => Err(IrError {
             class: StatusClass::ClientError,
@@ -921,7 +939,11 @@ impl ProtocolWriter for ResponsesWriter {
                                 }));
                             }
                             crate::ir::IrBlock::Image { media_type, data } => {
-                                let image_url = format!("data:{};base64,{}", media_type, data);
+                                // Reconstruct the original `image_url`: a URL-sentinel image is
+                                // emitted verbatim, a base64 image is re-wrapped as a data URI. This
+                                // is the inverse of `parse_image_url` so a same-protocol round-trip
+                                // is lossless.
+                                let image_url = image_url_from_ir(media_type, data);
                                 content_arr.push(serde_json::json!({
                                     "type": "input_image",
                                     "image_url": image_url
@@ -1044,6 +1066,11 @@ impl ProtocolWriter for ResponsesWriter {
             out.insert("temperature".to_string(), serde_json::json!(temperature));
         }
 
+        // `stream` is a modeled key (excluded from `extra`), so it must be emitted explicitly or it
+        // is silently dropped — a `stream: true` request would otherwise be answered non-streaming,
+        // stalling the SSE translation loop. Mirrors the OpenAI writer.
+        out.insert("stream".to_string(), serde_json::json!(req.stream));
+
         for (key, value) in &req.extra {
             out.insert(key.clone(), value.clone());
         }
@@ -1053,15 +1080,30 @@ impl ProtocolWriter for ResponsesWriter {
 
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
         match ev {
-            IrStreamEvent::MessageStart { .. } => Some((
-                "response.created".to_string(),
-                serde_json::json!({
-                    "response": {
-                        "object": "response",
-                        "status": "in_progress"
-                    }
-                }),
-            )),
+            IrStreamEvent::MessageStart {
+                id, created, model, ..
+            } => {
+                // The official OpenAI Responses SDK reads `response.id`/`created_at`/`model` from the
+                // opening `response.created` event to construct its Response object; a stub omitting
+                // them yields null identity fields and breaks event correlation. Forward the captured
+                // identity when present (same-protocol passthrough), otherwise synthesize a
+                // protocol-correct `resp_` id and the current unix time (cross-protocol, where
+                // `translate_event` strips these to None) so the event stays SDK-valid.
+                let mut resp_obj = serde_json::Map::new();
+                let id = id.clone().unwrap_or_else(synthesize_response_id);
+                let created_at = created.unwrap_or_else(now_unix_secs);
+                resp_obj.insert("id".to_string(), serde_json::json!(id));
+                resp_obj.insert("object".to_string(), serde_json::json!("response"));
+                resp_obj.insert("created_at".to_string(), serde_json::json!(created_at));
+                resp_obj.insert("status".to_string(), serde_json::json!("in_progress"));
+                if let Some(model) = model {
+                    resp_obj.insert("model".to_string(), serde_json::json!(model));
+                }
+                Some((
+                    "response.created".to_string(),
+                    serde_json::json!({ "response": resp_obj }),
+                ))
+            }
 
             IrStreamEvent::BlockStart { index, block } => match block {
                 crate::ir::IrBlockMeta::Text => None,
@@ -1215,7 +1257,13 @@ impl ProtocolWriter for ResponsesWriter {
                     }));
                 }
                 crate::ir::IrBlock::Thinking { .. } => {}
-                _ => {}
+                // ToolResult and Image have no representation in a Responses API `output` array
+                // (output carries assistant `message`/`function_call` items only), so they are
+                // intentionally dropped here. Enumerated explicitly rather than swallowed by a
+                // catch-all so a future IrBlock variant forces a compile error instead of silently
+                // vanishing from Responses output.
+                crate::ir::IrBlock::ToolResult { .. } => {}
+                crate::ir::IrBlock::Image { .. } => {}
             }
         }
 
@@ -2440,6 +2488,264 @@ mod tests {
             }
             other => panic!("expected ToolUse, got {other:?}"),
         }
+    }
+
+    /// Regression: a base64 `input_image` data URI of the canonical single-`;` shape
+    /// (`data:image/png;base64,<payload>`) must parse the FULL payload, not drop it to "". The old
+    /// `splitn(3, ';')` logic yielded only two fields and silently discarded every image. Covers
+    /// both `read_request` and `responses_block`.
+    #[test]
+    fn test_input_image_base64_payload_preserved() {
+        let payload = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let url = format!("data:image/png;base64,{payload}");
+
+        // read_request path.
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "input_image", "image_url": url}
+            ]
+        });
+        let reader = ResponsesReader;
+        let ir = reader.read_request(&json).expect("read_request ok");
+        assert_eq!(ir.messages.len(), 1);
+        match &ir.messages[0].content[0] {
+            crate::ir::IrBlock::Image { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, payload, "full base64 payload must be preserved");
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+
+        // responses_block path (e.g. a content block nested in a function_call_output).
+        let block = serde_json::json!({"type": "input_image", "image_url": url});
+        match responses_block(&block).expect("responses_block ok") {
+            crate::ir::IrBlock::Image { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, payload);
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    /// Regression: a base64 `input_image` must survive a same-protocol read -> write -> read
+    /// round-trip with its payload intact (the writer emits `data:<mime>;base64,<payload>` which the
+    /// reader must parse back to the identical pair).
+    #[test]
+    fn test_input_image_roundtrip_lossless() {
+        let payload = "QUJDMTIzKz0=";
+        let media_type = "image/jpeg";
+        let ir = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Image {
+                    media_type: media_type.to_string(),
+                    data: payload.to_string(),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let writer = ResponsesWriter;
+        let reader = ResponsesReader;
+        let json = writer.write_request(&ir);
+        let rt = reader.read_request(&json).expect("read round-trip ok");
+        match &rt.messages[0].content[0] {
+            crate::ir::IrBlock::Image {
+                media_type: mt,
+                data,
+            } => {
+                assert_eq!(mt, media_type);
+                assert_eq!(data, payload, "round-trip must not corrupt the payload");
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    /// Regression: a non-data (https) image URL must be stored verbatim under the `image_url`
+    /// sentinel media_type — NOT mangled into a `// note: non-data URL - ...` comment — and must
+    /// round-trip back to the exact original URL.
+    #[test]
+    fn test_input_image_https_url_sentinel_roundtrip() {
+        let url = "https://example.com/cat.png";
+        let block = serde_json::json!({"type": "input_image", "image_url": url});
+        let (media_type, data) = match responses_block(&block).expect("responses_block ok") {
+            crate::ir::IrBlock::Image { media_type, data } => (media_type, data),
+            other => panic!("expected Image, got {other:?}"),
+        };
+        assert_eq!(
+            media_type, "image_url",
+            "non-data URL must use the sentinel"
+        );
+        assert_eq!(data, url, "URL must be stored verbatim, not a comment");
+        assert!(
+            !data.starts_with("// note"),
+            "must not embed a human comment in the payload"
+        );
+
+        // Round-trip through the writer reconstructs the exact original image_url.
+        let ir = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Image { media_type, data }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let writer = ResponsesWriter;
+        let json = writer.write_request(&ir);
+        let emitted = json["input"][0]["content"][0]["image_url"]
+            .as_str()
+            .expect("image_url present");
+        assert_eq!(emitted, url, "writer must emit the original URL verbatim");
+    }
+
+    /// Regression: `write_request` must emit the `stream` field (a modeled key excluded from
+    /// `extra`); omitting it answers a `stream: true` request non-streaming and stalls SSE.
+    #[test]
+    fn test_write_request_emits_stream() {
+        let make = |stream: bool| crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream,
+            extra: serde_json::Map::new(),
+        };
+        let writer = ResponsesWriter;
+        assert_eq!(
+            writer.write_request(&make(true)).get("stream"),
+            Some(&serde_json::json!(true)),
+            "stream: true must be emitted"
+        );
+        assert_eq!(
+            writer.write_request(&make(false)).get("stream"),
+            Some(&serde_json::json!(false)),
+            "stream: false must be emitted explicitly"
+        );
+    }
+
+    /// Regression: a typed `{"type":"message","role":...,"content":[...]}` input item (the official
+    /// SDK conversation-turn shape) must be read, not silently dropped.
+    #[test]
+    fn test_typed_message_item_read() {
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "hello typed"}]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "hi back"}]}
+            ]
+        });
+        let reader = ResponsesReader;
+        let ir = reader.read_request(&json).expect("read_request ok");
+        assert_eq!(
+            ir.messages.len(),
+            2,
+            "both typed message turns must be read"
+        );
+        assert_eq!(ir.messages[0].role, crate::ir::IrRole::User);
+        match &ir.messages[0].content[0] {
+            crate::ir::IrBlock::Text { text, .. } => assert_eq!(text, "hello typed"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(ir.messages[1].role, crate::ir::IrRole::Assistant);
+        match &ir.messages[1].content[0] {
+            crate::ir::IrBlock::Text { text, .. } => assert_eq!(text, "hi back"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// Regression: the streaming `response.created` event must carry `id`/`created_at`/`status`
+    /// (and `model` when present), not a stub. Forwards captured identity for same-protocol
+    /// passthrough; synthesizes a valid `resp_` id + current time when the IR carries none.
+    #[test]
+    fn test_message_start_emits_identity() {
+        let writer = ResponsesWriter;
+
+        // Identity present (same-protocol passthrough): forwarded verbatim.
+        let ev = crate::ir::IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: Some("resp_streamid".to_string()),
+            created: Some(1_720_000_000),
+            model: Some("gpt-4o".to_string()),
+        };
+        let (etype, payload) = writer.write_response_event(&ev).expect("should emit");
+        assert_eq!(etype, "response.created");
+        let resp = payload.get("response").expect("response object");
+        assert_eq!(
+            resp.get("id").and_then(|i| i.as_str()),
+            Some("resp_streamid")
+        );
+        assert_eq!(
+            resp.get("created_at").and_then(|c| c.as_u64()),
+            Some(1_720_000_000)
+        );
+        assert_eq!(resp.get("model").and_then(|m| m.as_str()), Some("gpt-4o"));
+        assert_eq!(
+            resp.get("status").and_then(|s| s.as_str()),
+            Some("in_progress")
+        );
+
+        // Identity absent (cross-protocol, stripped by translate_event): synthesized + valid.
+        let ev2 = crate::ir::IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        };
+        let (_, payload2) = writer.write_response_event(&ev2).expect("should emit");
+        let resp2 = payload2.get("response").expect("response object");
+        let id = resp2
+            .get("id")
+            .and_then(|i| i.as_str())
+            .expect("synthesized id present");
+        assert!(
+            id.starts_with("resp_"),
+            "synthesized id must use resp_ prefix, got {id}"
+        );
+        assert!(
+            resp2.get("created_at").and_then(|c| c.as_u64()).is_some(),
+            "synthesized created_at must be present"
+        );
+        assert!(
+            resp2.get("model").is_none(),
+            "absent model must not be emitted"
+        );
+    }
+
+    /// Regression: synthesized response ids stay distinct even across many calls in the same second
+    /// (the old `timestamp << 24 ^ counter` folding collided once the counter advanced by 2^24).
+    #[test]
+    fn test_synthesize_response_id_unique() {
+        let n = 1000;
+        let ids: std::collections::HashSet<String> =
+            (0..n).map(|_| synthesize_response_id()).collect();
+        assert_eq!(
+            ids.len(),
+            n,
+            "all synthesized ids in a burst must be unique"
+        );
+        assert!(ids.iter().all(|id| id.starts_with("resp_")));
     }
 
     /// A role-only item (no `type`) must still be processed via the role fallback.

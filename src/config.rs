@@ -419,6 +419,12 @@ pub(crate) struct ProviderDeploy {
     /// `health` when set; this is the block the shipped `config.yaml` documents under a provider.
     #[serde(default)]
     pub(crate) health: Option<HealthCfg>,
+    /// Legacy inline `api_key:` under a provider. Captured ONLY so an operator who sets it (the
+    /// field name invites the mistake) gets a loud boot warning that inline keys are unsupported and
+    /// `api_key_env` must be used — rather than the value being silently dropped by serde with no
+    /// signal. busbar never reads a key from here; `resolve()` warns and discards it.
+    #[serde(default, rename = "api_key")]
+    pub(crate) _legacy_api_key: Option<String>,
 }
 
 /// Deployment configuration - operator-owned config.yaml structure.
@@ -517,6 +523,17 @@ pub(crate) fn resolve(
             .clone()
             .unwrap_or_else(|| def.base_url.clone());
 
+        // A legacy inline `api_key:` under a provider is NOT supported — keys come only from
+        // `api_key_env`. Warn loudly and discard it (rather than letting serde drop it silently),
+        // so an operator who set it learns why their key isn't taking effect.
+        if deploy_cfg._legacy_api_key.is_some() {
+            tracing::warn!(
+                provider = %deploy_name,
+                "inline `api_key:` under a provider is unsupported and ignored; set the key in the \
+                 environment variable named by `api_key_env` instead"
+            );
+        }
+
         // Merge error_map: def's map with deployment override taking precedence
         let mut error_map = def.error_map.clone();
         if let Some(override_map) = &deploy_cfg.error_map {
@@ -612,6 +629,7 @@ models:
                     interval_secs: Some(5),
                     timeout_secs: None,
                 }),
+                _legacy_api_key: None,
             },
         );
         let deploy = DeployCfg {
@@ -808,6 +826,7 @@ models:
                 path: None,
                 auth: None,
                 health: None,
+                _legacy_api_key: None,
             },
         );
 
@@ -840,6 +859,49 @@ models:
         );
     }
 
+    /// A legacy inline `api_key:` under a provider in config.yaml must parse onto
+    /// `ProviderDeploy._legacy_api_key` (so resolve can warn on it) rather than being silently
+    /// dropped by serde, and must NOT leak into the resolved ProviderCfg (keys come only from env).
+    #[test]
+    fn test_inline_api_key_parsed_and_ignored() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+providers:
+  myprov:
+    api_key_env: MYPROV_KEY
+    api_key: "sk-inline-should-be-ignored"
+models: {}
+"#;
+        let deploy: DeployCfg =
+            serde_yaml::from_str(yaml).expect("config with inline api_key must parse");
+        let dep = deploy.providers.get("myprov").expect("myprov present");
+        assert_eq!(
+            dep._legacy_api_key.as_deref(),
+            Some("sk-inline-should-be-ignored"),
+            "inline api_key must be captured on ProviderDeploy, not silently dropped"
+        );
+
+        // resolve() discards it (and warns); the resolved ProviderCfg never carries the inline key.
+        let mut defs = HashMap::new();
+        defs.insert(
+            "myprov".to_string(),
+            ProviderDef {
+                protocol: "anthropic".to_string(),
+                base_url: "https://api.example.com".to_string(),
+                error_map: HashMap::new(),
+                health: None,
+                path: None,
+                auth: None,
+            },
+        );
+        let cfg = resolve(&deploy, &defs).expect("resolve");
+        assert_eq!(
+            cfg.providers["myprov"]._legacy_api_key, None,
+            "inline api_key must never reach the resolved ProviderCfg"
+        );
+        assert_eq!(cfg.providers["myprov"].api_key_env, "MYPROV_KEY");
+    }
+
     #[test]
     fn test_resolve_unknown_provider_error() {
         // config.yaml references nope not in providers.yaml -> resolve returns error naming nope
@@ -856,6 +918,7 @@ models:
                 path: None,
                 auth: None,
                 health: None,
+                _legacy_api_key: None,
             },
         );
 
@@ -909,6 +972,7 @@ models:
                 path: None,
                 auth: None,
                 health: None,
+                _legacy_api_key: None,
             },
         );
 
@@ -970,6 +1034,7 @@ models:
                 path: None,
                 auth: None,
                 health: None,
+                _legacy_api_key: None,
             },
         );
 

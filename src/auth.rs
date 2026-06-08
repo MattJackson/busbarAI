@@ -228,12 +228,36 @@ fn proto_for_path(path: &str) -> &'static str {
     }
 }
 
-/// Build a 401 response carrying the inferred ingress protocol's NATIVE error envelope (design
-/// §8 BLOCKER #1). Auth runs before routing, so the protocol is inferred from the request path.
-/// A native vendor SDK hitting busbar in `token`/governance mode with a bad credential then gets
-/// the vendor's JSON 401 shape (`application/json`) instead of a bare `text/plain` 401 — removing
-/// a deterministic proxy tell. Falls back to the generic envelope for an unknown path. No unwrap /
-/// expect / panic on this request path: a serialization failure degrades to an empty JSON object.
+/// Mint a synthetic AWS-style request id (32 lowercase hex chars, the shape an AWS SDK reads off
+/// the `x-amzn-RequestId` header) for a busbar-synthesized Bedrock error response, where there is
+/// no upstream request to forward an id from. No new dependency: uniqueness comes from the unix
+/// second plus a process-global atomic counter. Never panics on a bad clock.
+fn synth_amzn_request_id() -> String {
+    static AMZN_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let seq = AMZN_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 16 hex chars from the timestamp + 16 from the counter → a stable 32-char AWS-style id.
+    format!("{secs:016x}{seq:016x}")
+}
+
+/// Build an auth-failure response carrying the inferred ingress protocol's NATIVE error envelope
+/// (design §8 BLOCKER #1). Auth runs before routing, so the protocol is inferred from the request
+/// path. A native vendor SDK hitting busbar in `token`/governance mode with a bad credential then
+/// gets the vendor's JSON error shape (`application/json`) instead of a bare `text/plain` 401 —
+/// removing a deterministic proxy tell. Falls back to the generic envelope for an unknown path.
+///
+/// Status and headers are protocol-shaped too: a real AWS Bedrock SigV4 auth failure returns HTTP
+/// 403 (not 401) and carries `x-amzn-ErrorType` / `x-amzn-RequestId`, which a native AWS SDK keys
+/// off to map the modeled exception (a bare JSON `__type` body is not how the SDK primarily types
+/// the error). Every other protocol uses 401. (Bedrock ingress is documented as unsupported under
+/// token/governance mode, so this branch is only reachable under a misconfiguration — but when it
+/// is reached, the envelope must still match native AWS to uphold the indistinguishability promise.)
+///
+/// No unwrap / expect / panic on this request path: a serialization failure degrades to an empty
+/// JSON object.
 fn unauthorized_response(path: &str, message: &str) -> Response {
     let proto = proto_for_path(path);
     // `protocol_for` knows every name `proto_for_path` can return, so this is `Some` in practice;
@@ -243,9 +267,29 @@ fn unauthorized_response(path: &str, message: &str) -> Response {
         None => serde_json::json!({"error": {"message": message, "type": "authentication_error"}}),
     };
     let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
-    let mut resp = (StatusCode::UNAUTHORIZED, bytes).into_response();
+
+    // Bedrock auth failures are HTTP 403 with x-amzn-* typing headers (matching a native SigV4
+    // rejection); all other protocols use 401.
+    let status = if proto == "bedrock" {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::UNAUTHORIZED
+    };
+    let mut resp = (status, bytes).into_response();
     resp.headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if proto == "bedrock" {
+        // `x-amzn-errortype`: the modeled exception name the AWS SDK reads to classify the error
+        // (mirrors the `__type` body field). For an auth failure that is `AccessDeniedException`.
+        let error_type = crate::proto::error_kind_to_bedrock_type("auth");
+        if let Ok(v) = HeaderValue::from_str(error_type) {
+            resp.headers_mut().insert("x-amzn-errortype", v);
+        }
+        // `x-amzn-RequestId`: AWS returns the request id only in this header (never in the body).
+        if let Ok(v) = HeaderValue::from_str(&synth_amzn_request_id()) {
+            resp.headers_mut().insert("x-amzn-requestid", v);
+        }
+    }
     resp
 }
 
@@ -268,7 +312,15 @@ pub(crate) async fn auth_middleware(
 
     // Derive owned values up front so no immutable borrow of `req` is live when we mutate its
     // extensions below.
-    let is_admin = path.starts_with("/admin");
+    //
+    // Admin detection must be path-boundary-safe: a bare `starts_with("/admin")` also captures
+    // sibling paths like `/adminx/v1/messages` or `/admin_portal`, which are NOT registered admin
+    // routes. Such a path would be sent down the admin auth branch and (with a valid admin token)
+    // early-return WITHOUT the `CallerToken` extension a non-admin handler requires — yielding a
+    // 500 MissingExtension and leaking that the path was treated as admin-protected. Require either
+    // the exact `/admin` segment or a `/admin/` delimiter so only the four registered admin routes
+    // (`/admin/keys`, `/admin/keys/:id`, `/admin/keys/:id/usage`) match.
+    let is_admin = path == "/admin" || path.starts_with("/admin/");
     let admin_header_token = req
         .headers()
         .get("x-admin-token")
@@ -280,6 +332,14 @@ pub(crate) async fn auth_middleware(
     // constant time. Replaces the previous Bearer-only `bearer_token`.
     let client_token: Option<String> = AuthMiddleware::extract_client_token(&req);
     let token_valid = app.auth.validate_token(client_token.as_deref());
+
+    // Thread the caller's token into request extensions for passthrough forwarding, using the same
+    // multi-scheme carrier precedence as auth (Bearer / x-api-key / x-goog-api-key). Inserted BEFORE
+    // any early-return below so EVERY request that reaches `next.run(req)` through this middleware
+    // carries the extension — the `Extension<CallerToken>` extractor in handlers never sees it
+    // absent (which would surface as a 500 MissingExtension). Always inserted (even when `None`).
+    req.extensions_mut()
+        .insert(CallerToken(client_token.clone()));
 
     // the /admin management API is guarded by the configured admin token (Bearer or
     // X-Admin-Token) — NOT a virtual key, and NOT the vendor-SDK carriers (admin is a busbar
@@ -340,12 +400,6 @@ pub(crate) async fn auth_middleware(
         req.extensions_mut()
             .insert(crate::governance::GovCtx::default());
     }
-
-    // Thread the caller's token into request extensions for passthrough forwarding. Uses the same
-    // multi-scheme carrier precedence as auth (Bearer / x-api-key / x-goog-api-key), so a native
-    // SDK's key is forwarded upstream regardless of which header carried it. Always inserted (even
-    // when None) so the `Extension<CallerToken>` extractor in handlers never fails.
-    req.extensions_mut().insert(CallerToken(client_token));
 
     Ok(next.run(req).await)
 }
@@ -623,9 +677,24 @@ mod tests {
         assert_eq!(proto_for_path("/stats"), "openai");
     }
 
+    /// Decode the JSON body of an `unauthorized_response` for shape assertions. Synchronously
+    /// drains the (in-memory, already-complete) body — no network, no runtime needed.
+    fn decode_body(resp: Response) -> serde_json::Value {
+        let bytes = futures::executor::block_on(async {
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("test body must collect")
+        });
+        serde_json::from_slice(&bytes).expect("auth-failure body must be valid JSON")
+    }
+
     #[test]
     fn test_unauthorized_response_is_json_with_native_envelope() {
-        // Gemini path → native Gemini error envelope, application/json.
+        // Every supported ingress protocol must get its DISTINCTIVE native error SHAPE, not just
+        // `application/json` — a wrong-shaped 401 is a deterministic proxy tell a native SDK
+        // would choke on. One assertion per `proto_for_path` arm.
+
+        // Gemini → {"error":{"code":401,"message":..,"status":"UNAUTHENTICATED"}}.
         let resp = unauthorized_response("/v1beta/models/x:generateContent", "unauthorized");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
@@ -634,15 +703,118 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("application/json")
         );
+        let body = decode_body(resp);
+        assert_eq!(body["error"]["code"], 401, "gemini body: {body}");
+        assert_eq!(
+            body["error"]["status"], "UNAUTHENTICATED",
+            "gemini body: {body}"
+        );
 
-        // Anthropic path → native Anthropic error envelope.
+        // Anthropic → top-level {"type":"error","error":{"type":"authentication_error",..}}.
         let resp = unauthorized_response("/pa/v1/messages", "unauthorized");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = decode_body(resp);
+        assert_eq!(body["type"], "error", "anthropic top-level type: {body}");
+        assert_eq!(
+            body["error"]["type"], "authentication_error",
+            "anthropic error.type: {body}"
+        );
+
+        // OpenAI → {"error":{"type":"authentication_error",..}} (no top-level type=error).
+        let resp = unauthorized_response("/v1/chat/completions", "unauthorized");
+        let body = decode_body(resp);
+        assert!(
+            body.get("type").is_none(),
+            "openai must NOT carry a top-level type: {body}"
+        );
+        assert_eq!(
+            body["error"]["type"], "authentication_error",
+            "openai error.type: {body}"
+        );
+
+        // Responses → {"error":{"type":"authentication_error","code":null,"param":null,..}}.
+        let resp = unauthorized_response("/v1/responses", "unauthorized");
+        let body = decode_body(resp);
+        assert_eq!(
+            body["error"]["type"], "authentication_error",
+            "responses error.type: {body}"
+        );
+        assert!(
+            body["error"].get("param").is_some(),
+            "responses envelope carries a param field: {body}"
+        );
+
+        // Cohere → bare {"message":..} with NO `error` and NO `type`.
+        let resp = unauthorized_response("/v2/chat", "unauthorized");
+        let body = decode_body(resp);
+        assert!(
+            body.get("message").is_some(),
+            "cohere body has a top-level message: {body}"
+        );
+        assert!(
+            body.get("error").is_none() && body.get("type").is_none(),
+            "cohere body must be bare (no error/type): {body}"
+        );
+
+        // Bedrock → {"__type":"AccessDeniedException","message":..}, HTTP 403, x-amzn-* headers.
+        let resp = unauthorized_response("/model/anthropic.claude/converse", "unauthorized");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a Bedrock SigV4 auth failure is 403, not 401"
+        );
         assert_eq!(
             resp.headers()
-                .get(CONTENT_TYPE)
+                .get("x-amzn-errortype")
                 .and_then(|v| v.to_str().ok()),
-            Some("application/json")
+            Some("AccessDeniedException"),
+            "Bedrock auth failure must carry x-amzn-errortype the AWS SDK types off"
         );
+        assert!(
+            resp.headers().get("x-amzn-requestid").is_some(),
+            "Bedrock auth failure must carry a synthetic x-amzn-requestid"
+        );
+        let body = decode_body(resp);
+        assert_eq!(
+            body["__type"], "AccessDeniedException",
+            "bedrock __type: {body}"
+        );
+        assert!(
+            body.get("error").is_none(),
+            "bedrock body uses __type, not an error object: {body}"
+        );
+    }
+
+    #[test]
+    fn test_every_router_ingress_path_maps_to_non_fallback_proto() {
+        // Coupling guard (finding: router route table ↔ proto_for_path ↔ protocol_for). Each real
+        // ingress path the router registers must resolve to a SPECIFIC proto, not the unknown-path
+        // `openai` fallback applied via the final `else`. If a future route is added without
+        // updating proto_for_path, callers on that protocol would silently get an OpenAI-shaped 401
+        // — a partial defeat of the indistinguishability promise. We assert the expected mapping
+        // explicitly (a sample path per registered ingress family), so a regression is caught.
+        let cases = [
+            ("/v1/messages", "anthropic"),
+            ("/somepool/v1/messages", "anthropic"),
+            ("/v1/chat/completions", "openai"),
+            ("/v2/chat", "cohere"),
+            ("/v1/responses", "responses"),
+            ("/v1beta/models/gemini-1.5:generateContent", "gemini"),
+            ("/model/anthropic.claude/converse", "bedrock"),
+            ("/model/anthropic.claude/converse-stream", "bedrock"),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                proto_for_path(path),
+                expected,
+                "router ingress path '{path}' must map to '{expected}', not the fallback"
+            );
+            // And the resolved proto must be a real protocol (never the dead `None` arm).
+            assert!(
+                crate::proto::protocol_for(proto_for_path(path)).is_some(),
+                "proto for '{path}' must resolve to a known protocol"
+            );
+        }
     }
 
     /// End-to-end through the real router + `auth_middleware` in TOKEN mode: the busbar client
@@ -787,6 +959,181 @@ mod tests {
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok()),
             Some("application/json"),
+        );
+
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// End-to-end through the real router + `auth_middleware` in TOKEN mode: an unauthenticated
+    /// POST to `/v2/chat` (Cohere) and `/v1/responses` (Responses) must be rejected 401 with the
+    /// RESPECTIVE protocol's native error envelope — not an Anthropic/OpenAI-shaped body. The
+    /// existing multi-carrier test only covers the Anthropic path, leaving these two protocol
+    /// envelopes untested on the auth boundary (an indistinguishability failure if regressed).
+    #[tokio::test]
+    async fn test_cohere_and_responses_ingress_token_mode_native_401() {
+        use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        crate::metrics::init();
+
+        // No upstream call is made — auth rejects before routing — but TestApp needs a lane/pool.
+        let state = Arc::new(MockServerState::new());
+        let server = MockServer::new(state).await;
+
+        let auth_cfg = crate::config::AuthCfg {
+            mode: "token".to_string(),
+            client_tokens: vec!["the-real-token".to_string()],
+            _legacy_token: None,
+        };
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "test-model",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .api_key("busbar-upstream-key"),
+            )
+            .pool("pa", &[(0, 1)])
+            .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+            .auth_mode(AuthMode::Token)
+            .build();
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let body =
+            json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}]}).to_string();
+
+        // Cohere `/v2/chat` → bare {"message":..}, no `error`, no `type`.
+        let r_cohere = client
+            .post(format!("http://{addr}/v2/chat"))
+            .header("x-api-key", "wrong-token")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_cohere.status().as_u16(), 401, "cohere wrong token → 401");
+        assert_eq!(
+            r_cohere
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+        );
+        let env: serde_json::Value = r_cohere.json().await.unwrap();
+        assert!(
+            env.get("message").is_some(),
+            "cohere 401 must carry a bare message: {env}"
+        );
+        assert!(
+            env.get("error").is_none() && env.get("type").is_none(),
+            "cohere 401 must be the bare envelope (no error/type): {env}"
+        );
+
+        // Responses `/v1/responses` → {"error":{"type":"authentication_error",..}}.
+        let r_resp = client
+            .post(format!("http://{addr}/v1/responses"))
+            .header("x-api-key", "wrong-token")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_resp.status().as_u16(), 401, "responses wrong token → 401");
+        assert_eq!(
+            r_resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+        );
+        let env: serde_json::Value = r_resp.json().await.unwrap();
+        assert_eq!(
+            env["error"]["type"], "authentication_error",
+            "responses 401 must carry error.type=authentication_error: {env}"
+        );
+
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// Regression for the over-broad admin-prefix detection: a path that merely STARTS WITH the
+    /// bytes `/admin` but is not a registered `/admin/...` route (e.g. `/adminx/...`) must NOT be
+    /// classified as admin. Under TOKEN mode with a wrong token it should be rejected by the normal
+    /// auth branch with the inferred-protocol native 401 envelope — never routed down the admin
+    /// branch (which would early-return without the `CallerToken` extension and 500 in a non-admin
+    /// handler). `/adminx/v1/messages` infers the anthropic protocol via the `/v1/messages` suffix.
+    #[tokio::test]
+    async fn test_admin_prefix_is_boundary_safe() {
+        use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        crate::metrics::init();
+
+        let state = Arc::new(MockServerState::new());
+        let server = MockServer::new(state).await;
+
+        let auth_cfg = crate::config::AuthCfg {
+            mode: "token".to_string(),
+            client_tokens: vec!["the-real-token".to_string()],
+            _legacy_token: None,
+        };
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "test-model",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .api_key("busbar-upstream-key"),
+            )
+            .pool("adminx", &[(0, 1)])
+            .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+            .auth_mode(AuthMode::Token)
+            .build();
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let body = json!({"model": "adminx", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+            .to_string();
+
+        // Wrong token to `/adminx/v1/messages`: rejected by the NORMAL auth branch, not the admin
+        // branch — a normal-protocol native 401 (anthropic), NOT the admin "admin unauthorized"
+        // path and NOT a 500 from a missing CallerToken extension.
+        let r = client
+            .post(format!("http://{addr}/adminx/v1/messages"))
+            .header("x-api-key", "wrong-token")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            401,
+            "an /adminx path with a wrong token must be a normal 401, not 500/admin-500 (got {})",
+            r.status()
+        );
+        assert_eq!(
+            r.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+        );
+        let env: serde_json::Value = r.json().await.unwrap();
+        // Anthropic native envelope (inferred from the `/v1/messages` suffix), proving the path was
+        // shaped by the normal ingress branch rather than the admin branch.
+        assert_eq!(env["type"], "error", "expected anthropic envelope: {env}");
+        assert_eq!(
+            env["error"]["type"], "authentication_error",
+            "expected anthropic authentication_error: {env}"
         );
 
         handle.abort();

@@ -75,8 +75,11 @@ fn validate_webhook_url(url: Option<String>) -> Result<Option<String>, String> {
 /// True if the URL's host is an address busbar must not POST telemetry to: a literal loopback,
 /// link-local (incl. `169.254.169.254` cloud-metadata), private (RFC1918 / unique-local), or
 /// unspecified IP. A hostname that does not parse as an IP literal is allowed (operators may name
-/// an external collector); DNS-rebinding is out of scope for a startup-validated, operator-supplied
-/// URL. Returns `true` (reject) when the host is missing entirely.
+/// an external collector) EXCEPT the well-known loopback DNS name `localhost` (and its dotted
+/// subdomains), which is blocked case-insensitively so an `https://localhost:<port>/path` URL can't
+/// be used to POST request logs to a co-located process — matching `config_validate::ssrf_blocked_host`.
+/// Full DNS-rebinding is out of scope for a startup-validated, operator-supplied URL. Returns `true`
+/// (reject) when the host is missing entirely.
 fn host_is_internal(url: &reqwest::Url) -> bool {
     use std::net::IpAddr;
     match url.host_str() {
@@ -94,6 +97,18 @@ fn host_is_internal(url: &reqwest::Url) -> bool {
                         || v4.is_broadcast()
                 }
                 Ok(IpAddr::V6(v6)) => {
+                    // Canonicalize an IPv4-mapped address (`::ffff:a.b.c.d`) FIRST and apply the V4
+                    // predicates: otherwise `[::ffff:127.0.0.1]` / `[::ffff:169.254.169.254]` parse as
+                    // V6, match none of the V6 predicates below, and reach loopback / cloud-metadata —
+                    // defeating the guard. `to_ipv4_mapped` only matches true `::ffff:0:0/96` mapped
+                    // addresses (NOT `::1`), so the V6 predicates still cover genuine V6 literals.
+                    if let Some(v4) = v6.to_ipv4_mapped() {
+                        return v4.is_loopback()
+                            || v4.is_link_local()
+                            || v4.is_private()
+                            || v4.is_unspecified()
+                            || v4.is_broadcast();
+                    }
                     v6.is_loopback()
                         || v6.is_unspecified()
                         // unique-local (fc00::/7) and link-local (fe80::/10): no stable std
@@ -101,8 +116,15 @@ fn host_is_internal(url: &reqwest::Url) -> bool {
                         || (v6.segments()[0] & 0xfe00) == 0xfc00
                         || (v6.segments()[0] & 0xffc0) == 0xfe80
                 }
-                // Not an IP literal — a DNS name for an external collector. Allow.
-                Err(_) => false,
+                // Not an IP literal — a DNS name. Block the well-known loopback name `localhost`
+                // (and any `*.localhost` subdomain, which RFC 6761 reserves to loopback) so it can't
+                // be used as an SSRF target; allow any other external-collector hostname.
+                Err(_) => {
+                    host.eq_ignore_ascii_case("localhost")
+                        || host
+                            .rsplit_once('.')
+                            .is_some_and(|(_, tld)| tld.eq_ignore_ascii_case("localhost"))
+                }
             }
         }
     }
@@ -355,24 +377,75 @@ mod tests {
         for bad in [
             "https://169.254.169.254/latest/meta-data/", // cloud metadata (link-local)
             "https://127.0.0.1/log",                     // loopback
-            "https://localhost/log", // loopback by name -> resolves to IP literal? no: name, allowed
-            "https://10.0.0.5/hook", // RFC1918
-            "https://192.168.1.10/hook", // RFC1918
-            "https://172.16.5.4/hook", // RFC1918
-            "https://0.0.0.0/hook",  // unspecified
-            "https://[::1]/hook",    // IPv6 loopback
-            "https://[fe80::1]/hook", // IPv6 link-local
-            "https://[fc00::1]/hook", // IPv6 unique-local
+            "https://10.0.0.5/hook",                     // RFC1918
+            "https://192.168.1.10/hook",                 // RFC1918
+            "https://172.16.5.4/hook",                   // RFC1918
+            "https://0.0.0.0/hook",                      // unspecified
+            "https://[::1]/hook",                        // IPv6 loopback
+            "https://[fe80::1]/hook",                    // IPv6 link-local
+            "https://[fc00::1]/hook",                    // IPv6 unique-local
         ] {
             let res = validate_webhook_url(Some(bad.to_string()));
-            // `localhost` is a DNS name, not an IP literal, so it is NOT rejected by the IP guard;
-            // skip the assertion for that one (documented behavior: only IP-literal internals).
-            if bad.contains("localhost") {
-                continue;
-            }
             assert!(
                 res.is_err(),
                 "https internal-host webhook URL '{bad}' must be rejected; got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_localhost_dns_name() {
+        // Regression (SSRF): `localhost` is a DNS name, not an IP literal, but RFC 6761 reserves it
+        // (and its subdomains) to loopback. An operator-set `https://localhost:<port>/path` would
+        // POST request logs to a co-located process, so it must be blocked case-insensitively.
+        for bad in [
+            "https://localhost/log",
+            "https://LOCALHOST/log",
+            "https://localhost:8443/exfil",
+            "https://api.localhost/log", // `*.localhost` subdomain -> loopback per RFC 6761
+            "https://service.LocalHost/log",
+        ] {
+            let res = validate_webhook_url(Some(bad.to_string()));
+            assert!(
+                res.is_err(),
+                "localhost-family webhook URL '{bad}' must be rejected by the SSRF guard; got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_ipv4_mapped_ipv6_internal() {
+        // Regression (SSRF): an IPv4-mapped IPv6 literal (`::ffff:a.b.c.d`) parses as IpAddr::V6 and
+        // matches none of the plain V6 predicates, so without canonicalization it would reach the
+        // same internal targets (loopback / cloud-metadata / RFC1918) the V4 arm rejects.
+        for bad in [
+            "https://[::ffff:127.0.0.1]/log",        // mapped loopback
+            "https://[::ffff:169.254.169.254]/meta", // mapped cloud metadata (link-local)
+            "https://[::ffff:10.0.0.5]/hook",        // mapped RFC1918
+            "https://[::ffff:192.168.1.10]/hook",    // mapped RFC1918
+            "https://[::ffff:0.0.0.0]/hook",         // mapped unspecified
+        ] {
+            let res = validate_webhook_url(Some(bad.to_string()));
+            assert!(
+                res.is_err(),
+                "IPv4-mapped-IPv6 internal webhook URL '{bad}' must be rejected; got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_accepts_mapped_public_and_localhost_substring() {
+        // An IPv4-mapped IPv6 of a PUBLIC address stays allowed (canonicalization must not over-block),
+        // and a hostname that merely CONTAINS "localhost" as a substring of a real label (not the
+        // `localhost` label itself) is a distinct external name and must not be falsely rejected.
+        for ok in [
+            "https://[::ffff:93.184.216.34]/log", // mapped public IP literal -> allowed
+            "https://mylocalhost.example.com/log", // label is `mylocalhost`, not `localhost`
+            "https://localhost.example.com/log", // registrable name under example.com, TLD != localhost
+        ] {
+            assert!(
+                validate_webhook_url(Some(ok.to_string())).is_ok(),
+                "external webhook URL '{ok}' must be accepted (no SSRF over-block)"
             );
         }
     }

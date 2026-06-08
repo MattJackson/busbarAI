@@ -41,6 +41,15 @@ opentelemetry_sdk = "0.32.1"
 # the reqwest client on rustls so HTTPS export actually works. Dropping default features removes
 # `reqwest-blocking-client` (a blocking reqwest busbar never uses) and the OTLP metrics/logs paths
 # (busbar exports metrics via Prometheus, not OTLP).
+#
+# KNOWN DUPLICATION (accepted, not removable here): opentelemetry-otlp 0.32 transitively pulls a
+# SECOND reqwest major (0.13 via opentelemetry-http + rustls-platform-verifier) alongside the 0.12
+# we pin for the request path, so `cargo tree -d` shows reqwest 0.12.x AND 0.13.x (plus duplicate
+# getrandom 0.2/0.3 and hashbrown 0.16/0.17 majors). The request path uses 0.12; OTLP uses 0.13
+# only for low-volume trace export. The "minimal surface" feature-trimming above therefore does NOT
+# yield a single client stack — collapsing to one reqwest major would require an opentelemetry
+# release aligned to reqwest 0.12 (or dropping OTLP HTTP export). We accept the duplication rather
+# than imply (via the trimming comments) a single stack that the resolved graph does not deliver.
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = [
     "trace",
     "http-proto",

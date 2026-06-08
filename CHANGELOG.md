@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller's native protocol shape, with multi-scheme auth and content-type/identity
   handling per protocol.
 
+### Security
+- **`/metrics` is no longer unconditionally open.** It now goes through the same
+  auth check as `/stats` (requires a valid client token in `token` mode, or a
+  virtual key under governance) because the Prometheus exposition — lane/pool
+  topology, per-protocol counters, error rates — is an information-disclosure
+  surface. Only `/healthz` remains unconditionally open. In `none`/`passthrough`
+  mode `/metrics` is still admitted unconditionally. This supersedes the 0.16.2
+  security-review note that described `/metrics` as intentionally open.
+
 ## [1.0.0-rc.2] — 2026-06-04
 
 ### Changed

@@ -124,6 +124,63 @@ fn die(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+/// Return the open-relay banner to emit when auth resolves to `mode=none`, or `None` when auth is
+/// engaged. `auth_present` distinguishes an explicit `mode: none` (operator opted in) from a
+/// missing `auth:` block (serde-defaulted to none — the silent foot-gun the banner must call out).
+/// Returns `None` for every non-`None` mode (and for an unparseable mode, which validation already
+/// rejects upstream) so the caller emits nothing.
+fn open_relay_banner(mode: Option<auth::AuthMode>, auth_present: bool) -> Option<&'static str> {
+    if mode != Some(auth::AuthMode::None) {
+        return None;
+    }
+    Some(if auth_present {
+        "auth is DISABLED (auth.mode=none) — busbar is running as an OPEN RELAY; do not run this in production"
+    } else {
+        "auth is DISABLED: no `auth:` block in config — busbar is running as an OPEN RELAY (anyone can use it). Add `auth:` with `mode: token` (and `client_tokens`) before exposing it; do not run this in production"
+    })
+}
+
+/// Resolve each model's single `context_max` from the pool members that reference it.
+///
+/// A model is realized as exactly one lane (keyed by model name in `by_model`), so its
+/// context window must be single-valued across every pool that lists it. We accept the same
+/// `context_max` repeated (including the same `Some(_)` in multiple pools, and a mix of an
+/// explicit value with `None` — the explicit value wins, since `None` only means "unspecified
+/// here"), but reject two DIFFERENT explicit limits for the same model: that is an operator
+/// contradiction that previously resolved nondeterministically to whichever pool iterated last.
+fn resolve_model_context_max(
+    pools: &HashMap<String, config::PoolCfg>,
+) -> Result<HashMap<String, Option<usize>>, String> {
+    let mut resolved: HashMap<String, Option<usize>> = HashMap::new();
+    for pool in pools.values() {
+        for m in &pool.members {
+            match resolved.get(&m.target) {
+                // First sighting of this model, or this member adds no opinion (None) — keep what
+                // we have / record what we got.
+                None => {
+                    resolved.insert(m.target.clone(), m.context_max);
+                }
+                Some(None) => {
+                    // Previously unspecified; let any value (including another None) refine it.
+                    resolved.insert(m.target.clone(), m.context_max);
+                }
+                Some(Some(existing)) => match m.context_max {
+                    // No opinion here, or an identical opinion — both fine, keep the explicit value.
+                    None => {}
+                    Some(c) if c == *existing => {}
+                    Some(c) => {
+                        return Err(format!(
+                            "model '{}' has conflicting context_max across pools ({} vs {}); a model maps to one lane and must declare a single context_max",
+                            m.target, existing, c
+                        ));
+                    }
+                },
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 #[tokio::main]
 async fn main() {
     // CLI flags first — these must work without a configured deployment (no env/file access).
@@ -198,6 +255,11 @@ async fn main() {
     // require max_tokens). Captured here because `cfg.models` is consumed by this loop.
     let mut model_default_max_tokens: std::collections::HashMap<String, Option<u32>> =
         std::collections::HashMap::new();
+    // Single source of truth for each provider's resolved API key. The secret-bearing env read
+    // happens exactly once per provider here; both the empty-key warning below and the later
+    // `Lane.api_key` population reuse this value, so the warning and the captured key can never
+    // diverge (and we don't read the same env var twice).
+    let mut provider_api_keys: HashMap<String, String> = HashMap::new();
     for (model, mc) in cfg.models {
         model_default_max_tokens.insert(model.clone(), mc.default_max_tokens);
         let provider_cfg = cfg.providers.get(&mc.provider).unwrap_or_else(|| {
@@ -206,7 +268,9 @@ async fn main() {
                 mc.provider
             ))
         });
-        let key = std::env::var(&provider_cfg.api_key_env).unwrap_or_default();
+        let key = provider_api_keys
+            .entry(mc.provider.clone())
+            .or_insert_with(|| std::env::var(&provider_cfg.api_key_env).unwrap_or_default());
         if key.is_empty() {
             eprintln!(
                 "[warn] provider {} key env {} empty",
@@ -242,15 +306,17 @@ async fn main() {
 
     let registry = ProtocolRegistry::with_builtins();
 
-    // Build a map from model name to context_max (pools can have different context_max per member).
-    let mut model_context_max: std::collections::HashMap<String, Option<usize>> =
-        std::collections::HashMap::new();
-    for pool in cfg.pools.values() {
-        for m in &pool.members {
-            // Later members override earlier ones if same target appears multiple times
-            model_context_max.insert(m.target.clone(), m.context_max);
-        }
-    }
+    // Build a map from model name to context_max. A model is one lane shared across every pool that
+    // names it, so its context_max must be single-valued. Previously the last pool to iterate (in
+    // nondeterministic HashMap order) silently won, so a model carrying `context_max: Some(128000)`
+    // in one pool and `None` (or a different limit) in another could end up with whichever value the
+    // iteration happened to land on — defeating the context-length failover exclusion in forward.rs
+    // and losing pool-specific limits without a diagnostic. Resolve it deterministically and fail
+    // loud on a genuine conflict instead.
+    let model_context_max = match resolve_model_context_max(&cfg.pools) {
+        Ok(map) => map,
+        Err(conflict) => die(conflict),
+    };
 
     let mut lanes = Vec::new();
     for ld in &lanes_data {
@@ -268,7 +334,12 @@ async fn main() {
             model: ld.model.clone(),
             provider: ld.provider.clone(),
             base_url: provider_cfg.base_url.trim_end_matches('/').to_string(),
-            api_key: std::env::var(&provider_cfg.api_key_env).unwrap_or_default(),
+            // Reuse the single env read captured in the lanes_data loop above (same source of truth
+            // as the empty-key warning); no second read of the secret-bearing env var.
+            api_key: provider_api_keys
+                .get(&ld.provider)
+                .cloned()
+                .unwrap_or_default(),
             protocol,
             max: ld.max,
             error_map: Arc::new(provider_cfg.error_map.clone()),
@@ -321,13 +392,17 @@ async fn main() {
     let listen = cfg.listen.clone();
 
     // Loud warning for auth.mode=none (open relay). Not fatal — busbar still starts (useful for
-    // local dev) — but operators must not run this in production.
-    if let Some(ref acfg) = cfg.auth {
-        if auth::AuthMode::from_config_str(&acfg.mode) == Some(auth::AuthMode::None) {
-            tracing::warn!(
-                "auth is DISABLED (auth.mode=none) — this is an open relay; do not run in production"
-            );
-        }
+    // local dev) — but operators must not run this in production. NOTE: an ABSENT `auth:` block
+    // serde-defaults to mode=none too (`AuthCfg::default_none`), so a config that merely omits
+    // `auth:` silently becomes an open relay. Surface this at ERROR level (not warn — a warn is
+    // suppressed under RUST_LOG=error, the very level an operator most likely runs in production)
+    // AND unconditionally on stderr, so the open-relay state cannot be masked by log configuration.
+    if let Some(banner) = open_relay_banner(
+        auth::AuthMode::from_config_str(&auth_cfg.mode),
+        cfg.auth.is_some(),
+    ) {
+        eprintln!("[error] {banner}");
+        tracing::error!("{banner}");
     }
 
     let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg));
@@ -480,4 +555,103 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
         // Cap request body size (buffered before the handler) to bound per-request memory.
         .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(app)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{PoolCfg, PoolMember};
+
+    fn pool(members: Vec<PoolMember>) -> PoolCfg {
+        PoolCfg {
+            members,
+            breaker: None,
+            failover: None,
+            on_exhausted: None,
+            affinity: None,
+        }
+    }
+
+    fn member(target: &str, context_max: Option<usize>) -> PoolMember {
+        PoolMember {
+            target: target.to_string(),
+            weight: 1,
+            context_max,
+        }
+    }
+
+    #[test]
+    fn test_resolve_model_context_max_explicit_wins_over_none() {
+        // The same model in pool A with Some(128000) and pool B with None must resolve to the
+        // explicit limit regardless of iteration order — None never clobbers a real value.
+        let mut pools = HashMap::new();
+        pools.insert("a".to_string(), pool(vec![member("m", Some(128_000))]));
+        pools.insert("b".to_string(), pool(vec![member("m", None)]));
+        let resolved = resolve_model_context_max(&pools).expect("None must not override Some");
+        assert_eq!(resolved.get("m"), Some(&Some(128_000)));
+    }
+
+    #[test]
+    fn test_resolve_model_context_max_identical_values_ok() {
+        // The same explicit limit repeated across pools is consistent, not a conflict.
+        let mut pools = HashMap::new();
+        pools.insert("a".to_string(), pool(vec![member("m", Some(64_000))]));
+        pools.insert("b".to_string(), pool(vec![member("m", Some(64_000))]));
+        let resolved =
+            resolve_model_context_max(&pools).expect("identical values must not conflict");
+        assert_eq!(resolved.get("m"), Some(&Some(64_000)));
+    }
+
+    #[test]
+    fn test_resolve_model_context_max_conflict_is_loud() {
+        // Two DIFFERENT explicit limits for the same model is an operator contradiction: fail loud
+        // (deterministic error) rather than silently pick whichever pool iterated last.
+        let mut pools = HashMap::new();
+        pools.insert("a".to_string(), pool(vec![member("m", Some(128_000))]));
+        pools.insert("b".to_string(), pool(vec![member("m", Some(32_000))]));
+        let err = resolve_model_context_max(&pools)
+            .expect_err("conflicting context_max must be rejected");
+        assert!(err.contains("conflicting context_max"), "got: {err}");
+        assert!(err.contains('m'), "error must name the model; got: {err}");
+        assert!(
+            err.contains("128000") && err.contains("32000"),
+            "error must show both values; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_model_context_max_none_everywhere() {
+        let mut pools = HashMap::new();
+        pools.insert("a".to_string(), pool(vec![member("m", None)]));
+        pools.insert("b".to_string(), pool(vec![member("m", None)]));
+        let resolved = resolve_model_context_max(&pools).expect("all-None resolves to None");
+        assert_eq!(resolved.get("m"), Some(&None));
+    }
+
+    #[test]
+    fn test_open_relay_banner_distinguishes_absent_vs_explicit_none() {
+        // Absent `auth:` block: banner must flag the silent open-relay foot-gun.
+        let absent = open_relay_banner(Some(auth::AuthMode::None), false)
+            .expect("mode=none must produce a banner");
+        assert!(
+            absent.contains("OPEN RELAY") && absent.contains("no `auth:` block"),
+            "absent-auth banner must call out the missing block; got: {absent}"
+        );
+        // Explicit mode: none: still an open relay, but the operator opted in.
+        let explicit = open_relay_banner(Some(auth::AuthMode::None), true)
+            .expect("explicit none must produce a banner");
+        assert!(
+            explicit.contains("OPEN RELAY") && explicit.contains("auth.mode=none"),
+            "explicit-none banner must reference auth.mode=none; got: {explicit}"
+        );
+    }
+
+    #[test]
+    fn test_open_relay_banner_silent_when_auth_engaged() {
+        // Token / passthrough modes (and an unparseable mode, already rejected by validation) emit
+        // nothing — the banner is exclusively for the open-relay state.
+        assert!(open_relay_banner(Some(auth::AuthMode::Token), true).is_none());
+        assert!(open_relay_banner(Some(auth::AuthMode::Passthrough), true).is_none());
+        assert!(open_relay_banner(None, true).is_none());
+    }
 }

@@ -28,7 +28,7 @@ The HTTP client uses a 300s request timeout and pools up to 64 idle keep-alive c
 | Endpoint | Auth | Meaning |
 |---|---|---|
 | `GET /healthz` | open | `200 ok` if **any** lane is usable; `503` otherwise. Use for liveness/readiness probes. |
-| `GET /metrics` | open | Prometheus exposition (always on). |
+| `GET /metrics` | client token (or virtual key) | Prometheus exposition; requires auth in `token`/governance mode, always open in `none`/`passthrough` mode. Restrict at the network layer if unauthenticated scraping is needed. |
 | `GET /stats` | client token (or virtual key) | Per-lane health snapshot + pool membership, JSON. |
 
 `/stats` returns, per lane: `model`, `provider`, `max_concurrent`, `inflight`,
@@ -49,8 +49,11 @@ All metrics are Prometheus counters/histograms exposed at `/metrics`.
 | `busbar_translations_total` | counter | `from`, `to` | Cross-protocol translation hops. |
 | `busbar_request_duration_seconds` | histogram | `ingress_protocol`, `pool` | End-to-end latency. |
 
-`/metrics` requires no auth — restrict it at the network layer (firewall, reverse
-proxy) if your threat model needs it.
+`/metrics` requires a valid client token in `token` mode (or a virtual key under
+governance) — it is treated as an information-disclosure surface and goes through
+the same auth check as other routes. Only `none`/`passthrough` mode admits scrapes
+unconditionally. Restrict it at the network layer (firewall, reverse proxy) if you
+need unauthenticated scraping under your threat model.
 
 ## Circuit breaker
 

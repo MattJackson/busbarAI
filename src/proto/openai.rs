@@ -30,18 +30,30 @@ static SYNTH_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn synth_completion_id() -> String {
     let n = SYNTH_COUNTER.fetch_add(1, Ordering::Relaxed);
     let ts = unix_now_secs();
-    // base-36 of (ts<<24 ^ counter) keeps the token compact and alphanumeric like a real chatcmpl id.
-    let mut mixed = (ts.wrapping_shl(24)) ^ n;
-    if mixed == 0 {
-        mixed = 1;
+    // Render the timestamp and the atomic counter as SEPARATE base-36 fields joined by a delimiter
+    // ('z' is not a base-36 digit produced below — the alphabet stops at base-36's 'z' but each
+    // field is `mixed % 36` so any single char including 'z' can appear; the delimiter must NOT be
+    // an alphabet char). We use a hyphen, which is not in the base-36 alphabet, as the field
+    // separator so the (ts, n) pair maps injectively to the token. The previous XOR scheme
+    // (`(ts<<24) ^ n`) collided whenever the counter advanced by exactly 2^24 between two seconds
+    // (e.g. ts=1000/n=0 and ts=1001/n=16777216 produced the same value), silently minting duplicate
+    // ids under sustained high request rates. Concatenation of the two fields is collision-free by
+    // construction as long as the u64 counter never wraps (astronomical).
+    format!("chatcmpl-{}-{}", base36(ts), base36(n))
+}
+
+/// Render a u64 as a compact base-36 (lowercase alphanumeric) string. Zero renders as "0".
+fn base36(mut value: u64) -> String {
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".to_string();
     }
     let mut token = String::new();
-    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    while mixed > 0 {
-        token.push(ALPHABET[(mixed % 36) as usize] as char);
-        mixed /= 36;
+    while value > 0 {
+        token.push(ALPHABET[(value % 36) as usize] as char);
+        value /= 36;
     }
-    format!("chatcmpl-{token}")
+    token
 }
 
 /// OpenAI reader implementation.
@@ -223,14 +235,14 @@ impl ProtocolReader for OpenAiReader {
                     let mut msg_content = Vec::new();
 
                     if let Some(cv) = content_val {
-                        if cv.is_string() {
+                        if let Some(text) = cv.as_str() {
                             msg_content.push(crate::ir::IrBlock::Text {
-                                text: cv.as_str().unwrap_or("").to_string(),
+                                text: text.to_string(),
                                 cache_control: None,
                                 citations: Vec::new(),
                             });
-                        } else if cv.is_array() {
-                            for block_val in cv.as_array().unwrap() {
+                        } else if let Some(arr) = cv.as_array() {
+                            for block_val in arr {
                                 let block = read_openai_block(block_val)?;
                                 msg_content.push(block);
                             }
@@ -605,14 +617,16 @@ impl ProtocolReader for OpenAiReader {
         }
 
         if let Some(content_val) = message_val.get("content") {
-            if content_val.is_string() && !content_val.as_str().unwrap_or("").is_empty() {
-                content.push(crate::ir::IrBlock::Text {
-                    text: content_val.as_str().unwrap_or("").to_string(),
-                    cache_control: None,
-                    citations: Vec::new(),
-                });
-            } else if content_val.is_array() {
-                for block_val in content_val.as_array().unwrap() {
+            if let Some(text) = content_val.as_str() {
+                if !text.is_empty() {
+                    content.push(crate::ir::IrBlock::Text {
+                        text: text.to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    });
+                }
+            } else if let Some(arr) = content_val.as_array() {
+                for block_val in arr {
                     let block = read_openai_block(block_val)?;
                     // Only include text blocks from array content (OpenAI image_url not supported in response)
                     if !matches!(block, crate::ir::IrBlock::Image { .. }) {
@@ -917,8 +931,16 @@ impl ProtocolWriter for OpenAiWriter {
                             // ToolUse is not OpenAI message content; it is surfaced via the
                             // `tool_calls` array built for this message below (any role).
                         }
-
-                        _ => {}
+                        crate::ir::IrBlock::ToolResult { .. } => {
+                            // ToolResult is not OpenAI message *content*; for a Tool-role message it
+                            // is rendered as a standalone `{"role":"tool","tool_call_id":...}` entry
+                            // by the tool-result path below. On a non-tool message it has no OpenAI
+                            // content representation, so it is intentionally not emitted here.
+                        }
+                        crate::ir::IrBlock::Thinking { .. } => {
+                            // Lossy-by-necessity: OpenAI Chat Completions has no thinking/reasoning
+                            // content block on request input, so a Thinking block is dropped here.
+                        }
                     }
                 }
 
@@ -1171,12 +1193,17 @@ impl ProtocolWriter for OpenAiWriter {
             },
             IrStreamEvent::BlockStop { .. } => None,
             IrStreamEvent::MessageDelta { stop_reason, .. } => {
-                let finish_reason = match stop_reason.as_deref() {
-                    Some("end_turn") | Some("stop_sequence") => "stop",
-                    Some("max_tokens") => "length",
-                    Some("tool_use") => "tool_calls",
-                    Some(reason) => reason,
-                    None => "",
+                // Map the IR stop_reason onto OpenAI's finish_reason enum. A non-terminal delta with
+                // no stop_reason must serialize finish_reason as JSON `null` — NOT the empty string.
+                // OpenAI chat.completion.chunk uses null for in-progress chunks and a valid enum
+                // string ("stop"/"length"/"tool_calls"/"content_filter") only on the final chunk; an
+                // empty string is not a valid enum value and fails strict SDK (Pydantic) validation.
+                let finish_reason: serde_json::Value = match stop_reason.as_deref() {
+                    Some("end_turn") | Some("stop_sequence") => serde_json::json!("stop"),
+                    Some("max_tokens") => serde_json::json!("length"),
+                    Some("tool_use") => serde_json::json!("tool_calls"),
+                    Some(reason) => serde_json::json!(reason),
+                    None => serde_json::Value::Null,
                 };
                 let delta_obj = serde_json::json!({});
                 let chunk_obj = serde_json::json!({
@@ -2060,5 +2087,184 @@ mod tests {
         assert_eq!(msgs[0]["content"], serde_json::json!("be terse"));
         assert_eq!(msgs[1]["role"], serde_json::json!("system"));
         assert_eq!(msgs[1]["content"], serde_json::json!(""));
+    }
+
+    // --- Round 3 fix 1: synthesized ids must not collide under the old XOR scheme ---
+
+    #[test]
+    fn synth_id_no_collision_across_second_and_counter_jump() {
+        // The old `(ts<<24) ^ n` scheme collided when the counter advanced by exactly 2^24 between
+        // two adjacent seconds: ts=1000/n=0 and ts=1001/n=16_777_216 hashed to the same value.
+        // The field-concatenation scheme maps each (ts, n) pair injectively, so these differ.
+        let a = format!("chatcmpl-{}-{}", base36(1000), base36(0));
+        let b = format!("chatcmpl-{}-{}", base36(1001), base36(16_777_216));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn base36_renders_zero_and_roundtrips_fields() {
+        assert_eq!(base36(0), "0");
+        assert_eq!(base36(35), "z");
+        // The hyphen delimiter is not a base-36 digit, so the (ts, n) split is unambiguous: even
+        // when one field's digits could otherwise run into the next, the separator keeps them apart.
+        let id = format!("chatcmpl-{}-{}", base36(36), base36(1));
+        // base36(36) == "01" (little-endian digits: 36 = 0 + 1*36), base36(1) == "1".
+        assert_eq!(id, "chatcmpl-01-1");
+    }
+
+    // --- Round 3 fix 2/5: streaming MessageDelta with no stop_reason emits finish_reason null ---
+
+    #[test]
+    fn stream_message_delta_none_stop_reason_serializes_null_not_empty_string() {
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: None,
+            usage: IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (_, chunk) = OpenAiWriter
+            .write_response_event(&ev)
+            .expect("message delta emits a chunk");
+        let fr = &chunk["choices"][0]["finish_reason"];
+        // Must be JSON null, never the empty string (a non-spec value strict SDKs reject).
+        assert_eq!(*fr, serde_json::Value::Null);
+        assert_ne!(*fr, serde_json::json!(""));
+    }
+
+    #[test]
+    fn stream_message_delta_maps_stop_reasons_to_openai_enum() {
+        let cases = [
+            (Some("end_turn"), serde_json::json!("stop")),
+            (Some("stop_sequence"), serde_json::json!("stop")),
+            (Some("max_tokens"), serde_json::json!("length")),
+            (Some("tool_use"), serde_json::json!("tool_calls")),
+            (Some("content_filter"), serde_json::json!("content_filter")),
+        ];
+        for (stop_reason, want) in cases {
+            let ev = IrStreamEvent::MessageDelta {
+                stop_reason: stop_reason.map(String::from),
+                usage: IrUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            };
+            let (_, chunk) = OpenAiWriter
+                .write_response_event(&ev)
+                .expect("message delta emits a chunk");
+            assert_eq!(
+                chunk["choices"][0]["finish_reason"], want,
+                "stop_reason={stop_reason:?}"
+            );
+        }
+    }
+
+    // --- Round 3 fix 4/6: ToolResult block on a non-tool message is not emitted as content,
+    //     and the match has no `_ =>` catch-all (compile-time exhaustiveness is the real guard) ---
+
+    #[test]
+    fn write_request_assistant_tool_result_block_not_emitted_as_content() {
+        // A ToolResult sitting on a non-Tool-role message has no OpenAI content representation; it
+        // must not leak into the message content array. (Tool results travel via the tool-role path.)
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![IrMessage {
+                role: IrRole::Assistant,
+                content: vec![
+                    text_block("answer"),
+                    IrBlock::ToolResult {
+                        tool_use_id: "t1".to_string(),
+                        content: vec![text_block("ignored")],
+                        is_error: false,
+                    },
+                ],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = OpenAiWriter.write_request(&req);
+        let content = out["messages"][0]["content"]
+            .as_array()
+            .expect("content array");
+        // Only the text block survives; the ToolResult is not projected into content.
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], serde_json::json!("text"));
+        assert_eq!(content[0]["text"], serde_json::json!("answer"));
+    }
+
+    #[test]
+    fn write_request_thinking_block_dropped_from_message_content() {
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![IrMessage {
+                role: IrRole::Assistant,
+                content: vec![
+                    IrBlock::Thinking {
+                        text: "secret reasoning".to_string(),
+                        signature: None,
+                    },
+                    text_block("visible"),
+                ],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = OpenAiWriter.write_request(&req);
+        let content = out["messages"][0]["content"]
+            .as_array()
+            .expect("content array");
+        // Thinking is lossy on OpenAI; only the text block is emitted.
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], serde_json::json!("visible"));
+    }
+
+    // --- Round 3 fix 3: array content with unwrap-free parse still reads every block ---
+
+    #[test]
+    fn read_request_array_content_reads_all_blocks() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "one" },
+                    { "type": "text", "text": "two" }
+                ]
+            }]
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        assert_eq!(ir.messages.len(), 1);
+        assert_eq!(
+            ir.messages[0].content,
+            vec![text_block("one"), text_block("two")]
+        );
+    }
+
+    #[test]
+    fn read_response_empty_string_content_yields_no_text_block() {
+        // An empty-string content must not produce a Text block (the unwrap-free path preserves the
+        // prior emptiness guard).
+        let body = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": ""},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 0}
+        });
+        let ir = OpenAiReader.read_response(&body).expect("read_response");
+        assert!(ir
+            .content
+            .iter()
+            .all(|b| !matches!(b, IrBlock::Text { .. })));
     }
 }
