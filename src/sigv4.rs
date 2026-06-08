@@ -17,10 +17,27 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
+/// HMAC-SHA256 of `data` under `key`. `Hmac::new_from_slice` is infallible for HMAC — the spec
+/// accepts a key of ANY length — so the `Err` arm is unreachable. We still avoid `expect()`/panic
+/// here because this runs transitively on the Bedrock request hot path (via `sign_v4` →
+/// `sign_request`), where the project rule forbids a panic surface: a future refactor that swaps the
+/// HMAC impl or key type must not turn a signing-init failure into a task abort. On the unreachable
+/// error we return an empty digest, which yields a wrong signature → AWS responds 403 → the caller's
+/// existing "misconfigured key" fallback surfaces it as an upstream auth failure, exactly the same
+/// graceful path it already takes for an unparseable credential.
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    match HmacSha256::new_from_slice(key) {
+        Ok(mut mac) => {
+            mac.update(data);
+            mac.finalize().into_bytes().to_vec()
+        }
+        Err(e) => {
+            tracing::error!(
+                "HMAC-SHA256 init failed (unreachable: HMAC accepts any key length): {e}"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Derive the SigV4 signing key: HMAC chain over date → region → service → "aws4_request".

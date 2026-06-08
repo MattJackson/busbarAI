@@ -24,3 +24,7 @@ Thumbs.db
 
 # Logs / scratch
 *.log
+/scratch/
+
+# Claude Code session/worktree state (never commit)
+/.claude/

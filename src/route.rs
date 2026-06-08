@@ -72,10 +72,15 @@ async fn budget_check(
 ) -> Option<Response> {
     if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
         if g.is_over_budget_async(key, crate::store::now()).await {
+            // `insufficient_quota` is the canonical OpenAI/Responses quota error type (the OpenAI
+            // writer passes it through verbatim as a real type; the Responses writer maps it
+            // explicitly). The older `billing_error` token was not in either vocabulary, so it
+            // leaked verbatim as a non-canonical `error.type` that an SDK's typed-exception mapping
+            // did not recognize — a router-side tell on a 402.
             return Some(ingress_error(
                 proto,
                 StatusCode::PAYMENT_REQUIRED,
-                "billing_error",
+                "insufficient_quota",
                 &format!("virtual key '{}' has exceeded its budget", key.id),
             ));
         }
@@ -378,10 +383,13 @@ async fn forward_resolved(
         return finish(app, gov, proto, model, started, resp);
     }
 
+    // `not_found_error` is the canonical token every writer maps (OpenAI, Responses, Anthropic →
+    // their native not-found type; Gemini → NOT_FOUND). The older generic `not_found` leaked
+    // verbatim through the OpenAI writer as a non-canonical `error.type`.
     ingress_error(
         proto,
         StatusCode::NOT_FOUND,
-        "not_found",
+        "not_found_error",
         &format!("router: unknown model '{model}'"),
     )
 }
@@ -429,7 +437,11 @@ pub(crate) async fn responses_ingress(
 // segment, so we capture the whole tail with a wildcard (`*rest`) and split on the LAST `:`
 // ourselves — model ids never contain `:` but the `:generateContent` separator always does, so the
 // last colon is unambiguous. `streamGenerateContent` ⇒ stream, `generateContent` ⇒ non-stream; any
-// other action is an unknown native operation → a Gemini-shaped 404.
+// other action is an unknown-or-unsupported native operation → a Gemini-shaped 404. Only the two
+// generate actions are proxied by design: busbar is a generation gateway, so non-generate model
+// methods on this surface (e.g. `countTokens`, `embedContent`, `batchGenerateContent`) are an
+// intentional, documented limitation rather than a relayed call. They return the native NOT_FOUND
+// envelope so the failure mode is at least Gemini-shaped.
 #[tracing::instrument(name = "gemini_ingress", skip_all)]
 pub(crate) async fn gemini_ingress(
     State(app): State<Arc<App>>,
@@ -453,6 +465,11 @@ pub(crate) async fn gemini_ingress(
         }
     };
 
+    // Only the two generate actions are proxied (see the route doc above). Any other action —
+    // including valid-but-unproxied Gemini methods such as `countTokens`/`embedContent` — is an
+    // intentional limitation and returns the native NOT_FOUND envelope. No `_ =>` catch-all: the
+    // two supported actions are listed explicitly, with the unsupported-action fallback handled
+    // afterwards.
     let stream = match action {
         "streamGenerateContent" => true,
         "generateContent" => false,
@@ -461,7 +478,7 @@ pub(crate) async fn gemini_ingress(
                 "gemini",
                 StatusCode::NOT_FOUND,
                 "NOT_FOUND",
-                &format!("router: unknown gemini action '{other}'"),
+                &format!("router: unsupported gemini action '{other}'"),
             )
         }
     };
@@ -484,10 +501,11 @@ pub(crate) async fn bedrock_converse(
     bedrock_ingress(&app, &gov, &caller, &headers, body, &model_id, false).await
 }
 
-// POST /model/:modelId/converse-stream — Bedrock Converse ingress (streaming). Same as `converse`
-// but stream=true. NOTE: the binary `application/vnd.amazon.eventstream` RESPONSE encoding is built
-// in the NEXT wave; this wave only wires the route + stream intent so the request resolves and
-// forwards correctly.
+// POST /model/:modelId/converse-stream — Bedrock Converse ingress (streaming, stream=true). The
+// upstream stream is re-encoded into binary `application/vnd.amazon.eventstream` frames (one
+// CRC32-valid frame per event via `eventstream::encode_frame`, wired through
+// `StreamTranslate::ingress_eventstream`) so a native AWS SDK Bedrock client decodes the response as
+// ConverseStream.
 #[tracing::instrument(name = "bedrock_converse_stream", skip_all)]
 pub(crate) async fn bedrock_converse_stream(
     State(app): State<Arc<App>>,
@@ -1130,8 +1148,8 @@ mod tests {
     }
 
     /// Bedrock `/model/foo/converse` (stream=false) resolves model "foo", routes cross-protocol to
-    /// an OpenAI backend, and returns native Converse JSON. (Streaming binary assertion is DEFERRED
-    /// to the eventstream-encoder wave.)
+    /// an OpenAI backend, and returns native Converse JSON. The streaming binary-eventstream
+    /// assertion lives in `test_bedrock_converse_stream_returns_binary_eventstream`.
     #[tokio::test]
     async fn test_bedrock_converse_routes_and_returns_json() {
         crate::metrics::init();
@@ -1186,5 +1204,461 @@ mod tests {
         );
         handle.abort();
         server.shutdown().await;
+    }
+
+    /// OpenAI-style streamed chat-completion chunks a mock backend emits (each wrapped as a `data:`
+    /// SSE line by `MockResponse::Sse`). The OpenAI reader decodes bare `data:`-framed chunks without
+    /// needing an `event:` line, so a cross-protocol ingress exercises the full reframe.
+    fn openai_stream_events() -> Vec<String> {
+        vec![
+            r#"{"choices":[{"delta":{"role":"assistant"}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{"content":"hi"}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#.to_string(),
+        ]
+    }
+
+    /// HIGH/test-coverage: the `/model/:modelId/converse-stream` route (stream=true) must (a) resolve
+    /// with stream intent, (b) return `Content-Type: application/vnd.amazon.eventstream`, and (c)
+    /// produce a body that is a sequence of binary AWS event-stream frames `eventstream::drain_frames`
+    /// can cleanly decode (buffer empties, frames carry the ConverseStream event names). Routes
+    /// cross-protocol to a streaming OpenAI backend so the SSE→binary reframe path runs.
+    #[tokio::test]
+    async fn test_bedrock_converse_stream_returns_binary_eventstream() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Sse {
+            events: openai_stream_events(),
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        // Bedrock ingress → OpenAI backend (cross-protocol) so the upstream SSE stream is re-encoded
+        // into the client's native binary eventstream framing.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/model/foo/converse-stream"))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "messages": [{"role": "user", "content": [{"text": "hello"}]}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "bedrock /converse-stream resolves model 'foo' and 2xx round-trips"
+        );
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/vnd.amazon.eventstream"),
+            "streaming bedrock ingress is binary eventstream; got {ct}"
+        );
+
+        // The body must decode as a clean sequence of binary AWS event-stream frames.
+        let body = resp.bytes().await.unwrap();
+        let mut buf = body.to_vec();
+        let frames = crate::eventstream::drain_frames(&mut buf);
+        assert!(
+            !frames.is_empty(),
+            "at least one binary eventstream frame must decode; body len {}",
+            body.len()
+        );
+        assert!(
+            buf.is_empty(),
+            "the body must be a whole sequence of frames with no trailing partial bytes"
+        );
+        let event_types: Vec<&str> = frames.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            event_types.contains(&"messageStart"),
+            "ConverseStream frames include messageStart; got {event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"contentBlockDelta"),
+            "ConverseStream frames include contentBlockDelta; got {event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"messageStop"),
+            "ConverseStream frames include messageStop; got {event_types:?}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// HIGH/conformance regression: a SAME-PROTOCOL bedrock-ingress → bedrock-backend passthrough must
+    /// NOT leak the router shim keys (`model`/`stream`) that `ingress_path_model` injects into the
+    /// body. `forward_with_pool` skips IR translation on same-protocol, so without the strip the
+    /// injected keys would reach the backend (a native Bedrock Converse body carries neither, and the
+    /// polluted body is what gets SigV4-signed). Asserts the body the backend RECEIVED has no
+    /// top-level `model`/`stream`.
+    #[tokio::test]
+    async fn test_bedrock_same_protocol_passthrough_strips_shim_keys() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        // A minimal native-shaped Bedrock Converse response; same-protocol passthrough relays it
+        // verbatim, so any 2xx body suffices for the round-trip.
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+                "usage": {"inputTokens": 5, "outputTokens": 3}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        // The mock backend only routes `/v1/messages` + `/v1/chat/completions`; point the bedrock
+        // lane's upstream path there so the same-protocol passthrough request reaches the handler
+        // (the shim-strip under test is path-independent). Bedrock's native egress path is
+        // `/model/{model}/converse`, which the mock does not serve.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::bedrock(), &server.base_url())
+                    .provider("aws")
+                    .path("/v1/messages"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/model/foo/converse"))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "messages": [{"role": "user", "content": [{"text": "hello"}]}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "bedrock→bedrock 2xx round-trip"
+        );
+
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&state.get_last_request_body().unwrap()).unwrap();
+        assert!(
+            upstream.get("model").is_none(),
+            "router shim key 'model' must not leak to the bedrock backend; got {upstream}"
+        );
+        assert!(
+            upstream.get("stream").is_none(),
+            "router shim key 'stream' must not leak to the bedrock backend; got {upstream}"
+        );
+        // The genuine native field must survive.
+        assert!(
+            upstream.get("messages").is_some(),
+            "native bedrock body fields survive the passthrough; got {upstream}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// HIGH/conformance regression: same as above for gemini-ingress → gemini-backend. The Gemini
+    /// writer's `rewrite_model` REINSERTS `model`, so the shim strip is the only thing keeping a
+    /// top-level `model`/`stream` off the native generateContent body the backend receives.
+    #[tokio::test]
+    async fn test_gemini_same_protocol_passthrough_strips_shim_keys() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "hi"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 3}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        // The mock backend only routes `/v1/messages` + `/v1/chat/completions`; point the gemini
+        // lane's upstream path there so the same-protocol passthrough request reaches the handler
+        // (the shim-strip under test is path-independent). Gemini's native egress path embeds the
+        // model and action, which the mock does not serve.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::gemini(), &server.base_url())
+                    .provider("google")
+                    .path("/v1/messages"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1beta/models/foo:generateContent"))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "contents": [{"role": "user", "parts": [{"text": "hello"}]}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "gemini→gemini 2xx round-trip");
+
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&state.get_last_request_body().unwrap()).unwrap();
+        assert!(
+            upstream.get("stream").is_none(),
+            "router shim key 'stream' must not leak to the gemini backend; got {upstream}"
+        );
+        assert!(
+            upstream.get("model").is_none(),
+            "router shim key 'model' must not leak to the gemini backend; got {upstream}"
+        );
+        assert!(
+            upstream.get("contents").is_some(),
+            "native gemini body fields survive the passthrough; got {upstream}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// MEDIUM/test-coverage: the `streamGenerateContent` action injects `stream:true` and routes to a
+    /// streaming backend. Routes gemini→openai (cross-protocol) so the request reaches the backend and
+    /// the response is SSE (text/event-stream) for the gemini SSE ingress contract.
+    #[tokio::test]
+    async fn test_gemini_stream_generate_content_routes() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Sse {
+            events: openai_stream_events(),
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/v1beta/models/foo:streamGenerateContent"
+            ))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "contents": [{"role": "user", "parts": [{"text": "hello"}]}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "gemini :streamGenerateContent resolves and 2xx round-trips"
+        );
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "gemini streaming ingress is SSE-framed; got {ct}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// MEDIUM/test-coverage: a Gemini path with NO colon (`/v1beta/models/gemini-flash`) hits the
+    /// malformed-path branch and must return a Gemini-shaped 404 (not a 200, not a panic).
+    #[tokio::test]
+    async fn test_gemini_malformed_path_no_colon_is_404() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1beta/models/gemini-flash"))
+            .bearer_auth("t")
+            .body(json!({"contents": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "gemini path with no colon ⇒ native 404"
+        );
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "gemini error envelope is JSON; got {ct}"
+        );
+        handle.abort();
+    }
+
+    /// MEDIUM/test-coverage: an EMPTY model (`/v1beta/models/:generateContent`) is malformed (the
+    /// pre-colon segment is empty) and must return a Gemini-shaped 404, not misroute.
+    #[tokio::test]
+    async fn test_gemini_empty_model_is_404() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1beta/models/:generateContent"))
+            .bearer_auth("t")
+            .body(json!({"contents": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "gemini empty model ⇒ native 404"
+        );
+        handle.abort();
+    }
+
+    /// MEDIUM/test-coverage: a model id that itself CONTAINS a colon must split on the LAST colon, so
+    /// `tunedModels/abc:1:generateContent` resolves model `tunedModels/abc:1` (not the action). The
+    /// lane is named with the colon-bearing id so a correct LAST-colon split is the only way it
+    /// resolves and 2xx round-trips.
+    #[tokio::test]
+    async fn test_gemini_model_with_colon_splits_on_last_colon() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: openai_ok_body(),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "tunedModels/abc:1",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("tunedModels/abc:1", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/v1beta/models/tunedModels/abc:1:generateContent"
+            ))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "contents": [{"role": "user", "parts": [{"text": "hello"}]}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "colon-bearing model id splits on the LAST colon and resolves"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    // ---- percent_decode unit tests (MEDIUM/test-coverage) ----
+
+    /// `%3A` decodes to a literal colon.
+    #[test]
+    fn test_percent_decode_colon() {
+        assert_eq!(percent_decode("%3A"), ":");
+        assert_eq!(
+            percent_decode("anthropic.claude-3%3A0"),
+            "anthropic.claude-3:0"
+        );
+    }
+
+    /// `%2E` decodes to a literal period, and an undecoded id passes through unchanged.
+    #[test]
+    fn test_percent_decode_period_and_plain() {
+        assert_eq!(percent_decode("a%2Eb"), "a.b");
+        assert_eq!(
+            percent_decode("anthropic.claude-3-sonnet"),
+            "anthropic.claude-3-sonnet"
+        );
+    }
+
+    /// A malformed escape (`%` followed by non-hex digits) is left verbatim rather than dropped or
+    /// panicking.
+    #[test]
+    fn test_percent_decode_malformed_escape_passes_through() {
+        assert_eq!(percent_decode("%XY"), "%XY");
+        assert_eq!(percent_decode("a%ZZb"), "a%ZZb");
+    }
+
+    /// A trailing `%` (or a `%` with too few following bytes) at end-of-string is safe — no
+    /// out-of-bounds index, the bytes pass through.
+    #[test]
+    fn test_percent_decode_trailing_percent_is_safe() {
+        assert_eq!(percent_decode("abc%"), "abc%");
+        assert_eq!(percent_decode("abc%3"), "abc%3");
+    }
+
+    /// LOW/conformance regression: a 404 from `forward_resolved` (unknown model) carries the
+    /// canonical `not_found_error` type for an OpenAI-ingress client, not the old non-canonical
+    /// `not_found`. Drives the real router so the body-model ingress → resolution-miss path runs.
+    #[tokio::test]
+    async fn test_unknown_model_404_uses_canonical_openai_type() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("t")
+            .body(json!({"model": "no-such-model", "messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 404, "unknown model ⇒ 404");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("not_found_error"),
+            "404 carries the canonical OpenAI not_found_error type; got {body}"
+        );
+        handle.abort();
     }
 }

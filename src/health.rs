@@ -21,10 +21,16 @@ use std::time::Duration;
 
 use axum::http::header::CONTENT_TYPE;
 
+use crate::breaker::{classify, normalize_raw_error, Disposition, RawUpstreamError};
 use crate::config::HealthMode;
 use crate::proto::convert_headers;
 use crate::state::App;
 use crate::store::{now, BreakerCfg};
+
+/// Cap on the bytes read from a non-2xx probe response before breaker classification, mirroring the
+/// request path's size-capped read: a hostile/misconfigured upstream must not force an unbounded
+/// heap allocation just because a probe failed. 64 KiB is far more than any error envelope needs.
+const PROBE_ERROR_BODY_CAP: usize = 64 * 1024;
 
 /// Default seconds between probes when a `health:` block omits `interval_secs`.
 const DEFAULT_PROBE_INTERVAL_SECS: u64 = 30;
@@ -81,11 +87,23 @@ pub(crate) fn spawn_probers(app: Arc<App>) {
     }
 }
 
-/// Send a single health probe to lane `i` and fold the outcome into the breaker:
+/// Send a single health probe to lane `i` and fold the outcome into the breaker, running a non-2xx
+/// response through the SAME two-stage disposition pipeline organic traffic uses
+/// (`proto.extract_error` → `normalize_raw_error` → `breaker::classify`) rather than forcing every
+/// failure to a transient cooldown:
 ///   - 2xx → recover the lane if it was tripped (→ Closed). A healthy lane is left untouched (no
 ///     synthetic success is counted, so probes don't pollute the `ok` stats).
-///   - anything else / transport error → record a transient failure (drives the trip evaluation in
-///     `active` mode and re-arms the cooldown on a tripped lane).
+///   - `HardDown` (Auth/Billing — e.g. an invalid credential or exhausted balance) → record a
+///     hard-down trip on every cell the lane routes against, matching organic semantics. Previously
+///     these were mis-recorded as transient, so an auth-dead lane oscillated between cooldown and
+///     re-probe forever instead of being parked dead (and the prober kept firing guaranteed-401s).
+///   - `TransientUpstream` (5xx/429/timeout/overloaded/network) and transport errors → record a
+///     transient failure across all cells (drives the trip evaluation in `active` mode and re-arms
+///     the cooldown on a tripped lane).
+///   - `ClientFault` / `ContextLength` → the LANE is healthy; the probe request itself was rejected
+///     as malformed or too large for this model. Record NOTHING — penalizing the breaker here would
+///     bench a working lane over a probe-construction issue, matching the organic "record nothing"
+///     disposition for these classes.
 pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
     let lane = &app.lanes[i];
 
@@ -122,22 +140,214 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
         .send()
         .await;
 
-    let healthy = matches!(&res, Ok(r) if r.status().is_success());
-    if healthy {
-        if app.store.lane_needs_probe(i, now()) {
-            // Probe tests the shared upstream → recover the lane in every cell (all pools + default),
-            // clearing both Open trips and soft cooldowns.
-            app.store.recover_lane(i);
-            tracing::info!(lane = %lane.model, "lane recovered via health probe");
+    // Classify the probe outcome through the organic disposition pipeline so auth/billing failures
+    // reach HardDown instead of being mis-filed as transient cooldowns.
+    let disposition = match res {
+        Ok(r) if r.status().is_success() => {
+            if app.store.lane_needs_probe(i, now()) {
+                // Probe tests the shared upstream → recover the lane in every cell (all pools +
+                // default), clearing both Open trips and soft cooldowns.
+                app.store.recover_lane(i);
+                tracing::info!(lane = %lane.model, "lane recovered via health probe");
+            }
+            return;
         }
-    } else {
-        // A failed probe must trip the SAME cells a successful probe (recover_lane) clears — the
-        // default cell AND every per-pool cell — because organic traffic routes against per-pool
-        // cells. Recording only the default cell (the previous behavior) meant `active` probing
-        // could never trip the per-pool breakers real traffic is selected against, so a silently
-        // dead upstream stayed Closed for named pools. (The single default BreakerCfg is used for
-        // all cells; per-pool trip-threshold nuance is a known limitation of the out-of-band prober.)
-        app.store
-            .record_probe_failure_all_cells(i, "health-probe", &BreakerCfg::default());
+        Ok(r) => {
+            // Non-2xx: run the body through Stage 1a (proto.extract_error) → Stage 1b
+            // (normalize_raw_error + the lane's error_map) → Stage 2 (classify), exactly as the
+            // forwarding path does, capturing the Retry-After header the body-only extractor can't
+            // see so the cooldown floor is honored.
+            let status = r.status();
+            let retry_after_secs = r
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            let body = read_capped_error_body(r).await;
+            let mut raw: RawUpstreamError = lane.protocol.reader().extract_error(status, &body);
+            raw.retry_after_secs = retry_after_secs;
+            classify(&normalize_raw_error(&raw, &lane.error_map))
+        }
+        // Transport error (connect/timeout/reset): treat as a transient network failure, as the
+        // organic path does.
+        Err(_) => Disposition::TransientUpstream,
+    };
+
+    match disposition {
+        Disposition::HardDown => {
+            // Auth/Billing: the lane is definitively bad (e.g. invalid credential). Park it dead in
+            // EVERY cell organic traffic routes against — the default cell PLUS every configured
+            // pool that contains this lane — mirroring the all-cells reach of a successful probe's
+            // `recover_lane`. (No `record_hard_down_all_cells` exists; the per-cell `record_hard_down`
+            // / `record_hard_down_in` are the public primitives, so we iterate the pools ourselves.)
+            let reason = "health-probe hard-down (auth/billing)";
+            app.store.record_hard_down(i, reason);
+            for (pool_name, members) in app.pools.iter() {
+                if members.iter().any(|m| m.idx == i) {
+                    app.store.record_hard_down_in(pool_name, i, reason);
+                }
+            }
+            tracing::warn!(lane = %lane.model, "lane hard-down via health probe (parked dead, recovers on a 2xx probe)");
+        }
+        Disposition::TransientUpstream => {
+            // A transient failed probe must trip the SAME cells a successful probe (recover_lane)
+            // clears — the default cell AND every per-pool cell — because organic traffic routes
+            // against per-pool cells. (The single BreakerCfg is used for all cells; per-pool
+            // trip-threshold nuance is a known limitation of the out-of-band prober.)
+            app.store
+                .record_probe_failure_all_cells(i, "health-probe", &BreakerCfg::default());
+        }
+        // The lane is healthy; the probe REQUEST was rejected (malformed / too large for the model).
+        // Record nothing — do not bench a working lane over a probe-construction issue.
+        Disposition::ClientFault | Disposition::ContextLength => {
+            tracing::debug!(
+                lane = %lane.model,
+                "health probe got a client-fault/context-length response; lane not penalized"
+            );
+        }
+    }
+}
+
+/// Read at most `PROBE_ERROR_BODY_CAP` bytes of a non-2xx probe response body for breaker
+/// classification. Streams chunk-by-chunk and stops once the cap is reached so a hostile or
+/// misconfigured upstream cannot force an unbounded allocation on the probe path.
+async fn read_capped_error_body(mut resp: reqwest::Response) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = PROBE_ERROR_BODY_CAP.saturating_sub(buf.len());
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(chunk.len());
+                buf.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    break; // this chunk filled the cap
+                }
+            }
+            Ok(None) => break, // end of body
+            Err(_) => break,   // mid-body transport error — classify on what we have
+        }
+    }
+    buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{HealthCfg, HealthMode};
+    use crate::proto::Protocol;
+    use crate::store::BreakerState;
+    use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
+    use axum::http::StatusCode;
+    use std::sync::Arc;
+
+    fn health_active() -> HealthCfg {
+        HealthCfg {
+            mode: HealthMode::Active,
+            interval_secs: Some(30),
+            timeout_secs: Some(5),
+        }
+    }
+
+    /// Stand up a mock upstream that returns `resp`, build a one-lane App (anthropic, in pool `p`)
+    /// pointed at it, run a single probe, and hand back the App so the test can inspect the breaker.
+    async fn probe_once(resp: MockResponse) -> (Arc<crate::state::App>, MockServer) {
+        let state = Arc::new(MockServerState::new());
+        state.push(resp);
+        let server = MockServer::new(state).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("claude", Protocol::anthropic(), &server.base_url())
+                    .api_key("sk-test")
+                    .health(health_active()),
+            )
+            .pool("p", &[(0, 1)])
+            .build();
+        probe_lane(&app, 0, Duration::from_secs(5)).await;
+        (app, server)
+    }
+
+    #[tokio::test]
+    async fn test_probe_auth_failure_is_hard_down_not_transient() {
+        // Regression: a 401 probe must classify as HardDown (auth) and PARK the lane dead in the
+        // default cell AND the per-pool cell — not be mis-recorded as a recoverable transient that
+        // oscillates between cooldown and re-probe forever.
+        let (app, server) = probe_once(MockResponse::Auth {
+            status: StatusCode::UNAUTHORIZED,
+        })
+        .await;
+
+        assert!(
+            matches!(app.store.breaker_state(0), BreakerState::Open { .. }),
+            "401 probe must trip the default cell Open (hard-down), got {:?}",
+            app.store.breaker_state(0)
+        );
+        assert!(
+            app.store.cooldown_remaining_in("p", 0, now()) > 60,
+            "401 probe must arm the long sticky hard-down cooldown on the per-pool cell, not a \
+             short transient cooldown"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_probe_server_error_is_transient_not_hard_down() {
+        // A single 503 probe is a transient failure: it must NOT immediately Open the default cell
+        // with the multi-minute sticky hard-down cooldown (one sub-threshold transient stays Closed
+        // under the default error-rate breaker).
+        let (app, server) = probe_once(MockResponse::ServerError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: serde_json::json!({"error": "upstream down"}),
+        })
+        .await;
+
+        assert!(
+            matches!(app.store.breaker_state(0), BreakerState::Closed),
+            "a single 503 probe must record a transient (no immediate hard-down trip), got {:?}",
+            app.store.breaker_state(0)
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_probe_client_fault_does_not_penalize_lane() {
+        // A 400 (client fault — the probe request shape, not the lane) must record NOTHING: the lane
+        // stays Closed with no cooldown, so a healthy lane is never benched over a probe-construction
+        // issue.
+        let (app, server) = probe_once(MockResponse::ServerError {
+            status: StatusCode::BAD_REQUEST,
+            body: serde_json::json!({"error": "bad request"}),
+        })
+        .await;
+
+        assert!(
+            matches!(app.store.breaker_state(0), BreakerState::Closed),
+            "a 400 probe (client fault) must not trip the breaker, got {:?}",
+            app.store.breaker_state(0)
+        );
+        assert_eq!(
+            app.store.cooldown_remaining_in("p", 0, now()),
+            0,
+            "a 400 probe (client fault) must not arm any cooldown"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_probe_skips_lane_without_key() {
+        // No api_key → no probe (can't authenticate; a guaranteed 401 would only thrash the breaker).
+        // The lane must stay Closed even though no upstream is reachable.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("claude", Protocol::anthropic(), "http://127.0.0.1:1")
+                    .api_key("")
+                    .health(health_active()),
+            )
+            .pool("p", &[(0, 1)])
+            .build();
+        probe_lane(&app, 0, Duration::from_secs(1)).await;
+        assert!(matches!(app.store.breaker_state(0), BreakerState::Closed));
     }
 }

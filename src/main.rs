@@ -98,6 +98,11 @@ ENDPOINTS (once running, listen address from config.yaml `listen`):
     POST /<pool>/v1/messages               route to a configured pool
     POST /<provider>/<model>/v1/messages   ad-hoc direct route
     POST /v1/chat/completions              OpenAI-format ingress
+    POST /v2/chat                          Cohere-format ingress
+    POST /v1/responses                     Responses-API ingress
+    POST /v1beta/models/<model>:<action>   Gemini-format ingress
+    POST /model/<modelId>/converse         Bedrock Converse ingress
+    POST /model/<modelId>/converse-stream  Bedrock Converse streaming ingress
     GET  /stats  /healthz  /metrics
 
 Docs: https://github.com/MattJackson/busbarAI",

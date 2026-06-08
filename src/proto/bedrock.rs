@@ -4,7 +4,6 @@
 //! Bedrock Converse protocol reader/writer implementation.
 
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Map busbar's generic error `kind` vocabulary to the AWS Bedrock Converse exception name carried
 /// in `__type`. AWS's Converse error model is a fixed, closed set of exception shapes
@@ -61,38 +60,6 @@ fn stop_reason_reverse(canonical: &str) -> String {
         "safety" => "content_filtered".to_string(),
         other => other.to_string(),
     }
-}
-
-/// Monotonic per-process counter mixed into a synthesized response id so two responses minted in
-/// the same wall-clock second still get distinct ids. Stdlib-only (no new crate dependency).
-#[cfg_attr(not(test), allow(dead_code))]
-static SYNTH_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Current unix time in whole seconds. Stdlib-only. A clock before the epoch (impossible on a
-/// sane host, but `duration_since` is fallible) degrades to 0 rather than panicking on the
-/// request path. Only reachable via `synth_response_id` on the test path until the cross-protocol
-/// wiring lands.
-#[cfg_attr(not(test), allow(dead_code))]
-fn unix_now_secs() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Synthesize a unique, Bedrock-flavored response identity for the CROSS-protocol case (the egress
-/// backend was not Bedrock, so the IR carries no id). The AWS SDK shapes a Converse response id as
-/// the request id surfaced in the `x-amzn-RequestId` HTTP header; those are uppercase-hyphen UUIDs.
-/// We mint a syntactically-plausible, collision-resistant token from (unix seconds + a monotonic
-/// counter) — no UUID crate, no panic. Used only to populate the IR's `id` when a downstream
-/// cross-protocol writer needs one; see `write_response` for why it is NOT injected into Bedrock's
-/// own response body (the native Converse body has no id field). Only reachable on the test path
-/// until the cross-protocol wiring lands in a later wave.
-#[cfg_attr(not(test), allow(dead_code))]
-fn synth_response_id() -> String {
-    let n = SYNTH_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{:016x}-{:016x}", unix_now_secs(), n)
 }
 
 #[derive(Clone)]
@@ -387,9 +354,16 @@ impl ProtocolReader for BedrockReader {
             tools,
             max_tokens,
             temperature,
-            // Bedrock has no `stream` field in the request body — streaming is selected by the
-            // endpoint (converse vs converse-stream), so there is nothing to read here.
-            stream: false,
+            // Bedrock's native Converse request body has no `stream` field — streaming is selected
+            // by the endpoint (converse vs converse-stream). The Bedrock ingress route therefore
+            // INJECTS `"stream": true` into the body for converse-stream requests before this reader
+            // runs (see `ingress_path_model`), so on a Bedrock-INGRESS cross-protocol request the
+            // re-parsed IR must carry that flag through — otherwise the target egress writer is never
+            // told to produce a streaming body and a client that called /converse-stream silently
+            // gets a buffered (non-streaming) response. Defaults to false when the field is absent
+            // (a native Bedrock egress reads the flag from the endpoint, not the body, so this is
+            // a no-op for the same-protocol path).
+            stream: obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
             extra,
         })
     }
@@ -570,7 +544,45 @@ impl ProtocolReader for BedrockReader {
                 }
             }
 
-            _ => {}
+            // Bedrock-documented mid-stream exception event shapes. The ConverseStream wire can
+            // carry a modeled error event in place of (or before) `messageStop`
+            // (`internalServerException`, `modelStreamErrorException`, `modelTimeoutException`,
+            // `throttlingException`, `validationException`, `serviceUnavailableException`). Surface
+            // these as an `IrStreamEvent::Error` so the downstream ingress writer terminates the
+            // client stream with a protocol-shaped error rather than silently dropping the event and
+            // leaving the client on a hanging / EOF-without-terminator stream.
+            Some(
+                exc @ ("internalServerException"
+                | "modelStreamErrorException"
+                | "modelTimeoutException"
+                | "throttlingException"
+                | "validationException"
+                | "serviceUnavailableException"),
+            ) => {
+                let message = data
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(String::from);
+                let class = match exc {
+                    "throttlingException" => StatusClass::RateLimit,
+                    "modelTimeoutException" => StatusClass::Timeout,
+                    "validationException" => StatusClass::ClientError,
+                    "serviceUnavailableException" => StatusClass::Overloaded,
+                    // internalServerException | modelStreamErrorException
+                    _ => StatusClass::ServerError,
+                };
+                out.push(IrStreamEvent::Error(crate::proto::IrError {
+                    class,
+                    provider_signal: message.or_else(|| Some(exc.to_string())),
+                    retry_after: None,
+                }));
+            }
+
+            // Any other (or absent) event type is a no-op. This is NOT a disposition/breaker match:
+            // it is the wire event-type demux for an open-ended, vendor-extensible event stream, so
+            // an unrecognized future event must be skipped (not error) to avoid breaking forward
+            // compatibility. The error-bearing event types are handled explicitly above.
+            Some(_) | None => {}
         }
 
         out
@@ -817,7 +829,16 @@ impl ProtocolWriter for BedrockWriter {
             let role_str = match msg.role {
                 crate::ir::IrRole::User => "user",
                 crate::ir::IrRole::Assistant => "assistant",
-                crate::ir::IrRole::System | crate::ir::IrRole::Tool => "user",
+                // A Tool-role IR message carries `toolResult` blocks; Bedrock Converse has no
+                // freestanding "tool" role — a tool result is a `toolResult` content block inside a
+                // USER-turn message, so mapping Tool → "user" is the correct native wire shape.
+                crate::ir::IrRole::Tool => "user",
+                // System text is extracted by the caller into `req.system` (emitted as the top-level
+                // `system` array above), so a System-role MESSAGE should never reach the Bedrock
+                // wire. If one somehow escapes extraction, skip it rather than silently mislabeling
+                // it as a "user" turn (which would inject system instructions as a user message and
+                // corrupt the conversation). Each role is handled explicitly — no catch-all.
+                crate::ir::IrRole::System => continue,
             };
 
             let mut content_arr: Vec<serde_json::Value> = Vec::new();
@@ -840,9 +861,47 @@ impl ProtocolWriter for BedrockWriter {
                                 crate::ir::IrBlock::Text { text, .. } => {
                                     inner_content.push(serde_json::json!({ "text": text }));
                                 }
-                                _ => {
-                                    let json_repr = "{}".to_string();
-                                    inner_content.push(serde_json::json!({ "text": json_repr }));
+                                // Bedrock Converse natively supports structured tool-result content
+                                // via a `{"json": <value>}` block (the inverse of what `read_request`
+                                // decodes). Preserve the actual content instead of collapsing it to
+                                // the constant string `"{}"`: a JSON-string Text-equivalent or a
+                                // structured result that arrives via the IR is re-encoded faithfully.
+                                crate::ir::IrBlock::Image { media_type, data } => {
+                                    let format_str = media_type
+                                        .strip_prefix("image/")
+                                        .unwrap_or("png")
+                                        .to_string();
+                                    inner_content.push(serde_json::json!({
+                                        "image": { "format": format_str, "source": { "bytes": data } }
+                                    }));
+                                }
+                                crate::ir::IrBlock::ToolUse { id, name, input } => {
+                                    // Nested ToolUse inside a tool result has no native Bedrock
+                                    // tool-result shape; carry it as a structured `json` block rather
+                                    // than discarding the call identity.
+                                    inner_content.push(serde_json::json!({
+                                        "json": { "toolUseId": id, "name": name, "input": input }
+                                    }));
+                                }
+                                crate::ir::IrBlock::ToolResult {
+                                    tool_use_id,
+                                    is_error,
+                                    ..
+                                } => {
+                                    // A tool result nested inside another tool result is not a native
+                                    // Bedrock shape; preserve its identity as a `json` block instead
+                                    // of emitting a meaningless `"{}"` placeholder.
+                                    inner_content.push(serde_json::json!({
+                                        "json": { "toolUseId": tool_use_id, "isError": is_error }
+                                    }));
+                                }
+                                // Thinking blocks have no representable Bedrock tool-result shape and
+                                // carry no result data; omit them entirely (with a trace) rather than
+                                // emitting a misleading placeholder block.
+                                crate::ir::IrBlock::Thinking { .. } => {
+                                    tracing::warn!(
+                                        "dropping non-representable Thinking block inside a Bedrock toolResult"
+                                    );
                                 }
                             }
                         }
@@ -935,7 +994,15 @@ impl ProtocolWriter for BedrockWriter {
             )),
 
             IrStreamEvent::BlockStart { index, block } => match block {
-                crate::ir::IrBlockMeta::Text => None,
+                // AWS ConverseStream emits a `contentBlockStart` frame at the start of EVERY content
+                // block, including text blocks, with an empty `start` struct. A native AWS SDK uses
+                // this event to initialize its per-block streaming decoder; omitting it for text
+                // blocks leaves the following `contentBlockDelta`s orphaned (no preceding start),
+                // which strict SDK parsers discard or reject — and is a detectable proxy tell.
+                crate::ir::IrBlockMeta::Text => Some((
+                    "contentBlockStart".to_string(),
+                    serde_json::json!({ "contentBlockIndex": index, "start": {} }),
+                )),
                 crate::ir::IrBlockMeta::ToolUse { id, name } => Some((
                     "contentBlockStart".to_string(),
                     serde_json::json!({
@@ -973,26 +1040,63 @@ impl ProtocolWriter for BedrockWriter {
                 serde_json::json!({ "contentBlockIndex": index }),
             )),
 
-            IrStreamEvent::MessageDelta {
-                stop_reason,
-                usage: _,
-            } => {
-                let reason_str = stop_reason.as_deref().unwrap_or("end_turn");
-                Some((
+            // The IR splits a stop event from a usage event (mirroring the native Bedrock wire,
+            // which carries `stopReason` in `messageStop` and token `usage` in a separate `metadata`
+            // frame that FOLLOWS `messageStop`). Map each IR MessageDelta to the matching native
+            // frame so a native AWS SDK Bedrock client sees the real two-frame sequence:
+            //   - stop_reason = Some(...)  → `messageStop` (the stop discriminant)
+            //   - stop_reason = None       → `metadata` carrying the real token usage
+            // Previously EVERY MessageDelta became a `messageStop` and usage was discarded (`usage: _`),
+            // so (a) a native SDK reading usage from the `metadata` frame got zero, and (b) a trailing
+            // usage-only delta produced a SECOND `messageStop` frame — both distinguishable tells.
+            IrStreamEvent::MessageDelta { stop_reason, usage } => match stop_reason {
+                Some(reason) => Some((
                     "messageStop".to_string(),
-                    serde_json::json!({ "stopReason": stop_reason_reverse(reason_str) }),
-                ))
-            }
+                    serde_json::json!({ "stopReason": stop_reason_reverse(reason) }),
+                )),
+                None => Some((
+                    "metadata".to_string(),
+                    serde_json::json!({
+                        "usage": {
+                            "inputTokens": usage.input_tokens,
+                            "outputTokens": usage.output_tokens,
+                            "totalTokens": usage.input_tokens + usage.output_tokens
+                        }
+                    }),
+                )),
+            },
 
             IrStreamEvent::MessageStop => None,
 
+            // A mid-stream error on the Bedrock-ingress path. The fully native representation is an
+            // AWS modeled-exception EVENT-STREAM frame (`:message-type: exception` +
+            // `:exception-type: <ExceptionName>`); that frame can only be produced by
+            // `eventstream::encode_exception_frame`, which the production mid-stream-error path
+            // (`forward.rs::mid_stream_error_bytes`) already emits for a bedrock-ingress client. The
+            // `write_response_event` trait returns a single `(event_type, json)` pair that the
+            // StreamTranslate consumer always wraps with `encode_frame` (`:message-type: event`), so
+            // this arm cannot set the exception message-type header. We therefore name the event with
+            // the real Converse exception name (mapped from the IR error class) and carry the AWS
+            // `{"message": ...}` body, so the type token is at least a genuine AWS exception name
+            // rather than the literal `"error"`. See `skipped` note: the message-type header itself is
+            // owned by the (out-of-unit) encoder + consumer.
             IrStreamEvent::Error(err) => {
+                let kind = match err.class {
+                    StatusClass::RateLimit => "throttling",
+                    StatusClass::Timeout => "model_timeout",
+                    StatusClass::Auth => "auth",
+                    StatusClass::Billing => "quota_exceeded",
+                    StatusClass::ClientError | StatusClass::ContextLength => "invalid_request",
+                    StatusClass::Overloaded => "service_unavailable",
+                    StatusClass::ServerError | StatusClass::Network => "api_error",
+                };
+                let exception_name = error_kind_to_bedrock_type(kind);
                 let message = err
                     .provider_signal
                     .clone()
-                    .unwrap_or_else(|| "error".to_string());
+                    .unwrap_or_else(|| exception_name.to_string());
                 Some((
-                    "error".to_string(),
+                    exception_name.to_string(),
                     serde_json::json!({ "message": message }),
                 ))
             }
@@ -1033,13 +1137,12 @@ impl ProtocolWriter for BedrockWriter {
         // deserializes — `output` / `stopReason` / `usage` / optional `metrics`) carries NO id or
         // `created` field; AWS returns the request id only in the `x-amzn-RequestId` HTTP header.
         // Injecting a synthesized `id`/`created` into the JSON body would therefore be a
-        // proxy-tell, not fidelity — so we deliberately do NOT add one. The cross-protocol
-        // synthesizer (`synth_response_id`) exists for the inverse direction (a Bedrock egress
-        // feeding an OpenAI/Anthropic ingress that DOES require a body id) and to populate the IR
-        // id when a downstream writer needs it; it is intentionally unused by Bedrock's own body
-        // writer. `stopReason` and `usage` (the only identity-bearing fields Bedrock emits) are
-        // reproduced exactly from the captured IR below, so a same-protocol round-trip is
-        // byte-identical.
+        // proxy-tell, not fidelity — so we deliberately do NOT add one. (The inverse direction — a
+        // Bedrock egress feeding an OpenAI/Anthropic ingress that DOES require a body id — is the
+        // job of that ingress writer, not this one; no Bedrock-side id synthesizer is wired into the
+        // production path, so none is shipped.) `stopReason` and `usage` (the only identity-bearing
+        // fields Bedrock emits) are reproduced exactly from the captured IR below, so a
+        // same-protocol round-trip is byte-identical.
         serde_json::json!({
             "output": {
                 "message": {
@@ -1079,6 +1182,33 @@ impl ProtocolWriter for BedrockWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Cross-protocol response-id synthesis is NOT wired into any production path (Bedrock's own
+    // body has no id field, and the inverse direction is the consuming ingress writer's job — see
+    // `write_response`). The helper trio below was previously shipped in the production binary under
+    // `#[cfg_attr(not(test), allow(dead_code))]`; it is now confined to the test module so 1.0 does
+    // not carry dead production scaffolding. If/when the cross-protocol id-population seam lands, the
+    // trio moves back into production scope (and loses this test-only home).
+
+    /// Monotonic per-process counter so two ids minted in the same wall-clock second still differ.
+    static SYNTH_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Current unix time in whole seconds; a pre-epoch clock degrades to 0 rather than panicking.
+    fn unix_now_secs() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Mint a syntactically-plausible, collision-resistant `<hex16>-<hex16>` token from
+    /// (unix seconds + a monotonic counter) — no UUID crate, no panic.
+    fn synth_response_id() -> String {
+        let n = SYNTH_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{:016x}-{:016x}", unix_now_secs(), n)
+    }
 
     #[test]
     fn test_bedrock_sigv4_sign_request_structure() {
@@ -1968,5 +2098,338 @@ mod tests {
         assert_eq!(rhs.len(), 16, "right half is 16 hex chars");
         assert!(u64::from_str_radix(lhs, 16).is_ok());
         assert!(u64::from_str_radix(rhs, 16).is_ok());
+    }
+
+    // --- Round 2 regression tests --------------------------------------------------------------
+
+    /// Regression (writer): a stream MessageDelta with `stop_reason = None` (the usage-only trailing
+    /// delta the reader emits from the Bedrock `metadata` event, or a cross-protocol egress's usage
+    /// frame) must be reframed as a native `metadata` frame carrying the real token usage — NOT a
+    /// second `messageStop` (the old behavior, which both discarded usage and produced two
+    /// `messageStop` frames, a distinguishable tell). A delta WITH a stop_reason still maps to
+    /// `messageStop`.
+    #[test]
+    fn test_write_response_event_usage_delta_is_metadata_frame() {
+        let writer = BedrockWriter;
+
+        // Usage-only delta → `metadata` frame with the real usage (and a derived totalTokens).
+        let usage_only = IrStreamEvent::MessageDelta {
+            stop_reason: None,
+            usage: IrUsage {
+                input_tokens: 11,
+                output_tokens: 7,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (et, payload) = writer
+            .write_response_event(&usage_only)
+            .expect("usage-only delta must emit a frame");
+        assert_eq!(
+            et, "metadata",
+            "usage-only delta must be a `metadata` frame, not messageStop"
+        );
+        assert_eq!(
+            payload
+                .pointer("/usage/inputTokens")
+                .and_then(|v| v.as_u64()),
+            Some(11)
+        );
+        assert_eq!(
+            payload
+                .pointer("/usage/outputTokens")
+                .and_then(|v| v.as_u64()),
+            Some(7)
+        );
+        assert_eq!(
+            payload
+                .pointer("/usage/totalTokens")
+                .and_then(|v| v.as_u64()),
+            Some(18),
+            "totalTokens must be inputTokens + outputTokens"
+        );
+
+        // Stop-reason delta still maps to `messageStop` (the stop discriminant).
+        let stop = IrStreamEvent::MessageDelta {
+            stop_reason: Some("tool_use".to_string()),
+            usage: IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (et2, payload2) = writer
+            .write_response_event(&stop)
+            .expect("stop delta must emit a frame");
+        assert_eq!(et2, "messageStop");
+        assert_eq!(
+            payload2.get("stopReason").and_then(|s| s.as_str()),
+            Some("tool_use")
+        );
+    }
+
+    /// Regression (writer): a text BlockStart must emit a native `contentBlockStart` frame with an
+    /// empty `start` struct (AWS emits one for every block, text included) so a native SDK can
+    /// initialize its block decoder and the following deltas are not orphaned.
+    #[test]
+    fn test_write_response_event_text_block_start_emits_frame() {
+        let writer = BedrockWriter;
+        let ev = IrStreamEvent::BlockStart {
+            index: 0,
+            block: crate::ir::IrBlockMeta::Text,
+        };
+        let (et, payload) = writer
+            .write_response_event(&ev)
+            .expect("text BlockStart must emit a contentBlockStart frame");
+        assert_eq!(et, "contentBlockStart");
+        assert_eq!(
+            payload.get("contentBlockIndex").and_then(|i| i.as_u64()),
+            Some(0)
+        );
+        assert!(
+            payload
+                .get("start")
+                .and_then(|s| s.as_object())
+                .map(|o| o.is_empty())
+                .unwrap_or(false),
+            "text block start must carry an empty `start` struct; got {payload}"
+        );
+    }
+
+    /// Regression (reader): a mid-stream Bedrock exception event (`internalServerException` etc.)
+    /// must surface as an `IrStreamEvent::Error` rather than being silently swallowed by a catch-all,
+    /// so a client whose stream hits an upstream model error receives a protocol-shaped error frame
+    /// instead of a hanging / EOF-without-terminator stream.
+    #[test]
+    fn test_stream_decode_surfaces_midstream_exception() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = BedrockReader;
+
+        let events = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "internalServerException",
+                "message": "the model is on fire"
+            }),
+            &mut state,
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one Error event expected; got {events:?}"
+        );
+        match &events[0] {
+            IrStreamEvent::Error(err) => {
+                assert_eq!(err.class, StatusClass::ServerError);
+                assert_eq!(err.provider_signal.as_deref(), Some("the model is on fire"));
+            }
+            other => panic!("expected IrStreamEvent::Error, got {other:?}"),
+        }
+
+        // A throttling exception maps to the RateLimit class and falls back to the exception name
+        // when no `message` is present.
+        let throttle = reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "throttlingException"}),
+            &mut state,
+        );
+        match throttle.as_slice() {
+            [IrStreamEvent::Error(err)] => {
+                assert_eq!(err.class, StatusClass::RateLimit);
+                assert_eq!(err.provider_signal.as_deref(), Some("throttlingException"));
+            }
+            other => panic!("expected a single RateLimit Error; got {other:?}"),
+        }
+
+        // An unrecognized (future / non-error) event type is still a silent no-op.
+        let unknown = reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "someFutureEvent"}),
+            &mut state,
+        );
+        assert!(
+            unknown.is_empty(),
+            "unknown event types must be skipped; got {unknown:?}"
+        );
+    }
+
+    /// Regression (reader): the injected `stream` flag on a Bedrock-INGRESS converse-stream request
+    /// must be read into the IR so a cross-protocol egress writer produces a streaming body. A body
+    /// without the flag (native Bedrock egress, where streaming is endpoint-selected) defaults false.
+    #[test]
+    fn test_read_request_honors_injected_stream_flag() {
+        let reader = BedrockReader;
+
+        let streaming = serde_json::json!({
+            "stream": true,
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}]
+        });
+        let ir = reader.read_request(&streaming).expect("read_request");
+        assert!(
+            ir.stream,
+            "injected `stream: true` must be read into the IR"
+        );
+
+        let buffered = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}]
+        });
+        let ir2 = reader.read_request(&buffered).expect("read_request");
+        assert!(
+            !ir2.stream,
+            "absent `stream` defaults to false (native egress)"
+        );
+    }
+
+    /// Regression (writer): a System-role message that escapes the caller's system extraction is
+    /// SKIPPED, not silently emitted as a `user` turn (which would inject system text as a user
+    /// message). A Tool-role message is still emitted as a `user` turn (the native shape for a
+    /// `toolResult` block).
+    #[test]
+    fn test_write_request_skips_system_role_message() {
+        let writer = BedrockWriter;
+        let req = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::System,
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "leaked system text".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                },
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::Tool,
+                    content: vec![crate::ir::IrBlock::ToolResult {
+                        tool_use_id: "t1".to_string(),
+                        content: vec![crate::ir::IrBlock::Text {
+                            text: "ok".to_string(),
+                            cache_control: None,
+                            citations: Vec::new(),
+                        }],
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+
+        let json = writer.write_request(&req);
+        let msgs = json
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .expect("messages array");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "the System-role message must be dropped; got {msgs:?}"
+        );
+        assert_eq!(
+            msgs[0].get("role").and_then(|r| r.as_str()),
+            Some("user"),
+            "the surviving Tool-role message maps to a user turn"
+        );
+        // The leaked system text must not appear anywhere on the wire.
+        let wire = serde_json::to_string(&json).unwrap();
+        assert!(
+            !wire.contains("leaked system text"),
+            "system text must not leak onto the wire; got {wire}"
+        );
+    }
+
+    /// Regression (writer): a non-Text block inside a ToolResult must be re-encoded faithfully
+    /// (Image → Bedrock `{"image":...}`, ToolUse/ToolResult → `{"json":...}`), never collapsed to
+    /// the constant string `"{}"` placeholder the old catch-all produced.
+    #[test]
+    fn test_write_request_tool_result_preserves_non_text_content() {
+        let writer = BedrockWriter;
+        let req = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: vec![crate::ir::IrBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: "BASE64DATA".to_string(),
+                    }],
+                    is_error: false,
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+
+        let json = writer.write_request(&req);
+        let inner = json
+            .pointer("/messages/0/content/0/toolResult/content/0")
+            .expect("tool result inner content block");
+        assert_eq!(
+            inner.pointer("/image/format").and_then(|v| v.as_str()),
+            Some("png"),
+            "image inner block must be a native Bedrock image block; got {inner}"
+        );
+        assert_eq!(
+            inner
+                .pointer("/image/source/bytes")
+                .and_then(|v| v.as_str()),
+            Some("BASE64DATA")
+        );
+        // The old `"{}"` placeholder must be gone.
+        let wire = serde_json::to_string(&json).unwrap();
+        assert!(
+            !wire.contains(r#"{"text":"{}"}"#),
+            "must not emit the `{{}}` placeholder; got {wire}"
+        );
+    }
+
+    /// Regression (writer): a stream Error event names a REAL Converse exception (mapped from the IR
+    /// error class) as its event-type token instead of the non-native literal `"error"`. (The
+    /// `:message-type: exception` framing itself is the encoder's job — see the production
+    /// mid-stream-error path in forward.rs — and is out of this unit's scope.)
+    #[test]
+    fn test_write_response_event_error_names_real_exception() {
+        let writer = BedrockWriter;
+
+        let throttle = IrStreamEvent::Error(crate::proto::IrError {
+            class: StatusClass::RateLimit,
+            provider_signal: Some("slow down".to_string()),
+            retry_after: None,
+        });
+        let (et, payload) = writer
+            .write_response_event(&throttle)
+            .expect("error event must emit a frame");
+        assert_eq!(
+            et, "ThrottlingException",
+            "event-type token must be a real Converse exception name, not `error`"
+        );
+        assert_eq!(
+            payload.get("message").and_then(|m| m.as_str()),
+            Some("slow down")
+        );
+
+        // A server-class error maps to InternalServerException and falls back to the exception name
+        // when no provider_signal is present.
+        let server = IrStreamEvent::Error(crate::proto::IrError {
+            class: StatusClass::ServerError,
+            provider_signal: None,
+            retry_after: None,
+        });
+        let (et2, payload2) = writer
+            .write_response_event(&server)
+            .expect("error event must emit a frame");
+        assert_eq!(et2, "InternalServerException");
+        assert_eq!(
+            payload2.get("message").and_then(|m| m.as_str()),
+            Some("InternalServerException")
+        );
     }
 }

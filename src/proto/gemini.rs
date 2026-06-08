@@ -187,6 +187,15 @@ impl ProtocolReader for GeminiReader {
                             // Convert response to string representation for content
                             let response_text = serde_json::to_string(&response_val)
                                 .unwrap_or_else(|_| "unknown".to_string());
+                            // ACCEPTED GEMINI-PROTOCOL LIMITATION: a Gemini `functionResponse`
+                            // carries only a `name` (no call id), and the corresponding
+                            // `functionCall` ToolUse blocks are themselves read with an empty id
+                            // (`id: String::new()` above), so there is no id to correlate back to.
+                            // We therefore set `tool_use_id` to the function name — the only stable
+                            // correlation key Gemini provides. Cross-protocol egress (Anthropic
+                            // `tool_use_id` / OpenAI `tool_call_id`) that correlates strictly by id
+                            // will see the name; same-protocol Gemini passthrough is unaffected
+                            // because the writer round-trips `name` back into `functionResponse.name`.
                             msg_content.push(crate::ir::IrBlock::ToolResult {
                                 tool_use_id: name,
                                 content: vec![crate::ir::IrBlock::Text {
@@ -270,20 +279,33 @@ impl ProtocolReader for GeminiReader {
             .and_then(|v| v.as_f64());
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        // Collect unmodeled top-level keys into extra (excluding modeled ones)
+        // Collect unmodeled top-level keys into extra (excluding modeled ones). `model` is in the
+        // set so the loop below does NOT re-insert it: it is preserved in `extra` exactly once via
+        // the explicit pre-insert below (preventing the silent duplicate insert the loop used to
+        // perform, which would be discarded the moment the two writes ever diverged).
+        //
+        // `stream` is deliberately NOT modeled here. The writer never injects a `stream` member
+        // unconditionally any more (the native GenerateContentRequest has no such field — streaming
+        // is URL-selected), so the only way `stream` reaches the wire is if the SOURCE request
+        // literally carried it: such a value is preserved verbatim through `extra` and echoed back,
+        // making a read→write round-trip lossless. A native Gemini client never sends `stream`, so
+        // for real traffic `extra` carries no `stream` and the egress body carries none either —
+        // the indistinguishability goal. `IrRequest.stream` (captured above) is read ONLY by
+        // path-selection (`upstream_path_for_stream`), never serialised into the body.
         let modeled_keys: std::collections::HashSet<&str> = [
             "contents",
             "tools",
             "systemInstruction",
             "generationConfig",
-            "stream",
             "tool_config",
+            "model",
         ]
         .iter()
         .cloned()
         .collect();
 
-        // model is modeled but we preserve it in extra for round-trip identity
+        // model is modeled but we preserve it in extra for round-trip identity. Done once here;
+        // the loop skips it because `model` is in `modeled_keys`.
         if let Some(model_val) = obj.get("model") {
             extra.insert("model".to_string(), model_val.clone());
         }
@@ -553,18 +575,16 @@ impl ProtocolReader for GeminiReader {
         }
 
         // Parse finishReason → stop_reason (map Gemini→canonical)
-        let stop_reason = candidate
-            .get("finishReason")
-            .and_then(|r| r.as_str())
-            .map(|fr| {
-                let s = match fr {
-                    "STOP" => "end_turn",
-                    "MAX_TOKENS" => "max_tokens",
-                    "SAFETY" => "safety",
-                    other => &other.to_lowercase(),
-                };
-                String::from(s)
-            });
+        let stop_reason =
+            candidate
+                .get("finishReason")
+                .and_then(|r| r.as_str())
+                .map(|fr| match fr {
+                    "STOP" => "end_turn".to_string(),
+                    "MAX_TOKENS" => "max_tokens".to_string(),
+                    "SAFETY" => "safety".to_string(),
+                    other => other.to_lowercase(),
+                });
 
         // Parse usageMetadata: promptTokenCount→input_tokens, candidatesTokenCount→output_tokens
         let usage_val = obj.get("usageMetadata");
@@ -624,6 +644,45 @@ impl ProtocolReader for GeminiReader {
 
     fn clone_box(&self) -> Box<dyn ProtocolReader> {
         Box::new(self.clone())
+    }
+}
+
+/// Process-global counter feeding synthesized `responseId`s, mirroring the Anthropic writer's
+/// `SYNTH_ID_COUNTER`. Combined with the unix second it makes two synthesized ids astronomically
+/// unlikely to collide without pulling in a uuid/rand crate.
+static SYNTH_RESPONSE_ID_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Current unix time in whole seconds, or 0 if the system clock predates the epoch. Never panics.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Mint a Gemini-shaped `responseId` for the cross-protocol path where the backend supplied none.
+/// Real `responseId`s are opaque strings with no documented prefix a native SDK could reject, so a
+/// timestamp+counter suffix is indistinguishable in shape. No new dependency.
+fn synth_response_id() -> String {
+    let seq = SYNTH_RESPONSE_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{:x}{:x}", unix_now_secs(), seq)
+}
+
+/// Map a canonical `StatusClass` onto the `(HTTP code, google.rpc.Code name)` pair Gemini uses in
+/// its `google.rpc.Status` error envelope. Exhaustive over `StatusClass` (no `_ =>` catch-all) so
+/// a new class forces a conscious choice here rather than silently degrading to INTERNAL.
+fn gemini_stream_error_code_status(class: StatusClass) -> (u16, &'static str) {
+    match class {
+        StatusClass::RateLimit => (429, "RESOURCE_EXHAUSTED"),
+        StatusClass::Overloaded => (503, "UNAVAILABLE"),
+        StatusClass::ServerError => (500, "INTERNAL"),
+        StatusClass::Timeout => (504, "DEADLINE_EXCEEDED"),
+        StatusClass::Network => (503, "UNAVAILABLE"),
+        StatusClass::Auth => (401, "UNAUTHENTICATED"),
+        StatusClass::Billing => (403, "PERMISSION_DENIED"),
+        StatusClass::ClientError => (400, "INVALID_ARGUMENT"),
+        StatusClass::ContextLength => (400, "INVALID_ARGUMENT"),
     }
 }
 
@@ -732,8 +791,13 @@ impl ProtocolWriter for GeminiWriter {
                             })
                             .collect::<Vec<_>>()
                             .join(" ");
-                        let response_val: serde_json::Value =
-                            serde_json::from_str(&response_text).unwrap_or(serde_json::json!({}));
+                        // If the joined text is valid JSON, forward it as the structured response.
+                        // Otherwise (e.g. multiple plain-text chunks) wrap the raw text in
+                        // `{"output": <text>}` — the Gemini functionResponse convention for
+                        // plain-text tool output — rather than silently discarding the content
+                        // with an empty `{}` object.
+                        let response_val: serde_json::Value = serde_json::from_str(&response_text)
+                            .unwrap_or_else(|_| serde_json::json!({ "output": response_text }));
                         parts_arr.push(serde_json::json!({
                             "functionResponse": { "name": name, "response": response_val }
                         }))
@@ -800,8 +864,14 @@ impl ProtocolWriter for GeminiWriter {
             );
         }
 
-        // stream flag
-        out.insert("stream".to_string(), serde_json::json!(req.stream));
+        // NB: the native Gemini GenerateContentRequest schema has NO top-level `stream` field —
+        // streaming is selected entirely by the URL endpoint (`:generateContent` vs
+        // `:streamGenerateContent?alt=sse`, produced by `upstream_path_for_stream`). Injecting a
+        // `stream` member here would make every egress request non-native (a backend could tell it
+        // wasn't a real client) and the Google Generative Language API rejects unknown top-level
+        // fields with INVALID_ARGUMENT. `req.stream` is therefore read only by path selection and
+        // never serialised into the body. It is also kept out of the `extra` passthrough below: the
+        // reader lists `stream` in `modeled_keys`, so a `stream` key is never echoed from `extra`.
 
         // Merge extra fields (may override, but that's expected behavior)
         for (key, value) in &req.extra {
@@ -993,8 +1063,14 @@ impl ProtocolWriter for GeminiWriter {
             // MessageStop → None (no frame needed)
             IrStreamEvent::MessageStop => None,
 
-            // Error → error object
+            // Error → full google.rpc.Status envelope `{"error":{"code","message","status"}}`.
+            // Real Gemini stream errors carry an HTTP `code` (int) and an UPPER_SNAKE `status`
+            // (e.g. INTERNAL, UNAVAILABLE, RESOURCE_EXHAUSTED); a Gemini SDK branches on
+            // `error.status`/`error.code`. Emitting only `message` (as before) was detectable and
+            // left SDK retry-decision code reading null. We derive `code`/`status` from the
+            // canonical `StatusClass`; an untyped/unknown class falls back to 500 / INTERNAL.
             IrStreamEvent::Error(err) => {
+                let (code, status_name) = gemini_stream_error_code_status(err.class);
                 let message = err
                     .provider_signal
                     .clone()
@@ -1002,7 +1078,11 @@ impl ProtocolWriter for GeminiWriter {
                 Some((
                     "".to_string(),
                     serde_json::json!({
-                        "error": {"message": message}
+                        "error": {
+                            "code": code,
+                            "message": message,
+                            "status": status_name,
+                        }
                     }),
                 ))
             }
@@ -1067,21 +1147,36 @@ impl ProtocolWriter for GeminiWriter {
         if let Some(ref model) = resp.model {
             out["modelVersion"] = serde_json::json!(model);
         }
-        // Response identity. `responseId` is emitted IFF the IR carries one (`resp.id`):
-        //   * Same-protocol passthrough: the Gemini reader set `id` from the upstream `responseId`,
-        //     so it is preserved verbatim — and a native body that legitimately OMITTED `responseId`
-        //     yields `id == None`, so we omit it too. Fabricating one would make the passthrough
-        //     DISTINGUISHABLE from the native response (the opposite of the fidelity goal); and
-        //     `responseId` is an optional field in the Gemini schema / `google-genai` SDK (surfaced
-        //     as `Optional[str]`), so omitting it is SDK-valid.
-        //   * Cross-protocol: a non-Gemini backend reader sets `id` to that protocol's response id
-        //     (OpenAI `chatcmpl-…`, Anthropic `msg_…`) — `Some(...)` — so a value is always present
-        //     for the SDK to read; the id is opaque to the Gemini SDK (Gemini ids carry no
-        //     documented prefix it could reject). If a cross-protocol backend supplies NO id at all
-        //     it is synthesized at the IR layer / future wave; here a `None` means "no upstream
-        //     identity", honored as omission. Gemini bodies carry no `created`, so none is emitted.
-        if let Some(ref id) = resp.id {
-            out["responseId"] = serde_json::json!(id);
+        // Response identity. This mirrors the Anthropic writer's id rule, keying synthesis off
+        // "did we cross a protocol boundary" (proxied by `created` being populated) rather than off
+        // `id` alone, so same-protocol round-trips stay idempotent. Three cases:
+        //   * Same-protocol passthrough: the Gemini reader set `id` from the upstream `responseId`
+        //     (and `created == None`, since Gemini bodies carry no timestamp), so it is re-emitted
+        //     verbatim — `(Some(id), _)`.
+        //   * Cross-protocol with a foreign id present: the non-Gemini backend reader set `id` to
+        //     that protocol's response id (OpenAI `chatcmpl-…`, Anthropic `msg_…`); the id is opaque
+        //     to the Gemini SDK (Gemini ids carry no documented prefix it could reject), so we
+        //     surface it verbatim — `(Some(id), _)`.
+        //   * Cross-protocol with NO foreign id: `forward.rs` strips `id` to `None` on every
+        //     cross-protocol response but LEAVES `created` populated as the boundary signal, so
+        //     `(None, Some(_))` — synthesize a Gemini-shaped `responseId` so a native `google-genai`
+        //     client reading `GenerateContentResponse.response_id` always sees a value (real Gemini
+        //     responses carry one). Previously this case omitted `responseId` on EVERY
+        //     cross-protocol response, a distinguishability signal; the old comment wrongly claimed a
+        //     value was "always present", contradicting `forward.rs` which sets `ir.id = None`.
+        //   * Minimal same-protocol IR with neither id nor created: a native body that legitimately
+        //     omitted `responseId` yields `(None, None)` — omit it rather than fabricate, since
+        //     `responseId` is `Optional` in the Gemini schema / SDK and fabricating one would make a
+        //     read→write round-trip distinguishable from the native response.
+        // Gemini bodies carry no `created`, so none is emitted in the wire shape.
+        match (&resp.id, resp.created) {
+            (Some(id), _) => {
+                out["responseId"] = serde_json::json!(id);
+            }
+            (None, Some(_)) => {
+                out["responseId"] = serde_json::json!(synth_response_id());
+            }
+            (None, None) => {}
         }
         out
     }
@@ -1582,6 +1677,249 @@ mod tests {
         assert!(
             frame.is_none(),
             "no-identity MessageStart must not emit a frame: {frame:?}"
+        );
+    }
+
+    /// Regression: `write_request` must NOT inject a top-level `stream` field. The native Gemini
+    /// GenerateContentRequest has no such field (streaming is URL-selected); injecting it makes the
+    /// request non-native and can trigger INVALID_ARGUMENT on the real API.
+    #[test]
+    fn test_write_request_omits_stream_field() {
+        let writer = GeminiWriter;
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: true,
+            extra: serde_json::Map::new(),
+        };
+        let wire = writer.write_request(&req);
+        assert!(
+            wire.get("stream").is_none(),
+            "write_request must not serialise a top-level `stream` field: {wire}"
+        );
+    }
+
+    /// Regression: a NATIVE request (which never carries `stream`) must produce a body with no
+    /// `stream` member — i.e. the writer no longer injects one unconditionally. The streaming
+    /// intent (`IrRequest.stream == true`) must NOT leak into the body even when set.
+    #[test]
+    fn test_native_request_without_stream_stays_streamless() {
+        let reader = GeminiReader;
+        // Native Gemini request — no `stream` field.
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        });
+        let mut ir = reader.read_request(&body).expect("read_request");
+        // Caller wants streaming (URL-selected), but it must not reach the body.
+        ir.stream = true;
+        assert!(
+            !ir.extra.contains_key("stream"),
+            "a native request carries no stream in extra: {:?}",
+            ir.extra
+        );
+        let wire = GeminiWriter.write_request(&ir);
+        assert!(
+            wire.get("stream").is_none(),
+            "stream intent must not be serialised into the body: {wire}"
+        );
+    }
+
+    /// Regression: `model` is preserved in `extra` exactly once (no duplicate insert) and survives
+    /// the read path because it is excluded from the loop via `modeled_keys`.
+    #[test]
+    fn test_read_request_model_preserved_in_extra_once() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "model": "gemini-1.5-pro"
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        assert_eq!(
+            ir.extra.get("model"),
+            Some(&serde_json::json!("gemini-1.5-pro")),
+            "model must be preserved in extra: {:?}",
+            ir.extra
+        );
+    }
+
+    /// Regression: a ToolResult whose content is multi-part PLAIN TEXT (not JSON) must be wrapped in
+    /// `{"output": <text>}` rather than silently discarded as an empty `{}` object.
+    #[test]
+    fn test_write_request_tool_result_plaintext_wrapped_not_dropped() {
+        let writer = GeminiWriter;
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::ToolResult {
+                    tool_use_id: "get_weather".to_string(),
+                    content: vec![
+                        crate::ir::IrBlock::Text {
+                            text: "sunny".to_string(),
+                            cache_control: None,
+                            citations: Vec::new(),
+                        },
+                        crate::ir::IrBlock::Text {
+                            text: "and warm".to_string(),
+                            cache_control: None,
+                            citations: Vec::new(),
+                        },
+                    ],
+                    is_error: false,
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let wire = writer.write_request(&req);
+        let resp = wire
+            .pointer("/contents/0/parts/0/functionResponse/response")
+            .expect("functionResponse.response must be present");
+        assert_ne!(
+            resp,
+            &serde_json::json!({}),
+            "plain-text tool result must not be discarded as empty object: {wire}"
+        );
+        assert_eq!(
+            resp.get("output").and_then(|o| o.as_str()),
+            Some("sunny and warm"),
+            "plain-text tool result must be wrapped as {{\"output\": text}}: {wire}"
+        );
+    }
+
+    /// A ToolResult whose joined text IS valid JSON is forwarded structurally (not wrapped).
+    #[test]
+    fn test_write_request_tool_result_json_passthrough() {
+        let writer = GeminiWriter;
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::ToolResult {
+                    tool_use_id: "f".to_string(),
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "{\"temp\":21}".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                    is_error: false,
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let wire = writer.write_request(&req);
+        let temp = wire
+            .pointer("/contents/0/parts/0/functionResponse/response/temp")
+            .and_then(|v| v.as_i64());
+        assert_eq!(temp, Some(21), "JSON tool result must pass through: {wire}");
+    }
+
+    /// Regression: a cross-protocol response with NO foreign id but a populated `created` (the
+    /// boundary signal `forward.rs` leaves intact after stripping `id`) must SYNTHESIZE a
+    /// Gemini-shaped `responseId` so a native SDK always sees a value. Previously omitted entirely.
+    #[test]
+    fn test_response_identity_cross_protocol_synthesizes_id_when_created_set() {
+        let writer = GeminiWriter;
+        let ir = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: Some(1_700_000_000),
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let wire = writer.write_response(&ir);
+        let synth = wire
+            .get("responseId")
+            .and_then(|v| v.as_str())
+            .expect("cross-protocol response (created set, id none) must synthesize responseId");
+        assert!(
+            !synth.is_empty(),
+            "synthesized responseId must be non-empty: {wire}"
+        );
+    }
+
+    /// Regression: the in-stream Error frame emits the FULL google.rpc.Status envelope
+    /// (`code` int + UPPER_SNAKE `status` + message), not a message-only object, so a Gemini SDK
+    /// can branch on `error.status`/`error.code`. Class → code/status is exhaustive (no catch-all).
+    #[test]
+    fn test_stream_error_emits_full_google_rpc_status() {
+        let writer = GeminiWriter;
+        let err = crate::proto::IrError {
+            class: StatusClass::RateLimit,
+            provider_signal: Some("slow down".to_string()),
+            retry_after: None,
+        };
+        let (_, frame) = writer
+            .write_response_event(&IrStreamEvent::Error(err))
+            .expect("Error event must emit a frame");
+        assert_eq!(
+            frame.pointer("/error/code"),
+            Some(&serde_json::json!(429)),
+            "frame: {frame}"
+        );
+        assert_eq!(
+            frame.pointer("/error/status").and_then(|s| s.as_str()),
+            Some("RESOURCE_EXHAUSTED"),
+            "frame: {frame}"
+        );
+        assert_eq!(
+            frame.pointer("/error/message").and_then(|m| m.as_str()),
+            Some("slow down"),
+            "frame: {frame}"
+        );
+    }
+
+    /// A server-error class maps to 500/INTERNAL in the stream error envelope.
+    #[test]
+    fn test_stream_error_server_error_maps_internal() {
+        let writer = GeminiWriter;
+        let err = crate::proto::IrError {
+            class: StatusClass::ServerError,
+            provider_signal: None,
+            retry_after: None,
+        };
+        let (_, frame) = writer
+            .write_response_event(&IrStreamEvent::Error(err))
+            .expect("Error event must emit a frame");
+        assert_eq!(frame.pointer("/error/code"), Some(&serde_json::json!(500)));
+        assert_eq!(
+            frame.pointer("/error/status").and_then(|s| s.as_str()),
+            Some("INTERNAL")
+        );
+        // No provider_signal → default message, no panic.
+        assert_eq!(
+            frame.pointer("/error/message").and_then(|m| m.as_str()),
+            Some("error")
         );
     }
 

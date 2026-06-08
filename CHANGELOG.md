@@ -5,6 +5,21 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Universal ingress — all six protocols are now first-class ingress.** Previously
+  clients could only speak Anthropic (`/<...>/v1/messages`) or OpenAI
+  (`/v1/chat/completions`); now native Responses (`/v1/responses`), Cohere
+  (`/v2/chat`), Gemini (`/v1beta/models/{model}:generateContent` /
+  `:streamGenerateContent`), and Bedrock (`/model/{modelId}/converse` /
+  `/converse-stream`) clients can point their SDK's base URL at busbar unmodified.
+  Each protocol has one ingress route; body-model protocols (`openai`, `responses`,
+  `cohere`) take the model/pool from the request body, path-model protocols
+  (`anthropic`, `gemini`, `bedrock`) from the URL. Errors are emitted in the
+  caller's native protocol shape, with multi-scheme auth and content-type/identity
+  handling per protocol.
+
 ## [1.0.0-rc.2] — 2026-06-04
 
 ### Changed

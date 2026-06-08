@@ -33,6 +33,16 @@ fn synth_message_id() -> String {
     format!("msg_{:x}{:x}", unix_now_secs(), seq)
 }
 
+/// Mint a protocol-correct Anthropic request id (`req_<hex>`) for the top level of an error
+/// envelope, where busbar synthesizes the error itself and has no upstream request id to forward.
+/// Current Anthropic API error responses carry a top-level `request_id`; emitting one keeps the
+/// shape indistinguishable from a native error body. Same uniqueness construction as
+/// `synth_message_id` (unix second + process-global atomic counter) — no new dependency.
+fn synth_request_id() -> String {
+    let seq = SYNTH_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("req_{:x}{:x}", unix_now_secs(), seq)
+}
+
 #[derive(Clone)]
 pub(crate) struct AnthropicReader;
 
@@ -139,8 +149,9 @@ impl ProtocolReader for AnthropicReader {
         }
 
         if status.as_u16() == 429 {
-            let text_lower = text.to_lowercase();
-            if text_lower.contains("quota") && text_lower.contains("exhausted") {
+            // Reuse the single lower-cased copy computed at the top of `classify` rather than
+            // allocating a second one — on a verbose 429 body this avoids a redundant heap copy.
+            if lower.contains("quota") && lower.contains("exhausted") {
                 return CanonicalSignal {
                     class: StatusClass::Billing,
                     provider_signal: Some("429-quota-exhausted".to_string()),
@@ -403,13 +414,19 @@ impl ProtocolReader for AnthropicReader {
             "message_stop" => Some(IrStreamEvent::MessageStop),
             "error" => {
                 let err_val = data.get("error")?;
+                // Carry the upstream error `type` through as-is: `Some("rate_limit_error")` when
+                // present, `None` when the event omits it. Do NOT `unwrap_or_default()` into
+                // `Some("")` — an empty-string type would make the writer emit `"type": ""` where a
+                // native Anthropic error event carries either a real type or `null`. The writer
+                // (write_response_event) already renders `None` as JSON `null`, so the absence
+                // round-trips faithfully.
                 let provider_signal = err_val
                     .get("type")
                     .and_then(|t| t.as_str())
                     .map(String::from);
                 Some(IrStreamEvent::Error(IrError {
                     class: StatusClass::ClientError,
-                    provider_signal: Some(provider_signal.unwrap_or_default()),
+                    provider_signal,
                     retry_after: None,
                 }))
             }
@@ -920,12 +937,17 @@ impl ProtocolWriter for AnthropicWriter {
             | "timeout_error" => kind,
             other => other,
         };
+        // Current Anthropic API error bodies carry a top-level `request_id` (`req_...`) alongside
+        // the `error` object. busbar synthesizes this envelope itself (no upstream request to
+        // forward), so mint one to match the native shape — the SDK doesn't require it to decode
+        // the typed exception, but its absence is a distinguishability tell.
         serde_json::json!({
             "type": "error",
             "error": {
                 "type": anthropic_type,
                 "message": message,
-            }
+            },
+            "request_id": synth_request_id(),
         })
     }
 
@@ -1120,12 +1142,30 @@ impl ProtocolWriter for AnthropicWriter {
             }
             IrStreamEvent::MessageStop => Some(("message_stop".to_string(), serde_json::json!({}))),
             IrStreamEvent::Error(err) => {
+                // Native Anthropic in-stream error event:
+                // `{"type":"error","error":{"type":<type>,"message":<msg>}}`. The SDK's streaming
+                // decoder reads BOTH `error.type` (→ typed exception) AND `error.message` (the
+                // human-readable description, a required field in the documented shape). Omitting
+                // `message` leaves the SDK's `APIError` with an undefined description and is a
+                // distinguishability tell vs a native event.
                 let mut error_obj = serde_json::Map::new();
-                if let Some(ref ps) = err.provider_signal {
-                    error_obj.insert("type".to_string(), serde_json::json!(ps));
-                } else {
-                    error_obj.insert("type".to_string(), serde_json::Value::Null);
+                match err.provider_signal {
+                    Some(ref ps) => {
+                        error_obj.insert("type".to_string(), serde_json::json!(ps));
+                    }
+                    None => {
+                        error_obj.insert("type".to_string(), serde_json::Value::Null);
+                    }
                 }
+                // The IR carries no separate message string (IrError == CanonicalSignal, which has
+                // no `message` field), so derive a human-readable one from the signal: prefer the
+                // provider type when present, otherwise a generic fallback. Always non-empty so the
+                // SDK's `error.message` is never undefined/null.
+                let message = match err.provider_signal.as_deref() {
+                    Some(ps) if !ps.is_empty() => format!("upstream error: {ps}"),
+                    Some(_) | None => "an error occurred while streaming the response".to_string(),
+                };
+                error_obj.insert("message".to_string(), serde_json::json!(message));
                 let mut data_obj = serde_json::Map::new();
                 data_obj.insert("error".to_string(), serde_json::Value::Object(error_obj));
                 Some(("error".to_string(), serde_json::Value::Object(data_obj)))
@@ -1523,5 +1563,139 @@ mod anthropic_hardening_tests {
         let id = synth_message_id();
         assert!(id.starts_with("msg_"));
         assert!(id.len() > "msg_".len());
+    }
+
+    /// `synth_request_id` must never panic and always returns a non-empty `req_`-prefixed id.
+    #[test]
+    fn synth_request_id_is_well_formed() {
+        let id = synth_request_id();
+        assert!(id.starts_with("req_"));
+        assert!(id.len() > "req_".len());
+    }
+
+    /// write_response_event(Error(...)) must serialize the NATIVE Anthropic in-stream error shape:
+    /// event type `"error"`, with `error.type` carrying the provider signal AND a non-empty
+    /// `error.message` (the SDK's `APIError` reads both). Regression guard for the message-omission
+    /// and the JSON-key shape (a wrong key would silently break SDK decoding into a hang).
+    #[test]
+    fn write_response_event_error_serializes_native_shape() {
+        let err = IrError {
+            class: StatusClass::RateLimit,
+            provider_signal: Some("rate_limit_error".to_string()),
+            retry_after: None,
+        };
+        let (event_type, data) = AnthropicWriter
+            .write_response_event(&IrStreamEvent::Error(err))
+            .expect("error event must serialize");
+        assert_eq!(event_type, "error");
+        let error_obj = data.get("error").expect("error sub-object present");
+        assert_eq!(
+            error_obj.get("type").and_then(|t| t.as_str()),
+            Some("rate_limit_error"),
+            "error.type must carry the provider signal"
+        );
+        let message = error_obj
+            .get("message")
+            .and_then(|m| m.as_str())
+            .expect("error.message must be present (SDK reads it)");
+        assert!(
+            !message.is_empty(),
+            "error.message must be non-empty so the SDK's APIError is never undefined"
+        );
+        // Round-trips as valid JSON — no panic on the error path.
+        let s = serde_json::to_string(&data).expect("must serialize");
+        let _: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
+    }
+
+    /// When the upstream error event carries no `type`, the writer must emit `error.type: null`
+    /// (not `""`) and still a non-empty `message`. Guards finding #7 (Option carried through, no
+    /// `unwrap_or_default()`) end-to-end and finding #3 (message always present).
+    #[test]
+    fn write_response_event_error_null_type_when_signal_absent() {
+        let err = IrError {
+            class: StatusClass::ClientError,
+            provider_signal: None,
+            retry_after: None,
+        };
+        let (event_type, data) = AnthropicWriter
+            .write_response_event(&IrStreamEvent::Error(err))
+            .expect("error event must serialize");
+        assert_eq!(event_type, "error");
+        let error_obj = data.get("error").expect("error sub-object present");
+        assert!(
+            error_obj.get("type").map(|t| t.is_null()).unwrap_or(false),
+            "error.type must be JSON null when no provider signal, not an empty string"
+        );
+        assert!(
+            error_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(|m| !m.is_empty())
+                .unwrap_or(false),
+            "error.message must still be present and non-empty"
+        );
+    }
+
+    /// The reader must carry a missing error `type` through as `None` (not `Some("")`), so a
+    /// `read -> write` of a type-less error event yields `error.type: null` rather than `""`.
+    /// Regression guard for finding #7.
+    #[test]
+    fn read_error_event_without_type_carries_none() {
+        let data = serde_json::json!({ "error": { "message": "boom" } });
+        let ev = AnthropicReader
+            .read_response_event("error", &data)
+            .expect("error event parses");
+        match ev {
+            IrStreamEvent::Error(err) => assert_eq!(
+                err.provider_signal, None,
+                "missing error.type must be None, not Some(\"\")"
+            ),
+            other => panic!("expected Error event, got {other:?}"),
+        }
+    }
+
+    /// A reader-captured error type round-trips through the writer verbatim.
+    #[test]
+    fn read_error_event_with_type_round_trips() {
+        let data = serde_json::json!({ "error": { "type": "overloaded_error" } });
+        let ev = AnthropicReader
+            .read_response_event("error", &data)
+            .expect("error event parses");
+        let (_, out) = AnthropicWriter
+            .write_response_event(&ev)
+            .expect("writes error event");
+        assert_eq!(
+            out.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("overloaded_error")
+        );
+    }
+
+    /// write_error must include a synthesized top-level `request_id` (`req_...`) to match the native
+    /// Anthropic error envelope, alongside the `type`/`error` fields. Regression guard for finding #6.
+    #[test]
+    fn write_error_includes_synthesized_request_id() {
+        let v = AnthropicWriter.write_error(429, "rate_limit", "slow down");
+        let request_id = v
+            .get("request_id")
+            .and_then(|r| r.as_str())
+            .expect("top-level request_id must be present");
+        assert!(
+            request_id.starts_with("req_"),
+            "request_id must carry the Anthropic `req_` prefix, got {request_id}"
+        );
+        assert!(
+            request_id.len() > "req_".len(),
+            "request_id must have a suffix"
+        );
+        // The error envelope's other fields are untouched.
+        assert_eq!(v.get("type").and_then(|t| t.as_str()), Some("error"));
+        assert_eq!(
+            v.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("rate_limit_error")
+        );
     }
 }

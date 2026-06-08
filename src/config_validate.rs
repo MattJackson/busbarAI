@@ -100,6 +100,16 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 "provider '{}' base_url must use https (got '{}')",
                 provider_name, provider_cfg.base_url
             ));
+        } else if let Some(host) = ssrf_blocked_host(&provider_cfg.base_url) {
+            // The `https://` prefix alone does not stop SSRF: `https://169.254.169.254/`,
+            // `https://[::1]/`, `https://10.0.0.1/`, `https://metadata.google.internal/` etc. all
+            // pass the scheme check yet point busbar's signed (API-key-bearing) traffic at the cloud
+            // metadata service or an internal host. Reject internal/loopback/link-local/private
+            // targets and known metadata hostnames at startup (fail-loud).
+            errors.push(format!(
+                "provider '{}' base_url '{}' targets a blocked internal/metadata host '{}' (loopback, link-local, RFC-1918 private, or cloud metadata endpoints are not permitted)",
+                provider_name, provider_cfg.base_url, host
+            ));
         }
     }
 
@@ -186,6 +196,39 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 }
             }
         }
+
+        // Rule 7: A well-formed `on_exhausted: fallback_pool:<name>` whose `<name>` is not a
+        // configured pool parses fine but silently misses at runtime (forward.rs's
+        // `fallback_pools.get(name)` returns None) and cascades to a generic 503 — the configured
+        // degraded-routing policy never engages, with no boot diagnostic. Mirror the member-target
+        // resolution check and fail loud. (A malformed action string already `die`s in main.rs at
+        // parse time; here we only catch the well-formed-but-dangling case.)
+        if let Some(on_exhausted) = &pool_cfg.on_exhausted {
+            if let Ok(crate::config::OnExhausted::FallbackPool(target)) =
+                crate::config::OnExhausted::parse(&on_exhausted.action)
+            {
+                if !cfg.pools.contains_key(&target) {
+                    errors.push(format!(
+                        "pool '{}' on_exhausted references unknown fallback pool '{}'",
+                        pool_name, target
+                    ));
+                }
+            }
+        }
+
+        // Rule 8: `affinity.mode` is a free-form String defaulting to "session", and "session" is
+        // the only supported mode (route.rs's `affinity_header_for` falls back to the default
+        // header for anything else). An unrecognized mode (e.g. "sticky") is silently accepted and
+        // degrades to default behavior with no diagnostic — reject it to uphold the fail-loud
+        // invariant the rest of validate() enforces.
+        if let Some(affinity) = &pool_cfg.affinity {
+            if affinity.mode != "session" {
+                errors.push(format!(
+                    "pool '{}' affinity.mode '{}' is invalid: the only supported mode is 'session'",
+                    pool_name, affinity.mode
+                ));
+            }
+        }
     }
 
     // Rule 5: Validate the auth mode (otherwise AuthMiddleware::new would panic at startup).
@@ -228,6 +271,86 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
 #[allow(deprecated)] // intentionally reading the deprecated legacy-token field to mirror normalize()
 fn effective_client_tokens_empty(auth: &crate::config::AuthCfg) -> bool {
     auth.client_tokens.is_empty() && auth._legacy_token.is_none()
+}
+
+/// Return `Some(host)` if the given `https://` URL points at an SSRF-sensitive target (loopback,
+/// link-local, RFC-1918 private, unique-local IPv6, or a known cloud metadata hostname), else
+/// `None`. The host is extracted by string slicing (no URL crate): strip the scheme, take up to the
+/// first `/`, `?`, or `#`, drop any `user@` prefix, then separate an IPv6 `[...]` literal or an
+/// `host:port` from its port. IP literals are parsed with `IpAddr` and checked against the blocked
+/// ranges; non-IP hostnames are matched case-insensitively against the metadata hostname list.
+fn ssrf_blocked_host(url: &str) -> Option<String> {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    // Strip "https://" (caller guarantees this prefix).
+    let rest = url.strip_prefix("https://")?;
+    // Authority is everything before the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Drop any "userinfo@" prefix.
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+
+    // Separate host from port, handling bracketed IPv6 literals (`[::1]:443`).
+    let host: &str = if let Some(after_bracket) = host_port.strip_prefix('[') {
+        // `[<ipv6>]` optionally followed by `:port`.
+        match after_bracket.split_once(']') {
+            Some((inner, _)) => inner,
+            None => after_bracket, // malformed; treat the remainder as the host
+        }
+    } else {
+        // `host` or `host:port` — split on the last colon only when the left side has no colon
+        // (a bare IPv6 without brackets would contain multiple colons; rsplit_once on a single
+        // `:` host:port is the common case).
+        match host_port.rsplit_once(':') {
+            // If the left part still contains a colon it's a bare IPv6 literal; keep the whole.
+            Some((left, _)) if !left.contains(':') => left,
+            _ => host_port,
+        }
+    };
+
+    if host.is_empty() {
+        return None;
+    }
+
+    // Known cloud metadata / internal hostnames (case-insensitive).
+    const METADATA_HOSTS: &[&str] = &["metadata.google.internal", "metadata.internal"];
+    let host_lc = host.to_ascii_lowercase();
+    if METADATA_HOSTS.contains(&host_lc.as_str()) {
+        return Some(host.to_string());
+    }
+
+    // IP-literal checks. A hostname that does not parse as an IP is allowed (DNS targets are not
+    // resolved here; the metadata-host list above covers the well-known names).
+    let blocked = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            v4.is_loopback()            // 127.0.0.0/8
+                || v4.is_private()      // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local()   // 169.254.0.0/16 (covers IMDS 169.254.169.254)
+                || v4.is_unspecified()  // 0.0.0.0
+                || v4 == Ipv4Addr::new(169, 254, 169, 254)
+        }
+        Ok(IpAddr::V6(v6)) => {
+            v6.is_loopback()            // ::1
+                || v6.is_unspecified()  // ::
+                || is_unique_local_v6(&v6)   // fc00::/7
+                || is_link_local_v6(&v6)     // fe80::/10
+                || v6.to_ipv4_mapped().is_some_and(|m| {
+                    m.is_loopback() || m.is_private() || m.is_link_local() || m.is_unspecified()
+                })
+        }
+        Err(_) => false,
+    };
+
+    blocked.then(|| host.to_string())
+}
+
+/// IPv6 unique-local range `fc00::/7` (the first 7 bits are `1111110`).
+fn is_unique_local_v6(addr: &std::net::Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xfe00) == 0xfc00
+}
+
+/// IPv6 link-local range `fe80::/10` (the first 10 bits are `1111111010`).
+fn is_link_local_v6(addr: &std::net::Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
 }
 
 #[cfg(test)]
@@ -877,6 +1000,144 @@ mod tests {
         assert!(
             validate(&cfg).is_ok(),
             "mode 'none' carries no token requirement"
+        );
+    }
+
+    #[test]
+    fn test_ssrf_blocked_host_rejects_internal_targets() {
+        // IP literals and metadata hostnames over https must be flagged.
+        for blocked in [
+            "https://169.254.169.254/latest/meta-data/",
+            "https://169.254.169.254/",
+            "https://127.0.0.1/",
+            "https://10.0.0.1/v1",
+            "https://172.16.0.1/",
+            "https://192.168.1.1:8443/",
+            "https://[::1]/",
+            "https://[::1]:443/",
+            "https://[fe80::1]/",
+            "https://[fc00::1]/",
+            "https://metadata.google.internal/computeMetadata/v1/",
+            "https://METADATA.INTERNAL/",
+            "https://0.0.0.0/",
+            "https://user:pass@10.0.0.5/path",
+        ] {
+            assert!(
+                ssrf_blocked_host(blocked).is_some(),
+                "expected '{blocked}' to be flagged as an SSRF target"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ssrf_blocked_host_allows_public_targets() {
+        // Public hostnames and public IPs must NOT be flagged.
+        for ok in [
+            "https://api.anthropic.com/v1/messages",
+            "https://api.openai.com",
+            "https://example.com:8443/v1",
+            "https://8.8.8.8/",
+            "https://[2606:4700:4700::1111]/",
+        ] {
+            assert!(
+                ssrf_blocked_host(ok).is_none(),
+                "expected '{ok}' to be allowed (not an SSRF target)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_https_internal_base_url() {
+        // A full validate() pass must reject an https:// base_url pointing at IMDS.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            make_provider("anthropic", "https://169.254.169.254/", "API_KEY"),
+        );
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        let errs = validate(&cfg).expect_err("https IMDS base_url must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("blocked internal/metadata host")
+                    && e.contains("169.254.169.254")),
+            "expected an SSRF/metadata-host error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_fallback_pool() {
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut pool = make_pool(vec![make_member("mymodel")]);
+        pool.on_exhausted = Some(config::OnExhaustedCfg {
+            action: "fallback_pool:does_not_exist".to_string(),
+        });
+        pools.insert("mypool".to_string(), pool);
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg).expect_err("on_exhausted referencing an unknown pool must fail");
+        assert!(
+            errs.iter().any(
+                |e| e.contains("on_exhausted references unknown fallback pool")
+                    && e.contains("does_not_exist")
+            ),
+            "expected a dangling-fallback-pool error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_existing_fallback_pool() {
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut pool = make_pool(vec![make_member("mymodel")]);
+        pool.on_exhausted = Some(config::OnExhaustedCfg {
+            action: "fallback_pool:backup".to_string(),
+        });
+        pools.insert("mypool".to_string(), pool);
+        // The referenced fallback pool exists → no error.
+        pools.insert(
+            "backup".to_string(),
+            make_pool(vec![make_member("mymodel")]),
+        );
+        let cfg = make_root_cfg(providers, models, pools);
+        assert!(
+            validate(&cfg).is_ok(),
+            "on_exhausted referencing an existing pool must validate"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_affinity_mode() {
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut pool = make_pool(vec![make_member("mymodel")]);
+        pool.affinity = Some(config::AffinityCfg {
+            mode: "sticky".to_string(),
+            header_name: None,
+        });
+        pools.insert("mypool".to_string(), pool);
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg).expect_err("an unsupported affinity.mode must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("affinity.mode 'sticky' is invalid")),
+            "expected an invalid affinity-mode error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_session_affinity_mode() {
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut pool = make_pool(vec![make_member("mymodel")]);
+        pool.affinity = Some(config::AffinityCfg {
+            mode: "session".to_string(),
+            header_name: Some("x-session-id".to_string()),
+        });
+        pools.insert("mypool".to_string(), pool);
+        let cfg = make_root_cfg(providers, models, pools);
+        assert!(
+            validate(&cfg).is_ok(),
+            "the supported 'session' affinity mode must validate"
         );
     }
 

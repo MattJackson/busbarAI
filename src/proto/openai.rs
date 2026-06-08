@@ -50,25 +50,22 @@ pub(crate) struct OpenAiReader;
 
 impl ProtocolReader for OpenAiReader {
     fn extract_error(&self, status: StatusCode, body: &[u8]) -> crate::breaker::RawUpstreamError {
-        let provider_code = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-            json.get("error")
-                .and_then(|e| e.as_object())
-                .and_then(|e_obj| e_obj.get("code"))
-                .and_then(|c| c.as_str())
-                .map(String::from)
-        } else {
-            None
-        };
-
-        let structured_type = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-            json.get("error")
-                .and_then(|e| e.as_object())
-                .and_then(|e_obj| e_obj.get("type"))
-                .and_then(|t| t.as_str())
-                .map(String::from)
-        } else {
-            None
-        };
+        // Parse the error body exactly once and derive both fields from the single tree, mirroring
+        // the single-parse pattern in AnthropicReader::extract_error. The previous code parsed the
+        // same bytes twice (once per field), doubling alloc/CPU on every non-2xx response.
+        let json = serde_json::from_slice::<serde_json::Value>(body).ok();
+        let error_obj = json
+            .as_ref()
+            .and_then(|j| j.get("error"))
+            .and_then(|e| e.as_object());
+        let provider_code = error_obj
+            .and_then(|e_obj| e_obj.get("code"))
+            .and_then(|c| c.as_str())
+            .map(String::from);
+        let structured_type = error_obj
+            .and_then(|e_obj| e_obj.get("type"))
+            .and_then(|t| t.as_str())
+            .map(String::from);
 
         crate::breaker::RawUpstreamError {
             http_status: status.as_u16(),
@@ -162,7 +159,6 @@ impl ProtocolReader for OpenAiReader {
             .map(|v| v as u32);
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-        let top_p = obj.get("top_p");
 
         // Handle messages array
         let mut messages: Vec<crate::ir::IrMessage> = Vec::new();
@@ -318,7 +314,12 @@ impl ProtocolReader for OpenAiReader {
             }
         }
 
-        // Collect unmodeled top-level keys into extra (excluding modeled ones)
+        // Collect unmodeled top-level keys into extra (excluding modeled ones). Only the fields the
+        // IR models as first-class (model, messages, tools, max_tokens, temperature, stream) are
+        // excluded; everything else — including the sampling parameters top_p, frequency_penalty,
+        // presence_penalty, stop, n, and logit_bias — flows through `extra` verbatim so it reaches
+        // the upstream after IR translation. (Previously these six were listed here but only top_p
+        // was re-inserted, silently dropping the other five and changing generation behavior.)
         let modeled_keys: std::collections::HashSet<&str> = [
             "model",
             "messages",
@@ -326,12 +327,6 @@ impl ProtocolReader for OpenAiReader {
             "max_tokens",
             "temperature",
             "stream",
-            "top_p",
-            "frequency_penalty",
-            "presence_penalty",
-            "stop",
-            "n",
-            "logit_bias",
         ]
         .iter()
         .cloned()
@@ -341,11 +336,6 @@ impl ProtocolReader for OpenAiReader {
             if !modeled_keys.contains(key.as_str()) {
                 extra.insert(key.clone(), value.clone());
             }
-        }
-
-        // Add top_p to extra if present
-        if let Some(top_p_val) = top_p {
-            extra.insert("top_p".to_string(), top_p_val.clone());
         }
 
         Ok(crate::ir::IrRequest {
@@ -753,21 +743,58 @@ fn read_openai_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock
                 provider_signal: Some("ir_parse".to_string()),
                 retry_after: None,
             })?;
-            let url = image_obj
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            Ok(crate::ir::IrBlock::Image {
-                media_type: "image".to_string(),
-                data: url,
-            })
+            let url = image_obj.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            // The IR `Image` contract (set by the Anthropic reader) is: `media_type` = a real MIME
+            // type (e.g. "image/png") and `data` = the raw base64 payload. The Anthropic writer
+            // renders that as a `{"type":"base64", "media_type":..., "data":...}` source. The prior
+            // code stored `media_type: "image"` (a literal, not a MIME type) and `data: <the full
+            // url>`, which the Anthropic writer then emitted as a base64 source whose data was a
+            // URL — an invalid Anthropic request. For a `data:<mime>;base64,<payload>` URI we now
+            // split out the real MIME type and payload so the cross-protocol image is valid.
+            let (media_type, data) = parse_image_url(url);
+            Ok(crate::ir::IrBlock::Image { media_type, data })
         }
         _ => Err(IrError {
             class: StatusClass::ClientError,
             provider_signal: Some("ir_parse".to_string()),
             retry_after: None,
         }),
+    }
+}
+
+/// Split an OpenAI `image_url` string into the IR `Image` (media_type, data) pair.
+///
+/// A `data:<mime>;base64,<payload>` URI is decomposed into its real MIME type ("image/png") and
+/// raw base64 payload, matching the IR contract the Anthropic reader/writer use for base64 images.
+/// Any other URL (an https reference, or a data URI we cannot confidently split) is preserved
+/// verbatim in `data` with an "image_url" media_type sentinel, so the OpenAI writer can reconstruct
+/// the original `image_url` exactly on same-protocol round-trips without guessing a MIME type.
+fn parse_image_url(url: &str) -> (String, String) {
+    if let Some(rest) = url.strip_prefix("data:") {
+        if let Some((meta, payload)) = rest.split_once(',') {
+            // meta is e.g. "image/png;base64" or "image/png" — keep only the MIME type.
+            let media_type = meta.split(';').next().unwrap_or("").to_string();
+            if meta.contains("base64") && !media_type.is_empty() {
+                return (media_type, payload.to_string());
+            }
+        }
+    }
+    // Non-data URL (https://...) or an unrecognized data URI: keep it verbatim. The "image_url"
+    // sentinel marks that `data` is a URL rather than a base64 payload so the OpenAI writer round-
+    // trips it as-is. (A faithful cross-protocol projection of a URL-source image to Anthropic's
+    // `{"type":"url",...}` source requires an IR discriminant / Anthropic-writer change outside the
+    // OpenAI module's ownership and is therefore not handled here.)
+    ("image_url".to_string(), url.to_string())
+}
+
+/// Reconstruct an OpenAI `image_url` string from the IR `Image` (media_type, data) pair — the
+/// inverse of [`parse_image_url`]. A URL-sentinel image is emitted verbatim; a base64 image is
+/// re-wrapped into a `data:<mime>;base64,<payload>` URI.
+fn image_url_from_ir(media_type: &str, data: &str) -> String {
+    if media_type == "image_url" {
+        data.to_string()
+    } else {
+        format!("data:{media_type};base64,{data}")
     }
 }
 
@@ -833,14 +860,25 @@ impl ProtocolWriter for OpenAiWriter {
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
         let mut messages_array: Vec<serde_json::Value> = Vec::new();
 
-        // Prepend system message as first message if present
+        // Prepend system message as first message if present. OpenAI system messages carry plain
+        // text only, so every system block is projected to text EXPLICITLY here rather than via a
+        // silent `if let Text` that would drop non-text blocks without a trace (the prior behavior).
+        // Text and Thinking both carry textual system guidance and are forwarded; the structurally
+        // text-less variants (ToolUse / ToolResult / Image) have no OpenAI system representation and
+        // are projected to empty text — a documented lossy projection, not a silent drop. The match
+        // is exhaustive (no `_ =>` catch-all) so a future IrBlock variant forces a compile error.
         for block in &req.system {
-            if let crate::ir::IrBlock::Text { text, .. } = block {
-                messages_array.push(serde_json::json!({
-                    "role": "system",
-                    "content": text
-                }));
-            }
+            let text: &str = match block {
+                crate::ir::IrBlock::Text { text, .. } => text,
+                crate::ir::IrBlock::Thinking { text, .. } => text,
+                crate::ir::IrBlock::ToolUse { .. }
+                | crate::ir::IrBlock::ToolResult { .. }
+                | crate::ir::IrBlock::Image { .. } => "",
+            };
+            messages_array.push(serde_json::json!({
+                "role": "system",
+                "content": text
+            }));
         }
 
         // Add regular messages
@@ -862,10 +900,10 @@ impl ProtocolWriter for OpenAiWriter {
                         crate::ir::IrBlock::Text { text, .. } => {
                             content_arr.push(serde_json::json!({ "type": "text", "text": text }));
                         }
-                        crate::ir::IrBlock::Image {
-                            media_type: _,
-                            data: url,
-                        } => {
+                        crate::ir::IrBlock::Image { media_type, data } => {
+                            // Reconstruct the original `image_url` from the IR pair: a URL-sentinel
+                            // image is emitted verbatim, a base64 image is re-wrapped as a data URI.
+                            let url = image_url_from_ir(media_type, data);
                             content_arr.push(serde_json::json!({
                                 "type": "image_url",
                                 "image_url": { "url": url }
@@ -884,7 +922,15 @@ impl ProtocolWriter for OpenAiWriter {
                     }
                 }
 
-                serde_json::Value::Array(content_arr)
+                // A message carrying only ToolUse blocks (a tool-call-only assistant turn) yields an
+                // empty content_arr: ToolUse is surfaced via `tool_calls`, not `content`. The OpenAI
+                // Chat Completions API expects such messages to have `content: null`, not `[]` — some
+                // validators reject an empty array alongside `tool_calls`. Emit Null in that case.
+                if content_arr.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::Array(content_arr)
+                }
             };
 
             let mut msg_obj = serde_json::json!({
@@ -955,8 +1001,9 @@ impl ProtocolWriter for OpenAiWriter {
                         messages_array.push(tool_result_obj);
                     }
                 }
-            } else if msg.role != crate::ir::IrRole::Tool {
-                // Only add non-tool messages to the array directly (tool results are handled above)
+            } else {
+                // Only add non-tool messages to the array directly (tool results are handled above).
+                // This is the `msg.role != Tool` branch by construction — the guard is implicit.
                 messages_array.push(msg_obj);
             }
         }
@@ -1148,8 +1195,24 @@ impl ProtocolWriter for OpenAiWriter {
                     .provider_signal
                     .clone()
                     .unwrap_or_else(|| "error".to_string());
+                // Map the IR error class onto OpenAI's enumerated error `type` vocabulary. The prior
+                // hardcoded "error" is not a valid OpenAI error type — SDK clients that switch on
+                // `error.type` would fall through to an unhandled default, and the bogus value is a
+                // detectable proxy tell. The match is exhaustive over StatusClass (no `_ =>`), so a
+                // new class forces an explicit decision; `server_error` is the safe fallback bucket.
+                let error_type = match err.class {
+                    crate::breaker::StatusClass::RateLimit => "rate_limit_error",
+                    crate::breaker::StatusClass::Auth => "authentication_error",
+                    crate::breaker::StatusClass::Billing => "permission_error",
+                    crate::breaker::StatusClass::ContextLength
+                    | crate::breaker::StatusClass::ClientError => "invalid_request_error",
+                    crate::breaker::StatusClass::Overloaded
+                    | crate::breaker::StatusClass::ServerError
+                    | crate::breaker::StatusClass::Timeout
+                    | crate::breaker::StatusClass::Network => "server_error",
+                };
                 let error_obj = serde_json::json!({
-                    "error": { "message": message, "type": "error" }
+                    "error": { "message": message, "type": error_type }
                 });
                 Some(("".to_string(), error_obj))
             }
@@ -1316,7 +1379,10 @@ impl ProtocolWriter for OpenAiWriter {
         );
         usage_map.insert(
             "total_tokens".to_string(),
-            serde_json::json!(resp.usage.input_tokens + resp.usage.output_tokens),
+            serde_json::json!(resp
+                .usage
+                .input_tokens
+                .saturating_add(resp.usage.output_tokens)),
         );
         obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
 
@@ -1775,5 +1841,224 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    // --- Round 2 fix 1: total_tokens must saturate, never overflow-panic/wrap ---
+
+    #[test]
+    fn write_response_total_tokens_saturates_on_overflow() {
+        let resp = crate::ir::IrResponse {
+            role: IrRole::Assistant,
+            content: vec![text_block("x")],
+            stop_reason: Some("end_turn".to_string()),
+            usage: IrUsage {
+                input_tokens: u64::MAX,
+                output_tokens: 5,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        // Must not panic (debug) or wrap (release); saturates at u64::MAX.
+        let out = OpenAiWriter.write_response(&resp);
+        assert_eq!(out["usage"]["total_tokens"], serde_json::json!(u64::MAX));
+    }
+
+    // --- Round 2 fix 8: sampling params must round-trip through extra, not be dropped ---
+
+    #[test]
+    fn read_request_preserves_sampling_params_in_extra() {
+        let body = serde_json::json!({
+            "model": "gpt-x",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "top_p": 0.9,
+            "frequency_penalty": 0.5,
+            "presence_penalty": 0.25,
+            "stop": ["\n\n"],
+            "n": 2,
+            "logit_bias": { "50256": -100 }
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        assert_eq!(ir.extra.get("top_p"), Some(&serde_json::json!(0.9)));
+        assert_eq!(
+            ir.extra.get("frequency_penalty"),
+            Some(&serde_json::json!(0.5))
+        );
+        assert_eq!(
+            ir.extra.get("presence_penalty"),
+            Some(&serde_json::json!(0.25))
+        );
+        assert_eq!(ir.extra.get("stop"), Some(&serde_json::json!(["\n\n"])));
+        assert_eq!(ir.extra.get("n"), Some(&serde_json::json!(2)));
+        assert_eq!(
+            ir.extra.get("logit_bias"),
+            Some(&serde_json::json!({ "50256": -100 }))
+        );
+        // And they reach the upstream body on write.
+        let out = OpenAiWriter.write_request(&ir);
+        assert_eq!(out["frequency_penalty"], serde_json::json!(0.5));
+        assert_eq!(out["n"], serde_json::json!(2));
+    }
+
+    // --- Round 2 fix 3: tool-call-only assistant turn → content: null, not [] ---
+
+    #[test]
+    fn write_request_tool_call_only_assistant_has_null_content() {
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![IrMessage {
+                role: IrRole::Assistant,
+                content: vec![IrBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "x"}),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = OpenAiWriter.write_request(&req);
+        let msg = &out["messages"][0];
+        assert_eq!(msg["content"], serde_json::Value::Null);
+        assert_eq!(msg["tool_calls"][0]["id"], serde_json::json!("t1"));
+    }
+
+    // --- Round 2 fix 2: image_url parsing honors the IR base64 contract ---
+
+    #[test]
+    fn read_block_data_uri_splits_media_type_and_payload() {
+        let block = serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": "data:image/png;base64,AAAB" }
+        });
+        let ir = read_openai_block(&block).expect("parses");
+        match ir {
+            IrBlock::Image { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, "AAAB");
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_block_https_url_kept_verbatim_with_sentinel() {
+        let block = serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": "https://example.com/cat.png" }
+        });
+        let ir = read_openai_block(&block).expect("parses");
+        match ir {
+            IrBlock::Image { media_type, data } => {
+                assert_eq!(media_type, "image_url");
+                assert_eq!(data, "https://example.com/cat.png");
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_url_round_trips_through_writer() {
+        for url in ["data:image/png;base64,AAAB", "https://example.com/cat.png"] {
+            let (mt, data) = parse_image_url(url);
+            assert_eq!(image_url_from_ir(&mt, &data), url);
+        }
+    }
+
+    // --- Round 2 fix 10: streaming Error type maps to a real OpenAI error type ---
+
+    #[test]
+    fn stream_error_uses_enumerated_openai_type() {
+        let cases = [
+            (crate::breaker::StatusClass::RateLimit, "rate_limit_error"),
+            (crate::breaker::StatusClass::Auth, "authentication_error"),
+            (crate::breaker::StatusClass::Billing, "permission_error"),
+            (
+                crate::breaker::StatusClass::ClientError,
+                "invalid_request_error",
+            ),
+            (
+                crate::breaker::StatusClass::ContextLength,
+                "invalid_request_error",
+            ),
+            (crate::breaker::StatusClass::ServerError, "server_error"),
+            (crate::breaker::StatusClass::Overloaded, "server_error"),
+            (crate::breaker::StatusClass::Timeout, "server_error"),
+            (crate::breaker::StatusClass::Network, "server_error"),
+        ];
+        for (class, want) in cases {
+            let ev = IrStreamEvent::Error(crate::breaker::CanonicalSignal {
+                class,
+                provider_signal: Some("boom".to_string()),
+                retry_after: None,
+            });
+            let (_, chunk) = OpenAiWriter
+                .write_response_event(&ev)
+                .expect("error emits a chunk");
+            assert_eq!(
+                chunk["error"]["type"],
+                serde_json::json!(want),
+                "class={class:?}"
+            );
+            assert_eq!(chunk["error"]["message"], serde_json::json!("boom"));
+            // Never the bogus literal "error".
+            assert_ne!(chunk["error"]["type"], serde_json::json!("error"));
+        }
+    }
+
+    // --- Round 2 fix 4/6/7: extract_error parses the body once, deriving both fields ---
+
+    #[test]
+    fn extract_error_derives_code_and_type_single_parse() {
+        let body = br#"{"error":{"message":"nope","type":"invalid_request_error","code":"model_not_found"}}"#;
+        let raw = OpenAiReader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(raw.provider_code.as_deref(), Some("model_not_found"));
+        assert_eq!(
+            raw.structured_type.as_deref(),
+            Some("invalid_request_error")
+        );
+        assert_eq!(raw.http_status, 400);
+        // Non-JSON body yields None for both, without panicking.
+        let raw2 = OpenAiReader.extract_error(StatusCode::BAD_GATEWAY, b"<html>502</html>");
+        assert!(raw2.provider_code.is_none());
+        assert!(raw2.structured_type.is_none());
+    }
+
+    // --- Round 2 fix 5: non-text system blocks are projected explicitly, not silently dropped ---
+
+    #[test]
+    fn write_request_non_text_system_block_does_not_vanish_silently() {
+        let req = crate::ir::IrRequest {
+            system: vec![
+                text_block("be terse"),
+                IrBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "AAAB".to_string(),
+                },
+            ],
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![text_block("hi")],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = OpenAiWriter.write_request(&req);
+        let msgs = out["messages"].as_array().expect("messages");
+        // Both system blocks produce a system message (text forwarded, image projected to "").
+        assert_eq!(msgs[0]["role"], serde_json::json!("system"));
+        assert_eq!(msgs[0]["content"], serde_json::json!("be terse"));
+        assert_eq!(msgs[1]["role"], serde_json::json!("system"));
+        assert_eq!(msgs[1]["content"], serde_json::json!(""));
     }
 }

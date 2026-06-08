@@ -75,6 +75,17 @@ fn disabled() -> Response {
     )
 }
 
+/// 500 for a `spawn_blocking` task that failed to run to completion (cancelled or panicked). The
+/// blocking store closures here don't panic in normal operation, but a `JoinError` must NOT
+/// propagate as an `unwrap()` on the request path — map it to a generic 500 (details logged).
+fn join_error(op: &str, e: &tokio::task::JoinError) -> Response {
+    tracing::error!(operation = op, error = %e, "admin store task failed to join");
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!({"error": "internal error"}),
+    )
+}
+
 /// POST /admin/keys — mint a virtual key. Returns the plaintext secret ONCE.
 pub(crate) async fn create_key(
     State(app): State<Arc<App>>,
@@ -91,13 +102,19 @@ pub(crate) async fn create_key(
         rpm_limit: req.rpm_limit,
         tpm_limit: req.tpm_limit,
     };
-    match gov.create_key(spec, crate::store::now()) {
-        Ok((key, secret)) => {
+    // Offload the blocking rusqlite write off the Tokio worker thread (matches the request-path
+    // discipline in governance::is_over_budget_async / offload_store_write).
+    let gov = gov.clone();
+    let now = crate::store::now();
+    let res = tokio::task::spawn_blocking(move || gov.create_key(spec, now)).await;
+    match res {
+        Ok(Ok((key, secret))) => {
             let mut body = key_meta(&key);
             body["secret"] = json!(secret); // shown exactly once
             json_response(StatusCode::CREATED, body)
         }
-        Err(e) => internal_error("create_key", &e),
+        Ok(Err(e)) => internal_error("create_key", &e),
+        Err(e) => join_error("create_key", &e),
     }
 }
 
@@ -106,12 +123,15 @@ pub(crate) async fn list_keys(State(app): State<Arc<App>>) -> Response {
     let Some(gov) = &app.governance else {
         return disabled();
     };
-    match gov.all_keys() {
-        Ok(keys) => json_response(
+    let gov = gov.clone();
+    let res = tokio::task::spawn_blocking(move || gov.all_keys()).await;
+    match res {
+        Ok(Ok(keys)) => json_response(
             StatusCode::OK,
             json!({ "keys": keys.iter().map(key_meta).collect::<Vec<_>>() }),
         ),
-        Err(e) => internal_error("list_keys", &e),
+        Ok(Err(e)) => internal_error("list_keys", &e),
+        Err(e) => join_error("list_keys", &e),
     }
 }
 
@@ -120,13 +140,18 @@ pub(crate) async fn key_usage(State(app): State<Arc<App>>, Path(id): Path<String
     let Some(gov) = &app.governance else {
         return disabled();
     };
-    match gov.usage_for(&id, crate::store::now()) {
-        Ok(Some(u)) => json_response(
+    let now = crate::store::now();
+    let gov2 = gov.clone();
+    let id2 = id.clone();
+    let res = tokio::task::spawn_blocking(move || gov2.usage_for(&id2, now)).await;
+    match res {
+        Ok(Ok(Some(u))) => json_response(
             StatusCode::OK,
             json!({"id": id, "spend_cents": u.spend_cents, "tokens": u.tokens, "requests": u.requests}),
         ),
-        Ok(None) => json_response(StatusCode::NOT_FOUND, json!({"error": "key not found"})),
-        Err(e) => internal_error("key_usage", &e),
+        Ok(Ok(None)) => json_response(StatusCode::NOT_FOUND, json!({"error": "key not found"})),
+        Ok(Err(e)) => internal_error("key_usage", &e),
+        Err(e) => join_error("key_usage", &e),
     }
 }
 
@@ -140,14 +165,29 @@ pub(crate) async fn delete_key(State(app): State<Arc<App>>, Path(id): Path<Strin
     // Existence check before delete: `usage_for` resolves the key by id and returns Ok(None) when it
     // does not exist (the store's `delete_key` silently no-ops a zero-row delete, so we cannot rely
     // on it to signal not-found). Use the public GovState API rather than reaching into the store.
-    match gov.usage_for(&id, crate::store::now()) {
-        Ok(None) => return json_response(StatusCode::NOT_FOUND, json!({"error": "key not found"})),
-        Ok(Some(_)) => {}
-        Err(e) => return internal_error("delete_key.lookup", &e),
-    }
-    match gov.delete_key(&id) {
-        Ok(()) => json_response(StatusCode::OK, json!({"deleted": id})),
-        Err(e) => internal_error("delete_key", &e),
+    //
+    // Both store calls (the lookup and the delete) run on ONE `spawn_blocking` task so neither
+    // blocks a Tokio worker thread, matching the request-path discipline. Running them on the same
+    // task also keeps the lookup→delete pair tighter than two separately-scheduled awaits would.
+    // NOTE: this does not make the check-then-act atomic — `GovState`/store expose no rows-affected
+    // signal, so two concurrent DELETEs of the same id can still both observe `Some` and both return
+    // 200 (the underlying `delete_key` no-ops the second SQL delete). Eliminating that residual
+    // TOCTOU requires the store's `delete_key` to report `changes()` and map zero rows to 404, which
+    // lives in the store layer (not this fix unit's owned files). See the obs unit's skipped note.
+    let now = crate::store::now();
+    let gov = gov.clone();
+    let id_for_task = id.clone();
+    let res = tokio::task::spawn_blocking(move || match gov.usage_for(&id_for_task, now) {
+        Ok(None) => Ok(None),
+        Ok(Some(_)) => gov.delete_key(&id_for_task).map(Some),
+        Err(e) => Err(e),
+    })
+    .await;
+    match res {
+        Ok(Ok(Some(()))) => json_response(StatusCode::OK, json!({"deleted": id})),
+        Ok(Ok(None)) => json_response(StatusCode::NOT_FOUND, json!({"error": "key not found"})),
+        Ok(Err(e)) => internal_error("delete_key", &e),
+        Err(e) => join_error("delete_key", &e),
     }
 }
 
@@ -168,6 +208,59 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn test_create_list_usage_roundtrip_through_spawn_blocking() {
+        // Exercises the create_key / list_keys / key_usage handlers end-to-end after they were moved
+        // onto spawn_blocking: a slow rusqlite call must not block a Tokio worker, and the offloaded
+        // handlers must still return the same responses (no secret/hash leak; usage resolves).
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (addr, handle) = serve_with_gov(gov).await;
+        let client = reqwest::Client::new();
+
+        // create
+        let created = client
+            .post(format!("http://{addr}/admin/keys"))
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"name": "k1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+        let body: serde_json::Value = created.json().await.unwrap();
+        let id = body["id"].as_str().unwrap().to_string();
+        assert!(body["secret"].is_string(), "secret returned once on create");
+        assert!(body["key_hash"].is_null(), "key_hash must never be exposed");
+
+        // list
+        let listed = client
+            .get(format!("http://{addr}/admin/keys"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listed.status().as_u16(), 200);
+        let lb: serde_json::Value = listed.json().await.unwrap();
+        assert_eq!(lb["keys"].as_array().unwrap().len(), 1);
+        assert!(
+            lb["keys"][0]["secret"].is_null(),
+            "list must not leak secrets"
+        );
+
+        // usage
+        let usage = client
+            .get(format!("http://{addr}/admin/keys/{id}/usage"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(usage.status().as_u16(), 200);
+        let ub: serde_json::Value = usage.json().await.unwrap();
+        assert_eq!(ub["id"], id);
+        handle.abort();
     }
 
     #[tokio::test]

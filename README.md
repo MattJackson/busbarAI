@@ -137,12 +137,17 @@ Streaming is first-class for all six: Gemini via `:streamGenerateContent?alt=sse
 | Route | Targets |
 |---|---|
 | `POST /<name>/v1/messages` | Anthropic ingress; `<name>` is a model (`/claude-sonnet`) **or** a pool (`/fast`) |
-| `POST /<provider>/<model>/v1/messages` | ad-hoc direct route to one provider+model, no pool needed |
+| `POST /<provider>/<model>/v1/messages` | Anthropic ingress, ad-hoc direct route to one provider+model, no pool needed |
 | `POST /v1/chat/completions` | OpenAI ingress; the body's `model` selects the model or pool |
+| `POST /v1/responses` | Responses-API ingress; the body's `model` selects the model or pool |
+| `POST /v2/chat` | Cohere ingress; the body's `model` selects the model or pool |
+| `POST /v1beta/models/{model}:generateContent` · `:streamGenerateContent` | Gemini ingress; the model (and pool) is taken from the URL path segment |
+| `POST /model/{modelId}/converse` · `/converse-stream` | Bedrock ingress; the model (and pool) is taken from the URL path |
 | `GET /stats` · `GET /healthz` · `GET /metrics` | per-lane health (JSON) · liveness · Prometheus |
-| `/admin/keys` (POST/GET/DELETE) | virtual-key management (governance only) |
+| `POST /admin/keys` · `GET /admin/keys` | create / list virtual keys (governance only) |
+| `DELETE /admin/keys/{id}` · `GET /admin/keys/{id}/usage` | revoke a virtual key · per-key usage (governance only) |
 
-Cross-protocol translation applies to all three targeting modes: the ingress protocol is fixed by the route, and if the chosen lane speaks something else, Busbar translates through the IR.
+Cross-protocol translation applies to every targeting mode and every ingress: the ingress protocol is fixed by the route, and if the chosen lane speaks something else, Busbar translates through the IR. Body-model ingress (`openai`, `responses`, `cohere`) reads the model/pool from the request body; path-model ingress (`anthropic`, `gemini`, `bedrock`) reads it from the URL.
 
 ## Features
 
@@ -162,11 +167,11 @@ Full field-by-field config reference, with defaults and worked examples, lives i
 
 ## Security
 
-Busbar sits in your request path, so it's built to be unremarkable there: no caller-controlled upstreams (destinations come from your vetted `providers.yaml`, never from request data, so it's SSRF-safe), constant-time comparison of client and admin tokens, virtual keys stored only as SHA-256 hashes, request bodies bounded at 32 MiB (even in open-relay mode), fully parameterized governance SQL, and provider keys / tokens / bodies kept out of the logs. These are exercised by the test suite (267 tests) and were the focus of a dedicated hardening pass. To report a vulnerability, see [SECURITY.md](SECURITY.md).
+Busbar sits in your request path, so it's built to be unremarkable there: no caller-controlled upstreams (destinations come from your vetted `providers.yaml`, never from request data, so it's SSRF-safe), constant-time comparison of client and admin tokens, virtual keys stored only as SHA-256 hashes, request bodies bounded at 32 MiB (even in open-relay mode), fully parameterized governance SQL, and provider keys / tokens / bodies kept out of the logs. These are exercised by the in-crate `cargo test` suite and were the focus of a dedicated hardening pass. To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Build & platforms
 
-Single Rust binary, stable toolchain (edition 2021). CI builds and tests on Linux, macOS, and Windows; releases ship `x86_64`/`aarch64` Linux, Intel/Apple-Silicon macOS, and `x86_64` Windows.
+Single Rust binary, stable toolchain (edition 2021). CI builds and tests on Linux and Windows; releases additionally cross-build macOS. Releases ship `x86_64`/`aarch64` Linux, Intel/Apple-Silicon macOS, and `x86_64` Windows.
 
 ```bash
 cargo build --release

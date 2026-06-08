@@ -10,10 +10,19 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Length of the fixed rate-limit window (RPM/TPM are evaluated per this many seconds).
 const RATE_WINDOW_SECS: u64 = 60;
+
+/// Amortize the bounded eviction sweep of the rate map: a full `retain` (O(active keys)) runs at
+/// most once per this many `check_rate` admissions, instead of on every single admission. Per-key
+/// correctness does not depend on the sweep — `check_rate` already resets a looked-up key's entry
+/// when its `window_start` is stale — so the sweep is purely to bound the map's memory by evicting
+/// keys that have gone silent. Running it occasionally keeps the per-request cost off the hot path
+/// while still guaranteeing the map cannot grow unboundedly across windows.
+const RATE_SWEEP_INTERVAL: u32 = 256;
 /// `price_per_1k_tokens_cents` is priced per this many tokens.
 const TOKENS_PER_PRICE_UNIT: u64 = 1000;
 
@@ -39,6 +48,10 @@ pub(crate) struct GovState {
     price_per_1k_tokens_cents: i64,
     /// per-key RPM/TPM windows (ephemeral).
     rate: RwLock<HashMap<String, RateState>>,
+    /// Admission counter that amortizes the bounded eviction sweep of `rate` (see
+    /// `RATE_SWEEP_INTERVAL`): every Nth `check_rate` call performs the full stale-entry retain,
+    /// so the per-request hot path does not scan all active keys on every admission.
+    rate_sweep_ticker: AtomicU32,
     /// bearer token guarding the /admin management API (None = admin API disabled).
     admin_token: Option<String>,
 }
@@ -67,6 +80,7 @@ impl GovState {
             price_per_request_cents,
             price_per_1k_tokens_cents,
             rate: RwLock::new(HashMap::new()),
+            rate_sweep_ticker: AtomicU32::new(0),
             admin_token,
         })
     }
@@ -192,14 +206,41 @@ impl GovState {
         let window = now / RATE_WINDOW_SECS * RATE_WINDOW_SECS;
         let retry = (window + RATE_WINDOW_SECS).saturating_sub(now).max(1);
         let mut map = self.rate.write().unwrap();
-        // Evict entries from older windows so the map stays bounded by the current window's active
-        // keys — a key that stops sending requests would otherwise leak its entry forever.
-        map.retain(|_, st| st.window_start == window);
-        // Fast path: the entry already exists for this window — mutate in place without cloning the
-        // key id. Only the cold path (missing entry, after a window roll) pays the clone+insert.
+        // Bounded eviction of stale entries (keys that have gone silent in older windows) keeps the
+        // map from leaking entries forever. This is an O(active-key-count) scan, so we DO NOT run it
+        // on every admission — it is purely a memory bound and is not required for correctness (the
+        // per-key staleness reset just below already resets the looked-up key's own entry). Instead
+        // we amortize it: only every `RATE_SWEEP_INTERVAL`th call pays the sweep, keeping the
+        // per-request cost of the hot path independent of the number of concurrently-active keys.
+        if self
+            .rate_sweep_ticker
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(RATE_SWEEP_INTERVAL)
+        {
+            map.retain(|_, st| st.window_start == window);
+        }
+        // Resolve this key's entry for the CURRENT window. Three cases:
+        //  - present & current-window  -> mutate in place (fast path; no key clone).
+        //  - present but STALE         -> reset it in place to the current window (counters back to
+        //                                 zero). This per-key reset is what makes correctness
+        //                                 independent of the global sweep above: even if the stale
+        //                                 entry was not evicted, we never carry an old window's
+        //                                 counts forward. (The previous code relied on the eager
+        //                                 retain having already removed it, so `or_insert_with`
+        //                                 minted a fresh one; with the sweep amortized we must reset
+        //                                 explicitly here.)
+        //  - absent                    -> insert a fresh entry (cold path; pays the key clone).
         let st = match map.get_mut(&key.id) {
             Some(st) if st.window_start == window => st,
-            _ => map.entry(key.id.clone()).or_insert_with(|| RateState {
+            Some(st) => {
+                *st = RateState {
+                    window_start: window,
+                    requests: 0,
+                    tokens: 0,
+                };
+                st
+            }
+            None => map.entry(key.id.clone()).or_insert_with(|| RateState {
                 window_start: window,
                 requests: 0,
                 tokens: 0,
@@ -927,6 +968,83 @@ mod tests {
             gov.check_rate(&k, now).is_err(),
             "RPM=2 → third rejected (entry reused, not reset)"
         );
+    }
+
+    #[test]
+    fn test_check_rate_resets_stale_entry_without_eager_sweep() {
+        // Regression for the amortized-sweep change: a key whose entry belongs to an OLDER window
+        // must have its counters reset on its next admission EVEN IF the global eviction sweep did
+        // not run this call. Previously the per-call `retain` guaranteed a fresh entry; now the
+        // per-key reset in `check_rate` must do it. We exhaust RPM in W0, then advance a full window
+        // and confirm the key is admitted again (stale W0 counts must not carry forward).
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 0, 0, None).unwrap();
+        let mut k = sample_key("k1", "h1");
+        k.rpm_limit = Some(1);
+        k.tpm_limit = None;
+        let w0 = 1_700_000_040 / 60 * 60;
+
+        // Burn the single W0 slot; a second W0 request is rejected.
+        assert!(gov.check_rate(&k, w0).is_ok(), "W0 first admits");
+        assert!(
+            gov.check_rate(&k, w0).is_err(),
+            "W0 second rejected (RPM=1)"
+        );
+
+        // Force the sweep ticker to a NON-multiple of the interval so the eager retain does NOT run
+        // on the next call — proving the per-key reset (not the sweep) is what clears the stale W0
+        // entry. (The two calls above advanced the ticker to 2; set it to 1 so the next is 1 % N.)
+        gov.rate_sweep_ticker.store(1, Ordering::Relaxed);
+        assert!(
+            !1u32.is_multiple_of(RATE_SWEEP_INTERVAL),
+            "test precondition: next call must skip the eager sweep"
+        );
+
+        // A request a full window later must be admitted: the stale W0 entry is reset in place.
+        let w1 = w0 + RATE_WINDOW_SECS;
+        assert!(
+            gov.check_rate(&k, w1).is_ok(),
+            "new window admits again despite no eager sweep (per-key stale reset)"
+        );
+        // And the reset took the count back to zero, so W1's own RPM=1 is re-enforced.
+        assert!(
+            gov.check_rate(&k, w1).is_err(),
+            "W1 second rejected — counter reset to 0, not carried from W0"
+        );
+    }
+
+    #[test]
+    fn test_check_rate_sweep_evicts_silent_keys_to_bound_map() {
+        // The amortized sweep must still evict entries for keys that have gone silent in older
+        // windows, so the map stays bounded. We seed many distinct keys in W0, then trigger a sweep
+        // on a later window and confirm the stale entries are gone.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 0, 0, None).unwrap();
+        let w0 = 1_700_000_040 / 60 * 60;
+
+        for i in 0..10 {
+            let mut k = sample_key(&format!("k{i}"), &format!("h{i}"));
+            k.rpm_limit = Some(5);
+            k.tpm_limit = None;
+            assert!(gov.check_rate(&k, w0).is_ok());
+        }
+        assert_eq!(gov.rate.read().unwrap().len(), 10, "10 W0 entries present");
+
+        // Force the next call to run the eager sweep (ticker at a multiple of the interval).
+        gov.rate_sweep_ticker.store(0, Ordering::Relaxed);
+        let mut survivor = sample_key("survivor", "hs");
+        survivor.rpm_limit = Some(5);
+        survivor.tpm_limit = None;
+        let w_later = w0 + RATE_WINDOW_SECS * 2;
+        assert!(gov.check_rate(&survivor, w_later).is_ok());
+
+        let map = gov.rate.read().unwrap();
+        assert_eq!(
+            map.len(),
+            1,
+            "sweep evicted all 10 stale W0 entries, leaving only the current-window survivor"
+        );
+        assert!(map.contains_key("survivor"));
     }
 
     #[tokio::test]

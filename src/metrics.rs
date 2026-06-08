@@ -13,7 +13,10 @@ use axum::response::{IntoResponse, Response};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::sync::OnceLock;
 
-static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+// `Option` inside the cell so the (run-exactly-once) initializer can record an install FAILURE
+// without panicking: `None` = install was attempted and failed; `Some(handle)` = installed. The
+// `OnceLock` still serializes the single global `install_recorder()` call across threads/tests.
+static HANDLE: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
 
 /// The canonical busbar metric taxonomy. Names are referenced here so the emission sites and the
 /// descriptions below stay in one authoritative list.
@@ -29,12 +32,21 @@ pub(crate) const TRANSLATIONS_TOTAL: &str = "busbar_translations_total"; // labe
 /// repeatedly from tests (the global recorder can only be installed once per process, so the
 /// `OnceLock` guards it). Also registers HELP/TYPE descriptions for the taxonomy.
 pub(crate) fn init() {
-    HANDLE.get_or_init(|| {
-        let handle = PrometheusBuilder::new()
-            .install_recorder()
-            .expect("install prometheus recorder");
-        describe();
-        handle
+    // The global recorder can only be installed once per process, so the `OnceLock` runs this
+    // initializer exactly once and serializes concurrent callers (startup + tests). On install
+    // FAILURE — typically because another library already installed a global recorder — we log and
+    // store `None` rather than panicking: `init()` runs on a background thread (main.rs:134) where a
+    // panic would be silent, leaving `/metrics` empty with no operator-visible cause. Storing `None`
+    // degrades gracefully (empty exposition) AND emits an error log so the cause is discoverable.
+    HANDLE.get_or_init(|| match PrometheusBuilder::new().install_recorder() {
+        Ok(handle) => {
+            describe();
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::error!("prometheus recorder install failed; /metrics will be empty: {e}");
+            None
+        }
     });
 }
 
@@ -70,7 +82,12 @@ fn describe() {
 
 /// Render the current Prometheus exposition text. Empty until `init()` has run.
 pub(crate) fn render() -> String {
-    HANDLE.get().map(|h| h.render()).unwrap_or_default()
+    // Outer `None` = `init()` not yet run; inner `None` = recorder install failed. Both render an
+    // empty exposition rather than panicking.
+    match HANDLE.get() {
+        Some(Some(h)) => h.render(),
+        _ => String::new(),
+    }
 }
 
 /// `GET /metrics` — Prometheus text exposition (OpenMetrics-compatible 0.0.4).
@@ -108,5 +125,19 @@ mod tests {
             out.contains("outcome=\"ok\""),
             "label should render; got:\n{out}"
         );
+    }
+
+    #[test]
+    fn test_init_is_idempotent_and_does_not_panic() {
+        // Regression: `init()` no longer `expect()`s the recorder install. Calling it repeatedly
+        // (as startup + every test does) must be a no-op past the first install and must never
+        // panic — even though the global recorder can only be installed once per process. A second
+        // install attempt would fail, but the `OnceLock` short-circuits it.
+        init();
+        init();
+        init();
+        // After init, render must not panic and (in a process where install succeeded) is non-empty
+        // only once a metric is emitted; the key assertion is simply that the calls return cleanly.
+        let _ = render();
     }
 }

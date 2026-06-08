@@ -11,12 +11,16 @@ pipeline**.
                 client (any protocol)
                         │
                         ▼
-        ┌───────────────────────────────────┐
-        │  HTTP router (axum)                │   POST /<model>/v1/messages
-        │  route fixes ingress protocol:     │   POST /<provider>/<model>/v1/messages
-        │   /v1/messages        → anthropic  │   POST /v1/chat/completions
-        │   /v1/chat/completions → openai    │
-        └───────────────┬───────────────────┘
+        ┌────────────────────────────────────────────────┐
+        │  HTTP router (axum)                              │
+        │  route fixes ingress protocol (one per proto):   │
+        │   /<...>/v1/messages          → anthropic        │
+        │   /v1/chat/completions        → openai           │
+        │   /v1/responses               → responses        │
+        │   /v2/chat                    → cohere           │
+        │   /v1beta/models/{model}:...  → gemini           │
+        │   /model/{id}/converse[-stream] → bedrock        │
+        └───────────────┬──────────────────────────────────┘
                         ▼
         ┌───────────────────────────────────┐
         │  auth middleware                   │
@@ -71,13 +75,29 @@ pipeline**.
 
 ### 1. Ingress & protocol detection
 
-The route table (`src/main.rs`, `src/route.rs`) determines the **ingress protocol**
-by path, not by sniffing the body:
+The route table (`src/main.rs` `build_router`, `src/route.rs`) determines the
+**ingress protocol** by path, not by sniffing the body. All six protocols are
+first-class ingress — one route per protocol:
 
 - `POST /:name/v1/messages` → ingress `anthropic`. `name` is a model or a pool.
 - `POST /:provider/:model/v1/messages` → ingress `anthropic`, ad-hoc direct route.
 - `POST /v1/chat/completions` → ingress `openai`. The body's `model` field names the
   model or pool.
+- `POST /v1/responses` → ingress `responses` (OpenAI Responses API). Model in the body.
+- `POST /v2/chat` → ingress `cohere`. Model in the body.
+- `POST /v1beta/models/*rest` → ingress `gemini`. The model and the action
+  (`:generateContent` / `:streamGenerateContent`) are packed into the last path
+  segment after a `:`; axum can't split on `:` inside a segment, so the tail is
+  captured with a wildcard and split in `gemini_ingress`.
+- `POST /model/:model_id/converse` and `/model/:model_id/converse-stream` → ingress
+  `bedrock`. The model is in the path; the streaming variant is selected by the
+  endpoint suffix.
+
+This splits cleanly into **body-model protocols** (`openai`, `responses`, `cohere`
+— the model/pool lives in the request body) and **path-model protocols**
+(`anthropic`, `gemini`, `bedrock` — the model/pool lives in the URL). A small
+injection shim normalises both into the same internal model/pool selection so the
+rest of the pipeline is protocol-agnostic.
 
 Management/observability routes (`/stats`, `/healthz`, `/metrics`,
 `/admin/keys...`) are handled separately.

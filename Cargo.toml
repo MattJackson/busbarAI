@@ -28,7 +28,13 @@ futures = "0.3"
 bytes = "1"
 http-body-util = "0.1"
 metrics = "0.24.6"
-metrics-exporter-prometheus = "0.18.3"
+# busbar uses this purely as an in-process recorder: `PrometheusBuilder::new().install_recorder()`
+# plus `handle.render()` (src/metrics.rs), serving the text exposition from its own axum /metrics
+# admin route. The crate's `default` feature enables `http-listener` and `push-gateway`, which drag
+# in hyper/hyper-rustls/hyper-util/rustls (an HTTP server + push client busbar never invokes) and a
+# second crypto backend (aws-lc-rs). Dropped for the same reason tokio/reqwest/otlp are hand-trimmed:
+# shrink the request-path binary's compile + attack surface.
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 opentelemetry = "0.32.0"
 opentelemetry_sdk = "0.32.1"
 # Pin OTLP to the HTTP/proto trace path busbar uses (`SpanExporter::builder().with_http()`), with

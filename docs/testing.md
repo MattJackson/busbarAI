@@ -7,8 +7,8 @@ is [ADR-0002](adr/0002-circuit-breaker.md).
 
 ## Shape of the suite
 
-All tests are **in-crate** and run under `cargo test` (267 tests at time of
-writing). There is no `tests/` directory of integration binaries. Two patterns:
+All tests are **in-crate** and run under `cargo test`. There is no `tests/`
+directory of integration binaries. Two patterns:
 
 - **Per-module `#[cfg(test)] mod tests`** — unit tests next to the code they cover
   (`store.rs` breaker FSM, `breaker.rs` classification, `sigv4.rs` against AWS's

@@ -20,7 +20,7 @@ and the two common extension tasks.
 | `config.rs` | The deploy/provider/pool schema (`DeployCfg`, `ProviderDef`, `ProviderDeploy`, `ModelCfg`, `PoolCfg`, `PoolMember`, `FailoverCfg`, `AffinityCfg`, `BreakerCfg`, `HealthCfg`, `GovernanceCfg`, `ObservabilityCfg`, `OnExhausted`), `interpolate_env`, and `resolve()` (merge catalog def + deployment override). |
 | `config_validate.rs` | Post-resolve config validation (fail-loud diagnostics before lanes are built). |
 | `state.rs` | Runtime types: `Lane`, `WeightedLane`, `PoolRuntime`, and the `App` shared state. |
-| `route.rs` | Axum handlers: `openai_ingress` (`/v1/chat/completions`), `named` (`/:name/v1/messages`), `adhoc` (`/:provider/:model/v1/messages`); governance pre-checks (allowed-pools/budget/rate); affinity-header resolution; `UsageSink` construction. |
+| `route.rs` | Axum handlers — one per ingress protocol: `openai_ingress` (`/v1/chat/completions`), `cohere_ingress` (`/v2/chat`), `responses_ingress` (`/v1/responses`), `gemini_ingress` (`/v1beta/models/*rest`), `bedrock_converse` / `bedrock_converse_stream` (`/model/:model_id/converse[-stream]`), `named` (`/:name/v1/messages`), `adhoc` (`/:provider/:model/v1/messages`); governance pre-checks (allowed-pools/budget/rate); affinity-header resolution; `UsageSink` construction. |
 | `auth.rs` | `AuthMode` (none/token/passthrough), `AuthMiddleware`, the `auth_middleware` layer (open `/healthz` `/metrics`, admin-token guard for `/admin/*`, virtual-key resolution, passthrough token threading), constant-time token compare. |
 | `forward.rs` | The forwarding engine: `forward` / `forward_with_pool` (selection → translate → sign → POST → classify → stream/failover), `RequestCtx` (deadline + exclusions + visited-pools), `FirstByteBody` (streaming body with the before-first-byte failover boundary + cross-protocol `StreamTranslate` wiring), `UsageTap`/`UsageSink`, `lane_auth_headers` (the `api-key` auth-adapter seam), and the `on_exhausted` handlers (`Status503`/`FallbackPool`/`LeastBad`). |
 | `breaker.rs` | The protocol-agnostic Stage 1b/2 classifier: `StatusClass`, `Disposition`, `RawUpstreamError`, `CanonicalSignal`, `normalize_raw_error`, `classify` (exhaustive). |
@@ -47,12 +47,12 @@ Single Rust binary, stable toolchain, edition 2021.
 ```bash
 cargo build                                   # debug build
 cargo build --release                         # release binary -> target/release/busbar
-cargo test                                    # full suite (267 tests)
+cargo test                                    # full in-crate suite
 cargo clippy --all-targets -- -D warnings     # lints must be clean (treat warnings as errors)
 cargo fmt --all                               # format (rustfmt.toml in repo)
 ```
 
-The test suite (267 tests at time of writing) is **in-crate**: a shared
+The test suite is **in-crate**: a shared
 `#[cfg(test)] mod test_support` provides the `MockServer` harness, and each module
 carries its own `#[cfg(test)] mod tests`. There are no `tests/` integration
 binaries — everything runs under `cargo test`. See [testing.md](testing.md).

@@ -181,10 +181,18 @@ impl AuthMiddleware {
                     return false;
                 }
 
-                // Constant-time compare against each allowed token.
-                self.client_tokens
-                    .iter()
-                    .any(|allowed| Self::constant_time_eq(token, allowed))
+                // Constant-time compare against EVERY allowed token. `.any()` would short-circuit
+                // on the first match, making the number of `constant_time_eq` calls depend on the
+                // matched token's position in the allowlist (a match at index 0 returns after one
+                // comparison; a miss scans all N) — a list-level timing oracle that lets an
+                // adversary distinguish "matched early" from "matched late" / "not found". Fold
+                // with bitwise-OR (`|`, NOT `||`) so all N comparisons always run regardless of
+                // where (or whether) a match occurs; `black_box` keeps the optimizer from
+                // reintroducing an early exit.
+                let found = self.client_tokens.iter().fold(0u8, |acc, allowed| {
+                    acc | u8::from(Self::constant_time_eq(token, allowed))
+                });
+                std::hint::black_box(found) != 0
             }
             AuthMode::Passthrough | AuthMode::None => true,
         }
@@ -198,7 +206,13 @@ impl AuthMiddleware {
 fn proto_for_path(path: &str) -> &'static str {
     if path.starts_with("/v1beta/models") {
         "gemini"
-    } else if path.starts_with("/model/") {
+    } else if path.starts_with("/model/")
+        && (path.ends_with("/converse") || path.ends_with("/converse-stream"))
+    {
+        // Bedrock's Converse API is `/model/<id>/converse[-stream]`. Require that suffix so a pool
+        // or model literally named "model" hitting `/model/v1/messages` is NOT misclassified as
+        // bedrock (which would hand it a Bedrock-shaped 401 envelope — a protocol tell). Such a
+        // path falls through to the `/v1/messages` (anthropic) arm below.
         "bedrock"
     } else if path == "/v1/messages" || path.ends_with("/v1/messages") {
         "anthropic"
@@ -241,11 +255,14 @@ pub(crate) async fn auth_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
-    // /healthz and /metrics are always open: liveness and Prometheus scraping must not require a
-    // caller token (operators protect /metrics at the network layer if needed). Clone the path so
+    // /healthz is always open: liveness probes must not require a caller token. /metrics is NOT
+    // exempted — Prometheus telemetry (lane/pool topology, per-protocol counters, error rates) is a
+    // fingerprinting / information-disclosure surface, so it goes through the same auth check as any
+    // other route. Operators scraping from a localhost sidecar use a configured token (or run under
+    // `none`/`passthrough` mode, where `validate_token` admits unconditionally). Clone the path so
     // no immutable borrow of `req` is held while we later mutate its extensions.
     let path = req.uri().path().to_owned();
-    if path == "/healthz" || path == "/metrics" {
+    if path == "/healthz" {
         return Ok(next.run(req).await);
     }
 
@@ -408,6 +425,27 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_token_matches_any_allowlist_position() {
+        // Regression for the list-level timing oracle: validation must compare against EVERY
+        // configured token (bitwise-OR fold, no `.any()` short-circuit). Behaviorally this means a
+        // match is found regardless of the token's ordinal position — first, middle, or last.
+        let cfg = AuthCfg {
+            mode: "token".to_string(),
+            client_tokens: vec![
+                "first-token".to_string(),
+                "middle-token".to_string(),
+                "last-token".to_string(),
+            ],
+            _legacy_token: None,
+        };
+        let mw = AuthMiddleware::new(&cfg);
+        assert!(mw.validate_token(Some("first-token")), "match at index 0");
+        assert!(mw.validate_token(Some("middle-token")), "match at index 1");
+        assert!(mw.validate_token(Some("last-token")), "match at last index");
+        assert!(!mw.validate_token(Some("absent-token")), "no match");
+    }
+
+    #[test]
     fn test_auth_mode_passthrough() {
         let cfg = AuthCfg {
             mode: "passthrough".to_string(),
@@ -566,6 +604,15 @@ mod tests {
             proto_for_path("/model/anthropic.claude/converse"),
             "bedrock"
         );
+        assert_eq!(
+            proto_for_path("/model/anthropic.claude/converse-stream"),
+            "bedrock"
+        );
+        // A pool/model literally named "model" hitting `/model/v1/messages` must NOT be classified
+        // as bedrock (no `/converse[-stream]` suffix) — it falls through to anthropic.
+        assert_eq!(proto_for_path("/model/v1/messages"), "anthropic");
+        // `/model/` prefix without a Converse suffix and without `/v1/messages` is unknown → openai.
+        assert_eq!(proto_for_path("/model/foo/bar"), "openai");
         assert_eq!(proto_for_path("/v1/messages"), "anthropic");
         assert_eq!(proto_for_path("/pa/v1/messages"), "anthropic");
         assert_eq!(proto_for_path("/anthropic/claude/v1/messages"), "anthropic");
@@ -855,6 +902,135 @@ mod tests {
             401,
             "an enabled virtual key must pass auth (got {})",
             r_ena.status()
+        );
+
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// End-to-end through the real router + `auth_middleware` in GOVERNANCE mode, exercising the
+    /// non-`Authorization` carriers (`x-goog-api-key`, `x-api-key`) into the virtual-key lookup.
+    /// The existing governance test only uses `Authorization: Bearer`, and the multi-carrier test
+    /// runs under static-token mode (`governance=None`) — so the intersection (a virtual key
+    /// presented via a vendor-SDK carrier resolving the governance lookup) was untested. A
+    /// regression that stopped threading those carriers into `gov.lookup` would otherwise pass CI.
+    #[tokio::test]
+    async fn test_governance_accepts_vendor_carriers_and_native_401() {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+        use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        crate::metrics::init();
+
+        let state = Arc::new(MockServerState::new());
+        // Two admitted requests (x-goog-api-key, x-api-key) reach the upstream; queue two bodies.
+        for _ in 0..2 {
+            state.push(MockResponse::Ok {
+                status: axum::http::StatusCode::OK,
+                body: json!({
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "test-model",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }),
+            });
+        }
+        let server = MockServer::new(state).await;
+
+        let secret = "sk-vk-carrier";
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .put_key(&VirtualKey {
+                id: "kc".to_string(),
+                key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
+                name: "kc".to_string(),
+                allowed_pools: vec!["pa".to_string()],
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "test-model",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .api_key("busbar-upstream-key"),
+            )
+            .pool("pa", &[(0, 1)])
+            .governance(gov)
+            .build();
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/pa/v1/messages");
+        let body = json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+            .to_string();
+
+        // Valid virtual key via x-goog-api-key (Gemini SDK carrier) → admitted past governance auth.
+        let r_goog = client
+            .post(&url)
+            .header("x-goog-api-key", secret)
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r_goog.status().as_u16(),
+            401,
+            "valid virtual key via x-goog-api-key must pass governance (got {})",
+            r_goog.status()
+        );
+
+        // Valid virtual key via x-api-key (Anthropic SDK carrier) → admitted past governance auth.
+        let r_xapi = client
+            .post(&url)
+            .header("x-api-key", secret)
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r_xapi.status().as_u16(),
+            401,
+            "valid virtual key via x-api-key must pass governance (got {})",
+            r_xapi.status()
+        );
+
+        // Bad secret via x-goog-api-key → native JSON 401 (governance lookup miss).
+        let r_bad = client
+            .post(&url)
+            .header("x-goog-api-key", "sk-vk-nope")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r_bad.status().as_u16(),
+            401,
+            "an unknown virtual key via x-goog-api-key must be 401"
+        );
+        assert_eq!(
+            r_bad
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "401 must carry the native application/json envelope, not text/plain"
         );
 
         handle.abort();

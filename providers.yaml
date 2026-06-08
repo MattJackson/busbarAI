@@ -8,7 +8,7 @@
 # deploy by referencing a provider name in config.yaml and supplying its key via an env var.
 #
 # busbar's thesis is "protocols, not providers": it implements a small set of wire protocols
-# (anthropic, openai, gemini, bedrock, responses) losslessly, and any provider speaking one of
+# (anthropic, openai, gemini, bedrock, responses, cohere) losslessly, and any provider speaking one of
 # those protocols is just a catalog entry here — no new code. A client speaking any protocol can
 # target any provider; busbar translates through its superset IR when they differ.
 #

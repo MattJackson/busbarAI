@@ -34,25 +34,25 @@ pub(crate) struct ResponsesReader;
 
 impl ProtocolReader for ResponsesReader {
     fn extract_error(&self, status: StatusCode, body: &[u8]) -> crate::breaker::RawUpstreamError {
-        let provider_code = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-            json.get("error")
-                .and_then(|e| e.as_object())
-                .and_then(|e_obj| e_obj.get("code"))
-                .and_then(|c| c.as_str())
-                .map(String::from)
-        } else {
-            None
-        };
-
-        let structured_type = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-            json.get("error")
-                .and_then(|e| e.as_object())
-                .and_then(|e_obj| e_obj.get("type"))
-                .and_then(|t| t.as_str())
-                .map(String::from)
-        } else {
-            None
-        };
+        // Parse the error body ONCE and pull both fields from the single JSON tree, rather than
+        // re-parsing the same bytes per field (matches the anthropic.rs pattern; error paths are
+        // already degraded — avoid the extra parse+alloc on every non-2xx response).
+        let (provider_code, structured_type) =
+            match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(json) => {
+                    let error = json.get("error").and_then(|e| e.as_object());
+                    let provider_code = error
+                        .and_then(|e_obj| e_obj.get("code"))
+                        .and_then(|c| c.as_str())
+                        .map(String::from);
+                    let structured_type = error
+                        .and_then(|e_obj| e_obj.get("type"))
+                        .and_then(|t| t.as_str())
+                        .map(String::from);
+                    (provider_code, structured_type)
+                }
+                Err(_) => (None, None),
+            };
 
         crate::breaker::RawUpstreamError {
             http_status: status.as_u16(),
@@ -242,8 +242,12 @@ impl ProtocolReader for ResponsesReader {
                                 .get("arguments")
                                 .and_then(|a| a.as_str())
                                 .unwrap_or("{}");
-                            let input =
-                                serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+                            // On malformed argument JSON, preserve the raw string rather than
+                            // discarding the caller's tool arguments to Null (mirrors the OpenAI
+                            // reader). Losing arguments entirely is a lossy cross-protocol bug.
+                            let input = serde_json::from_str(arguments).unwrap_or_else(|_| {
+                                serde_json::Value::String(arguments.to_string())
+                            });
 
                             messages.push(crate::ir::IrMessage {
                                 role: crate::ir::IrRole::Assistant,
@@ -537,9 +541,39 @@ impl ProtocolReader for ResponsesReader {
                         .and_then(|s| s.as_str())
                         .unwrap_or("");
 
+                    // A genuinely failed terminal stream must NOT be decoded as a successful
+                    // end_turn — that would mask the upstream failure from a downstream client
+                    // (e.g. an Anthropic client would see stop_reason=end_turn). Surface it as an
+                    // explicit IrStreamEvent::Error so the failure propagates, then still terminate
+                    // the stream so consumers do not hang.
+                    if status == "failed" {
+                        let provider_signal = response_obj
+                            .get("error")
+                            .and_then(|e| e.get("code"))
+                            .and_then(|c| c.as_str())
+                            .or_else(|| {
+                                response_obj
+                                    .get("error")
+                                    .and_then(|e| e.get("type"))
+                                    .and_then(|t| t.as_str())
+                            })
+                            .map(String::from)
+                            .or_else(|| Some("response_failed".to_string()));
+                        out.push(IrStreamEvent::Error(IrError {
+                            class: StatusClass::ServerError,
+                            provider_signal,
+                            retry_after: None,
+                        }));
+                        out.push(IrStreamEvent::MessageStop);
+                        return out;
+                    }
+
+                    // Enumerate the recognized statuses rather than defaulting unknown ones to a
+                    // successful end_turn. An unrecognized status is treated as a terminal stop
+                    // with no specific reason (None) rather than silently claiming success.
                     let stop_reason = match status {
                         "completed" => Some("end_turn".to_string()),
-                        "incomplete" | "failed" => {
+                        "incomplete" => {
                             if let Some(incomplete_details) = response_obj.get("incomplete_details")
                             {
                                 if let Some(reason) =
@@ -557,7 +591,8 @@ impl ProtocolReader for ResponsesReader {
                                 Some("end_turn".to_string())
                             }
                         }
-                        _ => Some("end_turn".to_string()),
+                        "" => Some("end_turn".to_string()),
+                        _ => None,
                     };
 
                     let usage = response_obj
@@ -679,8 +714,10 @@ impl ProtocolReader for ResponsesReader {
                             .get("arguments")
                             .and_then(|a| a.as_str())
                             .unwrap_or("{}");
-                        let input =
-                            serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+                        // Preserve the raw string on malformed JSON rather than dropping the tool
+                        // arguments to Null (mirrors the OpenAI reader; avoids lossy translation).
+                        let input = serde_json::from_str(arguments)
+                            .unwrap_or_else(|_| serde_json::Value::String(arguments.to_string()));
 
                         content.push(crate::ir::IrBlock::ToolUse {
                             id: call_id,
@@ -864,6 +901,12 @@ impl ProtocolWriter for ResponsesWriter {
                     };
 
                     let mut content_arr: Vec<serde_json::Value> = Vec::new();
+                    // function_call / function_call_output items are flat top-level `input`
+                    // entries in the Responses API, NOT nested inside a message's `content`.
+                    // Collect them separately so the enclosing assistant `message` is emitted
+                    // FIRST (and only when it actually has content), with the tool items appended
+                    // after it in order — matching the conversation order the assistant produced.
+                    let mut tool_items: Vec<serde_json::Value> = Vec::new();
                     for block in &msg.content {
                         match block {
                             crate::ir::IrBlock::Text { text, .. } => {
@@ -887,7 +930,7 @@ impl ProtocolWriter for ResponsesWriter {
                             crate::ir::IrBlock::ToolUse { id, name, input } => {
                                 let args_str = serde_json::to_string(input)
                                     .unwrap_or_else(|_| "{}".to_string());
-                                input_arr.push(serde_json::json!({
+                                tool_items.push(serde_json::json!({
                                     "type": "function_call",
                                     "call_id": id,
                                     "name": name,
@@ -908,7 +951,7 @@ impl ProtocolWriter for ResponsesWriter {
                                     .collect::<Vec<_>>()
                                     .join(" ");
 
-                                input_arr.push(serde_json::json!({
+                                tool_items.push(serde_json::json!({
                                     "type": "function_call_output",
                                     "call_id": tool_use_id,
                                     "output": output_text
@@ -918,10 +961,19 @@ impl ProtocolWriter for ResponsesWriter {
                         }
                     }
 
-                    let mut msg_obj = serde_json::Map::new();
-                    msg_obj.insert("role".to_string(), serde_json::json!(role_str));
-                    msg_obj.insert("content".to_string(), serde_json::Value::Array(content_arr));
-                    input_arr.push(serde_json::Value::Object(msg_obj));
+                    // Emit the assistant/user `message` wrapper only when it carries content. A
+                    // turn that is purely a tool call must NOT produce a spurious
+                    // `{role, content: []}` item — the Responses API rejects empty-content
+                    // message items.
+                    if !content_arr.is_empty() {
+                        let mut msg_obj = serde_json::Map::new();
+                        msg_obj.insert("role".to_string(), serde_json::json!(role_str));
+                        msg_obj
+                            .insert("content".to_string(), serde_json::Value::Array(content_arr));
+                        input_arr.push(serde_json::Value::Object(msg_obj));
+                    }
+                    // Then the flat tool items, in order, AFTER the message they belong to.
+                    input_arr.extend(tool_items);
                 }
 
                 crate::ir::IrRole::Tool => {
@@ -1056,11 +1108,16 @@ impl ProtocolWriter for ResponsesWriter {
             )),
 
             IrStreamEvent::MessageDelta { stop_reason, usage } => {
+                // Map IR stop reasons to Responses statuses. An unknown/None reason defaults to
+                // `completed` (the safe choice) rather than `failed`: a future IR reason (e.g. a
+                // new `refusal`) that did NOT explicitly signal an error must not be misclassified
+                // as a failed response, which would trigger client-side error handling for a
+                // successful turn. Genuine failures arrive via IrStreamEvent::Error, not here.
                 let status = match stop_reason.as_deref() {
                     Some("tool_use") | Some("end_turn") | Some("stop_sequence") => "completed",
                     Some("max_tokens") => "incomplete",
                     Some("safety") => "incomplete",
-                    _ => "failed",
+                    _ => "completed",
                 };
 
                 let mut resp_obj = serde_json::Map::new();
@@ -1092,35 +1149,49 @@ impl ProtocolWriter for ResponsesWriter {
                 );
                 resp_obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
 
+                // `status` is now always `completed`/`incomplete` (genuine failures arrive via
+                // IrStreamEvent::Error, never here), so the terminal event is `response.completed`.
                 Some((
-                    if status == "failed" {
-                        "response.failed".to_string()
-                    } else {
-                        "response.completed".to_string()
-                    },
+                    "response.completed".to_string(),
                     serde_json::json!({ "response": resp_obj }),
                 ))
             }
 
             IrStreamEvent::MessageStop => None,
 
-            IrStreamEvent::Error(err) => Some((
-                "response.failed".to_string(),
-                serde_json::json!({
-                    "error": {
-                        "message": err.provider_signal.clone().unwrap_or_else(|| "error".to_string())
-                    }
-                }),
-            )),
+            IrStreamEvent::Error(err) => {
+                // Emit the full Responses/OpenAI error object so an SDK that branches on
+                // `error.type`/`error.code` sees the same shape as a native error event, not a
+                // partial `{message}`. We have no typed code/param here, so default `type` to
+                // `server_error` and leave `code`/`param` explicitly null.
+                let message = err
+                    .provider_signal
+                    .clone()
+                    .unwrap_or_else(|| "error".to_string());
+                Some((
+                    "response.failed".to_string(),
+                    serde_json::json!({
+                        "error": {
+                            "message": message,
+                            "type": "server_error",
+                            "code": serde_json::Value::Null,
+                            "param": serde_json::Value::Null,
+                        }
+                    }),
+                ))
+            }
         }
     }
 
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
+        // Unknown/None stop reasons default to `completed` (not `failed`): a future IR reason that
+        // did not explicitly signal an error must not surface as a failed response to a Responses
+        // client. Only the explicitly-mapped incomplete reasons downgrade the status.
         let status = match resp.stop_reason.as_deref() {
             Some("tool_use") | Some("end_turn") | Some("stop_sequence") => "completed",
             Some("max_tokens") => "incomplete",
             Some("safety") => "incomplete",
-            _ => "failed",
+            _ => "completed",
         };
 
         let mut output_arr: Vec<serde_json::Value> = Vec::new();
@@ -2070,6 +2141,304 @@ mod tests {
         match &ir.messages[0].content[0] {
             crate::ir::IrBlock::Text { text, .. } => assert_eq!(text, "hello"),
             other => panic!("expected text turn, got {other:?}"),
+        }
+    }
+
+    /// Regression: an assistant turn that is PURELY a tool call must emit a flat `function_call`
+    /// item and NO companion empty-content assistant `message` wrapper. The Responses API rejects
+    /// assistant message items with `content: []`.
+    #[test]
+    fn test_tool_only_assistant_turn_no_empty_message_wrapper() {
+        let ir = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Assistant,
+                content: vec![crate::ir::IrBlock::ToolUse {
+                    id: "fc_1".to_string(),
+                    name: "get_weather".to_string(),
+                    input: serde_json::json!({"city": "SF"}),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let writer = ResponsesWriter;
+        let json = writer.write_request(&ir);
+        let input = json
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input should exist");
+        // Exactly one item: the function_call. No empty-content assistant message.
+        assert_eq!(
+            input.len(),
+            1,
+            "tool-only turn must not emit an empty message wrapper, got {input:?}"
+        );
+        assert_eq!(
+            input[0].get("type").and_then(|t| t.as_str()),
+            Some("function_call")
+        );
+        // No item should be a message with an empty content array.
+        for item in input {
+            if item.get("role").is_some() {
+                let content = item.get("content").and_then(|c| c.as_array());
+                assert!(
+                    content.map(|c| !c.is_empty()).unwrap_or(true),
+                    "no assistant message item may have empty content"
+                );
+            }
+        }
+    }
+
+    /// Regression: an assistant turn carrying BOTH text and a tool call must emit the assistant
+    /// `message` (with the text) FIRST, then the flat `function_call` item AFTER it — preserving
+    /// the conversation order the assistant produced.
+    #[test]
+    fn test_assistant_text_then_tool_call_order() {
+        let ir = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Assistant,
+                content: vec![
+                    crate::ir::IrBlock::Text {
+                        text: "Let me check.".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    },
+                    crate::ir::IrBlock::ToolUse {
+                        id: "fc_9".to_string(),
+                        name: "lookup".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let writer = ResponsesWriter;
+        let json = writer.write_request(&ir);
+        let input = json
+            .get("input")
+            .and_then(|v| v.as_array())
+            .expect("input should exist");
+        assert_eq!(
+            input.len(),
+            2,
+            "expected message + function_call, got {input:?}"
+        );
+        // Message first.
+        assert_eq!(
+            input[0].get("role").and_then(|r| r.as_str()),
+            Some("assistant")
+        );
+        let content = input[0]
+            .get("content")
+            .and_then(|c| c.as_array())
+            .expect("message content");
+        assert_eq!(
+            content[0].get("text").and_then(|t| t.as_str()),
+            Some("Let me check.")
+        );
+        // function_call after it.
+        assert_eq!(
+            input[1].get("type").and_then(|t| t.as_str()),
+            Some("function_call")
+        );
+        assert_eq!(
+            input[1].get("call_id").and_then(|c| c.as_str()),
+            Some("fc_9")
+        );
+    }
+
+    /// Regression: a streaming `response.failed` (status=="failed") must surface an
+    /// IrStreamEvent::Error followed by MessageStop, NOT a successful end_turn MessageDelta that
+    /// would mask the failure from a downstream client.
+    #[test]
+    fn test_stream_failed_status_emits_error_not_end_turn() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = reader_read_response_events(
+            "response.failed",
+            &serde_json::json!({
+                "response": {
+                    "status": "failed",
+                    "error": {"code": "server_error", "type": "server_error"}
+                }
+            }),
+            &mut state,
+        );
+        assert_eq!(
+            events.len(),
+            2,
+            "expected Error + MessageStop, got {events:?}"
+        );
+        match &events[0] {
+            crate::ir::IrStreamEvent::Error(err) => {
+                assert_eq!(err.provider_signal.as_deref(), Some("server_error"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(matches!(events[1], crate::ir::IrStreamEvent::MessageStop));
+        // Crucially, no MessageDelta with end_turn was emitted.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, crate::ir::IrStreamEvent::MessageDelta { .. })),
+            "failed stream must not emit a MessageDelta"
+        );
+    }
+
+    /// Regression: an unknown terminal status must not be decoded as a successful end_turn; its
+    /// stop_reason is None (terminal, but no success claim).
+    #[test]
+    fn test_stream_unknown_status_not_end_turn() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = reader_read_response_events(
+            "response.completed",
+            &serde_json::json!({"response": {"status": "some_future_status"}}),
+            &mut state,
+        );
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            crate::ir::IrStreamEvent::MessageDelta { stop_reason, .. } => {
+                assert_eq!(*stop_reason, None, "unknown status must not claim end_turn");
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+        assert!(matches!(events[1], crate::ir::IrStreamEvent::MessageStop));
+    }
+
+    /// Regression: the streaming error event must carry the full Responses error object
+    /// (`type`/`code`/`param`), not just `message`, so SDK clients that branch on `error.type`
+    /// see the native shape.
+    #[test]
+    fn test_write_error_stream_event_full_shape() {
+        let writer = ResponsesWriter;
+        let ev = crate::ir::IrStreamEvent::Error(IrError {
+            class: StatusClass::ServerError,
+            provider_signal: Some("boom".to_string()),
+            retry_after: None,
+        });
+        let (etype, payload) = writer
+            .write_response_event(&ev)
+            .expect("error event should emit");
+        assert_eq!(etype, "response.failed");
+        let err = payload.get("error").expect("error object present");
+        assert_eq!(err.get("message").and_then(|m| m.as_str()), Some("boom"));
+        assert_eq!(
+            err.get("type").and_then(|t| t.as_str()),
+            Some("server_error")
+        );
+        assert!(err.get("code").is_some(), "code key must be present");
+        assert!(err.get("param").is_some(), "param key must be present");
+        assert!(err.get("code").unwrap().is_null());
+        assert!(err.get("param").unwrap().is_null());
+    }
+
+    /// Regression: an unknown/unmapped stop_reason must map to a `completed` status (not `failed`),
+    /// so a future IR reason that did not signal an error is not misclassified as a failure.
+    #[test]
+    fn test_unknown_stop_reason_maps_to_completed() {
+        let writer = ResponsesWriter;
+        // Streaming MessageDelta path.
+        let ev = crate::ir::IrStreamEvent::MessageDelta {
+            stop_reason: Some("refusal".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (etype, payload) = writer.write_response_event(&ev).expect("should emit");
+        assert_eq!(etype, "response.completed");
+        assert_eq!(
+            payload
+                .get("response")
+                .and_then(|r| r.get("status"))
+                .and_then(|s| s.as_str()),
+            Some("completed"),
+            "unknown stop_reason must map to completed in stream"
+        );
+
+        // Non-streaming write_response path.
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "ok".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("refusal".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: Some("resp_x".to_string()),
+            created: Some(1),
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = writer.write_response(&resp);
+        assert_eq!(
+            out.get("status").and_then(|s| s.as_str()),
+            Some("completed"),
+            "unknown stop_reason must map to completed in write_response"
+        );
+    }
+
+    /// Regression: malformed function_call arguments must be preserved as the raw string, not
+    /// dropped to Null (mirrors the OpenAI reader). Covers both the request and response readers.
+    #[test]
+    fn test_malformed_function_call_args_preserved() {
+        let reader = ResponsesReader;
+
+        // read_request path.
+        let req_json = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "function_call", "call_id": "fc_1", "name": "f", "arguments": "not-json{"}
+            ]
+        });
+        let ir = reader.read_request(&req_json).expect("read_request ok");
+        let tool_use = ir
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                crate::ir::IrBlock::ToolUse { input, .. } => Some(input),
+                _ => None,
+            })
+            .expect("tool use present");
+        assert_eq!(
+            tool_use.as_str(),
+            Some("not-json{"),
+            "malformed args must be preserved as raw string, not Null"
+        );
+
+        // read_response path.
+        let resp_json = serde_json::json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {"type": "function_call", "call_id": "fc_2", "name": "g", "arguments": "broken]"}
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let resp = reader.read_response(&resp_json).expect("read_response ok");
+        match &resp.content[0] {
+            crate::ir::IrBlock::ToolUse { input, .. } => {
+                assert_eq!(input.as_str(), Some("broken]"));
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
         }
     }
 
