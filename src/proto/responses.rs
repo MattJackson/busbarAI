@@ -4,51 +4,12 @@
 //! OpenAI Responses API protocol reader/writer implementation.
 
 use super::*;
-use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Monotonic per-process counter mixed into synthesized response ids so two responses minted in
 /// the same wall-clock second still get distinct `resp_` ids. Paired with the unix timestamp this
 /// gives a collision-free id without pulling in a UUID/random crate (no new dependency).
 static RESPONSE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-thread_local! {
-    /// Per-stream `sequence_number` counter for the Responses streaming writer.
-    ///
-    /// EVERY native `/v1/responses` SSE event carries a top-level monotonically-increasing integer
-    /// `sequence_number` starting at 0 (it is a REQUIRED field on the official SDK's `Response*Event`
-    /// types). The writer (`ResponsesWriter`) is a zero-sized unit struct constructed by
-    /// `Protocol::responses()` and dispatched via `&self` through the `ProtocolWriter` vtable, so it
-    /// holds no instance state to thread a counter through. The counter therefore lives in
-    /// thread-local storage, keyed implicitly by the runtime worker driving the stream.
-    ///
-    /// Correctness contract: a single cross-protocol stream's events are emitted by
-    /// `StreamTranslate::feed`/`finish`, which borrow `&mut self` and run synchronously — one stream's
-    /// buffered events are fully written before another stream's bytes are processed, with no `.await`
-    /// interleaving inside the emit loop. The counter is RESET to 0 when the stream's opening event
-    /// (`MessageStart` → `response.created`) is written, so each stream's `sequence_number` sequence
-    /// begins at 0 and increases by one per emitted event for the remainder of that stream. The reader
-    /// side gates `MessageStart` on `state.started`, so exactly one opening event (one reset) is
-    /// produced per stream.
-    static RESPONSE_SEQUENCE: Cell<u64> = const { Cell::new(0) };
-}
-
-/// Reset the per-stream `sequence_number` counter to 0. Called when the stream's opening
-/// `response.created` event is written so every stream's sequence starts from 0.
-fn reset_sequence_number() {
-    RESPONSE_SEQUENCE.with(|c| c.set(0));
-}
-
-/// Return the next `sequence_number` for the current stream and advance the counter. The first call
-/// after a [`reset_sequence_number`] returns 0, the next 1, and so on — matching the native
-/// monotonic-from-0 contract.
-fn next_sequence_number() -> u64 {
-    RESPONSE_SEQUENCE.with(|c| {
-        let n = c.get();
-        c.set(n.saturating_add(1));
-        n
-    })
-}
 
 /// Synthesize a stable per-output-item id for the streaming writer. Native Responses events carry an
 /// `item_id` (`msg_…` for message parts, `fc_…` for function-call parts) that is constant across the
@@ -943,8 +904,76 @@ fn responses_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, 
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct ResponsesWriter;
+/// OpenAI Responses streaming writer.
+///
+/// EVERY native `/v1/responses` SSE event carries a top-level monotonically-increasing integer
+/// `sequence_number` starting at 0 (a REQUIRED field on the official SDK's `Response*Event` types).
+/// That counter is PER STREAM, not per process or per worker thread.
+///
+/// A previous revision kept the counter in thread-local storage, keyed implicitly by the Tokio
+/// worker driving the stream. That is unsound on the multi-thread work-stealing runtime: two
+/// concurrent streams scheduled on the same worker share one cell, and the second stream's opening
+/// `response.created` (which resets the counter to 0) silently clobbers the first stream's in-flight
+/// counter — producing non-monotonic `sequence_number`s that a native SDK rejects. The bleed is
+/// invisible from any single stream's emitted JSON.
+///
+/// The counter therefore lives in per-stream INSTANCE state. `StreamTranslate::new` builds a FRESH
+/// `Protocol::responses()` (hence a fresh `ResponsesWriter` with a zeroed counter) for each stream,
+/// so the counter is stream-scoped by construction and the increments are plain `&self` atomics on
+/// that one owned instance — no thread affinity, so the counter follows the stream across Tokio
+/// worker migrations.
+pub(crate) struct ResponsesWriter {
+    /// Per-stream `sequence_number` counter. Reset to 0 on the stream's opening `MessageStart`
+    /// (`response.created`) and advanced once per emitted event for the rest of the stream.
+    /// `AtomicU64` (not `Cell`) so the writer stays `Sync` as the `ProtocolWriter` trait requires;
+    /// the stream is single-threaded at any instant, so `Relaxed` ordering is sufficient.
+    sequence: AtomicU64,
+}
+
+/// Value-namespace constructor for [`ResponsesWriter`]. A `const` and a struct may share a name
+/// (they live in the value and type namespaces respectively), so `Protocol::responses()` can keep
+/// writing the bare `ResponsesWriter` literal while the type now carries per-stream state. Each
+/// USE of the const inlines a fresh `ResponsesWriter { sequence: AtomicU64::new(0) }`, so every
+/// `Protocol::responses()` call mints an independent zeroed counter — exactly the per-stream
+/// scoping the `sequence_number` contract needs. `AtomicU64::new` is a const fn, so this is valid
+/// in const context (an `Arc` counter would not be).
+///
+/// `clippy::declare_interior_mutable_const` warns that a `const` with interior mutability is
+/// inlined per use rather than shared. That per-use fresh instance is PRECISELY the semantics we
+/// need: a `static` would share ONE counter across every stream in the process — reintroducing the
+/// cross-stream `sequence_number` bleed this change exists to fix. So the lint's suggestion is
+/// wrong for this site and is suppressed deliberately.
+#[allow(non_upper_case_globals)]
+#[allow(clippy::declare_interior_mutable_const)]
+pub(crate) const ResponsesWriter: ResponsesWriter = ResponsesWriter {
+    sequence: AtomicU64::new(0),
+};
+
+impl Clone for ResponsesWriter {
+    fn clone(&self) -> Self {
+        // Preserve the current counter value on clone so a `Protocol::clone` mid-stream keeps the
+        // same `sequence_number` position rather than resetting to 0.
+        ResponsesWriter {
+            sequence: AtomicU64::new(self.sequence.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl ResponsesWriter {
+    /// Reset the per-stream `sequence_number` counter to 0. Called when the stream's opening
+    /// `response.created` event is written so every stream's sequence starts from 0. The reader
+    /// gates `MessageStart` on `state.started`, so exactly one reset happens per stream.
+    fn reset_sequence_number(&self) {
+        self.sequence.store(0, Ordering::Relaxed);
+    }
+
+    /// Return the next `sequence_number` for this stream and advance the counter. The first call
+    /// after a [`Self::reset_sequence_number`] returns 0, the next 1, and so on — matching the
+    /// native monotonic-from-0 contract.
+    fn next_sequence_number(&self) -> u64 {
+        self.sequence.fetch_add(1, Ordering::Relaxed)
+    }
+}
 
 impl ProtocolWriter for ResponsesWriter {
     fn upstream_path(&self) -> &str {
@@ -1159,7 +1188,7 @@ impl ProtocolWriter for ResponsesWriter {
         // `sequence_number` injected just before return (see the closing `map` below). The reader
         // gates `MessageStart` on `state.started`, so exactly one reset happens per stream.
         if matches!(ev, IrStreamEvent::MessageStart { .. }) {
-            reset_sequence_number();
+            self.reset_sequence_number();
         }
 
         let emitted: Option<(String, serde_json::Value)> = match ev {
@@ -1256,13 +1285,40 @@ impl ProtocolWriter for ResponsesWriter {
                 }
             },
 
-            IrStreamEvent::BlockStop { index } => Some((
-                "response.output_item.done".to_string(),
-                serde_json::json!({
-                    "type": "response.output_item.done",
-                    "output_index": index,
-                }),
-            )),
+            IrStreamEvent::BlockStop { index } => {
+                // Native `response.output_item.done` carries the SAME stable `item_id` as the
+                // matching `response.output_item.added` so a client correlates an item's
+                // `added → done` lifecycle. Omitting it left a native SDK reading `event.item_id`
+                // with `undefined`, breaking correlation and constituting a proxy-signature tell.
+                //
+                // The IR `BlockStop` carries only the integer output index (not the block kind),
+                // and the ONLY `output_item.added` this writer emits is the function-call item
+                // (the Text `BlockStart` arm returns `None`). So the deterministic
+                // `synthesize_item_id("fc", index)` here reconstructs exactly the id the function
+                // call's `added` event used — the open/close pair stays index-matched and
+                // id-matched.
+                let item_id = synthesize_item_id("fc", *index);
+                // Native `response.output_item.done` ALSO carries the finalized `item` object; a
+                // typed SDK reads `event.item` to return the completed item, so its absence raises
+                // `AttributeError`/`KeyError`. The IR `BlockStop` carries no content snapshot (only
+                // the index), so we cannot reconstruct `call_id`/`name`/`arguments` here — but we
+                // CAN emit a TYPED item carrying the same `id`/`type` as the matching
+                // `output_item.added` (a function-call item), which keeps the SDK's item-lifecycle
+                // decode alive and the `added`/`done` pair correlated, rather than a bare `{}` that
+                // is both crash-prone and a distinguishability tell.
+                Some((
+                    "response.output_item.done".to_string(),
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "output_index": index,
+                        "item_id": item_id,
+                        "item": {
+                            "type": "function_call",
+                            "id": item_id,
+                        },
+                    }),
+                ))
+            }
 
             IrStreamEvent::MessageDelta {
                 stop_reason,
@@ -1327,12 +1383,27 @@ impl ProtocolWriter for ResponsesWriter {
                 // Response, NOT a top-level `error` key. Emitting `{"error":{...}}` would leave a
                 // native SDK unable to locate `event.response` and it would crash or silently
                 // swallow the failure. Synthesize a `resp_` id so the SDK can correlate the failed
-                // response. We have no typed code/param here, so default `type` to `server_error`
-                // and leave `code`/`param` explicitly null.
+                // response.
+                //
+                // The in-band `response.error` object is the Responses-native `ResponseError` shape
+                // — `{"code": <non-null string enum>, "message": <str>}` — NOT the Chat-Completions
+                // `{message, type, code, param}` envelope. The official Python/Node SDK decodes
+                // `event.response.error` into a typed `ResponseError` whose `code` is a required
+                // non-null enum (default `"server_error"`); emitting a null `code` plus an extra
+                // `type`/`param` pair is an impossible-from-real-OpenAI shape and a deterministic
+                // indistinguishability tell. This protocol's OWN reader confirms the field choice:
+                // it reads `response.error.code` FIRST (canonical) and only falls back to `type`.
                 let message = err
                     .provider_signal
                     .clone()
                     .unwrap_or_else(|| "error".to_string());
+                // Use the carried provider signal as the error code enum when present (so a
+                // same-protocol round-trip preserves the upstream `code`), defaulting to the
+                // canonical `"server_error"` enum — never null.
+                let code = err
+                    .provider_signal
+                    .clone()
+                    .unwrap_or_else(|| "server_error".to_string());
                 Some((
                     "response.failed".to_string(),
                     serde_json::json!({
@@ -1342,10 +1413,8 @@ impl ProtocolWriter for ResponsesWriter {
                             "object": "response",
                             "status": "failed",
                             "error": {
+                                "code": code,
                                 "message": message,
-                                "type": "server_error",
-                                "code": serde_json::Value::Null,
-                                "param": serde_json::Value::Null,
                             }
                         }
                     }),
@@ -1363,7 +1432,7 @@ impl ProtocolWriter for ResponsesWriter {
             if let Some(obj) = data.as_object_mut() {
                 obj.insert(
                     "sequence_number".to_string(),
-                    serde_json::json!(next_sequence_number()),
+                    serde_json::json!(self.next_sequence_number()),
                 );
             }
             (event_name, data)
@@ -2507,10 +2576,11 @@ mod tests {
         assert!(matches!(events[1], crate::ir::IrStreamEvent::MessageStop));
     }
 
-    /// Regression: the streaming error event must carry the full Responses error object
-    /// (`type`/`code`/`param`), not just `message`, AND nest it inside the `response` object the
-    /// official SDK streaming decoder reads via `event.response`, so SDK clients that branch on
-    /// `error.type` see the native shape.
+    /// Regression: the streaming error event nests the error inside the `response` object the
+    /// official SDK streaming decoder reads via `event.response`, and the error object is the
+    /// Responses-native `ResponseError` shape `{code, message}` with a NON-NULL `code` enum — NOT
+    /// the Chat-Completions `{message, type, code:null, param:null}` envelope. A null `code` (or an
+    /// extra `type`/`param`) is impossible from real OpenAI and a distinguishability tell.
     #[test]
     fn test_write_error_stream_event_full_shape() {
         let writer = ResponsesWriter;
@@ -2532,14 +2602,16 @@ mod tests {
         assert_eq!(resp.get("status").and_then(|s| s.as_str()), Some("failed"));
         let err = resp.get("error").expect("nested error object present");
         assert_eq!(err.get("message").and_then(|m| m.as_str()), Some("boom"));
-        assert_eq!(
-            err.get("type").and_then(|t| t.as_str()),
-            Some("server_error")
+        // Native ResponseError: code is the non-null enum (here carried from provider_signal).
+        assert_eq!(err.get("code").and_then(|c| c.as_str()), Some("boom"));
+        assert!(
+            !err.as_object().unwrap().contains_key("type"),
+            "Responses ResponseError carries no `type` field: {err}"
         );
-        assert!(err.get("code").is_some(), "code key must be present");
-        assert!(err.get("param").is_some(), "param key must be present");
-        assert!(err.get("code").unwrap().is_null());
-        assert!(err.get("param").unwrap().is_null());
+        assert!(
+            !err.as_object().unwrap().contains_key("param"),
+            "Responses ResponseError carries no `param` field: {err}"
+        );
     }
 
     /// Regression: an unknown/unmapped stop_reason must map to a `completed` status (not `failed`),
@@ -3114,12 +3186,20 @@ mod tests {
             error.get("message").and_then(|m| m.as_str()),
             Some("overloaded")
         );
+        // Native ResponseError shape: a non-null `code` enum (carried from the provider signal),
+        // and NO Chat-style `type`/`param` fields.
         assert_eq!(
-            error.get("type").and_then(|t| t.as_str()),
-            Some("server_error")
+            error.get("code").and_then(|c| c.as_str()),
+            Some("overloaded")
         );
-        assert!(error.get("code").expect("code key present").is_null());
-        assert!(error.get("param").expect("param key present").is_null());
+        assert!(
+            !error.as_object().unwrap().contains_key("type"),
+            "Responses ResponseError carries no `type` field: {error}"
+        );
+        assert!(
+            !error.as_object().unwrap().contains_key("param"),
+            "Responses ResponseError carries no `param` field: {error}"
+        );
     }
 
     /// Regression (CRITICAL/conformance, class: stream event `type` discriminator): EVERY emitted
@@ -3408,6 +3488,165 @@ mod tests {
             args.get("item_id").and_then(|i| i.as_str()),
             Some(added_item),
             "arguments delta item_id must match the item's added item_id (stable per index)"
+        );
+    }
+
+    /// Regression (HIGH/correctness): the `sequence_number` counter is PER-STREAM INSTANCE state,
+    /// not thread-local. Two distinct writer instances model two concurrent streams sharing one
+    /// worker thread. Interleave their events (A.start, B.start, A.delta, B.delta, ...) — the way a
+    /// Tokio work-stealing runtime can schedule two parked stream tasks on the same thread. Each
+    /// writer's sequence must stay monotonic-from-0 with NO bleed from the other stream's resets or
+    /// increments. With the old thread-local cell, B's `MessageStart` reset clobbered A's in-flight
+    /// counter and A's next event would restart non-monotonically; here the counters are independent.
+    #[test]
+    fn test_sequence_number_is_per_instance_not_thread_local() {
+        let stream_a = ResponsesWriter;
+        let stream_b = ResponsesWriter;
+        let start = || IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        };
+        let delta = || IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::TextDelta("x".to_string()),
+        };
+        let seq = |opt: Option<(String, serde_json::Value)>| {
+            opt.expect("emit")
+                .1
+                .get("sequence_number")
+                .and_then(|s| s.as_u64())
+                .expect("sequence_number present")
+        };
+
+        // Interleave the two streams on the same "thread".
+        let a0 = seq(stream_a.write_response_event(&start())); // A: 0
+        let b0 = seq(stream_b.write_response_event(&start())); // B: 0 (must NOT touch A)
+        let a1 = seq(stream_a.write_response_event(&delta())); // A: 1
+        let b1 = seq(stream_b.write_response_event(&delta())); // B: 1
+        let a2 = seq(stream_a.write_response_event(&delta())); // A: 2
+        let b2 = seq(stream_b.write_response_event(&delta())); // B: 2
+
+        assert_eq!(
+            (a0, a1, a2),
+            (0, 1, 2),
+            "stream A must stay monotonic-from-0 despite stream B interleaving"
+        );
+        assert_eq!(
+            (b0, b1, b2),
+            (0, 1, 2),
+            "stream B must stay monotonic-from-0 independent of stream A"
+        );
+    }
+
+    /// Regression (HIGH/conformance): `response.output_item.done` must carry a stable `item_id`
+    /// that matches the `response.output_item.added` for the same output index, plus a typed `item`
+    /// object — an SDK reading `event.item_id`/`event.item` off the `done` event must not see
+    /// `undefined`. The `added` for a function call and the `done` at the same index share the id.
+    #[test]
+    fn test_output_item_done_carries_matching_item_id_and_item() {
+        let writer = ResponsesWriter;
+
+        let (_, added) = writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 3,
+                block: crate::ir::IrBlockMeta::ToolUse {
+                    id: "call_x".to_string(),
+                    name: "f".to_string(),
+                },
+            })
+            .expect("added emits");
+        let added_id = added
+            .get("item_id")
+            .and_then(|i| i.as_str())
+            .expect("added carries item_id")
+            .to_string();
+
+        let (etype, done) = writer
+            .write_response_event(&IrStreamEvent::BlockStop { index: 3 })
+            .expect("done emits");
+        assert_eq!(etype, "response.output_item.done");
+        assert_eq!(
+            done.get("item_id").and_then(|i| i.as_str()),
+            Some(added_id.as_str()),
+            "output_item.done item_id must match the output_item.added at the same index"
+        );
+        // A typed `item` object is present (not undefined / not a bare {}).
+        let item = done
+            .get("item")
+            .and_then(|i| i.as_object())
+            .expect("output_item.done must carry an item object");
+        assert_eq!(
+            item.get("type").and_then(|t| t.as_str()),
+            Some("function_call"),
+            "the done item must be typed"
+        );
+        assert_eq!(
+            item.get("id").and_then(|i| i.as_str()),
+            Some(added_id.as_str()),
+            "the done item.id must equal the item_id"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance): the in-band `response.failed` error object is the
+    /// Responses-native `ResponseError` shape `{code, message}` with a NON-NULL `code` enum — NOT
+    /// the Chat-Completions `{message, type, code:null, param:null}` envelope. A null `code` is
+    /// impossible from real OpenAI and a distinguishability tell.
+    #[test]
+    fn test_response_failed_uses_native_responseerror_shape() {
+        let writer = ResponsesWriter;
+
+        // With a provider signal: it becomes the non-null code enum AND the message.
+        let (etype, payload) = writer
+            .write_response_event(&IrStreamEvent::Error(IrError {
+                class: StatusClass::ServerError,
+                provider_signal: Some("rate_limit_exceeded".to_string()),
+                retry_after: None,
+            }))
+            .expect("emit");
+        assert_eq!(etype, "response.failed");
+        let error = payload
+            .get("response")
+            .and_then(|r| r.get("error"))
+            .and_then(|e| e.as_object())
+            .expect("response.error object present");
+        assert_eq!(
+            error.get("code").and_then(|c| c.as_str()),
+            Some("rate_limit_exceeded"),
+            "error.code must be the non-null Responses error enum"
+        );
+        assert_eq!(
+            error.get("message").and_then(|m| m.as_str()),
+            Some("rate_limit_exceeded")
+        );
+        assert!(
+            !error.contains_key("type"),
+            "Responses ResponseError carries no `type` field"
+        );
+        assert!(
+            !error.contains_key("param"),
+            "Responses ResponseError carries no `param` field"
+        );
+
+        // Without a provider signal: code defaults to the canonical `server_error`, never null.
+        let (_, payload) = writer
+            .write_response_event(&IrStreamEvent::Error(IrError {
+                class: StatusClass::ServerError,
+                provider_signal: None,
+                retry_after: None,
+            }))
+            .expect("emit");
+        let code = payload
+            .get("response")
+            .and_then(|r| r.get("error"))
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str());
+        assert_eq!(
+            code,
+            Some("server_error"),
+            "error.code must default to server_error, never null"
         );
     }
 }

@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use axum::{
     body::Bytes,
-    extract::{Path, RawQuery, State},
+    extract::{OriginalUri, Path, State},
     http::{HeaderMap, StatusCode},
     response::Response,
 };
@@ -478,13 +478,20 @@ pub(crate) async fn responses_ingress(
 pub(crate) async fn gemini_ingress(
     State(app): State<Arc<App>>,
     Path(rest): Path<String>,
-    RawQuery(query): RawQuery,
+    OriginalUri(uri): OriginalUri,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
     axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // `rest` is everything after `/v1beta/models/`, e.g. `foo:generateContent`. Split on the LAST
+    // The native Gemini error envelope echoes the API version the client actually used in its path
+    // ("v1" for the stable `/v1/models/...` surface, "v1beta" for `/v1beta/models/...`). Hardcoding
+    // "v1beta" is a distinguishability tell: the real Gemini v1 API says "v1" for these same paths.
+    // Derive the version from the matched ingress prefix (both surfaces route here via main.rs); fall
+    // back to "v1beta" only if the path is unexpectedly shaped (it always carries one of the two).
+    let api_version = gemini_api_version(uri.path());
+
+    // `rest` is everything after `/{version}/models/`, e.g. `foo:generateContent`. Split on the LAST
     // colon into (model, action). A missing colon means the client sent a malformed Gemini path.
     let (model, action) = match rest.rsplit_once(':') {
         Some((m, a)) if !m.is_empty() && !a.is_empty() => (m, a),
@@ -494,8 +501,8 @@ pub(crate) async fn gemini_ingress(
                 StatusCode::NOT_FOUND,
                 "NOT_FOUND",
                 &format!(
-                    "Invalid resource path: models/{rest} is not found for API version v1beta."
-                ),
+                "Invalid resource path: models/{rest} is not found for API version {api_version}."
+            ),
             )
         }
     };
@@ -514,7 +521,7 @@ pub(crate) async fn gemini_ingress(
                 StatusCode::NOT_FOUND,
                 "NOT_FOUND",
                 &format!(
-                    "models/{model} is not found for API version v1beta, \
+                    "models/{model} is not found for API version {api_version}, \
                      or is not supported for {other}."
                 ),
             )
@@ -526,7 +533,7 @@ pub(crate) async fn gemini_ingress(
     // `alt=sse` token in the raw query as the SSE request (matching the Gemini SDKs, which append
     // exactly `?alt=sse`). The param is meaningless on a non-stream request, so only a streaming
     // request without `alt=sse` engages the JSON-array framing.
-    let alt_sse = query.as_deref().map(query_has_alt_sse).unwrap_or(false);
+    let alt_sse = uri.query().map(query_has_alt_sse).unwrap_or(false);
     let gemini_json_array = stream && !alt_sse;
 
     ingress_path_model(
@@ -541,6 +548,22 @@ pub(crate) async fn gemini_ingress(
         "gemini",
     )
     .await
+}
+
+/// The Gemini API version token to echo in the native error envelope, derived from the actual
+/// ingress path the client used. busbar mounts the Gemini surface at both the stable `/v1/models/...`
+/// and the `/v1beta/models/...` prefixes (main.rs); the real Gemini API echoes whichever the caller
+/// sent ("v1" vs "v1beta"). Matching the prefix verbatim keeps the error indistinguishable from the
+/// native API — a client pinned to the stable v1 surface must not see "v1beta" leaked back. Unknown
+/// shapes fall back to "v1beta" (the historical default and the documented full surface).
+fn gemini_api_version(path: &str) -> &'static str {
+    if path.starts_with("/v1beta/") {
+        "v1beta"
+    } else if path.starts_with("/v1/") {
+        "v1"
+    } else {
+        "v1beta"
+    }
 }
 
 /// True when the raw query string carries an `alt=sse` pair (the Gemini SSE-streaming selector).
@@ -1441,6 +1464,125 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// HIGH/test-coverage: SAME-PROTOCOL bedrock streaming passthrough (bedrock client → bedrock
+    /// backend). The headline indistinguishability case: a native AWS SDK talks ConverseStream and the
+    /// upstream IS a Bedrock backend, so the binary `application/vnd.amazon.eventstream` body must be
+    /// relayed VERBATIM (no SSE→binary re-encode, no buffering) and the upstream's REAL
+    /// `x-amzn-RequestId` forwarded as-is — never re-synthesized. The cross-protocol stream tests
+    /// (OpenAI backend) only exercise the re-encode path; this one drives forward.rs's same-protocol
+    /// branch (`is_streaming_content_type` on the eventstream CT, verbatim FirstByteBody relay with
+    /// `translate=None`, upstream-CT preservation, and `upstream_amzn_id.or_else(synth)` taking the
+    /// upstream value). Asserts: (a) CT is `application/vnd.amazon.eventstream`, (b) the body decodes
+    /// via `drain_frames` with the buffer empty, (c) the response `x-amzn-RequestId` EQUALS the fixed
+    /// upstream id verbatim (proving it was passed through, not a freshly-minted UUID).
+    #[tokio::test]
+    async fn test_bedrock_same_protocol_stream_passthrough_forwards_upstream_request_id() {
+        crate::metrics::init();
+        // Fixed upstream request id: NOT UUID-shaped, so a synthesized id can never accidentally
+        // match it — the only way the assertion passes is verbatim passthrough.
+        const UPSTREAM_REQ_ID: &str = "fixed-upstream-amzn-req-id-0001";
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::EventStream {
+            frames: vec![
+                ("messageStart", br#"{"role":"assistant"}"#.to_vec()),
+                (
+                    "contentBlockDelta",
+                    br#"{"delta":{"text":"hi"},"contentBlockIndex":0}"#.to_vec(),
+                ),
+                ("messageStop", br#"{"stopReason":"end_turn"}"#.to_vec()),
+                (
+                    "metadata",
+                    br#"{"usage":{"inputTokens":5,"outputTokens":3,"totalTokens":8}}"#.to_vec(),
+                ),
+            ],
+            amzn_request_id: UPSTREAM_REQ_ID,
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        // Bedrock ingress → BEDROCK backend (same-protocol). The mock only routes
+        // `/v1/messages` + `/v1/chat/completions`; bedrock's native egress path is
+        // `/model/{model}/converse-stream`, which the mock does not serve, so point the lane's
+        // upstream path at a route the handler answers (the same-protocol relay under test is
+        // path-independent — it keys off the upstream Content-Type, not the URL).
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::bedrock(), &server.base_url())
+                    .provider("aws")
+                    .path("/v1/messages"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/model/foo/converse-stream"))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "messages": [{"role": "user", "content": [{"text": "hello"}]}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "bedrock→bedrock converse-stream 2xx round-trip"
+        );
+
+        // (a) the upstream eventstream Content-Type is preserved verbatim.
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/vnd.amazon.eventstream"),
+            "same-protocol bedrock stream preserves the upstream eventstream CT; got {ct}"
+        );
+
+        // (c) the upstream's REAL x-amzn-RequestId is forwarded VERBATIM (not a synthesized UUID).
+        let req_id = resp
+            .headers()
+            .get("x-amzn-requestid")
+            .and_then(|h| h.to_str().ok())
+            .expect("bedrock converse-stream success carries x-amzn-RequestId")
+            .to_string();
+        assert_eq!(
+            req_id, UPSTREAM_REQ_ID,
+            "same-protocol passthrough must forward the upstream x-amzn-RequestId verbatim, \
+             not synthesize a fresh UUID; got {req_id}"
+        );
+
+        // (b) the relayed body is the upstream's binary frames byte-for-byte: decodes via
+        // drain_frames with the buffer empty, carrying the native ConverseStream event names.
+        let body = resp.bytes().await.unwrap();
+        let mut buf = body.to_vec();
+        let frames = crate::eventstream::drain_frames(&mut buf);
+        assert!(
+            buf.is_empty(),
+            "verbatim-relayed body must be a whole frame sequence (no trailing partial bytes); \
+             {} bytes left",
+            buf.len()
+        );
+        let event_types: Vec<&str> = frames.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            event_types,
+            vec![
+                "messageStart",
+                "contentBlockDelta",
+                "messageStop",
+                "metadata"
+            ],
+            "the exact upstream frame sequence is relayed verbatim, in order; got {event_types:?}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
     /// HIGH/test-coverage (forward.rs:496-526): a TRUE mid-stream transport failure on a
     /// bedrock-ingress cross-protocol stream must terminate the body with a CRC-valid BINARY
     /// `:message-type: exception` frame appended AFTER the real frames — never SSE `event:`/`data:`
@@ -2123,6 +2265,112 @@ mod tests {
             "gemini empty model ⇒ native 404"
         );
         handle.abort();
+    }
+
+    /// MEDIUM/conformance regression: a request on the STABLE `/v1/models/...` Gemini surface that
+    /// hits an unsupported action (e.g. `countTokens`) must echo "v1" in the native NOT_FOUND
+    /// message — NOT the hardcoded "v1beta". The real Gemini v1 API says "v1" for this path; leaking
+    /// "v1beta" is a distinguishability tell against a google-generativeai SDK pinned to v1.
+    #[tokio::test]
+    async fn test_gemini_v1_surface_error_echoes_v1_not_v1beta() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+
+        // Unsupported-action branch on the v1 surface.
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/models/foo:countTokens"))
+            .bearer_auth("t")
+            .body(json!({"contents": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 404, "unsupported action ⇒ 404");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let msg = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        assert!(
+            msg.contains("API version v1,") || msg.contains("API version v1 "),
+            "v1-surface error must echo 'v1', not 'v1beta'; got message: {msg}"
+        );
+        assert!(
+            !msg.contains("v1beta"),
+            "v1-surface error must NOT leak 'v1beta'; got message: {msg}"
+        );
+
+        // Malformed-path branch (no colon) on the v1 surface echoes "v1" too.
+        let resp2 = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/models/gemini-flash"))
+            .bearer_auth("t")
+            .body(json!({"contents": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.status().as_u16(), 404, "malformed path ⇒ 404");
+        let body2: serde_json::Value = resp2.json().await.unwrap();
+        let msg2 = body2
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        assert!(
+            msg2.contains("API version v1.") && !msg2.contains("v1beta"),
+            "v1-surface malformed-path error must echo 'v1', not 'v1beta'; got: {msg2}"
+        );
+
+        handle.abort();
+    }
+
+    /// The `/v1beta/models/...` surface must still echo "v1beta" (no regression for the historical
+    /// full surface) — the fix is version-faithful, not a blanket rewrite.
+    #[tokio::test]
+    async fn test_gemini_v1beta_surface_error_still_echoes_v1beta() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1beta/models/foo:countTokens"))
+            .bearer_auth("t")
+            .body(json!({"contents": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 404);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let msg = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        assert!(
+            msg.contains("v1beta"),
+            "v1beta-surface error must still echo 'v1beta'; got: {msg}"
+        );
+        handle.abort();
+    }
+
+    /// Unit: `gemini_api_version` maps each ingress prefix to the token the native error echoes.
+    #[test]
+    fn test_gemini_api_version_prefix_mapping() {
+        assert_eq!(
+            gemini_api_version("/v1/models/foo:countTokens"),
+            "v1",
+            "stable surface ⇒ v1"
+        );
+        assert_eq!(
+            gemini_api_version("/v1beta/models/foo:countTokens"),
+            "v1beta",
+            "beta surface ⇒ v1beta"
+        );
+        // Unexpected shape falls back to the historical default.
+        assert_eq!(
+            gemini_api_version("/weird/path"),
+            "v1beta",
+            "fallback ⇒ v1beta"
+        );
     }
 
     /// MEDIUM/test-coverage: a model id that itself CONTAINS a colon must split on the LAST colon, so

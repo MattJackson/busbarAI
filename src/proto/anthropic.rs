@@ -1267,28 +1267,24 @@ impl ProtocolWriter for AnthropicWriter {
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
 
-        // id: an official SDK's `Message.id` is `"msg_<rand>"`. Three cases:
-        //   * same-protocol passthrough — the upstream id was captured into `resp.id`; re-emit it
-        //     verbatim so a native SDK sees the exact id its backend assigned.
-        //   * cross-protocol with a foreign id absent — `resp.id == None` AND `resp.created` is set
-        //     (every cross-protocol reader that lacks an Anthropic id still records `created`, e.g.
-        //     OpenAI's `created`), so synthesize a protocol-correct `msg_<rand>`. The SDK only
-        //     requires the `msg_` prefix + uniqueness, which `synth_message_id` guarantees with no
-        //     new crate.
-        //   * minimal same-protocol IR with neither id nor created (a body that carried no id) —
-        //     omit `id` rather than fabricate one, so a read→write→read round-trip is lossless
-        //     (synthesizing here would make the re-read IR carry an id the original lacked).
-        // This keys synthesis off "did we cross a protocol boundary" (proxied by `created` being
-        // populated) rather than off `id` alone, preserving same-protocol idempotence.
-        match (&resp.id, resp.created) {
-            (Some(id), _) => {
-                obj.insert("id".to_string(), serde_json::json!(id));
-            }
-            (None, Some(_)) => {
-                obj.insert("id".to_string(), serde_json::json!(synth_message_id()));
-            }
-            (None, None) => {}
-        }
+        // id: an official SDK's `Message.id` is a REQUIRED `"msg_<rand>"` string — the Python/TS SDK
+        // types `Message.id` as a non-optional `str`, so a body that omits it fails to decode. Emit
+        // it UNCONDITIONALLY, mirroring the streaming `message_start` writer (line ~1065) and every
+        // other protocol writer (openai/cohere/responses), all of which `unwrap_or_else` a synthesized
+        // id rather than gating on a second field:
+        //   * same-protocol passthrough / any source that carried an id — `resp.id` is `Some`; re-emit
+        //     it verbatim so a native SDK sees the exact id its backend assigned.
+        //   * id absent (`resp.id == None`) — synthesize a protocol-correct `msg_<rand>` via
+        //     `synth_message_id`. This covers BOTH the cross-protocol path where the source recorded a
+        //     `created` (e.g. OpenAI) AND the path where the source recorded neither id nor created
+        //     (e.g. a Bedrock Converse body, whose reader returns `created: None`) — the latter
+        //     previously hit a `(None, None)` arm that emitted NO `id`, producing an invalid Message
+        //     for a Bedrock→Anthropic non-stream client. Synthesis is safe for idempotence because
+        //     `write_response` runs ONLY on the cross-protocol translate path (see the `stop_sequence`
+        //     note below: same-protocol non-stream relays the raw upstream body and never reaches this
+        //     writer), so there is no same-protocol read→write→read round-trip to keep id-less.
+        let id = resp.id.clone().unwrap_or_else(synth_message_id);
+        obj.insert("id".to_string(), serde_json::json!(id));
 
         // type/role are constant for a Messages API response ("message"/"assistant").
         obj.insert("type".to_string(), serde_json::json!("message"));
@@ -1632,11 +1628,15 @@ mod anthropic_hardening_tests {
         assert_eq!(out1.get("type").and_then(|v| v.as_str()), Some("message"));
     }
 
-    /// A minimal same-protocol IR carrying neither `id` nor `created` must NOT fabricate an id —
-    /// omitting it keeps a read→write→read round-trip lossless (the synthesis is gated to the
-    /// cross-protocol path only).
+    /// Regression (recurring across rounds): an IR carrying NEITHER `id` NOR `created` — the exact
+    /// shape a Bedrock Converse reader produces (its `read_response` returns `created: None` and no
+    /// Anthropic id) — must STILL emit a synthesized `msg_`-prefixed id. `Message.id` is a REQUIRED,
+    /// non-optional field in the official Anthropic SDK, so omitting it (the old `(None, None)` arm)
+    /// produced an undecodable Message on the Bedrock→Anthropic non-stream path. `write_response`
+    /// runs only on the cross-protocol translate path, so there is no same-protocol round-trip to
+    /// keep id-less; the id must never be absent.
     #[test]
-    fn minimal_same_protocol_write_omits_synthesized_id() {
+    fn write_response_synthesizes_id_when_neither_id_nor_created() {
         let resp = crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
             content: vec![],
@@ -1648,15 +1648,23 @@ mod anthropic_hardening_tests {
                 cache_read_input_tokens: None,
             },
             model: None,
+            // The Bedrock egress → Anthropic ingress non-stream path: both None.
             id: None,
             created: None,
             system_fingerprint: None,
             stop_sequence: None,
         };
         let out = AnthropicWriter.write_response(&resp);
+        let id = out.get("id").and_then(|v| v.as_str()).expect(
+            "id is mandatory and must be synthesized even when id and created are both None",
+        );
         assert!(
-            out.get("id").is_none(),
-            "no id must be fabricated when neither id nor created is set (loss-free passthrough)"
+            id.starts_with("msg_"),
+            "synthesized id must carry the Anthropic `msg_` prefix, got {id}"
+        );
+        assert!(
+            id.len() > "msg_".len(),
+            "synthesized id must have a non-empty suffix"
         );
     }
 

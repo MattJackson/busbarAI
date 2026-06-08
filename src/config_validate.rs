@@ -220,6 +220,23 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             }
         }
 
+        // Rule 6b: Validate the per-pool failover budget. `failover.deadline_secs == 0` is the exact
+        // twin of the `max_concurrent: 0` / breaker `window_s: 0` foot-guns: `RequestCtx::new(0)` sets
+        // `deadline = start.saturating_add(0) == start`, and the failover loop checks
+        // `request_ctx.expired(now())` at the TOP of the very first (primary) iteration with
+        // `now >= deadline`. Because `now()` is read fresh and is always `>= start`, the primary attempt
+        // is rejected with a 503 before it runs — the pool serves ZERO requests with no boot diagnostic.
+        // Reject it loudly here, mirroring the rest of validate()'s fail-loud invariant. (`cap == 0` is
+        // benign: the `0..=cap` loop still runs the primary once, so it is NOT rejected.)
+        if let Some(failover) = &pool_cfg.failover {
+            if failover.deadline_secs == 0 {
+                errors.push(format!(
+                    "pool '{}' failover.deadline_secs must be >= 1; a 0 budget rejects the primary attempt before it runs (every request 503s)",
+                    pool_name
+                ));
+            }
+        }
+
         // Rule 7: A well-formed `on_exhausted: fallback_pool:<name>` whose `<name>` is not a
         // configured pool parses fine but silently misses at runtime (forward.rs's
         // `fallback_pools.get(name)` returns None) and cascades to a generic 503 — the configured
@@ -281,6 +298,37 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Validate the optional governance block (read separately from the resolved `RootCfg`, so it
+/// cannot ride along in `validate(&RootCfg)`). Called from `config::resolve`, whose `Err(Vec<String>)`
+/// is surfaced as a fail-loud boot error — the same channel `validate` uses.
+///
+/// When `governance.enabled` is true but `admin_token` is unset, `GovState::admin_token()` returns
+/// `None`, so the `/admin` auth branch's `authorized` is permanently `false`: the admin API is
+/// SILENTLY locked (every admin call 401s) with no startup diagnostic. An operator who enabled
+/// governance to manage virtual keys discovers this only at runtime. Mirror the `token` mode with no
+/// `client_tokens` fail-loud pattern and reject it at boot. A disabled governance block carries no
+/// requirement (the admin surface is inert anyway).
+pub(crate) fn validate_governance(
+    governance: &crate::config::GovernanceCfg,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    if governance.enabled
+        && governance
+            .admin_token
+            .as_deref()
+            .is_none_or(|t| t.is_empty())
+    {
+        errors.push(
+            "governance.enabled is true but no governance.admin_token is configured; the /admin management API is unreachable (every admin call returns 401). Set governance.admin_token (e.g. admin_token: ${BUSBAR_ADMIN_TOKEN})".to_string(),
+        );
+    }
     if errors.is_empty() {
         Ok(())
     } else {
@@ -1150,6 +1198,104 @@ mod tests {
         assert!(
             validate(&cfg).is_ok(),
             "a well-formed breaker config must validate"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_failover_deadline() {
+        // Twin of the breaker window_s:0 / max_concurrent:0 foot-guns on the failover-budget axis:
+        // RequestCtx::new(0) sets deadline == start, so the failover loop's first (primary) deadline
+        // check rejects with a 503 before the primary attempt runs — the pool serves ZERO requests
+        // with no boot diagnostic. Must fail loud at startup.
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut pool = make_pool(vec![make_member("mymodel")]);
+        pool.failover = Some(config::FailoverCfg {
+            deadline_secs: 0,
+            exclusions: None,
+            cap: 3,
+        });
+        pools.insert("mypool".to_string(), pool);
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg).expect_err("failover.deadline_secs: 0 must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("failover.deadline_secs must be >= 1") && e.contains("mypool")),
+            "expected a zero-failover-deadline error for 'mypool'; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_positive_failover_deadline_and_zero_cap() {
+        // A positive deadline validates. cap == 0 is deliberately BENIGN (the `0..=cap` loop still
+        // runs the primary once), so it must NOT be rejected.
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut pool = make_pool(vec![make_member("mymodel")]);
+        pool.failover = Some(config::FailoverCfg {
+            deadline_secs: 30,
+            exclusions: None,
+            cap: 0,
+        });
+        pools.insert("mypool".to_string(), pool);
+        let cfg = make_root_cfg(providers, models, pools);
+        assert!(
+            validate(&cfg).is_ok(),
+            "a positive failover.deadline_secs with cap:0 must validate"
+        );
+    }
+
+    #[test]
+    fn test_validate_governance_requires_admin_token_when_enabled() {
+        // governance.enabled with no admin_token silently locks the /admin API (every call 401s);
+        // must fail loud at boot. An empty-string token is treated as absent (GovState::admin_token
+        // would hand the constant-time compare an empty secret).
+        for missing in [None, Some(String::new())] {
+            let gov = config::GovernanceCfg {
+                enabled: true,
+                db_path: "busbar-governance.db".to_string(),
+                price_per_request_cents: 1,
+                price_per_1k_tokens_cents: 0,
+                admin_token: missing.clone(),
+            };
+            let errs = validate_governance(&gov)
+                .expect_err("enabled governance without admin_token must fail");
+            assert!(
+                errs.iter().any(|e| e.contains("governance.admin_token")
+                    && e.contains("/admin management API is unreachable")),
+                "expected an admin-token lockout error for {missing:?}; got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_governance_ok_when_enabled_with_admin_token() {
+        let gov = config::GovernanceCfg {
+            enabled: true,
+            db_path: "busbar-governance.db".to_string(),
+            price_per_request_cents: 1,
+            price_per_1k_tokens_cents: 0,
+            admin_token: Some("an-operator-secret".to_string()),
+        };
+        assert!(
+            validate_governance(&gov).is_ok(),
+            "enabled governance WITH an admin_token must validate"
+        );
+    }
+
+    #[test]
+    fn test_validate_governance_disabled_carries_no_requirement() {
+        // A disabled governance block (the admin surface is inert) must not require an admin_token.
+        let gov = config::GovernanceCfg {
+            enabled: false,
+            db_path: "busbar-governance.db".to_string(),
+            price_per_request_cents: 1,
+            price_per_1k_tokens_cents: 0,
+            admin_token: None,
+        };
+        assert!(
+            validate_governance(&gov).is_ok(),
+            "disabled governance carries no admin_token requirement"
         );
     }
 

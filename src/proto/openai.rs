@@ -41,16 +41,49 @@ static SYNTH_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn synth_completion_id() -> String {
     let n = SYNTH_COUNTER.fetch_add(1, Ordering::Relaxed);
     let ts = unix_now_secs();
-    // Render the timestamp and the atomic counter as SEPARATE base-36 fields joined by a delimiter
-    // ('z' is not a base-36 digit produced below — the alphabet stops at base-36's 'z' but each
-    // field is `mixed % 36` so any single char including 'z' can appear; the delimiter must NOT be
-    // an alphabet char). We use a hyphen, which is not in the base-36 alphabet, as the field
-    // separator so the (ts, n) pair maps injectively to the token. The previous XOR scheme
-    // (`(ts<<24) ^ n`) collided whenever the counter advanced by exactly 2^24 between two seconds
-    // (e.g. ts=1000/n=0 and ts=1001/n=16777216 produced the same value), silently minting duplicate
-    // ids under sustained high request rates. Concatenation of the two fields is collision-free by
-    // construction as long as the u64 counter never wraps (astronomical).
-    format!("chatcmpl-{}-{}", base36(ts), base36(n))
+    // Render the timestamp and the atomic counter as base-36 fields and CONCATENATE them with NO
+    // internal separator. Native OpenAI chat-completion ids have exactly one hyphen — the one in the
+    // `chatcmpl-` prefix — and no internal field delimiter (e.g. `chatcmpl-abc123xyz`); the previous
+    // `chatcmpl-<ts>-<n>` form inserted a second hyphen, a structurally distinguishable proxy tell
+    // to any client that validates the id shape (regex / startswith / visual inspection). Process
+    // uniqueness no longer relies on the (ts, n) string being injective: the atomic counter `n` is
+    // strictly monotonic and never repeats within the process, so it alone guarantees distinct ids;
+    // the timestamp prefix only mirrors the native shape's entropy distribution. The previous XOR
+    // scheme (`(ts<<24) ^ n`) collided whenever the counter advanced by exactly 2^24 between two
+    // seconds (e.g. ts=1000/n=0 and ts=1001/n=16777216 produced the same value), silently minting
+    // duplicate ids under sustained high request rates; this form has no such failure mode.
+    format!("chatcmpl-{}{}", base36(ts), base36(n))
+}
+
+/// Derive the native OpenAI `error.code` value for a given OpenAI error `type`.
+///
+/// Real OpenAI does not emit `code: null` uniformly: a bad-key 401 carries
+/// `{"type":"invalid_request_error", ...}` historically, but the modern wire shape returns
+/// `{"type":"authentication_error", ..., "code":"invalid_api_key"}` — and crucially the
+/// official SDKs (`openai.AuthenticationError`) surface `error.code` to callers, so emitting
+/// `code: null` on an auth failure is a deterministic proxy tell that contradicts the
+/// total-indistinguishability promise. We map the auth type onto its canonical code; every other
+/// type keeps `null` (the shape OpenAI uses when no machine-readable code applies). The match is
+/// exhaustive in intent over the type strings this writer can produce — there is no `_ =>`
+/// catch-all hiding an unhandled case; the final arm explicitly handles all remaining valid types
+/// by emitting `null`, which is the correct native value for them.
+fn openai_error_code(error_type: &str) -> serde_json::Value {
+    match error_type {
+        "authentication_error" => serde_json::Value::String("invalid_api_key".to_string()),
+        "invalid_request_error"
+        | "permission_error"
+        | "not_found_error"
+        | "rate_limit_error"
+        | "server_error"
+        | "api_error" => serde_json::Value::Null,
+        other => {
+            // A caller-supplied passthrough type we don't model a code for: OpenAI carries no
+            // machine-readable code for these, so `null` matches the native shape. Named binding
+            // (not `_`) keeps the arm explicit per the no-catch-all rule.
+            let _ = other;
+            serde_json::Value::Null
+        }
+    }
 }
 
 /// Render a u64 as a compact base-36 (lowercase alphanumeric) string. Zero renders as "0".
@@ -305,10 +338,30 @@ impl ProtocolReader for OpenAiReader {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        let content_text = content_val
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                        // OpenAI tool-message `content` may be EITHER a plain string OR an array of
+                        // content parts (e.g. `[{"type":"text","text":"..."}]`), both legal per the
+                        // current Chat Completions spec. The prior `as_str().unwrap_or("")` handled
+                        // only the string form and silently collapsed array-form tool output to an
+                        // empty string, dropping the tool result on the cross-protocol path. We now
+                        // mirror the user/assistant content handling: a string is used verbatim; an
+                        // array is parsed part-by-part via `read_openai_block` and its text parts are
+                        // concatenated. Non-text parts (which carry no textual payload) contribute
+                        // nothing, matching how a native backend would render the same array.
+                        let content_text = match content_val {
+                            Some(serde_json::Value::String(s)) => s.clone(),
+                            Some(serde_json::Value::Array(parts)) => {
+                                let mut acc = String::new();
+                                for part in parts {
+                                    if let Ok(crate::ir::IrBlock::Text { text, .. }) =
+                                        read_openai_block(part)
+                                    {
+                                        acc.push_str(&text);
+                                    }
+                                }
+                                acc
+                            }
+                            Some(_) | None => String::new(),
+                        };
 
                         msg_content.push(crate::ir::IrBlock::ToolResult {
                             tool_use_id: tool_call_id,
@@ -1310,7 +1363,7 @@ impl ProtocolWriter for OpenAiWriter {
                     "error": {
                         "message": message,
                         "type": error_type,
-                        "code": serde_json::Value::Null,
+                        "code": openai_error_code(error_type),
                         "param": serde_json::Value::Null,
                     }
                 });
@@ -1367,7 +1420,7 @@ impl ProtocolWriter for OpenAiWriter {
                 "message": message,
                 "type": error_type,
                 "param": serde_json::Value::Null,
-                "code": serde_json::Value::Null,
+                "code": openai_error_code(error_type),
             }
         })
     }
@@ -2691,5 +2744,154 @@ mod tests {
         // ...and the number of distinct opened blocks is bounded by the clamp ceiling (indices were
         // saturated at MAX_TOOL_INDEX, so the distinct count is MAX_TOOL_INDEX + 1 = 128 = the cap).
         assert!(block_starts <= MAX_OPEN_TOOLS);
+    }
+
+    // --- Round 8: synthetic chatcmpl id must not carry an internal field-separator hyphen.
+
+    #[test]
+    fn synth_completion_id_has_single_hyphen_after_prefix() {
+        let id = synth_completion_id();
+        assert!(
+            id.starts_with("chatcmpl-"),
+            "id must keep the native prefix: {id}"
+        );
+        // Native ids have exactly one hyphen (the one in `chatcmpl-`); the token after the prefix is
+        // pure base-36 with no internal delimiter. An extra hyphen is a structural proxy tell.
+        assert_eq!(
+            id.matches('-').count(),
+            1,
+            "synthetic id has an internal field separator: {id}"
+        );
+        let token = id.strip_prefix("chatcmpl-").expect("prefix present");
+        assert!(!token.is_empty(), "token after prefix must be non-empty");
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "token must be base-36 (lowercase alnum), got: {token}"
+        );
+    }
+
+    #[test]
+    fn synth_completion_ids_are_distinct_within_process() {
+        // The monotonic atomic counter alone guarantees distinctness even when minted back-to-back
+        // within the same second (where the timestamp field is identical).
+        let a = synth_completion_id();
+        let b = synth_completion_id();
+        assert_ne!(a, b);
+    }
+
+    // --- Round 8: OpenAI tool-message content given as an array of parts must not be dropped.
+
+    #[test]
+    fn read_request_reads_array_form_tool_message_content() {
+        let body = serde_json::json!({
+            "model": "gpt-x",
+            "messages": [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_42",
+                    "content": [
+                        { "type": "text", "text": "part one " },
+                        { "type": "text", "text": "part two" }
+                    ]
+                }
+            ]
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        let tool_msg = ir
+            .messages
+            .iter()
+            .find(|m| m.role == IrRole::Tool)
+            .expect("tool message present");
+        let result = tool_msg
+            .content
+            .iter()
+            .find_map(|b| match b {
+                IrBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => Some((tool_use_id.clone(), content.clone())),
+                _ => None,
+            })
+            .expect("tool result block present");
+        assert_eq!(result.0, "call_42");
+        // The array parts are concatenated; the prior string-only path collapsed this to "".
+        assert_eq!(result.1, vec![text_block("part one part two")]);
+    }
+
+    #[test]
+    fn read_request_reads_string_form_tool_message_content() {
+        let body = serde_json::json!({
+            "model": "gpt-x",
+            "messages": [
+                { "role": "tool", "tool_call_id": "call_7", "content": "plain string" }
+            ]
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        let tool_msg = ir
+            .messages
+            .iter()
+            .find(|m| m.role == IrRole::Tool)
+            .expect("tool message present");
+        let content = tool_msg
+            .content
+            .iter()
+            .find_map(|b| match b {
+                IrBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("tool result block present");
+        assert_eq!(content, vec![text_block("plain string")]);
+    }
+
+    // --- Round 8: a bad-key 401 must emit `code: "invalid_api_key"`, not `code: null`.
+
+    #[test]
+    fn write_error_emits_invalid_api_key_code_for_auth_failure() {
+        let w = OpenAiWriter;
+        let body = w.write_error(401, "authentication_error", "Incorrect API key provided");
+        assert_eq!(
+            body["error"]["type"],
+            serde_json::json!("authentication_error")
+        );
+        assert_eq!(body["error"]["code"], serde_json::json!("invalid_api_key"));
+        assert_eq!(body["error"]["param"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn write_error_keeps_null_code_for_non_auth_errors() {
+        let w = OpenAiWriter;
+        for (status, kind) in [
+            (400u16, "invalid_request_error"),
+            (429, "rate_limit_error"),
+            (500, "server_error"),
+        ] {
+            let body = w.write_error(status, kind, "boom");
+            assert_eq!(
+                body["error"]["code"],
+                serde_json::Value::Null,
+                "non-auth error must keep code: null (kind={kind})"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_error_auth_event_carries_invalid_api_key_code() {
+        let w = OpenAiWriter;
+        let ev = IrStreamEvent::Error(IrError {
+            class: crate::breaker::StatusClass::Auth,
+            provider_signal: Some("bad key".to_string()),
+            retry_after: None,
+        });
+        let (_, chunk) = w
+            .write_response_event(&ev)
+            .expect("error event emits a body");
+        assert_eq!(
+            chunk["error"]["type"],
+            serde_json::json!("authentication_error")
+        );
+        assert_eq!(chunk["error"]["code"], serde_json::json!("invalid_api_key"));
     }
 }

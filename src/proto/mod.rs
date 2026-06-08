@@ -4583,8 +4583,13 @@ mod stream_translate_tests {
 
     #[test]
     fn test_same_protocol_roundtrip_idempotence() {
-        // Anthropic read → write → read yields equal IrResponse
+        // Anthropic read → write → read yields equal IrResponse.
+        // `id` is seeded because a native Anthropic Message always carries one and the writer
+        // (correctly) synthesizes an `id` when absent — so idempotence is only meaningful with a
+        // real id present (an id-less fixture is not a shape a native client ever sends).
         let original_data = serde_json::json!({
+            "id": "msg_01TestRoundtripIdempotence",
+            "type": "message",
             "role": "assistant",
             "content": [
                 {"type": "text", "text": "hello"},

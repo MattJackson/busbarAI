@@ -560,6 +560,16 @@ pub(crate) fn resolve(
         );
     }
 
+    // Governance is read from `DeployCfg` (it does not land on the resolved `RootCfg`, so
+    // `config_validate::validate(&RootCfg)` cannot see it). Validate it here, on `resolve`'s
+    // existing fail-loud error channel, so an enabled-but-admin-token-less governance block (which
+    // silently locks the /admin API) is rejected at boot rather than discovered at runtime.
+    if let Some(governance) = &deploy.governance {
+        if let Err(gov_errors) = crate::config_validate::validate_governance(governance) {
+            errors.extend(gov_errors);
+        }
+    }
+
     if errors.is_empty() {
         Ok(RootCfg {
             listen: deploy.listen.clone(),
@@ -900,6 +910,59 @@ models: {}
             "inline api_key must never reach the resolved ProviderCfg"
         );
         assert_eq!(cfg.providers["myprov"].api_key_env, "MYPROV_KEY");
+    }
+
+    #[test]
+    fn test_resolve_rejects_enabled_governance_without_admin_token() {
+        // resolve() is the boot-time fail-loud channel for the governance block (which never lands
+        // on RootCfg, so config_validate::validate cannot see it). An enabled governance block with
+        // no admin_token silently locks the /admin API — resolve must reject it.
+        let defs = HashMap::new();
+        let deploy = DeployCfg {
+            listen: "0.0.0.0:8080".into(),
+            auth: None,
+            providers: HashMap::new(),
+            models: HashMap::new(),
+            pools: HashMap::new(),
+            observability: None,
+            governance: Some(GovernanceCfg {
+                enabled: true,
+                db_path: "busbar-governance.db".to_string(),
+                price_per_request_cents: 1,
+                price_per_1k_tokens_cents: 0,
+                admin_token: None,
+            }),
+        };
+        let errs = resolve(&deploy, &defs)
+            .expect_err("enabled governance without admin_token must fail resolution");
+        assert!(
+            errs.iter().any(|e| e.contains("governance.admin_token")),
+            "expected an admin-token lockout error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_accepts_enabled_governance_with_admin_token() {
+        let defs = HashMap::new();
+        let deploy = DeployCfg {
+            listen: "0.0.0.0:8080".into(),
+            auth: None,
+            providers: HashMap::new(),
+            models: HashMap::new(),
+            pools: HashMap::new(),
+            observability: None,
+            governance: Some(GovernanceCfg {
+                enabled: true,
+                db_path: "busbar-governance.db".to_string(),
+                price_per_request_cents: 1,
+                price_per_1k_tokens_cents: 0,
+                admin_token: Some("operator-secret".to_string()),
+            }),
+        };
+        assert!(
+            resolve(&deploy, &defs).is_ok(),
+            "enabled governance WITH an admin_token must resolve"
+        );
     }
 
     #[test]

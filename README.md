@@ -126,9 +126,11 @@ Busbar's scope is the **protocol count (6)**, not the provider count. Each proto
 | `anthropic` | `/v1/messages` | bearer + `x-api-key` | ✅ | ✅ | ✅ | ✅ |
 | `openai` | `/v1/chat/completions` | bearer (or `api-key` for Azure) | ✅ | ✅ | ✅ | ✅ |
 | `gemini` | `:generateContent` / `:streamGenerateContent` | `x-goog-api-key` | ✅ | ✅ | ✅ | ✅ |
-| `bedrock` | Converse / ConverseStream | AWS **SigV4** | ✅ | ✅ | ✅ | ✅ |
+| `bedrock` | Converse / ConverseStream | AWS **SigV4** | ✅¹ | ✅ | ✅ | ✅ |
 | `responses` | `/v1/responses` | bearer | ✅ | ✅ | ✅ | ✅ |
 | `cohere` | `/v2/chat` | bearer | ✅ | ✅ | ✅ | ✅ |
+
+¹ Bedrock **ingress** requires `auth.mode: passthrough` (or `none`). busbar does not verify inbound AWS SigV4 — `src/sigv4.rs` is sign-only, with no inbound verifier — so under `token`/governance mode a native SigV4-signed Bedrock request carries no bearer-style token busbar can match and is rejected `401`. Egress to a Bedrock backend (where busbar signs the request) is unconditional. The ✅ marks for request/response/stream/tools describe ingress behaviour once admitted under `passthrough`/`none`.
 
 Streaming is first-class for all six: Gemini via `:streamGenerateContent?alt=sse`, Bedrock by decoding the binary `application/vnd.amazon.eventstream` frames and re-framing them as the caller's protocol, the rest via SSE.
 
@@ -142,7 +144,7 @@ Streaming is first-class for all six: Gemini via `:streamGenerateContent?alt=sse
 | `POST /v1/responses` | Responses-API ingress; the body's `model` selects the model or pool |
 | `POST /v2/chat` | Cohere ingress; the body's `model` selects the model or pool |
 | `POST /v1{beta}/models/{model}:generateContent` · `:streamGenerateContent` | Gemini ingress; the model (and pool) is taken from the URL path segment. Both the stable `/v1/models/...` and the `/v1beta/models/...` path prefixes are accepted (the google-generativeai / Gen AI SDKs use either) |
-| `POST /model/{modelId}/converse` · `/converse-stream` | Bedrock ingress; the model (and pool) is taken from the URL path |
+| `POST /model/{modelId}/converse` · `/converse-stream` | Bedrock ingress; the model (and pool) is taken from the URL path. Requires `auth.mode: passthrough` (or `none`) — busbar does not verify inbound SigV4, so a SigV4-signed request is rejected `401` under `token`/governance mode (see footnote ¹ above) |
 | `GET /stats` · `GET /healthz` · `GET /metrics` | per-lane health (JSON) · liveness · Prometheus |
 | `POST /admin/keys` · `GET /admin/keys` | create / list virtual keys (governance only) |
 | `DELETE /admin/keys/{id}` · `GET /admin/keys/{id}/usage` | revoke a virtual key · per-key usage (governance only) |

@@ -123,6 +123,14 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
 - With governance disabled, the static `AuthMode` applies (`token` allowlist,
   `passthrough`, or `none`). The caller's bearer token is threaded through for
   passthrough forwarding.
+- **Bedrock ingress** is the one exception to "any ingress works in any mode".
+  `extract_client_token` only reads bearer-style carriers (`Authorization: Bearer`,
+  `x-api-key`, `x-goog-api-key`); it deliberately ignores SigV4
+  (`Authorization: AWS4-HMAC-SHA256 …`). busbar has no inbound SigV4 verifier
+  (`src/sigv4.rs` is sign-only). A native Bedrock SDK client therefore presents no
+  matchable token and is rejected `401` under `token`/governance mode, so Bedrock
+  ingress must run under `passthrough` (or `none`), where the caller's SigV4
+  credentials are forwarded upstream.
 
 ### 3. Governance checks
 

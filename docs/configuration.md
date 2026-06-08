@@ -139,6 +139,17 @@ Modes:
 - **`none`** — open relay; no client auth. Dev only — busbar prints a loud warning
   at startup.
 
+**Bedrock ingress caveat.** A `token`-mode (and governance) check only recognises
+bearer-style carriers — `Authorization: Bearer`, `x-api-key`, `x-goog-api-key`.
+Native Bedrock SDK clients authenticate with AWS SigV4 (`Authorization:
+AWS4-HMAC-SHA256 …`), and busbar does **not** verify inbound SigV4 (`src/sigv4.rs`
+is sign-only — no inbound verifier exists). So a SigV4-signed Bedrock request
+carries no token busbar can match and is rejected `401` in `token`/governance mode.
+**Bedrock ingress must therefore run under `passthrough` (or `none`)**, where the
+caller's SigV4 credentials are accepted and forwarded upstream. This applies to both
+`converse` and `converse-stream`. The other five ingress protocols use bearer-style
+auth and work in every mode.
+
 ### `providers`
 
 The providers this deployment uses, by catalog name, each naming the env var that

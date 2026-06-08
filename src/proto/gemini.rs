@@ -5,6 +5,17 @@
 
 use super::*;
 
+/// Hard cap on the number of distinct tool-call block indices recorded in `state.open_tools` for a
+/// single Gemini SSE stream. The set is only drained when a `finishReason` chunk arrives (the
+/// terminal frame closes every open tool block), so a hostile or buggy upstream that streams an
+/// unbounded run of `functionCall` parts WITHOUT ever emitting `finishReason` would grow it without
+/// bound — one inserted index per part — until the process is OOM-killed. No legitimate Gemini
+/// response approaches this many parallel tool calls in a single turn; past the cap we stop both
+/// recording new tool frames and emitting their BlockStart/BlockDelta events, so per-request heap
+/// stays bounded. The cap leaves every realistic stream untouched. Mirrors the Cohere reader's
+/// `MAX_TRACKED_TOOL_FRAMES`.
+const MAX_GEMINI_TOOL_FRAMES: usize = 4096;
+
 #[derive(Clone)]
 pub(crate) struct GeminiReader;
 
@@ -465,7 +476,18 @@ impl ProtocolReader for GeminiReader {
                                         .unwrap_or("")
                                         .to_string();
 
-                                    if !name_val.is_empty() {
+                                    // Bound `state.open_tools` so an adversarial/buggy upstream that
+                                    // streams an unbounded run of `functionCall` parts without ever
+                                    // emitting `finishReason` (the only event that drains the set)
+                                    // cannot grow per-request heap without bound. Past the cap we
+                                    // skip recording the frame AND emitting its BlockStart/BlockDelta
+                                    // — the next index is derived from `open_tools.len()`, so a
+                                    // recorded-but-uncapped frame would also produce duplicate
+                                    // indices once growth stalled. No legitimate Gemini turn carries
+                                    // this many parallel tool calls. Mirrors the Cohere reader's cap.
+                                    if !name_val.is_empty()
+                                        && state.open_tools.len() < MAX_GEMINI_TOOL_FRAMES
+                                    {
                                         // Tool blocks follow the text block (index 0). The next
                                         // index is 1 + however many tool blocks are already open.
                                         // Record it in `open_tools` so the finishReason handler
@@ -2799,5 +2821,66 @@ mod tests {
         let a = synth_response_id();
         let b = synth_response_id();
         assert_ne!(a, b, "consecutive synthesized ids must differ: {a} vs {b}");
+    }
+
+    /// Regression (HIGH/performance): `state.open_tools` is only drained on a `finishReason` chunk,
+    /// so an upstream that streams an unbounded run of `functionCall` parts WITHOUT a finishReason
+    /// must not grow it without bound. Past `MAX_GEMINI_TOOL_FRAMES` new tool frames stop being
+    /// recorded (and their events suppressed), keeping the set capped while every realistic stream
+    /// (a handful of tools) is unaffected. Mirrors the Cohere reader's cap regression.
+    #[test]
+    fn test_stream_open_tools_growth_is_capped() {
+        let reader = GeminiReader;
+        let mut state = StreamDecodeState::default();
+        // Feed many functionCall parts across many chunks, never sending a finishReason so the
+        // drain path never runs — the only thing that can keep the set bounded is the cap.
+        for n in 0..(MAX_GEMINI_TOOL_FRAMES + 200) {
+            reader.read_response_events(
+                "",
+                &serde_json::json!({
+                    "candidates": [{
+                        "content": {
+                            "role": "model",
+                            "parts": [{"functionCall": {"name": format!("f{n}"), "args": {}}}]
+                        }
+                    }]
+                }),
+                &mut state,
+            );
+        }
+        assert!(
+            state.open_tools.len() <= MAX_GEMINI_TOOL_FRAMES,
+            "open_tools must be capped at MAX_GEMINI_TOOL_FRAMES, got {}",
+            state.open_tools.len()
+        );
+    }
+
+    /// The cap must NOT perturb a realistic stream: a small number of tool calls are all recorded
+    /// and each gets a matching BlockStart it can close on finishReason.
+    #[test]
+    fn test_stream_open_tools_under_cap_records_all() {
+        let reader = GeminiReader;
+        let mut state = StreamDecodeState::default();
+        let mut starts = 0usize;
+        for n in 0..3 {
+            for ev in reader.read_response_events(
+                "",
+                &serde_json::json!({
+                    "candidates": [{
+                        "content": {
+                            "role": "model",
+                            "parts": [{"functionCall": {"name": format!("f{n}"), "args": {}}}]
+                        }
+                    }]
+                }),
+                &mut state,
+            ) {
+                if matches!(ev, IrStreamEvent::BlockStart { .. }) {
+                    starts += 1;
+                }
+            }
+        }
+        assert_eq!(state.open_tools.len(), 3, "all 3 tool frames recorded");
+        assert_eq!(starts, 3, "each tool frame emits exactly one BlockStart");
     }
 }

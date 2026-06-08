@@ -58,6 +58,19 @@ pub(crate) enum MockResponse {
     SseTransportError {
         ok_events: Vec<String>,
     },
+    /// A native AWS binary event-stream body (`application/vnd.amazon.eventstream`), as a real
+    /// Bedrock ConverseStream backend emits it. `frames` is the ordered `(event_type, json_payload)`
+    /// sequence (messageStart / contentBlockDelta / messageStop / metadata, …); each is encoded with
+    /// `crate::eventstream::encode_frame` so the bytes carry real prelude/message CRC32s an AWS SDK
+    /// validates. `amzn_request_id` is served as the `x-amzn-RequestId` response header — the value a
+    /// same-protocol bedrock passthrough must forward VERBATIM rather than synthesizing a fresh UUID.
+    /// Exercises the same-protocol bedrock-stream branch (verbatim binary relay, eventstream CT
+    /// preservation, upstream-request-id passthrough) that the SSE/`text/event-stream` variants cannot
+    /// reach.
+    EventStream {
+        frames: Vec<(&'static str, Vec<u8>)>,
+        amzn_request_id: &'static str,
+    },
 }
 
 impl Default for MockResponse {
@@ -290,6 +303,25 @@ async fn mock_handler(
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/event-stream")
                 .body(Body::from_stream(s))
+                .unwrap()
+        }
+        MockResponse::EventStream {
+            frames,
+            amzn_request_id,
+        } => {
+            // Encode each (event_type, payload) into a CRC-valid binary AWS event-stream frame and
+            // concatenate — the exact byte layout a native Bedrock ConverseStream backend returns. The
+            // `x-amzn-RequestId` header carries the upstream's REAL request id; a same-protocol bedrock
+            // passthrough must relay this verbatim (never re-synthesize a fresh UUID).
+            let mut bytes: Vec<u8> = Vec::new();
+            for (event_type, payload) in &frames {
+                bytes.extend(crate::eventstream::encode_frame(event_type, payload));
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
+                .header("x-amzn-requestid", amzn_request_id)
+                .body(Body::from(bytes))
                 .unwrap()
         }
     }
