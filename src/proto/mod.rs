@@ -129,6 +129,22 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// Write a response/stream event to wire (event_type, data).
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)>;
 
+    /// Map a mid-stream `IrError` to a MODELED-EXCEPTION pair `(exception_name, message)` for
+    /// protocols whose native stream signals errors with an out-of-band exception frame rather than a
+    /// normal event. Only the AWS Bedrock event-stream wire distinguishes this: a native AWS SDK
+    /// dispatches errors off the `:message-type: exception` / `:exception-type` headers, which can only
+    /// be produced by `eventstream::encode_exception_frame` — NOT by `write_response_event`, whose
+    /// `(event_type, json)` pair is always framed `:message-type: event`. `StreamTranslate` calls this
+    /// for a Bedrock-INGRESS stream when the IR event is `IrStreamEvent::Error`, so the client receives
+    /// the typed Converse exception it expects instead of a silently-dropped `event`-typed frame.
+    ///
+    /// Returns `None` by default: every SSE-framed protocol (openai/anthropic/gemini/cohere/responses)
+    /// carries its error in-band via `write_response_event`, so the StreamTranslate caller falls back
+    /// to the normal event path for them. Only `BedrockWriter` overrides this.
+    fn write_response_exception(&self, _err: &IrError) -> Option<(String, String)> {
+        None
+    }
+
     /// Write a whole (non-streaming) response to wire JSON.
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value;
 
@@ -366,6 +382,24 @@ impl StreamTranslate {
                 *created = None;
                 *model = None;
             }
+            // Bedrock-INGRESS error path: a native AWS SDK dispatches mid-stream errors off the
+            // `:message-type: exception` / `:exception-type` headers, which ONLY
+            // `encode_exception_frame` produces. A normal `write_response_event` pair would be framed
+            // `:message-type: event` and silently dropped by a strict decoder. So when the ingress is
+            // an event-stream client and the IR event is an Error, emit a real modeled-exception frame
+            // via the writer's `write_response_exception` mapping instead of the event encoder.
+            if self.ingress_eventstream {
+                if let crate::ir::IrStreamEvent::Error(err) = &ev {
+                    if let Some((exc_name, message)) =
+                        self.ingress.writer().write_response_exception(err)
+                    {
+                        out.extend_from_slice(&crate::eventstream::encode_exception_frame(
+                            &exc_name, &message,
+                        ));
+                        continue;
+                    }
+                }
+            }
             if let Some((out_et, out_data)) = self.ingress.writer().write_response_event(&ev) {
                 if self.ingress_eventstream {
                     // ingress is a native AWS SDK Bedrock client: pack the logical event into a
@@ -380,12 +414,14 @@ impl StreamTranslate {
     }
 
     /// Hard cap on the reassembly buffer. An upstream that streams bytes without ever emitting a
-    /// frame terminator must not grow `buf` indefinitely (memory-exhaustion DoS). Kept equal to
-    /// `eventstream::MAX_FRAME_BYTES` (16 MiB) so any single frame the binary decoder is willing to
-    /// assemble can be buffered to completion here — a smaller cap would silently abort an
-    /// oversized-but-decoder-legal frame before `drain_frames` ever saw it. Far larger than any
-    /// legitimate single SSE / event-stream frame from a chat completion.
-    const MAX_BUF: usize = 16 * 1024 * 1024;
+    /// frame terminator must not grow `buf` indefinitely (memory-exhaustion DoS). DEFINED as
+    /// `eventstream::MAX_FRAME_BYTES` (a single source of truth) so any single frame the binary
+    /// decoder is willing to assemble can be buffered to completion here — a smaller cap would
+    /// silently abort an oversized-but-decoder-legal frame before `drain_frames` ever saw it, and a
+    /// divergence between the two literals (the previous hand-copied `16 * 1024 * 1024`) would
+    /// reintroduce that bug with no compile-time signal. Far larger than any legitimate single SSE /
+    /// event-stream frame from a chat completion.
+    const MAX_BUF: usize = crate::eventstream::MAX_FRAME_BYTES;
 
     /// Feed a chunk of EGRESS SSE bytes; return translated INGRESS SSE bytes for whatever
     /// COMPLETE frames are now available (empty if only a partial frame is buffered). Once the
@@ -2894,6 +2930,82 @@ mod stream_translate_tests {
         assert!(
             dv.pointer("/delta/toolUse/input").is_some(),
             "tool input delta round-trips through the binary encoder; got {dv}"
+        );
+    }
+
+    /// HIGH/conformance regression: a mid-stream upstream ERROR on a Bedrock-INGRESS cross-protocol
+    /// stream must be framed as a MODELED EXCEPTION (`:message-type: exception` + `:exception-type`),
+    /// NOT a normal `:message-type: event` frame. An AWS SDK dispatches errors off `:message-type`;
+    /// an `event`-typed frame naming a Converse exception is silently dropped, so the client never
+    /// surfaces the error and the stream appears to truncate. This drives an Anthropic egress
+    /// `event: error` frame (decoded to `IrStreamEvent::Error`) through the bedrock-ingress translator
+    /// and asserts the emitted frame is a real exception frame.
+    #[test]
+    fn test_translate_error_to_bedrock_ingress_is_exception_frame() {
+        let mut t =
+            StreamTranslate::new("bedrock", "anthropic").expect("bedrock ingress translator");
+        // Anthropic native mid-stream error envelope → IrStreamEvent::Error (the Anthropic reader
+        // classifies all stream errors as ClientError → ValidationException).
+        let err_frame = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream is overloaded\"}}\n\n";
+        let raw = t.feed(err_frame.as_bytes());
+        assert!(!raw.is_empty(), "an error event must emit a frame");
+        // Must be binary framing, not SSE text.
+        assert!(
+            !raw.starts_with(b"event:") && !raw.starts_with(b"data:"),
+            "bedrock ingress error must be a binary frame, not SSE text"
+        );
+        // The frame must be a valid event-stream message carrying the exception headers.
+        let headers_len = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
+        let headers = String::from_utf8_lossy(&raw[12..12 + headers_len]);
+        assert!(
+            headers.contains(":message-type"),
+            "frame carries a :message-type header; headers: {headers}"
+        );
+        assert!(
+            headers.contains("exception"),
+            ":message-type must be `exception`, not `event`; headers: {headers}"
+        );
+        assert!(
+            headers.contains(":exception-type"),
+            "frame carries an :exception-type header; headers: {headers}"
+        );
+        // The exception-type is a real Converse exception name (ClientError → ValidationException).
+        assert!(
+            headers.contains("ValidationException"),
+            ":exception-type names a real Converse exception; headers: {headers}"
+        );
+        // The whole frame must decode without trailing bytes (valid CRC + lengths).
+        let total_len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+        assert_eq!(total_len, raw.len(), "total_len matches the bytes emitted");
+        // Payload is the JSON `{"message": ...}` the SDK surfaces. The Anthropic stream-error reader
+        // carries the upstream error `type` as the IR `provider_signal`, which becomes the message.
+        let payload = &raw[12 + headers_len..total_len - 4];
+        let v: serde_json::Value = serde_json::from_slice(payload).expect("valid JSON payload");
+        assert!(
+            v.get("message").and_then(|m| m.as_str()).is_some(),
+            "exception frame carries a JSON message body; got {v}"
+        );
+    }
+
+    /// MEDIUM/conformance regression: on a cross-protocol Gemini-INGRESS stream, the MessageStart
+    /// frame must still carry a `responseId` even though `StreamTranslate` strips the foreign id/model
+    /// to `None` — a native google-genai SDK reads `chunk.response_id` off the first chunk. Previously
+    /// the Gemini writer emitted NO frame when both id and model were `None`, leaving the client with
+    /// no responseId on any cross-protocol Gemini stream.
+    #[test]
+    fn test_translate_to_gemini_ingress_synthesizes_response_id() {
+        let mut t = StreamTranslate::new("gemini", "openai").expect("gemini ingress translator");
+        // OpenAI chunk with a top-level id/model that the cross-protocol strip will clear.
+        let chunk = "data: {\"id\":\"chatcmpl-abc\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n";
+        let out = String::from_utf8(t.feed(chunk.as_bytes())).unwrap();
+        assert!(
+            out.contains("responseId"),
+            "gemini cross-protocol stream must carry a synthesized responseId; got:\n{out}"
+        );
+        // The foreign OpenAI id must NOT leak through.
+        assert!(
+            !out.contains("chatcmpl-abc"),
+            "foreign backend id must be stripped, not leaked; got:\n{out}"
         );
     }
 

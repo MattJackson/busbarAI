@@ -1301,6 +1301,127 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// HIGH/test-coverage (forward.rs:496-526): a TRUE mid-stream transport failure on a
+    /// bedrock-ingress cross-protocol stream must terminate the body with a CRC-valid BINARY
+    /// `:message-type: exception` frame appended AFTER the real frames — never SSE `event:`/`data:`
+    /// ASCII (which yields an undecodable prelude/CRC for the AWS SDK). `SseTransportError` drops the
+    /// connection after the first frame, driving `FirstByteBody`'s `Poll::Ready(Some(Err))` arm — the
+    /// wiring previously exercised only by the isolated `mid_stream_error_bytes` unit test.
+    #[tokio::test]
+    async fn test_bedrock_ingress_mid_stream_transport_error_appends_binary_exception() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::SseTransportError {
+            ok_events: vec![r#"{"choices":[{"delta":{"role":"assistant"}}]}"#.to_string()],
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/model/foo/converse-stream"))
+            .bearer_auth("t")
+            .body(
+                json!({ "messages": [{"role": "user", "content": [{"text": "hi"}]}] }).to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body = resp.bytes().await.unwrap();
+        // No SSE ASCII anywhere in the body — it must be pure binary frames.
+        assert!(
+            !body.windows(7).any(|w| w == b"event: ") && !body.windows(6).any(|w| w == b"data: "),
+            "bedrock-ingress mid-stream error must NOT contain SSE ASCII; body: {body:?}"
+        );
+        // The body decodes as a sequence of binary frames, the LAST of which is an exception frame.
+        let mut buf = body.to_vec();
+        let frames = crate::eventstream::drain_frames(&mut buf);
+        assert!(
+            buf.is_empty(),
+            "body must be a whole sequence of CRC-valid frames; {} bytes left",
+            buf.len()
+        );
+        assert!(!frames.is_empty(), "at least the first real frame decodes");
+        // The trailing exception frame carries no `:event-type` (drain_frames yields an empty event
+        // type for it); re-scan the raw bytes to confirm an exception frame is present.
+        let raw = body.to_vec();
+        let raw_str = String::from_utf8_lossy(&raw);
+        assert!(
+            raw_str.contains(":exception-type"),
+            "a binary exception frame must be appended after the real frames"
+        );
+        assert!(
+            raw_str.contains("InternalServerException"),
+            "the mid-stream transport failure maps to InternalServerException"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// HIGH/test-coverage twin (forward.rs:186): the SSE-ingress (openai) mid-stream transport-failure
+    /// path must append a BARE `data:` error frame (NO `event:` line — openai native streams never
+    /// emit one mid-stream) whose `data:` is the native OpenAI error envelope.
+    #[tokio::test]
+    async fn test_openai_ingress_mid_stream_transport_error_appends_native_sse() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::SseTransportError {
+            ok_events: vec![r#"{"choices":[{"delta":{"content":"hi"}}]}"#.to_string()],
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "gpt-4o",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("openai"),
+            )
+            .pool("gpt-4o", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("t")
+            .body(json!({ "model": "gpt-4o", "stream": true, "messages": [] }).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body = resp.bytes().await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        // The trailing error frame is a bare `data:` envelope, with NO `event:` line.
+        assert!(
+            !text.contains("event:"),
+            "openai mid-stream error must be a bare data: frame (no event: line); got:\n{text}"
+        );
+        // The last frame's data: payload is the native OpenAI error envelope.
+        let frames: Vec<&str> = text
+            .split("\n\n")
+            .filter(|f| !f.trim().is_empty())
+            .collect();
+        let last_data = frames
+            .last()
+            .and_then(|f| f.lines().find_map(|l| l.strip_prefix("data: ")))
+            .expect("a trailing data: error frame");
+        let v: Value = serde_json::from_str(last_data).expect("native OpenAI JSON envelope");
+        assert!(
+            v.get("error").is_some(),
+            "OpenAI native error envelope: {v}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
     /// HIGH/conformance regression: a SAME-PROTOCOL bedrock-ingress → bedrock-backend passthrough must
     /// NOT leak the router shim keys (`model`/`stream`) that `ingress_path_model` injects into the
     /// body. `forward_with_pool` skips IR translation on same-protocol, so without the strip the

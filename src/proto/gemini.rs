@@ -958,12 +958,23 @@ impl ProtocolWriter for GeminiWriter {
             // stream that carried no identity is not made distinguishable by an injected empty chunk.
             // `created` has no Gemini stream analogue and is never emitted.
             IrStreamEvent::MessageStart { id, model, .. } => {
-                if id.is_none() && model.is_none() {
-                    return None;
-                }
                 let mut frame = serde_json::Map::new();
-                if let Some(id) = id {
-                    frame.insert("responseId".to_string(), serde_json::json!(id));
+                match (id, model) {
+                    (Some(id), _) => {
+                        frame.insert("responseId".to_string(), serde_json::json!(id));
+                    }
+                    // Cross-protocol stream: `StreamTranslate` strips the foreign id/model to `None`
+                    // before this writer runs. A native google-genai SDK reads `chunk.response_id`
+                    // off the FIRST chunk (for observability/tracing), so emitting no identity frame
+                    // at all is a detectable fidelity gap from a native Gemini stream (which always
+                    // carries `responseId` in the first chunk). Synthesize one — matching the
+                    // non-stream `write_response` behavior — rather than dropping the frame.
+                    (None, _) => {
+                        frame.insert(
+                            "responseId".to_string(),
+                            serde_json::json!(synth_response_id()),
+                        );
+                    }
                 }
                 if let Some(model) = model {
                     frame.insert("modelVersion".to_string(), serde_json::json!(model));
@@ -1661,22 +1672,33 @@ mod tests {
         );
     }
 
-    /// Fidelity guard (stream): a MessageStart with NO identity (id == None && model == None) emits
-    /// NO frame, so a native Gemini stream that carried no identity is not made distinguishable by
-    /// an injected empty leading chunk. Mirrors `write_response`'s omit-on-`None` rule. No panic.
+    /// Cross-protocol fidelity (stream): a MessageStart with NO identity (the post-strip state on a
+    /// cross-protocol Gemini-ingress stream — `StreamTranslate` clears the foreign id/model) must
+    /// still SYNTHESIZE a `responseId`, because a native google-genai SDK reads `chunk.response_id`
+    /// off the first chunk. Emitting no frame (the old behavior) left the client with no responseId on
+    /// any cross-protocol Gemini stream — a detectable fidelity gap. Mirrors the non-stream
+    /// `write_response` synthesis. (Same-protocol Gemini streams never reach this writer — they pass
+    /// through byte-for-byte — so this only affects the cross-protocol path.)
     #[test]
-    fn test_stream_message_start_no_identity_emits_no_frame() {
+    fn test_stream_message_start_no_identity_synthesizes_response_id() {
         let writer = GeminiWriter;
-        let frame = writer.write_response_event(&IrStreamEvent::MessageStart {
-            role: crate::ir::IrRole::Assistant,
-            usage: None,
-            id: None,
-            created: None,
-            model: None,
-        });
+        let frame = writer
+            .write_response_event(&IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: None,
+                created: None,
+                model: None,
+            })
+            .expect("a synthesized-identity MessageStart must emit a frame");
         assert!(
-            frame.is_none(),
-            "no-identity MessageStart must not emit a frame: {frame:?}"
+            frame
+                .1
+                .get("responseId")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
+            "post-strip MessageStart must synthesize a responseId: {}",
+            frame.1
         );
     }
 
@@ -1923,8 +1945,9 @@ mod tests {
         );
     }
 
-    /// A cross-protocol stream that carries only a model (no id) still surfaces `modelVersion` on
-    /// the leading frame so a native SDK reading `chunk.model_version` sees it.
+    /// A cross-protocol stream that carries only a model (no id) surfaces `modelVersion` AND a
+    /// synthesized `responseId` on the leading frame — a native SDK reads both `chunk.model_version`
+    /// and `chunk.response_id` off the first chunk.
     #[test]
     fn test_stream_message_start_model_only_emits_model_version() {
         let writer = GeminiWriter;
@@ -1944,8 +1967,12 @@ mod tests {
             frame.1
         );
         assert!(
-            frame.1.get("responseId").is_none(),
-            "no id → no responseId fabricated: {}",
+            frame
+                .1
+                .get("responseId")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
+            "no id → responseId synthesized so the SDK still sees one: {}",
             frame.1
         );
     }

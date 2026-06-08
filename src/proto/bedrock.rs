@@ -38,6 +38,28 @@ pub(crate) fn error_kind_to_bedrock_type(kind: &str) -> &'static str {
     }
 }
 
+/// Map a mid-stream `IrError` to the native AWS Converse `(exception_name, message)` a Bedrock SDK
+/// expects. Shared by `write_response_exception` (the StreamTranslate exception-frame path) and the
+/// fallback `write_response_event` Error arm so the class→exception mapping has a single source of
+/// truth. The message prefers the upstream's `provider_signal`, falling back to the exception name.
+fn bedrock_exception_for(err: &crate::proto::IrError) -> (&'static str, String) {
+    let kind = match err.class {
+        StatusClass::RateLimit => "throttling",
+        StatusClass::Timeout => "model_timeout",
+        StatusClass::Auth => "auth",
+        StatusClass::Billing => "quota_exceeded",
+        StatusClass::ClientError | StatusClass::ContextLength => "invalid_request",
+        StatusClass::Overloaded => "service_unavailable",
+        StatusClass::ServerError | StatusClass::Network => "api_error",
+    };
+    let exception_name = error_kind_to_bedrock_type(kind);
+    let message = err
+        .provider_signal
+        .clone()
+        .unwrap_or_else(|| exception_name.to_string());
+    (exception_name, message)
+}
+
 /// Bedrock stopReason → canonical IR stop_reason.
 fn stop_reason_map(ward: &str) -> String {
     match ward {
@@ -1070,37 +1092,31 @@ impl ProtocolWriter for BedrockWriter {
 
             // A mid-stream error on the Bedrock-ingress path. The fully native representation is an
             // AWS modeled-exception EVENT-STREAM frame (`:message-type: exception` +
-            // `:exception-type: <ExceptionName>`); that frame can only be produced by
-            // `eventstream::encode_exception_frame`, which the production mid-stream-error path
-            // (`forward.rs::mid_stream_error_bytes`) already emits for a bedrock-ingress client. The
-            // `write_response_event` trait returns a single `(event_type, json)` pair that the
-            // StreamTranslate consumer always wraps with `encode_frame` (`:message-type: event`), so
-            // this arm cannot set the exception message-type header. We therefore name the event with
-            // the real Converse exception name (mapped from the IR error class) and carry the AWS
-            // `{"message": ...}` body, so the type token is at least a genuine AWS exception name
-            // rather than the literal `"error"`. See `skipped` note: the message-type header itself is
-            // owned by the (out-of-unit) encoder + consumer.
+            // `:exception-type: <ExceptionName>`), which `StreamTranslate` now emits via
+            // `write_response_exception` + `eventstream::encode_exception_frame` BEFORE reaching this
+            // arm (a Bedrock-ingress stream never routes an `Error` through `write_response_event`).
+            // This arm therefore only fires if a non-eventstream consumer ever drives a Bedrock
+            // writer with an `Error` event; it falls back to a normal `event`-typed frame naming the
+            // real Converse exception so the type token is still a genuine AWS name rather than the
+            // literal `"error"`.
             IrStreamEvent::Error(err) => {
-                let kind = match err.class {
-                    StatusClass::RateLimit => "throttling",
-                    StatusClass::Timeout => "model_timeout",
-                    StatusClass::Auth => "auth",
-                    StatusClass::Billing => "quota_exceeded",
-                    StatusClass::ClientError | StatusClass::ContextLength => "invalid_request",
-                    StatusClass::Overloaded => "service_unavailable",
-                    StatusClass::ServerError | StatusClass::Network => "api_error",
-                };
-                let exception_name = error_kind_to_bedrock_type(kind);
-                let message = err
-                    .provider_signal
-                    .clone()
-                    .unwrap_or_else(|| exception_name.to_string());
+                let (exception_name, message) = bedrock_exception_for(err);
                 Some((
                     exception_name.to_string(),
                     serde_json::json!({ "message": message }),
                 ))
             }
         }
+    }
+
+    /// A Bedrock-ingress stream signals a mid-stream error with a MODELED-EXCEPTION event-stream
+    /// frame (`:message-type: exception`), which `StreamTranslate` emits via
+    /// `eventstream::encode_exception_frame`. This maps the IR error to that frame's
+    /// `(exception_name, message)`, sharing the class→exception mapping with the (fallback)
+    /// `write_response_event` Error arm so both stay consistent.
+    fn write_response_exception(&self, err: &crate::proto::IrError) -> Option<(String, String)> {
+        let (exception_name, message) = bedrock_exception_for(err);
+        Some((exception_name.to_string(), message))
     }
 
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {

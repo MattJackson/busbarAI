@@ -50,8 +50,10 @@ fn ingress_error(ingress: &str, status: StatusCode, kind: &str, msg: &str) -> Re
     };
     let body = serde_json::to_string(&envelope).unwrap_or_else(|_| {
         // Envelope is built from serde_json::json! values and always serializes; this fallback only
-        // exists to avoid an unwrap on the request path.
-        format!("{{\"error\":{{\"message\":{msg:?},\"type\":{kind:?}}}}}")
+        // exists to avoid an unwrap on the request path. Build it with `json!` (correct JSON string
+        // escaping) rather than interpolating Rust `{:?}` Debug formatting, which is NOT guaranteed
+        // valid JSON escaping for all inputs (e.g. it differs on `/` and some control sequences).
+        serde_json::json!({ "error": { "message": msg, "type": kind } }).to_string()
     });
     Response::builder()
         .status(status)
@@ -153,9 +155,11 @@ fn extract_error_message(bytes: &[u8]) -> Option<String> {
 ///     modeled-exception frame (`:message-type: exception`, `:exception-type: InternalServerException`)
 ///     with valid CRC32. Writing SSE `event:`/`data:` text into a binary eventstream body produces an
 ///     undecodable prelude/CRC for the SDK's decoder — the bug this guards against.
-///   - SSE ingress (openai/anthropic/gemini/cohere/responses): an `event: error` SSE frame whose
-///     `data:` payload is the ingress protocol's NATIVE error envelope, so the official SDK decodes
-///     it rather than seeing a foreign (previously always Anthropic-shaped) body.
+///   - SSE ingress (openai/anthropic/gemini/cohere/responses): an SSE error frame shaped in the
+///     ingress protocol's OWN convention — bare `data:` for openai/cohere (no `event:` line, which
+///     native streams of those protocols never emit), `event: error` for anthropic/gemini,
+///     `event: response.failed` for responses — whose `data:` payload is the ingress protocol's
+///     NATIVE error envelope, so the official SDK decodes it rather than seeing a foreign frame shape.
 fn mid_stream_error_bytes(
     ingress_protocol: &str,
     ingress_eventstream: bool,
@@ -181,9 +185,22 @@ fn mid_stream_error_bytes(
         ),
     };
     let data = serde_json::to_string(&envelope).unwrap_or_else(|_| {
-        format!("{{\"error\":{{\"message\":{message:?},\"type\":\"api_error\"}}}}")
+        serde_json::json!({ "error": { "message": message, "type": "api_error" } }).to_string()
     });
-    format!("event: error\ndata: {data}\n\n").into_bytes()
+    // Frame the SSE error in the INGRESS protocol's OWN convention, matching how the happy-path
+    // frames every other event for that protocol (proto::reframe_sse): protocols whose native stream
+    // uses bare `data:` frames (openai, cohere) get NO `event:` line — prepending `event: error` is a
+    // structural deviation native streams of those protocols never emit, and the official SDK parsers
+    // key off bare `data:`. Anthropic/Gemini use named SSE events (`event: error`). Responses uses
+    // event names; its terminal error event is `response.failed`. An unknown ingress falls back to the
+    // bare OpenAI shape.
+    let event_line = match ingress_protocol {
+        "anthropic" | "gemini" => "event: error\n",
+        "responses" => "event: response.failed\n",
+        "openai" | "cohere" => "",
+        _ => "",
+    };
+    format!("{event_line}data: {data}\n\n").into_bytes()
 }
 
 /// Non-buffering stream inspection tap for usage parsing.
@@ -214,6 +231,15 @@ impl UsageTap {
     /// Feed a chunk to the tap and extract any usage fields. Bounded: it only scans complete JSON
     /// objects within this chunk and keeps no cross-chunk buffer.
     pub(crate) fn feed(&mut self, chunk: &Bytes) {
+        // Bound per-poll scan time: `feed` runs synchronously inside the stream `poll_next`, so an
+        // O(n) brace-scan over a pathological multi-MiB single chunk would block the Tokio worker for
+        // its duration. Real SSE backends send one small event per chunk, and the usage-bearing
+        // frame is always a small terminal event — so skipping the scan for an oversized chunk costs
+        // no accounting accuracy in practice while capping the worst-case poll latency.
+        const MAX_SCAN_BYTES: usize = 64 * 1024;
+        if chunk.len() > MAX_SCAN_BYTES {
+            return;
+        }
         let mut pos = 0;
         while pos < chunk.len() {
             if let Some(delta_idx) = find_json_start(&chunk[pos..]) {
@@ -481,16 +507,24 @@ where
                     if !this.first_byte_sent.load(Ordering::Relaxed) {
                         this.first_byte_sent.store(true, Ordering::Relaxed);
                     }
-                    // Feed chunk to tap for usage extraction (non-buffering)
-                    this.tap.feed(&chunk);
                     // cross-protocol → translate egress SSE bytes to the ingress format.
                     if let Some(t) = this.translate.as_mut() {
                         let out = t.feed(&chunk);
-                        if out.is_empty() {
+                        // Feed the tap from the TRANSLATED output, not the raw upstream `chunk`. On a
+                        // Bedrock-EGRESS upstream the raw chunk is binary eventstream framing, not JSON
+                        // text — the tap's `{`-scanner would match CRC/length/header bytes and parse
+                        // garbage. The translated `out` is the ingress SSE/JSON shape the tap is built
+                        // for (and a same-protocol passthrough — translate=None — still feeds the raw
+                        // chunk below, which IS already the right shape there).
+                        let out_bytes = Bytes::from(out);
+                        this.tap.feed(&out_bytes);
+                        if out_bytes.is_empty() {
                             continue; // only a partial frame buffered; poll inner again
                         }
-                        return Poll::Ready(Some(Ok(Bytes::from(out))));
+                        return Poll::Ready(Some(Ok(out_bytes)));
                     }
+                    // Passthrough (same-protocol): the raw chunk is already in the client's shape.
+                    this.tap.feed(&chunk);
                     return Poll::Ready(Some(Ok(chunk)));
                 }
                 Poll::Ready(Some(Err(e))) => {
@@ -558,12 +592,19 @@ where
                         .unwrap_or_default();
                     drop(this.permit.take());
                     this.ended = true;
-                    // Charge this request's token usage to the virtual key's budget (once).
+                    // Charge this request's token usage to the virtual key's budget (once) — but ONLY
+                    // for a cleanly-terminated stream. A stream that emitted a mid-stream terminal
+                    // ERROR frame (`tap.terminal_error` set) delivered a partial/aborted response the
+                    // caller cannot use, and billing it contradicts the flat-fee-only-on-success
+                    // policy (`route::finish` charges the per-request fee only on 2xx). Mirror that
+                    // here: a failed stream is not token-billed.
                     if let Some(sink) = this.usage_sink.take() {
-                        let tokens = this.tap.input_tokens.unwrap_or(0)
-                            + this.tap.output_tokens.unwrap_or(0);
-                        sink.gov
-                            .record_tokens(&sink.key_id, &sink.period, now(), tokens);
+                        if this.tap.terminal_error.is_none() {
+                            let tokens = this.tap.input_tokens.unwrap_or(0)
+                                + this.tap.output_tokens.unwrap_or(0);
+                            sink.gov
+                                .record_tokens(&sink.key_id, &sink.period, now(), tokens);
+                        }
                     }
                     if !done.is_empty() {
                         return Poll::Ready(Some(Ok(Bytes::from(done))));
@@ -857,7 +898,12 @@ pub(crate) async fn forward_with_pool(
     ingress_protocol: &str,
     usage_sink: Option<UsageSink>,
 ) -> Response {
-    let mut v: Value = match serde_json::from_slice(&body) {
+    // The PRISTINE parsed request body. Never mutated after this point: each failover hop derives a
+    // fresh per-hop `hop_v` from this clone before translating/rewriting, so a cross-protocol hop
+    // never re-translates a body already rewritten into a previous egress lane's shape (the bug:
+    // mutating a shared `v` in place made hop N+1 read hop N's egress-shaped body with the ingress
+    // reader, misparsing or skipping translation entirely on a mixed-protocol pool).
+    let v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             return ingress_error(
@@ -987,6 +1033,9 @@ pub(crate) async fn forward_with_pool(
         .increment(1);
         tracing::debug!(pool = %pool_name, lane = %app.lanes[i].model, "upstream attempt");
 
+        // Derive a FRESH per-hop body from the pristine `v`. Each failover hop must translate/rewrite
+        // starting from the original request, never from a previous hop's egress-shaped body.
+        let mut hop_v = v.clone();
         let egress_name = app.lanes[i].protocol.name();
         if ingress_protocol != egress_name {
             // one cross-protocol translation hop for this request.
@@ -1005,10 +1054,10 @@ pub(crate) async fn forward_with_pool(
                     &format!("router: unknown ingress protocol '{ingress_protocol}'"),
                 );
             };
-            match ingress_proto.reader().read_request(&v) {
+            match ingress_proto.reader().read_request(&hop_v) {
                 Ok(mut ir) => {
                     apply_required_max_tokens(&mut ir, &app.lanes[i]);
-                    v = app.lanes[i].protocol.writer().write_request(&ir);
+                    hop_v = app.lanes[i].protocol.writer().write_request(&ir);
                 }
                 Err(_) => {
                     return ingress_error(
@@ -1024,16 +1073,17 @@ pub(crate) async fn forward_with_pool(
         app.lanes[i]
             .protocol
             .writer()
-            .rewrite_model(&mut v, &app.lanes[i].model);
+            .rewrite_model(&mut hop_v, &app.lanes[i].model);
         // Same-protocol passthrough for a PATH-MODEL ingress (gemini/bedrock): the route layer
         // injected `model`/`stream` shim keys into the body so the shared resolve/forward plumbing
-        // (which reads both from the body) works. Cross-protocol rebuilds `v` via read/write_request
-        // so the shims are already gone there, but the same-protocol branch would forward them to the
-        // backend — a router-internal leak (and, for Bedrock, an invalid Converse request). Strip them.
+        // (which reads both from the body) works. Cross-protocol rebuilds `hop_v` via
+        // read/write_request so the shims are already gone there, but the same-protocol branch would
+        // forward them to the backend — a router-internal leak (and, for Bedrock, an invalid Converse
+        // request). Strip them.
         if ingress_protocol == egress_name {
-            strip_router_shim_keys(&mut v, ingress_protocol);
+            strip_router_shim_keys(&mut hop_v, ingress_protocol);
         }
-        let payload = match serde_json::to_vec(&v) {
+        let payload = match serde_json::to_vec(&hop_v) {
             Ok(p) => p,
             // Re-serializing a Value that was parsed from valid JSON and only rewritten with
             // serde_json values is effectively infallible; return a shaped 500 rather than panic a
@@ -1365,8 +1415,8 @@ pub(crate) async fn forward_with_pool(
                     drop(permit); // upstream call complete; a non-streamed response holds no permit
                                   // Token accounting: no FirstByteBody on this buffered path, so tap here.
                     record_nonstream_usage(&bytes, &usage_sink);
-                    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                        if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&v) {
+                    if let Ok(rv) = serde_json::from_slice::<Value>(&bytes) {
+                        if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&rv) {
                             if let Some(ingress_proto) =
                                 crate::proto::protocol_for(ingress_protocol)
                             {
@@ -1402,14 +1452,27 @@ pub(crate) async fn forward_with_pool(
                             }
                         }
                     }
-                    // Not translatable (non-JSON / unexpected shape / unknown ingress): relay verbatim.
-                    let mut rb = Response::builder().status(status);
-                    if let Some(ct) = ct {
-                        rb = rb.header(CONTENT_TYPE, ct);
-                    }
-                    return rb
-                        .body(Body::from(bytes))
-                        .unwrap_or_else(|_| status.into_response());
+                    // Not translatable (non-JSON / unexpected-but-valid shape / unknown ingress).
+                    // We reached this block only because ingress != egress, so relaying the upstream
+                    // body+Content-Type verbatim would leak the EGRESS provider's native wire format
+                    // to a different-protocol client — a foreign-format response is an immediate proxy
+                    // tell (§8.2) and a functional failure (the client's SDK cannot decode it). Return
+                    // an ingress-native 500 instead. (Same-protocol passthrough never enters this
+                    // block — it streams through FirstByteBody / the buffered same-protocol path — so
+                    // a legitimate verbatim relay is never suppressed here.)
+                    tracing::warn!(
+                        ingress = %ingress_protocol,
+                        egress = %app.lanes[i].protocol.name(),
+                        status = status.as_u16(),
+                        "cross-protocol response not translatable; returning ingress-native error \
+                         instead of leaking the upstream's native body"
+                    );
+                    return ingress_error(
+                        ingress_protocol,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "api_error",
+                        "upstream returned an untranslatable response",
+                    );
                 }
 
                 // Use FirstByteBody wrapper to track first byte and emit SSE error events on mid-stream failures
@@ -1581,9 +1644,11 @@ fn handle_status_503(
 /// candidate (or give up). The concurrency `permit` is held for the lifetime of a streamed
 /// success body (invariant) and dropped on error.
 ///
-/// Limitation: this degraded path (least-bad / fallback-pool routing) forwards the request body
-/// as-is and does not translate between protocols, so it is only correct for same-protocol
-/// targets. Cross-protocol routing goes through the main `forward_with_pool` path.
+/// Cross-protocol translation: this degraded path translates BOTH directions symmetrically with the
+/// main `forward_with_pool` path — the request body is translated egress-side (via the superset IR)
+/// and the 2xx response is translated back to the ingress protocol (buffered for non-stream, framed
+/// via `StreamTranslate` for SSE). Non-2xx responses are reshaped to the ingress error envelope on a
+/// crossed boundary. Same-protocol targets pass through verbatim.
 #[tracing::instrument(name = "forward_once", skip_all, fields(lane = i))]
 async fn forward_once(
     app: &Arc<App>,
@@ -1697,11 +1762,27 @@ async fn forward_once(
         Ok(r) => {
             let status = r.status();
             let ct = r.headers().get(CONTENT_TYPE).cloned();
+            let cross_protocol = ingress_protocol != egress_name;
 
             if !status.is_success() {
-                // Degraded path: relay the upstream error verbatim (no classification). Size-capped
-                // read bounds a hostile/misconfigured upstream's allocation.
                 let bytes = read_capped_body(r).await;
+                // Cross-protocol: relaying the EGRESS provider's native error body+Content-Type to a
+                // different-protocol client is a foreign-format leak (§8.2). Reshape to the ingress
+                // protocol's native error envelope, lifting the upstream's human message where
+                // present. Same-protocol passthrough relays verbatim (already the client's shape).
+                if cross_protocol {
+                    let msg = extract_error_message(&bytes)
+                        .unwrap_or_else(|| "upstream rejected the request".to_string());
+                    let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                        "rate_limit_error"
+                    } else if status.is_server_error() {
+                        "api_error"
+                    } else {
+                        "invalid_request_error"
+                    };
+                    return Ok(ingress_error(ingress_protocol, status, kind, &msg));
+                }
+                // Same-protocol degraded path: relay the upstream error verbatim (no classification).
                 let mut rb = Response::builder().status(status);
                 if let Some(ct) = ct {
                     rb = rb.header(CONTENT_TYPE, ct);
@@ -1716,9 +1797,54 @@ async fn forward_once(
                 .as_ref()
                 .map(|h| is_streaming_content_type(h.to_str().unwrap_or("")))
                 .unwrap_or(false);
+
+            // Non-streaming cross-protocol response: buffer + translate egress→IR→ingress, mirroring
+            // the main forward_with_pool path so this degraded route does not leak the egress wire
+            // format to a different-protocol client.
+            if cross_protocol && !is_sse {
+                let bytes = read_capped_body(r).await;
+                drop(permit); // a buffered (non-streamed) response holds no permit
+                if let Ok(rv) = serde_json::from_slice::<Value>(&bytes) {
+                    if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&rv) {
+                        if let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) {
+                            // Strip the backend's native-format identity so the ingress writer mints
+                            // values in the CLIENT's format (see the main path for the rationale).
+                            ir.id = None;
+                            ir.system_fingerprint = None;
+                            ir.stop_sequence = None;
+                            let translated = ingress_proto.writer().write_response(&ir);
+                            return Ok(Response::builder()
+                                .status(status)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(translated.to_string()))
+                                .unwrap_or_else(|_| status.into_response()));
+                        }
+                    }
+                }
+                // Untranslatable across a protocol boundary: return an ingress-native error rather
+                // than leaking the upstream body verbatim.
+                tracing::warn!(
+                    ingress = %ingress_protocol,
+                    egress = %egress_name,
+                    "degraded cross-protocol response not translatable; returning ingress-native error"
+                );
+                return Ok(ingress_error(
+                    ingress_protocol,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "upstream returned an untranslatable response",
+                ));
+            }
+
+            // Streaming (or same-protocol non-stream): stream with first-byte boundary tracking. On a
+            // cross-protocol SSE response, translate egress frames → ingress frames, matching the main
+            // path. No pool context here → ADR-0002 default breaker config + lane-default cell.
+            let translate = if is_sse && cross_protocol {
+                crate::proto::StreamTranslate::new(ingress_protocol, egress_name)
+            } else {
+                None
+            };
             let upstream_stream = r.bytes_stream();
-            // Degraded fallback/least-bad path: no cross-protocol translation here (scope), and no
-            // pool context to resolve per-pool breaker config — use ADR-0002 defaults.
             let guarded_body = FirstByteBody::new(
                 upstream_stream,
                 is_sse,
@@ -1728,12 +1854,25 @@ async fn forward_once(
                 i,
                 Arc::new(crate::store::BreakerCfg::default()),
                 "", // degraded path: lane-default breaker cell
-                None,
+                translate,
                 None,
             );
             let mut rb = Response::builder().status(status);
-            if let Some(ct) = ct {
-                rb = rb.header(CONTENT_TYPE, ct);
+            // Cross-protocol streaming: the body is reframed to the client's format, so the CT must
+            // describe the ingress client's wire, not the upstream's. Same-protocol keeps the upstream
+            // CT verbatim.
+            match (cross_protocol && is_sse)
+                .then(|| ingress_stream_content_type(ingress_protocol))
+                .flatten()
+            {
+                Some(client_ct) => {
+                    rb = rb.header(CONTENT_TYPE, client_ct);
+                }
+                None => {
+                    if let Some(ct) = ct {
+                        rb = rb.header(CONTENT_TYPE, ct);
+                    }
+                }
             }
             Ok(rb
                 .body(guarded_body.into_body())
@@ -2091,25 +2230,53 @@ mod mid_stream_error_tests {
         assert_eq!(v["message"], "connection reset by peer");
     }
 
-    /// An SSE ingress client (e.g. OpenAI) must receive an `event: error` SSE frame whose `data:`
-    /// payload is the INGRESS protocol's native error envelope — not the previously hard-coded
-    /// Anthropic shape, and not a binary frame.
+    /// HIGH/conformance (forward.rs:186): the SSE mid-stream error frame must be shaped in the
+    /// INGRESS protocol's OWN convention, matching the happy path. Bare-`data:` protocols
+    /// (openai/cohere) get NO `event:` line — native streams of those protocols never emit one, and
+    /// the official SDK parsers key off bare `data:`. Anthropic/Gemini get `event: error`; Responses
+    /// gets `event: response.failed`. The `data:` payload is always the ingress protocol's native
+    /// error envelope.
     #[test]
-    fn test_sse_ingress_mid_stream_error_is_native_sse() {
-        let bytes = mid_stream_error_bytes("openai", false, "boom");
+    fn test_sse_ingress_mid_stream_error_uses_native_framing() {
+        // openai / cohere: bare `data:`, NO event line, native JSON envelope.
+        for proto in ["openai", "cohere"] {
+            let bytes = mid_stream_error_bytes(proto, false, "boom");
+            let text = String::from_utf8(bytes).expect("SSE error is utf-8 text");
+            assert!(
+                text.starts_with("data: "),
+                "{proto}: bare data: frame (no event: line); got: {text}"
+            );
+            assert!(
+                !text.contains("event:"),
+                "{proto}: native stream never emits an event: line mid-stream; got: {text}"
+            );
+            let data = text
+                .lines()
+                .find_map(|l| l.strip_prefix("data: "))
+                .expect("a data: line");
+            let v: Value = serde_json::from_str(data).expect("native JSON envelope");
+            // OpenAI wraps in `error`; Cohere uses a flat `message`. Either way it carries the detail.
+            let has_native_shape = v.get("error").is_some() || v.get("message").is_some();
+            assert!(has_native_shape, "{proto} native envelope: {v}");
+        }
+
+        // anthropic / gemini: named `event: error`.
+        for proto in ["anthropic", "gemini"] {
+            let bytes = mid_stream_error_bytes(proto, false, "boom");
+            let text = String::from_utf8(bytes).expect("SSE error is utf-8 text");
+            assert!(
+                text.starts_with("event: error\n"),
+                "{proto}: named event: error frame; got: {text}"
+            );
+        }
+
+        // responses: terminal error event is `response.failed`.
+        let bytes = mid_stream_error_bytes("responses", false, "boom");
         let text = String::from_utf8(bytes).expect("SSE error is utf-8 text");
         assert!(
-            text.starts_with("event: error\n"),
-            "SSE error frame; got: {text}"
+            text.starts_with("event: response.failed\n"),
+            "responses: event: response.failed frame; got: {text}"
         );
-        let data = text
-            .lines()
-            .find_map(|l| l.strip_prefix("data: "))
-            .expect("a data: line");
-        let v: Value = serde_json::from_str(data).expect("native JSON envelope");
-        // OpenAI native error envelope shape.
-        assert!(v.get("error").is_some(), "OpenAI envelope: {v}");
-        assert_eq!(v["error"]["type"], "api_error");
     }
 
     /// `client_fault_kind` maps the classified 4xx to a protocol-agnostic kind, exhaustively.

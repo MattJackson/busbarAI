@@ -49,6 +49,15 @@ pub(crate) enum MockResponse {
         events: Vec<String>,
         abort_at_index: Option<usize>,
     },
+    /// A TRUE mid-stream transport failure: emit `ok_events` real SSE frames, then make the body
+    /// stream yield an `Err`, aborting the connection mid-body (NOT a clean SSE `event: error` text
+    /// frame, which `Sse{abort_at_index}` emits). The downstream client sees a reqwest transport
+    /// error, exercising `FirstByteBody`'s `Poll::Ready(Some(Err))` arm — the path that appends the
+    /// ingress protocol's native mid-stream error (a binary exception frame for bedrock ingress, an
+    /// SSE error frame for SSE ingress) AFTER the already-sent real frames.
+    SseTransportError {
+        ok_events: Vec<String>,
+    },
 }
 
 impl Default for MockResponse {
@@ -250,6 +259,37 @@ async fn mock_handler(
                 .body(Body::from_stream(
                     s.map(|s| Ok::<_, std::convert::Infallible>(s.into_bytes())),
                 ))
+                .unwrap()
+        }
+        MockResponse::SseTransportError { ok_events } => {
+            // Emit the real frames, PAUSE so the proxy reliably reads + forwards the first byte to the
+            // client (crossing the after-first-byte failover boundary), THEN yield a stream Err so the
+            // connection aborts mid-body. The `io::Error` item type makes `Body::from_stream`
+            // propagate a transport failure (not a clean EOF), which reqwest surfaces as a transport
+            // error to the proxy's `FirstByteBody`. Without the pause, on fast localhost the error can
+            // race ahead of the first byte and trip pre-first-byte failover (a 503) instead.
+            // step: 0..ok_events.len() emit a real frame; the final step sleeps then errors; then end.
+            let frames: Vec<Bytes> = ok_events
+                .into_iter()
+                .map(|d| Bytes::from(format!("data: {d}\n\n")))
+                .collect();
+            let s = stream::unfold((0usize, frames), |(i, frames)| async move {
+                if i < frames.len() {
+                    let item = Ok::<Bytes, std::io::Error>(frames[i].clone());
+                    Some((item, (i + 1, frames)))
+                } else if i == frames.len() {
+                    // Pause so the proxy forwards the first byte before the error arrives.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let item = Err(std::io::Error::other("mid-stream connection drop"));
+                    Some((item, (i + 1, frames)))
+                } else {
+                    None
+                }
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(s))
                 .unwrap()
         }
     }
@@ -3812,10 +3852,20 @@ mod tests {
     async fn test_cross_protocol_openai_to_anthropic() {
         let state = Arc::new(MockServerState::new());
 
-        // Mock will receive translated Anthropic-shaped body and return 200
+        // Mock receives the translated Anthropic-shaped body and returns a NATIVE Anthropic response
+        // (so the cross-protocol RESPONSE translation back to OpenAI succeeds — a malformed dummy
+        // body now correctly yields an ingress-native 500 instead of leaking a foreign-format body).
         state.push(MockResponse::Ok {
             status: StatusCode::OK,
-            body: json!({ "content": ["translated"], "model": "m", "stop": [] }),
+            body: json!({
+                "id": "msg_x",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "translated"}],
+                "model": "m",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 2}
+            }),
         });
 
         let server = MockServer::new(state.clone()).await;

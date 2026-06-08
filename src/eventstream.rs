@@ -32,7 +32,7 @@
 /// here is willing to assemble can also be buffered to completion upstream — otherwise a frame
 /// between the two caps would be aborted before `drain_frames` ever saw it. Keep `MAX_FRAME_BYTES`
 /// and `StreamTranslate::MAX_BUF` in sync.
-const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Drain every COMPLETE frame from `buf`, returning `(event_type, payload_bytes)` per frame and
 /// leaving any trailing partial frame buffered. A malformed prelude clears the buffer (the stream
@@ -57,11 +57,14 @@ pub(crate) fn drain_frames(buf: &mut Vec<u8>) -> Vec<(String, Vec<u8>)> {
         if buf.len() < total_len {
             break; // partial frame — wait for more bytes
         }
-        let frame: Vec<u8> = buf.drain(..total_len).collect();
-        let headers = &frame[12..12 + headers_len];
-        let payload = &frame[12 + headers_len..total_len - 4];
+        // Read the frame in place via slices into `buf` (one payload copy), then advance past it with
+        // a single `drain` — rather than `drain(..total_len).collect()` into a throwaway per-frame
+        // Vec (which was a SECOND heap allocation per frame on the hot streaming-decode path).
+        let headers = &buf[12..12 + headers_len];
         let event_type = parse_event_type(headers).unwrap_or_default();
-        out.push((event_type, payload.to_vec()));
+        let payload = buf[12 + headers_len..total_len - 4].to_vec();
+        out.push((event_type, payload));
+        buf.drain(..total_len);
     }
     out
 }
@@ -131,19 +134,28 @@ fn parse_event_type(mut h: &[u8]) -> Option<String> {
 }
 
 /// Append one `[name_len:u8][name][value_type:u8 = 7 string][value_len:u16 BE][value]` string
-/// header to `headers`. Lengths are bounded by `MAX_FRAME_BYTES` framing (`name` is a fixed `:`-
-/// prefixed label and `value` is a short event-type string), so the `u8`/`u16` casts never wrap on
-/// any value this encoder produces.
-fn push_string_header(headers: &mut Vec<u8>, name: &str, value: &str) {
-    // name_len is a u8: header names here are fixed short literals (`:event-type` etc.), so
-    // `min(255)` is a defensive clamp that never triggers on real input rather than a wrap risk.
-    let name_len = name.len().min(u8::MAX as usize) as u8;
-    headers.push(name_len);
-    headers.extend_from_slice(&name.as_bytes()[..name_len as usize]);
+/// header to `headers`. The AWS event-stream spec caps a header name at 255 bytes (u8 length) and a
+/// type-7 string value at 65535 bytes (u16 length). All current callers pass fixed short ASCII
+/// labels and short event-type/exception names, so the limits never fire in practice.
+///
+/// Returns `false` (and pushes NOTHING) when `name` or `value` exceeds its length limit, rather than
+/// silently byte-truncating: a truncation could split a multi-byte UTF-8 sequence, emitting a
+/// CRC-valid frame carrying an invalid-UTF-8 type-7 string header that a strict AWS SDK rejects —
+/// the exact "CRC-valid but corrupt" outcome `encode_with_headers` deliberately avoids for payloads.
+/// The encoder treats a `false` return as a reason to DROP the whole frame (consistent with the
+/// oversized-payload policy) — a graceful, no-panic outcome safe on the streaming request path in
+/// every build profile (we do NOT `debug_assert`, which would panic a debug build on the hot path).
+#[must_use]
+fn push_string_header(headers: &mut Vec<u8>, name: &str, value: &str) -> bool {
+    if name.len() > u8::MAX as usize || value.len() > u16::MAX as usize {
+        return false; // oversized — drop rather than emit a truncated/corrupt header
+    }
+    headers.push(name.len() as u8);
+    headers.extend_from_slice(name.as_bytes());
     headers.push(7); // value_type 7 = UTF-8 string
-    let value_len = value.len().min(u16::MAX as usize) as u16;
-    headers.extend_from_slice(&value_len.to_be_bytes());
-    headers.extend_from_slice(&value.as_bytes()[..value_len as usize]);
+    headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    headers.extend_from_slice(value.as_bytes());
+    true
 }
 
 /// Encode one AWS `application/vnd.amazon.eventstream` message — the exact inverse of one
@@ -161,9 +173,14 @@ fn push_string_header(headers: &mut Vec<u8>, name: &str, value: &str) {
 /// can wrap (frame lengths are bounded and this never panics on the request path).
 pub(crate) fn encode_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
     let mut headers = Vec::new();
-    push_string_header(&mut headers, ":event-type", event_type);
-    push_string_header(&mut headers, ":content-type", "application/json");
-    push_string_header(&mut headers, ":message-type", "event");
+    // Drop the frame if any header is oversized rather than emit a corrupt/truncated header (see
+    // push_string_header). `:event-type` is the only caller-supplied value; the others are literals.
+    if !push_string_header(&mut headers, ":event-type", event_type)
+        || !push_string_header(&mut headers, ":content-type", "application/json")
+        || !push_string_header(&mut headers, ":message-type", "event")
+    {
+        return Vec::new();
+    }
     encode_with_headers(headers, payload)
 }
 
@@ -177,9 +194,12 @@ pub(crate) fn encode_exception_frame(exception_type: &str, message: &str) -> Vec
     let payload = serde_json::to_vec(&serde_json::json!({ "message": message }))
         .unwrap_or_else(|_| b"{\"message\":\"upstream stream error\"}".to_vec());
     let mut headers = Vec::new();
-    push_string_header(&mut headers, ":exception-type", exception_type);
-    push_string_header(&mut headers, ":content-type", "application/json");
-    push_string_header(&mut headers, ":message-type", "exception");
+    if !push_string_header(&mut headers, ":exception-type", exception_type)
+        || !push_string_header(&mut headers, ":content-type", "application/json")
+        || !push_string_header(&mut headers, ":message-type", "exception")
+    {
+        return Vec::new();
+    }
     encode_with_headers(headers, &payload)
 }
 
@@ -459,6 +479,46 @@ mod tests {
             frame.is_empty(),
             "oversized payload must drop the frame, not truncate JSON into a CRC-valid corrupt frame"
         );
+    }
+
+    /// `drain_frames` must abandon (clear) the buffer on a frame whose `total_len` is in range but
+    /// whose `headers_len` exceeds the space remaining after the 16-byte overhead — the second half
+    /// of the prelude-validation guard, previously untested. Without the guard, `&frame[12..12 +
+    /// headers_len]` would slice out of bounds and panic downstream.
+    #[test]
+    fn test_headers_len_overflow_abandoned() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&20u32.to_be_bytes()); // total_len = 20 (>= 16, <= cap)
+        buf.extend_from_slice(&5u32.to_be_bytes()); // headers_len = 5 (> 20 - 16 = 4)
+        buf.extend_from_slice(&[0, 0, 0, 0]); // prelude CRC
+        buf.extend_from_slice(b"junk extra bytes");
+
+        let frames = drain_frames(&mut buf);
+        assert!(
+            frames.is_empty(),
+            "no frame emitted for headers_len overflow"
+        );
+        assert!(
+            buf.is_empty(),
+            "headers_len overflow must abandon (clear) the buffer, not slice OOB"
+        );
+    }
+
+    /// An oversized header NAME or VALUE must DROP the whole frame (empty `Vec`) rather than silently
+    /// byte-truncate the string — a truncation could split a multi-byte UTF-8 sequence and emit a
+    /// CRC-valid frame carrying an invalid-UTF-8 type-7 header a strict AWS SDK rejects.
+    #[test]
+    fn test_oversized_header_value_drops_frame() {
+        // A header value just over the u16 cap (65535 bytes).
+        let huge_value = "x".repeat(u16::MAX as usize + 1);
+        let frame = encode_exception_frame(&huge_value, "msg");
+        assert!(
+            frame.is_empty(),
+            "an oversized exception-type header must drop the frame, not truncate the string"
+        );
+        // A short, valid exception type still encodes normally.
+        let ok = encode_exception_frame("InternalServerException", "msg");
+        assert!(!ok.is_empty());
     }
 
     /// The encoder carries the three Bedrock framing headers (`:event-type`, `:content-type`,

@@ -14,6 +14,13 @@ const COOLDOWN_TRANSIENT_SECS: u64 = 10;
 // re-probes are pointless; default 30 min.
 const HARD_DOWN_COOLDOWN_SECS: u64 = 1800;
 
+// Absolute ceiling on an UPSTREAM-supplied `Retry-After` we will honor as a cooldown floor. A
+// server's hint can legitimately exceed the configured `max_cooldown_secs`, so we honor past the
+// cap — but never past this ceiling (24h), so a hostile/buggy upstream sending a near-`u64::MAX`
+// `Retry-After` cannot overflow `now + duration` (breaker bypass in release / panic in debug) or
+// bench a lane for millennia.
+const MAX_HONORED_RETRY_AFTER_SECS: u64 = 24 * 60 * 60;
+
 // Breaker-state encoding for the per-cell `AtomicU64` (stored as u64 so it can be CAS'd).
 const ST_CLOSED: u64 = 0;
 const ST_OPEN: u64 = 1;
@@ -173,7 +180,10 @@ pub(crate) trait StateStore: Send + Sync + 'static {
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
     );
-    #[cfg_attr(not(test), allow(dead_code))]
+    // `record_hard_down` (bare-lane form) IS live in release: the health prober's `HardDown` arm
+    // calls it at `health.rs` (the hard-down probe-reset path). It is NOT test-only, so it carries no
+    // dead-code suppression — unlike the genuinely release-dead bare mutators above
+    // (`record_success`/`record_rate_limit`), whose `_in` siblings are the production path.
     fn record_hard_down(&self, lane: usize, reason: &str);
     fn record_hard_down_in(&self, pool: &str, lane: usize, reason: &str);
     /// A successful out-of-band health probe: recover the lane to Closed in EVERY cell (default and
@@ -555,11 +565,15 @@ impl InMemoryStore {
 
         // Honor Retry-After as cooldown floor if present and configured. Exhaustive on the bool —
         // no `_` wildcard (breaker-match hard rule). When honoring, the server's explicit
-        // Retry-After is a FLOOR (max with the computed backoff), always respected even past the
-        // cap; when NOT honoring, the server value is ignored entirely and the computed backoff
-        // stands (returning `ra` verbatim there could SHORTEN the cooldown below the backoff floor).
+        // Retry-After is a FLOOR (max with the computed backoff), respected even past the configured
+        // `max_cooldown_secs` cap (a legit upstream hint may exceed it) — BUT clamped to an absolute
+        // ceiling so a hostile/buggy upstream cannot drive the cooldown to near `u64::MAX`
+        // (`Retry-After: 18446744073709551615`): that would overflow `now + duration` downstream
+        // (breaker bypass in release, panic in debug) or park a lane out for millennia. When NOT
+        // honoring, the server value is ignored entirely and the computed backoff stands (returning
+        // `ra` verbatim there could SHORTEN the cooldown below the backoff floor).
         match (cfg.honor_retry_after, retry_after) {
-            (true, Some(ra)) => duration.max(ra),
+            (true, Some(ra)) => duration.max(ra.min(MAX_HONORED_RETRY_AFTER_SECS)),
             (false, Some(_)) => duration,
             (true, None) | (false, None) => duration,
         }
@@ -574,8 +588,12 @@ impl InMemoryStore {
         retry_after: Option<u64>,
     ) {
         let duration = Self::compute_cooldown_with_retry_after(c, now_time, cfg, retry_after);
+        // saturating_add: `duration` can be a server-supplied Retry-After (clamped in
+        // compute_cooldown_with_retry_after, but defense-in-depth) — never wrap `now + duration`,
+        // which in release would land `cooldown_until` in the past and instantly re-ready a tripped
+        // lane (breaker bypass), and in debug would panic on the request path.
         c.cooldown_until()
-            .store(now_time + duration, Ordering::Release);
+            .store(now_time.saturating_add(duration), Ordering::Release);
         c.breaker_state().store(ST_OPEN, Ordering::Release);
         // Opening releases the single-flight probe back to Open. A failed half-open probe routes
         // here (ST_HALF_OPEN → cell_open); without this reset the flag stayed `true` forever, so the
@@ -673,8 +691,10 @@ impl InMemoryStore {
                 } else {
                     let duration =
                         Self::compute_cooldown_with_retry_after(c, now_time, cfg, retry_after);
+                    // saturating_add: see cell_open — never wrap `now + duration` (breaker-bypass /
+                    // debug-panic on a hostile upstream's unbounded Retry-After).
                     c.cooldown_until()
-                        .store(now_time + duration, Ordering::Release);
+                        .store(now_time.saturating_add(duration), Ordering::Release);
                 }
             }
             ST_HALF_OPEN => Self::cell_open(c, now_time, cfg, retry_after), // probe failed → reopen
@@ -935,6 +955,13 @@ impl InMemoryStore {
             return; // administratively down — ignore
         }
         Self::cell_record_failure(self.cell(pool, lane).as_ref(), now_time, cfg, retry_after);
+        // Bump the lane-GLOBAL error counter as well. `cell_record_failure` only touches the per-pool
+        // `BreakerCell.err` (a per-pool diagnostic); the `/stats` snapshot reports `LaneState.err`,
+        // which would otherwise stay permanently 0 for any lane reached exclusively via named pools
+        // (production dispatch always passes the real pool name, never `""`). Mirrors how
+        // `record_success_for` always bumps `LaneState.ok` regardless of pool — keeps the
+        // success/error observability counters symmetric.
+        self.get_lane(lane).err.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_success_for(&self, pool: &str, lane: usize) {
@@ -962,7 +989,7 @@ impl InMemoryStore {
         );
         let cell = self.cell(pool, lane);
         cell.cooldown_until().store(
-            Self::now_secs() + HARD_DOWN_COOLDOWN_SECS,
+            Self::now_secs().saturating_add(HARD_DOWN_COOLDOWN_SECS),
             Ordering::Release,
         );
         cell.breaker_state().store(ST_OPEN, Ordering::Release);
@@ -990,6 +1017,15 @@ impl InMemoryStore {
         let mut healthy: Vec<(usize, Arc<dyn BreakerCellAccess>, i64)> =
             Vec::with_capacity(candidates.len());
         for (&candidate, &weight) in candidates.iter().zip(weights.iter()) {
+            // weight == 0 means "drain": never select this member. config.rs permits `weight: 0`
+            // with no `weight > 0` validation, and without this filter an all-zero-weight healthy set
+            // gives `total == 0`, every `fetch_add(0)` leaves `current_weight` unchanged, and the
+            // max-finder degenerates to always picking the first candidate — so a member weighted to
+            // 0 still receives (all) traffic. Excluding it here honors the drain intent and keeps the
+            // SWRR proportional-distribution invariant exact over the remaining members.
+            if weight == 0 {
+                continue;
+            }
             if !self.lane_admissible(candidate) {
                 continue;
             }
@@ -1836,6 +1872,77 @@ mod tests {
             "recover_lane must clear every cell (probe tests the shared upstream)"
         );
         assert!(store.usable_in("A", 0, 8000), "pool A recovered");
+    }
+
+    /// HIGH/correctness (store.rs:1213): a failure recorded against a NAMED pool must increment the
+    /// lane-global `err` counter the `/stats` snapshot reports — previously only the pool=`""` path
+    /// bumped it, so production (named-pool) traffic reported a permanently-zero error count.
+    #[test]
+    fn test_named_pool_failure_bumps_lane_global_err() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(1000);
+        let cfg = BreakerCfg::default();
+
+        assert_eq!(store.snapshot(0, 1000).err, 0, "starts at zero");
+        store.record_transient_in("prod-pool", 0, "5xx", &cfg, None);
+        store.record_transient_in("prod-pool", 0, "5xx", &cfg, None);
+        assert_eq!(
+            store.snapshot(0, 1000).err,
+            2,
+            "named-pool failures must increment the lane-global err counter (/stats observability)"
+        );
+    }
+
+    /// HIGH/security (store.rs:578,677 + 562): a hostile upstream `Retry-After` near `u64::MAX` must
+    /// NOT overflow `now + duration` (which would wrap `cooldown_until` into the past and instantly
+    /// re-ready a tripped lane — a breaker bypass). The honored value is clamped to an absolute
+    /// ceiling, and the add is saturating, so the lane stays tripped.
+    #[test]
+    fn test_hostile_retry_after_does_not_bypass_breaker() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(1000);
+        let cfg = BreakerCfg {
+            honor_retry_after: true,
+            ..BreakerCfg::default()
+        };
+
+        // A near-u64::MAX Retry-After (the `Retry-After: 18446744073709551615` attack).
+        store.record_rate_limit_in("prod-pool", 0, 1000, &cfg, Some(u64::MAX));
+
+        // The lane must be cooled down (tripped), NOT instantly ready again.
+        assert!(
+            !store.usable_in("prod-pool", 0, 1000),
+            "a hostile Retry-After must not wrap the cooldown into the past (breaker bypass)"
+        );
+        // And the cooldown must be a sane bounded value, not now+u64::MAX wrapped.
+        let remaining = store.cooldown_remaining_in("prod-pool", 0, 1000);
+        assert!(
+            remaining > 0 && remaining <= MAX_HONORED_RETRY_AFTER_SECS,
+            "cooldown must be clamped to the absolute ceiling; got {remaining}s"
+        );
+    }
+
+    /// LOW/correctness (store.rs:1010-1026): a healthy member with `weight: 0` (operator drain) must
+    /// never be selected. Without the filter an all-zero-weight set collapses to always picking the
+    /// first candidate.
+    #[test]
+    fn test_zero_weight_member_is_never_selected() {
+        let store = Arc::new(InMemoryStore::new(vec![
+            make_lane_data(0, 10),
+            make_lane_data(1, 10),
+        ]));
+        set_now_for_test(1000);
+        // Lane 0 weight 0 (drained), lane 1 weight 1. Every selection must pick lane 1.
+        for _ in 0..20 {
+            let picked = store.select_weighted_in("p", &[0, 1], &[0, 1], 1000);
+            assert_eq!(picked, Some(1), "zero-weight lane 0 must never be selected");
+        }
+        // All-zero-weight → no selectable member.
+        assert_eq!(
+            store.select_weighted_in("p", &[0, 1], &[0, 0], 1000),
+            None,
+            "an all-zero-weight set selects nothing (every member drained)"
+        );
     }
 
     /// The concurrency budget (max_requests) is lane-global: spending it through one pool must

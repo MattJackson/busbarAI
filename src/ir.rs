@@ -29,7 +29,12 @@ pub(crate) enum IrStreamEvent {
         /// writer can emit the SDK-required top-level identity fields a native stream carries
         /// (Anthropic `message_start.message.id`; OpenAI `chat.completion.chunk` top-level
         /// `id`/`created`/`model`). Default `None`; populated per-protocol in a later wave (and
-        /// synthesized when the backend supplies none). See `docs/DESIGN_universal_ingress.md` §8.2.
+        /// synthesized when the backend supplies none).
+        ///
+        /// Synthesized-ID contract: on a CROSS-PROTOCOL stream the foreign-format identity is stripped
+        /// (`StreamTranslate::translate_event` sets `id`/`created`/`model` to `None`) so the ingress
+        /// writer mints a NATIVE-format id rather than leaking the backend's `chatcmpl-…`/`msg_…` to a
+        /// different-protocol client. A same-protocol round-trip is untouched and stays byte-exact.
         id: Option<String>,
         /// Unix epoch seconds for the stream's creation time (OpenAI chunk top-level `created`).
         created: Option<u64>,
@@ -70,7 +75,12 @@ pub(crate) struct IrResponse {
     /// emit the SDK-required identity field a native response carries (OpenAI `id` =
     /// `"chatcmpl-..."`, Anthropic `id` = `"msg_..."`). Default `None`; populated per-protocol in a
     /// later wave (and synthesized when the backend supplies none, so the shape stays SDK-valid).
-    /// See `docs/DESIGN_universal_ingress.md` §8.2 (Unit J).
+    ///
+    /// Synthesized-ID contract: on a CROSS-PROTOCOL non-stream response the foreign-format `id` is
+    /// stripped (`forward.rs` sets `ir.id = None`) and the ingress writer mints a NATIVE-format id
+    /// when `created` is `Some` (the cross-boundary signal) — so e.g. an OpenAI backend's
+    /// `chatcmpl-…` id never reaches an Anthropic client. A same-protocol response preserves the
+    /// native id verbatim.
     pub id: Option<String>,
     /// Unix epoch seconds for the response creation time (OpenAI `created`). Default `None`.
     pub created: Option<u64>,
