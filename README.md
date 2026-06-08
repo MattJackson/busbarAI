@@ -141,7 +141,7 @@ Streaming is first-class for all six: Gemini via `:streamGenerateContent?alt=sse
 | `POST /v1/chat/completions` | OpenAI ingress; the body's `model` selects the model or pool |
 | `POST /v1/responses` | Responses-API ingress; the body's `model` selects the model or pool |
 | `POST /v2/chat` | Cohere ingress; the body's `model` selects the model or pool |
-| `POST /v1beta/models/{model}:generateContent` · `:streamGenerateContent` | Gemini ingress; the model (and pool) is taken from the URL path segment |
+| `POST /v1{beta}/models/{model}:generateContent` · `:streamGenerateContent` | Gemini ingress; the model (and pool) is taken from the URL path segment. Both the stable `/v1/models/...` and the `/v1beta/models/...` path prefixes are accepted (the google-generativeai / Gen AI SDKs use either) |
 | `POST /model/{modelId}/converse` · `/converse-stream` | Bedrock ingress; the model (and pool) is taken from the URL path |
 | `GET /stats` · `GET /healthz` · `GET /metrics` | per-lane health (JSON) · liveness · Prometheus |
 | `POST /admin/keys` · `GET /admin/keys` | create / list virtual keys (governance only) |

@@ -213,11 +213,18 @@ fn host_is_internal(url: &reqwest::Url) -> bool {
                 }
                 // Not an IP literal — a DNS name. Block the well-known loopback name `localhost`
                 // (and any `*.localhost` subdomain, which RFC 6761 reserves to loopback) so it can't
-                // be used as an SSRF target; allow any other external-collector hostname.
+                // be used as an SSRF target; allow any other external-collector hostname. Normalise a
+                // trailing-dot FQDN-root spelling FIRST: `localhost.` (and `sub.localhost.`) resolve
+                // to loopback via getaddrinfo exactly like `localhost`, yet without stripping the dot
+                // the bare-label compare misses `localhost.` and the `rsplit_once('.')` TLD becomes
+                // the empty string — so `https://localhost./exfil` slipped past this guard while
+                // `config_validate::ssrf_blocked_host` (which lists `localhost.` in METADATA_HOSTS)
+                // blocked it. Strip the single trailing dot so both spellings are caught and the two
+                // validators stay at parity.
                 Err(_) => {
-                    host.eq_ignore_ascii_case("localhost")
-                        || host
-                            .rsplit_once('.')
+                    let h = host.strip_suffix('.').unwrap_or(host);
+                    h.eq_ignore_ascii_case("localhost")
+                        || h.rsplit_once('.')
                             .is_some_and(|(_, tld)| tld.eq_ignore_ascii_case("localhost"))
                 }
             }
@@ -488,6 +495,13 @@ mod tests {
             "https://localhost:8443/exfil",
             "https://api.localhost/log", // `*.localhost` subdomain -> loopback per RFC 6761
             "https://service.LocalHost/log",
+            // Trailing-dot FQDN-root spellings: getaddrinfo resolves `localhost.` to loopback exactly
+            // like `localhost`, and `config_validate::ssrf_blocked_host` lists `localhost.` — these
+            // previously slipped past `host_is_internal` (the bare-label compare missed the dot and
+            // the rsplit TLD was the empty string), enabling `https://localhost./exfil`.
+            "https://localhost./log",
+            "https://localhost.:443/exfil",
+            "https://api.localhost./log", // `*.localhost.` subdomain, trailing dot
         ] {
             let res = validate_webhook_url(Some(bad.to_string()));
             assert!(

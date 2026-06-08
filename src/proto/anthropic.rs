@@ -23,31 +23,61 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Mint a protocol-correct Anthropic message id (`msg_<rand>`) for the cross-protocol path, where
-/// the backend supplied none. An official Anthropic SDK only requires the `msg_` prefix and a
-/// non-empty unique suffix — it does not parse the body — so a timestamp+counter suffix is
-/// indistinguishable in shape from a native id. No new dependency: uniqueness comes from the unix
-/// second plus a process-global atomic counter.
-fn synth_message_id() -> String {
-    let seq = SYNTH_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Zero-pad the counter to a fixed 16 hex digits so the (timestamp, seq) encoding is injective
-    // by construction (the responses.rs pattern). Bare hex concatenation — `{:x}{:x}` — collides:
-    // (ts=0x60c1a430, seq=0x10) and (ts=0x60c1a4301, seq=0x0) both render `...4301 0`, and analogous
-    // pairs arise whenever the counter advances by a power of 16 between two adjacent seconds. The
-    // fixed-width counter field removes the ambiguity without a uuid/rand dependency.
-    format!("msg_{:x}{:016x}", unix_now_secs(), seq)
+/// Mixed-case base62 alphabet (`[0-9A-Za-z]`), matching the character set of a native Anthropic id
+/// token. A native `msg_`/`req_` id is `01` followed by a fixed-length mixed-case alphanumeric
+/// token — NOT lowercase hex — so encoding the synthesized suffix in this alphabet (rather than
+/// bare `{:x}`) removes the alphabet/length/version-prefix distinguishability tell.
+const BASE62_ALPHABET: &[u8; 62] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// Encode a `u64` as exactly 11 base62 digits, zero-padded (most-significant first). `62^11`
+/// exceeds `2^64`, so 11 digits cover the whole `u64` range, and the FIXED width keeps the encoding
+/// injective — concatenating two fixed-width fields never lets one field's overflow bleed into the
+/// next (the property that makes a `(timestamp, counter)` pair collision-free). Pure arithmetic, no
+/// allocation beyond the returned string, and never panics.
+fn base62_u64_fixed(mut n: u64) -> String {
+    // 11 digits, filled from the least-significant end, then reversed to MSB-first.
+    let mut buf = [b'0'; 11];
+    for slot in buf.iter_mut().rev() {
+        *slot = BASE62_ALPHABET[(n % 62) as usize];
+        n /= 62;
+    }
+    // `buf` is ASCII base62 by construction, so the conversion cannot fail; fall back to the
+    // lossy form rather than `unwrap()` to keep this off any panic path.
+    String::from_utf8(buf.to_vec()).unwrap_or_else(|_| String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Mint a protocol-correct Anthropic request id (`req_<hex>`) for the top level of an error
+/// Mint a protocol-correct Anthropic message id for the cross-protocol path, where the backend
+/// supplied none. A native id is `msg_01` + a fixed-length mixed-case base62 token; an official
+/// Anthropic SDK only requires the `msg_` prefix and a non-empty unique suffix (it does not parse
+/// the body), but matching the native alphabet/version-prefix/length removes the structural tell a
+/// client could use to spot a synthesized id. No new dependency: uniqueness comes from the unix
+/// second plus a process-global atomic counter, each encoded at fixed base62 width.
+fn synth_message_id() -> String {
+    synth_id_with_prefix("msg_")
+}
+
+/// Mint a protocol-correct Anthropic request id (`req_01<token>`) for the top level of an error
 /// envelope, where busbar synthesizes the error itself and has no upstream request id to forward.
-/// Current Anthropic API error responses carry a top-level `request_id`; emitting one keeps the
-/// shape indistinguishable from a native error body. Same uniqueness construction as
-/// `synth_message_id` (unix second + process-global atomic counter) — no new dependency.
+/// Current Anthropic API error responses carry a top-level `request_id`; emitting one whose shape
+/// (version prefix, mixed-case base62 alphabet, fixed length) matches the native form keeps the
+/// envelope indistinguishable. Same uniqueness construction as `synth_message_id`.
 fn synth_request_id() -> String {
+    synth_id_with_prefix("req_")
+}
+
+/// Shared id construction for both `msg_` and `req_`. The suffix is the native `01` version marker
+/// followed by two fixed-width base62 fields — the unix second and a process-global atomic counter.
+/// Fixed widths make the `(timestamp, seq)` encoding injective (no bare-concat collision where a
+/// counter that advances between two adjacent seconds renders the same digits), and the base62
+/// alphabet plus the `01` prefix match a native id's character set, version marker, and length.
+fn synth_id_with_prefix(prefix: &str) -> String {
     let seq = SYNTH_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Same fixed-width-counter construction as `synth_message_id`: the 16-hex-digit zero-padded
-    // counter makes the (timestamp, seq) pair injective, eliminating the bare-`{:x}{:x}` collision.
-    format!("req_{:x}{:016x}", unix_now_secs(), seq)
+    format!(
+        "{prefix}01{}{}",
+        base62_u64_fixed(unix_now_secs()),
+        base62_u64_fixed(seq)
+    )
 }
 
 #[derive(Clone)]
@@ -116,8 +146,14 @@ impl ProtocolReader for AnthropicReader {
         }
 
         // Prefer the HTTP status, then structured error codes, then substrings as a fallback.
+        // Parse the JSON once and examine `error.code` and `error.message` INDEPENDENTLY: the
+        // message-substring billing/auth checks must fire even when the structured `code` field is
+        // absent (some Anthropic error shapes carry a 200/non-401-403 body with only a message), so
+        // they live OUTSIDE the `if let Some(code_val)` guard rather than nested inside it.
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-            if let Some(code_val) = json.get("error").and_then(|e| e.get("code")) {
+            let error = json.get("error");
+
+            if let Some(code_val) = error.and_then(|e| e.get("code")) {
                 if code_val.as_str() == Some("400") || code_val.as_str() == Some("422") {
                     return CanonicalSignal {
                         class: StatusClass::ClientError,
@@ -125,24 +161,26 @@ impl ProtocolReader for AnthropicReader {
                         retry_after: None,
                     };
                 }
+            }
 
-                if let Some(msg_val) = json.get("error").and_then(|e| e.get("message")) {
-                    if let Some(msg_str) = msg_val.as_str() {
-                        if msg_str.contains("nsufficient balance") {
-                            return CanonicalSignal {
-                                class: StatusClass::Billing,
-                                provider_signal: Some("billing".to_string()),
-                                retry_after: None,
-                            };
-                        }
-                        if msg_str.contains("unauthorized") || msg_str.contains("invalid token") {
-                            return CanonicalSignal {
-                                class: StatusClass::Auth,
-                                provider_signal: Some("auth".to_string()),
-                                retry_after: None,
-                            };
-                        }
-                    }
+            // Message-substring billing/auth detection — independent of `error.code` presence.
+            if let Some(msg_str) = error
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+            {
+                if msg_str.contains("nsufficient balance") {
+                    return CanonicalSignal {
+                        class: StatusClass::Billing,
+                        provider_signal: Some("billing".to_string()),
+                        retry_after: None,
+                    };
+                }
+                if msg_str.contains("unauthorized") || msg_str.contains("invalid token") {
+                    return CanonicalSignal {
+                        class: StatusClass::Auth,
+                        provider_signal: Some("auth".to_string()),
+                        retry_after: None,
+                    };
                 }
             }
         }
@@ -1214,6 +1252,12 @@ impl ProtocolWriter for AnthropicWriter {
                 };
                 error_obj.insert("message".to_string(), serde_json::json!(message));
                 let mut data_obj = serde_json::Map::new();
+                // Native Anthropic in-stream error data body carries the top-level `type:"error"`
+                // discriminator matching the SSE `event: error` header — exactly like every other
+                // event arm inserts its own `type`. An SDK that dispatches on `data.type` (the
+                // documented shape) won't recognize the event as an error without it, and its
+                // absence is a proxy-signature tell vs a native stream.
+                data_obj.insert("type".to_string(), serde_json::json!("error"));
                 data_obj.insert("error".to_string(), serde_json::Value::Object(error_obj));
                 Some(("error".to_string(), serde_json::Value::Object(data_obj)))
             }
@@ -1635,6 +1679,13 @@ mod anthropic_hardening_tests {
             .write_response_event(&IrStreamEvent::Error(err))
             .expect("error event must serialize");
         assert_eq!(event_type, "error");
+        // Top-level `type:"error"` discriminator must be present in the data body, matching every
+        // other event arm and the documented native shape (`{"type":"error","error":{...}}`).
+        assert_eq!(
+            data.get("type").and_then(|t| t.as_str()),
+            Some("error"),
+            "data body must carry the top-level `type`:\"error\" discriminator"
+        );
         let error_obj = data.get("error").expect("error sub-object present");
         assert_eq!(
             error_obj.get("type").and_then(|t| t.as_str()),
@@ -1668,6 +1719,11 @@ mod anthropic_hardening_tests {
             .write_response_event(&IrStreamEvent::Error(err))
             .expect("error event must serialize");
         assert_eq!(event_type, "error");
+        assert_eq!(
+            data.get("type").and_then(|t| t.as_str()),
+            Some("error"),
+            "data body must carry the top-level `type`:\"error\" discriminator even when the inner error.type is null"
+        );
         let error_obj = data.get("error").expect("error sub-object present");
         assert!(
             error_obj.get("type").map(|t| t.is_null()).unwrap_or(false),
@@ -1998,5 +2054,130 @@ mod anthropic_hardening_tests {
                 .and_then(|v| v.as_u64()),
             Some(7)
         );
+    }
+
+    /// Round-6 finding #1 (cross-protocol `type` discriminator class): EVERY event the writer emits
+    /// — including the Error variant — must carry a top-level `type` in its data body that matches
+    /// the SSE event name. A native SDK dispatches on `data.type`; a missing/mismatched `type` is a
+    /// decode failure and a proxy-signature tell. This sweeps all `write_response_event` arms, not
+    /// just the cited Error arm.
+    #[test]
+    fn every_write_response_event_carries_matching_top_level_type() {
+        let events = vec![
+            IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: None,
+                created: None,
+                model: None,
+            },
+            IrStreamEvent::BlockStart {
+                index: 0,
+                block: IrBlockMeta::Text,
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::TextDelta("hi".to_string()),
+            },
+            IrStreamEvent::BlockStop { index: 0 },
+            IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: IrUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            },
+            IrStreamEvent::MessageStop,
+            IrStreamEvent::Error(IrError {
+                class: StatusClass::ServerError,
+                provider_signal: Some("overloaded_error".to_string()),
+                retry_after: None,
+            }),
+        ];
+        for ev in events {
+            let (event_type, data) = AnthropicWriter
+                .write_response_event(&ev)
+                .expect("event must serialize");
+            let data_type = data
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or_else(|| {
+                    panic!("data body for `{event_type}` must carry a `type` field")
+                });
+            assert_eq!(
+                data_type, event_type,
+                "data.type must equal the SSE event name for every arm"
+            );
+        }
+    }
+
+    /// Round-6 finding #2 (classify ordering class): a billing error whose body carries a message
+    /// substring but NO structured `error.code` must still classify as Billing — the message check
+    /// must not be gated behind the `error.code` guard. Mirror for the auth substring.
+    #[test]
+    fn classify_billing_substring_without_code_field() {
+        // 200-status body (not 401/403/429), only a message — the regime the old nesting missed.
+        let body =
+            br#"{"error":{"type":"some_error","message":"insufficient balance to complete"}}"#;
+        let sig = AnthropicReader.classify(StatusCode::OK, body);
+        assert!(
+            matches!(sig.class, StatusClass::Billing),
+            "billing message substring must classify as Billing even without an error.code field, got {:?}",
+            sig.class
+        );
+
+        let auth_body = br#"{"error":{"type":"some_error","message":"unauthorized request"}}"#;
+        let auth_sig = AnthropicReader.classify(StatusCode::OK, auth_body);
+        assert!(
+            matches!(auth_sig.class, StatusClass::Auth),
+            "auth message substring must classify as Auth even without an error.code field, got {:?}",
+            auth_sig.class
+        );
+    }
+
+    /// Round-6 finding #2 regression: the structured `error.code` 400/422 → ClientError path must
+    /// still fire when the code IS present (the lift-out of the message checks must not regress it).
+    #[test]
+    fn classify_structured_code_still_maps_client_error() {
+        let body = br#"{"error":{"type":"invalid_request_error","code":"400","message":"bad"}}"#;
+        let sig = AnthropicReader.classify(StatusCode::BAD_REQUEST, body);
+        assert!(
+            matches!(sig.class, StatusClass::ClientError),
+            "structured code 400 must still classify as ClientError, got {:?}",
+            sig.class
+        );
+    }
+
+    /// Round-6 finding #3 (id-shape distinguishability class): synthesized ids must match the native
+    /// Anthropic shape — `<prefix>01` version marker, a mixed-case base62 alphabet (`[0-9A-Za-z]`,
+    /// NOT lowercase hex), and a FIXED length — so a client inspecting id shape can't tell a
+    /// synthesized id from a native one. Covers both `msg_` and `req_`.
+    #[test]
+    fn synth_ids_match_native_shape_base62_versioned_fixed_length() {
+        let check = |id: &str, prefix: &str| {
+            let suffix = id
+                .strip_prefix(prefix)
+                .unwrap_or_else(|| panic!("{id} must start with {prefix}"));
+            assert!(
+                suffix.starts_with("01"),
+                "{id} must carry the native `01` version marker after the prefix"
+            );
+            let token = &suffix[2..];
+            // 11 base62 digits per u64 field × 2 fields = 22 chars, fixed-width.
+            assert_eq!(
+                token.len(),
+                22,
+                "token must be fixed-length (2×11 base62 digits), got `{token}`"
+            );
+            assert!(
+                token.bytes().all(|b| b.is_ascii_alphanumeric()),
+                "token must be mixed-case base62 (no hex-only/non-alphanumeric chars), got `{token}`"
+            );
+        };
+        check(&synth_message_id(), "msg_");
+        check(&synth_request_id(), "req_");
     }
 }

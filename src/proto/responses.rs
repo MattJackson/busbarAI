@@ -1135,7 +1135,7 @@ impl ProtocolWriter for ResponsesWriter {
                 resp_obj.insert("usage".to_string(), serde_json::Value::Null);
                 Some((
                     "response.created".to_string(),
-                    serde_json::json!({ "response": resp_obj }),
+                    serde_json::json!({ "type": "response.created", "response": resp_obj }),
                 ))
             }
 
@@ -1144,6 +1144,7 @@ impl ProtocolWriter for ResponsesWriter {
                 crate::ir::IrBlockMeta::ToolUse { id, name } => Some((
                     "response.output_item.added".to_string(),
                     serde_json::json!({
+                        "type": "response.output_item.added",
                         "output_index": index,
                         "item": {
                             "type": "function_call",
@@ -1159,6 +1160,7 @@ impl ProtocolWriter for ResponsesWriter {
                 crate::ir::IrDelta::TextDelta(text) if !text.is_empty() => Some((
                     "response.output_text.delta".to_string(),
                     serde_json::json!({
+                        "type": "response.output_text.delta",
                         "output_index": index,
                         "delta": text
                     }),
@@ -1166,6 +1168,7 @@ impl ProtocolWriter for ResponsesWriter {
                 crate::ir::IrDelta::InputJsonDelta(json_str) => Some((
                     "response.function_call_arguments.delta".to_string(),
                     serde_json::json!({
+                        "type": "response.function_call_arguments.delta",
                         "output_index": index,
                         "delta": json_str
                     }),
@@ -1179,6 +1182,7 @@ impl ProtocolWriter for ResponsesWriter {
             IrStreamEvent::BlockStop { index } => Some((
                 "response.output_item.done".to_string(),
                 serde_json::json!({
+                    "type": "response.output_item.done",
                     "output_index": index,
                 }),
             )),
@@ -1233,7 +1237,7 @@ impl ProtocolWriter for ResponsesWriter {
                 // IrStreamEvent::Error, never here), so the terminal event is `response.completed`.
                 Some((
                     "response.completed".to_string(),
-                    serde_json::json!({ "response": resp_obj }),
+                    serde_json::json!({ "type": "response.completed", "response": resp_obj }),
                 ))
             }
 
@@ -1255,6 +1259,7 @@ impl ProtocolWriter for ResponsesWriter {
                 Some((
                     "response.failed".to_string(),
                     serde_json::json!({
+                        "type": "response.failed",
                         "response": {
                             "id": synthesize_response_id(),
                             "object": "response",
@@ -3022,5 +3027,70 @@ mod tests {
         );
         assert!(error.get("code").expect("code key present").is_null());
         assert!(error.get("param").expect("param key present").is_null());
+    }
+
+    /// Regression (CRITICAL/conformance, class: stream event `type` discriminator): EVERY emitted
+    /// Responses SSE data body must carry a top-level `"type"` key equal to its event name. The
+    /// official OpenAI Python/Node streaming decoders dispatch on `data["type"]`; a body missing it
+    /// (the prior `{"response":{...}}` shape) yields None/undefined for the event type and the SDK
+    /// never constructs the Response or fires event handlers. This exercises all writer arms that
+    /// produce a body — response.created, response.output_item.added, response.output_text.delta,
+    /// response.function_call_arguments.delta, response.output_item.done, response.completed, and
+    /// response.failed — and asserts `payload["type"] == event_name` for each.
+    #[test]
+    fn test_every_stream_event_carries_top_level_type() {
+        let writer = ResponsesWriter;
+        let usage = || crate::ir::IrUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        let events = vec![
+            IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: None,
+                created: None,
+                model: None,
+            },
+            IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::ToolUse {
+                    id: "fc_1".to_string(),
+                    name: "f".to_string(),
+                },
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::TextDelta("hi".to_string()),
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::InputJsonDelta("{}".to_string()),
+            },
+            IrStreamEvent::BlockStop { index: 0 },
+            IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: usage(),
+            },
+            IrStreamEvent::Error(IrError {
+                class: StatusClass::ServerError,
+                provider_signal: Some("boom".to_string()),
+                retry_after: None,
+            }),
+        ];
+
+        for ev in &events {
+            let (event_name, payload) = writer
+                .write_response_event(ev)
+                .unwrap_or_else(|| panic!("event {ev:?} must emit a body"));
+            assert_eq!(
+                payload.get("type").and_then(|t| t.as_str()),
+                Some(event_name.as_str()),
+                "event {event_name} body must carry top-level \"type\" == event name, got {payload}"
+            );
+        }
     }
 }

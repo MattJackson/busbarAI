@@ -304,13 +304,18 @@ impl ProtocolReader for GeminiReader {
             }
         }
 
-        // Extract scalar fields and extra
+        // Extract scalar fields and extra. `maxOutputTokens` is read as i64 and converted with a
+        // BOUNDS-CHECKED `u32::try_from` rather than a bare `as u32`: a pathological/garbage value
+        // above `u32::MAX` (e.g. `5_000_000_000`) would silently TRUNCATE under `as u32` (wrapping to
+        // a small token cap the caller never asked for), so an out-of-range value is dropped to `None`
+        // instead — the request then carries no `maxOutputTokens` and the backend applies its default,
+        // which is strictly safer than forwarding a silently-mangled cap.
         let max_tokens = obj
             .get("generationConfig")
             .and_then(|gc| gc.get("maxOutputTokens"))
             .and_then(|v| v.as_i64())
             .filter(|&v| v > 0)
-            .map(|v| v as u32);
+            .and_then(|v| u32::try_from(v).ok());
         let temperature = obj
             .get("generationConfig")
             .and_then(|gc| gc.get("temperature"))
@@ -2373,6 +2378,37 @@ mod tests {
         assert!(
             wire.get("stream").is_none(),
             "stream intent must not be synthesized onto a native body: {wire}"
+        );
+    }
+
+    /// Regression (R6, class D — integer-overflow on a cast): a `maxOutputTokens` above `u32::MAX`
+    /// must NOT silently truncate (wrap) into a tiny token cap. The bounds-checked `u32::try_from`
+    /// drops an out-of-range value to `None`, so the request carries no cap and the backend applies
+    /// its default — never a mangled one. A bare `as u32` would have wrapped `5_000_000_000` to
+    /// `705_032_704`, a cap the caller never asked for.
+    #[test]
+    fn test_read_request_max_output_tokens_overflow_drops_to_none() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"maxOutputTokens": 5_000_000_000i64}
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        assert_eq!(
+            ir.max_tokens, None,
+            "an out-of-u32-range maxOutputTokens must drop to None, not truncate"
+        );
+
+        // An in-range value still round-trips faithfully.
+        let body_ok = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"maxOutputTokens": 1024}
+        });
+        let ir_ok = reader.read_request(&body_ok).expect("read_request");
+        assert_eq!(
+            ir_ok.max_tokens,
+            Some(1024),
+            "in-range cap must be preserved"
         );
     }
 

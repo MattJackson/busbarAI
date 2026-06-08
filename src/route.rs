@@ -21,14 +21,15 @@ use crate::state::{App, WeightedLane};
 fn pool_authorized(gov: &crate::governance::GovCtx, pool: &str, proto: &str) -> Option<Response> {
     if let Some(key) = &gov.key {
         if !crate::governance::pool_allowed(key, pool) {
+            // The client-facing body carries only vendor-plausible copy — never the internal key id
+            // or governance vocabulary (a native vendor 403 never names an operator key or a pool).
+            // The key id + pool are recorded server-side via tracing for operator diagnosis.
+            tracing::info!(key_id = %key.id, pool = %pool, "governance: key not authorized for pool");
             return Some(ingress_error(
                 proto,
                 StatusCode::FORBIDDEN,
                 "permission_error",
-                &format!(
-                    "virtual key '{}' is not allowed to use pool '{pool}'",
-                    key.id
-                ),
+                "Your API key does not have permission to access this resource.",
             ));
         }
     }
@@ -77,11 +78,15 @@ async fn budget_check(
             // explicitly). The older `billing_error` token was not in either vocabulary, so it
             // leaked verbatim as a non-canonical `error.type` that an SDK's typed-exception mapping
             // did not recognize — a router-side tell on a 402.
+            //
+            // The client-facing message carries only vendor-plausible quota copy — never the
+            // internal key id or governance vocabulary. The key id is recorded server-side.
+            tracing::info!(key_id = %key.id, "governance: key over budget");
             return Some(ingress_error(
                 proto,
                 StatusCode::PAYMENT_REQUIRED,
                 "insufficient_quota",
-                &format!("virtual key '{}' has exceeded its budget", key.id),
+                "You have exceeded your current quota. Please check your plan and billing details.",
             ));
         }
     }
@@ -120,12 +125,15 @@ fn rate_check(app: &Arc<App>, gov: &crate::governance::GovCtx, proto: &str) -> O
     if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
         if let Err(retry) = g.check_rate(key, crate::store::now()) {
             // Native error envelope for the body, plus the standard `Retry-After` header so a
-            // well-behaved SDK backs off the right amount.
+            // well-behaved SDK backs off the right amount. The client-facing message carries only
+            // vendor-plausible rate-limit copy — never the internal key id or governance
+            // vocabulary. The key id + retry window are recorded server-side via tracing.
+            tracing::info!(key_id = %key.id, retry_after_secs = retry, "governance: key rate limited");
             let mut resp = ingress_error(
                 proto,
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
-                &format!("rate limit exceeded for virtual key '{}'", key.id),
+                "Rate limit exceeded. Please retry after the indicated time.",
             );
             if let Ok(hv) = axum::http::HeaderValue::from_str(&retry.to_string()) {
                 resp.headers_mut()
@@ -2336,6 +2344,133 @@ mod tests {
             passed.is_none(),
             "an allowed, in-budget, in-rate request is not rejected"
         );
+    }
+
+    /// Read a `Response`'s full body into a String (test helper for asserting error-envelope copy).
+    async fn body_string(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect response body");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// MEDIUM/security regression: the three governance rejection bodies (403 pool-not-allowed, 402
+    /// over-budget, 429 rate-limited) must carry ONLY vendor-plausible copy — never the internal
+    /// `virtual key` vocabulary, never the key id, never the pool name. A native vendor SDK parses
+    /// these envelopes; leaking the key id / pool topology is both a proxy tell and an info leak.
+    #[tokio::test]
+    async fn test_governance_rejection_bodies_leak_no_internal_vocab() {
+        crate::metrics::init();
+
+        // --- 403: pool not allowed ---
+        let (app, key) = governed_app_pool_restricted();
+        let gov = crate::governance::GovCtx {
+            key: Some(key.clone()),
+        };
+        let resp =
+            pool_authorized(&gov, "denied-pool", "openai").expect("disallowed pool ⇒ 403 response");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_string(resp).await;
+        assert_leak_free(&body, &key.id, "denied-pool");
+
+        // --- 402: over budget. A key with a zero budget cap is immediately over budget. ---
+        let (app2, key2) = governed_app_over_budget();
+        let gov2 = crate::governance::GovCtx {
+            key: Some(key2.clone()),
+        };
+        let resp = budget_check(&app2, &gov2, "openai")
+            .await
+            .expect("zero-budget key ⇒ 402 response");
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let body = body_string(resp).await;
+        assert_leak_free(&body, &key2.id, "any-pool");
+
+        // --- 429: rate limited. A key with rpm_limit=0 is rate-limited on the first request. ---
+        let (app3, key3) = governed_app_rate_limited();
+        let gov3 = crate::governance::GovCtx {
+            key: Some(key3.clone()),
+        };
+        let resp = rate_check(&app3, &gov3, "openai").expect("rpm=0 key ⇒ 429 response");
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        // The Retry-After header must still be present (regression: copy change must not drop it).
+        assert!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_some(),
+            "429 still carries Retry-After"
+        );
+        let body = body_string(resp).await;
+        assert_leak_free(&body, &key3.id, "any-pool");
+
+        // Silence unused-binding warnings for the apps held only to keep gov state alive.
+        let _ = (&app, &app2, &app3);
+    }
+
+    /// Assert a client-facing error body contains none of the operator-internal identifiers or
+    /// governance vocabulary.
+    fn assert_leak_free(body: &str, key_id: &str, pool: &str) {
+        assert!(
+            !body.contains("virtual key"),
+            "error body must not contain the 'virtual key' vocabulary; got: {body}"
+        );
+        assert!(
+            !body.contains(key_id),
+            "error body must not contain the internal key id '{key_id}'; got: {body}"
+        );
+        assert!(
+            !body.contains(pool),
+            "error body must not contain the pool name '{pool}'; got: {body}"
+        );
+        assert!(
+            !body.to_lowercase().contains("busbar"),
+            "error body must not contain the product name; got: {body}"
+        );
+    }
+
+    /// Governance-enabled App whose only key has a zero budget cap, so it is immediately over budget.
+    fn governed_app_over_budget() -> (Arc<App>, crate::governance::VirtualKey) {
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 30, 0, None).unwrap());
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "broke".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(0),
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .unwrap();
+        let mut app = minimal_app();
+        Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov);
+        (app, key)
+    }
+
+    /// Governance-enabled App whose only key has `rpm_limit = 0`, so the first request is rate-limited.
+    fn governed_app_rate_limited() -> (Arc<App>, crate::governance::VirtualKey) {
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 30, 0, None).unwrap());
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "throttled".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(100_000),
+                    budget_period: "total".to_string(),
+                    rpm_limit: Some(0),
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .unwrap();
+        let mut app = minimal_app();
+        Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov);
+        (app, key)
     }
 
     // ---- MEDIUM/conformance: bedrock ingress errors carry the x-amzn-* native headers ----

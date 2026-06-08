@@ -113,6 +113,64 @@ fn bedrock_image_block(media_type: &str, data: &str) -> Option<serde_json::Value
     }))
 }
 
+/// Derive the AWS region for SigV4 scope from a Bedrock endpoint host.
+///
+/// AWS resolves the signing region from the endpoint, not from a single hard-coded prefix. A naive
+/// `strip_prefix("bedrock-runtime.")` mis-handles every non-vanilla endpoint shape and silently
+/// signs for the wrong region, which AWS rejects with `SignatureDoesNotMatch` — surfaced as a
+/// confusing 403 the operator cannot distinguish from a credential error. We therefore match the
+/// known Bedrock service labels (with or without the `-fips` qualifier) and any VPC-interface
+/// (`vpce`) front, taking the dotted label that immediately follows the service label as the region:
+///
+///   - `bedrock-runtime.<region>.amazonaws.com`
+///   - `bedrock-runtime-fips.<region>.amazonaws.com`
+///   - `bedrock-runtime.<region>.vpce.amazonaws.com`
+///   - `vpce-0abc...-1xyz.bedrock-runtime.<region>.vpce.amazonaws.com` (interface-endpoint front)
+///   - `bedrock.<region>.amazonaws.com` (the control-plane label, defensively)
+///
+/// Returns `Some(region)` only when a Bedrock service label is found AND the following label looks
+/// like an AWS region token (`<area>-<direction>-<number>`, e.g. `us-east-1`, `ap-southeast-2`,
+/// `eu-central-1`); otherwise `None`. The caller logs a `tracing::warn!` and falls back to
+/// `us-east-1` for `None`, so a mis-derived region is no longer silent. Pure string parsing on a
+/// `&str` — no panic, no allocation of the host.
+fn derive_sigv4_region(host: &str) -> Option<&str> {
+    // An AWS region token: `<lowercase letters>-<lowercase letters>-<digits>`
+    // (us-east-1, ap-southeast-2, eu-central-1, ca-central-1, us-gov-west-1 → matched loosely as
+    // <alpha>-<alpha>-<alnum>). We accept any 3-part dash token whose final part is numeric so a
+    // future region naming scheme still parses, but reject obvious non-regions (a bare label, an
+    // IP octet, a CNAME segment).
+    fn looks_like_region(label: &str) -> bool {
+        let mut parts = label.split('-');
+        let (Some(a), Some(b), Some(c)) = (parts.next(), parts.next(), parts.next()) else {
+            return false;
+        };
+        // No 4th dash-part, all of area/direction alphabetic, trailing part all digits.
+        parts.next().is_none()
+            && !a.is_empty()
+            && a.bytes().all(|x| x.is_ascii_alphabetic())
+            && !b.is_empty()
+            && b.bytes().all(|x| x.is_ascii_alphabetic())
+            && !c.is_empty()
+            && c.bytes().all(|x| x.is_ascii_digit())
+    }
+
+    // Walk the dotted labels; when we hit a Bedrock service label, the NEXT label is the region.
+    let labels: Vec<&str> = host.split('.').collect();
+    for (i, label) in labels.iter().enumerate() {
+        if matches!(
+            *label,
+            "bedrock-runtime" | "bedrock-runtime-fips" | "bedrock" | "bedrock-fips"
+        ) {
+            if let Some(next) = labels.get(i + 1) {
+                if looks_like_region(next) {
+                    return Some(next);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Bedrock stopReason → canonical IR stop_reason.
 fn stop_reason_map(ward: &str) -> String {
     match ward {
@@ -647,26 +705,37 @@ impl ProtocolReader for BedrockReader {
                 // `message_stop` (Finding: delta-before-stop ordering). It is pushed unconditionally
                 // (even when `metadata` carries no `usage`) so the downstream stream always receives its
                 // terminal frame once `metadata` arrives.
-                if let Some(usage_obj) = data.get("usage").and_then(|u| u.as_object()) {
-                    let usage = crate::ir::IrUsage {
-                        input_tokens: usage_obj
-                            .get("inputTokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0),
-                        output_tokens: usage_obj
-                            .get("outputTokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0),
-                        cache_creation_input_tokens: None,
-                        cache_read_input_tokens: None,
-                    };
+                // Emit the combined MessageDelta UNCONDITIONALLY — even when `metadata` carries no
+                // `usage` object. Native AWS Bedrock always sends `usage` here, but a mock /
+                // Bedrock-compatible backend (common in staging & integration tests) may omit it. The
+                // old code took `pending_stop_reason` only INSIDE the `usage` guard, so a usage-less
+                // `metadata` dropped the buffered stop_reason entirely and terminated the stream with a
+                // bare MessageStop — no preceding MessageDelta. For a Bedrock→Anthropic translation that
+                // is a protocol-ordering violation (the Anthropic SDK expects `message_delta` before
+                // `message_stop`) AND a silent loss of the stop_reason. We therefore build a usage from
+                // whatever the frame carries (zero when absent — harmless) and always emit the delta,
+                // consuming the buffered stop_reason, BEFORE the terminal MessageStop. A bare
+                // `metadata` with neither usage nor a buffered stop_reason yields a zero-usage,
+                // stop_reason-less delta, which is benign.
+                let usage_obj = data.get("usage").and_then(|u| u.as_object());
+                let usage = crate::ir::IrUsage {
+                    input_tokens: usage_obj
+                        .and_then(|u| u.get("inputTokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    output_tokens: usage_obj
+                        .and_then(|u| u.get("outputTokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                };
 
-                    out.push(IrStreamEvent::MessageDelta {
-                        stop_reason: state.pending_stop_reason.take(),
-                        stop_sequence: None,
-                        usage,
-                    });
-                }
+                out.push(IrStreamEvent::MessageDelta {
+                    stop_reason: state.pending_stop_reason.take(),
+                    stop_sequence: None,
+                    usage,
+                });
                 out.push(IrStreamEvent::MessageStop);
             }
 
@@ -857,11 +926,26 @@ impl ProtocolWriter for BedrockWriter {
             (Some(a), Some(s), tok) if !a.is_empty() && !s.is_empty() => (a, s, tok),
             _ => return vec![], // misconfigured key → no signature (AWS will 403, surfaced as auth)
         };
-        let region = ctx
-            .host
-            .strip_prefix("bedrock-runtime.")
-            .and_then(|r| r.split('.').next())
-            .unwrap_or("us-east-1");
+        // Derive the SigV4 scope region from the endpoint host robustly (FIPS, VPC-interface, and
+        // control-plane labels — not just the vanilla `bedrock-runtime.<region>.` prefix). A region
+        // that cannot be derived no longer silently signs for `us-east-1`: we WARN (with the actual
+        // host) so a mis-derived region in a multi-region failover setup is diagnosable, then fall
+        // back to `us-east-1` (the historical default) so a genuinely region-less endpoint still
+        // attempts to sign rather than failing closed. The host is operator-config-derived (tracing
+        // it is fine; it is not a client-facing body).
+        let region = match derive_sigv4_region(&ctx.host) {
+            Some(r) => r,
+            None => {
+                tracing::warn!(
+                    host = %ctx.host,
+                    "could not derive AWS region from Bedrock endpoint host; defaulting SigV4 scope \
+                     to us-east-1 (signing may fail with SignatureDoesNotMatch if the endpoint is \
+                     in another region) — set the lane host to a \
+                     bedrock-runtime[-fips].<region>.amazonaws.com form"
+                );
+                "us-east-1"
+            }
+        };
         let service = "bedrock";
         let (amzdate, datestamp) = crate::sigv4::format_amz_time(ctx.timestamp_epoch);
         let payload_hash = crate::sigv4::sha256_hex(ctx.body);
@@ -3330,6 +3414,184 @@ mod tests {
             out2.pointer("/messages/0/content/0/image/source/bytes")
                 .and_then(|v| v.as_str()),
             Some("QkFTRTY0")
+        );
+    }
+
+    // --- Round 6 regression tests --------------------------------------------------------------
+
+    /// Regression (findings 1+2 — SigV4 region derivation): the region is parsed robustly from the
+    /// endpoint host across every real Bedrock shape (vanilla, FIPS, VPC-interface front,
+    /// control-plane label), not just `bedrock-runtime.<region>.`. A host that yields no derivable
+    /// region returns `None` (the caller warns and falls back to us-east-1) rather than silently
+    /// guessing — so a mis-derived region is diagnosable instead of producing a confusing 403.
+    #[test]
+    fn test_derive_sigv4_region_shapes() {
+        // Vanilla runtime endpoint.
+        assert_eq!(
+            derive_sigv4_region("bedrock-runtime.us-east-1.amazonaws.com"),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            derive_sigv4_region("bedrock-runtime.ap-southeast-2.amazonaws.com"),
+            Some("ap-southeast-2")
+        );
+        // FIPS endpoint (previously fell back to us-east-1 → cross-region mis-sign).
+        assert_eq!(
+            derive_sigv4_region("bedrock-runtime-fips.eu-west-1.amazonaws.com"),
+            Some("eu-west-1")
+        );
+        // VPC-interface endpoint front (does NOT start with the bare prefix).
+        assert_eq!(
+            derive_sigv4_region("bedrock-runtime.eu-central-1.vpce.amazonaws.com"),
+            Some("eu-central-1")
+        );
+        assert_eq!(
+            derive_sigv4_region(
+                "vpce-0a1b2c3d4e5f-9zyxw.bedrock-runtime.ca-central-1.vpce.amazonaws.com"
+            ),
+            Some("ca-central-1")
+        );
+        // Control-plane label, defensively handled.
+        assert_eq!(
+            derive_sigv4_region("bedrock.us-west-2.amazonaws.com"),
+            Some("us-west-2")
+        );
+
+        // Non-derivable hosts → None (caller warns + falls back to us-east-1).
+        assert_eq!(derive_sigv4_region("my-cname-front.example.com"), None);
+        assert_eq!(derive_sigv4_region("10.0.0.5"), None);
+        assert_eq!(derive_sigv4_region("localhost"), None);
+        // A Bedrock label whose following token is not a region (custom front) → None, not a wrong
+        // guess from a non-region label.
+        assert_eq!(
+            derive_sigv4_region("bedrock-runtime.internal.corp.example.com"),
+            None
+        );
+    }
+
+    /// Regression (findings 1+2): a FIPS host in a non-us-east-1 region signs for THAT region's
+    /// scope, not the silent `us-east-1` default the old prefix-only parser produced (which AWS
+    /// rejects with SignatureDoesNotMatch). The signing crypto itself is covered by sigv4::tests;
+    /// here we assert the derived scope region in the Authorization header.
+    #[test]
+    fn test_bedrock_sigv4_fips_host_derives_correct_region() {
+        let writer = BedrockWriter;
+        let ctx = crate::proto::SigningContext {
+            host: "bedrock-runtime-fips.eu-west-1.amazonaws.com".to_string(),
+            canonical_uri: "/model/m/converse".to_string(),
+            body: b"{}",
+            timestamp_epoch: 1_440_938_160,
+        };
+        let headers = writer.sign_request("AKID:SECRET", &ctx);
+        let auth = headers
+            .iter()
+            .find(|(k, _)| k.as_str() == "authorization")
+            .map(|(_, v)| v.to_str().unwrap().to_string())
+            .expect("authorization header");
+        assert!(
+            auth.contains("/eu-west-1/bedrock/aws4_request"),
+            "FIPS host must derive eu-west-1 scope, not the us-east-1 default; got: {auth}"
+        );
+        assert!(
+            !auth.contains("/us-east-1/"),
+            "must NOT silently fall back to us-east-1 for a derivable FIPS host; got: {auth}"
+        );
+    }
+
+    /// Regression (findings 1+2): a non-derivable host falls back to us-east-1 (signing still
+    /// proceeds, so a genuinely region-less endpoint is not failed closed) — the WARN is the
+    /// operator-visible signal, asserted indirectly via the resulting scope.
+    #[test]
+    fn test_bedrock_sigv4_undecodable_host_falls_back_to_us_east_1() {
+        let writer = BedrockWriter;
+        let ctx = crate::proto::SigningContext {
+            host: "my-cname-front.example.com".to_string(),
+            canonical_uri: "/model/m/converse".to_string(),
+            body: b"{}",
+            timestamp_epoch: 1_440_938_160,
+        };
+        let headers = writer.sign_request("AKID:SECRET", &ctx);
+        let auth = headers
+            .iter()
+            .find(|(k, _)| k.as_str() == "authorization")
+            .map(|(_, v)| v.to_str().unwrap().to_string())
+            .expect("authorization header");
+        assert!(
+            auth.contains("/us-east-1/bedrock/aws4_request"),
+            "non-derivable host falls back to the us-east-1 default scope; got: {auth}"
+        );
+    }
+
+    /// Regression (finding 3 — metadata WITHOUT usage): a `metadata` frame that lacks a `usage` key
+    /// (a mock / Bedrock-compatible backend) must STILL emit the combined `MessageDelta` (consuming
+    /// the stop_reason buffered from the preceding `messageStop`) BEFORE the terminal `MessageStop`,
+    /// so a Bedrock→Anthropic translation keeps the native `message_delta`-before-`message_stop`
+    /// ordering and never loses the stop_reason. Previously the delta lived inside the `usage` guard,
+    /// so a usage-less metadata dropped the stop_reason and emitted a bare MessageStop.
+    #[test]
+    fn test_stream_metadata_without_usage_still_emits_delta_with_stop_reason() {
+        use crate::ir::IrStreamEvent;
+
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = BedrockReader;
+
+        let events: Vec<_> = vec![
+            serde_json::json!({"type": "messageStart", "role": "assistant"}),
+            serde_json::json!({
+                "type": "contentBlockDelta",
+                "contentBlockIndex": 0,
+                "delta": {"text": "Hi"}
+            }),
+            serde_json::json!({"type": "contentBlockStop", "contentBlockIndex": 0}),
+            serde_json::json!({"type": "messageStop", "stopReason": "end_turn"}),
+            // `metadata` arrives but carries NO `usage` key (mock backend).
+            serde_json::json!({"type": "metadata", "metrics": {"latencyMs": 12}}),
+        ]
+        .into_iter()
+        .flat_map(|data| reader.read_response_events("", &data, &mut state))
+        .collect();
+
+        // The combined MessageDelta must be present, carry the buffered stop_reason, and have
+        // zero (harmless) usage since none was sent.
+        let delta_idx = events
+            .iter()
+            .position(|e| matches!(e, IrStreamEvent::MessageDelta { .. }))
+            .expect("a combined MessageDelta must be emitted even without usage");
+        match &events[delta_idx] {
+            IrStreamEvent::MessageDelta {
+                stop_reason, usage, ..
+            } => {
+                assert_eq!(
+                    stop_reason.as_deref(),
+                    Some("end_turn"),
+                    "stop_reason buffered from messageStop must survive a usage-less metadata"
+                );
+                assert_eq!(usage.input_tokens, 0);
+                assert_eq!(usage.output_tokens, 0);
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+
+        // The terminal MessageStop must follow the delta (delta-before-stop ordering).
+        let stop_idx = events
+            .iter()
+            .position(|e| matches!(e, IrStreamEvent::MessageStop))
+            .expect("a terminal MessageStop must be emitted");
+        assert!(
+            delta_idx < stop_idx,
+            "MessageDelta must precede MessageStop; got {events:?}"
+        );
+        // Exactly one terminal stop, and the buffered stop_reason was consumed.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, IrStreamEvent::MessageStop))
+                .count(),
+            1
+        );
+        assert!(
+            state.pending_stop_reason.is_none(),
+            "buffered stop_reason must be consumed by the delta"
         );
     }
 

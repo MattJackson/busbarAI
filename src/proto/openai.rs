@@ -7,6 +7,17 @@ use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Largest upstream `tool_calls[].index` we accept in a streaming chunk. OpenAI documents at most
+/// 128 parallel tool calls, so any larger index is malformed; we clamp to this value before it
+/// reaches the IR index arithmetic (`oai_idx + 1 + offset`) so a crafted `u64::MAX` index can never
+/// overflow the `usize` cast or the addition. Chosen as the highest valid 0-based index (127).
+const MAX_TOOL_INDEX: u64 = 127;
+
+/// Hard cap on the number of DISTINCT tool-call indices we track per stream (`open_tools`). Bounds
+/// per-request memory and the number of synthesized BlockStart events against a pathological backend
+/// emitting unbounded unique indices. Matches OpenAI's documented parallel-tool-call limit (128).
+const MAX_OPEN_TOOLS: usize = 128;
+
 /// Current unix time in seconds, used to synthesize `created` when the backend supplied none
 /// (cross-protocol). Falls back to 0 if the clock is before the epoch (never on a sane host) —
 /// `created: 0` is still a valid integer the SDK will accept, and we never panic on the request path.
@@ -469,11 +480,33 @@ impl ProtocolReader for OpenAiReader {
                 out.push(IrStreamEvent::BlockStop { index: 0 });
             }
             for tc in tcs {
-                let oai_idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                let ir_idx = oai_idx + 1 + offset;
+                // Bound the upstream-supplied tool-call index before it touches our index
+                // arithmetic. A crafted/proxied chunk can carry `"index": u64::MAX`; casting that
+                // raw to `usize` and computing `oai_idx + 1 + offset` overflows — panicking on the
+                // request path in debug builds and silently wrapping to a near-zero index in release
+                // (corrupting the IR block sequence delivered downstream). OpenAI documents at most
+                // 128 parallel tool calls, so any larger index is malformed; clamp to MAX_TOOL_INDEX
+                // and compute the IR index with checked arithmetic, skipping the chunk if it still
+                // would not fit (never reachable at this cap, but keeps the path panic-free).
+                let oai_idx = tc
+                    .get("index")
+                    .and_then(|i| i.as_u64())
+                    .map_or(0, |v| v.min(MAX_TOOL_INDEX) as usize);
+                let ir_idx = match oai_idx.checked_add(1).and_then(|n| n.checked_add(offset)) {
+                    Some(idx) => idx,
+                    None => continue,
+                };
                 let func = tc.get("function");
                 if let Some(name) = func.and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
-                    if !state.open_tools.contains(&oai_idx) {
+                    // Cap the number of DISTINCT open tool calls per stream. Without this, a
+                    // pathological backend emitting unbounded unique indices would grow `open_tools`
+                    // (and the emitted BlockStart count) without limit — a per-request memory-
+                    // exhaustion DoS. The cap matches OpenAI's documented parallel-tool-call limit;
+                    // an index beyond it that is not already open is treated as argument deltas for
+                    // an already-open block (its BlockStart is suppressed) rather than opening a new
+                    // one. An already-open index is always honored so in-flight blocks keep flowing.
+                    let already_open = state.open_tools.contains(&oai_idx);
+                    if !already_open && state.open_tools.len() < MAX_OPEN_TOOLS {
                         let id = tc
                             .get("id")
                             .and_then(|i| i.as_str())
@@ -493,10 +526,15 @@ impl ProtocolReader for OpenAiReader {
                     .and_then(|f| f.get("arguments"))
                     .and_then(|a| a.as_str())
                 {
-                    out.push(IrStreamEvent::BlockDelta {
-                        index: ir_idx,
-                        delta: crate::ir::IrDelta::InputJsonDelta(args.to_string()),
-                    });
+                    // Only route argument deltas to indices we actually opened a BlockStart for;
+                    // otherwise an over-cap index would emit a delta against a block that was never
+                    // started, corrupting the downstream stream.
+                    if state.open_tools.contains(&oai_idx) {
+                        out.push(IrStreamEvent::BlockDelta {
+                            index: ir_idx,
+                            delta: crate::ir::IrDelta::InputJsonDelta(args.to_string()),
+                        });
+                    }
                 }
             }
         }
@@ -536,8 +574,11 @@ impl ProtocolReader for OpenAiReader {
                 out.push(IrStreamEvent::BlockStop { index: text_index });
             }
             for oai_idx in std::mem::take(&mut state.open_tools) {
+                // `oai_idx` was clamped to <= MAX_TOOL_INDEX before it entered `open_tools`, so this
+                // cannot overflow; use saturating arithmetic anyway so the close index can never wrap
+                // and the BlockStop always pairs with the BlockStart's IR index.
                 out.push(IrStreamEvent::BlockStop {
-                    index: oai_idx + 1 + offset,
+                    index: oai_idx.saturating_add(1).saturating_add(offset),
                 });
             }
             let stop_reason = Some(match fr {
@@ -2515,5 +2556,140 @@ mod tests {
                 "stop_reason={stop_reason:?}"
             );
         }
+    }
+
+    // --- Round 6 fix 1 (HIGH/security): streaming tool-call index must not overflow the IR index ---
+
+    #[test]
+    fn stream_tool_call_index_u64_max_does_not_panic_or_wrap() {
+        // A crafted/proxied chunk with `"index": u64::MAX` must not panic (debug) or wrap to a
+        // near-zero IR index (release). The index is clamped to MAX_TOOL_INDEX before the
+        // `oai_idx + 1 + offset` arithmetic, so the emitted BlockStart index stays bounded.
+        let reader = OpenAiReader;
+        let mut st = crate::ir::StreamDecodeState::default();
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-ov",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": [{
+                        "index": u64::MAX,
+                        "id": "call_x",
+                        "function": { "name": "f", "arguments": "{}" }
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+            &mut st,
+        );
+        // A BlockStart is emitted with a bounded index (clamped 127 + 1, no thinking offset = 128),
+        // never wrapping to a tiny value.
+        let start_idx = evs
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::BlockStart { index, .. } => Some(*index),
+                _ => None,
+            })
+            .expect("clamped tool-call still opens a block");
+        assert_eq!(start_idx, (MAX_TOOL_INDEX as usize) + 1);
+        // The matching argument delta routes to the same bounded index.
+        let delta_idx = evs.iter().find_map(|e| match e {
+            IrStreamEvent::BlockDelta {
+                index,
+                delta: IrDelta::InputJsonDelta(_),
+            } => Some(*index),
+            _ => None,
+        });
+        assert_eq!(delta_idx, Some(start_idx));
+    }
+
+    #[test]
+    fn stream_tool_call_index_close_does_not_overflow_on_finish() {
+        // The finish-path close loop computes the same `oai_idx + 1 + offset`; with a clamped index
+        // it must close at the matching bounded IR index without panicking/wrapping.
+        let reader = OpenAiReader;
+        let mut st = crate::ir::StreamDecodeState::default();
+        let _ = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-c",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": [{
+                        "index": u64::MAX,
+                        "id": "call_y",
+                        "function": { "name": "g", "arguments": "{}" }
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+            &mut st,
+        );
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-c",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+            }),
+            &mut st,
+        );
+        let stop_idx = evs
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::BlockStop { index } => Some(*index),
+                _ => None,
+            })
+            .expect("open tool block is closed on finish");
+        assert_eq!(stop_idx, (MAX_TOOL_INDEX as usize) + 1);
+    }
+
+    // --- Round 6 fix 2 (MEDIUM/security): open_tools cardinality is capped per stream ---
+
+    #[test]
+    fn stream_open_tools_is_capped() {
+        // A pathological backend emitting many unique tool-call indices must not grow `open_tools`
+        // (or the BlockStart count) without bound. After feeding more than MAX_OPEN_TOOLS distinct
+        // indices, the tracked set is capped and no further BlockStart events are emitted.
+        let reader = OpenAiReader;
+        let mut st = crate::ir::StreamDecodeState::default();
+        let mut block_starts = 0usize;
+        for i in 0..(MAX_OPEN_TOOLS as u64 + 50) {
+            let evs = reader.read_response_events(
+                "",
+                &serde_json::json!({
+                    "id": "chatcmpl-cap",
+                    "created": 1_700_000_000u64,
+                    "model": "gpt-4o",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "tool_calls": [{
+                            // Distinct indices, all within the clamp ceiling so the cap (not the
+                            // clamp) is what limits growth here.
+                            "index": i.min(MAX_TOOL_INDEX),
+                            "id": format!("call_{i}"),
+                            "function": { "name": "f", "arguments": "{}" }
+                        }]},
+                        "finish_reason": null
+                    }]
+                }),
+                &mut st,
+            );
+            block_starts += evs
+                .iter()
+                .filter(|e| matches!(e, IrStreamEvent::BlockStart { .. }))
+                .count();
+        }
+        // The set never exceeds the cap...
+        assert!(st.open_tools.len() <= MAX_OPEN_TOOLS);
+        // ...and the number of distinct opened blocks is bounded by the clamp ceiling (indices were
+        // saturated at MAX_TOOL_INDEX, so the distinct count is MAX_TOOL_INDEX + 1 = 128 = the cap).
+        assert!(block_starts <= MAX_OPEN_TOOLS);
     }
 }

@@ -205,7 +205,23 @@ impl AuthMiddleware {
 /// covered by the generic `/v1/messages` suffix test.
 fn proto_for_path(path: &str) -> &'static str {
     if path.starts_with("/v1beta/models") {
+        // `/v1beta/models/...` is a Gemini-only surface (OpenAI has no v1beta), so always Gemini.
         "gemini"
+    } else if path.starts_with("/v1/models/") {
+        // The router registers `/v1/models/*rest` for Gemini ingress (the stable `v1` alias the
+        // google-generativeai / Gen AI SDK uses), but `/v1/models/` is ambiguous: Gemini packs a
+        // `:<action>` into the LAST path segment (`/v1/models/gemini-pro:generateContent`), whereas
+        // the OpenAI SDK's `model.retrieve` issues `GET /v1/models/{id}` with NO colon action. Shape
+        // the auth error in the protocol the client is actually speaking — a colon in the final
+        // segment → Gemini, otherwise OpenAI. This mirrors `main.rs::proto_for_path` exactly so the
+        // auth-time and fallback-time classifiers cannot drift (the previous auth copy had no
+        // `/v1/models/` arm at all, so a stable-v1 Gemini client got an OpenAI-shaped 401).
+        let last_segment = path.rsplit('/').next().unwrap_or("");
+        if last_segment.contains(':') {
+            "gemini"
+        } else {
+            "openai"
+        }
     } else if path.starts_with("/model/")
         && (path.ends_with("/converse") || path.ends_with("/converse-stream"))
     {
@@ -286,6 +302,37 @@ fn vendor_auth_failure_message(proto: &str) -> &'static str {
     }
 }
 
+/// The HTTP status and protocol-agnostic error `kind` a bad/missing credential yields for an
+/// inferred ingress protocol. The pair is chosen to MATCH what the genuine vendor returns for a
+/// bad API key, because the status code and the writer-mapped `error.type`/`error.status` are both
+/// deterministic protocol tells a native SDK keys its typed exception off:
+///   - bedrock → HTTP 403 + "auth": a real SigV4 rejection is 403 AccessDenied (NOT 401).
+///   - gemini  → HTTP 400 + "invalid_request_error": the Generative Language API does NOT return
+///     401/UNAUTHENTICATED for a bad API key; it returns HTTP 400 with `error.status:
+///     "INVALID_ARGUMENT"` (google.rpc.Code; the gemini writer maps `invalid_request_error` →
+///     INVALID_ARGUMENT and echoes `code: 400`). A 401/UNAUTHENTICATED body would be a tell the
+///     google-genai SDK never sees from real Google on the bad-key path.
+///   - openai / responses → HTTP 401 + "invalid_request_error": the genuine OpenAI/Responses bad-key
+///     401 body carries `error.type: "invalid_request_error"` (NOT "authentication_error") with
+///     `code: "invalid_api_key"`. The writers map `invalid_request_error` → that type, so passing
+///     this kind matches the real `error.type`. (The writers always emit `code: null`; the
+///     `code: "invalid_api_key"` field is a writer-level detail outside this unit and is not
+///     synthesised here.)
+///   - anthropic / cohere / unknown → HTTP 401 + "authentication_error": the standard
+///     bad-credential shape for those vendors.
+///
+/// Not a disposition/breaker match, so a named fallback arm (treating an unknown future proto like
+/// the Anthropic-family 401 authentication_error) is fine and keeps the request path panic-free.
+fn auth_failure_status_and_kind(proto: &str) -> (StatusCode, &'static str) {
+    match proto {
+        "bedrock" => (StatusCode::FORBIDDEN, "auth"),
+        "gemini" => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+        "openai" | "responses" => (StatusCode::UNAUTHORIZED, "invalid_request_error"),
+        "anthropic" | "cohere" => (StatusCode::UNAUTHORIZED, "authentication_error"),
+        _ => (StatusCode::UNAUTHORIZED, "authentication_error"),
+    }
+}
+
 /// Build an auth-failure response carrying the inferred ingress protocol's NATIVE error envelope
 /// (design §8 BLOCKER #1). Auth runs before routing, so the protocol is inferred from the request
 /// path. A native vendor SDK hitting busbar in `token`/governance mode with a bad credential then
@@ -299,33 +346,26 @@ fn vendor_auth_failure_message(proto: &str) -> &'static str {
 /// invalid-vs-disabled / missing-vs-wrong distinction is itself an oracle. A caller may still log
 /// the real reason server-side; it just never reaches the client body.
 ///
-/// Status and headers are protocol-shaped too: a real AWS Bedrock SigV4 auth failure returns HTTP
-/// 403 (not 401) and carries `x-amzn-ErrorType` / `x-amzn-RequestId`, which a native AWS SDK keys
-/// off to map the modeled exception (a bare JSON `__type` body is not how the SDK primarily types
-/// the error). Every other protocol uses 401. (Bedrock ingress is documented as unsupported under
-/// token/governance mode, so this branch is only reachable under a misconfiguration — but when it
-/// is reached, the envelope must still match native AWS to uphold the indistinguishability promise.)
+/// Status and the writer `kind` are protocol-shaped too (see `auth_failure_status_and_kind`): a real
+/// AWS Bedrock SigV4 auth failure returns HTTP 403 (not 401) and carries `x-amzn-ErrorType` /
+/// `x-amzn-RequestId`; a real Gemini bad-key returns HTTP 400 INVALID_ARGUMENT (not 401
+/// UNAUTHENTICATED); the other vendors use 401 authentication_error. (Bedrock ingress is documented
+/// as unsupported under token/governance mode, so that branch is only reachable under a
+/// misconfiguration — but when it is reached, the envelope must still match native AWS.)
 ///
 /// No unwrap / expect / panic on this request path: a serialization failure degrades to an empty
 /// JSON object.
 fn unauthorized_response(path: &str) -> Response {
     let proto = proto_for_path(path);
     let message = vendor_auth_failure_message(proto);
+    let (status, kind) = auth_failure_status_and_kind(proto);
     // `protocol_for` knows every name `proto_for_path` can return, so this is `Some` in practice;
     // the `?`-style fallback keeps the request path panic-free if that ever changes.
     let body = match crate::proto::protocol_for(proto) {
-        Some(p) => p.writer().write_error(401, "authentication_error", message),
+        Some(p) => p.writer().write_error(status.as_u16(), kind, message),
         None => serde_json::json!({"error": {"message": message, "type": "authentication_error"}}),
     };
     let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
-
-    // Bedrock auth failures are HTTP 403 with x-amzn-* typing headers (matching a native SigV4
-    // rejection); all other protocols use 401.
-    let status = if proto == "bedrock" {
-        StatusCode::FORBIDDEN
-    } else {
-        StatusCode::UNAUTHORIZED
-    };
     let mut resp = (status, bytes).into_response();
     resp.headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -762,6 +802,22 @@ mod tests {
             proto_for_path("/v1beta/models/gemini-1.5:generateContent"),
             "gemini"
         );
+        // The stable `v1` Gemini alias the router also registers (`/v1/models/*rest`). A colon
+        // `:<action>` in the final segment is the Gemini generateContent/streamGenerateContent shape
+        // → gemini (mirrors main.rs::proto_for_path so the two classifiers cannot drift).
+        assert_eq!(
+            proto_for_path("/v1/models/gemini-pro:generateContent"),
+            "gemini"
+        );
+        assert_eq!(
+            proto_for_path("/v1/models/gemini-1.5-pro:streamGenerateContent"),
+            "gemini"
+        );
+        // `/v1/models/...` WITHOUT a colon action is the OpenAI `model.retrieve` shape (`GET
+        // /v1/models/{id}`) — shape the auth error as OpenAI so an OpenAI SDK gets a decodable body.
+        assert_eq!(proto_for_path("/v1/models/gpt-4o"), "openai");
+        // `/v1beta/models/...` is Gemini-only even without a colon (OpenAI has no v1beta surface).
+        assert_eq!(proto_for_path("/v1beta/models/gemini-pro"), "gemini");
         assert_eq!(
             proto_for_path("/model/anthropic.claude/converse"),
             "bedrock"
@@ -802,9 +858,12 @@ mod tests {
         // `application/json` — a wrong-shaped 401 is a deterministic proxy tell a native SDK
         // would choke on. One assertion per `proto_for_path` arm.
 
-        // Gemini → {"error":{"code":401,"message":..,"status":"UNAUTHENTICATED"}}.
+        // Gemini → {"error":{"code":400,"message":..,"status":"INVALID_ARGUMENT"}}, HTTP 400. The
+        // genuine Generative Language API does NOT return 401/UNAUTHENTICATED for a bad API key; it
+        // returns HTTP 400 INVALID_ARGUMENT. A 401/UNAUTHENTICATED body is a tell the google-genai
+        // SDK never sees from real Google on the bad-key path.
         let resp = unauthorized_response("/v1beta/models/x:generateContent");
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             resp.headers()
                 .get(CONTENT_TYPE)
@@ -812,10 +871,25 @@ mod tests {
             Some("application/json")
         );
         let body = decode_body(resp);
-        assert_eq!(body["error"]["code"], 401, "gemini body: {body}");
+        assert_eq!(body["error"]["code"], 400, "gemini body: {body}");
         assert_eq!(
-            body["error"]["status"], "UNAUTHENTICATED",
+            body["error"]["status"], "INVALID_ARGUMENT",
             "gemini body: {body}"
+        );
+
+        // Gemini stable-v1 alias (`/v1/models/<m>:generateContent`) must shape IDENTICALLY to the
+        // v1beta surface — the bug this round fixed mis-shaped it as an OpenAI 401.
+        let resp = unauthorized_response("/v1/models/gemini-pro:generateContent");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "stable-v1 gemini status"
+        );
+        let body = decode_body(resp);
+        assert_eq!(body["error"]["code"], 400, "stable-v1 gemini body: {body}");
+        assert_eq!(
+            body["error"]["status"], "INVALID_ARGUMENT",
+            "stable-v1 gemini body: {body}"
         );
 
         // Anthropic → top-level {"type":"error","error":{"type":"authentication_error",..}}.
@@ -828,24 +902,32 @@ mod tests {
             "anthropic error.type: {body}"
         );
 
-        // OpenAI → {"error":{"type":"authentication_error",..}} (no top-level type=error).
+        // OpenAI → {"error":{"type":"invalid_request_error",..}} (no top-level type=error). The
+        // genuine OpenAI bad-key 401 body carries `error.type: "invalid_request_error"` (NOT
+        // "authentication_error"), so the envelope must match that on the most common failure path.
         let resp = unauthorized_response("/v1/chat/completions");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "openai auth status"
+        );
         let body = decode_body(resp);
         assert!(
             body.get("type").is_none(),
             "openai must NOT carry a top-level type: {body}"
         );
         assert_eq!(
-            body["error"]["type"], "authentication_error",
-            "openai error.type: {body}"
+            body["error"]["type"], "invalid_request_error",
+            "openai error.type must match the real bad-key body: {body}"
         );
 
-        // Responses → {"error":{"type":"authentication_error","code":null,"param":null,..}}.
+        // Responses → {"error":{"type":"invalid_request_error","code":null,"param":null,..}} (same
+        // OpenAI-family bad-key shape).
         let resp = unauthorized_response("/v1/responses");
         let body = decode_body(resp);
         assert_eq!(
-            body["error"]["type"], "authentication_error",
-            "responses error.type: {body}"
+            body["error"]["type"], "invalid_request_error",
+            "responses error.type must match the real bad-key body: {body}"
         );
         assert!(
             body["error"].get("param").is_some(),
@@ -1001,6 +1083,10 @@ mod tests {
             ("/v2/chat", "cohere"),
             ("/v1/responses", "responses"),
             ("/v1beta/models/gemini-1.5:generateContent", "gemini"),
+            // BOTH Gemini ingress prefixes the router registers (main.rs:700-701) must resolve to a
+            // non-fallback proto. The stable `v1` alias was previously omitted here, masking the
+            // missing `/v1/models/` arm in proto_for_path (a `:`-action path mis-shaped as openai).
+            ("/v1/models/gemini-pro:generateContent", "gemini"),
             ("/model/anthropic.claude/converse", "bedrock"),
             ("/model/anthropic.claude/converse-stream", "bedrock"),
         ];
@@ -1236,7 +1322,8 @@ mod tests {
             "cohere 401 must be the bare envelope (no error/type): {env}"
         );
 
-        // Responses `/v1/responses` → {"error":{"type":"authentication_error",..}}.
+        // Responses `/v1/responses` → {"error":{"type":"invalid_request_error",..}} (the genuine
+        // OpenAI-family bad-key 401 carries invalid_request_error, not authentication_error).
         let r_resp = client
             .post(format!("http://{addr}/v1/responses"))
             .header("x-api-key", "wrong-token")
@@ -1254,8 +1341,8 @@ mod tests {
         );
         let env: serde_json::Value = r_resp.json().await.unwrap();
         assert_eq!(
-            env["error"]["type"], "authentication_error",
-            "responses 401 must carry error.type=authentication_error: {env}"
+            env["error"]["type"], "invalid_request_error",
+            "responses 401 must carry error.type=invalid_request_error: {env}"
         );
 
         handle.abort();
@@ -1352,13 +1439,15 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// End-to-end through the real router + `auth_middleware` in TOKEN mode: a wrong token on the
-    /// Gemini ingress path (`/v1beta/models/<id>:generateContent`) must be rejected 401 with the
-    /// Gemini-native envelope (`error.code == 401`, `error.status == "UNAUTHENTICATED"`). Companion
-    /// to the bedrock test: the Gemini auth-boundary envelope was previously only checked via a
-    /// direct `unauthorized_response` call, not through the full router stack.
+    /// End-to-end through the real router + `auth_middleware` in TOKEN mode: a wrong token on EITHER
+    /// registered Gemini ingress prefix — the `v1beta` surface (`/v1beta/models/<id>:generateContent`)
+    /// AND the stable `v1` alias (`/v1/models/<id>:generateContent`) — must be rejected with the
+    /// Gemini-native bad-key envelope: HTTP 400, `error.code == 400`, `error.status ==
+    /// "INVALID_ARGUMENT"` (a real Generative Language API bad key is 400 INVALID_ARGUMENT, NOT
+    /// 401/UNAUTHENTICATED). The stable-v1 path was previously mis-shaped as an OpenAI 401 because
+    /// `proto_for_path` had no `/v1/models/` arm — this exercises both prefixes through the full stack.
     #[tokio::test]
-    async fn test_gemini_ingress_wrong_token_is_401_native_envelope() {
+    async fn test_gemini_ingress_wrong_token_is_native_bad_key_envelope() {
         use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
         use serde_json::json;
         use std::sync::Arc;
@@ -1394,34 +1483,41 @@ mod tests {
         let client = reqwest::Client::new();
         let body = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}).to_string();
 
-        let r = client
-            .post(format!(
-                "http://{addr}/v1beta/models/gemini-1.5:generateContent"
-            ))
-            .header("x-goog-api-key", "wrong-token")
-            .body(body)
-            .send()
-            .await
-            .unwrap();
+        // Both registered Gemini ingress prefixes must produce the identical native bad-key envelope.
+        for path in [
+            "/v1beta/models/gemini-1.5:generateContent",
+            "/v1/models/gemini-1.5:generateContent",
+        ] {
+            let r = client
+                .post(format!("http://{addr}{path}"))
+                .header("x-goog-api-key", "wrong-token")
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
 
-        assert_eq!(
-            r.status().as_u16(),
-            401,
-            "a Gemini auth failure must be 401 (got {})",
-            r.status()
-        );
-        assert_eq!(
-            r.headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok()),
-            Some("application/json"),
-        );
-        let env: serde_json::Value = r.json().await.unwrap();
-        assert_eq!(env["error"]["code"], 401, "gemini error.code: {env}");
-        assert_eq!(
-            env["error"]["status"], "UNAUTHENTICATED",
-            "gemini error.status must be UNAUTHENTICATED: {env}"
-        );
+            assert_eq!(
+                r.status().as_u16(),
+                400,
+                "a Gemini bad-key auth failure on '{path}' must be 400 INVALID_ARGUMENT (got {})",
+                r.status()
+            );
+            assert_eq!(
+                r.headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("application/json"),
+            );
+            let env: serde_json::Value = r.json().await.unwrap();
+            assert_eq!(
+                env["error"]["code"], 400,
+                "gemini error.code on '{path}': {env}"
+            );
+            assert_eq!(
+                env["error"]["status"], "INVALID_ARGUMENT",
+                "gemini error.status on '{path}' must be INVALID_ARGUMENT: {env}"
+            );
+        }
 
         handle.abort();
         server.shutdown().await;

@@ -13,6 +13,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// out of scope for this wave).
 static COHERE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Hard cap on the number of distinct tool-call frame indices recorded in `state.open_tools` for a
+/// single stream. The set is intentionally never shrunk (so each tool's IR block index stays stable
+/// for its lifetime — see `cohere_tool_ir_index`), which means a malicious or buggy upstream that
+/// streams an unbounded number of distinct `tool-call-start` frame indices would grow it without
+/// bound. No legitimate Cohere v2 stream approaches this many parallel tool calls; past the cap we
+/// stop recording new frames so memory stays bounded. The cap leaves every realistic stream
+/// untouched.
+const MAX_TRACKED_TOOL_FRAMES: usize = 4096;
+
 /// Format 128 bits as a UUID-shaped (8-4-4-4-12 lowercase hex) token. Real Cohere v2 chat response
 /// ids are bare UUIDs (e.g. `c14c80c3-18eb-4519-9460-6c92edd8cfb4`) with NO literal prefix, so a
 /// synthesized id must match that hex layout to stay shape-indistinguishable from a native one.
@@ -215,25 +224,38 @@ impl ProtocolReader for CohereReader {
                 }
 
                 let mut msg_content = Vec::new();
-                if let Some(content_val) = msg_val.get("content") {
-                    if content_val.is_string() {
-                        msg_content.push(crate::ir::IrBlock::Text {
-                            text: content_val.as_str().unwrap_or("").to_string(),
-                            cache_control: None,
-                            citations: Vec::new(),
-                        });
-                    } else if let Some(arr) = content_val.as_array() {
-                        for block_val in arr {
-                            if let Some(block_obj) = block_val.as_object() {
-                                if block_obj.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                    if let Some(text) =
-                                        block_obj.get("text").and_then(|t| t.as_str())
+                // The generic top-level content loop must NOT run for the Tool role: native Cohere
+                // v2 tool content is NOT a free-text message field — it is consumed below by the
+                // dedicated Tool branch into the ToolResult's inner content. Running this loop for
+                // a Tool message ALSO decoded the same `content` into stray top-level Text blocks,
+                // so one tool message produced both a top-level Text block AND a ToolResult holding
+                // the identical text. On egress CohereWriter's Tool branch then folds that leftover
+                // text into the first ToolResult, duplicating it. Skip the generic parse here — the
+                // Tool branch owns a tool message's content exclusively (mirrors the System early
+                // `continue` above, which keeps System content out of this loop too).
+                if role != crate::ir::IrRole::Tool {
+                    if let Some(content_val) = msg_val.get("content") {
+                        if content_val.is_string() {
+                            msg_content.push(crate::ir::IrBlock::Text {
+                                text: content_val.as_str().unwrap_or("").to_string(),
+                                cache_control: None,
+                                citations: Vec::new(),
+                            });
+                        } else if let Some(arr) = content_val.as_array() {
+                            for block_val in arr {
+                                if let Some(block_obj) = block_val.as_object() {
+                                    if block_obj.get("type").and_then(|t| t.as_str())
+                                        == Some("text")
                                     {
-                                        msg_content.push(crate::ir::IrBlock::Text {
-                                            text: text.to_string(),
-                                            cache_control: None,
-                                            citations: Vec::new(),
-                                        });
+                                        if let Some(text) =
+                                            block_obj.get("text").and_then(|t| t.as_str())
+                                        {
+                                            msg_content.push(crate::ir::IrBlock::Text {
+                                                text: text.to_string(),
+                                                cache_control: None,
+                                                citations: Vec::new(),
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -590,7 +612,16 @@ impl ProtocolReader for CohereReader {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                state.open_tools.insert(frame_idx);
+                // Record this tool frame so its IR index stays stable for its lifetime. Cap the
+                // tracked set so an adversarial/buggy upstream streaming an unbounded number of
+                // distinct frame indices cannot grow it without bound (the set is never shrunk).
+                // A frame already present is always re-inserted cheaply (no growth); only genuinely
+                // new frames past the cap are dropped from tracking.
+                if state.open_tools.contains(&frame_idx)
+                    || state.open_tools.len() < MAX_TRACKED_TOOL_FRAMES
+                {
+                    state.open_tools.insert(frame_idx);
+                }
                 let ir_idx = cohere_tool_ir_index(state, frame_idx);
                 out.push(IrStreamEvent::BlockStart {
                     index: ir_idx,
@@ -2741,5 +2772,129 @@ mod tests {
                 delta: crate::ir::IrDelta::ThinkingDelta("x".to_string()),
             })
             .is_none());
+    }
+
+    /// Regression (HIGH/correctness): a Cohere `tool`-role message's `content` must be decoded
+    /// EXACTLY ONCE — into the ToolResult's inner content — and NOT also into a stray top-level
+    /// Text block. The generic top-level content loop previously ran for every non-system role
+    /// (including Tool), so one tool message produced both a top-level Text block AND a ToolResult
+    /// holding the identical text. Assert the IR carries a single ToolResult and no top-level Text.
+    #[test]
+    fn test_read_request_tool_content_not_double_decoded() {
+        let body = serde_json::json!({
+            "model": "command-r",
+            "messages": [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": [{"type": "text", "text": "the result"}]
+                }
+            ]
+        });
+        let ir = CohereReader
+            .read_request(&body)
+            .expect("read_request should succeed");
+        let tool_msg = ir
+            .messages
+            .iter()
+            .find(|m| m.role == crate::ir::IrRole::Tool)
+            .expect("tool message present");
+
+        // No stray top-level Text block on the Tool message.
+        let stray_text = tool_msg
+            .content
+            .iter()
+            .any(|b| matches!(b, crate::ir::IrBlock::Text { .. }));
+        assert!(
+            !stray_text,
+            "tool message must NOT carry a top-level Text block (content belongs to the ToolResult)"
+        );
+
+        // Exactly one ToolResult, carrying the text once.
+        let tool_results: Vec<&Vec<crate::ir::IrBlock>> = tool_msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                crate::ir::IrBlock::ToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results.len(), 1, "exactly one ToolResult block");
+        let inner = match tool_results[0].first() {
+            Some(crate::ir::IrBlock::Text { text, .. }) => text.clone(),
+            other => panic!("expected text in tool result, got {other:?}"),
+        };
+        assert_eq!(inner, "the result");
+    }
+
+    /// Regression (HIGH/correctness): a Cohere -> Cohere round-trip of a tool message must NOT
+    /// duplicate the tool-result text. The double-decode caused the egress writer (whose Tool
+    /// branch folds leftover top-level text into the first ToolResult) to emit the same text twice
+    /// in the outgoing `content` string. Assert the text appears exactly once after a full
+    /// read_request -> write_request cycle.
+    #[test]
+    fn test_tool_message_roundtrip_no_duplicate_text() {
+        let body = serde_json::json!({
+            "model": "command-r",
+            "messages": [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": [{"type": "text", "text": "UNIQUEMARKER"}]
+                }
+            ]
+        });
+        let ir = CohereReader
+            .read_request(&body)
+            .expect("read_request should succeed");
+        let out = CohereWriter.write_request(&ir);
+        let msgs = out.get("messages").unwrap().as_array().unwrap();
+        let tool_msg = msgs
+            .iter()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+            .expect("a tool message must be emitted");
+        let content = tool_msg
+            .get("content")
+            .and_then(|c| c.as_str())
+            .expect("tool content string");
+        assert_eq!(
+            content.matches("UNIQUEMARKER").count(),
+            1,
+            "tool-result text must appear exactly once (no double-decode duplication), got {content}"
+        );
+        assert_eq!(
+            tool_msg.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_1")
+        );
+    }
+
+    /// Regression (LOW/robustness): `state.open_tools` is never shrunk, so an upstream streaming an
+    /// unbounded number of distinct `tool-call-start` frame indices must not grow it without bound.
+    /// Past `MAX_TRACKED_TOOL_FRAMES` new frames stop being recorded, keeping the set capped while
+    /// every realistic stream (a handful of tools) is unaffected.
+    #[test]
+    fn test_open_tools_growth_is_capped() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = CohereReader;
+        for frame_idx in 0..(MAX_TRACKED_TOOL_FRAMES + 50) {
+            reader.read_response_events(
+                "",
+                &serde_json::json!({
+                    "type": "tool-call-start",
+                    "index": frame_idx,
+                    "delta": {"message": {"tool_calls": {
+                        "id": format!("call_{frame_idx}"),
+                        "type": "function",
+                        "function": {"name": "f", "arguments": ""}
+                    }}}
+                }),
+                &mut state,
+            );
+        }
+        assert!(
+            state.open_tools.len() <= MAX_TRACKED_TOOL_FRAMES,
+            "open_tools must be capped at MAX_TRACKED_TOOL_FRAMES, got {}",
+            state.open_tools.len()
+        );
     }
 }

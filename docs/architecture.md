@@ -77,7 +77,8 @@ pipeline**.
 
 The route table (`src/main.rs` `build_router`, `src/route.rs`) determines the
 **ingress protocol** by path, not by sniffing the body. All six protocols are
-first-class ingress — one route per protocol:
+first-class ingress — one handler per protocol (Gemini's handler is reachable via
+two path prefixes, `v1` and `v1beta`):
 
 - `POST /:name/v1/messages` → ingress `anthropic`. `name` is a model or a pool.
 - `POST /:provider/:model/v1/messages` → ingress `anthropic`, ad-hoc direct route.
@@ -85,7 +86,9 @@ first-class ingress — one route per protocol:
   model or pool.
 - `POST /v1/responses` → ingress `responses` (OpenAI Responses API). Model in the body.
 - `POST /v2/chat` → ingress `cohere`. Model in the body.
-- `POST /v1beta/models/*rest` → ingress `gemini`. The model and the action
+- `POST /v1/models/*rest` and `POST /v1beta/models/*rest` → ingress `gemini`. Both the
+  stable `v1` and the `v1beta` path prefixes are accepted by the same handler, because the
+  google-generativeai / Gen AI SDKs use either surface. The model and the action
   (`:generateContent` / `:streamGenerateContent`) are packed into the last path
   segment after a `:`; axum can't split on `:` inside a segment, so the tail is
   captured with a wildcard and split in `gemini_ingress`.
