@@ -32,6 +32,15 @@ pub(crate) struct CreateKeyReq {
     tpm_limit: Option<u32>,
 }
 
+/// The budget periods `governance::budget_window` actually enforces. An unrecognized value (a typo
+/// like `"weekly"` / `"monthlly"`) is NOT a window `budget_window` knows: it silently degrades to the
+/// all-time `"total"` window with a `tracing::warn!`, so a key created with a typo'd period returns
+/// 201 yet enforces an all-time cap — its stored metadata says one thing while governance does
+/// another. Validate at the ingress (key creation) so an operator gets a 400 with the allowed set
+/// instead of a silently-misenforcing key. Kept in lock-step with the arms of
+/// `governance::budget_window`.
+const VALID_BUDGET_PERIODS: &[&str] = &["total", "daily", "monthly"];
+
 fn json_response(status: StatusCode, body: Value) -> Response {
     (
         status,
@@ -94,11 +103,26 @@ pub(crate) async fn create_key(
     let Some(gov) = &app.governance else {
         return disabled();
     };
+    // Default to the all-time `"total"` window when omitted; otherwise the value MUST be one
+    // `governance::budget_window` enforces. Reject an unrecognized period with 400 rather than
+    // letting it persist and silently degrade to `"total"` at evaluation time (a key whose stored
+    // metadata disagrees with the cap it actually enforces).
+    let budget_period = req.budget_period.unwrap_or_else(|| "total".to_string());
+    if !VALID_BUDGET_PERIODS.contains(&budget_period.as_str()) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": format!(
+                    "invalid budget_period '{budget_period}': must be one of {VALID_BUDGET_PERIODS:?}"
+                )
+            }),
+        );
+    }
     let spec = NewKeySpec {
         name: req.name,
         allowed_pools: req.allowed_pools,
         max_budget_cents: req.max_budget_cents,
-        budget_period: req.budget_period.unwrap_or_else(|| "total".to_string()),
+        budget_period,
         rpm_limit: req.rpm_limit,
         tpm_limit: req.tpm_limit,
     };
@@ -260,6 +284,81 @@ mod tests {
         assert_eq!(usage.status().as_u16(), 200);
         let ub: serde_json::Value = usage.json().await.unwrap();
         assert_eq!(ub["id"], id);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_create_key_rejects_unknown_budget_period() {
+        // Regression (MEDIUM/correctness): an unrecognized budget_period (a typo) must be rejected
+        // with 400, NOT accepted at 201 and silently enforced as the all-time `"total"` window. A
+        // valid period (and the default when omitted) must still create the key.
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (addr, handle) = serve_with_gov(gov).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/admin/keys");
+
+        // Typo'd period → 400, no key minted.
+        for bad in ["weekly", "monthlly", "", "TOTAL"] {
+            let resp = client
+                .post(&url)
+                .header("x-admin-token", "admintok")
+                .json(&serde_json::json!({"name": "k", "budget_period": bad}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                400,
+                "budget_period '{bad}' must be rejected with 400"
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("budget_period"),
+                "400 body must name budget_period: {body}"
+            );
+        }
+
+        // Each valid period (and the omitted-default) creates the key with that exact period.
+        for good in ["total", "daily", "monthly"] {
+            let resp = client
+                .post(&url)
+                .header("x-admin-token", "admintok")
+                .json(&serde_json::json!({"name": "k", "budget_period": good}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                201,
+                "valid budget_period '{good}' must create the key"
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(
+                body["budget_period"], good,
+                "stored period must match request"
+            );
+        }
+
+        // Omitted budget_period defaults to "total".
+        let resp = client
+            .post(&url)
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"name": "k"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 201, "omitted period must default");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["budget_period"], "total",
+            "omitted period defaults to total"
+        );
+
         handle.abort();
     }
 

@@ -8,7 +8,7 @@ use axum::{
     body::Bytes,
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use serde_json::Value;
 
@@ -204,73 +204,16 @@ fn finish(
 /// Unit I — total indistinguishability). A client on a vendor's official SDK gets the typed
 /// exception it expects (JSON envelope) instead of a plain-text body it cannot decode. `proto`
 /// names the ingress protocol of the route that failed; `status` is the HTTP status; `kind` is a
-/// protocol-appropriate error category; `message` is the human-readable detail. The body is always
-/// served as `application/json` (every vendor's error envelope is JSON). If `proto` is somehow not
-/// a known protocol, fall back to a plain-text body rather than panicking on the request path.
+/// protocol-appropriate error category; `message` is the human-readable detail.
+///
+/// Thin delegation to the CANONICAL `crate::forward::ingress_error` (Round-7 CORE made it the
+/// single source of truth for native error shaping + per-protocol headers — Bedrock
+/// `x-amzn-RequestId`/`x-amzn-errortype` via `proto::attach_bedrock_error_headers`, the generic
+/// fallback envelope, etc.). Keeping route.rs on this one function rather than a private copy means
+/// route/forward error shaping cannot drift. The route call sites (and the in-module tests) keep
+/// the short `proto`/`message` parameter names; the canonical fn names them `ingress`/`msg`.
 fn ingress_error(proto: &str, status: StatusCode, kind: &str, message: &str) -> Response {
-    match crate::proto::protocol_for(proto) {
-        Some(p) => {
-            let body = p.writer().write_error(status.as_u16(), kind, message);
-            let mut resp = (
-                status,
-                [(
-                    axum::http::header::CONTENT_TYPE,
-                    axum::http::HeaderValue::from_static("application/json"),
-                )],
-                body.to_string(),
-            )
-                .into_response();
-            // Bedrock ingress: a real AWS Bedrock runtime response ALWAYS carries an
-            // `x-amzn-RequestId` header (the only request-id surface the AWS SDK exposes via
-            // `request_id()`) and — for the JSON-1.1 error protocol — an `x-amzn-errortype` header
-            // equal to the body `__type`. A busbar-synthesized error (auth/validation/rate
-            // limit/exhaustion) that omits both is distinguishable from native Bedrock and leaves
-            // the SDK's request id empty. Attach them so the error is Bedrock-shaped end-to-end.
-            if proto == "bedrock" {
-                attach_bedrock_error_headers(&mut resp, kind);
-            }
-            resp
-        }
-        None => (status, message.to_string()).into_response(),
-    }
-}
-
-/// Attach the `x-amzn-RequestId` and `x-amzn-errortype` headers a native AWS Bedrock error response
-/// always carries. `x-amzn-errortype` mirrors the body `__type` (via `error_kind_to_bedrock_type`,
-/// the single source of truth) so header and body agree. Best-effort: if entropy or header encoding
-/// fails we skip that header rather than panic — this runs on the request path.
-fn attach_bedrock_error_headers(resp: &mut Response, kind: &str) {
-    let headers = resp.headers_mut();
-    if let Some(id) = synth_amzn_request_id() {
-        if let Ok(hv) = axum::http::HeaderValue::from_str(&id) {
-            headers.insert(axum::http::HeaderName::from_static("x-amzn-requestid"), hv);
-        }
-    }
-    let errortype = crate::proto::error_kind_to_bedrock_type(kind);
-    if let Ok(hv) = axum::http::HeaderValue::from_str(errortype) {
-        headers.insert(axum::http::HeaderName::from_static("x-amzn-errortype"), hv);
-    }
-}
-
-/// Mint a UUID-v4-shaped request id (`8-4-4-4-12` lowercase hex) for `x-amzn-RequestId`. Uses the
-/// OS CSPRNG; returns `None` (so the caller simply omits the header) if entropy is unavailable —
-/// this is on the request path, so it must never panic the way key-minting may.
-fn synth_amzn_request_id() -> Option<String> {
-    let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).ok()?;
-    // RFC 4122 v4 layout (version + variant bits) so the value is a well-formed UUID.
-    buf[6] = (buf[6] & 0x0f) | 0x40;
-    buf[8] = (buf[8] & 0x3f) | 0x80;
-    let h = |b: u8| format!("{b:02x}");
-    let s: String = buf.iter().map(|b| h(*b)).collect();
-    Some(format!(
-        "{}-{}-{}-{}-{}",
-        &s[0..8],
-        &s[8..12],
-        &s[12..16],
-        &s[16..20],
-        &s[20..32]
-    ))
+    crate::forward::ingress_error(proto, status, kind, message)
 }
 
 /// Shared ingress core for the BODY-MODEL protocols (`openai`, `cohere`, `responses`): the model
@@ -297,7 +240,7 @@ async fn ingress_body_model(
                 proto,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("router: bad json: {e}"),
+                &format!("We could not parse the JSON body of your request: {e}"),
             )
         }
     };
@@ -309,7 +252,7 @@ async fn ingress_body_model(
                 proto,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                "router: missing 'model' in request body",
+                "Missing required parameter: 'model'.",
             )
         }
     };
@@ -359,7 +302,7 @@ async fn ingress_path_model(
                 proto,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("router: bad json: {e}"),
+                &format!("We could not parse the JSON body of your request: {e}"),
             )
         }
     };
@@ -386,7 +329,7 @@ async fn ingress_path_model(
                 proto,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                "router: request body must be a JSON object",
+                "Request body must be a JSON object.",
             )
         }
     }
@@ -398,7 +341,7 @@ async fn ingress_path_model(
                 proto,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("router: cannot re-serialize body: {e}"),
+                &format!("The request body could not be processed: {e}"),
             )
         }
     };
@@ -479,7 +422,7 @@ async fn forward_resolved(
         proto,
         StatusCode::NOT_FOUND,
         "not_found_error",
-        &format!("router: unknown model '{model}'"),
+        &format!("The model '{model}' does not exist or you do not have access to it."),
     )
 }
 
@@ -550,7 +493,9 @@ pub(crate) async fn gemini_ingress(
                 "gemini",
                 StatusCode::NOT_FOUND,
                 "NOT_FOUND",
-                &format!("router: malformed gemini path '/v1beta/models/{rest}'"),
+                &format!(
+                    "Invalid resource path: models/{rest} is not found for API version v1beta."
+                ),
             )
         }
     };
@@ -568,7 +513,10 @@ pub(crate) async fn gemini_ingress(
                 "gemini",
                 StatusCode::NOT_FOUND,
                 "NOT_FOUND",
-                &format!("router: unsupported gemini action '{other}'"),
+                &format!(
+                    "models/{model} is not found for API version v1beta, \
+                     or is not supported for {other}."
+                ),
             )
         }
     };
@@ -755,7 +703,7 @@ pub(crate) async fn named(
             "anthropic",
             StatusCode::NOT_FOUND,
             "not_found_error",
-            &format!("router: '{name}' is not a known model or pool"),
+            &format!("The model '{name}' does not exist or you do not have access to it."),
         ),
     )
 }
@@ -793,22 +741,29 @@ pub(crate) async fn adhoc(
         // Provider mismatch / model miss: wrap the 4xx in `finish` so the client error is counted
         // in REQUESTS_TOTAL / REQUEST_DURATION_SECONDS and fires the request-log webhook, matching
         // the success arm and the governance-rejection path (a raw early-return made it invisible).
-        Some(&i) => finish(
-            &app,
-            &gov,
-            "anthropic",
-            &model,
-            started,
-            ingress_error(
+        // The client-facing copy is vendor-plausible (an Anthropic 400 never names a busbar
+        // "provider"); the actual provider mismatch is recorded server-side for operator diagnosis.
+        Some(&i) => {
+            tracing::info!(
+                model = %model,
+                requested_provider = %provider,
+                actual_provider = %app.lanes[i].provider,
+                "adhoc: model is on a different provider than the path requested"
+            );
+            finish(
+                &app,
+                &gov,
                 "anthropic",
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                &format!(
-                    "router: model '{}' is on provider '{}', not '{}'",
-                    model, app.lanes[i].provider, provider
+                &model,
+                started,
+                ingress_error(
+                    "anthropic",
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    &format!("The model '{model}' does not exist or you do not have access to it."),
                 ),
-            ),
-        ),
+            )
+        }
         None => finish(
             &app,
             &gov,
@@ -819,7 +774,7 @@ pub(crate) async fn adhoc(
                 "anthropic",
                 StatusCode::NOT_FOUND,
                 "not_found_error",
-                &format!("router: unknown model '{model}'"),
+                &format!("The model '{model}' does not exist or you do not have access to it."),
             ),
         ),
     }
@@ -828,6 +783,9 @@ pub(crate) async fn adhoc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `IntoResponse` is no longer used by the (now-delegating) production code, but the in-module
+    // tests build responses via `(StatusCode, body).into_response()`, which needs the trait in scope.
+    use axum::response::IntoResponse;
 
     /// `query_has_alt_sse` recognizes the gemini SSE selector only as a genuine `alt=sse` pair, not
     /// a substring of another param's value, and ignores order / other params.
@@ -1428,6 +1386,29 @@ mod tests {
         assert!(
             ct.starts_with("application/vnd.amazon.eventstream"),
             "streaming bedrock ingress is binary eventstream; got {ct}"
+        );
+
+        // HIGH/test-coverage (forward.rs streaming-success header emission): a real AWS Bedrock
+        // ConverseStream response ALWAYS carries `x-amzn-RequestId` (the only request-id surface the
+        // AWS SDK exposes via `*Output::request_id()`); an absent header makes that return None,
+        // which a native endpoint never does, and is a proxy tell on the most security-sensitive new
+        // surface. Assert the streaming-success header is present and UUID-v4 shaped (8-4-4-4-12),
+        // mirroring the non-stream `test_bedrock_ingress_success_carries_amzn_request_id`.
+        let req_id = resp
+            .headers()
+            .get("x-amzn-requestid")
+            .and_then(|h| h.to_str().ok())
+            .expect("bedrock converse-stream success carries x-amzn-RequestId")
+            .to_string();
+        let segs: Vec<&str> = req_id.split('-').collect();
+        assert_eq!(
+            segs.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12],
+            "x-amzn-RequestId is UUID-v4 shaped (8-4-4-4-12); got {req_id}"
+        );
+        assert!(
+            req_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "x-amzn-RequestId is lowercase hex with dashes; got {req_id}"
         );
 
         // The body must decode as a clean sequence of binary AWS event-stream frames.
@@ -2485,7 +2466,7 @@ mod tests {
             "bedrock",
             StatusCode::NOT_FOUND,
             "not_found_error",
-            "router: unknown model 'x'",
+            "The model 'x' does not exist or you do not have access to it.",
         );
         let req_id = resp
             .headers()
@@ -3093,5 +3074,232 @@ mod tests {
         );
         handle.abort();
         server.shutdown().await;
+    }
+
+    // ---- HIGH/test-coverage: mid-stream transport-error E2E for Cohere and Responses ingress ----
+    //
+    // `test_sse_ingress_mid_stream_error_uses_native_framing` (forward.rs) tests the byte shape of
+    // `mid_stream_error_bytes` in isolation; these two drive a TRUE `SseTransportError` through the
+    // REAL router on the two ingress routes that previously lacked an E2E mid-stream error test
+    // (bedrock/openai/gemini-json-array already have theirs above). Each routes cross-protocol to an
+    // OpenAI backend that drops the connection after the first frame.
+
+    /// Cohere `/v2/chat` (stream:true) mid-stream transport failure: the body must terminate with a
+    /// NATIVE Cohere SSE error frame — a BARE `data:` frame (Cohere's native stream never emits an
+    /// `event:` line mid-stream) whose JSON carries the Cohere-native flat shape (a `message`, or a
+    /// `type`+`message`) — and must NOT regress to an OpenAI `{"error":{...}}` envelope NESTED under
+    /// `error` only (the leak the finding guards against would be an `event:` line or a foreign shape).
+    #[tokio::test]
+    async fn test_cohere_ingress_mid_stream_transport_error_appends_native_sse() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::SseTransportError {
+            ok_events: vec![r#"{"choices":[{"delta":{"content":"hi"}}]}"#.to_string()],
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("co", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("co", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v2/chat"))
+            .bearer_auth("t")
+            .body(
+                json!({ "model": "co", "stream": true, "messages": [{"role": "user", "content": "hi"}] })
+                    .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "cohere stream starts 2xx");
+        let body = resp.bytes().await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        // No `event:` line anywhere — a native Cohere stream never emits one mid-stream.
+        assert!(
+            !text.contains("event:"),
+            "cohere mid-stream error must be a bare data: frame (no event: line); got:\n{text}"
+        );
+        // No OpenAI egress object may leak through verbatim.
+        assert!(
+            !text.contains("chat.completion.chunk"),
+            "cohere mid-stream error leaked an OpenAI chunk object; got:\n{text}"
+        );
+        // The LAST `data:` frame is the native Cohere error envelope (a flat `message`, possibly with
+        // a `type`), NOT a top-level OpenAI `{"error":{...}}`-only shape.
+        let last_data = sse_frames(&text)
+            .into_iter()
+            .next_back()
+            .map(|(_, d)| d)
+            .expect("a trailing data: error frame");
+        let v: Value = serde_json::from_str(&last_data).expect("native Cohere JSON envelope");
+        assert!(
+            v.get("message").is_some(),
+            "cohere mid-stream error carries a native flat `message`; got {v}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// Responses `/v1/responses` (stream:true) mid-stream transport failure: the body must terminate
+    /// with `event: response.failed` whose `data:` payload is the SDK-required STREAM shape
+    /// `{"response":{"status":"failed","error":{...}}}` — and must NOT regress to a top-level
+    /// `{"error":{...}}` HTTP envelope (which the official Responses stream decoder cannot locate via
+    /// `event.response`).
+    #[tokio::test]
+    async fn test_responses_ingress_mid_stream_transport_error_appends_response_failed() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::SseTransportError {
+            ok_events: vec![r#"{"choices":[{"delta":{"content":"hi"}}]}"#.to_string()],
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("re", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("re", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/responses"))
+            .bearer_auth("t")
+            .body(json!({ "model": "re", "stream": true, "input": "hi" }).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "responses stream starts 2xx");
+        let body = resp.bytes().await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        // The terminal frame is the named `response.failed` event.
+        assert!(
+            text.contains("event: response.failed"),
+            "responses mid-stream error must terminate with event: response.failed; got:\n{text}"
+        );
+        // Locate the `response.failed` frame and assert its payload is the STREAM shape.
+        let failed_data = sse_frames(&text)
+            .into_iter()
+            .find(|(ev, _)| ev == "response.failed")
+            .map(|(_, d)| d)
+            .expect("a response.failed data: frame");
+        let v: Value = serde_json::from_str(&failed_data).expect("native Responses JSON envelope");
+        assert!(
+            v.get("response").is_some(),
+            "responses stream error MUST wrap in a `response` object (SDK reads event.response); got {v}"
+        );
+        assert_eq!(
+            v["response"]["status"], "failed",
+            "response.status is `failed`; got {v}"
+        );
+        assert!(
+            v["response"]["error"]["message"].is_string(),
+            "the error lives inside response.error; got {v}"
+        );
+        assert!(
+            v.get("error").is_none(),
+            "responses stream error must NOT carry a top-level `error` (the HTTP envelope the stream \
+             decoder cannot locate); got {v}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    // ---- HIGH/conformance: no client-facing error message carries the wire-visible `router:` tell --
+
+    /// CLASS regression for the `router:` prefix leak. Drives the REAL router on EVERY ingress
+    /// protocol and asserts that NONE of the synthesized client-facing error bodies (bad JSON,
+    /// missing/unknown model, malformed gemini path, unsupported gemini action, non-object body,
+    /// provider mismatch) contains the substring `router:` anywhere — including inside the
+    /// per-protocol native envelope's `message`/`error.message`/`__type` fields. A native vendor
+    /// endpoint never returns an error whose copy begins `router:`, so its presence is a
+    /// deterministic proxy tell on any of the six surfaces.
+    #[tokio::test]
+    async fn test_no_client_error_message_carries_router_prefix() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let client = reqwest::Client::new();
+
+        // (path, body) pairs that each hit a distinct synthesized-error site across all protocols.
+        let cases: Vec<(String, String)> = vec![
+            // openai: bad json + missing model + unknown model.
+            (
+                format!("http://{addr}/v1/chat/completions"),
+                "not json{".to_string(),
+            ),
+            (
+                format!("http://{addr}/v1/chat/completions"),
+                json!({"messages": []}).to_string(),
+            ),
+            (
+                format!("http://{addr}/v1/chat/completions"),
+                json!({"model": "no-such", "messages": []}).to_string(),
+            ),
+            // cohere unknown model.
+            (
+                format!("http://{addr}/v2/chat"),
+                json!({"model": "no-such", "messages": []}).to_string(),
+            ),
+            // responses unknown model.
+            (
+                format!("http://{addr}/v1/responses"),
+                json!({"model": "no-such", "input": "hi"}).to_string(),
+            ),
+            // gemini: malformed path (no colon), unsupported action, non-object body, unknown model.
+            (
+                format!("http://{addr}/v1beta/models/gemini-flash"),
+                json!({}).to_string(),
+            ),
+            (
+                format!("http://{addr}/v1beta/models/foo:countTokens"),
+                json!({"contents": []}).to_string(),
+            ),
+            (
+                format!("http://{addr}/v1beta/models/foo:generateContent"),
+                json!([1, 2]).to_string(),
+            ),
+            (
+                format!("http://{addr}/v1beta/models/no-such:generateContent"),
+                json!({"contents": []}).to_string(),
+            ),
+            // bedrock: non-object body + unknown model.
+            (
+                format!("http://{addr}/model/foo/converse"),
+                json!([1, 2]).to_string(),
+            ),
+            (
+                format!("http://{addr}/model/no-such/converse"),
+                json!({"messages": []}).to_string(),
+            ),
+            // anthropic named: unknown model/pool.
+            (
+                format!("http://{addr}/no-such/v1/messages"),
+                json!({"model": "no-such", "messages": [], "max_tokens": 16}).to_string(),
+            ),
+        ];
+
+        for (url, payload) in cases {
+            let resp = client
+                .post(&url)
+                .bearer_auth("t")
+                .body(payload.clone())
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap();
+            assert!(
+                !body.contains("router:"),
+                "client-facing error body for {url} (payload {payload}) leaked the `router:` tell \
+                 (status {status}); got: {body}"
+            );
+        }
+        handle.abort();
     }
 }

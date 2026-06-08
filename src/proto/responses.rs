@@ -4,12 +4,62 @@
 //! OpenAI Responses API protocol reader/writer implementation.
 
 use super::*;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Monotonic per-process counter mixed into synthesized response ids so two responses minted in
 /// the same wall-clock second still get distinct `resp_` ids. Paired with the unix timestamp this
 /// gives a collision-free id without pulling in a UUID/random crate (no new dependency).
 static RESPONSE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// Per-stream `sequence_number` counter for the Responses streaming writer.
+    ///
+    /// EVERY native `/v1/responses` SSE event carries a top-level monotonically-increasing integer
+    /// `sequence_number` starting at 0 (it is a REQUIRED field on the official SDK's `Response*Event`
+    /// types). The writer (`ResponsesWriter`) is a zero-sized unit struct constructed by
+    /// `Protocol::responses()` and dispatched via `&self` through the `ProtocolWriter` vtable, so it
+    /// holds no instance state to thread a counter through. The counter therefore lives in
+    /// thread-local storage, keyed implicitly by the runtime worker driving the stream.
+    ///
+    /// Correctness contract: a single cross-protocol stream's events are emitted by
+    /// `StreamTranslate::feed`/`finish`, which borrow `&mut self` and run synchronously — one stream's
+    /// buffered events are fully written before another stream's bytes are processed, with no `.await`
+    /// interleaving inside the emit loop. The counter is RESET to 0 when the stream's opening event
+    /// (`MessageStart` → `response.created`) is written, so each stream's `sequence_number` sequence
+    /// begins at 0 and increases by one per emitted event for the remainder of that stream. The reader
+    /// side gates `MessageStart` on `state.started`, so exactly one opening event (one reset) is
+    /// produced per stream.
+    static RESPONSE_SEQUENCE: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Reset the per-stream `sequence_number` counter to 0. Called when the stream's opening
+/// `response.created` event is written so every stream's sequence starts from 0.
+fn reset_sequence_number() {
+    RESPONSE_SEQUENCE.with(|c| c.set(0));
+}
+
+/// Return the next `sequence_number` for the current stream and advance the counter. The first call
+/// after a [`reset_sequence_number`] returns 0, the next 1, and so on — matching the native
+/// monotonic-from-0 contract.
+fn next_sequence_number() -> u64 {
+    RESPONSE_SEQUENCE.with(|c| {
+        let n = c.get();
+        c.set(n.saturating_add(1));
+        n
+    })
+}
+
+/// Synthesize a stable per-output-item id for the streaming writer. Native Responses events carry an
+/// `item_id` (`msg_…` for message parts, `fc_…` for function-call parts) that is constant across the
+/// `output_item.added` → deltas → `output_item.done` lifecycle of a single output item. The IR's
+/// block events carry only the integer `output_index` (and, for tool use, the call id), not a wire
+/// `item_id`, so synthesize a deterministic id from the item kind + index. Determinism per index is
+/// what matters: the same `(kind, index)` always yields the same id within a stream, so the
+/// added/delta/done events of one item correlate, mirroring the native shape. No new dependency.
+fn synthesize_item_id(prefix: &str, index: usize) -> String {
+    format!("{prefix}_{index:08x}")
+}
 
 /// Current unix epoch seconds, or 0 if the clock is before the epoch (never on a sane host).
 /// Kept panic-free for the request path: no `unwrap`/`expect` on `SystemTime`.
@@ -1104,7 +1154,15 @@ impl ProtocolWriter for ResponsesWriter {
     }
 
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
-        match ev {
+        // The stream's opening event resets the per-stream `sequence_number` counter so each stream's
+        // sequence starts at 0. Every event this writer emits then carries a top-level
+        // `sequence_number` injected just before return (see the closing `map` below). The reader
+        // gates `MessageStart` on `state.started`, so exactly one reset happens per stream.
+        if matches!(ev, IrStreamEvent::MessageStart { .. }) {
+            reset_sequence_number();
+        }
+
+        let emitted: Option<(String, serde_json::Value)> = match ev {
             IrStreamEvent::MessageStart {
                 id, created, model, ..
             } => {
@@ -1141,35 +1199,54 @@ impl ProtocolWriter for ResponsesWriter {
 
             IrStreamEvent::BlockStart { index, block } => match block {
                 crate::ir::IrBlockMeta::Text => None,
-                crate::ir::IrBlockMeta::ToolUse { id, name } => Some((
-                    "response.output_item.added".to_string(),
-                    serde_json::json!({
-                        "type": "response.output_item.added",
-                        "output_index": index,
-                        "item": {
-                            "type": "function_call",
-                            "call_id": id,
-                            "name": name
-                        }
-                    }),
-                )),
+                crate::ir::IrBlockMeta::ToolUse { id, name } => {
+                    // `item_id` (a stable per-output-item id, `fc_…` for a function-call item) is
+                    // carried on the native `output_item.added`/`.done` pair so a client correlates the
+                    // item's lifecycle. Synthesize it deterministically from the output index so the
+                    // matching `.done` (which sees only the index) reconstructs the same id.
+                    let item_id = synthesize_item_id("fc", *index);
+                    Some((
+                        "response.output_item.added".to_string(),
+                        serde_json::json!({
+                            "type": "response.output_item.added",
+                            "output_index": index,
+                            "item_id": item_id,
+                            "item": {
+                                "type": "function_call",
+                                "id": item_id,
+                                "call_id": id,
+                                "name": name
+                            }
+                        }),
+                    ))
+                }
                 crate::ir::IrBlockMeta::Thinking | crate::ir::IrBlockMeta::Image => None,
             },
 
             IrStreamEvent::BlockDelta { index, delta } => match delta {
-                crate::ir::IrDelta::TextDelta(text) if !text.is_empty() => Some((
-                    "response.output_text.delta".to_string(),
-                    serde_json::json!({
-                        "type": "response.output_text.delta",
-                        "output_index": index,
-                        "delta": text
-                    }),
-                )),
+                crate::ir::IrDelta::TextDelta(text) if !text.is_empty() => {
+                    // Native `output_text.delta` carries `item_id` (the enclosing message item) and
+                    // `content_index` (the index of the text part within that item). The IR delta
+                    // carries only the output index; synthesize the message `item_id` deterministically
+                    // from it (matching the `msg_…` part), and emit `content_index: 0` — the single
+                    // text content part of the item.
+                    Some((
+                        "response.output_text.delta".to_string(),
+                        serde_json::json!({
+                            "type": "response.output_text.delta",
+                            "output_index": index,
+                            "item_id": synthesize_item_id("msg", *index),
+                            "content_index": 0,
+                            "delta": text
+                        }),
+                    ))
+                }
                 crate::ir::IrDelta::InputJsonDelta(json_str) => Some((
                     "response.function_call_arguments.delta".to_string(),
                     serde_json::json!({
                         "type": "response.function_call_arguments.delta",
                         "output_index": index,
+                        "item_id": synthesize_item_id("fc", *index),
                         "delta": json_str
                     }),
                 )),
@@ -1274,7 +1351,23 @@ impl ProtocolWriter for ResponsesWriter {
                     }),
                 ))
             }
-        }
+        };
+
+        // EVERY native `/v1/responses` SSE event carries a top-level `sequence_number` (monotonic
+        // from 0 per stream). Inject it uniformly here so no writer arm can forget it and so the
+        // counter advances exactly once per emitted event. Events that produce no body
+        // (`MessageStop`, empty text deltas, Text/Thinking/Image `BlockStart`) do NOT consume a
+        // sequence number — only events that actually go on the wire are numbered, matching the
+        // native stream where the integer counts emitted events.
+        emitted.map(|(event_name, mut data)| {
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert(
+                    "sequence_number".to_string(),
+                    serde_json::json!(next_sequence_number()),
+                );
+            }
+            (event_name, data)
+        })
     }
 
     fn write_response(&self, resp: &crate::ir::IrResponse) -> serde_json::Value {
@@ -3092,5 +3185,229 @@ mod tests {
                 "event {event_name} body must carry top-level \"type\" == event name, got {payload}"
             );
         }
+    }
+
+    /// A full single-stream sequence of emitted Responses events. The events go through the writer in
+    /// the order `StreamTranslate::feed` would emit them.
+    fn usage_fixture() -> crate::ir::IrUsage {
+        crate::ir::IrUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        }
+    }
+
+    /// Regression (HIGH/conformance): EVERY emitted Responses SSE event must carry a top-level
+    /// `sequence_number` that is monotonic from 0 within a single stream. The opening
+    /// `response.created` (MessageStart) resets the per-stream counter, so a fresh stream starts at 0
+    /// and increases by one per emitted event. Events that produce no body do not consume a number.
+    #[test]
+    fn test_sequence_number_monotonic_from_zero() {
+        let writer = ResponsesWriter;
+        // A representative stream: created → text deltas → completed.
+        let stream = vec![
+            IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: None,
+                created: None,
+                model: None,
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::TextDelta("Hel".to_string()),
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::TextDelta("lo".to_string()),
+            },
+            IrStreamEvent::BlockStop { index: 0 },
+            IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            },
+        ];
+
+        let mut seqs = Vec::new();
+        for ev in &stream {
+            if let Some((_, payload)) = writer.write_response_event(ev) {
+                let n = payload
+                    .get("sequence_number")
+                    .and_then(|s| s.as_u64())
+                    .unwrap_or_else(|| {
+                        panic!("every emitted event must carry sequence_number: {payload}")
+                    });
+                seqs.push(n);
+            }
+        }
+
+        assert_eq!(
+            seqs,
+            vec![0, 1, 2, 3, 4],
+            "sequence_number must be 0..N monotonic within the stream, got {seqs:?}"
+        );
+    }
+
+    /// Regression: a SECOND stream (its own `response.created`) must restart its `sequence_number`
+    /// from 0 — the counter is per-stream, not per-process. Exercises the reset-on-MessageStart
+    /// contract so one stream's numbering never bleeds into the next on the same worker.
+    #[test]
+    fn test_sequence_number_resets_per_stream() {
+        let writer = ResponsesWriter;
+        let start = || IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        };
+        let delta = || IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::TextDelta("x".to_string()),
+        };
+
+        // Stream A: created(0), delta(1).
+        let (_, a0) = writer.write_response_event(&start()).expect("emit");
+        let (_, a1) = writer.write_response_event(&delta()).expect("emit");
+        assert_eq!(a0.get("sequence_number").and_then(|s| s.as_u64()), Some(0));
+        assert_eq!(a1.get("sequence_number").and_then(|s| s.as_u64()), Some(1));
+
+        // Stream B begins with its own created → counter resets to 0.
+        let (_, b0) = writer.write_response_event(&start()).expect("emit");
+        let (_, b1) = writer.write_response_event(&delta()).expect("emit");
+        assert_eq!(
+            b0.get("sequence_number").and_then(|s| s.as_u64()),
+            Some(0),
+            "a new stream's response.created must reset sequence_number to 0"
+        );
+        assert_eq!(b1.get("sequence_number").and_then(|s| s.as_u64()), Some(1));
+    }
+
+    /// Regression: every writer arm that produces a body carries `sequence_number`, not just the
+    /// deltas. Mirrors `test_every_stream_event_carries_top_level_type` but asserts the integer
+    /// `sequence_number` is present (and a u64) on each emitted body.
+    #[test]
+    fn test_every_stream_event_carries_sequence_number() {
+        let writer = ResponsesWriter;
+        let events = vec![
+            IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: None,
+                created: None,
+                model: None,
+            },
+            IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "f".to_string(),
+                },
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::TextDelta("hi".to_string()),
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::InputJsonDelta("{}".to_string()),
+            },
+            IrStreamEvent::BlockStop { index: 0 },
+            IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            },
+            IrStreamEvent::Error(IrError {
+                class: StatusClass::ServerError,
+                provider_signal: Some("boom".to_string()),
+                retry_after: None,
+            }),
+        ];
+
+        for ev in &events {
+            let (event_name, payload) = writer
+                .write_response_event(ev)
+                .unwrap_or_else(|| panic!("event {ev:?} must emit a body"));
+            assert!(
+                payload
+                    .get("sequence_number")
+                    .map(|s| s.is_u64())
+                    .unwrap_or(false),
+                "event {event_name} body must carry a u64 sequence_number, got {payload}"
+            );
+        }
+    }
+
+    /// Regression: `response.output_text.delta` must carry `item_id` and `content_index` (native
+    /// shape), and the `output_item.added` for a function call must carry `item_id`. The
+    /// `function_call_arguments.delta` carries the matching `item_id`.
+    #[test]
+    fn test_delta_and_item_added_carry_item_id_and_content_index() {
+        let writer = ResponsesWriter;
+
+        // Text delta.
+        let (_, text) = writer
+            .write_response_event(&IrStreamEvent::BlockDelta {
+                index: 2,
+                delta: crate::ir::IrDelta::TextDelta("hi".to_string()),
+            })
+            .expect("emit");
+        let text_item = text
+            .get("item_id")
+            .and_then(|i| i.as_str())
+            .expect("output_text.delta must carry item_id");
+        assert!(
+            text_item.starts_with("msg_"),
+            "text delta item_id must be a msg_ id, got {text_item}"
+        );
+        assert_eq!(
+            text.get("content_index").and_then(|c| c.as_u64()),
+            Some(0),
+            "output_text.delta must carry content_index"
+        );
+
+        // output_item.added for a function call.
+        let (_, added) = writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 1,
+                block: crate::ir::IrBlockMeta::ToolUse {
+                    id: "call_9".to_string(),
+                    name: "lookup".to_string(),
+                },
+            })
+            .expect("emit");
+        let added_item = added
+            .get("item_id")
+            .and_then(|i| i.as_str())
+            .expect("output_item.added must carry item_id");
+        assert!(
+            added_item.starts_with("fc_"),
+            "function_call item_id must be an fc_ id, got {added_item}"
+        );
+        // The nested item id matches the top-level item_id (one logical item).
+        assert_eq!(
+            added
+                .get("item")
+                .and_then(|i| i.get("id"))
+                .and_then(|i| i.as_str()),
+            Some(added_item),
+            "nested item.id must equal the top-level item_id"
+        );
+
+        // The function_call_arguments.delta at the same index reuses the same fc_ item_id.
+        let (_, args) = writer
+            .write_response_event(&IrStreamEvent::BlockDelta {
+                index: 1,
+                delta: crate::ir::IrDelta::InputJsonDelta("{\"q\":1}".to_string()),
+            })
+            .expect("emit");
+        assert_eq!(
+            args.get("item_id").and_then(|i| i.as_str()),
+            Some(added_item),
+            "arguments delta item_id must match the item's added item_id (stable per index)"
+        );
     }
 }

@@ -129,29 +129,37 @@ fn bedrock_image_block(media_type: &str, data: &str) -> Option<serde_json::Value
 ///   - `bedrock.<region>.amazonaws.com` (the control-plane label, defensively)
 ///
 /// Returns `Some(region)` only when a Bedrock service label is found AND the following label looks
-/// like an AWS region token (`<area>-<direction>-<number>`, e.g. `us-east-1`, `ap-southeast-2`,
-/// `eu-central-1`); otherwise `None`. The caller logs a `tracing::warn!` and falls back to
+/// like an AWS region token (one or more alphabetic dash-parts then a numeric part, e.g.
+/// `us-east-1`, `ap-southeast-2`, `eu-central-1`, `us-gov-west-1`, `us-iso-east-1`); otherwise
+/// `None`. The caller logs a `tracing::warn!` and falls back to
 /// `us-east-1` for `None`, so a mis-derived region is no longer silent. Pure string parsing on a
 /// `&str` — no panic, no allocation of the host.
 fn derive_sigv4_region(host: &str) -> Option<&str> {
-    // An AWS region token: `<lowercase letters>-<lowercase letters>-<digits>`
-    // (us-east-1, ap-southeast-2, eu-central-1, ca-central-1, us-gov-west-1 → matched loosely as
-    // <alpha>-<alpha>-<alnum>). We accept any 3-part dash token whose final part is numeric so a
-    // future region naming scheme still parses, but reject obvious non-regions (a bare label, an
-    // IP octet, a CNAME segment).
+    // An AWS region token: one or more alphabetic dash-parts followed by a final numeric part.
+    //   3-part canonical:  us-east-1, ap-southeast-2, eu-central-1, ca-central-1
+    //   4-part partitions: us-gov-west-1, us-gov-east-1 (GovCloud), us-iso-east-1, us-isob-east-1
+    //                      (ISO), and any future >=3-part naming scheme.
+    // We accept any dash token of >= 3 parts whose leading parts are all ASCII-alphabetic and whose
+    // FINAL part is all ASCII-digits, so the parser tracks real AWS region shapes regardless of how
+    // many middle direction/partition segments AWS adds. We still reject obvious non-regions (a bare
+    // label, a 2-part token, an IP octet, a CNAME segment) because they fail the >=3 / alpha+digit
+    // structure. The old code hard-required EXACTLY 3 parts, which silently rejected every GovCloud
+    // and ISO region and fell the caller back to a wrong `us-east-1` SigV4 scope (403
+    // SignatureDoesNotMatch).
     fn looks_like_region(label: &str) -> bool {
-        let mut parts = label.split('-');
-        let (Some(a), Some(b), Some(c)) = (parts.next(), parts.next(), parts.next()) else {
+        let parts: Vec<&str> = label.split('-').collect();
+        // Need at least <area>-<direction>-<number>; no empty parts (rejects leading/trailing/
+        // doubled dashes).
+        if parts.len() < 3 || parts.iter().any(|p| p.is_empty()) {
+            return false;
+        }
+        let Some((last, leading)) = parts.split_last() else {
             return false;
         };
-        // No 4th dash-part, all of area/direction alphabetic, trailing part all digits.
-        parts.next().is_none()
-            && !a.is_empty()
-            && a.bytes().all(|x| x.is_ascii_alphabetic())
-            && !b.is_empty()
-            && b.bytes().all(|x| x.is_ascii_alphabetic())
-            && !c.is_empty()
-            && c.bytes().all(|x| x.is_ascii_digit())
+        last.bytes().all(|x| x.is_ascii_digit())
+            && leading
+                .iter()
+                .all(|p| p.bytes().all(|x| x.is_ascii_alphabetic()))
     }
 
     // Walk the dotted labels; when we hit a Bedrock service label, the NEXT label is the region.
@@ -500,7 +508,11 @@ impl ProtocolReader for BedrockReader {
                 .get("maxTokens")
                 .and_then(|v| v.as_u64())
                 .filter(|&v| v > 0)
-                .map(|v| v as u32)
+                // Bounds-checked: a bare `as u32` would silently TRUNCATE (wrap) a value above
+                // u32::MAX (e.g. 5_000_000_000 → 705_032_704) and forward it as a real cap the
+                // caller never asked for, diverging from a direct AWS call. Drop out-of-range
+                // values to None so the backend applies its own default. Mirrors the Gemini reader.
+                .and_then(|v| u32::try_from(v).ok())
         } else {
             None
         };
@@ -3457,6 +3469,29 @@ mod tests {
             Some("us-west-2")
         );
 
+        // 4-part AWS partition regions: GovCloud and ISO. The old EXACTLY-3-parts parser rejected
+        // every one of these and silently signed for us-east-1 (403 SignatureDoesNotMatch).
+        assert_eq!(
+            derive_sigv4_region("bedrock-runtime.us-gov-west-1.amazonaws.com"),
+            Some("us-gov-west-1")
+        );
+        assert_eq!(
+            derive_sigv4_region("bedrock-runtime.us-gov-east-1.amazonaws.com"),
+            Some("us-gov-east-1")
+        );
+        assert_eq!(
+            derive_sigv4_region("bedrock-runtime-fips.us-gov-west-1.amazonaws.com"),
+            Some("us-gov-west-1")
+        );
+        assert_eq!(
+            derive_sigv4_region("bedrock-runtime.us-iso-east-1.c2s.ic.gov"),
+            Some("us-iso-east-1")
+        );
+        assert_eq!(
+            derive_sigv4_region("bedrock-runtime.us-isob-east-1.sc2s.sgov.gov"),
+            Some("us-isob-east-1")
+        );
+
         // Non-derivable hosts → None (caller warns + falls back to us-east-1).
         assert_eq!(derive_sigv4_region("my-cname-front.example.com"), None);
         assert_eq!(derive_sigv4_region("10.0.0.5"), None);
@@ -3465,6 +3500,20 @@ mod tests {
         // guess from a non-region label.
         assert_eq!(
             derive_sigv4_region("bedrock-runtime.internal.corp.example.com"),
+            None
+        );
+        // Still reject obvious non-regions even though the part-count rule relaxed: a 2-part token,
+        // a non-numeric final part, and a numeric leading part all fail the alpha+...+digit shape.
+        assert_eq!(
+            derive_sigv4_region("bedrock-runtime.us-east.amazonaws.com"),
+            None
+        );
+        assert_eq!(
+            derive_sigv4_region("bedrock-runtime.us-gov-west-foo.amazonaws.com"),
+            None
+        );
+        assert_eq!(
+            derive_sigv4_region("bedrock-runtime.1-gov-west-1.amazonaws.com"),
             None
         );
     }
@@ -3648,5 +3697,42 @@ mod tests {
             Some(1),
             "URL-sentinel image inner block must be dropped; got {out}"
         );
+    }
+
+    /// Regression (class sweep — maxTokens overflow): a `maxTokens` value above u32::MAX must be
+    /// dropped to None (backend applies its default) rather than silently TRUNCATED (wrapped) into
+    /// an arbitrary smaller cap by a bare `as u32`. Mirrors the hardened Gemini reader; an in-range
+    /// value and the `> 0` filter are still honored.
+    #[test]
+    fn test_read_request_max_tokens_overflow_dropped_not_truncated() {
+        let reader = BedrockReader;
+
+        // Above u32::MAX → dropped to None (no truncation to 705_032_704).
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+            "inferenceConfig": {"maxTokens": 5_000_000_000u64}
+        });
+        let ir = reader.read_request(&body).unwrap();
+        assert_eq!(
+            ir.max_tokens, None,
+            "maxTokens above u32::MAX must drop to None, not wrap; got {:?}",
+            ir.max_tokens
+        );
+
+        // Exactly u32::MAX is in range and preserved.
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+            "inferenceConfig": {"maxTokens": u32::MAX as u64}
+        });
+        let ir = reader.read_request(&body).unwrap();
+        assert_eq!(ir.max_tokens, Some(u32::MAX));
+
+        // Zero is still filtered out (> 0 guard).
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+            "inferenceConfig": {"maxTokens": 0}
+        });
+        let ir = reader.read_request(&body).unwrap();
+        assert_eq!(ir.max_tokens, None);
     }
 }

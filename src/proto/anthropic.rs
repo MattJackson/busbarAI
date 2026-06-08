@@ -1312,10 +1312,22 @@ impl ProtocolWriter for AnthropicWriter {
             obj.insert("stop_reason".to_string(), serde_json::json!(reason));
         }
 
-        // stop_sequence: emit the captured value when a stop string actually matched; omit when
-        // None so a same-protocol round-trip of a body without one stays byte-faithful.
-        if let Some(ref seq) = resp.stop_sequence {
-            obj.insert("stop_sequence".to_string(), serde_json::json!(seq));
+        // stop_sequence: a native non-streaming Anthropic `Message` ALWAYS carries this key — the
+        // matched stop string when a stop sequence fired, JSON `null` otherwise (the SDK types
+        // `Message.stop_sequence` as `Optional[str]` and always populates it). `write_response` runs
+        // ONLY on the cross-protocol translate path (forward.rs: same-protocol non-stream relays the
+        // raw upstream body and never reaches here), where the egress is Anthropic and must byte-match
+        // the native shape — so emit an explicit `null` when absent rather than omitting the key. A
+        // read→write→read round-trip stays IR-idempotent (`read_response` maps a `null`
+        // `stop_sequence` back to `None`). Same conformance class as the streaming `message_delta`
+        // `stop_sequence`.
+        match &resp.stop_sequence {
+            Some(seq) => {
+                obj.insert("stop_sequence".to_string(), serde_json::json!(seq));
+            }
+            None => {
+                obj.insert("stop_sequence".to_string(), serde_json::Value::Null);
+            }
         }
 
         // usage
@@ -2112,6 +2124,72 @@ mod anthropic_hardening_tests {
                 "data.type must equal the SSE event name for every arm"
             );
         }
+    }
+
+    /// Round-7 finding (stop_sequence conformance class, non-streaming sibling): a non-streaming
+    /// `write_response` whose IR carried no stop sequence must still emit `stop_sequence: null` — a
+    /// native `Message` always carries the key. Sweeps the same class beyond the cited streaming arm.
+    /// IR-idempotence is preserved: re-reading a `null` stop_sequence yields `None` again.
+    #[test]
+    fn write_response_emits_null_stop_sequence_when_absent() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("claude-opus-4-8".to_string()),
+            id: Some("msg_01abc".to_string()),
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = AnthropicWriter.write_response(&resp);
+        let ss = out
+            .get("stop_sequence")
+            .expect("stop_sequence key must be present in a non-streaming Message");
+        assert!(
+            ss.is_null(),
+            "stop_sequence must be JSON null when absent, not omitted, got {ss:?}"
+        );
+        // IR-idempotence: re-reading the written body maps the null back to None.
+        let reread = AnthropicReader.read_response(&out).expect("reread");
+        assert_eq!(reread.stop_sequence, None);
+    }
+
+    /// Round-7 finding (stop_sequence conformance class): when present, the non-streaming
+    /// `write_response` must carry the matched string (unchanged from prior behavior).
+    #[test]
+    fn write_response_emits_matched_stop_sequence_string() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![],
+            stop_reason: Some("stop_sequence".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: Some("msg_01abc".to_string()),
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: Some("STOP".to_string()),
+        };
+        let out = AnthropicWriter.write_response(&resp);
+        assert_eq!(
+            out.get("stop_sequence").and_then(|s| s.as_str()),
+            Some("STOP")
+        );
     }
 
     /// Round-6 finding #2 (classify ordering class): a billing error whose body carries a message

@@ -6,9 +6,9 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::State,
-    http::{header::AUTHORIZATION, header::CONTENT_TYPE, HeaderValue, Request, StatusCode},
+    http::{header::AUTHORIZATION, Request, StatusCode},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 
 use crate::config::AuthCfg;
@@ -200,106 +200,31 @@ impl AuthMiddleware {
 }
 
 /// The ingress wire protocol a request targets, inferred from its path prefix. Auth runs BEFORE
-/// routing, so the path is the only signal available for shaping a native 401 envelope. Order of
-/// checks is significant: the more specific anthropic adhoc/named `/<seg>/v1/messages` shape is
-/// covered by the generic `/v1/messages` suffix test.
+/// routing, so the path is the only signal available for shaping a native 401 envelope.
+///
+/// This is a THIN delegation to the CANONICAL `crate::proto::proto_for_path` (the single source of
+/// truth shared with `main.rs`'s fallback/405 handlers): the previous private copy here was a
+/// wire-identical duplicate that COULD drift from the routing-time classifier — the exact
+/// indistinguishability tell where one handler shapes `/model/foo/bar` as bedrock and another as
+/// openai. Calling the canonical fn makes that drift impossible by construction; the auth-time and
+/// routing-time classifiers are now literally the same code.
 fn proto_for_path(path: &str) -> &'static str {
-    if path.starts_with("/v1beta/models") {
-        // `/v1beta/models/...` is a Gemini-only surface (OpenAI has no v1beta), so always Gemini.
-        "gemini"
-    } else if path.starts_with("/v1/models/") {
-        // The router registers `/v1/models/*rest` for Gemini ingress (the stable `v1` alias the
-        // google-generativeai / Gen AI SDK uses), but `/v1/models/` is ambiguous: Gemini packs a
-        // `:<action>` into the LAST path segment (`/v1/models/gemini-pro:generateContent`), whereas
-        // the OpenAI SDK's `model.retrieve` issues `GET /v1/models/{id}` with NO colon action. Shape
-        // the auth error in the protocol the client is actually speaking — a colon in the final
-        // segment → Gemini, otherwise OpenAI. This mirrors `main.rs::proto_for_path` exactly so the
-        // auth-time and fallback-time classifiers cannot drift (the previous auth copy had no
-        // `/v1/models/` arm at all, so a stable-v1 Gemini client got an OpenAI-shaped 401).
-        let last_segment = path.rsplit('/').next().unwrap_or("");
-        if last_segment.contains(':') {
-            "gemini"
-        } else {
-            "openai"
-        }
-    } else if path.starts_with("/model/")
-        && (path.ends_with("/converse") || path.ends_with("/converse-stream"))
-    {
-        // Bedrock's Converse API is `/model/<id>/converse[-stream]`. Require that suffix so a pool
-        // or model literally named "model" hitting `/model/v1/messages` is NOT misclassified as
-        // bedrock (which would hand it a Bedrock-shaped 401 envelope — a protocol tell). Such a
-        // path falls through to the `/v1/messages` (anthropic) arm below.
-        "bedrock"
-    } else if path == "/v1/messages" || path.ends_with("/v1/messages") {
-        "anthropic"
-    } else if path == "/v1/chat/completions" {
-        "openai"
-    } else if path == "/v2/chat" {
-        "cohere"
-    } else if path == "/v1/responses" {
-        "responses"
-    } else {
-        // Unknown ingress: fall back to the generic `ProtocolWriter::write_error` envelope.
-        "openai"
-    }
+    crate::proto::proto_for_path(path)
 }
 
-/// Mint a synthetic AWS request id for a busbar-synthesized Bedrock error response, where there is
-/// no upstream request to forward an id from. Real Bedrock runtime responses carry a UUID-v4-shaped
-/// value on `x-amzn-RequestId` (8-4-4-4-12 lowercase hex); a flat 32-hex string with no dashes is a
-/// protocol tell an AWS SDK that parses the header as a UUID would reject. This mirrors
-/// `route.rs::synth_amzn_request_id`: 16 CSPRNG bytes via `getrandom` with RFC 4122 v4 version +
-/// variant bits applied. Returns `None` when entropy is unavailable so the caller omits the header
-/// rather than emitting a malformed (non-random / non-UUID) id — never panics on the request path.
-fn synth_amzn_request_id() -> Option<String> {
-    let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).ok()?;
-    // RFC 4122 v4 layout (version nibble = 4, variant bits = 10) so the value is a well-formed UUID.
-    buf[6] = (buf[6] & 0x0f) | 0x40;
-    buf[8] = (buf[8] & 0x3f) | 0x80;
-    let s: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-    Some(format!(
-        "{}-{}-{}-{}-{}",
-        &s[0..8],
-        &s[8..12],
-        &s[12..16],
-        &s[16..20],
-        &s[20..32]
-    ))
-}
-
-/// The auth-failure wire message for an inferred ingress protocol. This string lands verbatim in
+/// The auth-failure wire message for an inferred ingress protocol — a THIN delegation to the
+/// CANONICAL `crate::proto::vendor_auth_failure_message` so the auth path and any other site that
+/// shapes a native bad-credential body cannot drift on the vendor copy. The string lands verbatim in
 /// the native error body (`error.message` for anthropic/openai/gemini/responses, the bare top-level
 /// `message` for cohere, the `message` field alongside `__type` for bedrock — every writer echoes
-/// it unchanged). It MUST read like the copy the REAL vendor returns for a bad/missing credential,
+/// it unchanged), so it MUST read like the copy the REAL vendor returns for a bad/missing credential
 /// and carry NO busbar-internal vocabulary ("virtual key", "client token", "allowlist", "disabled",
-/// "passthrough", …): any such word is a deterministic protocol tell a native SDK / a human reading
-/// SDK error output would never see from the genuine endpoint, and it also discloses busbar's auth
-/// model. The wording is chosen PURELY from the inferred protocol and is deliberately independent of
-/// WHY auth failed (missing token vs. wrong token vs. disabled virtual key vs. admin-token
-/// mismatch) — surfacing that distinction on the wire is itself an oracle. Call sites therefore
-/// pass no reason string; the wording lives here, behind the protocol.
-///
-/// Strings mirror genuine vendor copy (sampled from real 401/403 bodies):
-///   anthropic  → "invalid x-api-key"
-///   openai     → "Incorrect API key provided."
-///   gemini     → "API key not valid. Please pass a valid API key."
-///   cohere     → "invalid api token"
-///   responses  → "Incorrect API key provided." (OpenAI-family)
-///   bedrock    → "" (AWS conveys AccessDenied via __type / x-amzn-errortype, not message prose)
+/// "passthrough", …). The wording is chosen PURELY from the inferred protocol and is deliberately
+/// independent of WHY auth failed (missing token vs. wrong token vs. disabled virtual key vs.
+/// admin-token mismatch) — surfacing that distinction on the wire is itself an oracle. Call sites
+/// therefore pass no reason string.
 fn vendor_auth_failure_message(proto: &str) -> &'static str {
-    match proto {
-        "anthropic" => "invalid x-api-key",
-        "gemini" => "API key not valid. Please pass a valid API key.",
-        "cohere" => "invalid api token",
-        // AWS does not put a credential hint in the message; the modeled exception rides on
-        // `__type` / `x-amzn-errortype`. An empty message matches a native AccessDenied body.
-        "bedrock" => "",
-        // openai + responses (OpenAI-family) and any future/unknown proto: neutral credential copy
-        // with no busbar vocabulary. Not a disposition/breaker match, so a fallback arm is fine.
-        "openai" | "responses" => "Incorrect API key provided.",
-        _ => "authentication failed",
-    }
+    crate::proto::vendor_auth_failure_message(proto)
 }
 
 /// The HTTP status and protocol-agnostic error `kind` a bad/missing credential yields for an
@@ -353,39 +278,23 @@ fn auth_failure_status_and_kind(proto: &str) -> (StatusCode, &'static str) {
 /// as unsupported under token/governance mode, so that branch is only reachable under a
 /// misconfiguration — but when it is reached, the envelope must still match native AWS.)
 ///
-/// No unwrap / expect / panic on this request path: a serialization failure degrades to an empty
-/// JSON object.
+/// No unwrap / expect / panic on this request path: `ingress_error` degrades a serialization failure
+/// to a generic JSON object internally.
+///
+/// The envelope is built by the CANONICAL `crate::forward::ingress_error` (CORE made it
+/// `pub(crate)`), the single source of truth for native error shaping: it selects the protocol
+/// writer, sets `application/json`, and attaches the Bedrock `x-amzn-RequestId` / `x-amzn-errortype`
+/// headers via the shared `proto::attach_bedrock_error_headers` helper. Migrating here means the
+/// auth path, the forward path, and the route/fallback path CANNOT diverge on error shape or headers
+/// — converging the three error builders the design called out. Bedrock's auth-failure modeled
+/// exception is `AccessDeniedException`; `ingress_error`'s header attach derives the same
+/// `x-amzn-errortype` from the `kind` we pass (`auth` → `AccessDeniedException`), so the wire body
+/// `__type` and the header agree.
 fn unauthorized_response(path: &str) -> Response {
     let proto = proto_for_path(path);
     let message = vendor_auth_failure_message(proto);
     let (status, kind) = auth_failure_status_and_kind(proto);
-    // `protocol_for` knows every name `proto_for_path` can return, so this is `Some` in practice;
-    // the `?`-style fallback keeps the request path panic-free if that ever changes.
-    let body = match crate::proto::protocol_for(proto) {
-        Some(p) => p.writer().write_error(status.as_u16(), kind, message),
-        None => serde_json::json!({"error": {"message": message, "type": "authentication_error"}}),
-    };
-    let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
-    let mut resp = (status, bytes).into_response();
-    resp.headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if proto == "bedrock" {
-        // `x-amzn-errortype`: the modeled exception name the AWS SDK reads to classify the error
-        // (mirrors the `__type` body field). For an auth failure that is `AccessDeniedException`.
-        let error_type = crate::proto::error_kind_to_bedrock_type("auth");
-        if let Ok(v) = HeaderValue::from_str(error_type) {
-            resp.headers_mut().insert("x-amzn-errortype", v);
-        }
-        // `x-amzn-RequestId`: AWS returns the request id only in this header (never in the body).
-        // `synth_amzn_request_id` returns None when entropy is unavailable; omit the header in that
-        // case rather than emitting a malformed id (matching the route.rs behaviour).
-        if let Some(id) = synth_amzn_request_id() {
-            if let Ok(v) = HeaderValue::from_str(&id) {
-                resp.headers_mut().insert("x-amzn-requestid", v);
-            }
-        }
-    }
-    resp
+    crate::forward::ingress_error(proto, status, kind, message)
 }
 
 /// Axum middleware layer that validates auth before routing.
@@ -450,14 +359,28 @@ pub(crate) async fn auth_middleware(
         let configured = app.governance.as_ref().and_then(|g| g.admin_token());
         let authorized = match configured {
             // Constant-time compare so the admin token can't be recovered byte-by-byte via a timing
-            // side channel (matches the client-token path).
+            // side channel. BOTH carrier comparisons run UNCONDITIONALLY and are combined with a
+            // bitwise-OR fold (`|`, NOT `||`): a `||` short-circuits, so a request presenting BOTH a
+            // Bearer and an x-admin-token would skip the header compare whenever the Bearer matched —
+            // a carrier-level timing observable distinguishing "Bearer matched" (one compare) from
+            // "Bearer missed, fell through to header" (two compares), leaking one bit of oracle about
+            // the Bearer value. Mirror the client-token allowlist fold: compute each compare into a
+            // `u8`, OR them, and `black_box` the result so the optimizer can't reintroduce an early
+            // exit. A missing carrier contributes 0 (no compare to a secret leaks via its absence).
             Some(t) => {
-                admin_bearer
-                    .as_deref()
-                    .is_some_and(|b| AuthMiddleware::constant_time_eq(b, t))
-                    || admin_header_token
+                let bearer_match = u8::from(
+                    admin_bearer
                         .as_deref()
-                        .is_some_and(|h| AuthMiddleware::constant_time_eq(h, t))
+                        .map(|b| AuthMiddleware::constant_time_eq(b, t))
+                        .unwrap_or(false),
+                );
+                let header_match = u8::from(
+                    admin_header_token
+                        .as_deref()
+                        .map(|h| AuthMiddleware::constant_time_eq(h, t))
+                        .unwrap_or(false),
+                );
+                std::hint::black_box(bearer_match | header_match) != 0
             }
             None => false,
         };
@@ -517,6 +440,7 @@ pub(crate) async fn auth_middleware(
 #[allow(deprecated)] // allow deprecated field access in tests
 mod tests {
     use super::*;
+    use axum::http::header::CONTENT_TYPE;
 
     /// Assert a string is canonical UUID-v4 shaped: five dash-separated lowercase-hex groups of
     /// lengths 8-4-4-4-12, with the version nibble == '4' and the variant nibble in {8,9,a,b}.
@@ -548,10 +472,15 @@ mod tests {
     #[test]
     fn test_synth_amzn_request_id_is_uuid_v4() {
         // Regression for the flat-32-hex-no-dashes format: a Bedrock x-amzn-RequestId must be a
-        // CSPRNG UUID-v4, matching real AWS and the route.rs twin. Two consecutive ids must differ
+        // CSPRNG UUID-v4, matching real AWS. The auth path now mints this id through the CANONICAL
+        // `crate::proto::synth_amzn_request_id` (via `forward::ingress_error` →
+        // `attach_bedrock_error_headers`), not a private copy — assert the canonical fn's shape so the
+        // bedrock auth-failure header contract stays covered. Two consecutive ids must differ
         // (entropy-sourced, not a predictable timestamp||counter).
-        let a = synth_amzn_request_id().expect("entropy must be available under test");
-        let b = synth_amzn_request_id().expect("entropy must be available under test");
+        let a =
+            crate::proto::synth_amzn_request_id().expect("entropy must be available under test");
+        let b =
+            crate::proto::synth_amzn_request_id().expect("entropy must be available under test");
         assert_uuid_v4_shaped(&a);
         assert_uuid_v4_shaped(&b);
         assert_ne!(a, b, "consecutive synthetic request ids must differ");
@@ -1715,6 +1644,83 @@ mod tests {
 
         handle.abort();
         server.shutdown().await;
+    }
+
+    /// Regression for the admin-token carrier-level timing oracle (MEDIUM/security): the two admin
+    /// carriers (Authorization: Bearer and x-admin-token) are combined with a bitwise-OR fold, NOT a
+    /// short-circuiting `||`. Behaviorally this means EITHER carrier alone authorizes, AND a request
+    /// presenting BOTH carriers is authorized whenever EITHER matches — regardless of which one. We
+    /// drive it through the real router so the inline fold in `auth_middleware` is exercised:
+    ///   - correct Bearer + wrong x-admin-token  → authorized (header compare ran, didn't veto)
+    ///   - wrong Bearer  + correct x-admin-token  → authorized (Bearer miss didn't short-circuit away
+    ///                                               the header compare)
+    ///   - wrong + wrong                          → 401
+    #[tokio::test]
+    async fn test_admin_token_both_carriers_or_fold_no_short_circuit() {
+        use crate::governance::{GovState, SqliteStore};
+        use crate::test_support::TestApp;
+        use std::sync::Arc;
+
+        crate::metrics::init();
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/admin/keys");
+
+        // Correct Bearer + WRONG x-admin-token → authorized (the header compare must not veto a
+        // matching Bearer; the fold is OR, not AND).
+        let r = client
+            .get(&url)
+            .bearer_auth("admintok")
+            .header("x-admin-token", "wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r.status().as_u16(),
+            401,
+            "correct Bearer + wrong x-admin-token must authorize (OR fold), got {}",
+            r.status()
+        );
+
+        // WRONG Bearer + correct x-admin-token → authorized. This is the short-circuit regression: a
+        // `||` would have stopped after the Bearer miss only if the header were checked next, but the
+        // real risk is the inverse ordering — assert the header compare is reached and admits.
+        let r = client
+            .get(&url)
+            .bearer_auth("wrong")
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r.status().as_u16(),
+            401,
+            "wrong Bearer + correct x-admin-token must authorize (header compare must run), got {}",
+            r.status()
+        );
+
+        // Both wrong → 401.
+        let r = client
+            .get(&url)
+            .bearer_auth("wrong")
+            .header("x-admin-token", "also-wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            401,
+            "both carriers wrong must be rejected"
+        );
+
+        handle.abort();
     }
 
     /// End-to-end through the real router + `auth_middleware` in GOVERNANCE mode, exercising the

@@ -390,11 +390,16 @@ impl ProtocolReader for CohereReader {
             }
         }
 
+        // Narrow with `u32::try_from` (NOT a bare `as u32`): a `max_tokens` above `u32::MAX`
+        // silently wraps under `as` to a small nonsense cap that is then forwarded to Cohere,
+        // diverging from a direct Cohere call. `try_from` drops an out-of-range value to `None`
+        // instead, matching the hardened Gemini reader (gemini.rs). The `v > 0` filter still
+        // rejects zero/negative caps first.
         let max_tokens = obj
             .get("max_tokens")
             .and_then(|v| v.as_i64())
             .filter(|&v| v > 0)
-            .map(|v| v as u32);
+            .and_then(|v| u32::try_from(v).ok());
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -2865,6 +2870,84 @@ mod tests {
         assert_eq!(
             tool_msg.get("tool_call_id").and_then(|v| v.as_str()),
             Some("call_1")
+        );
+    }
+
+    /// Regression (MEDIUM/correctness): `max_tokens` must be narrowed with `u32::try_from`, NOT a
+    /// bare `as u32`. A value above `u32::MAX` previously wrapped to a small nonsense cap and was
+    /// forwarded to Cohere; it must now drop to `None` (no cap) rather than a truncated wrap. A
+    /// valid in-range value still parses, and a zero/negative value is still rejected.
+    #[test]
+    fn test_read_request_max_tokens_out_of_range_drops_to_none() {
+        let reader = CohereReader;
+
+        // u32::MAX + 1 must NOT wrap to 0 (or any truncated value): it drops to None.
+        let over = serde_json::json!({
+            "model": "command",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": (u32::MAX as i64) + 1
+        });
+        let ir = reader
+            .read_request(&over)
+            .expect("read_request should succeed");
+        assert_eq!(
+            ir.max_tokens, None,
+            "an out-of-range max_tokens must drop to None, not wrap under `as u32`"
+        );
+
+        // A far-larger value likewise drops rather than truncating into the valid u32 range.
+        let huge = serde_json::json!({
+            "model": "command",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": i64::MAX
+        });
+        let ir = reader
+            .read_request(&huge)
+            .expect("read_request should succeed");
+        assert_eq!(ir.max_tokens, None);
+
+        // The exact u32::MAX boundary is in range and preserved.
+        let max_in_range = serde_json::json!({
+            "model": "command",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": u32::MAX as i64
+        });
+        let ir = reader
+            .read_request(&max_in_range)
+            .expect("read_request should succeed");
+        assert_eq!(ir.max_tokens, Some(u32::MAX));
+
+        // A normal value still parses through unchanged.
+        let normal = serde_json::json!({
+            "model": "command",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1024
+        });
+        let ir = reader
+            .read_request(&normal)
+            .expect("read_request should succeed");
+        assert_eq!(ir.max_tokens, Some(1024));
+
+        // Zero/negative are still rejected by the `v > 0` filter (unchanged behavior).
+        let zero = serde_json::json!({
+            "model": "command",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 0
+        });
+        assert_eq!(
+            reader.read_request(&zero).expect("ok").max_tokens,
+            None,
+            "zero max_tokens is rejected"
+        );
+        let neg = serde_json::json!({
+            "model": "command",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": -5
+        });
+        assert_eq!(
+            reader.read_request(&neg).expect("ok").max_tokens,
+            None,
+            "negative max_tokens is rejected"
         );
     }
 
