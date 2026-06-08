@@ -38,7 +38,8 @@ pub(crate) fn synth_amzn_request_id() -> Option<String> {
     // RFC 4122 v4 layout (version + variant bits) so the value is a well-formed UUID.
     buf[6] = (buf[6] & 0x0f) | 0x40;
     buf[8] = (buf[8] & 0x3f) | 0x80;
-    let s: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    // One allocation for the 32-char lowercase hex string (was 17+ via per-byte `format!`).
+    let s = hex::encode(buf);
     Some(format!(
         "{}-{}-{}-{}-{}",
         &s[0..8],

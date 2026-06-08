@@ -145,27 +145,33 @@ fn shape_cross_protocol_error(
 /// stream intent in the path, not the body. Two keys, handled differently relative to `rewrite_model`
 /// because their correct egress treatment differs:
 ///
-///   - `stream` and the gemini JSON-array key are NEVER native egress body fields for ANY backend:
-///     stream intent is conveyed via the upstream path (`upstream_path_for_stream`), and the array
-///     key only influences RESPONSE framing. They must be stripped on EVERY branch — same- AND
-///     cross-protocol — because the cross-protocol `read_request`/`write_request` rebuild does NOT
-///     reliably drop them (the reader can sweep `stream`/the array key into IR `extra`, which the
-///     egress writer re-emits, leaking a router fingerprint to a foreign backend). `model` is the
-///     genuine egress field on a body-model backend, so it is handled separately.
+///   - The gemini JSON-array key is NEVER a native egress body field for ANY backend (it only
+///     influences RESPONSE framing), so it is stripped UNCONDITIONALLY on every branch and for every
+///     egress.
+///   - `stream` is a body field only for the BODY-MODEL protocols (openai/anthropic/cohere/responses),
+///     where the egress writer authoritatively writes `"stream": <ir.stream>` and the backend reads it
+///     to decide streaming. It is a PATH shim only for the PATH-MODEL egress protocols
+///     (`gemini`/`bedrock`), whose native wire conveys stream intent via the URL/path, never the body.
+///     So `stream` is stripped iff the EGRESS is gemini/bedrock — NOT based on the ingress. The old
+///     ingress-gated strip deleted the writer-authored `"stream": true` on a gemini/bedrock-ingress →
+///     body-model-egress streaming hop, so the backend saw no stream flag, answered non-streaming, and
+///     the client got a wrong (buffered / mis-framed) response. Gating on egress keeps the writer's
+///     authoritative `stream` for body-model backends and still strips it for path-model backends
+///     (where the URL carries the intent and a body `stream` would be a router fingerprint).
 ///   - `model` is stripped ONLY on the same-protocol branch (by [`strip_same_protocol_model_shim`],
 ///     after `rewrite_model`), never cross-protocol: a body-model egress REQUIRES `model` and
 ///     `rewrite_model` installs the authoritative one.
 ///
-/// No-op for body-model ingress (openai etc.), whose `model`/`stream` are GENUINE caller fields — but
-/// the gemini array key is stripped for them too (it is never native to any protocol).
-fn strip_router_shim_keys(v: &mut Value, ingress_protocol: &str) {
+/// The gemini array key is stripped for body-model ingress too (it is never native to any protocol).
+fn strip_router_shim_keys(v: &mut Value, egress_protocol: &str) {
     if let Some(obj) = v.as_object_mut() {
-        // The gemini JSON-array key is never native to ANY protocol → strip on every ingress (also
+        // The gemini JSON-array key is never native to ANY protocol → strip unconditionally (also
         // closes the leak where a body-model client smuggles the key in its own controlled body).
         obj.remove(GEMINI_JSON_ARRAY_SHIM_KEY);
-        // `stream` is a path-model shim only for gemini/bedrock; for body-model ingress it is the
-        // caller's genuine field and must be preserved.
-        if matches!(ingress_protocol, "gemini" | "bedrock") {
+        // `stream` is a path-model shim for the EGRESS protocols gemini/bedrock (stream intent rides
+        // the URL there); for body-model egress it is the writer-authored field the backend needs to
+        // start streaming, so it must be PRESERVED. Gate on egress, never ingress.
+        if matches!(egress_protocol, "gemini" | "bedrock") {
             obj.remove("stream");
         }
     }
@@ -197,6 +203,110 @@ fn wants_gemini_json_array(v: &Value) -> bool {
     v.get(GEMINI_JSON_ARRAY_SHIM_KEY)
         .and_then(|b| b.as_bool())
         .unwrap_or(false)
+}
+
+/// The SINGLE source of truth for shaping an ingress request body into the bytes sent to one egress
+/// lane. Both the hot path ([`forward_with_pool`], per failover hop) and the degraded last-resort
+/// path ([`forward_once`], FallbackPool/LeastBad) call THIS function so the two cannot drift apart on
+/// any translation step — historically they did (R8 added `ir.extra.clear()` to the hot path only;
+/// R9 found `forward_once` lacked it, leaking OpenAI `logprobs`/`top_logprobs`/`n` onto an Anthropic
+/// or Gemini backend). Unifying the seam makes that whole class of "one path is missing a step"
+/// regressions structurally impossible: there is now exactly one step list.
+///
+/// `body` is the per-hop parsed request `Value` (the caller owns deriving it fresh from the pristine
+/// body so a failover hop never re-translates a previous hop's egress-shaped body). It is consumed
+/// and the shaped egress bytes are returned. The full step list, in order:
+///   1. CROSS-protocol only (`ingress_protocol != egress`): read_request → `apply_required_max_tokens`
+///      → `ir.extra.clear()` → egress `write_request`. Clearing `extra` at this single seam, before
+///      any writer runs, is what stops every source-protocol-only passthrough key from leaking to a
+///      foreign backend — no individual writer can miss it.
+///   2. Strip the never-native router shim keys (gemini JSON-array key always; `stream` for path-model
+///      EGRESS) on every branch.
+///   3. `rewrite_model` installs the authoritative lane model.
+///   4. SAME-protocol only: strip the body `model` shim (path-model gemini/bedrock carry the model in
+///      the URL; a body `model` there is an indistinguishability leak).
+///   5. Serialize to bytes.
+///
+/// Returns `Err(Response)` — an ingress-native error envelope with the right status — on the only two
+/// shaping failures (unknown ingress protocol, request translation error) and on the effectively
+/// infallible re-serialization, so neither caller can panic on the request path.
+pub(crate) fn translate_request_cross_protocol(
+    app: &Arc<App>,
+    i: usize,
+    ingress_protocol: &str,
+    mut body: Value,
+) -> Result<Vec<u8>, Box<Response>> {
+    let egress_name = app.lanes[i].protocol.name();
+    if ingress_protocol != egress_name {
+        // one cross-protocol translation hop for this request.
+        metrics::counter!(
+            crate::metrics::TRANSLATIONS_TOTAL,
+            "from" => ingress_protocol.to_string(),
+            "to" => egress_name.to_string()
+        )
+        .increment(1);
+        // Cross-protocol: translate the request body through the superset IR.
+        let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) else {
+            return Err(Box::new(ingress_error(
+                ingress_protocol,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "We received an unexpected internal error. Please try again.",
+            )));
+        };
+        match ingress_proto.reader().read_request(&body) {
+            Ok(mut ir) => {
+                apply_required_max_tokens(&mut ir, &app.lanes[i]);
+                // CROSS-PROTOCOL extra-key leak guard (the structural class fix). Every reader sweeps
+                // unmodeled top-level request keys into `ir.extra`; on a SAME-protocol round-trip the
+                // egress writer re-emits them verbatim (lossless passthrough, the intended behavior).
+                // But on a CROSS-protocol hop those keys are source-protocol-only passthrough fields,
+                // and the foreign egress writer would merge them onto the backend body — leaking e.g.
+                // OpenAI `logprobs`/`top_logprobs`/`n` onto an Anthropic or Gemini backend (a §8.2
+                // foreign-format leak and a deterministic proxy tell). Clear `extra` ONCE here, at the
+                // single shared translate seam, BEFORE handing the IR to the egress `write_request`, so
+                // no individual writer can leak them and the fix cannot be missed on any one path.
+                // Same-protocol passthrough never enters this branch, so its `extra` stays intact.
+                ir.extra.clear();
+                body = app.lanes[i].protocol.writer().write_request(&ir);
+            }
+            Err(_) => {
+                return Err(Box::new(ingress_error(
+                    ingress_protocol,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "We could not process the content of your request.",
+                )));
+            }
+        }
+    }
+    // Remove the never-native shim keys (gemini JSON-array key on every protocol; `stream` for
+    // path-model EGRESS) on EVERY branch — same- AND cross-protocol. `model` is handled below,
+    // ordered relative to `rewrite_model`.
+    strip_router_shim_keys(&mut body, egress_name);
+    // `rewrite_model` installs the authoritative lane model. ORDERING (critical): on a cross-protocol
+    // hop to a BODY-MODEL egress (gemini/bedrock → openai/anthropic/cohere/responses) the backend
+    // REQUIRES this `model` body field, so `model` is stripped ONLY on the same-protocol passthrough
+    // (below), where the model rides the URL and a body `model` is an indistinguishability leak.
+    app.lanes[i]
+        .protocol
+        .writer()
+        .rewrite_model(&mut body, &app.lanes[i].model);
+    if ingress_protocol == egress_name {
+        strip_same_protocol_model_shim(&mut body, ingress_protocol);
+    }
+    match serde_json::to_vec(&body) {
+        Ok(p) => Ok(p),
+        // Re-serializing a Value parsed from valid JSON and rewritten only with serde_json values is
+        // effectively infallible; return a shaped 500 rather than panic a worker on the request path
+        // (the layer's no-unwrap/expect rule).
+        Err(_) => Err(Box::new(ingress_error(
+            ingress_protocol,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "We received an unexpected internal error. Please try again.",
+        ))),
+    }
 }
 
 /// Upper bound on a buffered UPSTREAM ERROR body (4xx/5xx envelopes). Any error envelope is far
@@ -378,7 +488,7 @@ fn mid_stream_error_bytes(
 /// Each event is rendered through the SAME `bedrock` writer used on the live streaming path and
 /// encoded via `eventstream::encode_frame`, so the bytes are byte-for-byte what a native stream sends.
 /// Never panics on the request path: a frame whose payload fails to serialize is skipped.
-fn bedrock_response_to_eventstream(ir: &crate::ir::IrResponse) -> Vec<u8> {
+fn bedrock_response_to_eventstream(ir: &crate::ir::IrResponse, elapsed_ms: Option<u64>) -> Vec<u8> {
     use crate::ir::{IrBlock, IrBlockMeta, IrDelta, IrStreamEvent, IrUsage};
     let writer = crate::proto::Protocol::bedrock();
     let writer = writer.writer();
@@ -386,7 +496,22 @@ fn bedrock_response_to_eventstream(ir: &crate::ir::IrResponse) -> Vec<u8> {
     // Render one IR stream event through the bedrock writer and append the encoded frame (if the
     // writer maps it to a native frame; some IR events have no Bedrock analog and yield None).
     let push = |ev: &IrStreamEvent, out: &mut Vec<u8>| {
-        if let Some((event_type, payload)) = writer.write_response_event(ev) {
+        if let Some((event_type, mut payload)) = writer.write_response_event(ev) {
+            // A native ConverseStream `metadata` frame ALWAYS carries a `metrics.latencyMs` (the SDK
+            // surfaces it via `ConverseStreamMetadataEvent::metrics()`); the bedrock writer's
+            // `MessageDelta` arm deliberately omits `metrics`, and the LIVE StreamTranslate path injects
+            // it there (`proto::mod.rs`). On this BUFFERED synthesis path StreamTranslate is bypassed,
+            // so inject it HERE too — otherwise `metrics == None`, which a real endpoint never returns
+            // (a deterministic proxy tell). Use the request's elapsed wall-clock, consistent with the
+            // live path; if timing is unavailable OMIT `metrics` rather than emit a tell-tale `0`.
+            if event_type == "metadata" {
+                if let (Some(ms), Some(obj)) = (elapsed_ms, payload.as_object_mut()) {
+                    obj.insert(
+                        "metrics".to_string(),
+                        serde_json::json!({ "latencyMs": ms }),
+                    );
+                }
+            }
             if let Ok(bytes) = serde_json::to_vec(&payload) {
                 out.extend_from_slice(&crate::eventstream::encode_frame(&event_type, &bytes));
             }
@@ -513,11 +638,21 @@ impl UsageTap {
     pub(crate) fn feed(&mut self, chunk: &Bytes) {
         // Bound per-poll scan time: `feed` runs synchronously inside the stream `poll_next`, so an
         // O(n) brace-scan over a pathological multi-MiB single chunk would block the Tokio worker for
-        // its duration. Real SSE backends send one small event per chunk, and the usage-bearing
-        // frame is always a small terminal event — so skipping the scan for an oversized chunk costs
-        // no accounting accuracy in practice while capping the worst-case poll latency.
-        const MAX_SCAN_BYTES: usize = 64 * 1024;
+        // its duration. Most SSE backends send one small event per chunk, but a buffering reverse
+        // proxy or an aggregating backend can coalesce many events (incl. the terminal usage frame)
+        // into one larger chunk — so the cap is set high enough (512 KiB) to still scan a realistically
+        // coalesced terminal flush rather than silently drop its usage and undercharge the key's
+        // TPM/spend budget. A chunk still larger than this is skipped (the worst-case poll-latency
+        // guard), but now with a `warn!` so the accounting gap is OBSERVABLE in production instead of
+        // invisible — ops can raise the cap or investigate the upstream's chunking if it fires.
+        const MAX_SCAN_BYTES: usize = 512 * 1024;
         if chunk.len() > MAX_SCAN_BYTES {
+            tracing::warn!(
+                chunk_len = chunk.len(),
+                cap = MAX_SCAN_BYTES,
+                "usage tap skipped an oversized stream chunk; if it carried the terminal usage frame, \
+                 this request's tokens are undercounted (TPM/spend may be undercharged)"
+            );
             return;
         }
         let mut pos = 0;
@@ -851,7 +986,20 @@ where
                         return Poll::Ready(Some(Ok(out_bytes)));
                     }
                     // Passthrough (same-protocol): the raw chunk is already in the client's shape.
-                    this.tap.feed(&chunk);
+                    // BUT on a SAME-PROTOCOL bedrock→bedrock passthrough that chunk is binary
+                    // `application/vnd.amazon.eventstream` framing (u32 length prefixes, CRC32s, header
+                    // blocks) — feeding it to the tap's `{`-brace JSON scanner makes stray `{` bytes
+                    // inside CRCs/preludes/payloads mislead it into parsing garbage or a partial object,
+                    // so `extract_usage_*` lands on wrong/zero token counts and terminal-error detection
+                    // over binary frames is non-deterministic. This is the SAME hazard the cross-protocol
+                    // branch above guards by reading `take_tap_json()` instead of the binary bytes; mirror
+                    // that discipline here by NOT scanning the binary chunk. (Token accounting for a
+                    // native bedrock ConverseStream passthrough is best handled off the JSON tap.) Every
+                    // other same-protocol passthrough (the five SSE protocols) IS JSON-bearing text, so
+                    // it still feeds the tap as before.
+                    if !this.ingress_eventstream {
+                        this.tap.feed(&chunk);
+                    }
                     // Gemini same-protocol passthrough WITHOUT `?alt=sse`: the upstream chunk is
                     // gemini SSE (busbar always requests `?alt=sse` upstream); reframe it into the
                     // JSON-array streaming shape the native client expects.
@@ -1302,7 +1450,7 @@ pub(crate) async fn forward_with_pool(
                 ingress_protocol,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("router: bad json: {e}"),
+                &format!("We could not parse the JSON body of your request: {e}"),
             )
         }
     };
@@ -1382,7 +1530,7 @@ pub(crate) async fn forward_with_pool(
                 ingress_protocol,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "overloaded",
-                "router: deadline exceeded",
+                "The request timed out. Please retry shortly.",
             );
         }
 
@@ -1403,7 +1551,7 @@ pub(crate) async fn forward_with_pool(
                         ingress_protocol,
                         StatusCode::SERVICE_UNAVAILABLE,
                         "overloaded",
-                        "router: no usable lane",
+                        "The service is temporarily overloaded. Please retry shortly.",
                     );
                 }
                 // No usable lane — whether the members were tripped before this request
@@ -1436,86 +1584,35 @@ pub(crate) async fn forward_with_pool(
         .increment(1);
         tracing::debug!(pool = %pool_name, lane = %app.lanes[i].model, "upstream attempt");
 
-        // Derive a FRESH per-hop body from the pristine `v`. Each failover hop must translate/rewrite
-        // starting from the original request, never from a previous hop's egress-shaped body.
-        let mut hop_v = v.clone();
         let egress_name = app.lanes[i].protocol.name();
-        if ingress_protocol != egress_name {
-            // one cross-protocol translation hop for this request.
-            metrics::counter!(
-                crate::metrics::TRANSLATIONS_TOTAL,
-                "from" => ingress_protocol.to_string(),
-                "to" => egress_name.to_string()
-            )
-            .increment(1);
-            // Cross-protocol: translate the request body through the superset IR.
-            let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) else {
-                return ingress_error(
-                    ingress_protocol,
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    &format!("router: unknown ingress protocol '{ingress_protocol}'"),
-                );
-            };
-            match ingress_proto.reader().read_request(&hop_v) {
-                Ok(mut ir) => {
-                    apply_required_max_tokens(&mut ir, &app.lanes[i]);
-                    // CROSS-PROTOCOL extra-key leak guard (the structural class fix). Every reader
-                    // sweeps unmodeled top-level request keys into `ir.extra`; on a SAME-protocol
-                    // round-trip the egress writer re-emits them verbatim (lossless passthrough, the
-                    // intended behavior). But on a CROSS-protocol hop those keys are source-protocol-
-                    // only passthrough fields, and the foreign egress writer would merge them onto the
-                    // backend body — leaking e.g. OpenAI `logprobs`/`top_logprobs`/`n` onto an
-                    // Anthropic or Gemini backend (a §8.2 foreign-format leak and a deterministic proxy
-                    // tell). Clear `extra` ONCE here, at the single translate seam, BEFORE handing the
-                    // IR to the egress `write_request`, so no individual writer can leak them and the
-                    // fix cannot be missed on any one writer. Same-protocol passthrough never enters
-                    // this branch (`ingress_protocol == egress_name`), so its `extra` stays intact.
-                    ir.extra.clear();
-                    hop_v = app.lanes[i].protocol.writer().write_request(&ir);
-                }
-                Err(_) => {
-                    return ingress_error(
-                        ingress_protocol,
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request_error",
-                        "router: request translation failed",
-                    );
-                }
-            }
-        }
-        // Remove the never-native shim keys (gemini JSON-array key on every protocol; `stream` for
-        // path-model gemini/bedrock ingress) on EVERY branch — same- AND cross-protocol — because the
-        // cross-protocol rebuild does not reliably drop them (they can ride IR `extra` to the egress
-        // writer). `model` is handled below, ordered relative to `rewrite_model`.
-        strip_router_shim_keys(&mut hop_v, ingress_protocol);
-        // `rewrite_model` installs the authoritative lane model. ORDERING (critical): on a
-        // cross-protocol hop to a BODY-MODEL egress (gemini/bedrock → openai/anthropic/cohere/
-        // responses) the backend REQUIRES this `model` body field; the previous code stripped `model`
-        // UNCONDITIONALLY *after* this rewrite, deleting it and making the backend 400 — the headline
-        // cross-protocol break this fixes. So `model` is now stripped ONLY on the same-protocol
-        // passthrough (below), where the model rides the URL and a body `model` is an indistinguishability
-        // leak; the cross-protocol body keeps the model the rewrite installed.
-        app.lanes[i]
-            .protocol
-            .writer()
-            .rewrite_model(&mut hop_v, &app.lanes[i].model);
-        if ingress_protocol == egress_name {
-            strip_same_protocol_model_shim(&mut hop_v, ingress_protocol);
-        }
-        let payload = match serde_json::to_vec(&hop_v) {
-            Ok(p) => p,
-            // Re-serializing a Value that was parsed from valid JSON and only rewritten with
-            // serde_json values is effectively infallible; return a shaped 500 rather than panic a
-            // worker on the request path (the layer's no-unwrap/expect rule).
+        // Derive a FRESH per-hop body for translation. Each failover hop must translate/rewrite
+        // starting from the ORIGINAL request, never from a previous hop's egress-shaped body. Re-PARSE
+        // from the pristine `Bytes` (Arc-backed, so cheap to retain) rather than deep-cloning the
+        // parsed `Value` tree per hop: a single JSON parse is far cheaper in time and peak heap than
+        // an O(n) `Value::clone` of a large request (long histories / base64 images / big tool
+        // schemas), which under sustained failover compounded to O(n × max_cap) allocations.
+        let hop_v: Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            // `body` already parsed once successfully into `v` above; this re-parse is infallible.
             Err(_) => {
                 drop(permit);
                 return ingress_error(
                     ingress_protocol,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "api_error",
-                    "router: failed to serialize request body",
+                    "We received an unexpected internal error. Please try again.",
                 );
+            }
+        };
+        // SINGLE shared cross-protocol request-shaping seam (shared verbatim with `forward_once`'s
+        // degraded path): read→clear-extra→write, shim-key strip, model rewrite, serialize. Both
+        // paths route through `translate_request_cross_protocol` so neither can carry a translation
+        // step the other lacks (the recurring drift class this round's unification ends).
+        let payload = match translate_request_cross_protocol(&app, i, ingress_protocol, hop_v) {
+            Ok(p) => p,
+            Err(resp) => {
+                drop(permit);
+                return *resp;
             }
         };
         let base = &app.lanes[i].base_url;
@@ -1564,6 +1661,9 @@ pub(crate) async fn forward_with_pool(
                 request_ctx.remaining(now()).max(1),
             )); // min 1s timeout
         }
+        // Wall-clock start of the upstream call, for the `metrics.latencyMs` a native bedrock
+        // ConverseStream `metadata` frame carries on the buffered-synthesis path below.
+        let upstream_started = std::time::Instant::now();
         let res = req.send().await;
 
         match res {
@@ -2002,7 +2102,9 @@ pub(crate) async fn forward_with_pool(
                                 // upstream is SSE — a non-SSE upstream to an SSE-stream request still
                                 // returns the translated JSON body, which their SDKs accept.)
                                 if ingress_protocol == "bedrock" && wants_stream {
-                                    let frames = bedrock_response_to_eventstream(&ir);
+                                    let elapsed_ms =
+                                        u64::try_from(upstream_started.elapsed().as_millis()).ok();
+                                    let frames = bedrock_response_to_eventstream(&ir, elapsed_ms);
                                     let rb = Response::builder()
                                         .status(status)
                                         .header(CONTENT_TYPE, "application/vnd.amazon.eventstream");
@@ -2012,6 +2114,22 @@ pub(crate) async fn forward_with_pool(
                                         .unwrap_or_else(|_| status.into_response());
                                 }
                                 let translated = ingress_proto.writer().write_response(&ir);
+                                // Gemini JSON-array streaming (`:streamGenerateContent` WITHOUT
+                                // `?alt=sse`, so `gemini_json_array`) answered by a BUFFERED non-SSE 2xx:
+                                // the native non-`alt=sse` endpoint returns a JSON ARRAY of chunk objects
+                                // (`[{...}]`), so a single bare `{...}` is undecodable by a Gemini SDK
+                                // parsing the body as an array — a functional break and a proxy tell.
+                                // Mirror the bedrock special-case above: wrap the single translated
+                                // object in a one-element array under `application/json`. (Only reached on
+                                // a cross-protocol non-SSE hop; the SSE path uses GeminiJsonArrayFramer.)
+                                if gemini_json_array && wants_stream {
+                                    let arr = Value::Array(vec![translated]);
+                                    return Response::builder()
+                                        .status(status)
+                                        .header(CONTENT_TYPE, "application/json")
+                                        .body(Body::from(arr.to_string()))
+                                        .unwrap_or_else(|_| status.into_response());
+                                }
                                 // Content-Type is the INGRESS JSON CT, not the upstream's — the body
                                 // is now in the client's native non-stream shape (§8.4). A
                                 // bedrock-ingress 2xx also carries `x-amzn-RequestId` (matching a real
@@ -2225,7 +2343,7 @@ fn handle_status_503(
         ingress_protocol,
         StatusCode::SERVICE_UNAVAILABLE,
         "overloaded",
-        &format!("router: all lanes exhausted; retry after {}s", retry_after),
+        "The service is temporarily overloaded. Please retry shortly.",
     );
     if let Ok(v) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
         resp.headers_mut()
@@ -2260,14 +2378,14 @@ async fn forward_once(
     usage_sink: Option<UsageSink>,
 ) -> Result<Response, ()> {
     // Re-parse body for per-lane model rewriting.
-    let mut v: Value = match serde_json::from_slice(body) {
+    let v: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
             return Ok(ingress_error(
                 ingress_protocol,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("router: bad json: {e}"),
+                &format!("We could not parse the JSON body of your request: {e}"),
             ));
         }
     };
@@ -2278,60 +2396,17 @@ async fn forward_once(
     // on `ingress_protocol == "gemini"` so a body-model client cannot smuggle the shim key to force
     // JSON-array reframing of its SSE stream.
     let gemini_json_array = ingress_protocol == "gemini" && wants_gemini_json_array(&v);
-
-    // Cross-protocol translation through the superset IR — same as the main path — so this degraded
-    // route is correct when the chosen lane speaks a different protocol than the caller.
     let egress_name = app.lanes[i].protocol.name();
-    if ingress_protocol != egress_name {
-        let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) else {
-            return Ok(ingress_error(
-                ingress_protocol,
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                &format!("router: unknown ingress protocol '{ingress_protocol}'"),
-            ));
-        };
-        match ingress_proto.reader().read_request(&v) {
-            Ok(mut ir) => {
-                apply_required_max_tokens(&mut ir, &app.lanes[i]);
-                v = app.lanes[i].protocol.writer().write_request(&ir);
-            }
-            Err(_) => {
-                return Ok(ingress_error(
-                    ingress_protocol,
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    "router: request translation failed",
-                ))
-            }
-        }
-    }
 
-    // Shim-key handling, ordered relative to `rewrite_model` exactly as the main `forward_with_pool`
-    // path (see there for the full rationale): strip the never-native shim keys (gemini array key /
-    // `stream`) on every branch; install the authoritative model via `rewrite_model`; then strip the
-    // `model` shim ONLY on the same-protocol branch (stripping `model` cross-protocol would delete the
-    // egress model a body-model backend requires — the cross-protocol break this fixes).
-    strip_router_shim_keys(&mut v, ingress_protocol);
-    app.lanes[i]
-        .protocol
-        .writer()
-        .rewrite_model(&mut v, &app.lanes[i].model);
-    if ingress_protocol == egress_name {
-        strip_same_protocol_model_shim(&mut v, ingress_protocol);
-    }
-    let payload = match serde_json::to_vec(&v) {
+    // Cross-protocol request shaping through the SINGLE shared seam (read→clear-extra→write, shim-key
+    // strip, model rewrite, serialize) — the SAME function the hot `forward_with_pool` path uses, so
+    // this degraded route cannot drift from it. This unification is what fixes the R9 high (this path
+    // previously lacked the `ir.extra.clear()` the hot path had, leaking source-only keys like OpenAI
+    // `logprobs`/`top_logprobs`/`n` to a foreign backend): the clear now lives in the one shared fn,
+    // so neither path can be missing it.
+    let payload = match translate_request_cross_protocol(app, i, ingress_protocol, v) {
         Ok(p) => p,
-        // Effectively infallible (Value parsed from valid JSON); return a shaped 500 rather than
-        // panic a worker on the request path.
-        Err(_) => {
-            return Ok(ingress_error(
-                ingress_protocol,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "api_error",
-                "router: failed to serialize request body",
-            ))
-        }
+        Err(resp) => return Ok(*resp),
     };
     let base = &app.lanes[i].base_url;
 
@@ -2370,6 +2445,9 @@ async fn forward_once(
     if !wants_stream {
         req = req.timeout(std::time::Duration::from_secs(timeout_secs.max(1)));
     }
+    // Wall-clock start of the upstream call, for the `metrics.latencyMs` a native bedrock
+    // ConverseStream `metadata` frame carries on the buffered-synthesis path below.
+    let upstream_started = std::time::Instant::now();
     let res = req.send().await;
 
     match res {
@@ -2467,7 +2545,9 @@ async fn forward_once(
                             // `application/json` Converse body the SDK's stream decoder cannot parse
                             // (mirrors the main forward path; see `bedrock_response_to_eventstream`).
                             if ingress_protocol == "bedrock" && wants_stream {
-                                let frames = bedrock_response_to_eventstream(&ir);
+                                let elapsed_ms =
+                                    u64::try_from(upstream_started.elapsed().as_millis()).ok();
+                                let frames = bedrock_response_to_eventstream(&ir, elapsed_ms);
                                 let rb = Response::builder()
                                     .status(status)
                                     .header(CONTENT_TYPE, "application/vnd.amazon.eventstream");
@@ -2477,6 +2557,17 @@ async fn forward_once(
                                     .unwrap_or_else(|_| status.into_response()));
                             }
                             let translated = ingress_proto.writer().write_response(&ir);
+                            // Gemini JSON-array streaming answered by a buffered non-SSE 2xx: wrap the
+                            // single translated object in a one-element JSON array, matching the native
+                            // non-`alt=sse` `streamGenerateContent` array framing (see the main path).
+                            if gemini_json_array && wants_stream {
+                                let arr = Value::Array(vec![translated]);
+                                return Ok(Response::builder()
+                                    .status(status)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Body::from(arr.to_string()))
+                                    .unwrap_or_else(|_| status.into_response()));
+                            }
                             // Bedrock-ingress 2xx carries `x-amzn-RequestId` (matching a real
                             // Converse response and the error path).
                             let rb = Response::builder()
@@ -2593,7 +2684,7 @@ async fn handle_fallback_pool(
             ingress_protocol,
             StatusCode::SERVICE_UNAVAILABLE,
             "overloaded",
-            "router: deadline exceeded",
+            "The request timed out. Please retry shortly.",
         );
     }
 
@@ -2617,7 +2708,7 @@ async fn handle_fallback_pool(
                 ingress_protocol,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "overloaded",
-                "router: deadline exceeded",
+                "The request timed out. Please retry shortly.",
             );
         }
 
@@ -2900,7 +2991,7 @@ mod bedrock_eventstream_tests {
             system_fingerprint: None,
             stop_sequence: None,
         };
-        let mut bytes = bedrock_response_to_eventstream(&ir);
+        let mut bytes = bedrock_response_to_eventstream(&ir, Some(42));
         assert!(!bytes.is_empty(), "must emit eventstream frames");
 
         // Decode the frames using the same decoder the wire uses.
@@ -2920,6 +3011,79 @@ mod bedrock_eventstream_tests {
         assert_eq!(payload["usage"]["inputTokens"], 11);
         assert_eq!(payload["usage"]["outputTokens"], 7);
         assert_eq!(payload["usage"]["totalTokens"], 18);
+        // HIGH (R9): a real ConverseStream `metadata` event ALWAYS carries `metrics.latencyMs`
+        // (the SDK surfaces it via `ConverseStreamMetadataEvent::metrics()`). The buffered-synthesis
+        // path must inject it too — `None` here would be a deterministic proxy tell. Mirrors the
+        // live StreamTranslate path assertion in proto/mod.rs.
+        assert_eq!(
+            payload["metrics"]["latencyMs"].as_u64(),
+            Some(42),
+            "buffered metadata frame must carry metrics.latencyMs like the live path: {payload}"
+        );
+    }
+
+    /// MEDIUM (R9, forward.rs:429-448): the `IrBlock::ToolUse` arm of `bedrock_response_to_eventstream`
+    /// must synthesize native ConverseStream tool-use framing — a `contentBlockStart` carrying
+    /// `start.toolUse.{toolUseId,name}` and a `contentBlockDelta` carrying `delta.toolUse.input` — so a
+    /// native AWS SDK ConverseStream client receiving a buffered cross-protocol tool-call completion can
+    /// decode it. The happy-path test only exercises a `Text` block; this covers the tool arm.
+    #[test]
+    fn buffered_tool_use_wraps_into_converse_stream_tool_frames() {
+        let ir = IrResponse {
+            role: IrRole::Assistant,
+            content: vec![IrBlock::ToolUse {
+                id: "toolu_abc123".to_string(),
+                name: "get_weather".to_string(),
+                input: serde_json::json!({"city": "Paris"}),
+            }],
+            stop_reason: Some("tool_use".to_string()),
+            usage: IrUsage {
+                input_tokens: 5,
+                output_tokens: 9,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("anthropic.claude-3".to_string()),
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let mut bytes = bedrock_response_to_eventstream(&ir, Some(7));
+        let frames = crate::eventstream::drain_frames(&mut bytes);
+
+        // contentBlockStart must carry the tool identity nested under start.toolUse.
+        let start = frames
+            .iter()
+            .find(|(t, _)| t == "contentBlockStart")
+            .expect("contentBlockStart frame");
+        let start_payload: serde_json::Value =
+            serde_json::from_slice(&start.1).expect("json contentBlockStart");
+        assert_eq!(
+            start_payload["start"]["toolUse"]["toolUseId"], "toolu_abc123",
+            "tool start carries toolUseId: {start_payload}"
+        );
+        assert_eq!(
+            start_payload["start"]["toolUse"]["name"], "get_weather",
+            "tool start carries name: {start_payload}"
+        );
+
+        // contentBlockDelta must carry the serialized tool input under delta.toolUse.input.
+        let delta = frames
+            .iter()
+            .find(|(t, _)| t == "contentBlockDelta")
+            .expect("contentBlockDelta frame");
+        let delta_payload: serde_json::Value =
+            serde_json::from_slice(&delta.1).expect("json contentBlockDelta");
+        let input_str = delta_payload["delta"]["toolUse"]["input"]
+            .as_str()
+            .expect("tool input is a serialized JSON string");
+        let input: serde_json::Value =
+            serde_json::from_str(input_str).expect("input decodes to JSON");
+        assert_eq!(
+            input["city"], "Paris",
+            "tool input round-trips through the delta: {delta_payload}"
+        );
     }
 }
 
@@ -3185,9 +3349,10 @@ mod mid_stream_error_tests {
     }
 
     /// `strip_router_shim_keys` removes the NEVER-NATIVE shim keys on every branch: the gemini
-    /// JSON-array key for ALL protocols, and `stream` for path-model gemini/bedrock ingress. It does
-    /// NOT remove `model` (that is `strip_same_protocol_model_shim`'s job, on the same-protocol branch
-    /// only) so a cross-protocol hop keeps the authoritative model `rewrite_model` installs.
+    /// JSON-array key for ALL egress, and `stream` for path-model gemini/bedrock EGRESS (R9 HIGH: gated
+    /// on egress, not ingress, so the writer-authored `stream` survives for a body-model backend). It
+    /// does NOT remove `model` (that is `strip_same_protocol_model_shim`'s job, on the same-protocol
+    /// branch only) so a cross-protocol hop keeps the authoritative model `rewrite_model` installs.
     #[test]
     fn test_strip_router_shim_keys() {
         let mut v =
@@ -3246,15 +3411,18 @@ mod mid_stream_error_tests {
     /// the authoritative egress `model`. The bug: `rewrite_model` ran, then an UNCONDITIONAL strip
     /// removed `model`, so the cross-protocol body hit the backend with no `model` (a guaranteed 400).
     /// This exercises the exact strip→rewrite ordering on a value, asserting the cross-protocol body
-    /// keeps `model` while `stream`/the array key are gone, and the same-protocol body drops `model`.
+    /// keeps `model` and (R9 HIGH) keeps the writer-authored `stream` for a BODY-MODEL egress, while
+    /// the array key is gone; and the same-protocol path drops `model` and (path-model egress) `stream`.
     #[test]
     fn test_shim_strip_ordering_cross_protocol_keeps_model() {
-        // Cross-protocol gemini→openai: strip (never-native keys) → rewrite_model installs the lane
-        // model → NO same-protocol model strip. Body must carry the egress model.
+        // Cross-protocol gemini→openai: strip (never-native keys, gated on EGRESS) → rewrite_model
+        // installs the lane model → NO same-protocol model strip. Body must carry the egress model AND
+        // keep the writer-authored `stream` (R9 HIGH: openai is a body-model egress, so the backend
+        // reads `stream` from the body — stripping it made it answer non-streaming).
         let mut v = json!({"model": "router-placeholder", "stream": true, GEMINI_JSON_ARRAY_SHIM_KEY: true});
         let ingress = "gemini";
         let egress = "openai";
-        strip_router_shim_keys(&mut v, ingress);
+        strip_router_shim_keys(&mut v, egress);
         crate::proto::Protocol::openai()
             .writer()
             .rewrite_model(&mut v, "gpt-4o");
@@ -3265,9 +3433,9 @@ mod mid_stream_error_tests {
             v["model"], "gpt-4o",
             "cross-protocol egress body MUST carry the authoritative model (the critical fix)"
         );
-        assert!(
-            v.get("stream").is_none(),
-            "shim stream stripped cross-protocol"
+        assert_eq!(
+            v["stream"], true,
+            "R9 HIGH: writer-authored `stream` MUST survive for a body-model egress (gated on egress)"
         );
         assert!(
             v.get(GEMINI_JSON_ARRAY_SHIM_KEY).is_none(),
@@ -3276,10 +3444,11 @@ mod mid_stream_error_tests {
 
         // Same-protocol gemini→gemini: model rides the URL, so the body must NOT carry `model` even
         // though the gemini writer's rewrite_model re-inserts one — the same-protocol strip runs after.
+        // `stream` IS stripped here because the EGRESS is gemini (path-model: stream rides the URL).
         let mut v = json!({"model": "router-placeholder", "stream": true, "contents": []});
         let ingress = "gemini";
         let egress = "gemini";
-        strip_router_shim_keys(&mut v, ingress);
+        strip_router_shim_keys(&mut v, egress);
         crate::proto::Protocol::gemini()
             .writer()
             .rewrite_model(&mut v, "gemini-1.5-pro");
@@ -3292,7 +3461,7 @@ mod mid_stream_error_tests {
         );
         assert!(
             v.get("stream").is_none(),
-            "shim stream stripped same-protocol"
+            "shim stream stripped for path-model (gemini) egress"
         );
     }
 }
@@ -3744,5 +3913,224 @@ mod ingress_indistinguishability_tests {
             v.get("error").is_some(),
             "OpenAI-native error envelope has a top-level error object: {v}"
         );
+    }
+
+    /// HEADLINE R9 (the unification): the DEGRADED `forward_once` path (LeastBad/FallbackPool) must
+    /// NOT leak source-protocol-only passthrough keys onto a foreign backend. Both forward paths now
+    /// route request shaping through the single `translate_request_cross_protocol` seam (which clears
+    /// `ir.extra` before the egress writer), so the clear cannot be missing on one path. This drives
+    /// an OpenAI ingress request carrying `logprobs`/`top_logprobs`/`n` through `forward_once`
+    /// (lane in cooldown → LeastBad) to a mock ANTHROPIC lane and asserts none of those keys appear in
+    /// the egress body the backend actually received.
+    #[tokio::test]
+    async fn test_forward_once_cross_protocol_strips_source_only_extra_keys() {
+        use crate::store::now as store_now;
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // Anthropic-shaped 2xx so the degraded path serves a success (it relays the body verbatim;
+        // we only care about what the backend RECEIVED, captured below).
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "id": "msg_x",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}],
+                "model": "claude-3",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 3, "output_tokens": 2}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let t0 = store_now();
+        // Lane speaks ANTHROPIC; ingress is OpenAI → cross-protocol. Lane in long cooldown so normal
+        // selection finds nothing and LeastBad serves via forward_once (the degraded path).
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "claude-3",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .provider("anthropic")
+                .cooldown_until(t0 + 600)
+                .streak(3)
+                .err(5),
+            )
+            .pool("leastbad", &[(0, 1)])
+            .on_exhausted("leastbad", crate::config::OnExhausted::LeastBad)
+            .build();
+
+        let req_body = serde_json::to_vec(&json!({
+            "model": "leastbad",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "logprobs": true,
+            "top_logprobs": 5,
+            "n": 3
+        }))
+        .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+            "leastbad",
+            None,
+            "openai",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200, "LeastBad serves the 2xx");
+
+        // The egress body the Anthropic backend ACTUALLY received: the OpenAI-only passthrough keys
+        // must be absent (cleared at the shared translate seam), proving the degraded path no longer
+        // diverges from the hot path.
+        let egress = state
+            .get_last_request_body()
+            .expect("backend received a request body");
+        let ev: Value = serde_json::from_slice(&egress).expect("egress body is JSON");
+        let obj = ev.as_object().expect("egress body is an object");
+        assert!(
+            !obj.contains_key("logprobs"),
+            "forward_once must NOT leak OpenAI `logprobs` onto an Anthropic backend: {ev}"
+        );
+        assert!(
+            !obj.contains_key("top_logprobs"),
+            "forward_once must NOT leak OpenAI `top_logprobs`: {ev}"
+        );
+        assert!(
+            !obj.contains_key("n"),
+            "forward_once must NOT leak OpenAI `n`: {ev}"
+        );
+        // Modeled fields still translated across.
+        assert!(obj.contains_key("messages"), "messages translated: {ev}");
+        server.shutdown().await;
+    }
+
+    /// HIGH/conformance (R9, forward.rs error sites): no forward-layer error body returned to a client
+    /// may begin with the wire-visible internal `router:` prefix — a deterministic proxy tell no native
+    /// endpoint emits. The route-layer regression test never reaches the forward layer; this drives the
+    /// most-exercised forward-layer error surfaces (overload 503 via empty-pool exhaustion, and the
+    /// Status503 retry body) for every ingress protocol and asserts the body is free of `router:`.
+    #[tokio::test]
+    async fn test_forward_layer_errors_carry_no_router_prefix() {
+        use http_body_util::BodyExt as _;
+        crate::metrics::init();
+        for ingress in [
+            "openai",
+            "anthropic",
+            "gemini",
+            "cohere",
+            "responses",
+            "bedrock",
+        ] {
+            let app = TestApp::new().build();
+            // Empty candidate pool → "no usable lane" / Status503 overload 503 through the forward
+            // layer (forward_with_pool → handle_exhaustion_for_pool → handle_status_503).
+            let resp = forward_with_pool(
+                app.clone(),
+                vec![],
+                serde_json::to_vec(&json!({"model": "x", "messages": []}))
+                    .unwrap()
+                    .into(),
+                None,
+                "missingpool",
+                None,
+                ingress,
+                None,
+            )
+            .await;
+            let status = resp.status().as_u16();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8_lossy(&bytes);
+            assert!(
+                !body.contains("router:"),
+                "forward-layer error body for ingress {ingress} (status {status}) leaked the \
+                 `router:` tell: {body}"
+            );
+        }
+    }
+
+    /// HIGH/test-coverage (R9, forward.rs:2004 area): a native AWS SDK ConverseStream request answered
+    /// by a buffered (non-SSE) `application/json` 2xx from a CROSS-protocol OpenAI lane must be emitted
+    /// at the HTTP boundary as `application/vnd.amazon.eventstream`, decode into the native frame
+    /// sequence, AND carry a UUID `x-amzn-RequestId`. The existing coverage tests only the synthesis
+    /// fn directly; this asserts the response-builder wiring (CT, frames, amzn id) on a real Response.
+    #[tokio::test]
+    async fn test_bedrock_converse_stream_buffered_cross_protocol_emits_binary_eventstream() {
+        use http_body_util::BodyExt as _;
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // NON-SSE buffered OpenAI 2xx (no SSE) to a cross-protocol bedrock-ingress ConverseStream.
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "id": "chatcmpl-buf",
+                "object": "chat.completion",
+                "created": 1234567890,
+                "model": "glm-4.5",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "glm-4.5",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("pb", &[(0, 1)])
+            .build();
+        // `stream: true` → bedrock ConverseStream intent; cross-protocol to an OpenAI lane that
+        // answers with a buffered (non-SSE) body → bedrock_response_to_eventstream synthesis path.
+        let body = serde_json::to_vec(&json!({
+            "model": "pb",
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+            "stream": true
+        }))
+        .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            body.into(),
+            None,
+            "pb",
+            None,
+            "bedrock",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200);
+        // (a) Content-Type is the native binary eventstream CT.
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/vnd.amazon.eventstream"),
+            "buffered cross-protocol ConverseStream must be the native binary CT, not application/json"
+        );
+        // (c) UUID-v4 x-amzn-RequestId present.
+        let amzn = resp
+            .headers()
+            .get("x-amzn-requestid")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(amzn.len(), 36, "x-amzn-RequestId is a UUID; got {amzn:?}");
+        // (b) body decodes into the native frame sequence.
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let mut buf = bytes.to_vec();
+        let frames = crate::eventstream::drain_frames(&mut buf);
+        let names: Vec<&str> = frames.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(names.first(), Some(&"messageStart"), "frames: {names:?}");
+        assert!(names.contains(&"contentBlockDelta"), "frames: {names:?}");
+        assert!(names.contains(&"messageStop"), "frames: {names:?}");
+        assert!(names.contains(&"metadata"), "frames: {names:?}");
+        server.shutdown().await;
     }
 }

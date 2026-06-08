@@ -108,6 +108,7 @@ ENDPOINTS (once running, listen address from config.yaml `listen`):
     POST /v1/chat/completions              OpenAI-format ingress
     POST /v2/chat                          Cohere-format ingress
     POST /v1/responses                     Responses-API ingress
+    POST /v1/models/<model>:<action>       Gemini-format ingress (stable v1)
     POST /v1beta/models/<model>:<action>   Gemini-format ingress
     POST /model/<modelId>/converse         Bedrock Converse ingress
     POST /model/<modelId>/converse-stream  Bedrock Converse streaming ingress

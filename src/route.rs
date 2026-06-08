@@ -2033,11 +2033,19 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// Round-4 HIGH/conformance: the router-internal `__busbar_gemini_json_array` shim (and `stream`)
+    /// Round-4 HIGH/conformance (UPDATED R9): the router-internal `__busbar_gemini_json_array` shim
     /// must NEVER reach a CROSS-protocol backend. Routes gemini `:streamGenerateContent` (no
-    /// `?alt=sse`) → an OpenAI backend and asserts the upstream-received body carries neither key (the
-    /// bug: the gemini reader swept both into IR `extra` and the egress writer re-emitted the
+    /// `?alt=sse`) → an OpenAI backend and asserts the upstream-received body carries no array shim
+    /// key (the bug: the gemini reader swept it into IR `extra` and the egress writer re-emitted the
     /// router fingerprint onto the foreign backend).
+    ///
+    /// R9 HIGH (forward.rs:1491) correction: the egress `stream` field is NOT a router fingerprint
+    /// for a BODY-MODEL backend — the OpenAI writer AUTHORS `"stream": ir.stream` and the backend
+    /// reads it to decide whether to stream. The client called `:streamGenerateContent`, so it
+    /// genuinely wants streaming; `stream: true` MUST reach the OpenAI backend, otherwise the backend
+    /// answers non-streaming and the gemini client gets a wrong (buffered) response. The shim-key
+    /// strip is now gated on the EGRESS protocol, so `stream` survives for body-model egress and is
+    /// stripped only for path-model (gemini/bedrock) egress where it rides the URL.
     #[tokio::test]
     async fn test_gemini_json_array_shim_not_leaked_cross_protocol() {
         crate::metrics::init();
@@ -2080,9 +2088,13 @@ mod tests {
             upstream_v.get("__busbar_gemini_json_array").is_none(),
             "router shim key must not leak to a foreign backend; got {upstream_v}"
         );
-        assert!(
-            upstream_v.get("stream").is_none(),
-            "router-injected `stream` must not leak to a foreign backend; got {upstream_v}"
+        // R9 HIGH (forward.rs:1491): the writer-authored `stream` MUST reach a body-model (OpenAI)
+        // backend so it actually streams — the client called `:streamGenerateContent`. Stripping it
+        // here was the bug that made the backend answer non-streaming.
+        assert_eq!(
+            upstream_v.get("stream").and_then(|s| s.as_bool()),
+            Some(true),
+            "writer-authored `stream: true` MUST reach the body-model backend so it streams; got {upstream_v}"
         );
         handle.abort();
         server.shutdown().await;
