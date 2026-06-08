@@ -16,6 +16,28 @@ use super::*;
 /// `MAX_TRACKED_TOOL_FRAMES`.
 const MAX_GEMINI_TOOL_FRAMES: usize = 4096;
 
+/// The set of top-level Gemini request keys the reader models into typed `IrRequest` fields (any
+/// OTHER key is swept verbatim into `extra` for round-trip fidelity). This set is a compile-time
+/// constant, so it is built ONCE into a process-global `OnceLock` and shared by every
+/// `read_request` call instead of being re-allocated and re-hashed per request on the ingress hot
+/// path. Every member is a `&'static str`, so the cached set borrows nothing request-scoped.
+fn modeled_request_keys() -> &'static std::collections::HashSet<&'static str> {
+    static MODELED_KEYS: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    MODELED_KEYS.get_or_init(|| {
+        [
+            "contents",
+            "tools",
+            "systemInstruction",
+            "generationConfig",
+            "model",
+            crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY,
+        ]
+        .into_iter()
+        .collect()
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct GeminiReader;
 
@@ -356,17 +378,14 @@ impl ProtocolReader for GeminiReader {
         // swept it into `extra` and every egress writer re-emitted this router fingerprint onto a
         // foreign OpenAI/Anthropic/Cohere/Bedrock backend. Both the unconditional forward-layer strip
         // and this exclusion now guard that leak (defense in depth).
-        let modeled_keys: std::collections::HashSet<&str> = [
-            "contents",
-            "tools",
-            "systemInstruction",
-            "generationConfig",
-            "model",
-            crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY,
-        ]
-        .iter()
-        .cloned()
-        .collect();
+        //
+        // The set is a compile-time constant, so it is built ONCE into a process-global `OnceLock`
+        // rather than re-allocated and re-hashed on every ingress `read_request` (it was previously
+        // rebuilt per request — heap churn + hashing on the hot path under load). All members are
+        // `&'static str` (`GEMINI_JSON_ARRAY_SHIM_KEY` is a `&'static str` const), so the cached set
+        // borrows nothing request-scoped and is cache-hot after first call. Mirrors the lazy-static
+        // pattern used elsewhere for per-request constant lookups.
+        let modeled_keys = modeled_request_keys();
 
         // model is modeled but we preserve it in extra for round-trip identity. Done once here;
         // the loop skips it because `model` is in `modeled_keys`.
@@ -1314,19 +1333,29 @@ impl ProtocolWriter for GeminiWriter {
         // it (mirroring the stream final-chunk frame), closing a concrete token-accounting gap and a
         // distinguishability tell. `saturating_add` avoids an overflow panic on the request path.
         //
-        // We gate emission on the SAME cross-protocol boundary signal the `responseId` synthesis
-        // below keys on (`resp.created.is_some()` — Gemini bodies carry no `created`, so a populated
-        // `created` means a non-Gemini backend reader set it, i.e. we crossed a protocol boundary).
-        // This keeps a SAME-protocol read→write idempotent: a native Gemini body that carried only
-        // the component counts (no `totalTokenCount`, no `created`) round-trips byte-identically, so
-        // we never inject a field the upstream omitted. (`write_response` itself only ever runs on
-        // cross-protocol egress in production — same-protocol passthrough is byte-exact and bypasses
-        // the writer — but the gating preserves the in-IR read→write identity invariant too.)
+        // We gate emission on a cross-protocol BOUNDARY signal: `resp.created.is_some()` OR
+        // `resp.model.is_some()`. Gemini bodies carry no `created`, so a populated `created` means a
+        // non-Gemini backend reader set it (the OpenAI reader does) — but the Anthropic, Bedrock, and
+        // Cohere readers all return `created: None`, so `created` ALONE missed three of the five
+        // foreign backends, dropping `totalTokenCount` for a Gemini client routed to them (the
+        // google-genai SDK then read `usage_metadata.total_token_count` as None, breaking billing).
+        // The Anthropic and Cohere readers DO populate `model` from the upstream body (a real
+        // Anthropic `Message` / Cohere response always names its model), so OR-ing `model.is_some()`
+        // closes the gap for those two as well. (Bedrock's Converse body carries no body-level model
+        // or timestamp, so its IR is identity-field-empty here — that residual cannot be distinguished
+        // from a minimal native body without crossing into a non-owned reader.)
+        //
+        // This still keeps a SAME-protocol read→write idempotent on the in-IR identity invariant that
+        // `src/proto/mod.rs::test_gemini_read_write_response_roundtrip` guards: that fixture is a
+        // native Gemini body with neither `modelVersion` nor a timestamp, so `model`/`created` are
+        // BOTH `None` and no `totalTokenCount` is injected — the round-trip stays byte-identical.
+        // (`write_response` only ever runs on cross-protocol egress in production — same-protocol
+        // passthrough is byte-exact and bypasses the writer — so this gate is conservative there.)
         let mut usage_metadata = serde_json::json!({
             "promptTokenCount": resp.usage.input_tokens,
             "candidatesTokenCount": resp.usage.output_tokens
         });
-        if resp.created.is_some() {
+        if resp.created.is_some() || resp.model.is_some() {
             let total = resp
                 .usage
                 .input_tokens
@@ -2629,6 +2658,140 @@ mod tests {
             wire.pointer("/usageMetadata/totalTokenCount"),
             Some(&serde_json::json!(u64::MAX)),
             "totalTokenCount must saturate, not wrap/panic: {wire}"
+        );
+    }
+
+    // --- Round 9 fix (conformance): totalTokenCount also emits when the boundary signal is `model`
+    //     (not just `created`), so Anthropic/Cohere backends — whose readers return `created: None`
+    //     but DO populate `model` — no longer drop the total for a Gemini client. ---
+
+    /// Regression (R9): a cross-protocol response from a backend whose reader sets `created: None`
+    /// but `model: Some(..)` (the Anthropic and Cohere shape) MUST still carry
+    /// `usageMetadata.totalTokenCount`. Before R9 the gate keyed on `created` alone, so these three-
+    /// of-five backends produced a usageMetadata block lacking the total, leaving the google-genai
+    /// SDK's `total_token_count` at None and breaking client-side billing.
+    #[test]
+    fn test_write_response_includes_total_token_count_when_only_model_present() {
+        let writer = GeminiWriter;
+        let ir = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 11,
+                output_tokens: 4,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            // Anthropic/Cohere cross-protocol shape: model survives, created/id are None.
+            model: Some("claude-opus-4-8".to_string()),
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let wire = writer.write_response(&ir);
+        assert_eq!(
+            wire.pointer("/usageMetadata/totalTokenCount"),
+            Some(&serde_json::json!(15)),
+            "model-only cross-protocol boundary must still carry totalTokenCount: {wire}"
+        );
+        assert_eq!(
+            wire.pointer("/usageMetadata/promptTokenCount"),
+            Some(&serde_json::json!(11))
+        );
+        assert_eq!(
+            wire.pointer("/usageMetadata/candidatesTokenCount"),
+            Some(&serde_json::json!(4))
+        );
+    }
+
+    /// The model-only cross-protocol total saturates (never overflow-panics) on pathological counts,
+    /// guarding the `saturating_add` on this newly-reachable branch of the request path.
+    #[test]
+    fn test_write_response_model_only_total_token_count_saturates() {
+        let writer = GeminiWriter;
+        let ir = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: Vec::new(),
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: u64::MAX,
+                output_tokens: 7,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("command-r".to_string()),
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let wire = writer.write_response(&ir);
+        assert_eq!(
+            wire.pointer("/usageMetadata/totalTokenCount"),
+            Some(&serde_json::json!(u64::MAX)),
+            "totalTokenCount must saturate, not wrap/panic: {wire}"
+        );
+    }
+
+    // --- Round 9 fix (performance): modeled_keys is hoisted to a process-global OnceLock. ---
+
+    /// Regression (R9): the modeled-key set is a stable process-global — repeated calls return the
+    /// SAME backing allocation (proving it is built once, not per request) and the set's membership
+    /// is exactly the modeled top-level keys, so unmodeled keys still flow to `extra`.
+    #[test]
+    fn test_modeled_request_keys_is_stable_singleton() {
+        let a = modeled_request_keys();
+        let b = modeled_request_keys();
+        assert!(
+            std::ptr::eq(a, b),
+            "modeled_request_keys must return the same cached set, not rebuild per call"
+        );
+        for k in [
+            "contents",
+            "tools",
+            "systemInstruction",
+            "generationConfig",
+            "model",
+            crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY,
+        ] {
+            assert!(a.contains(k), "modeled key set must contain {k}");
+        }
+        // An arbitrary caller field is NOT modeled, so the reader sweeps it into `extra`.
+        assert!(!a.contains("toolConfig"), "toolConfig must not be modeled");
+    }
+
+    /// Regression (R9): hoisting the set must not change read behavior — an unmodeled top-level key
+    /// still round-trips through `extra`, and the modeled `model` key is preserved exactly once.
+    #[test]
+    fn test_read_request_unmodeled_key_still_flows_to_extra_after_hoist() {
+        let reader = GeminiReader;
+        let j = serde_json::json!({
+            "model": "gemini-pro",
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}}
+        });
+        let ir = reader
+            .read_request(&j)
+            .expect("read_request should succeed");
+        assert_eq!(
+            ir.extra.get("toolConfig"),
+            Some(&serde_json::json!({"functionCallingConfig": {"mode": "AUTO"}})),
+            "unmodeled toolConfig must be preserved in extra"
+        );
+        assert_eq!(
+            ir.extra.get("model"),
+            Some(&serde_json::json!("gemini-pro")),
+            "modeled `model` is preserved in extra exactly once for round-trip identity"
+        );
+        assert!(
+            !ir.extra.contains_key("contents"),
+            "modeled `contents` must NOT leak into extra"
         );
     }
 

@@ -1541,6 +1541,228 @@ mod tests {
         handle.abort();
     }
 
+    /// Build a router whose ONLY virtual key has `rpm_limit: Some(0)`, so EVERY request is
+    /// rate-limited (429) by `rate_check` before any forwarding (`check_rate` rejects on the first
+    /// request when `requests >= rpm` with `rpm == 0`). Returns the bound address, the serve handle,
+    /// and the secret to present. The 429 mirror of `over_budget_router`: shared by the per-protocol
+    /// `test_rate_limit_429_*_native_envelope` tests below — the rejection fires before resolution, so
+    /// no lane/pool/backend is needed, only a parseable body that carries `model` where the protocol
+    /// expects it. `allowed_pools: vec![]` admits every pool so the ACL never short-circuits the rate
+    /// gate.
+    async fn over_rpm_router() -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        &'static str,
+    ) {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let secret = "sk-vk-rl-multi";
+        store
+            .put_key(&VirtualKey {
+                id: "krlm".to_string(),
+                key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
+                name: "rl-multi".to_string(),
+                allowed_pools: vec![], // all pools
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: Some(0), // 0 ⇒ rate-limited on the first request
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (addr, handle, secret)
+    }
+
+    /// OpenAI ingress (`/v1/chat/completions`): an over-RPM 429 must carry the native OpenAI error
+    /// envelope (`error.type == "rate_limit_error"`) and the `Retry-After` header.
+    #[tokio::test]
+    async fn test_rate_limit_429_openai_native_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) = over_rpm_router().await;
+
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth(secret)
+            .body(json!({"model": "anything", "messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 429, "openai over-RPM → 429");
+        assert_eq!(
+            r.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|h| h.to_str().ok()),
+            Some("application/json"),
+            "429 rejection is application/json",
+        );
+        assert!(
+            r.headers().get(reqwest::header::RETRY_AFTER).is_some(),
+            "openai 429 carries Retry-After"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("rate_limit_error"),
+            "openai 429 carries rate_limit_error error.type; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Responses ingress (`/v1/responses`): an over-RPM 429 must carry the native Responses error
+    /// envelope (`error.type == "rate_limit_error"`).
+    #[tokio::test]
+    async fn test_rate_limit_429_responses_native_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) = over_rpm_router().await;
+
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/responses"))
+            .bearer_auth(secret)
+            .body(json!({"model": "anything", "input": "hi"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 429, "responses over-RPM → 429");
+        assert!(
+            r.headers().get(reqwest::header::RETRY_AFTER).is_some(),
+            "responses 429 carries Retry-After"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("rate_limit_error"),
+            "responses 429 carries rate_limit_error error.type; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Cohere ingress (`/v2/chat`): an over-RPM 429 must carry the native Cohere error envelope —
+    /// a BARE top-level `message` with NO `error`/`type` wrapper.
+    #[tokio::test]
+    async fn test_rate_limit_429_cohere_native_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) = over_rpm_router().await;
+
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}/v2/chat"))
+            .bearer_auth(secret)
+            .body(json!({"model": "anything", "messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 429, "cohere over-RPM → 429");
+        assert!(
+            r.headers().get(reqwest::header::RETRY_AFTER).is_some(),
+            "cohere 429 carries Retry-After"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert!(
+            body.get("message").and_then(|m| m.as_str()).is_some(),
+            "cohere 429 envelope carries a bare top-level message; got {body}"
+        );
+        assert!(
+            body.get("error").is_none() && body.get("type").is_none(),
+            "cohere 429 envelope has NO error/type wrapper (native Cohere shape); got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Gemini ingress (`/v1beta/models/x:generateContent`): an over-RPM 429 must carry the native
+    /// Gemini error envelope — `error.code == 429` and `error.status == "RESOURCE_EXHAUSTED"`.
+    #[tokio::test]
+    async fn test_rate_limit_429_gemini_native_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) = over_rpm_router().await;
+
+        let r = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/v1beta/models/anything:generateContent"
+            ))
+            .bearer_auth(secret)
+            .body(json!({"contents": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 429, "gemini over-RPM → 429");
+        assert!(
+            r.headers().get(reqwest::header::RETRY_AFTER).is_some(),
+            "gemini 429 carries Retry-After"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_u64()),
+            Some(429),
+            "gemini 429 envelope carries error.code == 429; got {body}"
+        );
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("status"))
+                .and_then(|s| s.as_str()),
+            Some("RESOURCE_EXHAUSTED"),
+            "gemini 429 envelope carries error.status == RESOURCE_EXHAUSTED; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Bedrock ingress (`/model/x/converse`): an over-RPM 429 must carry the native AWS JSON-1.1
+    /// error envelope (`__type == "ThrottlingException"`) AND the `x-amzn-errortype` /
+    /// `x-amzn-RequestId` headers a native Bedrock runtime response always carries.
+    #[tokio::test]
+    async fn test_rate_limit_429_bedrock_native_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) = over_rpm_router().await;
+
+        let r = reqwest::Client::new()
+            .post(format!("http://{addr}/model/anything/converse"))
+            .bearer_auth(secret)
+            .body(json!({"messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 429, "bedrock over-RPM → 429");
+        assert!(
+            r.headers().get(reqwest::header::RETRY_AFTER).is_some(),
+            "bedrock 429 carries Retry-After"
+        );
+        // Headers: a native Bedrock error always carries x-amzn-RequestId and x-amzn-errortype.
+        let errortype_hdr = r
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        assert_eq!(
+            errortype_hdr.as_deref(),
+            Some("ThrottlingException"),
+            "bedrock 429 carries x-amzn-errortype header matching __type"
+        );
+        assert!(
+            r.headers().get("x-amzn-requestid").is_some(),
+            "bedrock 429 carries an x-amzn-RequestId header"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            body.get("__type").and_then(|t| t.as_str()),
+            Some("ThrottlingException"),
+            "bedrock 429 envelope carries __type == ThrottlingException; got {body}"
+        );
+        handle.abort();
+    }
+
     /// the /admin management API — create→list→usage→delete, admin-token gating, and a minted
     /// secret then authenticating as a working virtual key.
     #[tokio::test]

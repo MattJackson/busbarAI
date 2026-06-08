@@ -5,6 +5,7 @@
 
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Monotonic per-process counter mixed into a synthesized response id so two responses minted
@@ -21,6 +22,39 @@ static COHERE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// stop recording new frames so memory stays bounded. The cap leaves every realistic stream
 /// untouched.
 const MAX_TRACKED_TOOL_FRAMES: usize = 4096;
+
+/// Reserved sentinel recorded in `state.open_tools` the first time a text content block opens on a
+/// Cohere stream. It encodes the otherwise-unrecoverable fact that "a text block has occupied IR
+/// index 0 at some point this stream", which `cohere_tool_ir_index` needs to keep tool blocks off
+/// index 0 EVEN AFTER the text block has closed (`text_block_open` reverts to false on
+/// `content-end`, so that live flag cannot answer the question — see the HIGH finding this fixes).
+///
+/// `usize::MAX` is used because real Cohere v2 streams number content/tool frames with small
+/// sequential indices (0, 1, 2, …); a frame index of `usize::MAX` can never occur in practice, so
+/// the sentinel never collides with a genuine tool frame and is trivially excluded from the
+/// rank computation below. Recording it in the existing `open_tools` set keeps the fix entirely
+/// within this protocol module (the shared `StreamDecodeState` carries no text-high-water field).
+const TEXT_BLOCK_SEEN_SENTINEL: usize = usize::MAX;
+
+/// The request keys this reader models explicitly (and therefore must NOT echo back through
+/// `extra`). Built once per process via `OnceLock` instead of being reconstructed on every
+/// `read_request` call — the rebuild was a pointless per-request allocation on the Cohere ingress
+/// hot path (the MEDIUM/performance finding, shared with the Gemini/Bedrock readers).
+fn cohere_modeled_keys() -> &'static std::collections::HashSet<&'static str> {
+    static MODELED_KEYS: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
+    MODELED_KEYS.get_or_init(|| {
+        [
+            "model",
+            "messages",
+            "tools",
+            "max_tokens",
+            "temperature",
+            "stream",
+        ]
+        .into_iter()
+        .collect()
+    })
+}
 
 /// Format 128 bits as a UUID-shaped (8-4-4-4-12 lowercase hex) token. Real Cohere v2 chat response
 /// ids are bare UUIDs (e.g. `c14c80c3-18eb-4519-9460-6c92edd8cfb4`) with NO literal prefix, so a
@@ -62,17 +96,32 @@ fn synthesize_cohere_id() -> String {
 }
 
 /// Resolve the STABLE IR block index for a Cohere stream tool call identified by its wire
-/// `frame_idx`. Tool blocks follow an open text block (which occupies IR index 0), so the base
-/// offset is 1 when a text block is open and 0 otherwise. The per-tool offset is the rank of
-/// `frame_idx` among every tool frame seen this stream — i.e. the number of recorded frame indices
-/// strictly less than it. `state.open_tools` is populated on tool-call-start and NEVER shrunk for
-/// the stream's lifetime, so this rank is fixed once a tool starts: start, delta(s), and end for a
-/// given tool all resolve to the same IR index even though Cohere closes each tool before opening
-/// the next. (Deriving the index from a set that shrank on end was the defect this replaces — it
-/// collapsed the second and later tools onto the first tool's index.)
+/// `frame_idx`. A text content block always occupies IR index 0, so when one has appeared this
+/// stream the tool base offset is 1, otherwise 0.
+///
+/// The base must be derived from whether a text block was EVER opened, NOT from the live
+/// `text_block_open` flag: native Cohere v2 emits the text content block (content-start/delta/end)
+/// in full BEFORE the first tool-call-start, so by the time tools arrive `content-end` has already
+/// reset `text_block_open` to false. Keying the base on that live flag let the first tool reuse
+/// index 0 — the same index the now-closed text block consumed — emitting two BlockStart frames at
+/// index 0 (the HIGH finding). We therefore key the base on the `TEXT_BLOCK_SEEN_SENTINEL` recorded
+/// in `open_tools` when the text block first opened, which persists for the whole stream.
+///
+/// The per-tool offset is the rank of `frame_idx` among every tool frame seen this stream — i.e.
+/// the number of recorded REAL frame indices strictly less than it (the sentinel is excluded, both
+/// by the `< frame_idx` comparison since it is `usize::MAX` and explicitly for clarity).
+/// `state.open_tools` is populated on tool-call-start and NEVER shrunk for the stream's lifetime, so
+/// this rank is fixed once a tool starts: start, delta(s), and end for a given tool all resolve to
+/// the same IR index even though Cohere closes each tool before opening the next. (Deriving the
+/// index from a set that shrank on end was an earlier defect — it collapsed the second and later
+/// tools onto the first tool's index.)
 fn cohere_tool_ir_index(state: &crate::ir::StreamDecodeState, frame_idx: usize) -> usize {
-    let base = if state.text_block_open { 1 } else { 0 };
-    let rank = state.open_tools.iter().filter(|&&i| i < frame_idx).count();
+    let base = usize::from(state.open_tools.contains(&TEXT_BLOCK_SEEN_SENTINEL));
+    let rank = state
+        .open_tools
+        .iter()
+        .filter(|&&i| i != TEXT_BLOCK_SEEN_SENTINEL && i < frame_idx)
+        .count();
     base + rank
 }
 
@@ -403,19 +452,12 @@ impl ProtocolReader for CohereReader {
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        let modeled_keys: std::collections::HashSet<&str> = [
-            "model",
-            "messages",
-            "tools",
-            "max_tokens",
-            "temperature",
-            "stream",
-        ]
-        .iter()
-        .cloned()
-        .collect();
+        // Built once per process and reused across every request rather than rebuilt on each
+        // read_request call (the per-request allocation/hashing was wasted work on the ingress hot
+        // path — same fix the Gemini/Bedrock readers want). The set is immutable, so a OnceLock is
+        // safe to share across threads.
         for (key, value) in obj.iter() {
-            if !modeled_keys.contains(key.as_str()) {
+            if !cohere_modeled_keys().contains(key.as_str()) {
                 extra.insert(key.clone(), value.clone());
             }
         }
@@ -477,6 +519,10 @@ impl ProtocolReader for CohereReader {
                 let idx = data.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                 if !state.text_block_open {
                     state.text_block_open = true;
+                    // Permanently record that a text block has occupied IR index 0 this stream so a
+                    // later tool block does not reuse index 0 after content-end clears the live
+                    // flag (see cohere_tool_ir_index / TEXT_BLOCK_SEEN_SENTINEL).
+                    state.open_tools.insert(TEXT_BLOCK_SEEN_SENTINEL);
                     out.push(IrStreamEvent::BlockStart {
                         index: idx,
                         block: crate::ir::IrBlockMeta::Text,
@@ -487,6 +533,9 @@ impl ProtocolReader for CohereReader {
                 let idx = data.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                 if !state.text_block_open {
                     state.text_block_open = true;
+                    // See content-start: record the text block's claim on IR index 0 for the whole
+                    // stream so a subsequent tool block never collides with it.
+                    state.open_tools.insert(TEXT_BLOCK_SEEN_SENTINEL);
                     out.push(IrStreamEvent::BlockStart {
                         index: idx,
                         block: crate::ir::IrBlockMeta::Text,
@@ -2638,6 +2687,106 @@ mod tests {
             "second tool gets the next distinct index after the first"
         );
         assert_ne!(idx1, idx2);
+    }
+
+    /// Regression (HIGH/correctness): a text content block that has CLOSED before the first
+    /// tool-call-start must still reserve IR index 0 — the tool block must NOT reuse index 0. Native
+    /// Cohere v2 emits the full text block (content-start/delta/end) before any tool call, so by the
+    /// time the tool arrives `text_block_open` is already false; keying the tool base offset on that
+    /// live flag previously collapsed the first tool back onto index 0, emitting two BlockStart
+    /// frames at index 0 on a normal text-then-tool turn. The base must instead reflect that a text
+    /// block was EVER opened this stream.
+    #[test]
+    fn test_stream_tool_after_closed_text_block_does_not_reuse_index_zero() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = CohereReader;
+
+        // Text block: start at index 0 ...
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "content-start", "index": 0, "delta": {"message": {"content": {"type": "text", "text": ""}}}}),
+            &mut state,
+        );
+        assert!(matches!(
+            &evs[0],
+            crate::ir::IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::Text
+            }
+        ));
+
+        // ... and CLOSE it before any tool arrives (the trigger for the defect).
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "content-end", "index": 0}),
+            &mut state,
+        );
+        assert!(matches!(
+            &evs[0],
+            crate::ir::IrStreamEvent::BlockStop { index: 0 }
+        ));
+        assert!(
+            !state.text_block_open,
+            "content-end must clear the live text_block_open flag"
+        );
+
+        // Now the first tool starts. It must land at IR index 1, NOT reuse the closed text block's 0.
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "tool-call-start",
+                "index": 0,
+                "delta": {"message": {"tool_calls": {"id": "call_a", "type": "function", "function": {"name": "f", "arguments": ""}}}}
+            }),
+            &mut state,
+        );
+        let tool_idx = match &evs[0] {
+            crate::ir::IrStreamEvent::BlockStart {
+                index,
+                block: crate::ir::IrBlockMeta::ToolUse { .. },
+            } => *index,
+            other => panic!("expected BlockStart ToolUse, got {other:?}"),
+        };
+        assert_eq!(
+            tool_idx, 1,
+            "a tool following a CLOSED text block must not reuse the text block's IR index 0"
+        );
+
+        // The tool's delta and end resolve to the same index 1, never back to 0.
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "tool-call-end", "index": 0}),
+            &mut state,
+        );
+        assert!(matches!(
+            &evs[0],
+            crate::ir::IrStreamEvent::BlockStop { index: 1 }
+        ));
+    }
+
+    /// Regression (MEDIUM/performance): the modeled-key set is built once and shared, and still
+    /// contains exactly the keys this reader models — so request fields like those stay out of
+    /// `extra` while unknown keys are preserved. Calling it twice returns the same backing set.
+    #[test]
+    fn test_modeled_keys_built_once_and_complete() {
+        let a = cohere_modeled_keys();
+        let b = cohere_modeled_keys();
+        assert!(
+            std::ptr::eq(a, b),
+            "modeled-key set must be a shared singleton"
+        );
+        for k in [
+            "model",
+            "messages",
+            "tools",
+            "max_tokens",
+            "temperature",
+            "stream",
+        ] {
+            assert!(a.contains(k), "{k} must be a modeled key");
+        }
+        // An unknown key is NOT modeled (so it round-trips through `extra`).
+        assert!(!a.contains("unknown_passthrough_key"));
     }
 
     /// Regression (MEDIUM/conformance): a cross-protocol stream delivering tool calls to a

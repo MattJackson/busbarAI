@@ -5,7 +5,7 @@
 [![CI](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/MattJackson/busbarAI?include_prereleases)](https://github.com/MattJackson/busbarAI/releases)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
-![Binary](https://img.shields.io/badge/binary-7.4MB%20static-success)
+![Binary](https://img.shields.io/badge/binary-7.4MB-success)
 ![Cold start](https://img.shields.io/badge/cold%20start-%3C15ms-success)
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 
@@ -24,7 +24,7 @@ Your code already speaks OpenAI (or Anthropic, or Gemini). Change the base URL t
 
 That request left as OpenAI, may have been *served* by Anthropic, and came back as OpenAI — translated losslessly both ways. If Anthropic had returned a 429 mid-flight, Busbar would have rerouted to another pool member before your client saw a byte. One vendor's bad day stops being your outage.
 
-It's **one static 7.4 MB binary** — no Python sidecar, no runtime, no interpreter, no dependency tree, no GC pauses in your request path. It binds and starts serving in **under 15 ms**. Download it, point two YAML files at it, run it.
+It's **one ~7.4 MB native binary** — no Python sidecar, no runtime, no interpreter, no dependency tree, no GC pauses in your request path. It binds and starts serving in **under 15 ms**. Download it, point two YAML files at it, run it.
 
 > The name is from electrical distribution: a busbar takes one feed and fans it out across many breakered circuits — one entry point, weighted distribution, per-circuit protection. That's exactly the shape of this thing.
 
@@ -130,9 +130,9 @@ Busbar's scope is the **protocol count (6)**, not the provider count. Each proto
 | `responses` | `/v1/responses` | bearer | ✅ | ✅ | ✅ | ✅ |
 | `cohere` | `/v2/chat` | bearer | ✅ | ✅ | ✅ | ✅ |
 
-¹ Bedrock **ingress** requires `auth.mode: passthrough` (or `none`). busbar does not verify inbound AWS SigV4 — `src/sigv4.rs` is sign-only, with no inbound verifier — so under `token`/governance mode a native SigV4-signed Bedrock request carries no bearer-style token busbar can match and is rejected `401`. Egress to a Bedrock backend (where busbar signs the request) is unconditional. The ✅ marks for request/response/stream/tools describe ingress behaviour once admitted under `passthrough`/`none`.
+¹ Bedrock **ingress** requires `auth.mode: passthrough` (or `none`). busbar does not verify inbound AWS SigV4 — `src/sigv4.rs` is sign-only, with no inbound verifier — so under `token`/governance mode a native SigV4-signed Bedrock request carries no bearer-style token busbar can match and is rejected `403` (AccessDenied — matching a genuine SigV4 rejection, which is 403, not 401). Egress to a Bedrock backend (where busbar signs the request) is unconditional. The ✅ marks for request/response/stream/tools describe ingress behaviour once admitted under `passthrough`/`none`.
 
-Streaming is first-class for all six: Gemini via `:streamGenerateContent?alt=sse`, Bedrock by decoding the binary `application/vnd.amazon.eventstream` frames and re-framing them as the caller's protocol, the rest via SSE.
+Streaming is first-class for all six: Gemini via `:streamGenerateContent` — either with `?alt=sse` (SSE framing) or without it (native JSON-array framing, which the google-generativeai SDK uses by default) — Bedrock by decoding the binary `application/vnd.amazon.eventstream` frames and re-framing them as the caller's protocol, the rest via SSE.
 
 ## Routing
 
@@ -144,7 +144,7 @@ Streaming is first-class for all six: Gemini via `:streamGenerateContent?alt=sse
 | `POST /v1/responses` | Responses-API ingress; the body's `model` selects the model or pool |
 | `POST /v2/chat` | Cohere ingress; the body's `model` selects the model or pool |
 | `POST /v1{beta}/models/{model}:generateContent` · `:streamGenerateContent` | Gemini ingress; the model (and pool) is taken from the URL path segment. Both the stable `/v1/models/...` and the `/v1beta/models/...` path prefixes are accepted (the google-generativeai / Gen AI SDKs use either) |
-| `POST /model/{modelId}/converse` · `/converse-stream` | Bedrock ingress; the model (and pool) is taken from the URL path. Requires `auth.mode: passthrough` (or `none`) — busbar does not verify inbound SigV4, so a SigV4-signed request is rejected `401` under `token`/governance mode (see footnote ¹ above) |
+| `POST /model/{modelId}/converse` · `/converse-stream` | Bedrock ingress; the model (and pool) is taken from the URL path. Requires `auth.mode: passthrough` (or `none`) — busbar does not verify inbound SigV4, so a SigV4-signed request is rejected `403` (AccessDenied) under `token`/governance mode (see footnote ¹ above) |
 | `GET /stats` · `GET /healthz` · `GET /metrics` | per-lane health (JSON) · liveness · Prometheus |
 | `POST /admin/keys` · `GET /admin/keys` | create / list virtual keys (governance only) |
 | `DELETE /admin/keys/{id}` · `GET /admin/keys/{id}/usage` | revoke a virtual key · per-key usage (governance only) |

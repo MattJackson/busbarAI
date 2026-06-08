@@ -44,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 First release candidate for 1.0. Busbar is feature-complete and API-stable: six wire protocols
 with lossless cross-protocol translation, weighted SWRR pools with per-(pool,lane) circuit breaking
 and in-flight failover, governance (virtual keys / budgets / rate limits), and a security-hardened
-request path — all in one static binary. The remaining work before 1.0.0 is operational validation
+request path — all in one native binary. The remaining work before 1.0.0 is operational validation
 (extended soak/leak testing and a performance/SLO baseline), not features.
 
 ### Changed

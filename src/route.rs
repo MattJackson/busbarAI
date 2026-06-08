@@ -3562,4 +3562,395 @@ mod tests {
         }
         handle.abort();
     }
+
+    // ---- HIGH/test-coverage: governance pool-ACL 403 native envelope on the new ingress routes ----
+    //
+    // `test_governance_vkey_auth_and_pool_acl` (test_support.rs) and
+    // `test_governance_rejection_is_counted_via_finish` (above) only exercise the Anthropic ingress
+    // (`/v1/messages` / `/anypool/v1/messages`). The four first-class ingress routes
+    // (`/v2/chat`, `/v1/responses`, `/v1beta/models/...`, `/model/...`) each call `forward_resolved`
+    // → `governance_guard` with the route's own `proto`, so a pool-ACL 403 on those routes returns a
+    // PROTOCOL-NATIVE 403 envelope. These four tests drive a governance-rejected request through the
+    // REAL router on each route and assert the native 403 shape, so a regression in `ingress_error`
+    // writer dispatch / kind mapping for any of them is caught.
+    //
+    // The governance guard keys the ACL on the resolved MODEL string (the body `"model"` for
+    // body-model routes, the path model for path-model routes) — see `forward_resolved`. So a key
+    // whose `allowed_pools` does NOT contain the request model is pool-rejected with 403 BEFORE
+    // resolution. We still wire a matching lane+pool so the request is otherwise fully valid and the
+    // ONLY reason for the 403 is the ACL.
+
+    /// Build a governance-enabled router whose single virtual key is allowed ONLY on `other-pool`
+    /// (never on the model/pool the tests request), wired with `lane`+`pool` named `model` so the
+    /// request is otherwise valid. Returns `(addr, handle, secret)`.
+    async fn governed_pool_acl_router(
+        model: &str,
+        protocol: crate::proto::Protocol,
+        provider: &str,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        &'static str,
+    ) {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+        // The lane needs a base_url, but the pool-ACL 403 short-circuits before any forward, so an
+        // unreachable upstream is fine.
+        const SECRET: &str = "sk-vk-acl-denied";
+        let store = StdArc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .put_key(&VirtualKey {
+                id: "kacl".to_string(),
+                key_hash: crate::sigv4::sha256_hex(SECRET.as_bytes()),
+                name: "acl".to_string(),
+                // Allowed ONLY on a pool the requests never use → every request is pool-rejected 403.
+                allowed_pools: vec!["other-pool".to_string()],
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        let gov = StdArc::new(GovState::new(store, 1, 0, None).unwrap());
+        let app = TestApp::new()
+            .governance(gov)
+            .lane(LaneSpec::new(model, protocol, "http://127.0.0.1:1").provider(provider))
+            .pool(model, &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+        (addr, handle, SECRET)
+    }
+
+    /// Cohere `/v2/chat` governance pool-ACL 403 must carry the Cohere-native error envelope
+    /// (`{"message": ...}`), served as application/json.
+    #[tokio::test]
+    async fn test_governance_pool_acl_403_cohere_native_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) =
+            governed_pool_acl_router("co", crate::proto::Protocol::openai(), "zai").await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v2/chat"))
+            .bearer_auth(secret)
+            .body(
+                json!({"model": "co", "messages": [{"role": "user", "content": "hi"}]}).to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "cohere pool-ACL ⇒ 403");
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "cohere 403 envelope is JSON; got {ct}"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body.get("message").and_then(|m| m.as_str()).is_some(),
+            "cohere native 403 envelope has a message field; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Responses `/v1/responses` governance pool-ACL 403 must carry the OpenAI-identical error
+    /// envelope (`{"error":{"type":"permission_error"}}`).
+    #[tokio::test]
+    async fn test_governance_pool_acl_403_responses_native_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) =
+            governed_pool_acl_router("re", crate::proto::Protocol::openai(), "zai").await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/responses"))
+            .bearer_auth(secret)
+            .body(json!({"model": "re", "input": "hi"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "responses pool-ACL ⇒ 403");
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "responses 403 envelope is JSON; got {ct}"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("permission_error"),
+            "responses 403 carries the permission_error type; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Gemini `/v1beta/models/{model}:generateContent` governance pool-ACL 403 must carry the
+    /// Gemini-native error envelope (`{"error":{"code":403,"status":"PERMISSION_DENIED"}}`).
+    #[tokio::test]
+    async fn test_governance_pool_acl_403_gemini_native_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) =
+            governed_pool_acl_router("foo", crate::proto::Protocol::openai(), "zai").await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1beta/models/foo:generateContent"))
+            .bearer_auth(secret)
+            .body(json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "gemini pool-ACL ⇒ 403");
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "gemini 403 envelope is JSON; got {ct}"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_u64()),
+            Some(403),
+            "gemini 403 envelope carries error.code 403; got {body}"
+        );
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("status"))
+                .and_then(|s| s.as_str()),
+            Some("PERMISSION_DENIED"),
+            "gemini 403 envelope carries status PERMISSION_DENIED; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Bedrock `/model/{model}/converse` governance pool-ACL 403 must carry the Bedrock-native error
+    /// body (`{"__type":"AccessDeniedException"}`) AND the `x-amzn-errortype: AccessDeniedException`
+    /// header (plus `x-amzn-RequestId`), exactly as a real AWS Bedrock 403 does.
+    #[tokio::test]
+    async fn test_governance_pool_acl_403_bedrock_native_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) =
+            governed_pool_acl_router("foo", crate::proto::Protocol::openai(), "zai").await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/model/foo/converse"))
+            .bearer_auth(secret)
+            .body(json!({"messages": [{"role": "user", "content": [{"text": "hi"}]}]}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "bedrock pool-ACL ⇒ 403");
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "bedrock 403 envelope is JSON; got {ct}"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-amzn-errortype")
+                .and_then(|h| h.to_str().ok()),
+            Some("AccessDeniedException"),
+            "bedrock 403 carries x-amzn-errortype: AccessDeniedException"
+        );
+        assert!(
+            resp.headers().get("x-amzn-requestid").is_some(),
+            "bedrock 403 still carries x-amzn-RequestId"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("__type").and_then(|t| t.as_str()),
+            Some("AccessDeniedException"),
+            "bedrock 403 body __type is AccessDeniedException; got {body}"
+        );
+        handle.abort();
+    }
+
+    // ---- MEDIUM/test-coverage: adhoc `/{provider}/{model}/v1/messages` E2E through the router ----
+    //
+    // `test_adhoc_rejects_unconfigured_provider_model` (test_support.rs) calls the handler directly,
+    // bypassing the router, axum `Path` extraction, the auth middleware + CallerToken extension
+    // wiring, and `finish` metrics accounting. These three drive the adhoc route through the REAL
+    // router (`build_router`) so that whole stack is covered: (a) a successful round-trip, (b) a
+    // provider-mismatch 400 with the Anthropic-native envelope, (c) a governance pool-ACL rejection.
+
+    /// Adhoc success: `/{provider}/{model}/v1/messages` resolves the configured provider+model lane,
+    /// round-trips through the router (Anthropic ingress → Anthropic backend), and returns 2xx. This
+    /// exercises the axum two-segment `Path((provider, model))` extraction, the auth middleware +
+    /// CallerToken extension wiring, and `finish` — none of which the handler-direct unit test runs.
+    #[tokio::test]
+    async fn test_adhoc_success_round_trip_via_router() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: anthropic_ok_body(),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "claude-x",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .provider("anthropic"),
+            )
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/anthropic/claude-x/v1/messages"))
+            .bearer_auth("t")
+            .body(json!({"model": "claude-x", "messages": [], "max_tokens": 16}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "adhoc provider+model resolves and 2xx round-trips"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// Adhoc provider mismatch via the router: a configured model requested under the WRONG provider
+    /// segment ⇒ 400 with the Anthropic-native error envelope (`{"type":"error","error":{"type":...}}`),
+    /// not a foreign shape or a plain-text body.
+    #[tokio::test]
+    async fn test_adhoc_provider_mismatch_400_anthropic_envelope_via_router() {
+        crate::metrics::init();
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "claude-x",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1",
+                )
+                .provider("anthropic"),
+            )
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/wrong-provider/claude-x/v1/messages"))
+            .bearer_auth("t")
+            .body(json!({"model": "claude-x", "messages": [], "max_tokens": 16}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "model on a mismatched provider ⇒ 400"
+        );
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "adhoc 400 envelope is JSON; got {ct}"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("type").and_then(|t| t.as_str()),
+            Some("error"),
+            "adhoc 400 is the Anthropic native error envelope; got {body}"
+        );
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("invalid_request_error"),
+            "adhoc provider-mismatch 400 carries invalid_request_error; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// Adhoc governance pool-ACL rejection via the router: the adhoc handler also runs
+    /// `governance_guard` (keyed on the resolved MODEL). A key allowed only on `other-pool` requesting
+    /// the configured model ⇒ 403 with the Anthropic-native envelope, finished through `finish`. This
+    /// covers the governance path on the adhoc route end-to-end (untested by the handler-direct test,
+    /// which passes a default no-key GovCtx).
+    #[tokio::test]
+    async fn test_adhoc_governance_pool_acl_403_via_router() {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+        crate::metrics::init();
+        const SECRET: &str = "sk-vk-adhoc-acl";
+        let store = StdArc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .put_key(&VirtualKey {
+                id: "kadhoc".to_string(),
+                key_hash: crate::sigv4::sha256_hex(SECRET.as_bytes()),
+                name: "adhoc-acl".to_string(),
+                allowed_pools: vec!["other-pool".to_string()],
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        let gov = StdArc::new(GovState::new(store, 1, 0, None).unwrap());
+        let app = TestApp::new()
+            .governance(gov)
+            .lane(
+                LaneSpec::new(
+                    "claude-x",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1",
+                )
+                .provider("anthropic"),
+            )
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/anthropic/claude-x/v1/messages"))
+            .bearer_auth(SECRET)
+            .body(json!({"model": "claude-x", "messages": [], "max_tokens": 16}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            403,
+            "adhoc governance pool-ACL ⇒ 403"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("type").and_then(|t| t.as_str()),
+            Some("error"),
+            "adhoc 403 is the Anthropic native error envelope; got {body}"
+        );
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("permission_error"),
+            "adhoc governance 403 carries permission_error; got {body}"
+        );
+        handle.abort();
+    }
 }

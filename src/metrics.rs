@@ -20,12 +20,28 @@ static HANDLE: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
 
 /// The canonical busbar metric taxonomy. Names are referenced here so the emission sites and the
 /// descriptions below stay in one authoritative list.
-pub(crate) const REQUESTS_TOTAL: &str = "busbar_requests_total"; // labels: ingress_protocol, pool, outcome
-pub(crate) const UPSTREAM_ATTEMPTS_TOTAL: &str = "busbar_upstream_attempts_total"; // labels: pool, lane
-pub(crate) const UPSTREAM_FAILURES_TOTAL: &str = "busbar_upstream_failures_total"; // labels: pool, lane, disposition
-pub(crate) const BREAKER_TRIPS_TOTAL: &str = "busbar_breaker_trips_total"; // labels: pool, lane
-pub(crate) const FAILOVERS_TOTAL: &str = "busbar_failovers_total"; // labels: pool, reason
-pub(crate) const REQUEST_DURATION_SECONDS: &str = "busbar_request_duration_seconds"; // histogram
+///
+/// BOUNDED-CARDINALITY CONTRACT — the `pool` label.
+/// Every metric below that carries a `pool` label is part of a finite, operator-controlled label
+/// space. The value of `pool` MUST be EITHER the canonical name of a pool configured in `app.pools`
+/// (resolved via `app.by_model`), OR the fixed sentinel `"unresolved"` used when a request is
+/// terminated before its model is resolved to a configured pool (e.g. a governance rejection —
+/// 401/402/403/429 — that fires before pool resolution).
+///
+/// Emission sites MUST NOT pass the raw, client-supplied model string as `pool`. A virtual key with
+/// a restricted `allowed_pools` list could otherwise submit unbounded distinct model strings, each
+/// rejected yet each minting a brand-new time series, growing the Prometheus registry without bound
+/// — a low-effort memory-exhaustion DoS that also bloats every `/metrics` scrape. The label space
+/// is bounded BY CONSTRUCTION: |configured pools| + 1. The same rule applies to any request-log /
+/// webhook field that mirrors `pool`. The `lane`, `reason`, `disposition`, `outcome`,
+/// `ingress_protocol`, `from`, and `to` labels are likewise drawn from fixed enumerations, never
+/// from free-form client input.
+pub(crate) const REQUESTS_TOTAL: &str = "busbar_requests_total"; // labels: ingress_protocol, pool (bounded), outcome
+pub(crate) const UPSTREAM_ATTEMPTS_TOTAL: &str = "busbar_upstream_attempts_total"; // labels: pool (bounded), lane
+pub(crate) const UPSTREAM_FAILURES_TOTAL: &str = "busbar_upstream_failures_total"; // labels: pool (bounded), lane, disposition
+pub(crate) const BREAKER_TRIPS_TOTAL: &str = "busbar_breaker_trips_total"; // labels: pool (bounded), lane
+pub(crate) const FAILOVERS_TOTAL: &str = "busbar_failovers_total"; // labels: pool (bounded), reason
+pub(crate) const REQUEST_DURATION_SECONDS: &str = "busbar_request_duration_seconds"; // histogram; labels: pool (bounded)
 pub(crate) const TRANSLATIONS_TOTAL: &str = "busbar_translations_total"; // labels: from, to
 
 /// Install the global Prometheus recorder. Idempotent: safe to call once at startup and

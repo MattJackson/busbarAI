@@ -144,7 +144,8 @@ bearer-style carriers — `Authorization: Bearer`, `x-api-key`, `x-goog-api-key`
 Native Bedrock SDK clients authenticate with AWS SigV4 (`Authorization:
 AWS4-HMAC-SHA256 …`), and busbar does **not** verify inbound SigV4 (`src/sigv4.rs`
 is sign-only — no inbound verifier exists). So a SigV4-signed Bedrock request
-carries no token busbar can match and is rejected `401` in `token`/governance mode.
+carries no token busbar can match and is rejected `403` (AccessDenied) in `token`/governance mode
+(a genuine SigV4 rejection is 403, not 401).
 **Bedrock ingress must therefore run under `passthrough` (or `none`)**, where the
 caller's SigV4 credentials are accepted and forwarded upstream. This applies to both
 `converse` and `converse-stream`. The other five ingress protocols use bearer-style

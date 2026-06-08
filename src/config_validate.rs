@@ -425,12 +425,15 @@ fn ssrf_blocked_host(url: &str) -> Option<String> {
                 || v6.is_unspecified()  // ::
                 || is_unique_local_v6(&v6)   // fc00::/7
                 || is_link_local_v6(&v6)     // fe80::/10
-                // An IPv4-mapped IPv6 literal (`[::ffff:a.b.c.d]`) reaches the same v4 target as the
-                // bare `a.b.c.d` form, so the mapped branch MUST apply the IDENTICAL block set as the
-                // direct IPv4 arm above — otherwise `https://[::ffff:100.64.0.1]/` slips past while
-                // `https://100.64.0.1/` is rejected (an SSRF credential-relay gap). Mirror every
-                // check, including the RFC 6598 CGNAT range and the explicit IMDS literal.
-                || v6.to_ipv4_mapped().is_some_and(|m| {
+                // An IPv6 literal that embeds an IPv4 address reaches the same v4 target as the bare
+                // `a.b.c.d` form, so it MUST apply the IDENTICAL block set as the direct IPv4 arm
+                // above — otherwise `https://[::ffff:100.64.0.1]/` slips past while `https://100.64.0.1/`
+                // is rejected (an SSRF credential-relay gap). Use `to_ipv4()` rather than
+                // `to_ipv4_mapped()`: it is a SUPERSET that also covers the IPv4-COMPATIBLE form
+                // (`[::a.b.c.d]`, e.g. `[::127.0.0.1]` / `[::169.254.169.254]`), where the leading
+                // `segments()[0] == 0` makes the ULA/link-local masks miss and `to_ipv4_mapped()`
+                // returns None — yet a connecting stack still routes it to the embedded v4 target.
+                || v6.to_ipv4().is_some_and(|m| {
                     m.is_loopback()
                         || m.is_private()
                         || m.is_link_local()
@@ -1369,6 +1372,14 @@ mod tests {
             "https://[::ffff:127.0.0.1]/",  // loopback via mapped IPv6
             "https://[::ffff:10.0.0.1]/",   // RFC-1918 private via mapped IPv6
             "https://[::ffff:169.254.1.1]:8443/", // link-local via mapped IPv6, with port
+            // IPv4-COMPATIBLE IPv6 forms (`[::a.b.c.d]`, leading segment 0, NOT the `::ffff:` mapped
+            // prefix). `to_ipv4_mapped()` returns None for these and the ULA/link-local masks miss
+            // (segments()[0]==0), but `to_ipv4()` still yields the embedded v4 a connecting stack
+            // routes internally — so they MUST be blocked identically to the bare v4 form.
+            "https://[::127.0.0.1]/", // loopback via IPv4-compatible IPv6
+            "https://[::169.254.169.254]/", // IMDS via IPv4-compatible IPv6
+            "https://[::10.0.0.1]/v1", // RFC-1918 private via IPv4-compatible IPv6
+            "https://[::100.64.0.1]:8443/", // CGNAT (RFC 6598) via IPv4-compatible IPv6, with port
             // Alternate IPv4 encodings the OS resolver maps to loopback / IMDS but `IpAddr` rejects.
             "https://2130706433/",          // decimal int = 127.0.0.1
             "https://0x7f000001/",          // hex = 127.0.0.1

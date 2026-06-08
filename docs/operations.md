@@ -6,7 +6,7 @@ governance/admin usage, and troubleshooting.
 
 ## Process configuration
 
-Busbar is a single static binary configured by two YAML files and environment
+Busbar is a single native binary configured by two YAML files and environment
 variables.
 
 | Env var | Default | Purpose |

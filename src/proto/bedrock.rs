@@ -27,7 +27,9 @@ pub(crate) fn error_kind_to_bedrock_type(kind: &str) -> &'static str {
         }
         "not_found" | "not_found_error" | "model_not_found" => "ResourceNotFoundException",
         "timeout" | "model_timeout" => "ModelTimeoutException",
-        "overloaded_error" | "service_unavailable" | "unavailable" => "ServiceUnavailableException",
+        "overloaded" | "overloaded_error" | "service_unavailable" | "unavailable" => {
+            "ServiceUnavailableException"
+        }
         "quota_exceeded" | "service_quota_exceeded" | "insufficient_quota" => {
             "ServiceQuotaExceededException"
         }
@@ -106,7 +108,15 @@ fn bedrock_image_block(media_type: &str, data: &str) -> Option<serde_json::Value
         );
         return None;
     }
-    let format_str = media_type.strip_prefix("image/").unwrap_or("png");
+    // `strip_prefix("image/")` returns `Some("")` for the exact MIME prefix `"image/"` (an empty
+    // subtype), and `Some(format)` for a real subtype. `unwrap_or("png")` only fires on `None`, so
+    // without the `filter` an empty subtype would flow through as `format: ""` — not a member of
+    // Bedrock Converse's `ImageFormat` union, which the SDK rejects with a `ValidationException`.
+    // Treat an empty subtype the same as a missing prefix and fall back to `png`.
+    let format_str = media_type
+        .strip_prefix("image/")
+        .filter(|s| !s.is_empty())
+        .unwrap_or("png");
     Some(serde_json::json!({
         "format": format_str,
         "source": { "bytes": data }
@@ -321,15 +331,21 @@ impl ProtocolReader for BedrockReader {
         // (`maxTokens`/`temperature`) onto that raw object. The two typed fields are still parsed into
         // the structured IR below for cross-protocol egress; the raw capture is what makes a
         // Bedrock->Bedrock passthrough re-emit `stopSequences`/`topP`/`topK` faithfully.
-        let modeled_keys: std::collections::HashSet<&str> =
-            ["system", "messages", "toolConfig", "stream", "model"]
-                .iter()
-                .cloned()
-                .collect();
+        // The modeled top-level keys this reader handles structurally (so they must NOT be swept into
+        // `extra`). Held as a sorted `&'static` slice and probed with `binary_search`: a fixed,
+        // five-element membership set that was previously a `HashSet` rebuilt (and heap-allocated) on
+        // every `read_request` call on the Bedrock ingress hot path. A sorted-slice binary search is
+        // allocation-free and faster than hashing for a set this small. MUST stay sorted for
+        // `binary_search` — keep alphabetical when editing.
+        const MODELED_KEYS: &[&str] = &["messages", "model", "stream", "system", "toolConfig"];
+        debug_assert!(
+            MODELED_KEYS.windows(2).all(|w| w[0] < w[1]),
+            "MODELED_KEYS must stay sorted for binary_search"
+        );
 
         let mut extra = serde_json::Map::new();
         for (key, value) in obj.iter() {
-            if !modeled_keys.contains(key.as_str()) {
+            if MODELED_KEYS.binary_search(&key.as_str()).is_err() {
                 extra.insert(key.clone(), value.clone());
             }
         }
@@ -751,17 +767,19 @@ impl ProtocolReader for BedrockReader {
                 out.push(IrStreamEvent::MessageStop);
             }
 
-            // Bedrock-documented mid-stream exception event shapes. The ConverseStream wire can
-            // carry a modeled error event in place of (or before) `messageStop`
-            // (`internalServerException`, `modelStreamErrorException`, `modelTimeoutException`,
-            // `throttlingException`, `validationException`, `serviceUnavailableException`). Surface
-            // these as an `IrStreamEvent::Error` so the downstream ingress writer terminates the
-            // client stream with a protocol-shaped error rather than silently dropping the event and
-            // leaving the client on a hanging / EOF-without-terminator stream.
+            // Bedrock mid-stream exception event shapes. The `ConverseStream.responseStream` output
+            // union has EXACTLY five modeled error-event members — `internalServerException`,
+            // `modelStreamErrorException`, `validationException`, `throttlingException`, and
+            // `serviceUnavailableException` — any of which can arrive in place of (or before)
+            // `messageStop`. (`modelTimeoutException` is a REQUEST-level Converse exception, NOT a
+            // member of this stream union, so a real AWS endpoint never emits it mid-stream; it is
+            // therefore not accepted here — see `bedrock_stream_exception_for`'s docstring.) Surface
+            // a recognized event as an `IrStreamEvent::Error` so the downstream ingress writer
+            // terminates the client stream with a protocol-shaped error rather than silently dropping
+            // the event and leaving the client on a hanging / EOF-without-terminator stream.
             Some(
                 exc @ ("internalServerException"
                 | "modelStreamErrorException"
-                | "modelTimeoutException"
                 | "throttlingException"
                 | "validationException"
                 | "serviceUnavailableException"),
@@ -772,7 +790,6 @@ impl ProtocolReader for BedrockReader {
                     .map(String::from);
                 let class = match exc {
                     "throttlingException" => StatusClass::RateLimit,
-                    "modelTimeoutException" => StatusClass::Timeout,
                     "validationException" => StatusClass::ClientError,
                     "serviceUnavailableException" => StatusClass::Overloaded,
                     // internalServerException | modelStreamErrorException
@@ -2301,6 +2318,15 @@ mod tests {
             error_kind_to_bedrock_type("overloaded_error"),
             "ServiceUnavailableException"
         );
+        // Regression (R9 HIGH): the forward layer emits the BARE kind `"overloaded"` for every
+        // operational 503 path (lane exhaustion, deadline exceeded, no usable lane). It must map to
+        // ServiceUnavailableException — NOT fall through to the ValidationException catch-all, which
+        // would pair an HTTP 503 with a 400-class `__type` AWS never produces, making an AWS SDK
+        // raise a non-retryable client fault instead of a retryable ServiceUnavailableException.
+        assert_eq!(
+            error_kind_to_bedrock_type("overloaded"),
+            "ServiceUnavailableException"
+        );
         assert_eq!(
             error_kind_to_bedrock_type("api_error"),
             "InternalServerException"
@@ -2543,6 +2569,63 @@ mod tests {
         assert!(
             unknown.is_empty(),
             "unknown event types must be skipped; got {unknown:?}"
+        );
+
+        // Regression (R9 MEDIUM): `modelTimeoutException` is a REQUEST-level Converse exception, NOT
+        // a member of the `ConverseStream.responseStream` output union (which has exactly five
+        // members), so a real AWS endpoint never emits it mid-stream. It must be treated as an
+        // unrecognized event (silent no-op) — NOT accepted as a stream exception and re-emitted as
+        // `ModelStreamErrorException`, which would mutate the exception type across a same-protocol
+        // boundary.
+        let model_timeout = reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "modelTimeoutException", "message": "slow"}),
+            &mut state,
+        );
+        assert!(
+            model_timeout.is_empty(),
+            "modelTimeoutException is not a ConverseStream output-union member; must be skipped, \
+             got {model_timeout:?}"
+        );
+    }
+
+    /// Regression (R9 HIGH): `bedrock_image_block` must never emit `format: ""`. An exact `"image/"`
+    /// media_type (empty subtype) once slipped past the `strip_prefix(...).unwrap_or("png")` fallback
+    /// — `strip_prefix` returns `Some("")`, not `None` — producing a `format: ""` block outside
+    /// Bedrock's `ImageFormat` union that the SDK rejects with a ValidationException. It must fall
+    /// back to `png`, like a missing/unprefixed media_type.
+    #[test]
+    fn test_bedrock_image_block_empty_subtype_falls_back_to_png() {
+        // Exact `"image/"` prefix with an empty subtype.
+        let block = bedrock_image_block("image/", "QQ==").expect("base64 image must emit a block");
+        assert_eq!(
+            block.pointer("/format").and_then(|f| f.as_str()),
+            Some("png"),
+            "empty subtype must fall back to png, never an empty `format`; got {block}"
+        );
+        assert_eq!(
+            block.pointer("/source/bytes").and_then(|b| b.as_str()),
+            Some("QQ==")
+        );
+
+        // A real subtype is preserved verbatim.
+        let jpeg = bedrock_image_block("image/jpeg", "QQ==").expect("jpeg must emit a block");
+        assert_eq!(
+            jpeg.pointer("/format").and_then(|f| f.as_str()),
+            Some("jpeg")
+        );
+
+        // A media_type with no `image/` prefix also falls back to png (unchanged behavior).
+        let bare = bedrock_image_block("png", "QQ==").expect("bare png must emit a block");
+        assert_eq!(
+            bare.pointer("/format").and_then(|f| f.as_str()),
+            Some("png")
+        );
+
+        // The URL sentinel is still dropped (no corrupt block).
+        assert!(
+            bedrock_image_block("image_url", "https://example.com/x.png").is_none(),
+            "URL-source image must be dropped, not emitted as a base64 block"
         );
     }
 

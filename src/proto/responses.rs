@@ -77,6 +77,35 @@ fn image_url_from_ir(media_type: &str, data: &str) -> String {
     }
 }
 
+/// Derive the native `error.code` value for a Responses/OpenAI `error.type`.
+///
+/// The `/v1/responses` surface shares the OpenAI error envelope, and a real bad-key 401 returns
+/// `{"type":"authentication_error", ..., "code":"invalid_api_key"}` — the official SDKs surface
+/// `error.code` (e.g. `AuthenticationError.code`) to callers, so emitting `code: null` on an auth
+/// failure is a deterministic proxy tell that contradicts the total-indistinguishability promise.
+/// This mirrors `openai.rs::openai_error_code` (the sibling writer fixed this exact case) so the
+/// two surfaces stay consistent. Every other type keeps `null` — the shape OpenAI uses when no
+/// machine-readable code applies. No `_ =>` catch-all: the final arm explicitly binds and handles
+/// all remaining (including caller-passthrough) types by emitting `null`, the correct native value.
+fn responses_error_code(error_type: &str) -> serde_json::Value {
+    match error_type {
+        "authentication_error" => serde_json::Value::String("invalid_api_key".to_string()),
+        "invalid_request_error"
+        | "permission_error"
+        | "not_found_error"
+        | "rate_limit_error"
+        | "server_error"
+        | "insufficient_quota" => serde_json::Value::Null,
+        other => {
+            // A caller-supplied passthrough type we model no code for: OpenAI carries no
+            // machine-readable code for these, so `null` matches the native shape. Named binding
+            // (not `_`) keeps the arm explicit per the no-catch-all rule.
+            let _ = other;
+            serde_json::Value::Null
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ResponsesReader;
 
@@ -524,8 +553,16 @@ impl ProtocolReader for ResponsesReader {
                         if let Some(output_index) =
                             data.get("output_index").and_then(|i| i.as_u64())
                         {
+                            let idx = output_index as usize;
+                            // Record the open tool index so the terminal `output_item.done` for
+                            // this index closes the block EXACTLY once. Native Responses emits a
+                            // single `output_item.done` per function-call item, so unlike text
+                            // (which also gets a `content_part.done`) a tool index is closed by one
+                            // event — tracking it here keeps the open/close pair balanced and lets
+                            // the done arm distinguish a real open block from a duplicate close.
+                            state.open_tools.insert(idx);
                             out.push(IrStreamEvent::BlockStart {
-                                index: output_index as usize,
+                                index: idx,
                                 block: crate::ir::IrBlockMeta::ToolUse { id: call_id, name },
                             });
                         }
@@ -582,15 +619,29 @@ impl ProtocolReader for ResponsesReader {
 
             "response.output_item.done" | "response.content_part.done" => {
                 if let Some(output_index) = data.get("output_index").and_then(|i| i.as_u64()) {
-                    // The text block (if any) opened at this index is now closed; clear the flag so a
-                    // later text part can lazily re-open its own block instead of silently reusing a
-                    // stale "open" state.
-                    if state.text_block_open {
+                    let idx = output_index as usize;
+                    // Native Responses closes a single text item with TWO terminal frames at the
+                    // SAME `output_index`: `content_part.done` (the text content part) immediately
+                    // followed by `output_item.done` (the enclosing message item). Emitting a
+                    // BlockStop for BOTH produces a duplicate `content_block_stop` at one index for
+                    // a block that opened once — an invalid event sequence and a distinguishability
+                    // tell. So close a block EXACTLY once: only emit BlockStop for an index that is
+                    // currently open, and clear the open marker so the second terminal frame at the
+                    // same index is a no-op. A tool index opened via `output_item.added` and a text
+                    // index opened lazily by `output_text.delta` are tracked separately.
+                    if state.open_tools.remove(&idx) {
+                        // This index was a (now-closed) function-call item.
+                        out.push(IrStreamEvent::BlockStop { index: idx });
+                    } else if state.text_block_open {
+                        // This index was the open text block; close it once and clear the flag so a
+                        // later text part lazily re-opens its own block rather than reusing stale
+                        // open state, and so a paired `content_part.done`/`output_item.done` for the
+                        // same text item does not double-close.
                         state.text_block_open = false;
+                        out.push(IrStreamEvent::BlockStop { index: idx });
                     }
-                    out.push(IrStreamEvent::BlockStop {
-                        index: output_index as usize,
-                    });
+                    // Otherwise nothing is open at this index (e.g. the second terminal frame of a
+                    // text item, or a `done` for an item we never opened): emit nothing.
                 }
             }
 
@@ -928,6 +979,17 @@ pub(crate) struct ResponsesWriter {
     /// `AtomicU64` (not `Cell`) so the writer stays `Sync` as the `ProtocolWriter` trait requires;
     /// the stream is single-threaded at any instant, so `Relaxed` ordering is sufficient.
     sequence: AtomicU64,
+    /// Output indices for which this writer emitted a function-call `output_item.added`. The IR
+    /// `BlockStop` carries only the integer index (no block kind), but a native Responses stream
+    /// emits `output_item.done` ONLY for items it previously `added` — and the Text `BlockStart`
+    /// arm emits no `added` (so a text block has no `output_item.added`/`.done` pair at all). Track
+    /// the tool-call opens here so `BlockStop` emits `output_item.done` for a function-call index
+    /// only, never for a text index. Without this a text block's BlockStop emitted a spurious
+    /// `output_item.done` with `type:"function_call"` for an item that was never opened — an
+    /// unmatched lifecycle event and a hard distinguishability tell. Per-stream INSTANCE state for
+    /// the same reason as `sequence` (see the type doc); `Relaxed`-equivalent `Mutex` access is
+    /// fine since a stream is single-threaded at any instant and the writer must stay `Sync`.
+    open_tool_indices: std::sync::Mutex<std::collections::BTreeSet<usize>>,
 }
 
 /// Value-namespace constructor for [`ResponsesWriter`]. A `const` and a struct may share a name
@@ -947,14 +1009,24 @@ pub(crate) struct ResponsesWriter {
 #[allow(clippy::declare_interior_mutable_const)]
 pub(crate) const ResponsesWriter: ResponsesWriter = ResponsesWriter {
     sequence: AtomicU64::new(0),
+    open_tool_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
 };
 
 impl Clone for ResponsesWriter {
     fn clone(&self) -> Self {
         // Preserve the current counter value on clone so a `Protocol::clone` mid-stream keeps the
-        // same `sequence_number` position rather than resetting to 0.
+        // same `sequence_number` position rather than resetting to 0. The open-tool-index set is
+        // likewise carried across the clone so a mid-stream `Protocol::clone` keeps the in-flight
+        // function-call lifecycle correlation; a poisoned lock degrades to an empty set rather than
+        // panicking on the request path.
         ResponsesWriter {
             sequence: AtomicU64::new(self.sequence.load(Ordering::Relaxed)),
+            open_tool_indices: std::sync::Mutex::new(
+                self.open_tool_indices
+                    .lock()
+                    .map(|set| set.clone())
+                    .unwrap_or_default(),
+            ),
         }
     }
 }
@@ -962,9 +1034,14 @@ impl Clone for ResponsesWriter {
 impl ResponsesWriter {
     /// Reset the per-stream `sequence_number` counter to 0. Called when the stream's opening
     /// `response.created` event is written so every stream's sequence starts from 0. The reader
-    /// gates `MessageStart` on `state.started`, so exactly one reset happens per stream.
+    /// gates `MessageStart` on `state.started`, so exactly one reset happens per stream. The
+    /// open-tool-index set is also cleared so a reused/cloned writer does not carry a stale
+    /// function-call index into a fresh stream.
     fn reset_sequence_number(&self) {
         self.sequence.store(0, Ordering::Relaxed);
+        if let Ok(mut set) = self.open_tool_indices.lock() {
+            set.clear();
+        }
     }
 
     /// Return the next `sequence_number` for this stream and advance the counter. The first call
@@ -972,6 +1049,26 @@ impl ResponsesWriter {
     /// native monotonic-from-0 contract.
     fn next_sequence_number(&self) -> u64 {
         self.sequence.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Record that a function-call `output_item.added` was emitted at `index`, so the matching
+    /// `BlockStop` knows to emit `output_item.done` for it. Lock poisoning degrades to a no-op
+    /// rather than panicking on the request path.
+    fn mark_tool_open(&self, index: usize) {
+        if let Ok(mut set) = self.open_tool_indices.lock() {
+            set.insert(index);
+        }
+    }
+
+    /// Return true and forget `index` if it was a previously-opened function-call item; false if no
+    /// function-call item was opened at `index` (e.g. a text block, whose `BlockStop` must NOT emit
+    /// `output_item.done`). Lock poisoning degrades to `false` (suppress the `done`) rather than
+    /// panicking on the request path.
+    fn take_tool_open(&self, index: usize) -> bool {
+        self.open_tool_indices
+            .lock()
+            .map(|mut set| set.remove(&index))
+            .unwrap_or(false)
     }
 }
 
@@ -1234,6 +1331,10 @@ impl ProtocolWriter for ResponsesWriter {
                     // item's lifecycle. Synthesize it deterministically from the output index so the
                     // matching `.done` (which sees only the index) reconstructs the same id.
                     let item_id = synthesize_item_id("fc", *index);
+                    // Record the open function-call index so the matching `BlockStop` emits
+                    // `output_item.done` for THIS index only — a text block's BlockStop (whose
+                    // BlockStart produced no `output_item.added`) must emit no `done`.
+                    self.mark_tool_open(*index);
                     Some((
                         "response.output_item.added".to_string(),
                         serde_json::json!({
@@ -1286,26 +1387,31 @@ impl ProtocolWriter for ResponsesWriter {
             },
 
             IrStreamEvent::BlockStop { index } => {
-                // Native `response.output_item.done` carries the SAME stable `item_id` as the
-                // matching `response.output_item.added` so a client correlates an item's
-                // `added → done` lifecycle. Omitting it left a native SDK reading `event.item_id`
-                // with `undefined`, breaking correlation and constituting a proxy-signature tell.
+                // The IR `BlockStop` carries only the integer output index, not the block kind. A
+                // native Responses stream emits `response.output_item.done` ONLY for an item it
+                // previously `output_item.added` — and this writer emits `output_item.added` solely
+                // for function-call items (the Text `BlockStart` arm returns `None`, so a text part
+                // has NO `output_item.added`/`.done` pair; its content-part lifecycle is closed by
+                // the upstream `content_part.done`/`output_text.done` frames the reader already
+                // collapsed). Emitting `output_item.done` unconditionally — as a prior revision did
+                // — produced, for every text block, an `output_item.done` with
+                // `type:"function_call"` for an item that was never opened: an unmatched lifecycle
+                // event (a `done` with no prior `added`) AND a text response mis-typed as a
+                // function call, both of which break a typed Responses SDK and are deterministic
+                // distinguishability tells.
                 //
-                // The IR `BlockStop` carries only the integer output index (not the block kind),
-                // and the ONLY `output_item.added` this writer emits is the function-call item
-                // (the Text `BlockStart` arm returns `None`). So the deterministic
-                // `synthesize_item_id("fc", index)` here reconstructs exactly the id the function
-                // call's `added` event used — the open/close pair stays index-matched and
-                // id-matched.
+                // So consult the per-stream open-tool set: emit `output_item.done` for a
+                // function-call index only (consuming the marker), and emit NOTHING for a text (or
+                // any non-tool) index.
+                if !self.take_tool_open(*index) {
+                    return None;
+                }
+                // Native `response.output_item.done` carries the SAME stable `item_id` as the
+                // matching `output_item.added` (so a client correlates the `added → done`
+                // lifecycle) plus the finalized `item` object (a typed SDK reads `event.item`). The
+                // function-call `output_item.added` used `synthesize_item_id("fc", index)`, so the
+                // same deterministic id reconstructs the matching pair here.
                 let item_id = synthesize_item_id("fc", *index);
-                // Native `response.output_item.done` ALSO carries the finalized `item` object; a
-                // typed SDK reads `event.item` to return the completed item, so its absence raises
-                // `AttributeError`/`KeyError`. The IR `BlockStop` carries no content snapshot (only
-                // the index), so we cannot reconstruct `call_id`/`name`/`arguments` here — but we
-                // CAN emit a TYPED item carrying the same `id`/`type` as the matching
-                // `output_item.added` (a function-call item), which keeps the SDK's item-lifecycle
-                // decode alive and the `added`/`done` pair correlated, rather than a bare `{}` that
-                // is both crash-prone and a distinguishability tell.
                 Some((
                     "response.output_item.done".to_string(),
                     serde_json::json!({
@@ -1338,7 +1444,22 @@ impl ProtocolWriter for ResponsesWriter {
                 };
 
                 let mut resp_obj = serde_json::Map::new();
+                // The native `response.completed`/`response.incomplete` terminal event ALWAYS
+                // carries `id` (a `resp_…` string) and `created_at` (unix seconds) in its inner
+                // `response` object; the official Python/Node SDK reads `event.response.id` on the
+                // terminal event to finalize the `Response`, and strict typed decoders raise on a
+                // missing `id`/`created_at`. A real OpenAI stream never sends a terminal event
+                // without an `id`, so omitting it is also a distinguishability tell. The IR
+                // `MessageDelta` carries no identity, so synthesize a protocol-correct `resp_` id
+                // and the current unix time — consistent with the `Error` arm below (which already
+                // synthesizes a `resp_` id for `response.failed`) and the non-stream
+                // `write_response`.
+                resp_obj.insert(
+                    "id".to_string(),
+                    serde_json::json!(synthesize_response_id()),
+                );
                 resp_obj.insert("object".to_string(), serde_json::json!("response"));
+                resp_obj.insert("created_at".to_string(), serde_json::json!(now_unix_secs()));
                 resp_obj.insert("status".to_string(), serde_json::json!(status));
 
                 if status == "incomplete" {
@@ -1569,7 +1690,7 @@ impl ProtocolWriter for ResponsesWriter {
             "error": {
                 "message": message,
                 "type": error_type,
-                "code": serde_json::Value::Null,
+                "code": responses_error_code(error_type),
                 "param": serde_json::Value::Null,
             }
         })
@@ -3323,9 +3444,12 @@ mod tests {
             }
         }
 
+        // A TEXT block's `BlockStop` emits no body (a text part has no `output_item.added`/`.done`
+        // pair — its content-part lifecycle is closed upstream), so it consumes no sequence number.
+        // The numbered events are therefore: created, two text deltas, completed = four events.
         assert_eq!(
             seqs,
-            vec![0, 1, 2, 3, 4],
+            vec![0, 1, 2, 3],
             "sequence_number must be 0..N monotonic within the stream, got {seqs:?}"
         );
     }
@@ -3647,6 +3771,242 @@ mod tests {
             code,
             Some("server_error"),
             "error.code must default to server_error, never null"
+        );
+    }
+
+    /// Regression (HIGH/correctness+conformance): a TEXT block's `BlockStop` must emit NOTHING from
+    /// the Responses writer. The Text `BlockStart` arm emits no `output_item.added`, so emitting an
+    /// `output_item.done` (with `type:"function_call"`, as a prior revision did) would be an
+    /// unmatched lifecycle event AND mis-type a text response as a function call — both break a
+    /// typed Responses SDK and are distinguishability tells.
+    #[test]
+    fn test_text_block_stop_emits_no_output_item_done() {
+        let writer = ResponsesWriter;
+        // Open a stream and a text part (text BlockStart emits no body, then a text delta).
+        let _ = writer.write_response_event(&IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        });
+        assert!(
+            writer
+                .write_response_event(&IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: crate::ir::IrBlockMeta::Text,
+                })
+                .is_none(),
+            "text BlockStart emits no body"
+        );
+        let _ = writer.write_response_event(&IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::TextDelta("hi".to_string()),
+        });
+        // The text BlockStop must emit nothing — no phantom output_item.done.
+        assert!(
+            writer
+                .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
+                .is_none(),
+            "a text block's BlockStop must not emit output_item.done"
+        );
+    }
+
+    /// Regression (HIGH): an interleaved tool+text stream must close ONLY the tool index with an
+    /// `output_item.done`. The tool BlockStop emits a `function_call` done; the text BlockStop emits
+    /// nothing. Exercises the per-stream open-tool-index tracking so a text index is never mistaken
+    /// for a function-call item.
+    #[test]
+    fn test_tool_block_stop_emits_done_text_does_not() {
+        let writer = ResponsesWriter;
+        let _ = writer.write_response_event(&IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        });
+        // Tool at index 0, text at index 1.
+        let _ = writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "f".to_string(),
+                },
+            })
+            .expect("tool added emits");
+        let _ = writer.write_response_event(&IrStreamEvent::BlockDelta {
+            index: 1,
+            delta: crate::ir::IrDelta::TextDelta("hi".to_string()),
+        });
+        // Tool index closes with a done.
+        let (etype, _) = writer
+            .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
+            .expect("tool BlockStop emits output_item.done");
+        assert_eq!(etype, "response.output_item.done");
+        // Text index closes with nothing.
+        assert!(
+            writer
+                .write_response_event(&IrStreamEvent::BlockStop { index: 1 })
+                .is_none(),
+            "text BlockStop must not emit output_item.done"
+        );
+        // A SECOND BlockStop at the (already-closed) tool index 0 must not emit a duplicate done.
+        assert!(
+            writer
+                .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
+                .is_none(),
+            "a repeated BlockStop for a closed tool index must not re-emit output_item.done"
+        );
+    }
+
+    /// Regression (HIGH/conformance): the terminal `response.completed` event's inner `response`
+    /// object must carry both `id` (a `resp_…` string) and `created_at` (a unix-seconds integer).
+    /// The official SDKs read `event.response.id` on the terminal event to finalize the Response;
+    /// omitting it breaks correlation and is a distinguishability tell (a real stream never sends a
+    /// terminal event without an id).
+    #[test]
+    fn test_completed_event_carries_id_and_created_at() {
+        let writer = ResponsesWriter;
+        let (etype, payload) = writer
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            })
+            .expect("emit");
+        assert_eq!(etype, "response.completed");
+        let resp = payload
+            .get("response")
+            .and_then(|r| r.as_object())
+            .expect("response object present");
+        let id = resp
+            .get("id")
+            .and_then(|i| i.as_str())
+            .expect("response.completed must carry response.id");
+        assert!(
+            id.starts_with("resp_"),
+            "synthesized id must be a resp_ id, got {id}"
+        );
+        assert!(
+            resp.get("created_at").and_then(|c| c.as_u64()).is_some(),
+            "response.completed must carry an integer created_at"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance): `write_error` must emit `code:"invalid_api_key"` for an
+    /// authentication failure (mirrors `openai.rs` `write_error_emits_invalid_api_key_code_for_auth_failure`).
+    /// Emitting `code:null` on auth is a deterministic proxy tell vs a real OpenAI Responses 401.
+    #[test]
+    fn write_error_emits_invalid_api_key_code_for_auth_failure() {
+        let writer = ResponsesWriter;
+        for kind in ["authentication", "authentication_error", "auth"] {
+            let body = writer.write_error(401, kind, "bad key");
+            assert_eq!(
+                body["error"]["type"],
+                serde_json::json!("authentication_error"),
+                "kind {kind} must map to authentication_error"
+            );
+            assert_eq!(
+                body["error"]["code"],
+                serde_json::json!("invalid_api_key"),
+                "auth failure (kind {kind}) must carry code=invalid_api_key, not null"
+            );
+        }
+    }
+
+    /// Regression (MEDIUM/conformance): non-auth error kinds keep `code:null` — the native shape
+    /// when no machine-readable code applies — so only the auth path is special-cased.
+    #[test]
+    fn write_error_keeps_null_code_for_non_auth_errors() {
+        let writer = ResponsesWriter;
+        for kind in [
+            "invalid_request",
+            "permission",
+            "not_found",
+            "rate_limit",
+            "server_error",
+            "billing",
+        ] {
+            let body = writer.write_error(400, kind, "msg");
+            assert_eq!(
+                body["error"]["code"],
+                serde_json::Value::Null,
+                "non-auth kind {kind} must keep code=null"
+            );
+        }
+    }
+
+    /// Regression (MEDIUM/correctness): a native text item is closed by BOTH `content_part.done`
+    /// and `output_item.done` at the SAME `output_index`. The reader must emit EXACTLY ONE
+    /// `BlockStop` for that index — the second terminal frame is a no-op — so a downstream writer
+    /// does not emit a duplicate `content_block_stop`.
+    #[test]
+    fn test_paired_content_and_item_done_emits_single_block_stop() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        // Open a text block lazily.
+        let _ = reader_read_response_events(
+            "response.output_text.delta",
+            &serde_json::json!({"output_index": 0, "delta": "a"}),
+            &mut state,
+        );
+        assert!(state.text_block_open);
+        // First terminal frame: content_part.done → one BlockStop, clears the open flag.
+        let first = reader_read_response_events(
+            "response.content_part.done",
+            &serde_json::json!({"output_index": 0}),
+            &mut state,
+        );
+        assert_eq!(
+            first.len(),
+            1,
+            "content_part.done closes the text block once"
+        );
+        assert!(!state.text_block_open);
+        // Second terminal frame at the same index: output_item.done → NOTHING (already closed).
+        let second = reader_read_response_events(
+            "response.output_item.done",
+            &serde_json::json!({"output_index": 0}),
+            &mut state,
+        );
+        assert!(
+            second.is_empty(),
+            "the second terminal frame for one text item must not emit a duplicate BlockStop, got {second:?}"
+        );
+    }
+
+    /// Regression (MEDIUM/correctness): a tool item opened by `output_item.added` is closed by a
+    /// single `output_item.done`, and a stray second `done` at that index emits nothing.
+    #[test]
+    fn test_tool_item_done_emits_single_block_stop() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let _ = reader_read_response_events(
+            "response.output_item.added",
+            &serde_json::json!({
+                "output_index": 2,
+                "item": {"type":"function_call","call_id":"fc_1","name":"f"}
+            }),
+            &mut state,
+        );
+        let first = reader_read_response_events(
+            "response.output_item.done",
+            &serde_json::json!({"output_index": 2}),
+            &mut state,
+        );
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            first[0],
+            crate::ir::IrStreamEvent::BlockStop { index: 2 }
+        ));
+        let second = reader_read_response_events(
+            "response.output_item.done",
+            &serde_json::json!({"output_index": 2}),
+            &mut state,
+        );
+        assert!(
+            second.is_empty(),
+            "a closed tool index must not re-emit BlockStop, got {second:?}"
         );
     }
 }

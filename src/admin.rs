@@ -193,11 +193,17 @@ pub(crate) async fn delete_key(State(app): State<Arc<App>>, Path(id): Path<Strin
     // Both store calls (the lookup and the delete) run on ONE `spawn_blocking` task so neither
     // blocks a Tokio worker thread, matching the request-path discipline. Running them on the same
     // task also keeps the lookup→delete pair tighter than two separately-scheduled awaits would.
-    // NOTE: this does not make the check-then-act atomic — `GovState`/store expose no rows-affected
-    // signal, so two concurrent DELETEs of the same id can still both observe `Some` and both return
-    // 200 (the underlying `delete_key` no-ops the second SQL delete). Eliminating that residual
-    // TOCTOU requires the store's `delete_key` to report `changes()` and map zero rows to 404, which
-    // lives in the store layer (not this fix unit's owned files). See the obs unit's skipped note.
+    //
+    // TOCTOU: `GovState`/store expose no rows-affected signal, so a *bare* check-then-act would let
+    // two concurrent DELETEs of the same id both observe `Some` and both return 200 (the second SQL
+    // delete no-ops) — a misleading audit trail implying two revocations of one row. The store-layer
+    // `changes()` fix is out of this unit's owned files, so we close the race here instead: serialize
+    // every delete's lookup→delete critical section behind a process-wide async mutex. `delete_key`
+    // is the only operation that flips a key from existing to absent, so serializing deletes against
+    // each other is sufficient — the loser of a race now observes `Ok(None)` and correctly returns
+    // 404. Deletes are admin-only and rare, so a single global lock has no meaningful cost.
+    static DELETE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _delete_guard = DELETE_GATE.lock().await;
     let now = crate::store::now();
     let gov = gov.clone();
     let id_for_task = id.clone();
@@ -454,6 +460,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.status().as_u16(), 404, "second delete must 404");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_delete_returns_exactly_one_200() {
+        // Regression (MEDIUM/correctness, TOCTOU): two concurrent DELETEs of the SAME id must not
+        // both observe the key and both return 200 (which would imply two revocations of one row in
+        // an audit trail). The delete handler serializes its lookup→delete critical section, so the
+        // winner returns 200 and every loser returns 404. Fire a burst and assert exactly one 200.
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                0,
+            )
+            .unwrap();
+        let (addr, handle) = serve_with_gov(gov).await;
+        let url = format!("http://{addr}/admin/keys/{}", key.id);
+
+        // Launch several DELETEs concurrently against the single freshly-created key.
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let url = url.clone();
+            tasks.push(tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                client
+                    .delete(&url)
+                    .header("x-admin-token", "admintok")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }));
+        }
+        let mut ok = 0;
+        let mut not_found = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                200 => ok += 1,
+                404 => not_found += 1,
+                other => panic!("unexpected status {other} from concurrent delete"),
+            }
+        }
+        assert_eq!(
+            ok, 1,
+            "exactly one concurrent delete must report a 200 revocation"
+        );
+        assert_eq!(
+            not_found, 7,
+            "every losing concurrent delete must report 404"
+        );
         handle.abort();
     }
 }

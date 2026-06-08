@@ -723,9 +723,17 @@ impl Store for SqliteStore {
     }
 
     fn delete_key(&self, id: &str) -> StoreResult<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM virtual_keys WHERE id=?1", params![id])?;
-        conn.execute("DELETE FROM usage_counters WHERE key_id=?1", params![id])?;
+        // Both DELETEs must be atomic. Under SQLite autocommit each `execute` commits on its own, so
+        // a failure of the second statement (I/O error, disk full, constraint) would leave the key
+        // row gone but its usage_counters rows orphaned — accumulating forever and, worse, poisoning
+        // any future key re-created with the same id with stale usage. Wrap both in one transaction
+        // so they commit together or not at all. The Mutex already serializes us against other
+        // writers, so the transaction cannot deadlock against a concurrent busbar caller.
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM virtual_keys WHERE id=?1", params![id])?;
+        tx.execute("DELETE FROM usage_counters WHERE key_id=?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1244,5 +1252,81 @@ mod tests {
         );
         // Different window is independent; unknown = zero.
         assert_eq!(s.get_usage("k1", 200).unwrap(), Usage::default());
+    }
+
+    #[test]
+    fn test_delete_key_removes_key_and_usage_atomically() {
+        // Regression: `delete_key` deletes from both `virtual_keys` and `usage_counters`. The two
+        // DELETEs are now wrapped in one transaction so they commit together — leaving no orphaned
+        // usage rows that would (a) accumulate forever and (b) poison a future key re-created with
+        // the same id with stale usage. Here we assert the post-condition: after delete, both the
+        // key row AND all of its usage rows across windows are gone.
+        let s = SqliteStore::open_in_memory().unwrap();
+        let key = VirtualKey {
+            id: "vk_delete_me".into(),
+            key_hash: "hash_delete_me".into(),
+            name: "victim".into(),
+            allowed_pools: vec!["p1".into()],
+            max_budget_cents: Some(1000),
+            budget_period: "total".into(),
+            rpm_limit: Some(60),
+            tpm_limit: Some(1000),
+            enabled: true,
+            created_at: 0,
+        };
+        s.put_key(&key).unwrap();
+        s.add_usage("vk_delete_me", 100, 25, 1000, true).unwrap();
+        s.add_usage("vk_delete_me", 200, 5, 50, true).unwrap();
+        // Precondition: key + usage present.
+        assert!(s.get_key("vk_delete_me").unwrap().is_some());
+        assert_eq!(s.get_usage("vk_delete_me", 100).unwrap().requests, 1);
+
+        s.delete_key("vk_delete_me").unwrap();
+
+        // Key row gone.
+        assert!(
+            s.get_key("vk_delete_me").unwrap().is_none(),
+            "key row must be deleted"
+        );
+        // No orphaned usage rows in ANY window.
+        assert_eq!(
+            s.get_usage("vk_delete_me", 100).unwrap(),
+            Usage::default(),
+            "usage row in window 100 must be deleted alongside the key"
+        );
+        assert_eq!(
+            s.get_usage("vk_delete_me", 200).unwrap(),
+            Usage::default(),
+            "usage row in window 200 must be deleted alongside the key"
+        );
+    }
+
+    #[test]
+    fn test_delete_key_does_not_inherit_stale_usage_on_recreate() {
+        // The orphaned-usage hazard manifests as a re-created key inheriting prior usage. With the
+        // atomic delete, re-minting the same id starts from zero usage.
+        let s = SqliteStore::open_in_memory().unwrap();
+        let mk = |id: &str| VirtualKey {
+            id: id.into(),
+            key_hash: format!("hash_{id}"),
+            name: "k".into(),
+            allowed_pools: vec![],
+            max_budget_cents: None,
+            budget_period: "total".into(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled: true,
+            created_at: 0,
+        };
+        s.put_key(&mk("vk_reuse")).unwrap();
+        s.add_usage("vk_reuse", 100, 99, 9999, true).unwrap();
+        s.delete_key("vk_reuse").unwrap();
+        // Re-create with the same id; the prior window's usage must NOT bleed through.
+        s.put_key(&mk("vk_reuse")).unwrap();
+        assert_eq!(
+            s.get_usage("vk_reuse", 100).unwrap(),
+            Usage::default(),
+            "re-created key must not inherit the deleted key's usage"
+        );
     }
 }
