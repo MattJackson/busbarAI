@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 
 use axum::{
     body::Body,
-    http::header::{CONTENT_TYPE, USER_AGENT},
+    http::header::{ACCEPT, CONTENT_TYPE, USER_AGENT},
     response::IntoResponse,
     response::Response,
 };
@@ -172,6 +172,16 @@ fn cross_protocol_error_kind(status: StatusCode) -> &'static str {
         "permission_error"
     } else if status == StatusCode::TOO_MANY_REQUESTS {
         "rate_limit_error"
+    } else if status == StatusCode::SERVICE_UNAVAILABLE {
+        // A genuine upstream 503 carries the unavailable/overloaded distinction — collapsing it into
+        // `api_error` would emit, on a bedrock ingress, the status(503)/InternalServerException
+        // pairing the real AWS runtime NEVER produces (503 pairs with ServiceUnavailableException).
+        // Use `overloaded` — the SAME kind busbar already uses for its OWN 503s, mapping to
+        // ServiceUnavailableException (bedrock) / UNAVAILABLE (gemini).
+        "overloaded"
+    } else if status == StatusCode::GATEWAY_TIMEOUT {
+        // 504 maps to the timeout class (bedrock ModelTimeoutException), not a generic server error.
+        "timeout"
     } else if status.is_server_error() {
         "api_error"
     } else {
@@ -1709,6 +1719,44 @@ fn egress_user_agent(egress_protocol: &str) -> &'static str {
     }
 }
 
+/// The `Accept` header a native SDK for `egress_protocol` sends, given the caller's stream intent.
+/// `accept` is NOT part of SigV4 SignedHeaders, so adding it never affects a Bedrock signature — but
+/// a native SDK ALWAYS sends one, so omitting it is a deterministic backend-side proxy fingerprint
+/// (a busbar-proxied request carries none where a native one does). Mirrors the per-protocol
+/// `egress_user_agent` lookup: set to what the real SDK emits so the backend cannot separate busbar
+/// traffic from native traffic on this header. Enumerated (no disposition wildcard) — a header-string
+/// lookup, not a breaker/disposition decision.
+fn egress_accept(egress_protocol: &str, wants_stream: bool) -> &'static str {
+    match egress_protocol {
+        // botocore/boto3 sends `application/vnd.amazon.eventstream` on a ConverseStream call and
+        // `application/json` on a non-stream Converse call — the headline Bedrock egress surface.
+        "bedrock" => {
+            if wants_stream {
+                "application/vnd.amazon.eventstream"
+            } else {
+                "application/json"
+            }
+        }
+        // Anthropic, OpenAI/Responses, Gemini, and Cohere SDKs all negotiate JSON for the unary call
+        // and `text/event-stream` for an SSE stream — the same shape across these REST/SSE backends.
+        "anthropic" | "openai" | "responses" | "gemini" | "cohere" => {
+            if wants_stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            }
+        }
+        // Unknown/foreign egress: a present, plausible Accept still beats sending none.
+        _ => {
+            if wants_stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            }
+        }
+    }
+}
+
 /// Charge a non-streaming response's token usage to the virtual key's budget. The streaming path
 /// taps tokens incrementally inside `FirstByteBody`; buffered (non-streaming) responses have no
 /// such wrapper, so without this the per-key token counter (and any TPM limit derived from it)
@@ -1778,12 +1826,17 @@ pub(crate) async fn forward_with_pool(
     let v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
+            // Log the parser's real cause (line/column/expectation) for operators, but NEVER leak it
+            // into the client-facing 400 body: the serde_json Display detail is a busbar-internal tell
+            // (no native vendor surfaces it) and can echo fragments of the malformed body. The client
+            // gets the generic, vendor-plausible message only.
+            tracing::debug!(error = %e, "request body JSON parse failed");
             return ingress_error(
                 ingress_protocol,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("We could not parse the JSON body of your request: {e}"),
-            )
+                "We could not parse the JSON body of your request.",
+            );
         }
     };
 
@@ -1988,6 +2041,12 @@ pub(crate) async fn forward_with_pool(
             // Native-SDK User-Agent for the egress protocol. The shared client sets none, so without
             // this the backend sees a UA-less request — a proxy fingerprint (see egress_user_agent).
             .header(USER_AGENT, egress_user_agent(egress_name))
+            // Native-SDK Accept for the egress protocol (eventstream/json/SSE by stream intent). A
+            // native SDK always sends one; omitting it is a backend-side proxy fingerprint, especially
+            // on the bedrock egress where botocore sends `application/vnd.amazon.eventstream` on a
+            // ConverseStream call (see egress_accept). Not part of SigV4 SignedHeaders, so no signature
+            // impact.
+            .header(ACCEPT, egress_accept(egress_name, wants_stream))
             .body(payload);
         // reqwest's per-request `.timeout()` bounds the ENTIRE request lifecycle, INCLUDING reading
         // the response body. For a STREAMING response that body is a long-lived generation stream
@@ -2826,11 +2885,14 @@ async fn forward_once(
     let v: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
+            // See the main forward path: log the parser cause for operators, never leak the
+            // serde_json Display detail into the client 400 body (an internal tell + body echo).
+            tracing::debug!(error = %e, "request body JSON parse failed");
             return Ok(ingress_error(
                 ingress_protocol,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("We could not parse the JSON body of your request: {e}"),
+                "We could not parse the JSON body of your request.",
             ));
         }
     };
@@ -2888,6 +2950,8 @@ async fn forward_once(
         .header(CONTENT_TYPE, "application/json")
         // Native-SDK User-Agent for the egress protocol (mirrors the main forward path).
         .header(USER_AGENT, egress_user_agent(egress_name))
+        // Native-SDK Accept for the egress protocol (mirrors the main forward path; see egress_accept).
+        .header(ACCEPT, egress_accept(egress_name, wants_stream))
         .body(payload);
     // See the main forward path: reqwest's `.timeout()` bounds the whole body read, so applying the
     // failover deadline to a STREAMING request truncates a healthy long generation at that wall-clock
@@ -3715,6 +3779,116 @@ mod bedrock_eventstream_tests {
             "tool input round-trips through the delta: {delta_payload}"
         );
     }
+
+    /// REGRESSION (R15 MEDIUM, test-coverage): a MULTI-block buffered cross-protocol completion (the
+    /// canonical 'assistant says something then calls a tool') must emit a DISTINCT, monotonically
+    /// increasing `contentBlockIndex` per block — 0 for block 0, 1 for block 1, 2 for block 2. A real
+    /// AWS Bedrock ConverseStream keys its per-block streaming reassembly off that index; a collision
+    /// or failure to advance (e.g. a refactor replacing `.enumerate()` with a fixed `0`) would make
+    /// the SDK merge or misorder blocks — silent content corruption. The single-block tests above
+    /// cannot catch this because index 0 is correct trivially.
+    #[test]
+    fn buffered_multi_block_assigns_distinct_monotonic_content_block_indices() {
+        let ir = IrResponse {
+            role: IrRole::Assistant,
+            content: vec![
+                IrBlock::Text {
+                    text: "Let me check the weather.".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                },
+                IrBlock::ToolUse {
+                    id: "toolu_abc123".to_string(),
+                    name: "get_weather".to_string(),
+                    input: serde_json::json!({"city": "Paris"}),
+                },
+                IrBlock::Text {
+                    text: "One moment.".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                },
+            ],
+            stop_reason: Some("tool_use".to_string()),
+            usage: IrUsage {
+                input_tokens: 12,
+                output_tokens: 20,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("anthropic.claude-3".to_string()),
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let mut bytes = bedrock_response_to_eventstream(&ir, Some(99));
+        let frames = crate::eventstream::drain_frames(&mut bytes);
+        let names: Vec<&str> = frames.iter().map(|(t, _)| t.as_str()).collect();
+
+        // (a) Frame ordering: messageStart, then per-block start/delta/stop triples (one per block),
+        // then messageStop, then metadata — the native ConverseStream envelope.
+        assert_eq!(names.first(), Some(&"messageStart"), "frames: {names:?}");
+        let block_frames: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| n.starts_with("contentBlock"))
+            .collect();
+        assert_eq!(
+            block_frames,
+            vec![
+                "contentBlockStart",
+                "contentBlockDelta",
+                "contentBlockStop",
+                "contentBlockStart",
+                "contentBlockDelta",
+                "contentBlockStop",
+                "contentBlockStart",
+                "contentBlockDelta",
+                "contentBlockStop",
+            ],
+            "three blocks must each emit a start/delta/stop triple in order: {names:?}"
+        );
+        let stop_pos = names
+            .iter()
+            .position(|n| *n == "messageStop")
+            .expect("messageStop");
+        let meta_pos = names
+            .iter()
+            .position(|n| *n == "metadata")
+            .expect("metadata");
+        assert!(
+            stop_pos < meta_pos,
+            "messageStop precedes metadata: {names:?}"
+        );
+        let last_block_pos = names
+            .iter()
+            .rposition(|n| n.starts_with("contentBlock"))
+            .expect("a contentBlock frame");
+        assert!(
+            last_block_pos < stop_pos,
+            "all content blocks precede messageStop: {names:?}"
+        );
+
+        // (b) contentBlockIndex is distinct and monotonically increasing across blocks: every
+        // content* frame carries the index of its block — 0,0,0 then 1,1,1 then 2,2,2 in emission
+        // order. Collect the index off each content frame and assert the per-block grouping.
+        let block_indices: Vec<u64> = frames
+            .iter()
+            .filter(|(t, _)| t.starts_with("contentBlock"))
+            .map(|(t, body)| {
+                let v: serde_json::Value =
+                    serde_json::from_slice(body).expect("content frame JSON");
+                v["contentBlockIndex"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("{t} frame must carry contentBlockIndex: {v}"))
+            })
+            .collect();
+        assert_eq!(
+            block_indices,
+            vec![0, 0, 0, 1, 1, 1, 2, 2, 2],
+            "each block's three frames carry its own distinct, monotonic index; never colliding"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4250,13 +4424,35 @@ mod mid_stream_error_tests {
 #[cfg(test)]
 mod ingress_indistinguishability_tests {
     use super::{
-        cross_protocol_error_kind, forward_with_pool, ingress_error, ingress_stream_content_type,
-        shape_cross_protocol_error,
+        cross_protocol_error_kind, egress_accept, forward_with_pool, ingress_error,
+        ingress_stream_content_type, shape_cross_protocol_error,
     };
     use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
     use reqwest::StatusCode;
     use serde_json::{json, Value};
     use std::sync::Arc;
+
+    /// REGRESSION (R15 MEDIUM, conformance): every egress request must carry a native-SDK `Accept`
+    /// header — a native SDK always sends one, so its absence is a backend-side proxy fingerprint.
+    /// The headline bedrock egress must mirror botocore: `application/vnd.amazon.eventstream` for a
+    /// ConverseStream (stream) call, `application/json` for the unary Converse call.
+    #[test]
+    fn test_egress_accept_matches_native_sdk() {
+        // Bedrock: eventstream on stream, json on unary (the botocore split).
+        assert_eq!(
+            egress_accept("bedrock", true),
+            "application/vnd.amazon.eventstream"
+        );
+        assert_eq!(egress_accept("bedrock", false), "application/json");
+        // REST/SSE backends: SSE on stream, json on unary.
+        for p in ["anthropic", "openai", "responses", "gemini", "cohere"] {
+            assert_eq!(egress_accept(p, true), "text/event-stream", "{p} stream");
+            assert_eq!(egress_accept(p, false), "application/json", "{p} unary");
+        }
+        // Unknown egress still gets a present, plausible Accept (never absent).
+        assert_eq!(egress_accept("mystery", true), "text/event-stream");
+        assert_eq!(egress_accept("mystery", false), "application/json");
+    }
 
     /// CANONICAL status→kind mapping shared by the main and degraded cross-protocol error shaping.
     /// REGRESSION (R7 MEDIUM, forward_once): a 401/403 must map to authentication_error/
@@ -4283,6 +4479,19 @@ mod ingress_indistinguishability_tests {
         assert_eq!(
             cross_protocol_error_kind(StatusCode::BAD_GATEWAY),
             "api_error"
+        );
+        // REGRESSION (R15 MEDIUM): a genuine upstream 503 must map to `overloaded`, NOT `api_error`.
+        // Collapsing it into `api_error` would emit, on a bedrock ingress, the
+        // 503/InternalServerException pairing the real AWS runtime never produces (503 pairs with
+        // ServiceUnavailableException). `overloaded` is the kind busbar already uses for its own 503s.
+        assert_eq!(
+            cross_protocol_error_kind(StatusCode::SERVICE_UNAVAILABLE),
+            "overloaded"
+        );
+        // 504 maps to the timeout class, distinct from the generic 5xx `api_error`.
+        assert_eq!(
+            cross_protocol_error_kind(StatusCode::GATEWAY_TIMEOUT),
+            "timeout"
         );
         assert_eq!(
             cross_protocol_error_kind(StatusCode::BAD_REQUEST),

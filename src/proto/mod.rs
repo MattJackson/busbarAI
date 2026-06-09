@@ -481,17 +481,23 @@ pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
 /// The INGRESS protocol's NATIVE tool-call id prefix, used by [`ToolIdRemap`] to reshape a foreign
 /// egress tool id into the ingress client's expected form. `None` means the protocol either carries
 /// no tool id on the wire (Gemini correlates `functionCall`s by name; its writer ignores the IR
-/// `ToolUse.id`) so no remap is meaningful, OR uses a free-form id with no canonical prefix where we
-/// still want reversibility — those are handled by the empty-prefix branch in [`ToolIdRemap`].
+/// `ToolUse.id`) so no remap is meaningful, OR uses a free-form id with NO canonical prefix — for the
+/// latter the foreign egress id passes through verbatim (no reshape on the response, no decode on the
+/// request), the correct no-op.
 fn native_tool_id_prefix(protocol_name: &str) -> Option<&'static str> {
     match protocol_name {
         // Anthropic `toolu_…`, OpenAI/Responses `call_…`, Bedrock `tooluse_…` are the documented
-        // native shapes. Cohere tool ids are free-form (no canonical prefix) — use an empty prefix so
-        // the reversible sentinel still applies (the foreign id is never emitted verbatim).
+        // native shapes — each is a stable prefix the encode can prepend and the decode can gate on.
         "anthropic" => Some("toolu_"),
         "openai" | "responses" => Some("call_"),
         "bedrock" => Some("tooluse_"),
-        "cohere" => Some(""),
+        // Cohere tool ids are free-form with NO canonical prefix. An empty prefix would make the
+        // reversibility marker (`bb1`) itself the only distinguishing signal, which collides with a
+        // legitimate client-authored id of shape `bb1<even-len-hex-UTF8>` (e.g. `bb161626364` → the
+        // decode silently rewrites it to `abcd`) — corrupting tool_use/tool_result correlation on a
+        // Cohere-ingress cross-protocol hop. Return `None` (like Gemini) so Cohere ids pass through
+        // verbatim: the egress id is never reshaped, so there is nothing to mis-decode on the echo.
+        "cohere" => None,
         // Gemini carries no tool id on the wire — its writer drops `ToolUse.id` entirely — so there is
         // nothing to reshape and no risk of a foreign id leaking to a Gemini client.
         _ => None,
@@ -528,7 +534,9 @@ pub(crate) struct ToolIdRemap {
 
 impl ToolIdRemap {
     /// Reshape one egress tool id into the ingress protocol's native form. Deterministic + memoized.
-    /// `None` ingress prefix (Gemini) returns the id unchanged — that protocol drops tool ids anyway.
+    /// A `None` ingress prefix (Gemini, Cohere) returns the id unchanged — Gemini drops tool ids
+    /// outright, and Cohere ids are free-form (no canonical prefix to make the reshape reversible
+    /// without colliding with client-authored ids), so both pass through verbatim.
     fn native_for(&mut self, ingress_protocol: &str, egress_id: &str) -> String {
         let Some(prefix) = native_tool_id_prefix(ingress_protocol) else {
             return egress_id.to_string();
@@ -596,11 +604,12 @@ impl ToolIdRemap {
 /// shared map across rounds.
 ///
 /// The decode is gated on the SAME `native_tool_id_prefix(ingress_protocol)` the encode used — NOT a
-/// best-effort scan over every known prefix. Trying foreign prefixes (or the empty Cohere prefix on a
-/// non-Cohere ingress) would mis-detect a genuine CLIENT-authored id of the colliding shape
-/// (`<any-known-prefix>bb1<even-len-hex>`, or a bare `bb1<hex>` via the empty prefix) as
+/// best-effort scan over every known prefix. Trying foreign prefixes would mis-detect a genuine
+/// CLIENT-authored id of the colliding shape (`<any-known-prefix>bb1<even-len-hex>`) as
 /// busbar-reshaped and silently hex-decode it, corrupting the tool_use/tool_result correlation for
 /// that turn. Restricting to the ingress's own prefix makes this the precise inverse of the encode.
+/// A prefix-less ingress (Cohere, Gemini) returns `None` here, so its ids are never decoded — the
+/// matching no-op for a protocol whose ids are never reshaped on the response.
 pub(crate) fn decode_native_tool_id(ingress_protocol: &str, id: &str) -> Option<String> {
     // The ingress protocol's own native prefix — exactly what `native_for` prepended on encode.
     // Gemini (and any protocol without a prefix) never has ids reshaped, so nothing to decode.
@@ -2715,6 +2724,29 @@ mod tests {
         // Test 403 → Auth
         let signal = reader.classify(StatusCode::FORBIDDEN, b"{}");
         assert_eq!(signal.class, StatusClass::Auth);
+    }
+
+    /// REGRESSION (R15 MEDIUM, proto/mod.rs:native_tool_id_prefix): Cohere is a free-form-tool-id
+    /// ingress with NO canonical prefix, so `native_tool_id_prefix("cohere")` must be `None` (like
+    /// Gemini). An empty prefix would make the bare `bb1` marker the only distinguishing signal and
+    /// silently hex-decode a legitimate client-authored id of shape `bb1<even-len-hex-UTF8>`,
+    /// corrupting tool_use/tool_result correlation on a Cohere-ingress cross-protocol hop.
+    #[test]
+    fn cohere_tool_ids_pass_through_verbatim_no_decode() {
+        // No prefix for Cohere — the encode never reshapes a Cohere-ingress tool id.
+        assert_eq!(native_tool_id_prefix("cohere"), None);
+
+        // A client-authored Cohere id that matches the colliding `bb1<even-hex-UTF8>` shape
+        // (`bb161626364` → `bb1` + hex("abcd")) must NOT be decoded — it passes through unchanged.
+        assert_eq!(decode_native_tool_id("cohere", "bb161626364"), None);
+        // Any other free-form Cohere id is likewise a no-op on decode.
+        assert_eq!(decode_native_tool_id("cohere", "my-tool-call-7"), None);
+
+        // The forward (encode) path is also a verbatim no-op for a Cohere ingress: the egress id is
+        // emitted as-is, so there is nothing to mis-decode on the client's echo.
+        let mut remap = ToolIdRemap::default();
+        assert_eq!(remap.native_for("cohere", "call_xyz"), "call_xyz");
+        assert_eq!(remap.native_for("cohere", "bb161626364"), "bb161626364");
     }
 
     #[cfg(test)]
