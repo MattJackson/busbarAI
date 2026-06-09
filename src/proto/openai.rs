@@ -239,6 +239,10 @@ impl ProtocolReader for OpenAiReader {
             .filter(|&v| v > 0)
             .map(|v| v as u32);
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
+        let top_p = obj.get("top_p").and_then(|v| v.as_f64());
+        // OpenAI's `stop` is a string OR an array of strings; normalize to the IR's Vec<String>.
+        // OpenAI has NO top_k knob, so `top_k` stays None (its writer omits it too).
+        let stop = crate::ir::read_stop_sequences(obj.get("stop"));
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Handle messages array
@@ -415,18 +419,23 @@ impl ProtocolReader for OpenAiReader {
             }
         }
 
-        // Collect unmodeled top-level keys into extra (excluding modeled ones). Only the fields the
-        // IR models as first-class (model, messages, tools, max_tokens, temperature, stream) are
-        // excluded; everything else — including the sampling parameters top_p, frequency_penalty,
-        // presence_penalty, stop, n, and logit_bias — flows through `extra` verbatim so it reaches
-        // the upstream after IR translation. (Previously these six were listed here but only top_p
-        // was re-inserted, silently dropping the other five and changing generation behavior.)
+        // Collect unmodeled top-level keys into extra (excluding modeled ones). The fields the IR
+        // models as first-class — model, messages, tools, max_tokens, temperature, top_p, stop,
+        // stream — are excluded; everything else (frequency_penalty, presence_penalty, n, logit_bias,
+        // seed, …) flows through `extra` verbatim so a SAME-protocol OpenAI passthrough reaches the
+        // upstream unchanged. NOTE: the penalties stay in `extra` (and are therefore stripped on a
+        // cross-protocol hop) ON PURPOSE — Anthropic and the Bedrock `inferenceConfig` have no penalty
+        // knob, so they lack a clean universal mapping; only the universally-modeled controls (top_p,
+        // stop) are promoted. top_p and stop are pulled out here so they survive the cross-protocol
+        // seam as first-class IR fields rather than being cleared with the rest of `extra`.
         let modeled_keys: std::collections::HashSet<&str> = [
             "model",
             "messages",
             "tools",
             "max_tokens",
             "temperature",
+            "top_p",
+            "stop",
             "stream",
         ]
         .iter()
@@ -445,6 +454,9 @@ impl ProtocolReader for OpenAiReader {
             tools,
             max_tokens,
             temperature,
+            top_p,
+            top_k: None,
+            stop,
             stream,
             extra,
         })
@@ -1229,6 +1241,17 @@ impl ProtocolWriter for OpenAiWriter {
             out.insert("temperature".to_string(), serde_json::json!(temperature));
         }
 
+        // Promoted sampling controls: emit `top_p` and `stop` in OpenAI's native shape. OpenAI has NO
+        // top_k parameter, so `req.top_k` is intentionally NOT emitted (lossy-by-target — a source
+        // protocol's top_k cannot be honored by the OpenAI API). `stop` serializes as the array form
+        // (OpenAI accepts both a string and an array; the array is always valid).
+        if let Some(top_p) = req.top_p {
+            out.insert("top_p".to_string(), serde_json::json!(top_p));
+        }
+        if !req.stop.is_empty() {
+            out.insert("stop".to_string(), serde_json::json!(req.stop));
+        }
+
         out.insert("stream".to_string(), serde_json::json!(req.stream));
 
         // Add tools if present. The Chat Completions API requires the NESTED tool shape
@@ -1800,6 +1823,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2137,7 +2163,15 @@ mod tests {
             "logit_bias": { "50256": -100 }
         });
         let ir = OpenAiReader.read_request(&body).expect("parses");
-        assert_eq!(ir.extra.get("top_p"), Some(&serde_json::json!(0.9)));
+        // top_p and stop are now PROMOTED to first-class IR fields (universally-modeled sampling
+        // controls that must translate across the cross-protocol seam), so they leave `extra` and
+        // land in the typed fields.
+        assert!(!ir.extra.contains_key("top_p"));
+        assert!(!ir.extra.contains_key("stop"));
+        assert_eq!(ir.top_p, Some(0.9_f64));
+        assert_eq!(ir.stop, vec!["\n\n".to_string()]);
+        // The penalties / n / logit_bias have no clean universal cross-protocol mapping and stay in
+        // `extra` (still re-emitted on a same-protocol passthrough, still stripped cross-protocol).
         assert_eq!(
             ir.extra.get("frequency_penalty"),
             Some(&serde_json::json!(0.5))
@@ -2146,14 +2180,16 @@ mod tests {
             ir.extra.get("presence_penalty"),
             Some(&serde_json::json!(0.25))
         );
-        assert_eq!(ir.extra.get("stop"), Some(&serde_json::json!(["\n\n"])));
         assert_eq!(ir.extra.get("n"), Some(&serde_json::json!(2)));
         assert_eq!(
             ir.extra.get("logit_bias"),
             Some(&serde_json::json!({ "50256": -100 }))
         );
-        // And they reach the upstream body on write.
+        // And they reach the upstream body on write: promoted controls via the typed fields, the
+        // rest via the extra-forwarding loop.
         let out = OpenAiWriter.write_request(&ir);
+        assert_eq!(out["top_p"], serde_json::json!(0.9));
+        assert_eq!(out["stop"], serde_json::json!(["\n\n"]));
         assert_eq!(out["frequency_penalty"], serde_json::json!(0.5));
         assert_eq!(out["n"], serde_json::json!(2));
     }
@@ -2175,6 +2211,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2304,6 +2343,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2430,6 +2472,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2460,6 +2505,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3024,6 +3072,9 @@ mod tests {
             }],
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         }

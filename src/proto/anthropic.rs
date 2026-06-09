@@ -286,6 +286,10 @@ impl ProtocolReader for AnthropicReader {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
+        let top_p = obj.get("top_p").and_then(|v| v.as_f64());
+        let top_k = obj.get("top_k").and_then(|v| v.as_u64()).map(|v| v as u32);
+        // Anthropic's native `stop_sequences` is an array of strings.
+        let stop = crate::ir::read_stop_sequences(obj.get("stop_sequences"));
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Collect unmodeled top-level keys into extra
@@ -296,6 +300,9 @@ impl ProtocolReader for AnthropicReader {
             "tools",
             "max_tokens",
             "temperature",
+            "top_p",
+            "top_k",
+            "stop_sequences",
             "stream",
         ]
         .iter()
@@ -314,6 +321,9 @@ impl ProtocolReader for AnthropicReader {
             tools,
             max_tokens,
             temperature,
+            top_p,
+            top_k,
+            stop,
             stream,
             extra,
         })
@@ -1086,6 +1096,19 @@ impl ProtocolWriter for AnthropicWriter {
         }
         if let Some(temperature) = req.temperature {
             out.insert("temperature".to_string(), serde_json::json!(temperature));
+        }
+        // Sampling controls promoted to first-class IR fields (see `IrRequest`): emit each in
+        // Anthropic's native shape when present. `top_p`/`top_k` map 1:1; the IR's normalized `stop`
+        // vec is Anthropic's native `stop_sequences` array. Emitted before the `extra` overlay (these
+        // keys were pulled OUT of extra by the reader, so there is no double-emit on passthrough).
+        if let Some(top_p) = req.top_p {
+            out.insert("top_p".to_string(), serde_json::json!(top_p));
+        }
+        if let Some(top_k) = req.top_k {
+            out.insert("top_k".to_string(), serde_json::json!(top_k));
+        }
+        if !req.stop.is_empty() {
+            out.insert("stop_sequences".to_string(), serde_json::json!(req.stop));
         }
         out.insert("stream".to_string(), serde_json::json!(req.stream));
         for (key, value) in &req.extra {

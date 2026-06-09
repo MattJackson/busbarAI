@@ -49,6 +49,9 @@ fn cohere_modeled_keys() -> &'static std::collections::HashSet<&'static str> {
             "tools",
             "max_tokens",
             "temperature",
+            "p",
+            "k",
+            "stop_sequences",
             "stream",
         ]
         .into_iter()
@@ -451,6 +454,10 @@ impl ProtocolReader for CohereReader {
             .filter(|&v| v > 0)
             .and_then(|v| u32::try_from(v).ok());
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
+        // Cohere v2 chat names its sampling controls `p` (top_p), `k` (top_k), `stop_sequences`.
+        let top_p = obj.get("p").and_then(|v| v.as_f64());
+        let top_k = obj.get("k").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let stop = crate::ir::read_stop_sequences(obj.get("stop_sequences"));
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Built once per process and reused across every request rather than rebuilt on each
@@ -469,6 +476,9 @@ impl ProtocolReader for CohereReader {
             tools,
             max_tokens,
             temperature,
+            top_p,
+            top_k,
+            stop,
             stream,
             extra,
         })
@@ -1121,6 +1131,18 @@ impl ProtocolWriter for CohereWriter {
         if let Some(temperature) = req.temperature {
             out.insert("temperature".to_string(), serde_json::json!(temperature));
         }
+        // Promoted sampling controls in Cohere v2's native names: `p` (top_p), `k` (top_k),
+        // `stop_sequences`. Emitted before the `extra` overlay (the reader pulled these keys out of
+        // extra, so there is no double-emit on a same-protocol passthrough).
+        if let Some(top_p) = req.top_p {
+            out.insert("p".to_string(), serde_json::json!(top_p));
+        }
+        if let Some(top_k) = req.top_k {
+            out.insert("k".to_string(), serde_json::json!(top_k));
+        }
+        if !req.stop.is_empty() {
+            out.insert("stop_sequences".to_string(), serde_json::json!(req.stop));
+        }
         // Only emit `stream` when streaming is requested. A native Cohere client omitting `stream`
         // (relying on the `false` default) produces a body WITHOUT the field; always injecting
         // `"stream": false` is a proxy tell and a same-protocol passthrough fidelity break (the
@@ -1466,6 +1488,9 @@ mod tests {
             }],
             max_tokens: Some(1024),
             temperature: Some(0.7),
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -1531,6 +1556,9 @@ mod tests {
             tools: vec![],
             max_tokens: Some(512),
             temperature: Some(0.7),
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: true,
             extra: serde_json::Map::new(),
         };
@@ -1805,6 +1833,9 @@ mod tests {
             tools: vec![],
             max_tokens: Some(64),
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -1840,6 +1871,9 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2288,6 +2322,9 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2462,6 +2499,9 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2497,6 +2537,9 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };

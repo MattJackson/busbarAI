@@ -352,6 +352,9 @@ pub(crate) trait ProtocolWriter: Send + Sync {
             tools: vec![],
             max_tokens: Some(1),
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -532,6 +535,18 @@ pub(crate) struct StreamTranslate {
     /// pre-encode JSON instead, decoupling its input from the `ingress_eventstream` framing. Empty for
     /// non-bedrock ingress (the tap reads the SSE output directly there). Drained by `take_tap_json`.
     tap_json: Vec<u8>,
+    /// Input-token usage captured at stream start (`MessageStart.usage`), carried forward so the
+    /// terminal `MessageDelta` reports the prompt-token count.
+    ///
+    /// Anthropic's SSE puts `usage.input_tokens` (and the cache-token splits) ONLY on `message_start`;
+    /// its `message_delta` carries `output_tokens` alone. Every other protocol bundles input+output
+    /// into the terminal usage event. So on a cross-protocol hop OUT of an Anthropic backend the IR's
+    /// terminal `MessageDelta.usage.input_tokens` is 0 and the prompt-token count is lost — the ingress
+    /// writer (and the forward-layer `UsageTap` scanning its output) under-reports usage. Latch the
+    /// start-usage input/cache fields here and backfill them onto the terminal delta when the delta
+    /// itself carries none, so input tokens survive the seam regardless of how the egress protocol
+    /// split start-vs-terminal usage. `None` until the first `MessageStart` carrying usage is seen.
+    start_usage: Option<crate::ir::IrUsage>,
 }
 
 /// The OpenAI stream-start identity replayed onto every `chat.completion.chunk` (see
@@ -567,6 +582,7 @@ impl StreamTranslate {
             bedrock_metadata_emitted: false,
             bedrock_metadata_pending: false,
             tap_json: Vec::new(),
+            start_usage: None,
         })
     }
 
@@ -590,9 +606,37 @@ impl StreamTranslate {
             // missing `id`/`type`/`content`/`stop_reason`/`stop_sequence`; the Gemini writer omitted
             // `modelVersion`). The non-stream path in forward.rs also does NOT clear `model`. Same-
             // protocol byte-exact round-trips never reach here, so they are untouched.
-            if let crate::ir::IrStreamEvent::MessageStart { id, created, .. } = &mut ev {
+            if let crate::ir::IrStreamEvent::MessageStart {
+                id, created, usage, ..
+            } = &mut ev
+            {
+                // Latch the start-usage input/cache token counts (before stripping identity). Anthropic
+                // carries input tokens ONLY here, never on `message_delta`; backfilling the terminal
+                // delta below keeps the prompt-token count from vanishing across the cross-protocol seam.
+                if let Some(u) = usage {
+                    self.start_usage = Some(u.clone());
+                }
                 *id = None;
                 *created = None;
+            }
+            // Backfill the terminal usage: if the egress protocol reported input/cache tokens only at
+            // stream start (Anthropic), the `MessageDelta` arrives with `input_tokens == 0` and no cache
+            // splits. Restore them from the latched start-usage so the ingress writer emits — and the
+            // forward-layer UsageTap reads — the real prompt-token count. Only fills fields the delta
+            // itself left empty, so a protocol that DOES carry input on its terminal delta (OpenAI
+            // include_usage, Gemini, Bedrock, Cohere) is never overwritten.
+            if let crate::ir::IrStreamEvent::MessageDelta { usage, .. } = &mut ev {
+                if let Some(start) = &self.start_usage {
+                    if usage.input_tokens == 0 {
+                        usage.input_tokens = start.input_tokens;
+                    }
+                    if usage.cache_creation_input_tokens.is_none() {
+                        usage.cache_creation_input_tokens = start.cache_creation_input_tokens;
+                    }
+                    if usage.cache_read_input_tokens.is_none() {
+                        usage.cache_read_input_tokens = start.cache_read_input_tokens;
+                    }
+                }
             }
             // Bedrock-INGRESS error path: a native AWS SDK dispatches mid-stream errors off the
             // `:message-type: exception` / `:exception-type` headers, which ONLY
@@ -1707,9 +1751,99 @@ mod tests {
         let ir = reader
             .read_request(&j)
             .expect("read_request should succeed");
-        assert!(ir.extra.contains_key("top_p"));
+        // top_p is now a first-class IR sampling control (promoted out of `extra` so it survives the
+        // cross-protocol seam); it must NOT linger in `extra` but MUST still round-trip via the typed
+        // field into the written body.
+        assert!(!ir.extra.contains_key("top_p"));
+        assert!(ir.top_p.is_some());
         let roundtrip = writer.write_request(&ir);
         assert!(roundtrip.as_object().unwrap().contains_key("top_p"));
+    }
+
+    // Finding 2 (native control fields dropped on cross-protocol hops). The universally-modeled
+    // sampling controls (top_p, top_k, stop) are now first-class IR fields, so they survive the
+    // cross-protocol seam (which CLEARS `ir.extra` to stop source-only key leakage). Each test reads
+    // a native request, CLEARS `extra` to simulate the seam (forward.rs `ir.extra.clear()`), then
+    // writes through a DIFFERENT protocol and asserts the control reappears in that protocol's native
+    // shape. Were these still extra-only, the clear would drop them.
+
+    #[test]
+    fn test_cross_protocol_openai_top_p_to_anthropic() {
+        let body = serde_json::json!({
+            "model":"gpt-x",
+            "messages":[{"role":"user","content":"hi"}],
+            "top_p":0.81
+        });
+        let mut ir = OpenAiReader.read_request(&body).expect("openai parses");
+        assert_eq!(ir.top_p, Some(0.81));
+        ir.extra.clear(); // simulate the cross-protocol seam
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(
+            out.get("top_p").and_then(|v| v.as_f64()),
+            Some(0.81),
+            "openai top_p must translate to anthropic top_p across the seam; got {out}"
+        );
+    }
+
+    #[test]
+    fn test_cross_protocol_gemini_stop_sequences_to_openai_stop() {
+        let body = serde_json::json!({
+            "model":"gemini-x",
+            "contents":[{"role":"user","parts":[{"text":"hi"}]}],
+            "generationConfig":{"stopSequences":["STOP","END"]}
+        });
+        let mut ir = GeminiReader.read_request(&body).expect("gemini parses");
+        assert_eq!(ir.stop, vec!["STOP".to_string(), "END".to_string()]);
+        ir.extra.clear(); // simulate the cross-protocol seam
+        let out = OpenAiWriter.write_request(&ir);
+        assert_eq!(
+            out.get("stop"),
+            Some(&serde_json::json!(["STOP", "END"])),
+            "gemini stopSequences must translate to openai stop across the seam; got {out}"
+        );
+    }
+
+    #[test]
+    fn test_cross_protocol_anthropic_top_k_to_gemini() {
+        let body = serde_json::json!({
+            "model":"claude-x",
+            "messages":[{"role":"user","content":"hi"}],
+            "max_tokens":16,
+            "top_k":40
+        });
+        let mut ir = AnthropicReader
+            .read_request(&body)
+            .expect("anthropic parses");
+        assert_eq!(ir.top_k, Some(40));
+        ir.extra.clear(); // simulate the cross-protocol seam
+        let writer = GeminiWriter;
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out.pointer("/generationConfig/topK")
+                .and_then(|v| v.as_u64()),
+            Some(40),
+            "anthropic top_k must translate to gemini generationConfig.topK; got {out}"
+        );
+    }
+
+    // top_k has NO OpenAI target: the OpenAI writer must NOT invent one (lossy-by-target, not a leak).
+    #[test]
+    fn test_cross_protocol_top_k_dropped_for_openai_target() {
+        let body = serde_json::json!({
+            "model":"claude-x",
+            "messages":[{"role":"user","content":"hi"}],
+            "max_tokens":16,
+            "top_k":40
+        });
+        let mut ir = AnthropicReader
+            .read_request(&body)
+            .expect("anthropic parses");
+        ir.extra.clear();
+        let out = OpenAiWriter.write_request(&ir);
+        assert!(
+            out.get("top_k").is_none() && out.get("k").is_none(),
+            "OpenAI has no top_k knob; the writer must not synthesize one; got {out}"
+        );
     }
 
     #[test]
@@ -2513,9 +2647,10 @@ mod tests {
             // Assert temperature == Some(0.7) (f64, exact - natural value not 0.699999988)
             assert_eq!(ir.temperature, Some(0.7_f64));
 
-            // Assert extra contains top_p
-            assert!(ir.extra.contains_key("top_p"));
-            assert_eq!(ir.extra.get("top_p"), Some(&serde_json::json!(0.95)));
+            // top_p is now promoted to a first-class IR field (so it survives the cross-protocol
+            // seam): it must be carried in `ir.top_p`, NOT left in `extra`.
+            assert!(!ir.extra.contains_key("top_p"));
+            assert_eq!(ir.top_p, Some(0.95_f64));
         }
 
         #[test]
@@ -4212,6 +4347,94 @@ mod stream_translate_tests {
         assert!(
             out.contains("event: message_stop"),
             "missing message_stop; got {out}"
+        );
+    }
+
+    // Finding 1 (input-token loss across the IR on streaming). Anthropic's SSE carries
+    // `usage.input_tokens` ONLY on `message_start`; its `message_delta` carries `output_tokens`
+    // alone. On a cross-protocol hop OUT of an Anthropic backend the terminal `MessageDelta.usage`
+    // therefore had `input_tokens == 0` and the prompt-token count vanished. `StreamTranslate` now
+    // latches the start-usage input/cache tokens and backfills the terminal delta. Gemini ingress is
+    // the cleanest observer: its writer renders the terminal usage as `usageMetadata.promptTokenCount`
+    // (Anthropic→Gemini), so a non-zero promptTokenCount proves the input count survived the seam.
+    #[test]
+    fn test_translate_anthropic_egress_to_gemini_ingress_preserves_input_tokens() {
+        let mut t = StreamTranslate::new("gemini", "anthropic").expect("gemini ingress translator");
+        let mut out = String::new();
+        for frame in [
+            // input_tokens live ONLY here (message_start), per the native Anthropic shape.
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"usage\":{\"input_tokens\":42,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            // message_delta carries output_tokens but NO input_tokens (native Anthropic).
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            out.push_str(&String::from_utf8(t.feed(frame.as_bytes())).unwrap());
+        }
+        out.push_str(&String::from_utf8(t.finish()).unwrap());
+        let payloads = data_payloads(&out);
+        // The terminal Gemini chunk's usageMetadata must report BOTH the input (prompt) tokens
+        // latched at stream start AND the output (candidates) tokens from the delta.
+        let usage = payloads
+            .iter()
+            .find_map(|p| p.pointer("/usageMetadata"))
+            .unwrap_or_else(|| panic!("no usageMetadata in translated stream; got {out}"));
+        assert_eq!(
+            usage.get("promptTokenCount").and_then(|v| v.as_u64()),
+            Some(42),
+            "input tokens captured at message_start must survive to the terminal usage; got {out}"
+        );
+        assert_eq!(
+            usage.get("candidatesTokenCount").and_then(|v| v.as_u64()),
+            Some(7),
+            "output tokens from message_delta must be reported; got {out}"
+        );
+    }
+
+    // Finding 1, same-protocol round-trip: an Anthropic stream read into IR events and written back
+    // out by the Anthropic writer must carry input tokens (message_start) AND output tokens
+    // (message_delta) — neither half lost. (Same-protocol forwarding is byte-passthrough in prod and
+    // never hits StreamTranslate; this asserts the reader+writer IR contract underneath that.)
+    #[test]
+    fn test_anthropic_stream_usage_roundtrips_input_and_output_tokens() {
+        let reader = AnthropicReader;
+        let writer = AnthropicWriter;
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        // message_start → MessageStart carrying input_tokens.
+        let start_in = serde_json::json!({
+            "type":"message_start",
+            "message":{"role":"assistant","usage":{"input_tokens":42,"output_tokens":0}}
+        });
+        let start_evs = reader.read_response_events("message_start", &start_in, &mut state);
+        let (_et, start_out) = writer
+            .write_response_event(&start_evs[0])
+            .expect("message_start writes");
+        assert_eq!(
+            start_out
+                .pointer("/message/usage/input_tokens")
+                .and_then(|v| v.as_u64()),
+            Some(42),
+            "message_start must round-trip input_tokens"
+        );
+
+        // message_delta → MessageDelta carrying output_tokens.
+        let delta_in = serde_json::json!({
+            "type":"message_delta",
+            "delta":{"stop_reason":"end_turn"},
+            "usage":{"output_tokens":7}
+        });
+        let delta_evs = reader.read_response_events("message_delta", &delta_in, &mut state);
+        let (_et, delta_out) = writer
+            .write_response_event(&delta_evs[0])
+            .expect("message_delta writes");
+        assert_eq!(
+            delta_out
+                .pointer("/usage/output_tokens")
+                .and_then(|v| v.as_u64()),
+            Some(7),
+            "message_delta must round-trip output_tokens"
         );
     }
 

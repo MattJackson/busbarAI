@@ -16,8 +16,50 @@ pub(crate) struct IrRequest {
     // f64 (not ADR-0005's f32): JSON numbers are f64; an f32 round-trip silently mutates a
     // caller's temperature (0.7 → 0.699999988) — the exact lossiness busbar exists to avoid.
     pub temperature: Option<f64>,
+    /// Nucleus-sampling cutoff (`top_p`). A first-class IR field — NOT left in `extra` — because it
+    /// is a UNIVERSALLY-modeled sampling control with a clean native shape in every protocol busbar
+    /// speaks (OpenAI `top_p`, Anthropic `top_p`, Gemini `generationConfig.topP`, Bedrock
+    /// `inferenceConfig.topP`, Cohere `p`). `extra` is cleared on the cross-protocol seam to stop
+    /// source-only key leakage; a control that should TRANSLATE must be modeled here or it would be
+    /// silently dropped on every cross-protocol hop. `f64` for the same lossless-number reason as
+    /// `temperature`. `None` when the caller omitted it. Each reader populates it from its native
+    /// shape; each writer emits it in its native shape when present.
+    pub top_p: Option<f64>,
+    /// Top-k sampling cutoff (`top_k`). First-class for the same reason as `top_p`: it has a real
+    /// cross-protocol mapping in the protocols that model it (Anthropic `top_k`, Gemini
+    /// `generationConfig.topK`, Cohere `k`, Bedrock via `additionalModelRequestFields`). OpenAI has
+    /// NO top_k knob, so the OpenAI writer omits it (and its reader never sets it) — a lossy-by-target
+    /// omission, not a leak. `u32`: top_k is a non-negative integer count. `None` when omitted.
+    pub top_k: Option<u32>,
+    /// Stop sequences (`stop`). First-class because every protocol models it (OpenAI `stop` —
+    /// string OR array; Anthropic `stop_sequences`; Gemini `generationConfig.stopSequences`; Bedrock
+    /// `inferenceConfig.stopSequences`; Cohere `stop_sequences`). Normalized to a `Vec<String>` (the
+    /// common shape); a writer whose native form is a bare string for the single-element case still
+    /// round-trips because the SDKs accept the array form. Empty `Vec` == omitted (no `stop` field
+    /// emitted), so a request that never carried stops does not gain an empty array on translation.
+    pub stop: Vec<String>,
     pub stream: bool,
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Normalize a protocol's native stop-sequence field into the IR's `Vec<String>`.
+///
+/// Stop sequences arrive in two native shapes across busbar's protocols: a bare string (OpenAI's
+/// `stop` accepts a single string) or an array of strings (Anthropic `stop_sequences`, Gemini
+/// `stopSequences`, Bedrock `stopSequences`, Cohere `stop_sequences`, and OpenAI's array form). This
+/// collapses both into the IR's normalized `Vec<String>`: a string becomes a one-element vec, an
+/// array keeps its string elements (non-string elements are skipped — a malformed entry should not
+/// abort the whole request), and absent/`null`/any other type yields an empty vec (== omitted). Used
+/// by every reader so the cross-protocol seam carries stops uniformly.
+pub(crate) fn read_stop_sequences(val: Option<&Value>) -> Vec<String> {
+    match val {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

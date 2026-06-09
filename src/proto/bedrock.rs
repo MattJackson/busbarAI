@@ -534,13 +534,20 @@ impl ProtocolReader for BedrockReader {
             None
         };
 
-        let temperature = if let Some(inference_config) =
-            obj.get("inferenceConfig").and_then(|i| i.as_object())
-        {
-            inference_config.get("temperature").and_then(|v| v.as_f64())
-        } else {
-            None
-        };
+        let inference_config = obj.get("inferenceConfig").and_then(|i| i.as_object());
+        let temperature =
+            inference_config.and_then(|ic| ic.get("temperature").and_then(|v| v.as_f64()));
+        // Promoted sampling controls in Bedrock's `inferenceConfig`: topP and stopSequences. `topK`
+        // is NOT an inferenceConfig field (it lives in model-specific `additionalModelRequestFields`),
+        // so it is left in `extra` and `top_k` stays None for Bedrock — promoting it would have no
+        // clean inferenceConfig target. These two are ALSO preserved verbatim in the raw
+        // `inferenceConfig` captured into `extra` for the same-protocol passthrough; the IR fields are
+        // what carry them across the cross-protocol seam (where `extra` is cleared). The writer's
+        // overlay re-emits the typed fields onto the raw object, so a Bedrock->Bedrock round-trip is
+        // unaffected (the overlaid value equals the captured one).
+        let top_p = inference_config.and_then(|ic| ic.get("topP").and_then(|v| v.as_f64()));
+        let stop =
+            crate::ir::read_stop_sequences(inference_config.and_then(|ic| ic.get("stopSequences")));
 
         Ok(crate::ir::IrRequest {
             system: system_blocks,
@@ -548,6 +555,9 @@ impl ProtocolReader for BedrockReader {
             tools,
             max_tokens,
             temperature,
+            top_p,
+            top_k: None,
+            stop,
             // Bedrock's native Converse request body has no `stream` field — streaming is selected
             // by the endpoint (converse vs converse-stream). The Bedrock ingress route therefore
             // INJECTS `"stream": true` into the body for converse-stream requests before this reader
@@ -1212,6 +1222,17 @@ impl ProtocolWriter for BedrockWriter {
         if let Some(temperature) = req.temperature {
             inference_config.insert("temperature".to_string(), serde_json::json!(temperature));
         }
+        // Promoted sampling controls overlaid in Bedrock's inferenceConfig shape (typed IR wins over
+        // the raw captured value, so same-protocol round-trips re-emit the identical value and
+        // cross-protocol egress emits the value carried in the IR). `top_k` has no inferenceConfig
+        // home, so it is never emitted here (a source protocol's top_k stays in extra / is dropped on
+        // the cross-protocol seam — documented in the reader).
+        if let Some(top_p) = req.top_p {
+            inference_config.insert("topP".to_string(), serde_json::json!(top_p));
+        }
+        if !req.stop.is_empty() {
+            inference_config.insert("stopSequences".to_string(), serde_json::json!(req.stop));
+        }
 
         if !inference_config.is_empty() {
             out.insert(
@@ -1648,6 +1669,9 @@ mod tests {
             }],
             max_tokens: Some(1024),
             temperature: Some(0.7_f64),
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2691,6 +2715,9 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2740,6 +2767,9 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3293,6 +3323,9 @@ mod tests {
             tools: vec![],
             max_tokens: Some(999),
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra,
         };
@@ -3324,6 +3357,9 @@ mod tests {
             tools: vec![],
             max_tokens: Some(42),
             temperature: Some(0.1),
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3469,6 +3505,9 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3758,6 +3797,9 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };

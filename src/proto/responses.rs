@@ -514,6 +514,10 @@ impl ProtocolReader for ResponsesReader {
             .filter(|&v| v > 0)
             .map(|v| v as u32);
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
+        // The Responses API supports `top_p` but has NO `top_k` and no top-level stop-sequence param,
+        // so only top_p is promoted here; `top_k`/`stop` stay None/empty (any unmodeled knob remains
+        // in `extra`).
+        let top_p = obj.get("top_p").and_then(|v| v.as_f64());
         // The Responses API carries `stream` in the request body — read it (don't drop the intent).
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -529,6 +533,7 @@ impl ProtocolReader for ResponsesReader {
             "tools",
             "max_output_tokens",
             "temperature",
+            "top_p",
             "stream",
         ]
         .iter()
@@ -551,6 +556,9 @@ impl ProtocolReader for ResponsesReader {
             tools,
             max_tokens,
             temperature,
+            top_p,
+            top_k: None,
+            stop: vec![],
             stream,
             extra,
         })
@@ -1477,6 +1485,12 @@ impl ProtocolWriter for ResponsesWriter {
         if let Some(temperature) = req.temperature {
             out.insert("temperature".to_string(), serde_json::json!(temperature));
         }
+        // Promoted sampling control: the Responses API supports `top_p` (but no top_k / stop), so
+        // only top_p is emitted. A cross-protocol source's top_k/stop have no Responses target and
+        // are dropped (documented in the reader).
+        if let Some(top_p) = req.top_p {
+            out.insert("top_p".to_string(), serde_json::json!(top_p));
+        }
 
         // `stream` is a modeled key (excluded from `extra`), so it must be emitted explicitly or it
         // is silently dropped — a `stream: true` request would otherwise be answered non-streaming,
@@ -2066,6 +2080,9 @@ mod tests {
             }],
             max_tokens: Some(1024),
             temperature: Some(0.7),
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2225,6 +2242,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: Some(500),
             temperature: Some(0.7),
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2858,6 +2878,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2914,6 +2937,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3207,6 +3233,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3257,6 +3286,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3285,6 +3317,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream,
             extra: serde_json::Map::new(),
         };

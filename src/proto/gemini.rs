@@ -357,6 +357,20 @@ impl ProtocolReader for GeminiReader {
             .get("generationConfig")
             .and_then(|gc| gc.get("temperature"))
             .and_then(|v| v.as_f64());
+        // Promoted sampling controls live under `generationConfig`: topP, topK, stopSequences.
+        let top_p = obj
+            .get("generationConfig")
+            .and_then(|gc| gc.get("topP"))
+            .and_then(|v| v.as_f64());
+        let top_k = obj
+            .get("generationConfig")
+            .and_then(|gc| gc.get("topK"))
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
+        let stop = crate::ir::read_stop_sequences(
+            obj.get("generationConfig")
+                .and_then(|gc| gc.get("stopSequences")),
+        );
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Collect unmodeled top-level keys into extra (excluding modeled ones). `model` is in the
@@ -409,6 +423,9 @@ impl ProtocolReader for GeminiReader {
             tools,
             max_tokens,
             temperature,
+            top_p,
+            top_k,
+            stop,
             stream,
             extra,
         })
@@ -1098,13 +1115,23 @@ impl ProtocolWriter for GeminiWriter {
             );
         }
 
-        // generationConfig{maxOutputTokens, temperature}
+        // generationConfig{maxOutputTokens, temperature, topP, topK, stopSequences}
         let mut gen_config = serde_json::Map::new();
         if let Some(max_tokens) = req.max_tokens {
             gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(max_tokens));
         }
         if let Some(temperature) = req.temperature {
             gen_config.insert("temperature".to_string(), serde_json::json!(temperature));
+        }
+        // Promoted sampling controls in Gemini's native generationConfig shape.
+        if let Some(top_p) = req.top_p {
+            gen_config.insert("topP".to_string(), serde_json::json!(top_p));
+        }
+        if let Some(top_k) = req.top_k {
+            gen_config.insert("topK".to_string(), serde_json::json!(top_k));
+        }
+        if !req.stop.is_empty() {
+            gen_config.insert("stopSequences".to_string(), serde_json::json!(req.stop));
         }
         if !gen_config.is_empty() {
             out.insert(
@@ -2329,6 +2356,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: true,
             extra: serde_json::Map::new(),
         };
@@ -2467,6 +2497,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2507,6 +2540,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3301,6 +3337,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3334,6 +3373,9 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
             stream: false,
             extra: serde_json::Map::new(),
         };
