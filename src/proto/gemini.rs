@@ -1006,7 +1006,15 @@ impl ProtocolWriter for GeminiWriter {
         for msg in &req.messages {
             let role_str = match msg.role {
                 crate::ir::IrRole::User => "user",
-                crate::ir::IrRole::Assistant | crate::ir::IrRole::Tool => "model",
+                crate::ir::IrRole::Assistant => "model",
+                // A Tool-role IR message carries `ToolResult` blocks, emitted below as Gemini
+                // `functionResponse` parts. In the native Gemini GenerateContentRequest schema a
+                // `functionResponse` MUST be sent under a `user`-side turn: the `model` role is
+                // exclusively the assistant's turn (which produces `functionCall`s, never
+                // `functionResponse`s). Emitting a `functionResponse` under `role:"model"` is a
+                // non-native shape the real Gemini API / google-genai SDK rejects. Map Tool →
+                // "user" (matching the Bedrock writer's `toolResult` handling).
+                crate::ir::IrRole::Tool => "user",
                 crate::ir::IrRole::System => continue, // Already in systemInstruction
             };
 
@@ -3545,6 +3553,98 @@ mod tests {
         assert!(
             headers.is_empty(),
             "a control-byte credential must omit the auth header: {headers:?}"
+        );
+    }
+
+    /// HIGH/correctness regression: a Tool-role IR message carries `ToolResult` blocks, which the
+    /// writer emits as Gemini `functionResponse` parts. In the native GenerateContentRequest schema
+    /// a `functionResponse` turn MUST be sent under `role:"user"` — the `model` role is exclusively
+    /// the assistant turn (which produces `functionCall`s). Mapping Tool → "model" emits a
+    /// non-native shape the real Gemini API / google-genai SDK rejects (400 INVALID_ARGUMENT). The
+    /// turn carrying the `functionResponse` must therefore have `role == "user"`, matching the
+    /// Bedrock writer's `toolResult` handling.
+    #[test]
+    fn test_tool_role_maps_to_user_for_function_response() {
+        let writer = GeminiWriter;
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Tool,
+                content: vec![crate::ir::IrBlock::ToolResult {
+                    tool_use_id: "get_weather".to_string(),
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "{\"temp\":21}".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                    is_error: false,
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+
+        let wire = writer.write_request(&req);
+        let content = &wire["contents"][0];
+
+        assert_eq!(
+            content["role"], "user",
+            "a Tool-role message carrying a functionResponse must be emitted under role:\"user\", \
+             never \"model\": {wire}"
+        );
+        // The functionResponse part must still be present and correctly shaped under that turn.
+        let fr = &content["parts"][0]["functionResponse"];
+        assert_eq!(
+            fr["name"], "get_weather",
+            "functionResponse must name the tool: {wire}"
+        );
+        assert_eq!(
+            fr["response"]["temp"], 21,
+            "structured JSON tool output must be forwarded verbatim: {wire}"
+        );
+    }
+
+    /// HIGH/correctness regression: an Assistant-role message carrying a `functionCall` (ToolUse)
+    /// must still be emitted under `role:"model"` — the fix to the Tool role must NOT regress the
+    /// assistant mapping, since `functionCall`s are exclusively a model-turn shape.
+    #[test]
+    fn test_assistant_tool_use_stays_model_role() {
+        let writer = GeminiWriter;
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Assistant,
+                content: vec![crate::ir::IrBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    input: serde_json::json!({ "city": "SF" }),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+
+        let wire = writer.write_request(&req);
+        let content = &wire["contents"][0];
+        assert_eq!(
+            content["role"], "model",
+            "an Assistant functionCall turn must stay role:\"model\": {wire}"
+        );
+        assert_eq!(
+            content["parts"][0]["functionCall"]["name"], "get_weather",
+            "functionCall must be preserved under the model turn: {wire}"
         );
     }
 }

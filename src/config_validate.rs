@@ -75,6 +75,36 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 pool_name, pool_name
             ));
         }
+        // Reserved-name check: the auth middleware classifies any request path that is exactly
+        // `/admin` or starts with `/admin/` as the operator admin surface (guarded by the governance
+        // admin_token, NOT a client/virtual-key token). A pool named `admin` is reached at
+        // `POST /admin/v1/messages`, which the middleware intercepts as an admin request — so a
+        // normal client_token / virtual-key holder gets a 401 and the pool is permanently
+        // unreachable; worse, in governance mode the admin branch inserts `GovCtx::default()`
+        // (key: None), so an admin-token holder reaching the pool this way bypasses per-pool
+        // allowed_pools enforcement entirely. The collision also extends to any name whose first
+        // path segment would be `admin` — i.e. a name equal to `admin` or beginning with `admin/`.
+        // Reject these at boot rather than shipping a silently-inaccessible / governance-bypassing
+        // pool. (`reserved_admin_name` centralises the rule so the pool and provider checks — and
+        // the auth-middleware `is_admin` boundary — cannot drift.)
+        if reserved_admin_name(pool_name) {
+            errors.push(format!(
+                "pool name '{}' is reserved: 'admin' is a built-in management prefix (the auth middleware routes /admin and /admin/* to the operator admin surface), so a pool reachable via that path is unreachable to clients and bypasses per-pool governance; rename it",
+                pool_name
+            ));
+        }
+    }
+
+    // The same reserved-prefix collision applies to PROVIDER names: a provider named `admin` is
+    // reachable via the adhoc route `POST /admin/<model>/v1/messages`, which the auth middleware
+    // intercepts as an admin request for the identical reason. Reject it symmetrically.
+    for provider_name in cfg.providers.keys() {
+        if reserved_admin_name(provider_name) {
+            errors.push(format!(
+                "provider name '{}' is reserved: 'admin' is a built-in management prefix (the auth middleware routes /admin and /admin/* to the operator admin surface), so a provider reachable via the adhoc /admin/<model> route is unreachable to clients; rename it",
+                provider_name
+            ));
+        }
     }
 
     // Rule 4: Validate error_map values on every provider. An EMPTY error_map is valid — a provider
@@ -293,8 +323,24 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     );
                 }
             }
-            // Passthrough/None carry no token-allowlist requirement.
-            Some(crate::auth::AuthMode::Passthrough) | Some(crate::auth::AuthMode::None) => {}
+            // Passthrough carries no token-allowlist requirement.
+            Some(crate::auth::AuthMode::Passthrough) => {}
+            Some(crate::auth::AuthMode::None) => {
+                // mode=none is an open relay: `validate_token` admits every request unconditionally,
+                // so a configured `client_tokens` allowlist has ZERO enforcement effect. An operator
+                // who set BOTH `mode: none` and a `client_tokens` list believes the list constrains
+                // access while the server is wide open. This is not a hard boot error (none mode is
+                // intentionally permissive and may be deliberate in dev), but it MUST be loud — warn
+                // here at boot (config-visible) in addition to the runtime warning AuthMiddleware::new
+                // emits. NB: this is a no-op when no tokens are listed (the common none-mode case).
+                if !effective_client_tokens_empty(auth) {
+                    tracing::warn!(
+                        "auth.mode=none ignores the configured client_tokens: None mode is an open \
+                         relay that admits every request regardless of token, so the allowlist has \
+                         no enforcement effect. Set auth.mode=token to enforce it."
+                    );
+                }
+            }
         }
     }
 
@@ -354,6 +400,21 @@ pub(crate) fn validate_governance(
     } else {
         Err(errors)
     }
+}
+
+/// True when a pool / provider `name` would collide with the built-in `/admin` operator surface.
+///
+/// The auth middleware (`auth::auth_middleware`) classifies a request as admin with the
+/// PATH-BOUNDARY-SAFE test `path == "/admin" || path.starts_with("/admin/")` — deliberately NOT a
+/// bare `starts_with("/admin")`, so sibling names like `adminx` / `admin_portal` are NOT admin
+/// (see `test_admin_prefix_is_boundary_safe`). A pool/provider name lands as a path SEGMENT
+/// (`/<name>/v1/messages`, or `/admin/<model>/...` for the adhoc provider route), so a name collides
+/// with the admin surface IFF the segment is exactly `admin`. We mirror that exact boundary here
+/// rather than the finding's looser `starts_with("admin")` (which would wrongly reject the safe
+/// `adminx` the boundary test proves is a normal route). A name containing a `/` could also smuggle
+/// an `admin/` first segment, so reject that family too.
+fn reserved_admin_name(name: &str) -> bool {
+    name == "admin" || name.starts_with("admin/") || name.split('/').next() == Some("admin")
 }
 
 /// True when an `AuthCfg` would resolve to an empty client-token allowlist after `normalize()`.
@@ -1166,6 +1227,68 @@ mod tests {
             errs.iter()
                 .any(|e| e.contains("conflicts with model name") && e.contains("mymodel")),
             "expected a pool/model name-collision error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_pool_named_admin() {
+        // A pool named `admin` is reached at `/admin/v1/messages`, which the auth middleware
+        // intercepts as the operator admin surface — making the pool unreachable to clients and
+        // (in governance mode) bypassing per-pool enforcement. Must fail loud at boot.
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        pools.insert("admin".to_string(), make_pool(vec![make_member("mymodel")]));
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg).expect_err("a pool named 'admin' must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("pool name 'admin' is reserved")),
+            "expected a reserved-admin-name error for the pool; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_provider_named_admin() {
+        // A provider named `admin` is reachable via the adhoc route `/admin/<model>/v1/messages`,
+        // which the auth middleware likewise intercepts as the admin surface. Reject symmetrically.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "admin".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        let errs = validate(&cfg).expect_err("a provider named 'admin' must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("provider name 'admin' is reserved")),
+            "expected a reserved-admin-name error for the provider; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_allows_admin_prefixed_but_boundary_safe_names() {
+        // The reserved check mirrors the auth middleware's PATH-BOUNDARY-SAFE `is_admin` test: only
+        // the exact `admin` segment collides. `adminx` / `administrative` / `admin-pool` are normal
+        // routes (proven by test_admin_prefix_is_boundary_safe in auth.rs) and must NOT be rejected.
+        for name in ["adminx", "administrative", "admin-pool", "admin_portal"] {
+            assert!(
+                !reserved_admin_name(name),
+                "'{name}' is a boundary-safe name and must not be treated as reserved"
+            );
+        }
+        assert!(reserved_admin_name("admin"), "'admin' must be reserved");
+
+        // A full validate() pass with an `adminx` pool must succeed (no reserved-name error).
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        pools.insert(
+            "adminx".to_string(),
+            make_pool(vec![make_member("mymodel")]),
+        );
+        let cfg = make_root_cfg(providers, models, pools);
+        assert!(
+            validate(&cfg).is_ok(),
+            "an 'adminx' pool is boundary-safe and must validate"
         );
     }
 

@@ -1426,4 +1426,45 @@ mod tests {
             "re-created key must not inherit the deleted key's usage"
         );
     }
+
+    #[test]
+    fn test_poisoned_conn_lock_recovers_not_panics() {
+        // Regression: a panic while the SqliteStore `conn` Mutex is held poisons it. Every `Store`
+        // method acquires the connection via `lock_conn`, which must RECOVER (via into_inner)
+        // rather than `.unwrap()`-panic on every subsequent call — otherwise one transient panic
+        // permanently disables governance persistence (and, via spawn_blocking join, silently fails
+        // budget enforcement OPEN). We deliberately poison the lock, then assert the durable
+        // read/write path still functions.
+        use std::sync::Arc;
+
+        let s = Arc::new(SqliteStore::open_in_memory().unwrap());
+        s.add_usage("k_poison", 100, 10, 50, true).unwrap();
+
+        // Poison the connection Mutex: panic while holding the guard.
+        let s2 = Arc::clone(&s);
+        let _ = std::thread::spawn(move || {
+            let _guard = s2.conn.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(
+            s.conn.is_poisoned(),
+            "conn lock must be poisoned for the test"
+        );
+
+        // Despite the poison, durable access keeps working (no panic): reads recover the guard,
+        // and writes continue to accrue correctly on the recovered (still-consistent) connection.
+        assert_eq!(
+            s.get_usage("k_poison", 100).unwrap().requests,
+            1,
+            "get_usage must recover the poisoned conn lock instead of panicking"
+        );
+        s.add_usage("k_poison", 100, 5, 25, true).unwrap();
+        let u = s.get_usage("k_poison", 100).unwrap();
+        assert_eq!(
+            (u.requests, u.spend_cents, u.tokens),
+            (2, 15, 75),
+            "writes must keep accruing on a recovered (poisoned) conn lock"
+        );
+    }
 }

@@ -85,10 +85,25 @@ impl AuthMiddleware {
         // exactly once; just clone the resolved values.
         let tokens: Vec<String> = cfg.client_tokens.clone();
 
-        if mode == AuthMode::None && tokens.is_empty() {
-            tracing::warn!(
-                "auth.mode=none (open relay) — only acceptable for dev; reject in production"
-            );
+        if mode == AuthMode::None {
+            if tokens.is_empty() {
+                tracing::warn!(
+                    "auth.mode=none (open relay) — only acceptable for dev; reject in production"
+                );
+            } else {
+                // `validate_token` admits unconditionally in None mode (see below), so a configured
+                // `client_tokens` allowlist has ZERO enforcement effect here. An operator who set
+                // BOTH `mode: none` and a `client_tokens` list in the belief the list constrains
+                // access is running an unrestricted open relay while their config reads as secured.
+                // Warn loudly that the listed tokens are inert (mirrored at boot in
+                // `config_validate::validate`, which can see the config before this runs).
+                tracing::warn!(
+                    "auth.mode=none ignores the configured client_tokens ({} listed): None mode is \
+                     an open relay and admits every request regardless of token. The allowlist has \
+                     no effect — set auth.mode=token to enforce it.",
+                    tokens.len()
+                );
+            }
         }
 
         Self {
@@ -237,12 +252,15 @@ fn vendor_auth_failure_message(proto: &str) -> &'static str {
 ///     "INVALID_ARGUMENT"` (google.rpc.Code; the gemini writer maps `invalid_request_error` →
 ///     INVALID_ARGUMENT and echoes `code: 400`). A 401/UNAUTHENTICATED body would be a tell the
 ///     google-genai SDK never sees from real Google on the bad-key path.
-///   - openai / responses → HTTP 401 + "invalid_request_error": the genuine OpenAI/Responses bad-key
-///     401 body carries `error.type: "invalid_request_error"` (NOT "authentication_error") with
-///     `code: "invalid_api_key"`. The writers map `invalid_request_error` → that type, so passing
-///     this kind matches the real `error.type`. (The writers always emit `code: null`; the
-///     `code: "invalid_api_key"` field is a writer-level detail outside this unit and is not
-///     synthesised here.)
+///   - openai / responses → HTTP 401 + "authentication_error": the genuine OpenAI/Responses bad-key
+///     401 body carries `error.code: "invalid_api_key"`, and the official SDKs surface that value as
+///     `AuthenticationError.code`. Emitting `code: null` is a deterministic proxy tell a native SDK
+///     keys its typed-exception comparison off. The openai/responses writers pair
+///     `code: "invalid_api_key"` ONLY with `error.type: "authentication_error"` (see
+///     `openai_error_code`/`responses_error_code`); the alternate `invalid_request_error` type maps
+///     to `code: null`. We therefore pass `authentication_error` here so the wire body carries the
+///     real `code: "invalid_api_key"` pairing — matching the modern OpenAI bad-key shape the writers
+///     document — rather than the `code: null` tell.
 ///   - anthropic / cohere / unknown → HTTP 401 + "authentication_error": the standard
 ///     bad-credential shape for those vendors.
 ///
@@ -252,7 +270,7 @@ pub(crate) fn auth_failure_status_and_kind(proto: &str) -> (StatusCode, &'static
     match proto {
         "bedrock" => (StatusCode::FORBIDDEN, "auth"),
         "gemini" => (StatusCode::BAD_REQUEST, "invalid_request_error"),
-        "openai" | "responses" => (StatusCode::UNAUTHORIZED, "invalid_request_error"),
+        "openai" | "responses" => (StatusCode::UNAUTHORIZED, "authentication_error"),
         "anthropic" | "cohere" => (StatusCode::UNAUTHORIZED, "authentication_error"),
         _ => (StatusCode::UNAUTHORIZED, "authentication_error"),
     }
@@ -617,6 +635,26 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_mode_none_with_client_tokens_is_inert_open_relay() {
+        // Regression (MEDIUM/correctness): `mode: none` together with a non-empty client_tokens list
+        // is an open relay — the listed tokens have ZERO enforcement effect. The constructor must not
+        // panic, must preserve the configured tokens, and `validate_token` must still admit EVERY
+        // request (including a token NOT in the list, and no token at all), proving the allowlist is
+        // inert. (A startup warning is emitted but is not asserted here — behaviour is the contract.)
+        let cfg = AuthCfg {
+            mode: "none".to_string(),
+            client_tokens: vec!["listed-but-ignored".to_string()],
+            _legacy_token: None,
+        };
+        let mw = AuthMiddleware::new(&cfg);
+        assert_eq!(mw.client_tokens, vec!["listed-but-ignored".to_string()]);
+        // Open relay: a token NOT on the list is admitted (the list does not constrain access).
+        assert!(mw.validate_token(Some("some-other-token")));
+        // And so is no token at all.
+        assert!(mw.validate_token(None));
+    }
+
+    #[test]
     fn test_auth_mode_invalid() {
         let cfg = AuthCfg {
             mode: "invalid".to_string(),
@@ -738,6 +776,56 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_client_token_non_bearer_authorization_falls_through_to_x_api_key() {
+        // A PRESENT but non-Bearer Authorization header (AWS SigV4, or Basic) must NOT short-circuit
+        // extract_client_token to None: extract_bearer_token returns None for these schemes, so the
+        // code must FALL THROUGH to x-api-key. This is the bedrock-SigV4-plus-vendor-key shape the
+        // multi-scheme design targets (a client signs the upstream request with SigV4 in
+        // Authorization while carrying the busbar token in x-api-key). A regression that made any
+        // present Authorization header short-circuit would silently break those clients yet pass
+        // every bearer-only / carrier-only test.
+        for non_bearer in [
+            "AWS4-HMAC-SHA256 Credential=AKIA.../20240101/us-east-1/bedrock/aws4_request, \
+             SignedHeaders=host;x-amz-date, Signature=deadbeef",
+            "Basic dXNlcjpwYXNz",
+        ] {
+            let req = Request::builder()
+                .uri("/v1/messages")
+                .header("authorization", non_bearer)
+                .header("x-api-key", "tok")
+                .body(Body::empty())
+                .expect("test request must build");
+            assert_eq!(
+                AuthMiddleware::extract_client_token(&req),
+                Some("tok".to_string()),
+                "a non-bearer Authorization ('{non_bearer}') must fall through to x-api-key"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_client_token_non_bearer_authorization_falls_through_to_x_goog_api_key() {
+        // Symmetric to the x-api-key case: a present-but-non-bearer Authorization must fall through
+        // PAST the (empty/absent) x-api-key carrier all the way to x-goog-api-key, locking the full
+        // multi-scheme chain. A regression short-circuiting on the non-bearer Authorization, or one
+        // that stopped after x-api-key, would be caught here.
+        let req = Request::builder()
+            .uri("/v1/messages")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKIA.../bedrock/aws4_request",
+            )
+            .header("x-goog-api-key", "goog-tok")
+            .body(Body::empty())
+            .expect("test request must build");
+        assert_eq!(
+            AuthMiddleware::extract_client_token(&req),
+            Some("goog-tok".to_string()),
+            "a non-bearer Authorization must fall through to x-goog-api-key"
+        );
+    }
+
+    #[test]
     fn test_proto_for_path_inference() {
         assert_eq!(
             proto_for_path("/v1beta/models/gemini-1.5:generateContent"),
@@ -843,9 +931,12 @@ mod tests {
             "anthropic error.type: {body}"
         );
 
-        // OpenAI → {"error":{"type":"invalid_request_error",..}} (no top-level type=error). The
-        // genuine OpenAI bad-key 401 body carries `error.type: "invalid_request_error"` (NOT
-        // "authentication_error"), so the envelope must match that on the most common failure path.
+        // OpenAI → {"error":{"type":"authentication_error","code":"invalid_api_key",..}} (no
+        // top-level type=error). The genuine OpenAI bad-key 401 body carries
+        // `error.code: "invalid_api_key"`, which the official SDK surfaces as
+        // `AuthenticationError.code`; emitting `code: null` is a deterministic proxy tell. The
+        // writers pair that code ONLY with `error.type: "authentication_error"`, so the envelope
+        // must carry that pairing on the most common failure path.
         let resp = unauthorized_response("/v1/chat/completions");
         assert_eq!(
             resp.status(),
@@ -858,17 +949,25 @@ mod tests {
             "openai must NOT carry a top-level type: {body}"
         );
         assert_eq!(
-            body["error"]["type"], "invalid_request_error",
+            body["error"]["type"], "authentication_error",
             "openai error.type must match the real bad-key body: {body}"
         );
+        assert_eq!(
+            body["error"]["code"], "invalid_api_key",
+            "openai bad-key body must carry code=invalid_api_key (not null), the SDK-visible tell: {body}"
+        );
 
-        // Responses → {"error":{"type":"invalid_request_error","code":null,"param":null,..}} (same
-        // OpenAI-family bad-key shape).
+        // Responses → {"error":{"type":"authentication_error","code":"invalid_api_key","param":null,..}}
+        // (same OpenAI-family bad-key shape, with the SDK-visible code populated).
         let resp = unauthorized_response("/v1/responses");
         let body = decode_body(resp);
         assert_eq!(
-            body["error"]["type"], "invalid_request_error",
+            body["error"]["type"], "authentication_error",
             "responses error.type must match the real bad-key body: {body}"
+        );
+        assert_eq!(
+            body["error"]["code"], "invalid_api_key",
+            "responses bad-key body must carry code=invalid_api_key (not null): {body}"
         );
         assert!(
             body["error"].get("param").is_some(),
@@ -1263,8 +1362,9 @@ mod tests {
             "cohere 401 must be the bare envelope (no error/type): {env}"
         );
 
-        // Responses `/v1/responses` → {"error":{"type":"invalid_request_error",..}} (the genuine
-        // OpenAI-family bad-key 401 carries invalid_request_error, not authentication_error).
+        // Responses `/v1/responses` → {"error":{"type":"authentication_error","code":"invalid_api_key",..}}
+        // (the genuine OpenAI-family bad-key 401 carries the SDK-visible code=invalid_api_key, which
+        // the writers pair with type=authentication_error).
         let r_resp = client
             .post(format!("http://{addr}/v1/responses"))
             .header("x-api-key", "wrong-token")
@@ -1282,8 +1382,12 @@ mod tests {
         );
         let env: serde_json::Value = r_resp.json().await.unwrap();
         assert_eq!(
-            env["error"]["type"], "invalid_request_error",
-            "responses 401 must carry error.type=invalid_request_error: {env}"
+            env["error"]["type"], "authentication_error",
+            "responses 401 must carry error.type=authentication_error: {env}"
+        );
+        assert_eq!(
+            env["error"]["code"], "invalid_api_key",
+            "responses 401 must carry the SDK-visible code=invalid_api_key (not null): {env}"
         );
 
         handle.abort();

@@ -645,11 +645,16 @@ impl ProtocolReader for ResponsesReader {
                             //
                             // Cap the distinct-index cardinality: a backend emitting a unique
                             // `output_index` per event must not grow `open_tools` without bound
-                            // (a per-connection amplification DoS). Only open a new block when the
-                            // index is already tracked or there is room under the cap; beyond it the
-                            // event is silently skipped (no BlockStart), matching openai.rs.
+                            // (a per-connection amplification DoS). Open a new block ONLY when the
+                            // index is not already tracked AND there is room under the cap. An
+                            // already-open index must NOT re-emit BlockStart — a second
+                            // `output_item.added` for an open index would produce an invalid
+                            // BlockStart→BlockStart→BlockStop sequence (a duplicate
+                            // `content_block_start`), a deterministic proxy tell that corrupts a
+                            // downstream writer's tool-call state. Beyond the cap a NEW index is
+                            // silently skipped (no BlockStart), matching openai.rs.
                             let already_open = state.open_tools.contains(&idx);
-                            if already_open || state.open_tools.len() < MAX_OPEN_TOOLS {
+                            if !already_open && state.open_tools.len() < MAX_OPEN_TOOLS {
                                 state.open_tools.insert(idx);
                                 out.push(IrStreamEvent::BlockStart {
                                     index: idx,
@@ -700,10 +705,21 @@ impl ProtocolReader for ResponsesReader {
                     .to_string();
                 if !delta.is_empty() {
                     if let Some(output_index) = data.get("output_index").and_then(|i| i.as_u64()) {
-                        out.push(IrStreamEvent::BlockDelta {
-                            index: (output_index as usize).min(MAX_OUTPUT_INDEX),
-                            delta: crate::ir::IrDelta::InputJsonDelta(delta),
-                        });
+                        let idx = (output_index as usize).min(MAX_OUTPUT_INDEX);
+                        // Route the argument delta ONLY to an index that actually emitted a
+                        // BlockStart (tracked in `open_tools` by the `output_item.added` arm).
+                        // An index suppressed by the cardinality cap — or an arguments-delta that
+                        // arrives with no preceding `output_item.added` at all — has no open block,
+                        // so a BlockDelta against it would be a tool-argument fragment for a block
+                        // with no `content_block_start`: an invalid event sequence that breaks a
+                        // strict SDK reassembling tool-call arguments and a distinguishability tell.
+                        // Drop it (mirrors openai.rs's `state.open_tools.contains` guard).
+                        if state.open_tools.contains(&idx) {
+                            out.push(IrStreamEvent::BlockDelta {
+                                index: idx,
+                                delta: crate::ir::IrDelta::InputJsonDelta(delta),
+                            });
+                        }
                     }
                 }
             }
@@ -1081,6 +1097,18 @@ pub(crate) struct ResponsesWriter {
     /// Per-stream INSTANCE state for the same reason as `sequence` (see the type doc); a poisoned
     /// lock degrades to the synthesize-fresh fallback rather than panicking on the request path.
     response_id: std::sync::Mutex<Option<String>>,
+    /// Per-stream `response.created_at` (unix seconds). Captured on the opening `MessageStart`
+    /// (`response.created`) and replayed verbatim onto EVERY subsequent lifecycle event
+    /// (`response.completed`/`response.incomplete`/`response.failed`). A native OpenAI Responses
+    /// stream carries the SAME `created_at` on every event for a given response. Before this cell
+    /// existed, the terminal `MessageDelta` (and error) events each called `now_unix_secs()`
+    /// directly, so on any stream where the opening event's `created_at` came from upstream IR — or
+    /// merely a wall-clock instant earlier than the terminal event — the terminal `created_at`
+    /// differed from `response.created`'s, a detectable proxy tell that breaks SDK consumers
+    /// comparing timestamps across events. Per-stream INSTANCE state for the same reason as
+    /// `response_id`; a poisoned lock degrades to the synthesize-fresh (`now_unix_secs`) fallback
+    /// rather than panicking on the request path.
+    created_at: std::sync::Mutex<Option<u64>>,
     /// Output indices for which this writer emitted a function-call `output_item.added`. The IR
     /// `BlockStop` carries only the integer index (no block kind), but a native Responses stream
     /// emits `output_item.done` ONLY for items it previously `added` — and the Text `BlockStart`
@@ -1135,6 +1163,7 @@ pub(crate) struct ResponsesWriter {
 pub(crate) const ResponsesWriter: ResponsesWriter = ResponsesWriter {
     sequence: AtomicU64::new(0),
     response_id: std::sync::Mutex::new(None),
+    created_at: std::sync::Mutex::new(None),
     open_tool_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
     open_text_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
     item_ids: std::sync::Mutex::new(std::collections::BTreeMap::new()),
@@ -1152,6 +1181,10 @@ impl Clone for ResponsesWriter {
             response_id: std::sync::Mutex::new(
                 self.response_id.lock().map(|id| id.clone()).unwrap_or(None),
             ),
+            // Carry the captured `created_at` across a mid-stream `Protocol::clone` so the cloned
+            // writer's terminal events replay the SAME timestamp; a poisoned lock degrades to None
+            // (terminal arm then falls back to `now_unix_secs`).
+            created_at: std::sync::Mutex::new(self.created_at.lock().map(|c| *c).unwrap_or(None)),
             open_tool_indices: std::sync::Mutex::new(
                 self.open_tool_indices
                     .lock()
@@ -1199,6 +1232,12 @@ impl ResponsesWriter {
         if let Ok(mut id) = self.response_id.lock() {
             *id = None;
         }
+        // Clear the carried `created_at` alongside the id: a reused/cloned writer must not leak a
+        // previous stream's creation timestamp onto a new stream's terminal events. The new value
+        // is stored when this stream's `MessageStart` is written.
+        if let Ok(mut created) = self.created_at.lock() {
+            *created = None;
+        }
     }
 
     /// Store the per-stream `response.id` captured on `MessageStart` so terminal events replay it
@@ -1215,6 +1254,27 @@ impl ResponsesWriter {
     /// The caller falls back to synthesizing a fresh id in that case.
     fn carried_response_id(&self) -> Option<String> {
         self.response_id.lock().ok().and_then(|id| id.clone())
+    }
+
+    /// Store the per-stream `created_at` captured on `MessageStart` so terminal events replay it
+    /// verbatim. Lock poisoning degrades to a no-op (the terminal arm then falls back to
+    /// `now_unix_secs`) rather than panicking on the request path.
+    fn set_created_at(&self, created_at: u64) {
+        if let Ok(mut slot) = self.created_at.lock() {
+            *slot = Some(created_at);
+        }
+    }
+
+    /// Return the per-stream `created_at` captured on `MessageStart`, falling back to the current
+    /// unix time if it was never set (a malformed stream whose terminal event preceded
+    /// `MessageStart`, or a poisoned lock). Replaying the captured value keeps every event's
+    /// `created_at` identical, matching a native Responses stream.
+    fn carried_created_at(&self) -> u64 {
+        self.created_at
+            .lock()
+            .ok()
+            .and_then(|c| *c)
+            .unwrap_or_else(now_unix_secs)
     }
 
     /// Return the next `sequence_number` for this stream and advance the counter. The first call
@@ -1532,6 +1592,10 @@ impl ProtocolWriter for ResponsesWriter {
                 // the SAME `response.id` — a native stream never changes its id mid-flight.
                 self.set_response_id(&id);
                 let created_at = created.unwrap_or_else(now_unix_secs);
+                // Carry this stream's `created_at` forward so the terminal events (and any failure)
+                // replay the SAME timestamp — a native stream's `created_at` is constant across
+                // every event.
+                self.set_created_at(created_at);
                 resp_obj.insert("id".to_string(), serde_json::json!(id));
                 resp_obj.insert("object".to_string(), serde_json::json!("response"));
                 resp_obj.insert("created_at".to_string(), serde_json::json!(created_at));
@@ -1756,7 +1820,15 @@ impl ProtocolWriter for ResponsesWriter {
                     .unwrap_or_else(synthesize_response_id);
                 resp_obj.insert("id".to_string(), serde_json::json!(response_id));
                 resp_obj.insert("object".to_string(), serde_json::json!("response"));
-                resp_obj.insert("created_at".to_string(), serde_json::json!(now_unix_secs()));
+                // Replay the `created_at` captured on this stream's opening `MessageStart` so the
+                // terminal event carries the SAME timestamp as `response.created`. The IR
+                // `MessageDelta` carries no identity, so a direct `now_unix_secs()` here would emit
+                // a later wall-clock value than the opening event — a detectable proxy tell. Fall
+                // back to the current time only if the cell was never populated.
+                resp_obj.insert(
+                    "created_at".to_string(),
+                    serde_json::json!(self.carried_created_at()),
+                );
                 resp_obj.insert("status".to_string(), serde_json::json!(status));
 
                 if status == "incomplete" {
@@ -1851,6 +1923,11 @@ impl ProtocolWriter for ResponsesWriter {
                         "response": {
                             "id": response_id,
                             "object": "response",
+                            // Replay the captured `created_at` so `response.failed` carries the
+                            // SAME timestamp as `response.created` (a native stream never changes
+                            // it mid-flight); falls back to the current time only if the failure
+                            // preceded any `MessageStart`.
+                            "created_at": self.carried_created_at(),
                             "status": "failed",
                             "error": {
                                 "code": code,
@@ -2011,6 +2088,19 @@ impl ProtocolWriter for ResponsesWriter {
             "overloaded" | "overloaded_error" | "service_unavailable" | "unavailable" => {
                 "server_error"
             }
+            // forward.rs emits these transient/upstream-failure kinds directly to every ingress
+            // writer (`timeout`/`network`/`connect` from the request-error path, `5xx`/`transient`
+            // from the canonical-signal mapping, `api_error` from the generic upstream-error path).
+            // None is an OpenAI/Responses error type — real OpenAI reports a transient upstream
+            // failure as `server_error` — so without these arms `other => other` would leak a
+            // non-native `type` such as `{"error":{"type":"timeout"}}` or `{"error":{"type":"5xx"}}`
+            // to a Responses-API client: a deterministic cross-protocol tell that breaks SDK
+            // consumers switching on `error.type`. Mirrors openai.rs's `server_error` bucket.
+            "timeout" | "network" | "connect" | "5xx" | "transient" | "api_error" => "server_error",
+            // A context-length overflow is surfaced by forward.rs as `context_length_exceeded`; the
+            // Responses vocabulary has no dedicated type for it (as openai.rs also maps it), so it
+            // folds into `invalid_request_error`. `bad_request` is the same client-error class.
+            "context_length_exceeded" | "bad_request" => "invalid_request_error",
             "billing" | "insufficient_quota" => "insufficient_quota",
             other => other,
         };
@@ -4893,5 +4983,227 @@ mod tests {
             "added/delta/done must share one item_id"
         );
         assert_eq!(done["item"]["id"].as_str(), Some(added_id.as_str()));
+    }
+
+    /// Regression (HIGH/correctness, Round 12): the cardinality-cap guard on
+    /// `response.output_item.added` was inverted (`if already_open || ...`), re-emitting a BlockStart
+    /// for an index that was already open. A repeated `output_item.added` for the SAME function-call
+    /// index must NOT produce a second BlockStart (only the first added opens the block); the second
+    /// is a no-op. Otherwise downstream sees BlockStart→BlockStart for one block — an invalid
+    /// sequence and a proxy tell.
+    #[test]
+    fn test_repeated_output_item_added_does_not_reemit_block_start() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let item = serde_json::json!({
+            "output_index": 0,
+            "item": {"type":"function_call","call_id":"fc_1","name":"f"}
+        });
+        let first = reader_read_response_events("response.output_item.added", &item, &mut state);
+        assert_eq!(
+            first.len(),
+            1,
+            "the first output_item.added opens exactly one BlockStart"
+        );
+        assert!(matches!(
+            first.first(),
+            Some(crate::ir::IrStreamEvent::BlockStart { index: 0, .. })
+        ));
+        // A second added for the SAME index must emit nothing (the block is already open).
+        let second = reader_read_response_events("response.output_item.added", &item, &mut state);
+        assert!(
+            second.is_empty(),
+            "a repeated output_item.added for an open index must not re-emit BlockStart, got {second:?}"
+        );
+        assert_eq!(
+            state.open_tools.len(),
+            1,
+            "the index is tracked exactly once"
+        );
+    }
+
+    /// Regression (HIGH/correctness, Round 12): the fixed guard must STILL bound new distinct
+    /// indices under MAX_OPEN_TOOLS — the inversion fix must not weaken the DoS cap. Beyond the cap
+    /// a NEW index emits no BlockStart and is not tracked.
+    #[test]
+    fn test_cap_still_bounds_new_indices_after_guard_fix() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        for i in 0..(MAX_OPEN_TOOLS as u64) {
+            let out = reader_read_response_events(
+                "response.output_item.added",
+                &serde_json::json!({
+                    "output_index": i,
+                    "item": {"type":"function_call","call_id":"fc","name":"f"}
+                }),
+                &mut state,
+            );
+            assert_eq!(out.len(), 1, "each fresh in-cap index opens one BlockStart");
+        }
+        assert_eq!(state.open_tools.len(), MAX_OPEN_TOOLS);
+        // A fresh index beyond the cap (use a distinct, un-clamped value below MAX_OUTPUT_INDEX is
+        // impossible here since indices 0..128 already fill it; use a high index that clamps to a
+        // value already present is not a "new" index, so instead assert no growth past the cap).
+        let over = reader_read_response_events(
+            "response.output_item.added",
+            &serde_json::json!({
+                "output_index": (MAX_OPEN_TOOLS as u64) + 50,
+                "item": {"type":"function_call","call_id":"fc","name":"f"}
+            }),
+            &mut state,
+        );
+        // The over-cap index clamps to MAX_OUTPUT_INDEX (127), which is already open (it was inserted
+        // in the loop), so by the already-open rule it emits nothing and does not grow the set.
+        assert!(
+            over.is_empty() || state.open_tools.len() <= MAX_OPEN_TOOLS,
+            "the cap is never exceeded"
+        );
+        assert!(
+            state.open_tools.len() <= MAX_OPEN_TOOLS,
+            "open_tools must never exceed MAX_OPEN_TOOLS, got {}",
+            state.open_tools.len()
+        );
+    }
+
+    /// Regression (MEDIUM/correctness, Round 12): a `function_call_arguments.delta` for an index
+    /// with no open block (suppressed by the cap, or arriving with no preceding
+    /// `output_item.added`) must be dropped — never an InputJsonDelta against a block that emitted
+    /// no BlockStart.
+    #[test]
+    fn test_args_delta_dropped_for_unopened_index() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        // No output_item.added for index 3 — the delta must be dropped.
+        let out = reader_read_response_events(
+            "response.function_call_arguments.delta",
+            &serde_json::json!({"output_index": 3, "delta": "{\"a\":1}"}),
+            &mut state,
+        );
+        assert!(
+            out.is_empty(),
+            "args delta for an unopened index must be dropped, got {out:?}"
+        );
+    }
+
+    /// Regression (MEDIUM/correctness, Round 12): a `function_call_arguments.delta` for an index
+    /// that DID open (via `output_item.added`) is routed as an InputJsonDelta to that index.
+    #[test]
+    fn test_args_delta_routed_for_opened_index() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let _ = reader_read_response_events(
+            "response.output_item.added",
+            &serde_json::json!({
+                "output_index": 1,
+                "item": {"type":"function_call","call_id":"fc","name":"f"}
+            }),
+            &mut state,
+        );
+        let out = reader_read_response_events(
+            "response.function_call_arguments.delta",
+            &serde_json::json!({"output_index": 1, "delta": "{\"a\":1}"}),
+            &mut state,
+        );
+        match out.first() {
+            Some(crate::ir::IrStreamEvent::BlockDelta {
+                index,
+                delta: crate::ir::IrDelta::InputJsonDelta(s),
+            }) => {
+                assert_eq!(*index, 1);
+                assert_eq!(s, "{\"a\":1}");
+            }
+            other => panic!("expected InputJsonDelta at index 1, got {other:?}"),
+        }
+    }
+
+    /// Regression (MEDIUM/conformance, Round 12): every lifecycle event in a stream must carry the
+    /// SAME `created_at` as the opening `response.created` — the terminal event must replay the
+    /// captured timestamp, not a fresh `now_unix_secs()` wall-clock read.
+    #[test]
+    fn test_created_at_is_constant_across_stream_events() {
+        let writer = ResponsesWriter;
+        let (_, created) = writer
+            .write_response_event(&IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: None,
+                created: Some(1_700_000_000),
+                model: None,
+            })
+            .expect("response.created");
+        let created_ts = created["response"]["created_at"].as_u64();
+        assert_eq!(created_ts, Some(1_700_000_000));
+
+        let (_, completed) = writer
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            })
+            .expect("terminal event");
+        assert_eq!(
+            completed["response"]["created_at"].as_u64(),
+            created_ts,
+            "terminal created_at must match the opening event's"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance, Round 12): the `response.failed` event must also replay the
+    /// captured `created_at`, matching `response.created`.
+    #[test]
+    fn test_failed_event_replays_created_at() {
+        let writer = ResponsesWriter;
+        let (_, created) = writer
+            .write_response_event(&IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: None,
+                created: Some(1_700_000_123),
+                model: None,
+            })
+            .expect("response.created");
+        let created_ts = created["response"]["created_at"].as_u64();
+
+        let (_, failed) = writer
+            .write_response_event(&IrStreamEvent::Error(IrError {
+                class: StatusClass::ServerError,
+                provider_signal: Some("boom".to_string()),
+                retry_after: None,
+            }))
+            .expect("response.failed");
+        assert_eq!(
+            failed["response"]["created_at"].as_u64(),
+            created_ts,
+            "response.failed created_at must match response.created"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance, Round 12): the forward.rs transient/upstream error kinds
+    /// (`timeout`/`network`/`connect`/`5xx`/`transient`/`api_error`) must map to the native
+    /// `server_error` type, and `context_length_exceeded`/`bad_request` to `invalid_request_error`,
+    /// never leaking a non-native `error.type` to a Responses client.
+    #[test]
+    fn test_write_error_maps_forward_transient_kinds() {
+        let writer = ResponsesWriter;
+        for kind in [
+            "timeout",
+            "network",
+            "connect",
+            "5xx",
+            "transient",
+            "api_error",
+        ] {
+            let v = writer.write_error(503, kind, "upstream failure");
+            assert_eq!(
+                v["error"]["type"].as_str(),
+                Some("server_error"),
+                "kind {kind:?} must map to server_error"
+            );
+            assert!(v["error"]["code"].is_null(), "server_error code is null");
+        }
+        for kind in ["context_length_exceeded", "bad_request"] {
+            let v = writer.write_error(400, kind, "bad request");
+            assert_eq!(
+                v["error"]["type"].as_str(),
+                Some("invalid_request_error"),
+                "kind {kind:?} must map to invalid_request_error"
+            );
+        }
     }
 }

@@ -364,7 +364,14 @@ impl ProtocolReader for AnthropicReader {
                 // `message_start` has no `created` field, so `created` stays None on this path; the
                 // writer synthesizes one only when translating from a protocol that omitted it.
                 let id = msg.get("id").and_then(|i| i.as_str()).map(String::from);
-                let model = msg.get("model").and_then(|m| m.as_str()).map(String::from);
+                // Empty `model` maps to `None`: the writer emits `model: ""` as the mandatory-field
+                // fallback when no source model exists, so reading it back as `None` keeps the
+                // stream-event round-trip idempotent (a real model id is never empty).
+                let model = msg
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
                 Some(IrStreamEvent::MessageStart {
                     role,
                     usage,
@@ -457,21 +464,30 @@ impl ProtocolReader for AnthropicReader {
                     .get("stop_sequence")
                     .and_then(|s| s.as_str())
                     .map(String::from);
-                let usage_val = data.get("usage")?;
+                // `usage` is OPTIONAL on read here: do NOT `?` it. `message_delta` is the terminal
+                // event that carries `stop_reason`/`stop_sequence`, so propagating `None` out of this
+                // closure when `usage` is absent would silently DROP the whole event — the client then
+                // never sees the stop reason and cannot tell whether generation completed. A native
+                // Anthropic stream always includes `usage`, but an Anthropic-compatible backend that
+                // doesn't implement usage counting (or makes it conditional) may omit it; preserve the
+                // event regardless by zero-defaulting the counters when `usage` is missing. This mirrors
+                // the `message_start` reader above, which already maps a missing `usage` to defaults
+                // rather than bailing.
+                let usage_val = data.get("usage");
                 let usage = IrUsage {
                     input_tokens: usage_val
-                        .get("input_tokens")
+                        .and_then(|u| u.get("input_tokens"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
                     output_tokens: usage_val
-                        .get("output_tokens")
+                        .and_then(|u| u.get("output_tokens"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
                     cache_creation_input_tokens: usage_val
-                        .get("cache_creation_input_tokens")
+                        .and_then(|u| u.get("cache_creation_input_tokens"))
                         .and_then(|v| v.as_u64()),
                     cache_read_input_tokens: usage_val
-                        .get("cache_read_input_tokens")
+                        .and_then(|u| u.get("cache_read_input_tokens"))
                         .and_then(|v| v.as_u64()),
                 };
                 Some(IrStreamEvent::MessageDelta {
@@ -578,7 +594,15 @@ impl ProtocolReader for AnthropicReader {
                 .and_then(|v| v.as_u64()),
         };
 
-        let model = obj.get("model").and_then(|m| m.as_str()).map(String::from);
+        // Treat an empty `model` string as absent (`None`). The writer emits `model: ""` as the
+        // mandatory-field fallback when the source carried no model (see `write_response`); mapping
+        // that empty string back to `None` keeps a write→read round-trip IR-idempotent and never
+        // mistakes the placeholder for a real model identifier (a genuine model id is never empty).
+        let model = obj
+            .get("model")
+            .and_then(|m| m.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
 
         // Capture the native response identity so a same-protocol (anthropic→anthropic) passthrough
         // preserves it byte-for-byte. An official SDK's `Message` carries `id` ("msg_<rand>"),
@@ -1150,9 +1174,13 @@ impl ProtocolWriter for AnthropicWriter {
                 msg_obj.insert("id".to_string(), serde_json::json!(msg_id));
                 msg_obj.insert("type".to_string(), serde_json::json!("message"));
                 msg_obj.insert("role".to_string(), serde_json::json!(role_str));
-                if let Some(model_str) = model {
-                    msg_obj.insert("model".to_string(), serde_json::json!(model_str));
-                }
+                // model: same conformance class as the non-stream `write_response` writer — the SDK
+                // types `message_start.message.model` as a REQUIRED non-optional string and reads it to
+                // populate the assembled streaming Message. Emit it UNCONDITIONALLY (empty-string
+                // fallback when the cross-protocol source didn't carry a model), so the skeleton is
+                // structurally valid rather than dropping a mandatory field.
+                let model_str = model.as_deref().unwrap_or("");
+                msg_obj.insert("model".to_string(), serde_json::json!(model_str));
                 msg_obj.insert("content".to_string(), serde_json::Value::Array(Vec::new()));
                 msg_obj.insert("stop_reason".to_string(), serde_json::Value::Null);
                 msg_obj.insert("stop_sequence".to_string(), serde_json::Value::Null);
@@ -1378,10 +1406,14 @@ impl ProtocolWriter for AnthropicWriter {
         obj.insert("type".to_string(), serde_json::json!("message"));
         obj.insert("role".to_string(), serde_json::json!("assistant"));
 
-        // model that served the response (preserved across cross-protocol translation)
-        if let Some(ref model) = resp.model {
-            obj.insert("model".to_string(), serde_json::json!(model));
-        }
+        // model: the official SDKs type `Message.model` as a REQUIRED non-optional string, so a body
+        // that omits it fails to decode (Pydantic/Zod validation error). Emit it UNCONDITIONALLY,
+        // mirroring the `id` handling above. On a cross-protocol path where the egress reader didn't
+        // populate `resp.model` (notably Bedrock→Anthropic, whose `read_response` may not surface a
+        // model), fall back to an empty string so the key is always present and structurally valid
+        // rather than dropping it. Same-protocol passthrough preserves the upstream value verbatim.
+        let model = resp.model.as_deref().unwrap_or("");
+        obj.insert("model".to_string(), serde_json::json!(model));
 
         // content blocks
         let content_array: Vec<serde_json::Value> = resp.content.iter().map(write_block).collect();
@@ -2275,6 +2307,147 @@ mod anthropic_hardening_tests {
                 .get("cache_read_input_tokens")
                 .and_then(|v| v.as_u64()),
             Some(7)
+        );
+    }
+
+    /// Round-12 finding (terminal-event drop class): reading a `message_delta` whose data omits the
+    /// `usage` key must STILL yield the `MessageDelta` event — `usage` is optional on read and must
+    /// not be `?`-propagated, because dropping the event would discard the terminal `stop_reason` and
+    /// leave the client unable to tell whether generation completed. Counters default to zero.
+    #[test]
+    fn read_message_delta_without_usage_preserves_terminal_event() {
+        let data = serde_json::json!({
+            "delta": { "stop_reason": "end_turn", "stop_sequence": null }
+        });
+        let ev = AnthropicReader
+            .read_response_event("message_delta", &data)
+            .expect("message_delta without usage must still parse, not be dropped");
+        match ev {
+            IrStreamEvent::MessageDelta {
+                stop_reason,
+                stop_sequence,
+                usage,
+            } => {
+                assert_eq!(
+                    stop_reason,
+                    Some("end_turn".to_string()),
+                    "terminal stop_reason must survive a missing usage"
+                );
+                assert_eq!(stop_sequence, None);
+                assert_eq!(usage.input_tokens, 0, "missing usage zero-defaults input");
+                assert_eq!(usage.output_tokens, 0, "missing usage zero-defaults output");
+                assert_eq!(usage.cache_creation_input_tokens, None);
+                assert_eq!(usage.cache_read_input_tokens, None);
+            }
+            other => panic!("expected MessageDelta event, got {other:?}"),
+        }
+    }
+
+    /// Round-12 finding (terminal-event drop class): when `usage` IS present on a `message_delta`,
+    /// its counters and optional cache fields flow through verbatim.
+    #[test]
+    fn read_message_delta_with_usage_flows_through() {
+        let data = serde_json::json!({
+            "delta": { "stop_reason": "max_tokens" },
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 22,
+                "cache_creation_input_tokens": 3,
+                "cache_read_input_tokens": 4
+            }
+        });
+        let ev = AnthropicReader
+            .read_response_event("message_delta", &data)
+            .expect("message_delta parses");
+        match ev {
+            IrStreamEvent::MessageDelta { usage, .. } => {
+                assert_eq!(usage.input_tokens, 11);
+                assert_eq!(usage.output_tokens, 22);
+                assert_eq!(usage.cache_creation_input_tokens, Some(3));
+                assert_eq!(usage.cache_read_input_tokens, Some(4));
+            }
+            other => panic!("expected MessageDelta event, got {other:?}"),
+        }
+    }
+
+    /// Round-12 finding (required-`model` conformance class): the non-stream `write_response` must
+    /// emit `model` UNCONDITIONALLY — the official SDKs type `Message.model` as a required string, so
+    /// a body that omits it fails to decode. On a Bedrock→Anthropic path where `resp.model` is None,
+    /// the key must still be present (empty-string fallback), not dropped.
+    #[test]
+    fn write_response_emits_model_even_when_none() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![],
+            stop_reason: None,
+            usage: crate::ir::IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: Some("msg_x".to_string()),
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = AnthropicWriter.write_response(&resp);
+        assert_eq!(
+            out.get("model").and_then(|v| v.as_str()),
+            Some(""),
+            "model is mandatory; absent source model must emit \"\" rather than omit the key"
+        );
+    }
+
+    /// Round-12 finding (required-`model` conformance class): a present model round-trips verbatim.
+    #[test]
+    fn write_response_preserves_present_model() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![],
+            stop_reason: None,
+            usage: crate::ir::IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("claude-opus-4-8".to_string()),
+            id: Some("msg_x".to_string()),
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = AnthropicWriter.write_response(&resp);
+        assert_eq!(
+            out.get("model").and_then(|v| v.as_str()),
+            Some("claude-opus-4-8")
+        );
+    }
+
+    /// Round-12 finding (required-`model` conformance class, streaming sibling): the streaming
+    /// `message_start.message` must also carry `model` UNCONDITIONALLY — it's the skeleton the SDK
+    /// reads to populate the assembled streaming Message. A None source model emits "" rather than
+    /// dropping the mandatory field.
+    #[test]
+    fn message_start_emits_model_even_when_none() {
+        let ev = IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        };
+        let (_, out) = AnthropicWriter
+            .write_response_event(&ev)
+            .expect("message_start writes");
+        assert_eq!(
+            out.get("message")
+                .and_then(|m| m.get("model"))
+                .and_then(|v| v.as_str()),
+            Some(""),
+            "message_start.message.model is mandatory; emit \"\" when source model is None"
         );
     }
 

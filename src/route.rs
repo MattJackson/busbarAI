@@ -277,6 +277,9 @@ async fn ingress_body_model(
         body,
         caller_token,
         started,
+        // Body-model protocols (openai/cohere/responses) are never gemini, so the model-not-found
+        // 404 uses the canonical OpenAI-style message.
+        None,
     )
     .await
 }
@@ -303,6 +306,7 @@ async fn ingress_path_model(
     stream: bool,
     gemini_json_array: bool,
     proto: &'static str,
+    gemini_api_version: Option<&str>,
 ) -> Response {
     let caller_token = caller.0.as_deref();
     let started = Instant::now();
@@ -371,6 +375,7 @@ async fn ingress_path_model(
         injected,
         caller_token,
         started,
+        gemini_api_version,
     )
     .await
 }
@@ -378,6 +383,11 @@ async fn ingress_path_model(
 /// The common tail shared by both ingress cores: run the governance guards, resolve `model`
 /// against `app.pools` then `app.by_model`, forward through `forward_with_pool` with `proto`, and
 /// `finish`. A miss on both maps is a protocol-shaped 404.
+///
+/// `gemini_api_version` is `Some("v1"|"v1beta")` only for the gemini ingress (threaded down from
+/// `gemini_ingress`, which derives it from the request path); it shapes the model-not-found 404
+/// message into Gemini's native vocabulary. Every other protocol passes `None` and gets the
+/// canonical OpenAI-style copy (see `not_found_message`).
 #[allow(clippy::too_many_arguments)]
 async fn forward_resolved(
     app: &Arc<App>,
@@ -388,6 +398,7 @@ async fn forward_resolved(
     body: Bytes,
     caller_token: Option<&str>,
     started: Instant,
+    gemini_api_version: Option<&str>,
 ) -> Response {
     // Governance guards (pool-allowed / budget / rate). A rejection is finished through `finish`
     // so it is still counted in metrics and the request-log webhook.
@@ -450,7 +461,7 @@ async fn forward_resolved(
             proto,
             StatusCode::NOT_FOUND,
             "not_found_error",
-            &format!("The model '{model}' does not exist or you do not have access to it."),
+            &not_found_message(model, gemini_api_version),
         ),
     )
 }
@@ -575,8 +586,34 @@ pub(crate) async fn gemini_ingress(
         stream,
         gemini_json_array,
         "gemini",
+        // Thread the path-derived api_version so a model-not-found 404 says
+        // "models/{model} is not found for API version {api_version}, …" (the native Gemini
+        // message), not the OpenAI-style copy — a distinguishability tell for SDKs that match on
+        // `error.message`.
+        Some(api_version),
     )
     .await
+}
+
+/// Build the human-readable message for a model/pool-miss 404, in the INGRESS protocol's native
+/// vocabulary. Gemini's real API does NOT use the OpenAI-style "The model '{model}' does not exist…"
+/// string — it says "models/{model} is not found for API version {api_version}, or is not supported
+/// for the task you are trying to perform." Any client/SDK that pattern-matches the message string to
+/// distinguish a model-not-found 404 from other 404 variants (Google's client libraries surface
+/// `error.message` in their exception text) would diverge from a native call if we leaked the OpenAI
+/// copy. `gemini_api_version` carries the version token the gemini ingress derived from the request
+/// path (`v1` vs `v1beta`); it is `None` for every non-gemini protocol, which keeps the canonical
+/// OpenAI-style copy the OpenAI/Responses/Cohere/Anthropic SDKs expect. There is no `_ =>` catch-all:
+/// the gemini branch is selected by the presence of the version token, every other protocol shares
+/// the canonical message.
+fn not_found_message(model: &str, gemini_api_version: Option<&str>) -> String {
+    match gemini_api_version {
+        Some(api_version) => format!(
+            "models/{model} is not found for API version {api_version}, \
+             or is not supported for the task you are trying to perform."
+        ),
+        None => format!("The model '{model}' does not exist or you do not have access to it."),
+    }
 }
 
 /// The Gemini API version token to echo in the native error envelope, derived from the actual
@@ -656,9 +693,10 @@ async fn bedrock_ingress(
     model_id: &str,
     stream: bool,
 ) -> Response {
-    // Bedrock never uses the gemini JSON-array framing.
+    // Bedrock never uses the gemini JSON-array framing, and a model-not-found 404 uses the canonical
+    // (non-gemini) message, so no api_version is threaded.
     ingress_path_model(
-        app, gov, caller, headers, body, model_id, stream, false, "bedrock",
+        app, gov, caller, headers, body, model_id, stream, false, "bedrock", None,
     )
     .await
 }
@@ -755,7 +793,8 @@ pub(crate) async fn named(
             "anthropic",
             StatusCode::NOT_FOUND,
             "not_found_error",
-            &format!("The model '{name}' does not exist or you do not have access to it."),
+            // Anthropic ingress: canonical (non-gemini) model-not-found copy.
+            &not_found_message(&name, None),
         ),
     )
 }
@@ -812,7 +851,8 @@ pub(crate) async fn adhoc(
                     "anthropic",
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
-                    &format!("The model '{model}' does not exist or you do not have access to it."),
+                    // Anthropic ingress: canonical (non-gemini) model-not-found copy.
+                    &not_found_message(&model, None),
                 ),
             )
         }
@@ -826,7 +866,8 @@ pub(crate) async fn adhoc(
                 "anthropic",
                 StatusCode::NOT_FOUND,
                 "not_found_error",
-                &format!("The model '{model}' does not exist or you do not have access to it."),
+                // Anthropic ingress: canonical (non-gemini) model-not-found copy.
+                &not_found_message(&model, None),
             ),
         ),
     }
@@ -4257,5 +4298,237 @@ mod tests {
             "adhoc governance 403 carries permission_error; got {body}"
         );
         handle.abort();
+    }
+
+    /// MEDIUM/conformance regression: `not_found_message` shapes the model-not-found copy per the
+    /// INGRESS protocol. A gemini api_version yields the NATIVE Gemini string (versioned, no OpenAI
+    /// "The model '…'" phrasing); every other protocol (api_version `None`) keeps the canonical
+    /// OpenAI-style copy the OpenAI/Responses/Cohere/Anthropic SDKs expect. Guards against a future
+    /// edit re-leaking the OpenAI message onto the gemini surface.
+    #[test]
+    fn test_not_found_message_is_protocol_native() {
+        // Gemini v1beta: native versioned message, NO OpenAI phrasing.
+        let g_beta = not_found_message("gemini-1.5-pro", Some("v1beta"));
+        assert_eq!(
+            g_beta,
+            "models/gemini-1.5-pro is not found for API version v1beta, \
+             or is not supported for the task you are trying to perform."
+        );
+        // Gemini stable v1: the version token echoes "v1" (not a hardcoded "v1beta").
+        let g_v1 = not_found_message("gemini-1.5-pro", Some("v1"));
+        assert!(
+            g_v1.contains("for API version v1,"),
+            "stable v1 message echoes the v1 token; got {g_v1}"
+        );
+        assert!(
+            !g_v1.contains("does not exist"),
+            "gemini message must NOT use the OpenAI 'does not exist' phrasing; got {g_v1}"
+        );
+        // Non-gemini (None): the canonical OpenAI-style copy is preserved.
+        let oai = not_found_message("gpt-4o", None);
+        assert_eq!(
+            oai,
+            "The model 'gpt-4o' does not exist or you do not have access to it."
+        );
+    }
+
+    /// MEDIUM/conformance: a model-not-found 404 on the gemini ingress returns the NATIVE Gemini
+    /// message ("models/{model} is not found for API version {api_version}, …"), with the version
+    /// token matching the request path — `v1beta` on the v1beta surface, `v1` on the stable v1
+    /// surface. NO OpenAI "The model '…' does not exist" copy may leak (a tell for SDKs matching on
+    /// `error.message`). Drives the real router with an empty app so resolution misses on both maps.
+    #[tokio::test]
+    async fn test_gemini_model_not_found_uses_native_message() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+
+        for (path, version) in [
+            ("/v1beta/models/no-such-model:generateContent", "v1beta"),
+            ("/v1/models/no-such-model:generateContent", "v1"),
+        ] {
+            let resp = reqwest::Client::new()
+                .post(format!("http://{addr}{path}"))
+                .bearer_auth("t")
+                .body(json!({"contents": []}).to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                404,
+                "gemini unknown-model ⇒ native 404 ({path})"
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            let msg = body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            assert_eq!(
+                msg,
+                format!(
+                    "models/no-such-model is not found for API version {version}, \
+                     or is not supported for the task you are trying to perform."
+                ),
+                "gemini 404 carries the native versioned message ({path}); got {body}"
+            );
+            assert!(
+                !msg.contains("does not exist"),
+                "no OpenAI 'does not exist' copy may leak to a gemini client ({path}); got {body}"
+            );
+        }
+        handle.abort();
+    }
+
+    /// MEDIUM/test-coverage: the STABLE v1 gemini surface (`/v1/models/*rest`) is a separately
+    /// registered route (main.rs) that funnels through the same `gemini_ingress` handler as v1beta.
+    /// This exercises a happy-path STREAMING request via the stable v1 prefix WITH `?alt=sse`, so a
+    /// routing regression on the v1 alias (e.g. a wildcard conflict) is caught. Mirrors
+    /// `test_gemini_stream_generate_content_alt_sse_is_event_stream` but on the v1 path: asserts SSE
+    /// framing and that the frames carry native gemini `candidates[]` (never OpenAI `choices`).
+    #[tokio::test]
+    async fn test_gemini_v1_stable_stream_generate_content_alt_sse() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Sse {
+            events: openai_stream_events(),
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/v1/models/foo:streamGenerateContent?alt=sse"
+            ))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "contents": [{"role": "user", "parts": [{"text": "hello"}]}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "stable v1 :streamGenerateContent?alt=sse resolves and 2xx round-trips"
+        );
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "stable v1 gemini streaming WITH ?alt=sse is SSE-framed; got {ct}"
+        );
+        let body = resp.text().await.unwrap();
+        let payloads: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .filter(|data| !data.is_empty() && *data != "[DONE]")
+            .filter_map(|data| serde_json::from_str(data).ok())
+            .collect();
+        assert!(
+            !payloads.is_empty(),
+            "stable v1 SSE body carries at least one JSON data: frame; got {body:?}"
+        );
+        assert!(
+            payloads.iter().any(|c| c.get("candidates").is_some()),
+            "stable v1 SSE frames are native gemini GenerateContentResponse (candidates[]); \
+             got {body:?}"
+        );
+        assert!(
+            payloads.iter().all(|c| c.get("choices").is_none()),
+            "no OpenAI `choices` field may leak into the stable v1 gemini SSE frames; got {body:?}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// MEDIUM/test-coverage: the STABLE v1 gemini surface (`/v1/models/*rest`), streaming WITHOUT
+    /// `?alt=sse`, must return the JSON-ARRAY framing (`application/json`, a `[{...}]` body) exactly
+    /// like the v1beta surface. Mirrors `test_gemini_stream_generate_content_no_alt_sse_is_json_array`
+    /// on the v1 path so a regression isolating the stable-v1 alias is caught.
+    #[tokio::test]
+    async fn test_gemini_v1_stable_stream_generate_content_no_alt_sse() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Sse {
+            events: openai_stream_events(),
+            abort_at_index: None,
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/models/foo:streamGenerateContent"))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "contents": [{"role": "user", "parts": [{"text": "hello"}]}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "stable v1 :streamGenerateContent (no alt=sse) 2xx"
+        );
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "stable v1 gemini streaming WITHOUT ?alt=sse is JSON-array framed; got {ct}"
+        );
+        let body = resp.text().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("JSON-array body must parse; got {body:?} ({e})"));
+        let arr = parsed
+            .as_array()
+            .unwrap_or_else(|| panic!("body must be a JSON array; got {body:?}"));
+        assert!(
+            !arr.is_empty(),
+            "array carries at least one chunk; got {body:?}"
+        );
+        assert!(
+            arr.iter().any(|c| c.get("candidates").is_some()),
+            "stable v1 array chunk is a native gemini GenerateContentResponse; got {body:?}"
+        );
+        assert!(
+            arr.iter().all(|c| c.get("choices").is_none()),
+            "no OpenAI `choices` field may leak into the stable v1 JSON-array frames; got {body:?}"
+        );
+        handle.abort();
+        server.shutdown().await;
     }
 }

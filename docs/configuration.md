@@ -176,7 +176,7 @@ providers:
 
 | Backend | Credential format | Header / signing |
 |---|---|---|
-| anthropic | API key | `x-api-key: <key>` and `Authorization: Bearer <key>` + `anthropic-version` |
+| anthropic | API key or OAuth token | `x-api-key: <key>` (API key, prefix `sk-ant-api…`) or `Authorization: Bearer <key>` (OAuth token, prefix `sk-ant-oat…`); `anthropic-version` on all. Only one auth header is sent per request, chosen by credential type; an unrecognized credential gets both. |
 | openai / responses / cohere | API key | `Authorization: Bearer <key>` |
 | openai + `auth: api-key` (Azure) | API key | `api-key: <key>` |
 | gemini | API key | `x-goog-api-key: <key>` |

@@ -455,7 +455,15 @@ impl ProtocolReader for CohereReader {
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
         // Cohere v2 chat names its sampling controls `p` (top_p), `k` (top_k), `stop_sequences`.
         let top_p = obj.get("p").and_then(|v| v.as_f64());
-        let top_k = obj.get("k").and_then(|v| v.as_u64()).map(|v| v as u32);
+        // Narrow with `u32::try_from` (NOT a bare `as u32`), matching the hardened `max_tokens`
+        // path above: a `k` (top_k) above `u32::MAX` silently wraps under `as` to a small nonsense
+        // sampling cap (e.g. 4294967296 -> 0, 4294967297 -> 1) that is then forwarded to Cohere,
+        // diverging from a direct Cohere call with the same JSON. `try_from` drops an out-of-range
+        // value to `None` instead, so the proxy forwards no cap rather than a wrapped one.
+        let top_k = obj
+            .get("k")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
         let stop = crate::ir::read_stop_sequences(obj.get("stop_sequences"));
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -3249,6 +3257,63 @@ mod tests {
             None,
             "negative max_tokens is rejected"
         );
+    }
+
+    /// Regression (MEDIUM/correctness): `k` (top_k) must be narrowed with `u32::try_from`, NOT a
+    /// bare `as u32`. A value above `u32::MAX` previously wrapped to a small nonsense sampling cap
+    /// (e.g. 4294967296 -> 0, 4294967297 -> 1) that was forwarded to Cohere, diverging from a
+    /// direct Cohere call; it must now drop to `None` (no cap forwarded) instead of wrapping. A
+    /// valid in-range value, including the exact `u32::MAX` boundary, is preserved.
+    #[test]
+    fn test_read_request_top_k_out_of_range_drops_to_none() {
+        let reader = CohereReader;
+
+        // u32::MAX + 1 must NOT wrap to 0: it drops to None.
+        let over = serde_json::json!({
+            "model": "command",
+            "messages": [{"role": "user", "content": "hi"}],
+            "k": (u32::MAX as u64) + 1
+        });
+        assert_eq!(
+            reader.read_request(&over).expect("ok").top_k,
+            None,
+            "an out-of-range top_k must drop to None, not wrap under `as u32`"
+        );
+
+        // u32::MAX + 2 must NOT wrap to 1 either.
+        let over2 = serde_json::json!({
+            "model": "command",
+            "messages": [{"role": "user", "content": "hi"}],
+            "k": (u32::MAX as u64) + 2
+        });
+        assert_eq!(reader.read_request(&over2).expect("ok").top_k, None);
+
+        // A far-larger value likewise drops rather than truncating into the valid u32 range.
+        let huge = serde_json::json!({
+            "model": "command",
+            "messages": [{"role": "user", "content": "hi"}],
+            "k": u64::MAX
+        });
+        assert_eq!(reader.read_request(&huge).expect("ok").top_k, None);
+
+        // The exact u32::MAX boundary is in range and preserved.
+        let max_in_range = serde_json::json!({
+            "model": "command",
+            "messages": [{"role": "user", "content": "hi"}],
+            "k": u32::MAX as u64
+        });
+        assert_eq!(
+            reader.read_request(&max_in_range).expect("ok").top_k,
+            Some(u32::MAX)
+        );
+
+        // A normal value still parses through unchanged.
+        let normal = serde_json::json!({
+            "model": "command",
+            "messages": [{"role": "user", "content": "hi"}],
+            "k": 40
+        });
+        assert_eq!(reader.read_request(&normal).expect("ok").top_k, Some(40));
     }
 
     /// Regression (LOW/robustness): `state.open_tools` is never shrunk, so an upstream streaming an
