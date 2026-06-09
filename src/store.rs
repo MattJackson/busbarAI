@@ -360,6 +360,19 @@ pub(crate) struct BreakerCell {
     pub(crate) err: AtomicU64,
     pub(crate) outcome_window: std::sync::Mutex<OutcomeWindow>,
     pub(crate) current_weight: AtomicI64, // SWRR state (per pool — selection runs over a pool's set)
+    // Serializes every state+cooldown TRANSITION on this cell. `breaker_state` and `cooldown_until`
+    // are two separate atomics, so a transition that touches BOTH (open: Open+long cooldown; closed:
+    // Closed+clear cooldown; the Open→HalfOpen probe acquire) is not atomic across the pair on its
+    // own. Two such transitions racing (e.g. a half-open probe SUCCESS recovering the cell to Closed
+    // while a concurrent hard-down trips it Open with a 30-min sticky cooldown) could interleave their
+    // individual stores into an INCONSISTENT pair — a hard-down lane left Open with a cleared/short
+    // cooldown (sticky cooldown silently dropped → the dead lane keeps receiving traffic), or Closed
+    // with a stale cooldown. Holding this lock across each transition's read-modify-write makes the
+    // (state, cooldown) pair move as a unit with a single linearization point, so racing transitions
+    // serialize and the last writer's consistent pair always wins. The hot read path
+    // (`cell_ready_breaker`/`cell_acquire_breaker` selection) does NOT take this lock — it stays
+    // lock-free; only the (comparatively rare) transitions serialize against each other.
+    pub(crate) transition_lock: std::sync::Mutex<()>,
 }
 
 impl BreakerCell {
@@ -372,6 +385,7 @@ impl BreakerCell {
             err: AtomicU64::new(0),
             outcome_window: std::sync::Mutex::new(OutcomeWindow::new(OUTCOME_WINDOW_CAPACITY)),
             current_weight: AtomicI64::new(0),
+            transition_lock: std::sync::Mutex::new(()),
         }
     }
 }
@@ -386,6 +400,8 @@ pub(crate) trait BreakerCellAccess {
     fn err(&self) -> &AtomicU64;
     fn outcome_window(&self) -> &std::sync::Mutex<OutcomeWindow>;
     fn current_weight(&self) -> &AtomicI64;
+    /// Serializes state+cooldown transitions on this cell (see `BreakerCell::transition_lock`).
+    fn transition_lock(&self) -> &std::sync::Mutex<()>;
 }
 
 impl BreakerCellAccess for BreakerCell {
@@ -410,6 +426,9 @@ impl BreakerCellAccess for BreakerCell {
     fn current_weight(&self) -> &AtomicI64 {
         &self.current_weight
     }
+    fn transition_lock(&self) -> &std::sync::Mutex<()> {
+        &self.transition_lock
+    }
 }
 
 impl BreakerCellAccess for LaneState {
@@ -433,6 +452,9 @@ impl BreakerCellAccess for LaneState {
     }
     fn current_weight(&self) -> &AtomicI64 {
         &self.current_weight
+    }
+    fn transition_lock(&self) -> &std::sync::Mutex<()> {
+        &self.transition_lock
     }
 }
 
@@ -491,6 +513,8 @@ struct LaneState {
     outcome_window: std::sync::Mutex<OutcomeWindow>,
     // SWRR state per lane
     current_weight: AtomicI64,
+    // Serializes state+cooldown transitions on the default cell — see `BreakerCell::transition_lock`.
+    transition_lock: std::sync::Mutex<()>,
 }
 
 impl InMemoryStore {
@@ -524,6 +548,7 @@ impl InMemoryStore {
                         OUTCOME_WINDOW_CAPACITY,
                     )),
                     current_weight: AtomicI64::new(0),
+                    transition_lock: std::sync::Mutex::new(()),
                 })
             })
             .collect();
@@ -738,8 +763,25 @@ impl InMemoryStore {
     }
 
     /// Transition the cell to Open with an escalated cooldown (streak is owned by the record path,
-    /// only read here).
+    /// only read here). Acquires the per-cell transition lock so the Open state + cooldown move as a
+    /// consistent pair against any racing transition; see `cell_open_locked`. Release code reaches
+    /// the trip via `cell_open_locked` (already holding the lock), so only the test helpers call this
+    /// lock-acquiring wrapper — hence release-dead.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn cell_open(
+        c: &dyn BreakerCellAccess,
+        now_time: u64,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    ) {
+        let _tx = lock_recover(c.transition_lock());
+        Self::cell_open_locked(c, now_time, cfg, retry_after);
+    }
+
+    /// `cell_open` body, assuming the caller already holds `c.transition_lock()`. Used by the record
+    /// paths that take the lock once and may then call `cell_open` under it (re-taking the std Mutex
+    /// would deadlock), so they call this instead.
+    fn cell_open_locked(
         c: &dyn BreakerCellAccess,
         now_time: u64,
         cfg: &BreakerCfg,
@@ -761,8 +803,16 @@ impl InMemoryStore {
     }
 
     /// Transition the cell to Closed (full recovery): reset streak/err/window, clear the cooldown
-    /// and release the single-flight probe.
+    /// and release the single-flight probe. Acquires the per-cell transition lock so the Closed state
+    /// and cleared cooldown move as a consistent pair against any racing transition (see
+    /// `cell_closed_locked`).
     fn cell_closed(c: &dyn BreakerCellAccess) {
+        let _tx = lock_recover(c.transition_lock());
+        Self::cell_closed_locked(c);
+    }
+
+    /// `cell_closed` body, assuming the caller already holds `c.transition_lock()`.
+    fn cell_closed_locked(c: &dyn BreakerCellAccess) {
         c.streak().store(0, Ordering::Release);
         c.err().store(0, Ordering::Release);
         lock_recover(c.outcome_window()).clear();
@@ -785,6 +835,10 @@ impl InMemoryStore {
     /// have already moved it); otherwise it just clears the flag defensively. The mirror of the
     /// `cell_open` probe-release, but for the no-outcome abandon path rather than a recorded failure.
     fn cell_release_probe(c: &dyn BreakerCellAccess) {
+        // Serialize against other transitions: this leaves the existing (expired) cooldown intact and
+        // only reverts the state HalfOpen → Open, but it must not interleave with a concurrent
+        // open/close/trip that is mid-way through its own (state, cooldown) pair.
+        let _tx = lock_recover(c.transition_lock());
         // CAS the state HalfOpen → Open so we don't clobber a concurrent transition (e.g. a success
         // that already moved the cell to Closed). The probe flag is cleared regardless so a stale
         // `true` can never wedge the lane.
@@ -829,13 +883,29 @@ impl InMemoryStore {
     /// HalfOpen and admits exactly one probe (CAS); HalfOpen admits nobody else. Returns true iff
     /// this caller may proceed (Closed-and-ready, or the probe winner).
     fn cell_acquire_breaker(c: &dyn BreakerCellAccess, now: u64) -> bool {
+        // Fast lock-free pre-check: only an Open cell whose cooldown has expired needs the mutating
+        // Open→HalfOpen probe-acquisition (which must serialize against trips/closes). Closed and
+        // HalfOpen, and a not-yet-expired Open, are decided by a plain consistent read with no lock —
+        // keeping the common dispatch case lock-free. We re-confirm the state under the lock below.
         match c.breaker_state().load(Ordering::Acquire) {
             ST_CLOSED => now >= c.cooldown_until().load(Ordering::Acquire),
             ST_OPEN => {
                 let until = c.cooldown_until().load(Ordering::Acquire);
                 if now >= until {
-                    // Single CAS Open→HalfOpen: the state and probe acquisition must move as an
-                    // atomic pair. A non-CAS `store(ST_HALF_OPEN)` followed by a separate
+                    // The Open→HalfOpen probe acquisition reads BOTH state and cooldown and must move
+                    // as an atomic pair against a concurrent trip/close (which writes both). Take the
+                    // transition lock so a hard-down parking the cell Open with a fresh sticky
+                    // cooldown can't interleave with this acquisition and let a probe slip through on
+                    // a just-parked lane. Re-read under the lock: a peer transition may have changed
+                    // the state or re-armed the cooldown since the lock-free check above.
+                    let _tx = lock_recover(c.transition_lock());
+                    if c.breaker_state().load(Ordering::Acquire) != ST_OPEN
+                        || now < c.cooldown_until().load(Ordering::Acquire)
+                    {
+                        return false;
+                    }
+                    // Single CAS Open→HalfOpen under the lock: the state and probe acquisition move as
+                    // an atomic pair. A non-CAS `store(ST_HALF_OPEN)` followed by a separate
                     // `probe_in_flight` CAS opens a window where a delayed store can clobber a
                     // concurrent `cell_closed` (which writes ST_CLOSED + clears the probe flag),
                     // leaving a Closed cell with probe_in_flight wedged true and permanently
@@ -904,10 +974,17 @@ impl InMemoryStore {
         c.err().fetch_add(1, Ordering::Relaxed);
         c.streak().fetch_add(1, Ordering::Relaxed);
 
+        // The state-dependent transition reads BOTH state and cooldown and writes the (state,
+        // cooldown) pair, so serialize it under the transition lock (re-reading the state under the
+        // lock) — a concurrent close/trip must not interleave its pair with this one. The counter
+        // bumps above are independent atomics and need no lock. `should_trip` (which also locks the
+        // outcome_window) and the inner `cell_open_locked` run UNDER this lock; we call the `_locked`
+        // open variant so we never re-take this std Mutex (which would deadlock).
+        let _tx = lock_recover(c.transition_lock());
         match c.breaker_state().load(Ordering::Acquire) {
             ST_CLOSED => {
                 if Self::should_trip(c, now_time, cfg) {
-                    Self::cell_open(c, now_time, cfg, retry_after);
+                    Self::cell_open_locked(c, now_time, cfg, retry_after);
                 } else {
                     let duration =
                         Self::compute_cooldown_with_retry_after(c, now_time, cfg, retry_after);
@@ -917,7 +994,7 @@ impl InMemoryStore {
                         .store(now_time.saturating_add(duration), Ordering::Release);
                 }
             }
-            ST_HALF_OPEN => Self::cell_open(c, now_time, cfg, retry_after), // probe failed → reopen
+            ST_HALF_OPEN => Self::cell_open_locked(c, now_time, cfg, retry_after), // probe failed → reopen
             // Already Open: a failure while Open is an intentional no-op (the cooldown is already
             // armed; we don't re-escalate on every failed request during a cooldown). Enumerated
             // explicitly per the breaker-match hard rule — no `_ =>` catch-all.
@@ -938,6 +1015,13 @@ impl InMemoryStore {
     /// push the outcome, and — if this was the half-open probe — complete recovery to Closed. (The
     /// lane-global `ok` counter is bumped by the caller, since it is shared across pools.)
     fn cell_record_success(c: &dyn BreakerCellAccess, now_time: u64) {
+        // Serialize the whole state-dependent transition (the streak-reset gate reads the state, and
+        // the HalfOpen→Closed recovery writes the (state, cooldown) pair) under the transition lock,
+        // so a concurrent hard-down trip (Open + sticky cooldown) can't interleave its pair with this
+        // recovery — the exact race this lock closes. `cell_closed` is reached via `cell_closed_locked`
+        // below so we never re-take this std Mutex (deadlock). The outcome_window push is a leaf lock
+        // taken under this one (consistent ordering, no other path takes them in the reverse order).
+        let _tx = lock_recover(c.transition_lock());
         // Reset the consecutive-failure streak on a success — but NOT while the cell is Open. A bare
         // `record_success(lane)` can land on an Open cell via the degraded-forward path
         // (forward.rs `record_success` on a lane whose cell is still Open): the HalfOpen→Closed CAS
@@ -966,7 +1050,7 @@ impl InMemoryStore {
             .compare_exchange(ST_HALF_OPEN, ST_CLOSED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            Self::cell_closed(c);
+            Self::cell_closed_locked(c);
         }
     }
 
@@ -1301,6 +1385,12 @@ impl InMemoryStore {
             "lane hard-down; sticky cooldown (recovers via half-open probe)"
         );
         let cell = self.cell(pool, lane);
+        // Take the cell's transition lock so this trip's (Open + sticky cooldown) pair lands
+        // atomically with respect to a racing recovery (`cell_closed`) or probe acquisition — without
+        // it the separate `cooldown_until`/`breaker_state` stores could interleave with a concurrent
+        // success-recovery and leave the cell Open with a cleared/short cooldown (sticky cooldown
+        // dropped) or Closed with the stale sticky cooldown.
+        let _tx = lock_recover(cell.transition_lock());
         cell.cooldown_until().store(
             Self::now_secs().saturating_add(HARD_DOWN_COOLDOWN_SECS),
             Ordering::Release,
@@ -1496,6 +1586,12 @@ impl StateStore for InMemoryStore {
         );
         let now = Self::now_secs();
         let trip = |c: &dyn BreakerCellAccess| {
+            // Per-cell transition lock so the (Open + sticky cooldown) pair lands atomically against a
+            // racing recovery/probe-acquire on the SAME cell (the torn-write race). Each cell has its
+            // own lock and we take them one at a time (never nested), so iterating all cells here
+            // cannot deadlock; the `pool_cells` READ lock held by the caller is a different,
+            // strictly-outer lock (transition fns never reach back to `pool_cells`).
+            let _tx = lock_recover(c.transition_lock());
             c.cooldown_until().store(
                 now.saturating_add(HARD_DOWN_COOLDOWN_SECS),
                 Ordering::Release,
