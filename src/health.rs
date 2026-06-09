@@ -120,11 +120,19 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
             .upstream_path_for_stream(&lane.model, false)
     });
 
+    // SigV4 signs over the URI-encoded canonical path, so the probe MUST send the wire request over
+    // the SAME encoding or AWS rejects with SignatureDoesNotMatch (every Bedrock modelId carries a
+    // reserved `:` that signs as `%3A` but a raw send transmits `:`). Encode the path ONCE via the
+    // shared `sign_and_wire_path` helper — the identical primitive the organic forward path uses —
+    // and reuse it for both the signed canonical URI and the wire URL so signed == sent.
+    let wire_path = crate::forward::sign_and_wire_path(&url_path);
     let signing_ctx = crate::proto::SigningContext {
         host: crate::forward::host_from_base(&lane.base_url),
-        canonical_uri: crate::sigv4::uri_encode_path(
-            url_path.split('?').next().unwrap_or(&url_path),
-        ),
+        canonical_uri: wire_path
+            .split('?')
+            .next()
+            .unwrap_or(&wire_path)
+            .to_string(),
         body: &body,
         timestamp_epoch: now(),
     };
@@ -132,7 +140,7 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
 
     let res = app
         .client
-        .post(format!("{}{}", lane.base_url, url_path))
+        .post(format!("{}{}", lane.base_url, wire_path))
         .headers(convert_headers(auth))
         .header(CONTENT_TYPE, "application/json")
         .timeout(timeout)
@@ -348,5 +356,39 @@ mod tests {
             .build();
         probe_lane(&app, 0, Duration::from_secs(1)).await;
         assert!(matches!(app.store.breaker_state(0), BreakerState::Closed));
+    }
+
+    /// REGRESSION (R16 HIGH, SigV4 signed==sent): the active probe MUST sign the canonical URI from
+    /// the SAME path encoding it transmits on the wire. `probe_lane` derives both the SigV4
+    /// `canonical_uri` and the wire URL from `crate::forward::sign_and_wire_path(&url_path)` (the
+    /// identical primitive the organic forward path uses), so for a Bedrock-style path whose modelId
+    /// carries a reserved `:` the signed/sent path is byte-identical and `%3A`-encoded — eliminating
+    /// the `SignatureDoesNotMatch` 403 that would otherwise park every Bedrock lane dead. This guards
+    /// the contract at the health layer (the helper itself is covered by the forward.rs reserved-char
+    /// test) so a future refactor of the probe can't reintroduce a raw-send divergence.
+    #[test]
+    fn test_probe_signs_and_sends_same_encoded_path_for_reserved_chars() {
+        let url_path = "/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse";
+        let wire_path = crate::forward::sign_and_wire_path(url_path);
+        let canonical_uri = wire_path
+            .split('?')
+            .next()
+            .unwrap_or(&wire_path)
+            .to_string();
+
+        assert!(
+            wire_path.contains("%3A"),
+            "Bedrock modelId ':' must be percent-encoded on the wire path: {wire_path}"
+        );
+        assert!(
+            !wire_path.contains(":0/converse"),
+            "the raw ':' must NOT survive on the wire path (would diverge from the signed URI): \
+             {wire_path}"
+        );
+        assert_eq!(
+            canonical_uri, wire_path,
+            "with no query string the signed canonical URI must equal the transmitted wire path \
+             (signed == sent), the exact invariant that prevents SignatureDoesNotMatch"
+        );
     }
 }

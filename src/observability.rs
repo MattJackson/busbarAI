@@ -352,6 +352,19 @@ pub(crate) fn init_logging(otlp_endpoint: Option<&str>) {
     let filter = tracing_subscriber::filter::LevelFilter::from_level(level);
     let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
 
+    // SSRF-validate the OTLP endpoint BEFORE building the exporter, so a config pointing at cloud
+    // metadata / an internal service (e.g. `https://169.254.169.254/v1/traces`) is rejected and OTLP
+    // left disabled — span data carries key_ids, pool names, and governance decisions, so the export
+    // sink must be SSRF-safe (parity with the request-log webhook; loopback collectors are allowed).
+    let validated_otlp = match validate_otlp_endpoint(otlp_endpoint) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("busbar: {msg}; disabling OTLP trace export");
+            None
+        }
+    };
+    let otlp_endpoint = validated_otlp.as_deref();
+
     // Build the OTLP exporter/provider BEFORE installing the subscriber, but defer the global
     // side effect (`set_tracer_provider`) until we know the subscriber actually installed.
     let otel = otlp_endpoint.and_then(build_otlp);
@@ -395,6 +408,128 @@ pub(crate) fn shutdown_tracing() {
             eprintln!("busbar: OTLP tracer shutdown failed ({e})");
         }
     }
+}
+
+/// Validate an operator-configured OTLP endpoint as an SSRF-safe export target, mirroring the
+/// webhook guard (`validate_webhook_url`) so the documented invariant "observability sinks are
+/// SSRF-safe" holds for OTLP as well, not just the webhook. Two differences from the webhook guard,
+/// both deliberate:
+///   1. SCHEME: `http://` is permitted in addition to `https://`, because the standard OTLP
+///      collector deployment is a co-located `http://localhost:4318` (or a sidecar) — a plaintext
+///      loopback hop carries no exfiltration risk. Any other scheme is rejected.
+///   2. LOOPBACK: a loopback / `localhost` target is ALLOWED (it IS the standard collector pattern),
+///      whereas the webhook blocks it. Everything else `host_is_internal` blocks is STILL blocked:
+///      `169.254.169.254` cloud-metadata, the `METADATA_HOSTS` DNS names, RFC1918 private, RFC6598
+///      CGNAT, link-local, and the alternate-IPv4 encodings the resolver expands to those targets.
+///      So `http://169.254.169.254/v1/traces` or `https://10.0.0.1/collect` is rejected, but
+///      `http://localhost:4318` is accepted.
+///
+/// `None` (OTLP disabled) is always valid. Pure, so it is unit-testable without process-wide state.
+fn validate_otlp_endpoint(endpoint: Option<&str>) -> Result<Option<String>, String> {
+    let Some(e) = endpoint else {
+        return Ok(None);
+    };
+    if !(e.starts_with("https://") || e.starts_with("http://")) {
+        return Err(format!(
+            "observability.otlp_endpoint must be an http:// or https:// URL (got '{e}')"
+        ));
+    }
+    let parsed = reqwest::Url::parse(e)
+        .map_err(|err| format!("observability.otlp_endpoint is not a valid URL: {err}"))?;
+    // Block the internal/metadata set, but carve out loopback (the localhost-collector exception).
+    // `otlp_host_is_blocked` is `host_is_internal` minus the loopback/localhost arms.
+    if otlp_host_is_blocked(&parsed) {
+        return Err(format!(
+            "observability.otlp_endpoint must not target a link-local/private/CGNAT/cloud-metadata \
+             host (SSRF guard; loopback/localhost collectors are allowed); got '{e}'"
+        ));
+    }
+    Ok(Some(e.to_string()))
+}
+
+/// SSRF block predicate for the OTLP endpoint: identical to `host_is_internal` EXCEPT loopback and
+/// the `localhost` DNS name are NOT blocked (the standard `http://localhost:4318` collector). Every
+/// other internal/metadata target `host_is_internal` rejects is rejected here too — same
+/// link-local/IMDS, private, CGNAT, unspecified, alternate-IPv4-encoding, and `METADATA_HOSTS`
+/// coverage — so the only relaxation versus the webhook guard is the intentional loopback carve-out.
+fn otlp_host_is_blocked(url: &reqwest::Url) -> bool {
+    use std::net::IpAddr;
+    match url.host_str() {
+        // A URL with no host is unusable as an export target; reject it.
+        None => true,
+        Some(host) => {
+            let host = host.strip_prefix('[').unwrap_or(host);
+            let host = host.strip_suffix(']').unwrap_or(host);
+
+            if METADATA_HOSTS.iter().any(|m| host.eq_ignore_ascii_case(m)) {
+                return true;
+            }
+            // Alternate IPv4 encodings that resolve to an internal target. A loopback alternate
+            // encoding (e.g. `2130706433` == 127.0.0.1) is the localhost-collector exception, so
+            // canonicalize and let the loopback carve-out below apply rather than blanket-blocking.
+            if is_alternate_ipv4_encoding(host) {
+                // Best-effort canonicalization: if it parses to a loopback v4 after the resolver
+                // expansion we model here, allow it; otherwise it's an alternate-encoded internal
+                // target and must be blocked. We can't run getaddrinfo in a pure validator, so be
+                // conservative: block every alternate encoding EXCEPT the canonical decimal/hex/octal
+                // spellings of 127.0.0.1, which are unambiguously loopback.
+                return !is_alternate_loopback_v4(host);
+            }
+
+            match host.parse::<IpAddr>() {
+                // Loopback is the allowed collector pattern; every other internal v4 is blocked.
+                Ok(IpAddr::V4(v4)) => !v4.is_loopback() && is_internal_v4(&v4),
+                Ok(IpAddr::V6(v6)) => {
+                    if v6.is_loopback() {
+                        return false; // `::1` loopback collector — allowed.
+                    }
+                    if let Some(v4) = v6.to_ipv4() {
+                        return !v4.is_loopback() && is_internal_v4(&v4);
+                    }
+                    v6.is_unspecified()
+                        || (v6.segments()[0] & 0xfe00) == 0xfc00
+                        || (v6.segments()[0] & 0xffc0) == 0xfe80
+                }
+                // DNS name: block the cloud-metadata names (handled above) but ALLOW `localhost`
+                // (and `*.localhost`) — the loopback carve-out — and any external collector hostname.
+                Err(_) => false,
+            }
+        }
+    }
+}
+
+/// True iff `host` is an alternate (non-dotted-quad) IPv4 encoding that unambiguously denotes the
+/// loopback address `127.0.0.1`: the decimal integer `2130706433`, the hex `0x7f000001`, the octal
+/// `017700000001`, or a short-dotted form like `127.1` / `127.0.1`. Used by `otlp_host_is_blocked`
+/// to permit the localhost-collector exception while still blocking every other alternate-encoded
+/// internal target. Conservative: anything it can't positively confirm as loopback is treated as
+/// non-loopback by the caller (and therefore blocked).
+fn is_alternate_loopback_v4(host: &str) -> bool {
+    // Decimal integer form: must equal 127.0.0.1 == 2130706433.
+    if !host.contains('.') {
+        if let Some(hex) = host.strip_prefix("0x").or_else(|| host.strip_prefix("0X")) {
+            return u32::from_str_radix(hex, 16).ok() == Some(0x7f00_0001);
+        }
+        if let Some(oct) = host.strip_prefix('0').filter(|_| host.len() > 1) {
+            // Leading-zero octal (e.g. `017700000001`).
+            if let Ok(v) = u32::from_str_radix(oct, 8) {
+                return v == 0x7f00_0001;
+            }
+        }
+        if let Ok(v) = host.parse::<u32>() {
+            return v == 0x7f00_0001;
+        }
+        return false;
+    }
+    // Short-dotted form: first octet 127 and every present octet numeric, fewer than 4 parts.
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() >= 4 || parts.is_empty() {
+        return false;
+    }
+    let Some(first) = parts.first().and_then(|p| p.parse::<u32>().ok()) else {
+        return false;
+    };
+    first == 127 && parts.iter().all(|p| p.parse::<u32>().is_ok())
 }
 
 /// Build the OpenTelemetry tracing layer + retained provider for OTLP/HTTP export to `endpoint`.
@@ -731,5 +866,115 @@ mod tests {
             before,
             "InflightGuard::drop must return the slot even though the permit was forgotten"
         );
+    }
+
+    #[test]
+    fn test_validate_otlp_endpoint_accepts_none_and_external() {
+        // OTLP disabled is always valid; an external collector over https is accepted verbatim.
+        assert_eq!(validate_otlp_endpoint(None), Ok(None));
+        assert_eq!(
+            validate_otlp_endpoint(Some("https://collector.example.com:4318/v1/traces")),
+            Ok(Some(
+                "https://collector.example.com:4318/v1/traces".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_validate_otlp_endpoint_allows_loopback_collectors() {
+        // The localhost-collector carve-out: the standard OTLP deployment is a co-located plaintext
+        // loopback hop. http:// is permitted, and loopback v4/v6/`localhost` must be accepted.
+        for ok in [
+            "http://localhost:4318/v1/traces",
+            "http://LOCALHOST:4318",
+            "https://localhost:4318/v1/traces",
+            "http://127.0.0.1:4318/v1/traces",
+            "http://[::1]:4318/v1/traces",
+            "http://api.localhost:4318", // *.localhost -> loopback per RFC 6761
+        ] {
+            let res = validate_otlp_endpoint(Some(ok));
+            assert!(
+                res.is_ok(),
+                "loopback OTLP collector '{ok}' must be accepted; got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_otlp_endpoint_rejects_cloud_metadata_and_internal() {
+        // Regression (R16 SSRF medium): span data carries key_ids, pool names, and governance
+        // decisions, so the OTLP sink must block cloud-metadata / RFC1918 / CGNAT / link-local
+        // targets exactly like the webhook guard (only loopback is the intentional exception).
+        for bad in [
+            "https://169.254.169.254/v1/traces", // IMDS (link-local)
+            "http://169.254.169.254/v1/traces",  // IMDS over plaintext too
+            "https://10.0.0.1/collect",          // RFC1918
+            "http://10.0.0.1/collect",
+            "https://192.168.1.10/v1/traces",             // RFC1918
+            "https://172.16.5.4/v1/traces",               // RFC1918
+            "https://100.64.0.1/v1/traces",               // RFC6598 CGNAT
+            "https://0.0.0.0/v1/traces",                  // unspecified
+            "https://[fe80::1]/v1/traces",                // IPv6 link-local
+            "https://[fc00::1]/v1/traces",                // IPv6 unique-local
+            "https://metadata.google.internal/v1/traces", // cloud-metadata DNS name
+            "http://2130706433/v1/traces", // 127.0.0.1 alt encoding is loopback -> allowed below
+        ] {
+            // The last entry is a loopback alternate encoding and is deliberately exercised in the
+            // allow-test; here we only assert the genuinely-internal set is rejected.
+            if bad.contains("2130706433") {
+                continue;
+            }
+            let res = validate_otlp_endpoint(Some(bad));
+            assert!(
+                res.is_err(),
+                "internal/cloud-metadata OTLP endpoint '{bad}' must be rejected; got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_otlp_endpoint_rejects_alternate_encoded_internal() {
+        // Alternate IPv4 encodings of an INTERNAL target must be blocked (e.g. decimal/hex of an
+        // RFC1918 host), while the loopback alternate encodings are the only ones permitted.
+        for bad in [
+            "http://0xa000001/v1/traces", // 10.0.0.1 in hex
+            "http://167772161/v1/traces", // 10.0.0.1 in decimal
+            "http://2852039166/collect",  // 169.254.169.254 in decimal
+        ] {
+            let res = validate_otlp_endpoint(Some(bad));
+            assert!(
+                res.is_err(),
+                "alternate-encoded internal OTLP endpoint '{bad}' must be rejected; got {res:?}"
+            );
+        }
+        // Loopback alternate encodings ARE the localhost-collector exception -> allowed.
+        for ok in [
+            "http://2130706433/v1/traces", // 127.0.0.1 decimal
+            "http://0x7f000001/v1/traces", // 127.0.0.1 hex
+        ] {
+            let res = validate_otlp_endpoint(Some(ok));
+            assert!(
+                res.is_ok(),
+                "loopback alternate encoding '{ok}' must be accepted (localhost collector); got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_otlp_endpoint_rejects_bad_scheme() {
+        // Only http/https export targets are valid; anything else (or a non-URL) is rejected.
+        for bad in [
+            "file:///etc/shadow",
+            "ftp://collector.example.com",
+            "grpc://collector:4317",
+            "not-a-url",
+            "",
+        ] {
+            let res = validate_otlp_endpoint(Some(bad));
+            assert!(
+                res.is_err(),
+                "non-http(s) OTLP endpoint '{bad}' must be rejected; got {res:?}"
+            );
+        }
     }
 }

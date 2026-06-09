@@ -4,14 +4,7 @@
 //! Cohere v2 protocol reader/writer implementation.
 
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-
-/// Monotonic per-process counter folded into a synthesized response id so two responses minted in
-/// quick succession (even if the OS CSPRNG were to return identical bytes) still get distinct ids.
-/// This is a uniqueness backstop ONLY — the id's entropy comes from `getrandom`, NOT from this
-/// counter or any clock, so the value carries no observable timestamp (see `synthesize_cohere_id`).
-static COHERE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Hard cap on the number of distinct tool-call frame indices recorded in `state.open_tools` for a
 /// single stream. The set is intentionally never shrunk (so each tool's IR block index stays stable
@@ -82,35 +75,43 @@ fn format_uuid_layout(bytes: &[u8; 16]) -> String {
 /// to `4` and the variant bits forced to `10xx`. A client (or any observer) that validates the id
 /// as a UUIDv4 — Cohere's are — sees a well-formed value, so this is no longer a proxy tell, and no
 /// timestamp is embedded (the earlier `secs << 32` layout leaked the server clock in the first
-/// group). The monotonic counter is folded into the low 64 bits AFTER the random draw purely as a
-/// per-process uniqueness backstop should the CSPRNG ever return identical bytes; it does not
-/// reduce the version/variant guarantee or reintroduce a clock leak. Never panics on the request
-/// path: on the near-impossible `getrandom` failure the buffer stays zeroed and the counter overlay
-/// still yields a unique, well-formed v4.
+/// group). A native UUIDv4 is fully random in its 122 free bits (~5.3e36 values), so there is NO
+/// monotonic-counter overlay: a counter folded into any fixed region leaves those bytes
+/// predictable/low-entropy, a structural tell a native random v4 never carries, and a 122-bit random
+/// id is collision-free in practice for a per-process id stream. Never panics on the request path:
+/// on the near-impossible `getrandom` failure the buffer stays zeroed and the version/variant
+/// stamping still yields a well-formed (if non-random) v4.
 fn synthesize_cohere_id() -> String {
-    let n = COHERE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-
     let mut bytes = [0u8; 16];
-    // OS CSPRNG. Ignore failure (no unwrap/expect/panic on the request path): the counter fold
-    // below keeps the id unique even if the buffer stays all-zero, and the version/variant stamping
-    // still produces a valid v4.
+    // OS CSPRNG. Ignore failure (no unwrap/expect/panic on the request path): the version/variant
+    // stamping below still produces a valid v4 even if the buffer stays all-zero.
     let _ = getrandom::getrandom(&mut bytes);
 
-    // Fold the monotonic counter into the trailing 8 bytes (big-endian) so two ids minted in quick
-    // succession differ even if `getrandom` returned identical bytes. XOR (not overwrite) preserves
-    // the random entropy in those bytes.
-    let counter = n.to_be_bytes();
-    for (b, c) in bytes[8..16].iter_mut().zip(counter.iter()) {
-        *b ^= *c;
-    }
-
     // RFC-4122 v4: high nibble of byte 6 (the 3rd group's first nibble) = 4; top two bits of byte 8
-    // (the 4th group's first nibble) = 10. Applied AFTER the counter fold so neither bit field can
-    // be clobbered.
+    // (the 4th group's first nibble) = 10.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
 
     format_uuid_layout(&bytes)
+}
+
+/// Whether a mid-stream `IrError`'s `provider_signal` names a CONTENT-MODERATION stop (so the
+/// Cohere-ingress writer should terminate with `ERROR_TOXIC` rather than the generic `ERROR`).
+///
+/// The IR `Error` arrives from any upstream protocol, so the signal text is not Cohere-specific. We
+/// recognise the canonical moderation tokens busbar's readers normalise to (`safety`, the IR stop
+/// reason) plus the native Cohere `ERROR_TOXIC` and the common provider words for a moderation/
+/// content-policy stop. Anything else is an infrastructure-class error and maps to `ERROR`. This is
+/// an exhaustive boolean classifier — there is no catch-all hiding an unhandled case; the `else`
+/// branch is the explicit "not a moderation stop" disposition.
+fn cohere_error_is_content_moderation(signal: &str) -> bool {
+    let s = signal.to_ascii_lowercase();
+    s.contains("toxic")
+        || s.contains("safety")
+        || s.contains("moderation")
+        || s.contains("content_policy")
+        || s.contains("content-policy")
+        || s.contains("content_filter")
 }
 
 /// Resolve the STABLE IR block index for a Cohere stream tool call identified by its wire
@@ -1370,13 +1371,38 @@ impl ProtocolWriter for CohereWriter {
 
             IrStreamEvent::MessageStop => None,
             IrStreamEvent::Error(err) => {
+                // Cohere v2 has NO `type: "error"` out-of-band stream event. A native v2 stream
+                // signals a mid-stream error by terminating with a `message-end` frame whose
+                // `finish_reason` is `ERROR` (infrastructure failure) or `ERROR_TOXIC` (content
+                // moderation). Emitting a `type: "error"` frame was both non-native (a strict Cohere
+                // SDK ignores or rejects an unknown event type, silently dropping the error) and a
+                // protocol-indistinguishability tell. We therefore emit the native `message-end`
+                // termination instead. The reader maps BOTH `ERROR` and `ERROR_TOXIC` back to IR
+                // `safety` (see line ~610), so this round-trips: a content-moderation signal in the
+                // provider_signal maps to `ERROR_TOXIC`, everything else to the generic `ERROR`.
+                let toxic = err
+                    .provider_signal
+                    .as_deref()
+                    .is_some_and(cohere_error_is_content_moderation);
+                let finish_reason = if toxic { "ERROR_TOXIC" } else { "ERROR" };
+                // Carry the human-readable detail in a top-level `message` field. The native v2
+                // `message-end` error termination's load-bearing discriminant is `finish_reason`
+                // (`ERROR`/`ERROR_TOXIC`), which the reader maps back to IR `safety`; the `message`
+                // is an additive, non-structural detail string so an operator/observer is not left
+                // with an opaque error and the SSE framing layer can surface the cause. The earlier
+                // `{"type":"error", ...}` frame (a NON-native v2 event type a strict SDK ignores or
+                // rejects) is gone; the frame is now the native `message-end` shape.
                 let message = err
                     .provider_signal
                     .clone()
                     .unwrap_or_else(|| "error".to_string());
                 Some((
                     "".to_string(),
-                    serde_json::json!({ "type": "error", "message": message }),
+                    serde_json::json!({
+                        "type": "message-end",
+                        "message": message,
+                        "delta": { "finish_reason": finish_reason }
+                    }),
                 ))
             }
         }
@@ -2335,6 +2361,98 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("ERROR_TOXIC"),
             "streamed safety stop must emit ERROR_TOXIC, not ERROR"
+        );
+    }
+
+    /// Regression (MEDIUM/correctness): a mid-stream `IrStreamEvent::Error` on a Cohere-ingress
+    /// stream must terminate with the NATIVE Cohere v2 error shape — a `message-end` frame whose
+    /// `finish_reason` is `ERROR` — NOT a non-native `type: "error"` out-of-band frame (which a
+    /// strict Cohere SDK ignores or rejects, silently dropping the error, and which is a
+    /// protocol-indistinguishability tell). A content-moderation signal maps to `ERROR_TOXIC`; any
+    /// other signal maps to the generic `ERROR`. The emitted frame must round-trip through this
+    /// protocol's OWN reader back to the IR `safety` stop reason.
+    #[test]
+    fn test_stream_error_emits_native_message_end_not_error_event() {
+        let writer = CohereWriter;
+
+        // Generic infrastructure error -> ERROR.
+        let infra = IrStreamEvent::Error(crate::proto::IrError {
+            class: crate::breaker::StatusClass::ServerError,
+            provider_signal: Some("internal_server_error".to_string()),
+            retry_after: None,
+        });
+        let (event_type, frame) = writer
+            .write_response_event(&infra)
+            .expect("Error must serialize to a native frame");
+        // The SSE `event:` field is empty for Cohere v2 (the type lives in the JSON `type` key).
+        assert_eq!(event_type, "");
+        assert_eq!(
+            frame.get("type").and_then(|v| v.as_str()),
+            Some("message-end"),
+            "Cohere v2 has no `type: error` event; a mid-stream error terminates with message-end"
+        );
+        assert_ne!(
+            frame.get("type").and_then(|v| v.as_str()),
+            Some("error"),
+            "the non-native `type: error` frame must not be emitted"
+        );
+        assert_eq!(
+            frame
+                .get("delta")
+                .and_then(|d| d.get("finish_reason"))
+                .and_then(|v| v.as_str()),
+            Some("ERROR"),
+            "an infrastructure error maps to the native ERROR finish_reason"
+        );
+        // Round-trips through the reader back to IR safety (the reader maps ERROR -> safety).
+        let mut state = crate::ir::StreamDecodeState::default();
+        let decoded = CohereReader.read_response_events("", &frame, &mut state);
+        assert!(
+            decoded.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::MessageDelta { stop_reason, .. }
+                    if stop_reason.as_deref() == Some("safety")
+            )),
+            "emitted message-end must decode back to a safety stop, got {decoded:?}"
+        );
+
+        // Content-moderation signal -> ERROR_TOXIC.
+        let toxic = IrStreamEvent::Error(crate::proto::IrError {
+            class: crate::breaker::StatusClass::ClientError,
+            provider_signal: Some("content_filter_safety".to_string()),
+            retry_after: None,
+        });
+        let (_, toxic_frame) = writer
+            .write_response_event(&toxic)
+            .expect("Error must serialize");
+        assert_eq!(
+            toxic_frame
+                .get("delta")
+                .and_then(|d| d.get("finish_reason"))
+                .and_then(|v| v.as_str()),
+            Some("ERROR_TOXIC"),
+            "a content-moderation signal maps to the native ERROR_TOXIC finish_reason"
+        );
+
+        // An absent provider_signal still produces a native ERROR termination (never `type: error`).
+        let bare = IrStreamEvent::Error(crate::proto::IrError {
+            class: crate::breaker::StatusClass::ServerError,
+            provider_signal: None,
+            retry_after: None,
+        });
+        let (_, bare_frame) = writer
+            .write_response_event(&bare)
+            .expect("Error must serialize");
+        assert_eq!(
+            bare_frame.get("type").and_then(|v| v.as_str()),
+            Some("message-end")
+        );
+        assert_eq!(
+            bare_frame
+                .get("delta")
+                .and_then(|d| d.get("finish_reason"))
+                .and_then(|v| v.as_str()),
+            Some("ERROR")
         );
     }
 

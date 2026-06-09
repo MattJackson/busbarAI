@@ -1260,10 +1260,15 @@ mod tests {
         server_b.shutdown().await;
     }
 
-    /// GET /metrics through the REAL router (route table + auth middleware) over HTTP returns
-    /// the Prometheus exposition with NO caller token — the endpoint is auth-exempt like /healthz.
+    /// GET /metrics through the REAL router (route table + auth middleware) in `auth.mode=none`
+    /// (open relay) returns the Prometheus exposition without a bearer token — `/metrics` is NOT
+    /// auth-exempt; it is admitted here only because the mode is None, where `validate_token`
+    /// returns `true` unconditionally. The sole always-open route is `/healthz` (auth.rs:331-333).
+    /// The companion test `test_metrics_requires_auth_in_token_mode` asserts that a missing-token
+    /// request to `/metrics` at `auth.mode=token` is rejected (401), covering the security fix that
+    /// supersedes the 0.16.2 note describing `/metrics` as intentionally open.
     #[tokio::test]
-    async fn test_metrics_endpoint_served_over_http_no_auth() {
+    async fn test_metrics_admitted_in_open_relay_mode() {
         crate::metrics::init();
         metrics::counter!(crate::metrics::REQUESTS_TOTAL, "outcome" => "ok").increment(1);
 
@@ -1293,6 +1298,71 @@ mod tests {
         assert!(
             body.contains(crate::metrics::REQUESTS_TOTAL),
             "exposition should contain a metric; got:\n{body}"
+        );
+
+        handle.abort();
+    }
+
+    /// Companion to `test_metrics_admitted_in_open_relay_mode`: in `auth.mode=token`, a GET
+    /// /metrics with NO bearer token is rejected with 401 — `/metrics` is auth-gated, NOT exempt
+    /// like `/healthz`. This guards the [Unreleased] security fix that made `/metrics` auth-gated
+    /// (superseding the 0.16.2 review note that described it as intentionally open): a regression
+    /// that re-added `/metrics` to the always-open allowlist alongside `/healthz` (auth.rs:331-333)
+    /// would let this unauthenticated scrape through and fail here. The same request WITH the
+    /// configured token is admitted (200), proving the gate is token-based, not a blanket block.
+    #[tokio::test]
+    async fn test_metrics_requires_auth_in_token_mode() {
+        crate::metrics::init();
+        metrics::counter!(crate::metrics::REQUESTS_TOTAL, "outcome" => "ok").increment(1);
+
+        let token = "sk-metrics-scrape";
+        let auth_cfg = crate::config::AuthCfg {
+            mode: "token".to_string(),
+            client_tokens: vec![token.to_string()],
+            _legacy_token: None,
+        };
+        let app = TestApp::new()
+            .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+            .auth_mode(crate::auth::AuthMode::Token)
+            .build();
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/metrics");
+
+        // No bearer token in token mode → /metrics is auth-gated, so the middleware rejects (401).
+        let unauthed = client
+            .get(&url)
+            .send()
+            .await
+            .expect("GET /metrics no token");
+        assert_eq!(
+            unauthed.status().as_u16(),
+            401,
+            "/metrics must require auth in token mode; a 200 means it was re-exempted like /healthz"
+        );
+
+        // With the configured token, the scrape is admitted (200) — the gate is token-based.
+        let authed = client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("GET /metrics with token");
+        assert_eq!(
+            authed.status().as_u16(),
+            200,
+            "/metrics with the configured token must be admitted"
+        );
+        let body = authed.text().await.unwrap();
+        assert!(
+            body.contains(crate::metrics::REQUESTS_TOTAL),
+            "authed exposition should contain a metric; got:\n{body}"
         );
 
         handle.abort();

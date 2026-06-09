@@ -793,13 +793,6 @@ impl ProtocolReader for GeminiReader {
     }
 }
 
-/// Process-global counter folded into every synthesized `responseId`, mirroring the Responses
-/// writer's `SYNTH_COUNTER`. It is overlaid onto the leading characters of the CSPRNG token so two
-/// synthesized ids are guaranteed distinct WITHIN a process even if the OS RNG returns identical
-/// bytes — without an embedded clock or a uuid/rand crate.
-static SYNTH_RESPONSE_ID_COUNTER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 /// Lowercase+uppercase+digit base62 alphabet — the mixed-case alphanumeric character class a native
 /// Gemini `responseId` draws from (e.g. `PXmFaPzVMI…`). Carries no `-`/`_`, so no separator or
 /// hyphen leaks the synthetic boundary the old `{:x}-{:x}` form exposed.
@@ -819,32 +812,20 @@ const RESPONSE_ID_TOKEN_LEN: usize = 16;
 /// previous `format!("{:x}-{:x}", unix_now_secs(), seq)` form was structurally distinguishable on two
 /// counts: (a) the `-` separator plus `[0-9a-f]`-only character class is a shape no native id has,
 /// and (b) the leading hex segment leaked the proxy host's wall-clock second to anyone holding a
-/// response id. This mints an opaque CSPRNG-backed base62 token of native length instead, mirroring
-/// the Responses writer's `synth_token`: fill from `getrandom`, then overlay the monotonic process
-/// counter MSB-first across the leading characters so the per-process uniqueness guarantee holds
-/// regardless of the RNG. No embedded clock, no separator, no new dependency. Never panics on the
-/// request path: on entropy failure the buffer stays the base62 zero char and the counter overlay
-/// still makes the token unique. 62^11 > u64::MAX, so 11 leading chars fully encode the counter.
+/// response id. This mints an opaque CSPRNG-backed base62 token of native length instead: the WHOLE
+/// token is filled from `getrandom` with NO counter overlay. A counter overlaid into any fixed
+/// region of the token leaves those characters predictable/low-entropy (the counter stays small, so
+/// its high base62 digits are constant '0') — a structural tell at whatever position it occupies. A
+/// 16-char base62 token is ~95 bits of entropy, collision-free in practice for a per-process id
+/// stream, so no counter backstop is needed and every position stays fully random like a native id.
+/// No embedded clock, no separator, no new dependency. Never panics on the request path: on entropy
+/// failure the buffer stays the base62 zero char.
 fn synth_response_id() -> String {
-    const _: () = assert!(
-        RESPONSE_ID_TOKEN_LEN >= 11,
-        "token must be wide enough to encode a u64 counter MSB-first"
-    );
-    let seq = SYNTH_RESPONSE_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
     let mut rand_bytes = [0u8; RESPONSE_ID_TOKEN_LEN];
     let _ = getrandom::getrandom(&mut rand_bytes);
     let mut token = [b'0'; RESPONSE_ID_TOKEN_LEN];
     for (slot, &byte) in token.iter_mut().zip(rand_bytes.iter()) {
         *slot = RESPONSE_ID_ALPHABET[(byte % 62) as usize];
-    }
-
-    // Overlay the monotonic counter MSB-first across the leading characters so adjacent ids differ
-    // in those positions even when the CSPRNG returns identical bytes.
-    let mut counter = seq;
-    for slot in token.iter_mut().take(11).rev() {
-        *slot = RESPONSE_ID_ALPHABET[(counter % 62) as usize];
-        counter /= 62;
     }
 
     // `token` is ASCII base62 by construction, hence always valid UTF-8; the fallback only guards an

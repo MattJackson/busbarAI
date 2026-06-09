@@ -708,12 +708,27 @@ fn bedrock_response_to_eventstream(ir: &crate::ir::IrResponse, elapsed_ms: Optio
     // messageStop (stop reason) then metadata (usage) — the writer's `MessageDelta` arm maps a
     // stop_reason-bearing delta to `messageStop` and a usage-only delta to `metadata`, exactly the
     // two native frames a real ConverseStream ends with.
+    // Default the synthesized stop reason from the IR CONTENT, not unconditionally `end_turn`. A
+    // native Bedrock Converse reports `tool_use` for a turn that emitted a tool call; if the buffered
+    // IR carried a ToolUse block but no explicit stop_reason (a cross-protocol 2xx whose upstream
+    // omitted it), default to the canonical `tool_use` so `stop_reason_reverse` yields `tool_use` and
+    // an AWS SDK consumer keying agentic control flow off stopReason re-invokes the tool. Only fall
+    // back to `end_turn` when the completion carried no tool call.
+    let default_stop_reason = if ir
+        .content
+        .iter()
+        .any(|b| matches!(b, IrBlock::ToolUse { .. }))
+    {
+        "tool_use"
+    } else {
+        "end_turn"
+    };
     push(
         &IrStreamEvent::MessageDelta {
             stop_reason: ir
                 .stop_reason
                 .clone()
-                .or_else(|| Some("end_turn".to_string())),
+                .or_else(|| Some(default_stop_reason.to_string())),
             usage: IrUsage {
                 input_tokens: 0,
                 output_tokens: 0,
@@ -2605,7 +2620,27 @@ pub(crate) async fn forward_with_pool(
                                         .body(Body::from(frames))
                                         .unwrap_or_else(|_| status.into_response());
                                 }
-                                let translated = ingress_proto.writer().write_response(&ir);
+                                let mut translated = ingress_proto.writer().write_response(&ir);
+                                // A native AWS Bedrock Converse (non-stream) response ALWAYS populates
+                                // `metrics.latencyMs` (the SDK surfaces it via
+                                // `ConverseOutput::metrics().latencyMs()`); the bedrock writer's
+                                // `write_response` deliberately emits only output/stopReason/usage, so a
+                                // bedrock-ingress non-stream client would read `metrics == None` — the
+                                // same proxy tell the streaming path already injects against. Mirror the
+                                // streaming policy: inject the real request elapsed wall-clock here, and
+                                // OMIT `metrics` rather than fabricate a tell-tale `0` if timing is
+                                // unavailable.
+                                if ingress_protocol == "bedrock" {
+                                    if let (Some(ms), Some(obj)) = (
+                                        u64::try_from(upstream_started.elapsed().as_millis()).ok(),
+                                        translated.as_object_mut(),
+                                    ) {
+                                        obj.insert(
+                                            "metrics".to_string(),
+                                            serde_json::json!({ "latencyMs": ms }),
+                                        );
+                                    }
+                                }
                                 // Gemini JSON-array streaming (`:streamGenerateContent` WITHOUT
                                 // `?alt=sse`, so `gemini_json_array`) answered by a BUFFERED non-SSE 2xx:
                                 // the native non-`alt=sse` endpoint returns a JSON ARRAY of chunk objects
@@ -3125,7 +3160,22 @@ async fn forward_once(
                                     .body(Body::from(frames))
                                     .unwrap_or_else(|_| status.into_response()));
                             }
-                            let translated = ingress_proto.writer().write_response(&ir);
+                            let mut translated = ingress_proto.writer().write_response(&ir);
+                            // Inject `metrics.latencyMs` for a bedrock-ingress non-stream Converse — a
+                            // native AWS Converse always populates it, so its absence is a proxy tell
+                            // (mirrors the streaming path and the buffered cross-protocol path above).
+                            // OMIT rather than fabricate `0` if timing is unavailable.
+                            if ingress_protocol == "bedrock" {
+                                if let (Some(ms), Some(obj)) = (
+                                    u64::try_from(upstream_started.elapsed().as_millis()).ok(),
+                                    translated.as_object_mut(),
+                                ) {
+                                    obj.insert(
+                                        "metrics".to_string(),
+                                        serde_json::json!({ "latencyMs": ms }),
+                                    );
+                                }
+                            }
                             // Gemini JSON-array streaming answered by a buffered non-SSE 2xx: wrap the
                             // single translated object in a one-element JSON array, matching the native
                             // non-`alt=sse` `streamGenerateContent` array framing (see the main path).
@@ -3887,6 +3937,122 @@ mod bedrock_eventstream_tests {
             block_indices,
             vec![0, 0, 0, 1, 1, 1, 2, 2, 2],
             "each block's three frames carry its own distinct, monotonic index; never colliding"
+        );
+    }
+
+    /// REGRESSION (R16 MEDIUM, conformance): a buffered cross-protocol completion whose IR carried a
+    /// ToolUse block but NO explicit `stop_reason` must synthesize `messageStop.stopReason ==
+    /// "tool_use"`, not the old unconditional `end_turn`. A native Bedrock Converse reports `tool_use`
+    /// for a tool-call turn, and an AWS SDK consumer keys agentic control flow off it — defaulting to
+    /// `end_turn` would silently break the tool re-invocation loop.
+    #[test]
+    fn buffered_tool_use_with_absent_stop_reason_defaults_to_tool_use() {
+        let ir = IrResponse {
+            role: IrRole::Assistant,
+            content: vec![IrBlock::ToolUse {
+                id: "toolu_xyz".to_string(),
+                name: "get_weather".to_string(),
+                input: serde_json::json!({"city": "Paris"}),
+            }],
+            // The hazard: upstream omitted a stop reason on the cross-protocol 2xx.
+            stop_reason: None,
+            usage: IrUsage {
+                input_tokens: 5,
+                output_tokens: 9,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("anthropic.claude-3".to_string()),
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let mut bytes = bedrock_response_to_eventstream(&ir, Some(3));
+        let frames = crate::eventstream::drain_frames(&mut bytes);
+        let stop = frames
+            .iter()
+            .find(|(t, _)| t == "messageStop")
+            .expect("messageStop frame");
+        let payload: serde_json::Value = serde_json::from_slice(&stop.1).expect("json messageStop");
+        assert_eq!(
+            payload["stopReason"], "tool_use",
+            "absent stop_reason with a ToolUse block must default to tool_use, not end_turn: {payload}"
+        );
+    }
+
+    /// REGRESSION (R16 MEDIUM, conformance): the companion to the test above — a TEXT-only completion
+    /// with an absent `stop_reason` must STILL default to `end_turn` (no tool call → no tool_use). This
+    /// guards against an over-broad fix that would mislabel a plain text completion as `tool_use`.
+    #[test]
+    fn buffered_text_only_with_absent_stop_reason_defaults_to_end_turn() {
+        let ir = IrResponse {
+            role: IrRole::Assistant,
+            content: vec![IrBlock::Text {
+                text: "All done.".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: None,
+            usage: IrUsage {
+                input_tokens: 3,
+                output_tokens: 4,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("anthropic.claude-3".to_string()),
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let mut bytes = bedrock_response_to_eventstream(&ir, Some(3));
+        let frames = crate::eventstream::drain_frames(&mut bytes);
+        let stop = frames
+            .iter()
+            .find(|(t, _)| t == "messageStop")
+            .expect("messageStop frame");
+        let payload: serde_json::Value = serde_json::from_slice(&stop.1).expect("json messageStop");
+        assert_eq!(
+            payload["stopReason"], "end_turn",
+            "absent stop_reason with no tool call must remain end_turn: {payload}"
+        );
+    }
+
+    /// REGRESSION (R16 MEDIUM, conformance): an EXPLICIT `stop_reason` always wins over the
+    /// content-derived default — a ToolUse block alongside an explicit `end_turn` keeps `end_turn`.
+    #[test]
+    fn buffered_explicit_stop_reason_overrides_content_default() {
+        let ir = IrResponse {
+            role: IrRole::Assistant,
+            content: vec![IrBlock::ToolUse {
+                id: "toolu_xyz".to_string(),
+                name: "get_weather".to_string(),
+                input: serde_json::json!({"city": "Paris"}),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: IrUsage {
+                input_tokens: 5,
+                output_tokens: 9,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("anthropic.claude-3".to_string()),
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let mut bytes = bedrock_response_to_eventstream(&ir, Some(3));
+        let frames = crate::eventstream::drain_frames(&mut bytes);
+        let stop = frames
+            .iter()
+            .find(|(t, _)| t == "messageStop")
+            .expect("messageStop frame");
+        let payload: serde_json::Value = serde_json::from_slice(&stop.1).expect("json messageStop");
+        assert_eq!(
+            payload["stopReason"], "end_turn",
+            "explicit stop_reason must override the content-derived default: {payload}"
         );
     }
 }

@@ -4,7 +4,6 @@
 //! OpenAI protocol reader/writer implementation.
 
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Largest upstream `tool_calls[].index` we accept in a streaming chunk. OpenAI documents at most
@@ -45,12 +44,6 @@ fn model_or_default(model: Option<&str>) -> &str {
     model.unwrap_or(DEFAULT_MODEL)
 }
 
-/// Process-local monotonic counter that GUARANTEES synthesized-id uniqueness within a process. It
-/// never repeats while the process lives, so even on the astronomically unlikely event of the OS
-/// CSPRNG returning a duplicate (or being unavailable, when we fall back to it entirely) two
-/// distinct calls still mint distinct ids. No crate dependency — just `std`.
-static SYNTH_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// Width of a native OpenAI chat-completion id's random suffix: the `chatcmpl-` prefix is followed
 /// by exactly 24 base62 characters (total 33 chars), the shape every native `chat.completion` /
 /// `chat.completion.chunk` id carries. Matching this length AND alphabet is what keeps the
@@ -69,33 +62,24 @@ const BASE62: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP
 /// a too-short or wrong-alphabet value as non-native. The previous base-36 form produced a
 /// variable-width ~7-char little-endian suffix (~16 chars total) — both too short and non-canonical.
 ///
-/// The 24-char suffix is filled from the OS CSPRNG (mirroring `synth_anthropic_request_id` /
-/// `synth_amzn_request_id` in `proto::mod`), giving native-looking entropy. To keep the
-/// collision-free guarantee unconditionally — independent of the RNG — the strictly-monotonic
-/// process counter is folded MSB-first into the leading characters of the token: two calls that
-/// happen to draw the same random bytes still differ because their counter values differ, and if the
-/// CSPRNG is unavailable the token degrades to a pure counter/timestamp encoding that is still
-/// unique and still 24 base62 chars wide. Never panics on the request path.
+/// The 24-char suffix is filled ENTIRELY from the OS CSPRNG (mirroring `synth_anthropic_request_id`
+/// / `synth_amzn_request_id` in `proto::mod`), giving native-looking entropy at EVERY position. A
+/// 24-char base62 token is ~142 bits of entropy; the birthday bound on a collision is ~2^71 draws,
+/// so pure CSPRNG output is collision-free in practice and needs no monotonic-counter backstop. We
+/// deliberately do NOT overlay a process counter: a counter overlaid into any fixed region of the
+/// token makes those characters predictable/low-entropy (the counter stays small, so its high
+/// base62 digits are constant '0'), which is itself a structural fingerprint a native vendor id —
+/// which is fully random across all positions — never carries. Native vendor ids ARE fully random,
+/// so we are too. Never panics on the request path: on the near-impossible `getrandom` failure the
+/// buffer stays the base62 zero char rather than `?`-ing out.
 fn synth_completion_id() -> String {
-    let n = SYNTH_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    // Fill the suffix with CSPRNG bytes mapped into base62. On entropy failure we leave the buffer
-    // zeroed (all '0'); the counter overlay below still makes the id unique, so we never panic.
+    // Fill the entire suffix with CSPRNG bytes mapped into base62. On entropy failure we leave the
+    // buffer zeroed (all '0') rather than panic; there is no counter overlay.
     let mut rand_bytes = [0u8; COMPLETION_ID_TOKEN_LEN];
     let _ = getrandom::getrandom(&mut rand_bytes);
     let mut token = [b'0'; COMPLETION_ID_TOKEN_LEN];
     for (slot, &byte) in token.iter_mut().zip(rand_bytes.iter()) {
         *slot = BASE62[(byte % 62) as usize];
-    }
-
-    // Overlay the monotonic counter MSB-first across the leading characters so the per-process
-    // uniqueness guarantee holds regardless of the RNG. 62^11 > 2^65 > u64::MAX, so 11 leading
-    // characters fully encode any `u64` counter without losing low bits; the remaining 13 stay
-    // random. Big-endian (MSB-first) so the digits read naturally rather than reversed.
-    let mut counter = n;
-    for slot in token.iter_mut().take(11).rev() {
-        *slot = BASE62[(counter % 62) as usize];
-        counter /= 62;
     }
 
     // `token` is ASCII base62 by construction, hence always valid UTF-8; the fallback only guards
@@ -331,17 +315,26 @@ impl ProtocolReader for OpenAiReader {
                 } else {
                     let mut msg_content = Vec::new();
 
-                    if let Some(cv) = content_val {
-                        if let Some(text) = cv.as_str() {
-                            msg_content.push(crate::ir::IrBlock::Text {
-                                text: text.to_string(),
-                                cache_control: None,
-                                citations: Vec::new(),
-                            });
-                        } else if let Some(arr) = cv.as_array() {
-                            for block_val in arr {
-                                let block = read_openai_block(block_val)?;
-                                msg_content.push(block);
+                    // For a Tool-role message the `content` payload is the tool RESULT: it is
+                    // captured below as the `ToolResult` block's inner content (mirroring the native
+                    // shape). Pushing it ALSO as a standalone Text block here duplicated the tool
+                    // output into two IR blocks — and on a Tool->OpenAI write that surfaced as a
+                    // spurious extra `{"role":"tool"}` message carrying the same text. So skip the
+                    // standalone-content projection for Tool-role messages; the ToolResult path owns
+                    // the tool content. User/assistant/system content is projected as before.
+                    if role != crate::ir::IrRole::Tool {
+                        if let Some(cv) = content_val {
+                            if let Some(text) = cv.as_str() {
+                                msg_content.push(crate::ir::IrBlock::Text {
+                                    text: text.to_string(),
+                                    cache_control: None,
+                                    citations: Vec::new(),
+                                });
+                            } else if let Some(arr) = cv.as_array() {
+                                for block_val in arr {
+                                    let block = read_openai_block(block_val)?;
+                                    msg_content.push(block);
+                                }
                             }
                         }
                     }
@@ -1225,6 +1218,7 @@ impl ProtocolWriter for OpenAiWriter {
 
             // Handle tool results (ToolRole messages)
             if msg.role == crate::ir::IrRole::Tool {
+                let mut emitted_tool_result = false;
                 for block in &msg.content {
                     if let crate::ir::IrBlock::ToolResult {
                         tool_use_id,
@@ -1255,7 +1249,24 @@ impl ProtocolWriter for OpenAiWriter {
                         }
 
                         messages_array.push(tool_result_obj);
+                        emitted_tool_result = true;
                     }
+                }
+
+                // A well-formed Tool-role message carries ONLY ToolResult blocks, each emitted above
+                // as a standalone `{"role":"tool",...}` entry; `msg_obj` is intentionally NOT added
+                // for that case. But a malformed IR Tool-role message can also carry non-ToolResult
+                // content (Text/Image projected into `content_val`, or ToolUse projected into
+                // `msg_obj["tool_calls"]`). Previously that content was silently dropped because
+                // `msg_obj` was never pushed on the Tool-role path. Surface it instead: push `msg_obj`
+                // when it carries any non-ToolResult payload (non-null `content` or a `tool_calls`
+                // array), or when the message had NO ToolResult block at all (so an otherwise-empty
+                // Tool-role message is not lost). This never duplicates a ToolResult — those are the
+                // standalone entries above and never appear in `content_val`.
+                let msg_has_payload = msg_obj.get("content").is_some_and(|c| !c.is_null())
+                    || msg_obj.get("tool_calls").is_some();
+                if msg_has_payload || !emitted_tool_result {
+                    messages_array.push(msg_obj);
                 }
             } else {
                 // Only add non-tool messages to the array directly (tool results are handled above).
@@ -2006,6 +2017,108 @@ mod tests {
         assert_eq!(
             tcs[0]["function"]["arguments"],
             serde_json::json!("{\"q\":\"rust\"}")
+        );
+    }
+
+    /// Regression (MEDIUM/correctness): a Tool-role message carrying ONLY ToolResult blocks must
+    /// emit ONLY the flat `{"role":"tool",...}` entries — `msg_obj` is NOT pushed (no spurious
+    /// `{"role":"tool","content":null}` entry).
+    #[test]
+    fn write_request_pure_tool_result_message_emits_only_flat_entries() {
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![IrMessage {
+                role: IrRole::Tool,
+                content: vec![IrBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: vec![text_block("42")],
+                    is_error: false,
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = OpenAiWriter.write_request(&req);
+        let msgs = out["messages"].as_array().expect("messages array");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "pure tool-result must yield exactly one entry"
+        );
+        assert_eq!(msgs[0]["role"], serde_json::json!("tool"));
+        assert_eq!(msgs[0]["tool_call_id"], serde_json::json!("call_1"));
+        assert_eq!(msgs[0]["content"], serde_json::json!("42"));
+    }
+
+    /// Regression (MEDIUM/correctness): a Tool-role message carrying BOTH a ToolResult block AND
+    /// non-ToolResult content (Text here, plus a ToolUse) must NOT silently drop the non-ToolResult
+    /// content. Previously the `msg_obj` (carrying the Text content and `tool_calls`) was never
+    /// pushed on the Tool-role path, dropping it. The fix surfaces it as an additional message entry.
+    #[test]
+    fn write_request_tool_role_mixed_content_not_dropped() {
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![IrMessage {
+                role: IrRole::Tool,
+                content: vec![
+                    IrBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: vec![text_block("result")],
+                        is_error: false,
+                    },
+                    text_block("stray narration"),
+                    IrBlock::ToolUse {
+                        id: "call_2".to_string(),
+                        name: "lookup".to_string(),
+                        input: serde_json::json!({"k": "v"}),
+                    },
+                ],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = OpenAiWriter.write_request(&req);
+        let msgs = out["messages"].as_array().expect("messages array");
+        // One flat tool-result entry, plus the msg_obj carrying the stray text + tool_calls.
+        assert_eq!(
+            msgs.len(),
+            2,
+            "tool-result entry + the non-dropped mixed-content entry, got {msgs:?}"
+        );
+        // The flat tool-result entry.
+        let flat = msgs
+            .iter()
+            .find(|m| m.get("tool_call_id").is_some())
+            .expect("flat tool-result entry present");
+        assert_eq!(flat["tool_call_id"], serde_json::json!("call_1"));
+        // The non-ToolResult content was surfaced, not dropped.
+        let carried = msgs
+            .iter()
+            .find(|m| m.get("tool_calls").is_some())
+            .expect("the non-ToolResult content (text + tool_calls) must not be dropped");
+        let tcs = carried["tool_calls"].as_array().expect("tool_calls array");
+        assert_eq!(tcs[0]["id"], serde_json::json!("call_2"));
+        // The stray text survives in the carried message's content array.
+        let content = carried["content"]
+            .as_array()
+            .expect("stray text content survives as an array");
+        assert!(
+            content
+                .iter()
+                .any(|c| c["type"] == "text" && c["text"] == "stray narration"),
+            "stray text must survive, got {content:?}"
         );
     }
 

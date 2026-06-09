@@ -1015,19 +1015,19 @@ impl ProtocolReader for BedrockReader {
             .and_then(|s| s.as_str())
             .map(stop_reason_map);
 
-        let usage_val = obj.get("usage").ok_or(IrError {
-            class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".to_string()),
-            retry_after: None,
-        })?;
-
+        // Treat an absent `usage` object leniently, mirroring the streaming path
+        // (`read_response_events` defaults each token field to 0 when `metadata` carries no usage):
+        // fall back to zero counts rather than hard-erroring. A missing `usage` is an upstream
+        // response-format quirk (mock/staging backend, or a future model variant), not a client
+        // error, so a spurious `ClientError` here would mislabel the cause and confuse retry logic.
+        let usage_obj = obj.get("usage");
         let usage = crate::ir::IrUsage {
-            input_tokens: usage_val
-                .get("inputTokens")
+            input_tokens: usage_obj
+                .and_then(|u| u.get("inputTokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
-            output_tokens: usage_val
-                .get("outputTokens")
+            output_tokens: usage_obj
+                .and_then(|u| u.get("outputTokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             cache_creation_input_tokens: None,

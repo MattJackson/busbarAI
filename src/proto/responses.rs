@@ -41,12 +41,6 @@ const MAX_OPEN_TOOLS: usize = 128;
 /// distinguishes a tool close (`remove(&idx)`) from a text close (`remove(&(idx + offset))`).
 const TEXT_INDEX_KEY_OFFSET: usize = 1000;
 
-/// Process-local monotonic counter folded into synthesized `resp_`/`msg_`/`fc_` ids so two ids
-/// minted in the same instant (even on an entropy-starved host) are still distinct. It never repeats
-/// while the process lives, giving an unconditional uniqueness guarantee independent of the CSPRNG.
-/// No crate dependency beyond `std`.
-static SYNTH_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// Lowercase+uppercase+digit base62 alphabet — the character class native Responses ids draw their
 /// opaque suffix from. Shared by [`synthesize_item_id`] and [`synthesize_response_id`].
 const BASE62: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -61,28 +55,20 @@ const ITEM_ID_TOKEN_LEN: usize = 48;
 /// ~38+ chars of opaque random data after the `resp_` prefix; 48 base62 chars stays in that profile.
 const RESPONSE_ID_TOKEN_LEN: usize = 48;
 
-/// Fill a fixed-width base62 token from the OS CSPRNG and overlay the monotonic process counter
-/// MSB-first across the leading characters so the per-process uniqueness guarantee holds regardless
-/// of the RNG. On entropy failure the buffer stays zeroed (all '0'); the counter overlay still makes
-/// the token unique, so this never panics on the request path. 62^11 > u64::MAX, so 11 leading
-/// characters fully encode any `u64` counter; the remaining characters stay random. `N` must be
-/// >= 11. Returns an owned `String` of exactly `N` base62 characters.
+/// Fill a fixed-width base62 token ENTIRELY from the OS CSPRNG, with NO counter overlay. A counter
+/// overlaid into any fixed region of the token leaves those characters predictable/low-entropy (the
+/// counter stays small, so its high base62 digits are constant '0') — a structural fingerprint at
+/// whatever position it occupies that a native, fully-random vendor id never carries. The opaque
+/// suffixes here are wide (>= 48 chars ≈ 285 bits of base62 entropy), so pure CSPRNG output is
+/// collision-free in practice for a per-process id stream and needs no monotonic-counter backstop.
+/// On entropy failure the buffer stays zeroed (all '0'), so this never panics on the request path.
+/// Returns an owned `String` of exactly `N` base62 characters.
 fn synth_token<const N: usize>() -> String {
-    let n = SYNTH_COUNTER.fetch_add(1, Ordering::Relaxed);
-
     let mut rand_bytes = [0u8; N];
     let _ = getrandom::getrandom(&mut rand_bytes);
     let mut token = [b'0'; N];
     for (slot, &byte) in token.iter_mut().zip(rand_bytes.iter()) {
         *slot = BASE62[(byte % 62) as usize];
-    }
-
-    // Overlay the monotonic counter MSB-first across the leading characters so adjacent ids differ
-    // in those positions even when the CSPRNG returns identical bytes.
-    let mut counter = n;
-    for slot in token.iter_mut().take(11).rev() {
-        *slot = BASE62[(counter % 62) as usize];
-        counter /= 62;
     }
 
     // `token` is ASCII base62 by construction, hence always valid UTF-8; the fallback only guards an
@@ -123,9 +109,10 @@ fn now_unix_secs() -> u64 {
 /// the leading hex segment (`resp_{timestamp_hex}{counter_hex}`), which both made the id shorter than
 /// native AND leaked the proxy's server clock to within one second to anyone holding a response id.
 /// The opaque CSPRNG token here matches the native length/entropy profile and embeds no timestamp;
-/// the monotonic process counter folded into the token (via `synth_token`) preserves the
-/// collision-free per-process uniqueness guarantee without an embedded clock. Native passthrough
-/// never calls this: it carries the upstream id verbatim.
+/// the whole token is drawn from `getrandom` (via `synth_token`) with NO counter overlay — at >= 48
+/// base62 chars (~285 bits) the birthday bound makes a per-process collision astronomically unlikely,
+/// so a counter would only ADD a predictable low-entropy region (a structural fingerprint) for no
+/// uniqueness benefit. Native passthrough never calls this: it carries the upstream id verbatim.
 fn synthesize_response_id() -> String {
     format!("resp_{}", synth_token::<RESPONSE_ID_TOKEN_LEN>())
 }
@@ -1233,6 +1220,28 @@ pub(crate) struct ResponsesWriter {
     /// poisoned lock degrades to omitting the accumulated fields (still emits the `done`) rather than
     /// panicking on the request path.
     tool_calls: std::sync::Mutex<std::collections::BTreeMap<usize, ToolCallAccum>>,
+    /// Per-stream accumulator of streamed assistant TEXT, keyed by `output_index`. A native
+    /// /v1/responses terminal `response.completed`/`response.incomplete` event carries the FULLY
+    /// assembled `output[]` array, and a message item in it carries its `output_text` parts with the
+    /// complete text the stream delivered via `output_text.delta`. The IR streams text only as
+    /// `TextDelta` fragments, so the writer concatenates them here as they arrive and drains the
+    /// joined text into the terminal `output` message item at BlockStop. Per-stream INSTANCE state
+    /// for the same reason as the other fields; a poisoned lock degrades to omitting the accumulated
+    /// text (the item then carries empty text) rather than panicking on the request path.
+    text_accum: std::sync::Mutex<std::collections::BTreeMap<usize, String>>,
+    /// Per-stream buffer of FINALIZED `output[]` items, keyed by `output_index` so the terminal
+    /// event emits them in stable index order. A native /v1/responses `response.completed`/
+    /// `response.incomplete` event's inner `response.output` is the fully assembled array (each
+    /// `message` item with its `output_text` parts, each finalized `function_call` item) — the
+    /// official SDK reads `event.response.output` to materialize the final `Response.output`. The IR
+    /// `MessageDelta` carries no assembled output, but the writer has already seen every delta, so it
+    /// records each item here as the matching `BlockStop` finalizes it and drains the map into the
+    /// terminal `response.output`. Before this, the terminal `output` was hard-coded to `[]` even
+    /// though real text/tool items streamed — an empty `output` with nonzero `usage.output_tokens`
+    /// is a shape real OpenAI never emits and breaks SDK consumers that read the assembled output off
+    /// the completed event. Per-stream INSTANCE state for the same reason as the other fields; a
+    /// poisoned lock degrades to an empty array (the prior behavior) rather than panicking.
+    output_items: std::sync::Mutex<std::collections::BTreeMap<usize, serde_json::Value>>,
 }
 
 /// Accumulated function-call item fields for one open `output_index`, finalized into the
@@ -1269,6 +1278,8 @@ pub(crate) const ResponsesWriter: ResponsesWriter = ResponsesWriter {
     open_text_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
     item_ids: std::sync::Mutex::new(std::collections::BTreeMap::new()),
     tool_calls: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+    text_accum: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+    output_items: std::sync::Mutex::new(std::collections::BTreeMap::new()),
 };
 
 impl Clone for ResponsesWriter {
@@ -1319,6 +1330,24 @@ impl Clone for ResponsesWriter {
                     .map(|m| m.clone())
                     .unwrap_or_default(),
             ),
+            // Carry the in-flight text accumulator across a mid-stream `Protocol::clone` so the
+            // cloned writer's terminal `output` still assembles the full streamed text; a poisoned
+            // lock degrades to an empty map.
+            text_accum: std::sync::Mutex::new(
+                self.text_accum
+                    .lock()
+                    .map(|m| m.clone())
+                    .unwrap_or_default(),
+            ),
+            // Carry the finalized-output buffer across a mid-stream `Protocol::clone` so the cloned
+            // writer's terminal event still emits the assembled `output[]`; a poisoned lock degrades
+            // to an empty map (terminal `output` then falls back to `[]`).
+            output_items: std::sync::Mutex::new(
+                self.output_items
+                    .lock()
+                    .map(|m| m.clone())
+                    .unwrap_or_default(),
+            ),
         }
     }
 }
@@ -1345,6 +1374,14 @@ impl ResponsesWriter {
         // Clear the per-stream function-call field accumulator so a reused/cloned writer does not
         // carry a previous stream's call_id/name/arguments into a new stream's `output_item.done`.
         if let Ok(mut map) = self.tool_calls.lock() {
+            map.clear();
+        }
+        // Clear the per-stream text accumulator and the finalized-output buffer so a reused/cloned
+        // writer does not leak a previous stream's text/items into a new stream's terminal `output`.
+        if let Ok(mut map) = self.text_accum.lock() {
+            map.clear();
+        }
+        if let Ok(mut map) = self.output_items.lock() {
             map.clear();
         }
         // Clear the carried `response.id` alongside the sequence counter: a reused/cloned writer
@@ -1482,6 +1519,47 @@ impl ResponsesWriter {
             .lock()
             .ok()
             .and_then(|mut map| map.remove(&index))
+    }
+
+    /// Append a streamed text fragment for the message item at `index`. The native terminal
+    /// `response.output` carries the COMPLETE assembled text per message item, so the writer
+    /// concatenates the `TextDelta` fragments here. Lock poisoning degrades to a no-op (the terminal
+    /// item then carries empty text) rather than panicking on the request path.
+    fn append_text(&self, index: usize, fragment: &str) {
+        if let Ok(mut map) = self.text_accum.lock() {
+            map.entry(index).or_default().push_str(fragment);
+        }
+    }
+
+    /// Remove and return the accumulated text for the message item at `index`. Returns an empty
+    /// string if nothing was accumulated (a text block with no deltas, or a poisoned lock).
+    fn take_text_accum(&self, index: usize) -> String {
+        self.text_accum
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&index))
+            .unwrap_or_default()
+    }
+
+    /// Record a FINALIZED `output[]` item at `index`, captured as the matching `BlockStop`
+    /// assembles it, so the terminal `response.completed`/`response.incomplete` event can emit the
+    /// fully assembled `output` array (keyed by index for stable order). Lock poisoning degrades to
+    /// a no-op (that item is omitted from the terminal `output`) rather than panicking.
+    fn record_output_item(&self, index: usize, item: serde_json::Value) {
+        if let Ok(mut map) = self.output_items.lock() {
+            map.insert(index, item);
+        }
+    }
+
+    /// Drain the finalized `output[]` items into an index-ordered array for the terminal event.
+    /// `BTreeMap` iteration is key-ordered, so the items come out in `output_index` order, matching
+    /// the order a native /v1/responses stream assembled them. A poisoned lock degrades to an empty
+    /// array (the prior `[]` behavior) rather than panicking on the request path.
+    fn drain_output_items(&self) -> Vec<serde_json::Value> {
+        self.output_items
+            .lock()
+            .map(|mut map| std::mem::take(&mut *map).into_values().collect())
+            .unwrap_or_default()
     }
 
     /// Mark a TEXT message item open at `index` IF it is not already open and there is room under
@@ -1879,6 +1957,10 @@ impl ProtocolWriter for ResponsesWriter {
                     // carries only the output index; synthesize the message `item_id` deterministically
                     // from it (matching the `msg_…` part), and emit `content_index: 0` — the single
                     // text content part of the item.
+                    //
+                    // Accumulate the fragment so the matching `BlockStop` can assemble the message
+                    // item with its COMPLETE `output_text` for the terminal `response.output` array.
+                    self.append_text(*index, text);
                     Some((
                         "response.output_text.delta".to_string(),
                         serde_json::json!({
@@ -1945,39 +2027,55 @@ impl ProtocolWriter for ResponsesWriter {
                     // degrades to empty-string fields rather than panicking.
                     let item_id = self.item_id_for("fc", *index);
                     let accum = self.take_tool_accum(*index).unwrap_or_default();
+                    let item = serde_json::json!({
+                        "type": "function_call",
+                        "id": item_id,
+                        "call_id": accum.call_id,
+                        "name": accum.name,
+                        "arguments": accum.arguments,
+                    });
+                    // Record the finalized function-call item so the terminal `response.completed`/
+                    // `response.incomplete` event emits the fully assembled `output[]` array (the
+                    // SDK reads `event.response.output` to materialize `Response.output`).
+                    self.record_output_item(*index, item.clone());
                     Some((
                         "response.output_item.done".to_string(),
                         serde_json::json!({
                             "type": "response.output_item.done",
                             "output_index": index,
                             "item_id": item_id,
-                            "item": {
-                                "type": "function_call",
-                                "id": item_id,
-                                "call_id": accum.call_id,
-                                "name": accum.name,
-                                "arguments": accum.arguments,
-                            },
+                            "item": item,
                         }),
                     ))
                 } else if self.take_text_open(*index) {
                     // Close the message item opened by the Text BlockStart. The same cached `msg_…`
                     // id (also carried on every `output_text.delta`) reconstructs the matching
-                    // `added → done` pair the SDK uses to finalize `response.output[]`.
+                    // `added → done` pair the SDK uses to finalize `response.output[]`. The native
+                    // `output_item.done` for a message item carries the assembled `output_text`
+                    // content part with the COMPLETE text the deltas delivered (the SDK accumulates
+                    // `Response.output_text` from it), so emit the accumulated text rather than an
+                    // empty content array.
                     let item_id = self.item_id_for("msg", *index);
+                    let text = self.take_text_accum(*index);
+                    let item = serde_json::json!({
+                        "type": "message",
+                        "id": item_id,
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            { "type": "output_text", "text": text, "annotations": [] }
+                        ]
+                    });
+                    // Record the finalized message item so the terminal event emits the fully
+                    // assembled `output[]` array.
+                    self.record_output_item(*index, item.clone());
                     Some((
                         "response.output_item.done".to_string(),
                         serde_json::json!({
                             "type": "response.output_item.done",
                             "output_index": index,
                             "item_id": item_id,
-                            "item": {
-                                "type": "message",
-                                "id": item_id,
-                                "role": "assistant",
-                                "status": "completed",
-                                "content": []
-                            }
+                            "item": item,
                         }),
                     ))
                 } else {
@@ -2068,14 +2166,19 @@ impl ProtocolWriter for ResponsesWriter {
                 // The native terminal `response.completed`/`response.incomplete` event carries the
                 // FULLY assembled inner `response` object: the official Python/Node SDK reads
                 // `event.response.output` to finalize the assembled `Response`, and `output` is a
-                // REQUIRED field a strict typed decoder raises on when absent. The IR `MessageDelta`
-                // did not retain the assembled `output` items (they streamed as deltas), but the
-                // native shape requires the key present, so emit a present-but-empty array — never
-                // omit it. `error` is likewise REQUIRED and `null` on a non-failed terminal event
-                // (a genuine failure arrives via IrStreamEvent::Error → `response.failed`, never
-                // this arm). This mirrors the `response.created` skeleton, which already emits
-                // `output: []` and `error: null`.
-                resp_obj.insert("output".to_string(), serde_json::json!([]));
+                // REQUIRED field a strict typed decoder raises on when absent. The writer recorded
+                // each finalized item (message text parts and function-call items) into
+                // `output_items` as the matching `BlockStop` fired, so drain that index-ordered
+                // buffer here — a `completed` response with nonzero `usage.output_tokens` but an
+                // EMPTY `output` is a shape real OpenAI never emits and breaks SDK consumers that
+                // read the assembled output off the completed event. The buffer is empty (yielding
+                // `[]`) only for a genuinely output-less turn or a poisoned lock. `error` is
+                // likewise REQUIRED and `null` on a non-failed terminal event (a genuine failure
+                // arrives via IrStreamEvent::Error → `response.failed`, never this arm).
+                resp_obj.insert(
+                    "output".to_string(),
+                    serde_json::Value::Array(self.drain_output_items()),
+                );
                 resp_obj.insert("error".to_string(), serde_json::Value::Null);
 
                 // The terminal event's NAME and inner `type` MUST agree with the inner
@@ -5964,6 +6067,126 @@ mod tests {
             failed["response"]["error"]["code"].as_str(),
             Some("boom"),
             "response.failed must still carry its populated error object"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance): the terminal `response.completed` event's inner
+    /// `response.output` must carry the FULLY assembled output array (the message item with its
+    /// `output_text` content, and the finalized function-call item) — NOT a hard-coded `[]`. A
+    /// `completed` response with nonzero `usage.output_tokens` but an empty `output` is a shape real
+    /// /v1/responses never emits and breaks SDK consumers that read `event.response.output`.
+    #[test]
+    fn test_terminal_output_assembles_streamed_text_and_tool_items() {
+        let writer = ResponsesWriter;
+        // Opening event.
+        let _ = writer.write_response_event(&IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        });
+
+        // Text item at index 0: BlockStart + two deltas + BlockStop.
+        let _ = writer.write_response_event(&IrStreamEvent::BlockStart {
+            index: 0,
+            block: crate::ir::IrBlockMeta::Text,
+        });
+        let _ = writer.write_response_event(&IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::TextDelta("Hello ".to_string()),
+        });
+        let _ = writer.write_response_event(&IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::TextDelta("world".to_string()),
+        });
+        let _ = writer.write_response_event(&IrStreamEvent::BlockStop { index: 0 });
+
+        // Function-call item at index 1: BlockStart(ToolUse) + arg deltas + BlockStop.
+        let _ = writer.write_response_event(&IrStreamEvent::BlockStart {
+            index: 1,
+            block: crate::ir::IrBlockMeta::ToolUse {
+                id: "call_abc".to_string(),
+                name: "get_weather".to_string(),
+            },
+        });
+        let _ = writer.write_response_event(&IrStreamEvent::BlockDelta {
+            index: 1,
+            delta: crate::ir::IrDelta::InputJsonDelta("{\"city\":".to_string()),
+        });
+        let _ = writer.write_response_event(&IrStreamEvent::BlockDelta {
+            index: 1,
+            delta: crate::ir::IrDelta::InputJsonDelta("\"SF\"}".to_string()),
+        });
+        let _ = writer.write_response_event(&IrStreamEvent::BlockStop { index: 1 });
+
+        // Terminal.
+        let (ename, completed) = writer
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("tool_use".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            })
+            .expect("terminal event");
+        assert_eq!(ename, "response.completed");
+
+        let output = completed["response"]["output"]
+            .as_array()
+            .expect("terminal output must be an array");
+        assert_eq!(
+            output.len(),
+            2,
+            "assembled output must carry both the message and the function_call item, got {output:?}"
+        );
+
+        // Items come out in output_index order: message (0) then function_call (1).
+        let msg_item = &output[0];
+        assert_eq!(msg_item["type"], serde_json::json!("message"));
+        assert_eq!(msg_item["role"], serde_json::json!("assistant"));
+        let text = msg_item["content"][0]["text"]
+            .as_str()
+            .expect("message item carries assembled output_text");
+        assert_eq!(
+            text, "Hello world",
+            "the streamed text must be fully assembled"
+        );
+
+        let fc_item = &output[1];
+        assert_eq!(fc_item["type"], serde_json::json!("function_call"));
+        assert_eq!(fc_item["call_id"], serde_json::json!("call_abc"));
+        assert_eq!(fc_item["name"], serde_json::json!("get_weather"));
+        assert_eq!(
+            fc_item["arguments"],
+            serde_json::json!("{\"city\":\"SF\"}"),
+            "the finalized function-call item must carry the complete accumulated arguments"
+        );
+    }
+
+    /// A genuinely output-less turn (no blocks streamed) still emits a present-but-empty `output`
+    /// array on the terminal event — never an omitted key.
+    #[test]
+    fn test_terminal_output_empty_when_no_blocks_streamed() {
+        let writer = ResponsesWriter;
+        let _ = writer.write_response_event(&IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        });
+        let (_, completed) = writer
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            })
+            .expect("terminal event");
+        let output = completed["response"]["output"]
+            .as_array()
+            .expect("output present-but-empty, never omitted");
+        assert!(
+            output.is_empty(),
+            "no blocks streamed -> empty output array"
         );
     }
 }

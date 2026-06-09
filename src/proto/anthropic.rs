@@ -9,14 +9,6 @@ use super::*;
 /// targets). Bump when adopting a newer Anthropic API version.
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
-/// Process-local monotonic counter that GUARANTEES synthesized-id uniqueness within a process: it
-/// never repeats while the process lives, so even on the astronomically unlikely event of the OS
-/// CSPRNG returning a duplicate draw (or being unavailable, when we fall back to it entirely) two
-/// distinct calls still mint distinct ids. It is folded into the token only as a uniqueness
-/// BACKSTOP — never the entropy source — so it cannot reduce randomness or leak the wall clock. No
-/// crate dependency beyond `std`.
-static SYNTH_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Mixed-case base62 alphabet (`[0-9A-Za-z]`), matching the character set of a native Anthropic id
 /// token. A native `msg_`/`req_` id is `01` followed by a fixed-length mixed-case alphanumeric
 /// token — NOT lowercase hex — so encoding the synthesized suffix in this alphabet (rather than
@@ -49,40 +41,23 @@ fn synth_request_id() -> String {
 }
 
 /// Shared id construction for both `msg_` and `req_`. The suffix is the native `01` version marker
-/// followed by a fixed-width 24-char mixed-case base62 token drawn from the OS CSPRNG (mirroring
-/// `proto::mod::synth_anthropic_request_id` and `openai::synth_completion_id`). The earlier
-/// `(unix_second, counter)` encoding was a deterministic clock+counter fingerprint — at the current
-/// epoch its base62 timestamp field zero-pads to a fixed `01000000…` run that no native Anthropic id
-/// ever carries — so it is replaced entirely by CSPRNG bytes. The process-monotonic counter is
-/// folded MSB-first into only the leading characters as a pure uniqueness BACKSTOP: it guarantees
-/// two calls differ even if the RNG repeats or is unavailable, but it never supplies the entropy and
-/// (carrying no wall-clock component) cannot leak the clock. Never panics on the request path.
+/// followed by a fixed-width 24-char mixed-case base62 token drawn ENTIRELY from the OS CSPRNG
+/// (mirroring `proto::mod::synth_anthropic_request_id` and `openai::synth_completion_id`). The
+/// earlier `(unix_second, counter)` encoding was a deterministic clock+counter fingerprint, and even
+/// a counter overlaid into a fixed region of an otherwise-random token leaves those characters
+/// predictable/low-entropy (the counter stays small, so its high base62 digits are constant '0') —
+/// a structural tell at WHATEVER position (leading or trailing) it occupies. We therefore overlay NO
+/// counter at all: a 24-char base62 token is ~142 bits of entropy with a ~2^71 birthday bound, so
+/// pure CSPRNG output is collision-free in practice and every position stays fully random, exactly
+/// like a native Anthropic id. Never panics on the request path.
 fn synth_id_with_prefix(prefix: &str) -> String {
-    let n = SYNTH_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    // Fill the token with CSPRNG bytes mapped into base62. On entropy failure we leave the buffer
-    // zeroed (all '0'); the counter overlay below still makes the id unique, so we never panic and
-    // never `?`-out on the request path.
+    // Fill the entire token with CSPRNG bytes mapped into base62. On entropy failure we leave the
+    // buffer zeroed (all '0') rather than panic; there is no counter overlay.
     let mut rand_bytes = [0u8; SYNTH_ID_TOKEN_LEN];
     let _ = getrandom::getrandom(&mut rand_bytes);
     let mut token = [b'0'; SYNTH_ID_TOKEN_LEN];
     for (slot, &byte) in token.iter_mut().zip(rand_bytes.iter()) {
         *slot = BASE62_ALPHABET[(byte % 62) as usize];
-    }
-
-    // Overlay the monotonic counter into the TRAILING 11 characters so the per-process uniqueness
-    // guarantee holds regardless of the RNG, WITHOUT recreating the very leading-zero tell this fix
-    // removes. 62^11 > 2^65 > u64::MAX, so 11 characters fully encode any `u64` counter; the LEADING
-    // 13 stay purely random. Folding the counter into the tail (least-significant digits first, from
-    // the end) is deliberate: the counter starts at 0 and stays small, so its high base62 digits are
-    // '0' for the entire practical life of the process — placing those at the FRONT (as a naive
-    // MSB-first overlay would) would zero-pad the leading characters and reintroduce a structural
-    // `01000…` prefix. Keeping the leading 13 random guarantees the token never has a run of leading
-    // zeros longer than chance allows, so a synthesized id is entropy-indistinguishable from native.
-    let mut counter = n;
-    for slot in token.iter_mut().rev().take(11) {
-        *slot = BASE62_ALPHABET[(counter % 62) as usize];
-        counter /= 62;
     }
 
     // `token` is ASCII base62 by construction, hence always valid UTF-8; the fallback only guards
