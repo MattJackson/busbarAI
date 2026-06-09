@@ -31,7 +31,7 @@ pipeline**.
         ┌───────────────────────────────────┐
         │  governance checks (if enabled)    │
         │   allowed-pools (403)              │
-        │   budget       (402)              │
+        │   budget       (429 / 400 bedrock)│
         │   rate limit   (429 + Retry-After)│
         └───────────────┬───────────────────┘
                         ▼
@@ -136,8 +136,13 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
 ### 3. Governance checks
 
 When a virtual key is resolved, the route handler enforces, in order:
-allowed-pools (`403`), budget (`402`), and rate limits (`429` + `Retry-After`)
-*before* forwarding. The flat per-request fee is charged at request completion;
+allowed-pools (`403`), budget (`429`, or `400` for Bedrock ingress), and rate
+limits (`429` + `Retry-After`) *before* forwarding. Budget exhaustion does **not**
+emit `402`: no upstream vendor returns `402` for an over-quota condition, so a
+`402` would be a router-side tell. Instead each ingress writer maps to its native
+quota shape — `429` (`insufficient_quota`) for OpenAI / Responses / Anthropic /
+Gemini / Cohere, and `400` (`ServiceQuotaExceededException`) for Bedrock. The flat
+per-request fee is charged at request completion;
 token-based spend is charged when the response stream completes (token-accurate
 accounting). See [operations.md](operations.md).
 

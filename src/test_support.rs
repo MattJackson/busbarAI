@@ -959,6 +959,119 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// Regression: token usage from a cross-protocol STREAMING response must be charged to the
+    /// virtual key, so TPM limits enforce on streams too. The streaming path records tokens through
+    /// a completely separate code path from the non-stream test above: `FirstByteBody`'s stream-end
+    /// handler taps `UsageTap` and calls `UsageSink`'s `gov.record_tokens` on clean 2xx completion
+    /// (forward.rs:1341-1344), NOT the buffered `record_nonstream_usage`. A regression that broke the
+    /// stream-end charge (the drop/poll handler not firing, the sink not wired into the streaming
+    /// branch) would leave streaming token usage uncharged and TPM would silently stop enforcing for
+    /// streams — the non-stream test gives no coverage because the paths are disjoint. After the first
+    /// stream fully drains (160 tokens charged), a second request in the same window is rejected (429).
+    #[tokio::test]
+    async fn test_cross_protocol_stream_records_tokens_for_tpm() {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+        crate::metrics::init();
+
+        // OpenAI-protocol SSE stream whose final chunk carries usage totalling 160 tokens
+        // (prompt 100 + completion 60). The OpenAI reader decodes bare `data:`-framed chunks the
+        // mock emits; the trailing-usage chunk is where `UsageTap` reads prompt/completion tokens.
+        let stream_events = || -> Vec<String> {
+            vec![
+                r#"{"choices":[{"delta":{"role":"assistant"}}]}"#.to_string(),
+                r#"{"choices":[{"delta":{"content":"Hello there friend"}}]}"#.to_string(),
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":60}}"#.to_string(),
+            ]
+        };
+
+        let state = Arc::new(MockServerState::new());
+        for _ in 0..2 {
+            state.push(MockResponse::Sse {
+                events: stream_events(),
+                abort_at_index: None,
+            });
+        }
+        let server = MockServer::new(state.clone()).await;
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let secret = "sk-vk-tpm-stream";
+        store
+            .put_key(&VirtualKey {
+                id: "ktpmstream".to_string(),
+                key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
+                name: "tpm-stream".to_string(),
+                allowed_pools: vec!["pas".to_string()],
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: Some(100), // high, so RPM doesn't interfere — TPM is what we exercise
+                tpm_limit: Some(30),
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+
+        // Lane speaks OpenAI; ingress below is Anthropic streaming → cross-protocol SSE reframe.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "glm-4.5",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("pas", &[(0, 1)])
+            .governance(gov)
+            .build();
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/pas/v1/messages");
+        let req = json!({"model": "pas", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50, "stream": true}).to_string();
+
+        // First request: tokens-so-far is 0 (< 30) → admitted. The stream must be FULLY DRAINED so
+        // `FirstByteBody`'s stream-end handler fires and charges the 160 tokens via the UsageSink.
+        let r1 = client
+            .post(&url)
+            .bearer_auth(secret)
+            .body(req.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r1.status().as_u16(),
+            200,
+            "first streaming request is under TPM"
+        );
+        let b1 = r1.bytes().await.unwrap();
+        assert!(
+            !b1.is_empty(),
+            "first stream must yield a non-empty SSE body that drains to completion; got empty"
+        );
+
+        // Second request in the same 60s window: prior tokens (160) now exceed TPM 30 → 429. This
+        // proves the STREAM-end UsageSink charge landed (was the risk: streaming tokens stayed 0).
+        let r2 = client
+            .post(&url)
+            .bearer_auth(secret)
+            .body(req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r2.status().as_u16(),
+            429,
+            "stream-recorded tokens must make TPM enforce on the next request (streaming charge path)"
+        );
+
+        handle.abort();
+        server.shutdown().await;
+    }
+
     /// Regression: a lane's `max_requests` lifetime cap (loaded as `budget`, `limited=true`) must
     /// actually exhaust the lane — and each success must increment the per-lane `ok` counter. Both
     /// were unwired: the success path never called record_success or spend_budget, so the cap never

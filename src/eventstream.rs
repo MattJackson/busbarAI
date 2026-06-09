@@ -664,6 +664,25 @@ mod tests {
         assert!(!ok.is_empty());
     }
 
+    /// `encode_frame` must DROP the whole frame (empty `Vec`) when the caller-supplied `:event-type`
+    /// value exceeds the type-7 string cap (u16, 65535 bytes), rather than emit a CRC-valid frame
+    /// carrying a byte-truncated (possibly invalid-UTF-8) header. This exercises the `encode_frame`
+    /// early-return on a failed `push_string_header` for `:event-type` — the only caller-supplied
+    /// header in that path — which the payload-cap and exception-frame tests do not reach.
+    #[test]
+    fn test_encode_frame_oversized_event_type_drops_frame() {
+        // An event-type value one byte over the u16 type-7 string cap.
+        let huge_event_type = "e".repeat(u16::MAX as usize + 1);
+        let frame = encode_frame(&huge_event_type, br#"{"x":1}"#);
+        assert!(
+            frame.is_empty(),
+            "an oversized :event-type header must drop the frame, not truncate the string"
+        );
+        // A short, valid event type still encodes normally.
+        let ok = encode_frame("contentBlockDelta", br#"{"x":1}"#);
+        assert!(!ok.is_empty());
+    }
+
     /// The encoder carries the three Bedrock framing headers (`:event-type`, `:content-type`,
     /// `:message-type`); `parse_event_type` must skip past the others and still find the event name.
     #[test]

@@ -200,15 +200,18 @@ Create-key fields:
 |---|---|---|---|
 | `name` | string | — | Required label. |
 | `allowed_pools` | list<string> | `[]` | Pools/models this key may target. Empty = all allowed. Violations → `403`. |
-| `max_budget_cents` | integer | none | Spend cap for the budget window; exceeded → `402`. |
+| `max_budget_cents` | integer | none | Spend cap for the budget window; exceeded → `429` (or `400` for Bedrock ingress). |
 | `budget_period` | string | `total` | `total` (all-time), `daily` (UTC midnight), or `monthly` (UTC first-of-month). |
 | `rpm_limit` | integer | none | Requests per 60s window; exceeded → `429` + `Retry-After`. |
 | `tpm_limit` | integer | none | Tokens per 60s window; exceeded → `429` + `Retry-After`. |
 
 ### Enforcement model
 
-- **Allowed-pools / budget / rate** are checked before forwarding (`403` / `402` /
-  `429` respectively).
+- **Allowed-pools / budget / rate** are checked before forwarding (`403` /
+  `429` (or `400` for Bedrock ingress) / `429` respectively). Budget exhaustion is
+  not a distinct `402`: it surfaces as the vendor-native quota status with
+  `error.type: insufficient_quota` in the body, so it stays indistinguishable from
+  a real upstream quota error.
 - **Budget** is token-accurate: a flat `price_per_request_cents` is charged at
   request completion, and `price_per_1k_tokens_cents * tokens/1000` is charged when
   the response stream completes, tapped from the upstream's reported usage.
@@ -227,8 +230,7 @@ Create-key fields:
 | `503` on every request | `/stats` — are all lanes `dead` or in cooldown? Check `dead_reason`. |
 | A lane stuck `dead` with `billing` reason | Upstream wallet/quota; the lane recovers on a successful probe once funded. Consider `health.mode: dead`. |
 | A lane stuck `dead` with `auth` reason | Wrong/expired key in the provider's `api_key_env`. |
-| `429` from busbar itself | A virtual key hit its RPM/TPM. Check `GET /admin/keys/:id/usage`. |
-| `402` from busbar | A virtual key is over budget for its window. |
+| `429` from busbar itself | A virtual key hit a limit. The body's `error.type` distinguishes the cause: `rate_limit_error` = RPM/TPM cap; `insufficient_quota` = over budget for its window (Bedrock ingress signals over-budget as `400` instead). Check `GET /admin/keys/:id/usage`. |
 | `403` from busbar | The virtual key's `allowed_pools` doesn't include the target. |
 | Startup panic: "unset environment variable" | A `${VAR}` (possibly in a comment) isn't exported. |
 | Startup panic: "not found in providers.yaml" | A `config.yaml` provider name isn't in the catalog. |

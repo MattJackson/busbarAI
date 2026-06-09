@@ -118,14 +118,19 @@ async fn governance_guard(
     pool: &str,
     started: Instant,
 ) -> Option<Response> {
+    // A governance rejection fires BEFORE the model is resolved to a configured pool, so the raw
+    // client-supplied `pool` string must be mapped to the bounded metric label (metrics.rs:24-38)
+    // before it reaches `finish` (which stamps it onto REQUESTS_TOTAL / the duration histogram /
+    // the request-log webhook). Passing it raw was an unbounded-cardinality DoS vector.
+    let label = pool_label(app, pool);
     if let Some(resp) = pool_authorized(gov, pool, proto) {
-        return Some(finish(app, gov, proto, pool, started, resp));
+        return Some(finish(app, gov, proto, label, started, resp));
     }
     if let Some(resp) = budget_check(app, gov, proto).await {
-        return Some(finish(app, gov, proto, pool, started, resp));
+        return Some(finish(app, gov, proto, label, started, resp));
     }
     if let Some(resp) = rate_check(app, gov, proto) {
-        return Some(finish(app, gov, proto, pool, started, resp));
+        return Some(finish(app, gov, proto, label, started, resp));
     }
     None
 }
@@ -154,6 +159,26 @@ fn rate_check(app: &Arc<App>, gov: &crate::governance::GovCtx, proto: &str) -> O
         }
     }
     None
+}
+
+/// Map a client-supplied model/name string to a BOUNDED `pool` metric label (metrics.rs:24-38).
+/// Returns the string verbatim ONLY when it names a configured pool (`app.pools`) or a configured
+/// by-model lane (`app.by_model`) — i.e. a value drawn from the finite, operator-controlled label
+/// space. For anything else (an unknown model, a governance-rejected request whose model was never
+/// resolved, a provider-mismatched ad-hoc model) it returns the fixed sentinel `"unresolved"`.
+///
+/// Without this, every `finish`/webhook call on a 404 / governance-rejection path stamped the raw
+/// attacker-controlled model as the `pool` label, letting a single valid credential mint an
+/// unbounded number of Prometheus time series (one per distinct model string) — a low-effort
+/// memory-exhaustion DoS that also bloats every `/metrics` scrape and leaks the attacker-chosen
+/// string into the request-log webhook. The label space is now bounded BY CONSTRUCTION:
+/// |configured pools| + |configured by-model lanes| + 1.
+fn pool_label<'a>(app: &Arc<App>, model: &'a str) -> &'a str {
+    if app.pools.contains_key(model) || app.by_model.contains_key(model) {
+        model
+    } else {
+        "unresolved"
+    }
 }
 
 /// The ingress boundary — emit per-request observability metrics (one client request =
@@ -451,11 +476,14 @@ async fn forward_resolved(
     // the governance rejections and the `named`/`adhoc` 404s already enforce. A raw early-return
     // made every unknown-model miss on the universal-ingress routes (openai/cohere/responses/
     // gemini/bedrock) invisible to Prometheus and the webhook.
+    // Both maps missed, so `model` is an unresolved, client-supplied string — stamp the bounded
+    // sentinel as the `pool` label (metrics.rs:24-38), never the raw model (unbounded-cardinality
+    // DoS). `pool_label` returns `"unresolved"` here by construction.
     finish(
         app,
         gov,
         proto,
-        model,
+        pool_label(app, model),
         started,
         ingress_error(
             proto,
@@ -783,11 +811,14 @@ pub(crate) async fn named(
     // Model/pool miss: wrap the 404 in `finish` so it is still counted in REQUESTS_TOTAL /
     // REQUEST_DURATION_SECONDS and fires the request-log webhook — the same observability invariant
     // already enforced for governance rejections (a raw early-return made the miss invisible).
+    // Both maps missed, so `name` is an unresolved, client-supplied URL segment — stamp the bounded
+    // sentinel as the `pool` label (metrics.rs:24-38), never the raw segment (unbounded-cardinality
+    // DoS). `pool_label` returns `"unresolved"` here by construction.
     finish(
         &app,
         &gov,
         "anthropic",
-        &name,
+        pool_label(&app, &name),
         started,
         ingress_error(
             "anthropic",
@@ -841,11 +872,13 @@ pub(crate) async fn adhoc(
                 actual_provider = %app.lanes[i].provider,
                 "adhoc: model is on a different provider than the path requested"
             );
+            // The model IS a configured by-model lane (bounded), but route the label through
+            // `pool_label` for uniformity with the other ingress paths; it returns `model` here.
             finish(
                 &app,
                 &gov,
                 "anthropic",
-                &model,
+                pool_label(&app, &model),
                 started,
                 ingress_error(
                     "anthropic",
@@ -856,11 +889,13 @@ pub(crate) async fn adhoc(
                 ),
             )
         }
+        // Model miss: `model` is an unresolved, client-supplied string — stamp the bounded sentinel
+        // as the `pool` label (metrics.rs:24-38). `pool_label` returns `"unresolved"` here.
         None => finish(
             &app,
             &gov,
             "anthropic",
-            &model,
+            pool_label(&app, &model),
             started,
             ingress_error(
                 "anthropic",
@@ -2135,6 +2170,172 @@ mod tests {
         );
         handle.abort();
         server.shutdown().await;
+    }
+
+    /// Round-13 HIGH/test-coverage: a MID-STREAM transport failure on a gemini
+    /// `:streamGenerateContent?alt=sse` request (the SSE framer, `json_array=false`) must terminate
+    /// the body with a NATIVE Gemini SSE error frame — `text/event-stream`, a trailing `data:`
+    /// payload carrying a `google.rpc.Status`-shaped envelope (`error.status`), with NO `event:`
+    /// line (native Gemini SSE never emits one mid-stream) and NO OpenAI `choices`/
+    /// `chat.completion.chunk` leak. This drives `FirstByteBody`'s `Poll::Ready(Some(Err))` arm
+    /// with `json_array=false`, a DISTINCT code path from the JSON-array case covered by
+    /// `test_gemini_json_array_mid_stream_error_closes_array_no_sse`. Routes gemini→openai with
+    /// `SseTransportError` so the upstream drops the connection after the first frame.
+    #[tokio::test]
+    async fn test_gemini_alt_sse_mid_stream_transport_error_appends_native_sse_frame() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::SseTransportError {
+            ok_events: vec![r#"{"choices":[{"delta":{"content":"hi"}}]}"#.to_string()],
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/v1beta/models/foo:streamGenerateContent?alt=sse"
+            ))
+            .bearer_auth("t")
+            .body(
+                json!({ "contents": [{"role": "user", "parts": [{"text": "hello"}]}] }).to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "stream starts 2xx");
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "alt=sse mid-stream error stays SSE-framed; got {ct}"
+        );
+        let body = resp.text().await.unwrap();
+        // Native Gemini SSE never emits a named `event:` line mid-stream — only bare `data:` frames.
+        assert!(
+            !body.contains("event:"),
+            "native gemini SSE carries no `event:` line; got {body:?}"
+        );
+        // The body must NOT be JSON-array framed (no brackets spliced into the SSE).
+        let payloads: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .filter(|data| !data.is_empty() && *data != "[DONE]")
+            .filter_map(|data| serde_json::from_str(data).ok())
+            .collect();
+        assert!(
+            !payloads.is_empty(),
+            "SSE body carries at least one JSON data: frame; got {body:?}"
+        );
+        // No OpenAI envelope may leak into the gemini SSE frames.
+        assert!(
+            payloads.iter().all(|p| p.get("choices").is_none()),
+            "no OpenAI `choices` field may leak into the gemini SSE frames; got {body:?}"
+        );
+        assert!(
+            !body.contains("chat.completion.chunk"),
+            "no OpenAI `chat.completion.chunk` object may leak; got {body:?}"
+        );
+        // The LAST `data:` payload is the native Gemini `google.rpc.Status`-shaped error envelope.
+        let last = payloads
+            .last()
+            .unwrap_or_else(|| panic!("expected a trailing SSE error frame; got {body:?}"));
+        assert!(
+            last.get("error").and_then(|e| e.get("status")).is_some(),
+            "trailing SSE frame is a native gemini google.rpc.Status error (error.status); \
+             got {body:?}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// Round-13 MEDIUM/security: an UNRESOLVED model on a body-model ingress (openai) must NOT stamp
+    /// the raw client-supplied model string as the Prometheus `pool` label — the bounded-cardinality
+    /// contract (metrics.rs:24-38) requires the fixed sentinel `"unresolved"`. A regression that
+    /// passed the raw model through `finish` would let a single credential mint unbounded time
+    /// series (a memory-exhaustion DoS) and leak the attacker string into `/metrics`. Drives the
+    /// 404 (both-maps-miss) path through the real router and scrapes the registry.
+    #[tokio::test]
+    async fn test_unresolved_model_uses_bounded_pool_label_not_raw_string() {
+        crate::metrics::init();
+        // A lane/pool named "foo" exists, but the client asks for a DISTINCT unknown model so both
+        // `app.pools` and `app.by_model` miss and the 404 path runs.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "foo",
+                    crate::proto::Protocol::openai(),
+                    "http://127.0.0.1:1",
+                )
+                .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        // A unique, attacker-flavored model string that is NOT a configured pool/by-model key.
+        let attacker_model = "zzz-unbounded-cardinality-probe-9f3a";
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "model": attacker_model,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 404, "unknown model is a 404");
+
+        let scrape = crate::metrics::render();
+        // The raw attacker string must NEVER appear as a label value in the exposition.
+        assert!(
+            !scrape.contains(attacker_model),
+            "raw client model must not become a Prometheus label; got:\n{scrape}"
+        );
+        // The bounded sentinel must be present instead.
+        assert!(
+            scrape.contains("pool=\"unresolved\""),
+            "unresolved model stamps the bounded `unresolved` sentinel; got:\n{scrape}"
+        );
+        handle.abort();
+    }
+
+    /// Round-13 MEDIUM/security (unit test for `pool_label`): the bounded-label mapper returns a
+    /// model verbatim ONLY when it names a configured pool or by-model lane, and the fixed sentinel
+    /// `"unresolved"` for anything else.
+    #[test]
+    fn test_pool_label_bounds_cardinality() {
+        let mut app = minimal_app();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.pools.insert(
+                "mypool".to_string(),
+                vec![WeightedLane { idx: 0, weight: 1 }],
+            );
+            inner.by_model.insert("mymodel".to_string(), 0);
+        }
+        // Configured pool name → verbatim.
+        assert_eq!(pool_label(&app, "mypool"), "mypool");
+        // Configured by-model lane → verbatim.
+        assert_eq!(pool_label(&app, "mymodel"), "mymodel");
+        // Unknown / attacker-controlled string → bounded sentinel.
+        assert_eq!(pool_label(&app, "anything-else"), "unresolved");
+        assert_eq!(pool_label(&app, ""), "unresolved");
     }
 
     /// HIGH/conformance: a native gemini `:streamGenerateContent` request WITHOUT `?alt=sse` must

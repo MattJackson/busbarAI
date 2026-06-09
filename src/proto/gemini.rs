@@ -478,148 +478,154 @@ impl ProtocolReader for GeminiReader {
 
         let candidates = data.get("candidates").and_then(|c| c.as_array());
 
-        if let Some(cands) = candidates {
-            for candidate in cands {
-                // 2. Process content parts (text + functionCall)
-                if let Some(content) = candidate.get("content") {
-                    let role_val = content.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        // Process ONLY the first candidate, mirroring the non-streaming `read_response` (which reads
+        // `candidates[0]`). Gemini's `streamGenerateContent` honors
+        // `generationConfig.candidateCount > 1`, so a chunk may carry N candidates each with its own
+        // `finishReason`. Iterating EVERY candidate (the old behavior) emitted a full terminal
+        // sequence — close text/tool blocks, then MessageDelta + MessageStop — once PER candidate, so
+        // a downstream Anthropic/OpenAI ingress writer produced multiple `message_stop`/
+        // `message_delta` frames on a single stream (a protocol violation a strict SDK rejects, and a
+        // detectable proxy tell), and `state.open_tools` was drained N times with the tool-index
+        // bookkeeping resetting per candidate. Collapsing to the first candidate makes the streaming
+        // and non-streaming paths agree and guarantees exactly one terminal sequence per stream.
+        if let Some(candidate) = candidates.and_then(|cands| cands.first()) {
+            // 2. Process content parts (text + functionCall)
+            if let Some(content) = candidate.get("content") {
+                let role_val = content.get("role").and_then(|r| r.as_str()).unwrap_or("");
 
-                    if role_val == "model" || role_val.is_empty() {
-                        if let Some(parts_arr) = content.get("parts").and_then(|p| p.as_array()) {
-                            // The text block always owns IR index 0. Tool blocks take indices 1..n.
-                            // The next tool index is derived from persistent state (`open_tools`)
-                            // rather than a per-chunk local, so indices stay stable across the
-                            // multiple SSE chunks of a single response.
-                            for part in parts_arr {
-                                // Text block
-                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                    if !text.is_empty() {
-                                        if !state.text_block_open {
-                                            state.text_block_open = true;
-                                            out.push(IrStreamEvent::BlockStart {
-                                                index: 0,
-                                                block: crate::ir::IrBlockMeta::Text,
-                                            });
-                                        }
-                                        out.push(IrStreamEvent::BlockDelta {
-                                            index: 0,
-                                            delta: crate::ir::IrDelta::TextDelta(text.to_string()),
-                                        });
-                                    }
-                                }
-
-                                // FunctionCall (ToolUse) - Gemini sends whole args, not streamed
-                                if let Some(func_call) = part.get("functionCall") {
-                                    let name_val = func_call
-                                        .get("name")
-                                        .and_then(|n| n.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-
-                                    // Bound `state.open_tools` so an adversarial/buggy upstream that
-                                    // streams an unbounded run of `functionCall` parts without ever
-                                    // emitting `finishReason` (the only event that drains the set)
-                                    // cannot grow per-request heap without bound. Past the cap we
-                                    // skip recording the frame AND emitting its BlockStart/BlockDelta
-                                    // — the next index is derived from `open_tools.len()`, so a
-                                    // recorded-but-uncapped frame would also produce duplicate
-                                    // indices once growth stalled. No legitimate Gemini turn carries
-                                    // this many parallel tool calls. Mirrors the Cohere reader's cap.
-                                    if !name_val.is_empty()
-                                        && state.open_tools.len() < MAX_GEMINI_TOOL_FRAMES
-                                    {
-                                        // Tool blocks follow the text block (index 0). The next
-                                        // index is 1 + however many tool blocks are already open.
-                                        // Record it in `open_tools` so the finishReason handler
-                                        // emits a matching BlockStop for every tool block.
-                                        let ir_idx = 1 + state.open_tools.len();
-                                        state.open_tools.insert(ir_idx);
-
-                                        let args = func_call
-                                            .get("args")
-                                            .cloned()
-                                            .unwrap_or(serde_json::Value::Null);
-
-                                        // Gemini streams carry no tool-call id; synthesize a stable,
-                                        // non-empty one keyed by (tool-position, name) so the
-                                        // Anthropic/OpenAI stream writers emit a non-empty id on the
-                                        // content_block_start. Tool blocks occupy indices 1..n, so
-                                        // `ir_idx - 1` is the 0-based tool position.
-                                        let id = synth_tool_call_id(ir_idx - 1, &name_val);
+                if role_val == "model" || role_val.is_empty() {
+                    if let Some(parts_arr) = content.get("parts").and_then(|p| p.as_array()) {
+                        // The text block always owns IR index 0. Tool blocks take indices 1..n.
+                        // The next tool index is derived from persistent state (`open_tools`)
+                        // rather than a per-chunk local, so indices stay stable across the
+                        // multiple SSE chunks of a single response.
+                        for part in parts_arr {
+                            // Text block
+                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                if !text.is_empty() {
+                                    if !state.text_block_open {
+                                        state.text_block_open = true;
                                         out.push(IrStreamEvent::BlockStart {
-                                            index: ir_idx,
-                                            block: crate::ir::IrBlockMeta::ToolUse {
-                                                id,
-                                                name: name_val.clone(),
-                                            },
-                                        });
-
-                                        // Emit the whole args as InputJsonDelta (Gemini doesn't stream functionCall)
-                                        let args_str =
-                                            serde_json::to_string(&args).unwrap_or_default();
-                                        out.push(IrStreamEvent::BlockDelta {
-                                            index: ir_idx,
-                                            delta: crate::ir::IrDelta::InputJsonDelta(args_str),
+                                            index: 0,
+                                            block: crate::ir::IrBlockMeta::Text,
                                         });
                                     }
+                                    out.push(IrStreamEvent::BlockDelta {
+                                        index: 0,
+                                        delta: crate::ir::IrDelta::TextDelta(text.to_string()),
+                                    });
+                                }
+                            }
+
+                            // FunctionCall (ToolUse) - Gemini sends whole args, not streamed
+                            if let Some(func_call) = part.get("functionCall") {
+                                let name_val = func_call
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                // Bound `state.open_tools` so an adversarial/buggy upstream that
+                                // streams an unbounded run of `functionCall` parts without ever
+                                // emitting `finishReason` (the only event that drains the set)
+                                // cannot grow per-request heap without bound. Past the cap we
+                                // skip recording the frame AND emitting its BlockStart/BlockDelta
+                                // — the next index is derived from `open_tools.len()`, so a
+                                // recorded-but-uncapped frame would also produce duplicate
+                                // indices once growth stalled. No legitimate Gemini turn carries
+                                // this many parallel tool calls. Mirrors the Cohere reader's cap.
+                                if !name_val.is_empty()
+                                    && state.open_tools.len() < MAX_GEMINI_TOOL_FRAMES
+                                {
+                                    // Tool blocks follow the text block (index 0). The next
+                                    // index is 1 + however many tool blocks are already open.
+                                    // Record it in `open_tools` so the finishReason handler
+                                    // emits a matching BlockStop for every tool block.
+                                    let ir_idx = 1 + state.open_tools.len();
+                                    state.open_tools.insert(ir_idx);
+
+                                    let args = func_call
+                                        .get("args")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null);
+
+                                    // Gemini streams carry no tool-call id; synthesize a stable,
+                                    // non-empty one keyed by (tool-position, name) so the
+                                    // Anthropic/OpenAI stream writers emit a non-empty id on the
+                                    // content_block_start. Tool blocks occupy indices 1..n, so
+                                    // `ir_idx - 1` is the 0-based tool position.
+                                    let id = synth_tool_call_id(ir_idx - 1, &name_val);
+                                    out.push(IrStreamEvent::BlockStart {
+                                        index: ir_idx,
+                                        block: crate::ir::IrBlockMeta::ToolUse {
+                                            id,
+                                            name: name_val.clone(),
+                                        },
+                                    });
+
+                                    // Emit the whole args as InputJsonDelta (Gemini doesn't stream functionCall)
+                                    let args_str = serde_json::to_string(&args).unwrap_or_default();
+                                    out.push(IrStreamEvent::BlockDelta {
+                                        index: ir_idx,
+                                        delta: crate::ir::IrDelta::InputJsonDelta(args_str),
+                                    });
                                 }
                             }
                         }
                     }
                 }
+            }
 
-                // 3. finishReason → close blocks + MessageDelta + MessageStop
-                if let Some(finish_reason_val) =
-                    candidate.get("finishReason").and_then(|r| r.as_str())
-                {
-                    let stop_reason = match finish_reason_val {
-                        "STOP" => "end_turn".to_string(),
-                        "MAX_TOKENS" => "max_tokens".to_string(),
-                        "SAFETY" => "safety".to_string(),
-                        other => other.to_lowercase(),
-                    };
+            // 3. finishReason → close blocks + MessageDelta + MessageStop
+            if let Some(finish_reason_val) = candidate.get("finishReason").and_then(|r| r.as_str())
+            {
+                let stop_reason = match finish_reason_val {
+                    "STOP" => "end_turn".to_string(),
+                    "MAX_TOKENS" => "max_tokens".to_string(),
+                    "SAFETY" => "safety".to_string(),
+                    other => other.to_lowercase(),
+                };
 
-                    // Close text block first if open
-                    if state.text_block_open {
-                        state.text_block_open = false;
-                        out.push(IrStreamEvent::BlockStop { index: 0 });
-                    }
-
-                    // Close tools in ascending order (track via open_tools)
-                    for oai_idx in std::mem::take(&mut state.open_tools) {
-                        out.push(IrStreamEvent::BlockStop { index: oai_idx });
-                    }
-
-                    // Parse usageMetadata if present
-                    let usage = data
-                        .get("usageMetadata")
-                        .map(|u| crate::ir::IrUsage {
-                            input_tokens: u
-                                .get("promptTokenCount")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0),
-                            output_tokens: u
-                                .get("candidatesTokenCount")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0),
-                            cache_creation_input_tokens: None,
-                            cache_read_input_tokens: None,
-                        })
-                        .unwrap_or(crate::ir::IrUsage {
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            cache_creation_input_tokens: None,
-                            cache_read_input_tokens: None,
-                        });
-
-                    out.push(IrStreamEvent::MessageDelta {
-                        stop_reason: Some(stop_reason.to_string()),
-                        // Gemini has no stop_sequence analog in its stream.
-                        stop_sequence: None,
-                        usage,
-                    });
-                    out.push(IrStreamEvent::MessageStop);
+                // Close text block first if open
+                if state.text_block_open {
+                    state.text_block_open = false;
+                    out.push(IrStreamEvent::BlockStop { index: 0 });
                 }
+
+                // Close tools in ascending order (track via open_tools)
+                for oai_idx in std::mem::take(&mut state.open_tools) {
+                    out.push(IrStreamEvent::BlockStop { index: oai_idx });
+                }
+
+                // Parse usageMetadata if present
+                let usage = data
+                    .get("usageMetadata")
+                    .map(|u| crate::ir::IrUsage {
+                        input_tokens: u
+                            .get("promptTokenCount")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                        output_tokens: u
+                            .get("candidatesTokenCount")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
+                    })
+                    .unwrap_or(crate::ir::IrUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
+                    });
+
+                out.push(IrStreamEvent::MessageDelta {
+                    stop_reason: Some(stop_reason.to_string()),
+                    // Gemini has no stop_sequence analog in its stream.
+                    stop_sequence: None,
+                    usage,
+                });
+                out.push(IrStreamEvent::MessageStop);
             }
         }
 
@@ -1651,6 +1657,81 @@ mod tests {
         );
 
         // Balance check: every BlockStart has a matching BlockStop.
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, IrStreamEvent::BlockStart { .. }))
+            .count();
+        let stops = events
+            .iter()
+            .filter(|e| matches!(e, IrStreamEvent::BlockStop { .. }))
+            .count();
+        assert_eq!(starts, stops, "unbalanced block events: {events:?}");
+    }
+
+    /// Regression: a Gemini stream chunk with `candidateCount > 1` (multiple candidates each
+    /// carrying their own `finishReason`) MUST still produce EXACTLY ONE terminal sequence —
+    /// one MessageDelta and one MessageStop — not one per candidate. The reader previously looped
+    /// over every candidate and emitted a full close+MessageDelta+MessageStop sequence per
+    /// candidate, so a downstream ingress writer saw duplicate `message_stop`/`message_delta`
+    /// frames on a single stream (a protocol violation). The reader now mirrors the non-streaming
+    /// `read_response`, which reads `candidates[0]` only.
+    #[test]
+    fn test_stream_multiple_candidates_emit_single_terminal_sequence() {
+        let events = collect_stream(&[serde_json::json!({
+            "candidates": [
+                {
+                    "content": {"role": "model", "parts": [{"text": "first"}]},
+                    "finishReason": "STOP"
+                },
+                {
+                    "content": {"role": "model", "parts": [{"text": "second"}]},
+                    "finishReason": "STOP"
+                },
+                {
+                    "content": {"role": "model", "parts": [{"text": "third"}]},
+                    "finishReason": "MAX_TOKENS"
+                }
+            ]
+        })]);
+
+        let message_stops = events
+            .iter()
+            .filter(|e| matches!(e, IrStreamEvent::MessageStop))
+            .count();
+        assert_eq!(
+            message_stops, 1,
+            "exactly one MessageStop expected regardless of candidateCount: {events:?}"
+        );
+
+        let message_deltas = events
+            .iter()
+            .filter(|e| matches!(e, IrStreamEvent::MessageDelta { .. }))
+            .count();
+        assert_eq!(
+            message_deltas, 1,
+            "exactly one MessageDelta expected regardless of candidateCount: {events:?}"
+        );
+
+        // Only the first candidate's text is surfaced; the others are ignored entirely.
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                IrStreamEvent::BlockDelta {
+                    delta: IrDelta::TextDelta(t),
+                    ..
+                } => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "first", "only candidates[0] text should be emitted");
+
+        // The single MessageStop must be the LAST event in the stream.
+        assert!(
+            matches!(events.last(), Some(IrStreamEvent::MessageStop)),
+            "MessageStop must terminate the stream: {events:?}"
+        );
+
+        // Block events stay balanced (no per-candidate index churn).
         let starts = events
             .iter()
             .filter(|e| matches!(e, IrStreamEvent::BlockStart { .. }))

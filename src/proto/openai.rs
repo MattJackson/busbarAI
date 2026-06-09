@@ -28,6 +28,23 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Fallback `model` string stamped onto a cross-protocol OpenAI response when the egress backend
+/// supplied none. The native OpenAI `chat.completion` / `chat.completion.chunk` schemas define
+/// `model` as a REQUIRED non-nullable string, and the official `openai-python` (>=1.0) Pydantic
+/// models raise `ValidationError` when it is absent. A backend whose `read_response` yields
+/// `model: None` (e.g. Bedrock egress -> OpenAI ingress, where `read_response` sets `model: None`)
+/// would otherwise produce a model-less first chunk / completion — both an SDK deserialisation
+/// failure and a proxy tell (a real OpenAI endpoint never omits `model`). A current, widely-served
+/// model id keeps the synthesized value plausible.
+const DEFAULT_MODEL: &str = "gpt-4o";
+
+/// Resolve the `model` to emit on an OpenAI response: the upstream-supplied value when present,
+/// otherwise the [`DEFAULT_MODEL`] fallback so the required non-nullable `model` field is never
+/// omitted on a cross-protocol response. Never panics on the request path.
+fn model_or_default(model: Option<&str>) -> &str {
+    model.unwrap_or(DEFAULT_MODEL)
+}
+
 /// Process-local monotonic counter that GUARANTEES synthesized-id uniqueness within a process. It
 /// never repeats while the process lives, so even on the astronomically unlikely event of the OS
 /// CSPRNG returning a duplicate (or being unavailable, when we fall back to it entirely) two
@@ -1322,19 +1339,22 @@ impl ProtocolWriter for OpenAiWriter {
                 // SYNTHESIZE a protocol-correct id/created so a native SDK accepts the stream.
                 let chunk_id = id.clone().unwrap_or_else(synth_completion_id);
                 let chunk_created = created.unwrap_or_else(unix_now_secs);
-                let mut chunk = serde_json::json!({
+                // `model` is REQUIRED and non-nullable in the OpenAI chunk schema. A cross-protocol
+                // backend (e.g. Bedrock) whose IR carries `model: None` must not yield a model-less
+                // first chunk — that fails strict SDK (Pydantic) deserialisation and is a proxy tell —
+                // so fall back to DEFAULT_MODEL rather than omitting the field.
+                let chunk_model = model_or_default(model.as_deref());
+                let chunk = serde_json::json!({
                     "id": chunk_id,
                     "object": "chat.completion.chunk",
                     "created": chunk_created,
+                    "model": chunk_model,
                     "choices": [{
                         "index": 0,
                         "delta": delta_obj,
                         "finish_reason": null
                     }]
                 });
-                if let Some(m) = model {
-                    chunk["model"] = serde_json::json!(m);
-                }
                 Some(("".to_string(), chunk))
             }
             IrStreamEvent::BlockStart { index, block } => match block {
@@ -1630,10 +1650,15 @@ impl ProtocolWriter for OpenAiWriter {
         obj.insert("object".to_string(), serde_json::json!("chat.completion"));
         let created = resp.created.unwrap_or_else(unix_now_secs);
         obj.insert("created".to_string(), serde_json::json!(created));
-        // model that served the response (preserved across cross-protocol translation)
-        if let Some(ref model) = resp.model {
-            obj.insert("model".to_string(), serde_json::json!(model));
-        }
+        // model that served the response. `model` is a REQUIRED non-nullable string in the OpenAI
+        // chat.completion schema; a cross-protocol backend whose `read_response` yields `model: None`
+        // (e.g. Bedrock egress -> OpenAI ingress) would otherwise produce a model-less completion that
+        // fails strict SDK deserialisation and is a proxy tell. Preserve the upstream value on a
+        // same-protocol passthrough; fall back to DEFAULT_MODEL when none was supplied.
+        obj.insert(
+            "model".to_string(),
+            serde_json::json!(model_or_default(resp.model.as_deref())),
+        );
         // system_fingerprint is only emitted when the upstream supplied one (same-protocol
         // passthrough); we do not fabricate an opaque backend marker on cross-protocol responses.
         if let Some(ref fp) = resp.system_fingerprint {
@@ -2044,6 +2069,103 @@ mod tests {
         );
         // No system_fingerprint fabricated on cross-protocol responses.
         assert!(out.get("system_fingerprint").is_none());
+    }
+
+    // --- Round 13 MEDIUM/conformance: `model` is required + non-nullable; cross-protocol
+    //     (model: None) responses must stamp a fallback rather than omit the field ---
+
+    #[test]
+    fn cross_protocol_write_response_emits_fallback_model() {
+        // A Bedrock-egress -> OpenAI-ingress buffered response carries `model: None`. The native
+        // chat.completion schema requires a non-nullable `model` string, so the writer must emit a
+        // present, non-null fallback (never omit the key).
+        let resp = crate::ir::IrResponse {
+            role: IrRole::Assistant,
+            content: vec![text_block("hi")],
+            stop_reason: Some("end_turn".to_string()),
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = OpenAiWriter.write_response(&resp);
+        let obj = out.as_object().expect("response object");
+        assert!(
+            obj.contains_key("model"),
+            "model key must always be present"
+        );
+        let model = out["model"].as_str().expect("model is a non-null string");
+        assert!(!model.is_empty(), "model fallback is non-empty: {model}");
+        assert_eq!(out["model"], serde_json::json!(DEFAULT_MODEL));
+    }
+
+    #[test]
+    fn write_response_preserves_upstream_model_over_fallback() {
+        // A same-protocol passthrough must keep the upstream model verbatim, not the fallback.
+        let resp = crate::ir::IrResponse {
+            role: IrRole::Assistant,
+            content: vec![text_block("hi")],
+            stop_reason: Some("end_turn".to_string()),
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("gpt-4o-mini".to_string()),
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = OpenAiWriter.write_response(&resp);
+        assert_eq!(out["model"], serde_json::json!("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn stream_message_start_emits_fallback_model_when_none() {
+        // The opening chunk's `model` is required + non-nullable; a cross-protocol stream with
+        // `model: None` must stamp the fallback rather than omit the field.
+        let no_model = IrStreamEvent::MessageStart {
+            role: IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        };
+        let (_, chunk) = OpenAiWriter
+            .write_response_event(&no_model)
+            .expect("message start emits a chunk");
+        let obj = chunk.as_object().expect("chunk object");
+        assert!(
+            obj.contains_key("model"),
+            "model key must always be present"
+        );
+        let model = chunk["model"].as_str().expect("model is a non-null string");
+        assert!(!model.is_empty(), "model fallback is non-empty: {model}");
+        assert_eq!(chunk["model"], serde_json::json!(DEFAULT_MODEL));
+    }
+
+    #[test]
+    fn stream_message_start_preserves_upstream_model_over_fallback() {
+        let with_model = IrStreamEvent::MessageStart {
+            role: IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: Some("gpt-4o-2024-08-06".to_string()),
+        };
+        let (_, chunk) = OpenAiWriter
+            .write_response_event(&with_model)
+            .expect("message start emits a chunk");
+        assert_eq!(chunk["model"], serde_json::json!("gpt-4o-2024-08-06"));
     }
 
     #[test]

@@ -19,6 +19,20 @@ const MAX_OUTPUT_INDEX: usize = 127;
 /// DoS). Matches `openai.rs::MAX_OPEN_TOOLS` (OpenAI's documented parallel-tool-call limit, 128).
 const MAX_OPEN_TOOLS: usize = 128;
 
+/// Key offset under which the streaming reader tracks OPEN TEXT output indices inside the shared
+/// `StreamDecodeState::open_tools` set. A native /v1/responses stream can carry MULTIPLE message
+/// (text) output items, each at its OWN `output_index`, so a single index-blind `text_block_open`
+/// bool cannot pair a BlockStart/BlockStop per text index: a second text item's delta would emit a
+/// BlockDelta with no preceding BlockStart (orphan delta) and the terminal frame would close the
+/// wrong index. `StreamDecodeState` (in `ir.rs`) exposes only the `open_tools` set and the
+/// `text_block_open` bool, so to give text the SAME per-index discipline tool items already have —
+/// without a new shared field — text indices are stored as `idx + TEXT_INDEX_KEY_OFFSET`. Wire
+/// `output_index` is clamped to `MAX_OUTPUT_INDEX` (127), so a real tool index (<=127) and an
+/// offset text key (>=1000) can never collide; the function-call routing guards
+/// (`open_tools.contains(&idx)`) keep matching only raw tool indices, and the terminal arm
+/// distinguishes a tool close (`remove(&idx)`) from a text close (`remove(&(idx + offset))`).
+const TEXT_INDEX_KEY_OFFSET: usize = 1000;
+
 /// Process-local monotonic counter folded into synthesized `resp_`/`msg_`/`fc_` ids so two ids
 /// minted in the same instant (even on an entropy-starved host) are still distinct. It never repeats
 /// while the process lives, giving an unconditional uniqueness guarantee independent of the CSPRNG.
@@ -683,8 +697,24 @@ impl ProtocolReader for ResponsesReader {
                         .get("output_index")
                         .and_then(|i| i.as_u64())
                         .map_or(0, |v| (v as usize).min(MAX_OUTPUT_INDEX));
-                    if !state.text_block_open {
-                        state.text_block_open = true;
+                    // Track open TEXT indices PER INDEX in `open_tools` under a disjoint key offset
+                    // (see `TEXT_INDEX_KEY_OFFSET`) instead of the single index-blind
+                    // `text_block_open` bool. A native stream can carry multiple message items, each
+                    // at its own `output_index`; the per-index set opens a BlockStart lazily ONLY for
+                    // an index not already open (so a second text item gets its own BlockStart rather
+                    // than an orphan delta), and bounds cardinality under the same cap as tool items
+                    // so a backend emitting a unique index per delta cannot grow the set without
+                    // bound. Beyond the cap a new index streams no BlockStart/BlockDelta (matching
+                    // the tool arm's suppression), never an orphan delta.
+                    let text_key = idx + TEXT_INDEX_KEY_OFFSET;
+                    let already_open = state.open_tools.contains(&text_key);
+                    if !already_open {
+                        if state.open_tools.len() >= MAX_OPEN_TOOLS {
+                            // Cap reached: suppress this index entirely (no BlockStart, no orphan
+                            // BlockDelta) rather than emitting a delta for an unopened block.
+                            return out;
+                        }
+                        state.open_tools.insert(text_key);
                         out.push(IrStreamEvent::BlockStart {
                             index: idx,
                             block: crate::ir::IrBlockMeta::Text,
@@ -734,17 +764,20 @@ impl ProtocolReader for ResponsesReader {
                     // a block that opened once — an invalid event sequence and a distinguishability
                     // tell. So close a block EXACTLY once: only emit BlockStop for an index that is
                     // currently open, and clear the open marker so the second terminal frame at the
-                    // same index is a no-op. A tool index opened via `output_item.added` and a text
-                    // index opened lazily by `output_text.delta` are tracked separately.
+                    // same index is a no-op. A tool index (raw `idx`) and a text index (stored under
+                    // `TEXT_INDEX_KEY_OFFSET`) are tracked PER INDEX in `open_tools`, so the close
+                    // routes to the correct block kind AND the correct index — a native stream's two
+                    // terminal frames for one text item (`content_part.done` then `output_item.done`,
+                    // same index) close it exactly once because the second frame finds the key gone.
                     if state.open_tools.remove(&idx) {
                         // This index was a (now-closed) function-call item.
                         out.push(IrStreamEvent::BlockStop { index: idx });
-                    } else if state.text_block_open {
-                        // This index was the open text block; close it once and clear the flag so a
-                        // later text part lazily re-opens its own block rather than reusing stale
-                        // open state, and so a paired `content_part.done`/`output_item.done` for the
-                        // same text item does not double-close.
-                        state.text_block_open = false;
+                    } else if state.open_tools.remove(&(idx + TEXT_INDEX_KEY_OFFSET)) {
+                        // This index was an open text block; close THIS index once. Removing the
+                        // per-index key (rather than clearing a global bool) lets a different text
+                        // index stay open and close on its own terminal frame, and makes the paired
+                        // `content_part.done`/`output_item.done` for the same item a no-op the
+                        // second time.
                         out.push(IrStreamEvent::BlockStop { index: idx });
                     }
                     // Otherwise nothing is open at this index (e.g. the second terminal frame of a
@@ -1143,6 +1176,30 @@ pub(crate) struct ResponsesWriter {
     /// reason as the other fields; a poisoned lock degrades to a freshly-minted id (still opaque,
     /// still valid) rather than panicking on the request path.
     item_ids: std::sync::Mutex<std::collections::BTreeMap<(&'static str, usize), String>>,
+    /// Per-stream accumulator of function-call item fields, keyed by `output_index`. A native
+    /// /v1/responses stream's `response.output_item.done` for a function-call item carries the FULLY
+    /// finalized item — `call_id`, `name`, AND the complete accumulated `arguments` string — and the
+    /// official SDK reads `event.item.arguments`/`.name`/`.call_id` off the `done` event to
+    /// reconstruct the tool invocation. The IR `BlockStop` carries only the integer index, so the
+    /// writer must accumulate those fields across the lifecycle: `call_id`+`name` arrive on the
+    /// `BlockStart` (`IrBlockMeta::ToolUse`), and `arguments` is concatenated from the
+    /// `InputJsonDelta` fragments on each `BlockDelta`. Without this the `output_item.done` item was
+    /// `{"type":"function_call","id":…}` — missing `call_id`/`name`/`arguments`, an
+    /// impossible-from-real-OpenAI shape that breaks SDK tool-call handling and is a
+    /// distinguishability tell. Per-stream INSTANCE state for the same reason as the other fields; a
+    /// poisoned lock degrades to omitting the accumulated fields (still emits the `done`) rather than
+    /// panicking on the request path.
+    tool_calls: std::sync::Mutex<std::collections::BTreeMap<usize, ToolCallAccum>>,
+}
+
+/// Accumulated function-call item fields for one open `output_index`, finalized into the
+/// `response.output_item.done` `item` object. `call_id`/`name` are captured from the opening
+/// `BlockStart`; `arguments` is built by concatenating the streamed `InputJsonDelta` fragments.
+#[derive(Clone, Default)]
+struct ToolCallAccum {
+    call_id: String,
+    name: String,
+    arguments: String,
 }
 
 /// Value-namespace constructor for [`ResponsesWriter`]. A `const` and a struct may share a name
@@ -1167,6 +1224,7 @@ pub(crate) const ResponsesWriter: ResponsesWriter = ResponsesWriter {
     open_tool_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
     open_text_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
     item_ids: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+    tool_calls: std::sync::Mutex::new(std::collections::BTreeMap::new()),
 };
 
 impl Clone for ResponsesWriter {
@@ -1203,6 +1261,16 @@ impl Clone for ResponsesWriter {
             item_ids: std::sync::Mutex::new(
                 self.item_ids.lock().map(|m| m.clone()).unwrap_or_default(),
             ),
+            // Carry the in-flight function-call field accumulator across a mid-stream
+            // `Protocol::clone` so the cloned writer's `output_item.done` still emits the complete
+            // finalized item (call_id/name/accumulated arguments); a poisoned lock degrades to an
+            // empty map (the done then omits the accumulated fields).
+            tool_calls: std::sync::Mutex::new(
+                self.tool_calls
+                    .lock()
+                    .map(|m| m.clone())
+                    .unwrap_or_default(),
+            ),
         }
     }
 }
@@ -1224,6 +1292,11 @@ impl ResponsesWriter {
         // Clear the per-stream `item_id` cache so a reused/cloned writer mints fresh opaque ids for
         // the new stream rather than replaying a previous stream's item ids.
         if let Ok(mut map) = self.item_ids.lock() {
+            map.clear();
+        }
+        // Clear the per-stream function-call field accumulator so a reused/cloned writer does not
+        // carry a previous stream's call_id/name/arguments into a new stream's `output_item.done`.
+        if let Ok(mut map) = self.tool_calls.lock() {
             map.clear();
         }
         // Clear the carried `response.id` alongside the sequence counter: a reused/cloned writer
@@ -1302,6 +1375,38 @@ impl ResponsesWriter {
             .lock()
             .map(|mut set| set.remove(&index))
             .unwrap_or(false)
+    }
+
+    /// Record the `call_id`/`name` for a function-call item opened at `index`, captured from the
+    /// `BlockStart`'s `IrBlockMeta::ToolUse`, so the matching `output_item.done` can emit the fully
+    /// finalized item. Lock poisoning degrades to a no-op (the `done` then omits these fields)
+    /// rather than panicking on the request path.
+    fn record_tool_meta(&self, index: usize, call_id: &str, name: &str) {
+        if let Ok(mut map) = self.tool_calls.lock() {
+            let entry = map.entry(index).or_default();
+            entry.call_id = call_id.to_string();
+            entry.name = name.to_string();
+        }
+    }
+
+    /// Append a streamed `arguments` fragment for the function-call item at `index`. Native
+    /// `response.output_item.done` carries the COMPLETE accumulated arguments string, so the writer
+    /// concatenates the `InputJsonDelta` fragments here. Lock poisoning degrades to a no-op.
+    fn append_tool_arguments(&self, index: usize, fragment: &str) {
+        if let Ok(mut map) = self.tool_calls.lock() {
+            map.entry(index).or_default().arguments.push_str(fragment);
+        }
+    }
+
+    /// Remove and return the accumulated function-call fields for `index` (call_id, name, fully
+    /// accumulated arguments) so the matching `output_item.done` emits the finalized item. Returns
+    /// `None` if nothing was accumulated (e.g. a poisoned lock); the caller then emits the `done`
+    /// without the accumulated fields rather than panicking on the request path.
+    fn take_tool_accum(&self, index: usize) -> Option<ToolCallAccum> {
+        self.tool_calls
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&index))
     }
 
     /// Mark a TEXT message item open at `index` IF it is not already open and there is room under
@@ -1664,6 +1769,10 @@ impl ProtocolWriter for ResponsesWriter {
                     // `output_item.done` for THIS index only — a text block's BlockStop (whose
                     // BlockStart produced no `output_item.added`) must emit no `done`.
                     self.mark_tool_open(*index);
+                    // Capture call_id/name now so the matching `output_item.done` can emit the
+                    // fully finalized item (native `done` carries call_id/name/arguments; the IR
+                    // BlockStop carries only the index).
+                    self.record_tool_meta(*index, id, name);
                     Some((
                         "response.output_item.added".to_string(),
                         serde_json::json!({
@@ -1700,15 +1809,21 @@ impl ProtocolWriter for ResponsesWriter {
                         }),
                     ))
                 }
-                crate::ir::IrDelta::InputJsonDelta(json_str) => Some((
-                    "response.function_call_arguments.delta".to_string(),
-                    serde_json::json!({
-                        "type": "response.function_call_arguments.delta",
-                        "output_index": index,
-                        "item_id": self.item_id_for("fc", *index),
-                        "delta": json_str
-                    }),
-                )),
+                crate::ir::IrDelta::InputJsonDelta(json_str) => {
+                    // Accumulate the arguments fragment so the matching `output_item.done` emits the
+                    // COMPLETE arguments string the native event (and the SDK's `event.item.arguments`)
+                    // carries.
+                    self.append_tool_arguments(*index, json_str);
+                    Some((
+                        "response.function_call_arguments.delta".to_string(),
+                        serde_json::json!({
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": index,
+                            "item_id": self.item_id_for("fc", *index),
+                            "delta": json_str
+                        }),
+                    ))
+                }
                 &crate::ir::IrDelta::TextDelta(_) => None,
                 crate::ir::IrDelta::ThinkingDelta(_) | crate::ir::IrDelta::SignatureDelta(_) => {
                     None
@@ -1740,10 +1855,15 @@ impl ProtocolWriter for ResponsesWriter {
                 if self.take_tool_open(*index) {
                     // Native `response.output_item.done` carries the SAME stable `item_id` as the
                     // matching `output_item.added` (so a client correlates the `added → done`
-                    // lifecycle) plus the finalized `item` object (a typed SDK reads `event.item`).
-                    // The function-call `output_item.added` used `item_id_for("fc", index)`,
-                    // so the cached id reconstructs the matching pair here.
+                    // lifecycle) plus the FULLY finalized `item` object: a typed SDK reads
+                    // `event.item.call_id`/`.name`/`.arguments` off the done event to reconstruct the
+                    // tool invocation. Emit all three from the per-stream accumulator (call_id/name
+                    // captured on `output_item.added`, arguments concatenated from the delta frames).
+                    // The function-call `output_item.added` used `item_id_for("fc", index)`, so the
+                    // cached id reconstructs the matching pair here. A poisoned-lock-empty accumulator
+                    // degrades to empty-string fields rather than panicking.
                     let item_id = self.item_id_for("fc", *index);
+                    let accum = self.take_tool_accum(*index).unwrap_or_default();
                     Some((
                         "response.output_item.done".to_string(),
                         serde_json::json!({
@@ -1753,6 +1873,9 @@ impl ProtocolWriter for ResponsesWriter {
                             "item": {
                                 "type": "function_call",
                                 "id": item_id,
+                                "call_id": accum.call_id,
+                                "name": accum.name,
+                                "arguments": accum.arguments,
                             },
                         }),
                     ))
@@ -2809,7 +2932,7 @@ mod tests {
             &mut state,
         );
         assert_eq!(opened.len(), 2);
-        assert!(state.text_block_open);
+        assert!(state.open_tools.contains(&TEXT_INDEX_KEY_OFFSET));
         // Now an empty keepalive while the block is open -> nothing.
         let keepalive = reader_read_response_events(
             "response.output_text.delta",
@@ -2828,10 +2951,10 @@ mod tests {
             &mut fresh,
         );
         assert!(pre.is_empty());
-        assert!(!fresh.text_block_open);
+        assert!(!fresh.open_tools.contains(&TEXT_INDEX_KEY_OFFSET));
     }
 
-    /// Regression: output_item.done must clear `text_block_open` so a subsequent text part can
+    /// Regression: output_item.done must clear the open TEXT index so a subsequent text part can
     /// lazily re-open its own block instead of silently reusing stale open state.
     #[test]
     fn test_done_clears_text_block_open() {
@@ -2841,7 +2964,7 @@ mod tests {
             &serde_json::json!({"output_index": 0, "delta": "a"}),
             &mut state,
         );
-        assert!(state.text_block_open);
+        assert!(state.open_tools.contains(&TEXT_INDEX_KEY_OFFSET));
         let done = reader_read_response_events(
             "response.output_item.done",
             &serde_json::json!({"output_index": 0}),
@@ -2852,7 +2975,10 @@ mod tests {
             done[0],
             crate::ir::IrStreamEvent::BlockStop { .. }
         ));
-        assert!(!state.text_block_open, "done must clear text_block_open");
+        assert!(
+            !state.open_tools.contains(&TEXT_INDEX_KEY_OFFSET),
+            "done must clear the open text index"
+        );
         // A new text part at index 1 re-opens lazily.
         let reopen = reader_read_response_events(
             "response.output_text.delta",
@@ -2885,7 +3011,7 @@ mod tests {
             done[0],
             crate::ir::IrStreamEvent::BlockStop { .. }
         ));
-        assert!(!state.text_block_open);
+        assert!(!state.open_tools.contains(&TEXT_INDEX_KEY_OFFSET));
     }
 
     /// Regression: a minimal `response.completed` lacking a nested `response` object must still
@@ -4444,8 +4570,8 @@ mod tests {
             &serde_json::json!({"output_index": 0, "delta": "a"}),
             &mut state,
         );
-        assert!(state.text_block_open);
-        // First terminal frame: content_part.done → one BlockStop, clears the open flag.
+        assert!(state.open_tools.contains(&TEXT_INDEX_KEY_OFFSET));
+        // First terminal frame: content_part.done → one BlockStop, clears the open index.
         let first = reader_read_response_events(
             "response.content_part.done",
             &serde_json::json!({"output_index": 0}),
@@ -4456,7 +4582,7 @@ mod tests {
             1,
             "content_part.done closes the text block once"
         );
-        assert!(!state.text_block_open);
+        assert!(!state.open_tools.contains(&TEXT_INDEX_KEY_OFFSET));
         // Second terminal frame at the same index: output_item.done → NOTHING (already closed).
         let second = reader_read_response_events(
             "response.output_item.done",
@@ -5205,5 +5331,190 @@ mod tests {
                 "kind {kind:?} must map to invalid_request_error"
             );
         }
+    }
+
+    /// Regression (MEDIUM/conformance, finding 2): the function-call `response.output_item.done`
+    /// must carry the FULLY finalized item — `call_id`, `name`, AND the complete accumulated
+    /// `arguments` string the SDK reads off `event.item`. Previously it emitted only
+    /// `{"type":"function_call","id":…}`, an impossible-from-real-OpenAI shape.
+    #[test]
+    fn test_function_call_done_carries_finalized_item() {
+        let writer = ResponsesWriter;
+        // Open the stream so the per-stream state is initialized/reset.
+        let _ = writer.write_response_event(&crate::ir::IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        });
+        // BlockStart(ToolUse) captures call_id + name.
+        let added = writer
+            .write_response_event(&crate::ir::IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::ToolUse {
+                    id: "call_abc".to_string(),
+                    name: "get_weather".to_string(),
+                },
+            })
+            .expect("output_item.added should emit");
+        assert_eq!(added.0, "response.output_item.added");
+
+        // Two argument fragments accumulate into the complete string.
+        let _ = writer.write_response_event(&crate::ir::IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::InputJsonDelta("{\"city\":".to_string()),
+        });
+        let _ = writer.write_response_event(&crate::ir::IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::InputJsonDelta("\"SF\"}".to_string()),
+        });
+
+        // BlockStop closes it with the fully finalized item.
+        let (etype, payload) = writer
+            .write_response_event(&crate::ir::IrStreamEvent::BlockStop { index: 0 })
+            .expect("output_item.done should emit");
+        assert_eq!(etype, "response.output_item.done");
+        let item = &payload["item"];
+        assert_eq!(item["type"].as_str(), Some("function_call"));
+        assert_eq!(
+            item["call_id"].as_str(),
+            Some("call_abc"),
+            "done item must carry call_id"
+        );
+        assert_eq!(
+            item["name"].as_str(),
+            Some("get_weather"),
+            "done item must carry name"
+        );
+        assert_eq!(
+            item["arguments"].as_str(),
+            Some("{\"city\":\"SF\"}"),
+            "done item must carry the COMPLETE accumulated arguments"
+        );
+        // `id` (the opaque fc_ item id) is still present and stable with the added frame.
+        assert_eq!(item["id"], added.1["item"]["id"]);
+    }
+
+    /// Regression (MEDIUM/correctness, finding 3): the streaming READER must track open text blocks
+    /// PER `output_index`, not with a single index-blind bool. Two message items at distinct indices
+    /// must each get their OWN BlockStart and their OWN BlockStop — no orphan delta, no mismatched
+    /// close.
+    #[test]
+    fn test_reader_multiple_text_items_distinct_indices() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        // First text item at index 0.
+        let a = reader_read_response_events(
+            "response.output_text.delta",
+            &serde_json::json!({"output_index": 0, "delta": "alpha"}),
+            &mut state,
+        );
+        assert_eq!(a.len(), 2, "first delta opens its block then writes");
+        assert!(matches!(
+            a[0],
+            crate::ir::IrStreamEvent::BlockStart { index: 0, .. }
+        ));
+        // Second text item at index 1 arrives BEFORE index 0 closes — must open its OWN block,
+        // never an orphan delta against an unopened block.
+        let b = reader_read_response_events(
+            "response.output_text.delta",
+            &serde_json::json!({"output_index": 1, "delta": "beta"}),
+            &mut state,
+        );
+        assert_eq!(b.len(), 2, "a new index must lazily open its own block");
+        assert!(
+            matches!(b[0], crate::ir::IrStreamEvent::BlockStart { index: 1, .. }),
+            "second text index must emit its OWN BlockStart, got {:?}",
+            b[0]
+        );
+        assert!(matches!(
+            b[1],
+            crate::ir::IrStreamEvent::BlockDelta { index: 1, .. }
+        ));
+        // Close index 0: BlockStop must pair with index 0 (not index 1).
+        let close0 = reader_read_response_events(
+            "response.output_item.done",
+            &serde_json::json!({"output_index": 0}),
+            &mut state,
+        );
+        assert_eq!(close0.len(), 1);
+        assert!(
+            matches!(close0[0], crate::ir::IrStreamEvent::BlockStop { index: 0 }),
+            "close must pair with index 0, got {:?}",
+            close0[0]
+        );
+        // Index 1 is still open and closes on its own terminal frame.
+        let close1 = reader_read_response_events(
+            "response.output_item.done",
+            &serde_json::json!({"output_index": 1}),
+            &mut state,
+        );
+        assert_eq!(close1.len(), 1);
+        assert!(matches!(
+            close1[0],
+            crate::ir::IrStreamEvent::BlockStop { index: 1 }
+        ));
+    }
+
+    /// Regression (MEDIUM/correctness, finding 3): a tool item and a text item at DISTINCT indices
+    /// in the same stream must not interfere — the tool index routes its arguments delta and closes
+    /// as a tool, while the text index opens/closes independently. Confirms the disjoint key-offset
+    /// keeps tool routing (`open_tools.contains(&idx)`) intact.
+    #[test]
+    fn test_reader_text_and_tool_indices_coexist() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        // Tool item opens at index 0.
+        let _ = reader_read_response_events(
+            "response.output_item.added",
+            &serde_json::json!({
+                "output_index": 0,
+                "item": {"type":"function_call","call_id":"fc_1","name":"f"}
+            }),
+            &mut state,
+        );
+        // Text item opens at index 1.
+        let t = reader_read_response_events(
+            "response.output_text.delta",
+            &serde_json::json!({"output_index": 1, "delta": "hi"}),
+            &mut state,
+        );
+        assert!(matches!(
+            t[0],
+            crate::ir::IrStreamEvent::BlockStart { index: 1, .. }
+        ));
+        // Tool arguments delta at index 0 must still route (tool index intact under raw key).
+        let args = reader_read_response_events(
+            "response.function_call_arguments.delta",
+            &serde_json::json!({"output_index": 0, "delta": "{\"x\":1}"}),
+            &mut state,
+        );
+        assert_eq!(args.len(), 1, "tool args delta must route to the open tool");
+        assert!(matches!(
+            args[0],
+            crate::ir::IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::InputJsonDelta(_)
+            }
+        ));
+        // Close the tool index → tool BlockStop.
+        let close_tool = reader_read_response_events(
+            "response.output_item.done",
+            &serde_json::json!({"output_index": 0}),
+            &mut state,
+        );
+        assert!(matches!(
+            close_tool[0],
+            crate::ir::IrStreamEvent::BlockStop { index: 0 }
+        ));
+        // Close the text index → text BlockStop.
+        let close_text = reader_read_response_events(
+            "response.output_item.done",
+            &serde_json::json!({"output_index": 1}),
+            &mut state,
+        );
+        assert!(matches!(
+            close_text[0],
+            crate::ir::IrStreamEvent::BlockStop { index: 1 }
+        ));
     }
 }

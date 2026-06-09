@@ -21,8 +21,11 @@ directory of integration binaries. Two patterns:
 ## The MockServer harness (`src/test_support.rs`)
 
 `MockServer` is a real axum server bound to `127.0.0.1:0` (ephemeral port) that
-serves `/v1/messages` and `/v1/chat/completions`. You program its responses ahead
-of time by pushing onto a shared `MockServerState`:
+serves every upstream path through one handler: `/v1/messages` and
+`/v1/chat/completions` have named routes, and a catch-all `.fallback` routes all
+other paths (Bedrock `/model/{model}/converse[-stream]`, Gemini
+`/v1beta/models/...`, Cohere `/v2/chat`) through the same handler. You program its
+responses ahead of time by pushing onto a shared `MockServerState`:
 
 - **`MockServerState`** holds a `Mutex<Vec<MockResponse>>` (LIFO: `push` then
   `pop` per request), plus the **last seen** auth header and request body for
@@ -176,12 +179,11 @@ Patterns this enables:
   assert the same-protocol path relays the binary event-stream verbatim,
   preserves the `application/vnd.amazon.eventstream` content type, and forwards
   the upstream `x-amzn-RequestId` rather than synthesizing a fresh one.
-  Note: `MockServer` only routes `/v1/messages` and `/v1/chat/completions`,
-  but Bedrock's native egress path is `/model/{model}/converse-stream`, which
-  the mock does **not** serve — a lane left at its default path would 404 on
-  every upstream call. Override the lane's path with `.path("/v1/messages")`
-  (any served route works; the same-protocol relay keys off the upstream
-  Content-Type, not the URL) so the request reaches the mock. See
+  Note: `MockServer`'s catch-all `.fallback` serves every path, so Bedrock's
+  native egress path (`/model/{model}/converse-stream`) reaches the handler with
+  no path override needed. Some existing lanes still set `.path("/v1/messages")`;
+  that override is now optional (any path resolves to the same handler), since the
+  same-protocol relay keys off the upstream Content-Type, not the URL. See
   `test_bedrock_same_protocol_stream_passthrough_forwards_upstream_request_id`
   in `src/route.rs` for the full pattern.
 - **on_exhausted** — populate `on_exhausted_cfgs` with `LeastBad` /

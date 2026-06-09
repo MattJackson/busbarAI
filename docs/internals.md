@@ -243,8 +243,10 @@ approximate, but eligibility filtering and long-run proportionality hold. See
   single-binary story; the `Store` trait leaves room for a `PostgresStore` for
   multi-node later.
 - **Enforcement order** (in `src/route.rs`, before forwarding): allowed-pools
-  (`pool_allowed` → 403) → budget (`is_over_budget` → 402) → rate
-  (`check_rate` → 429 + `Retry-After`). The auth middleware resolves the virtual
+  (`pool_allowed` → 403) → budget (`is_over_budget` → 429, or 400 for Bedrock
+  ingress) → rate (`check_rate` → 429 + `Retry-After`). Over-budget never returns
+  402 (no vendor does); the body `error.type` is `insufficient_quota`. The auth
+  middleware resolves the virtual
   key first (`src/auth.rs`); `/admin/*` is guarded by the separate admin token,
   not a virtual key.
 

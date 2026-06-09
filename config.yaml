@@ -217,7 +217,8 @@ pools:
 # ── Governance (optional) ────────────────────────────────────────────────────────────────────────
 # When enabled, clients authenticate with busbar-issued VIRTUAL KEYS (managed via the admin API)
 # instead of the static `auth` tokens above. Each key carries allowed-pools (403), a spend budget
-# (402 when exceeded), and RPM/TPM rate limits (429). Enforcement state persists in embedded SQLite.
+# (429 when exceeded, or 400 for Bedrock ingress), and RPM/TPM rate limits (429). Enforcement state
+# persists in embedded SQLite.
 # governance:
 #   enabled: true
 #   db_path: /var/lib/busbar/governance.db

@@ -1362,8 +1362,14 @@ impl ProtocolWriter for AnthropicWriter {
                 // no `message` field), so derive a human-readable one from the signal: prefer the
                 // provider type when present, otherwise a generic fallback. Always non-empty so the
                 // SDK's `error.message` is never undefined/null.
+                //
+                // The message text MUST stay native-plausible: a real Anthropic streaming `error`
+                // event never carries reverse-proxy vocabulary ("upstream", "gateway", "backend",
+                // …). The provider type token (`provider_signal`, e.g. `overloaded_error`) is the
+                // provider's OWN type string, so emit it VERBATIM — never prefixed with router/proxy
+                // words. When no signal is present, fall back to the generic native phrasing.
                 let message = match err.provider_signal.as_deref() {
-                    Some(ps) if !ps.is_empty() => format!("upstream error: {ps}"),
+                    Some(ps) if !ps.is_empty() => ps.to_string(),
                     Some(_) | None => "an error occurred while streaming the response".to_string(),
                 };
                 error_obj.insert("message".to_string(), serde_json::json!(message));
@@ -2641,5 +2647,43 @@ mod anthropic_hardening_tests {
         };
         check(&synth_message_id(), "msg_");
         check(&synth_request_id(), "req_");
+    }
+
+    /// Round-13 HIGH (error-message proxy vocabulary): the in-stream `error` event's
+    /// `error.message` must NEVER carry reverse-proxy vocabulary ("upstream", "gateway",
+    /// "backend", "proxy"). When a provider signal is present, the message is the provider's own
+    /// type token VERBATIM (no router prefix).
+    #[test]
+    fn write_response_event_error_message_has_no_proxy_vocabulary() {
+        for (signal, expected) in [
+            (Some("overloaded_error".to_string()), "overloaded_error"),
+            (Some("rate_limit_error".to_string()), "rate_limit_error"),
+            (None, "an error occurred while streaming the response"),
+        ] {
+            let err = IrError {
+                class: StatusClass::ServerError,
+                provider_signal: signal.clone(),
+                retry_after: None,
+            };
+            let (_, data) = AnthropicWriter
+                .write_response_event(&IrStreamEvent::Error(err))
+                .expect("error event must serialize");
+            let message = data
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .expect("error.message must be present");
+            assert_eq!(
+                message, expected,
+                "message must be native-plausible (verbatim signal or generic fallback) for signal {signal:?}"
+            );
+            let lower = message.to_lowercase();
+            for tell in ["upstream", "gateway", "backend", "proxy", "router"] {
+                assert!(
+                    !lower.contains(tell),
+                    "error.message leaks proxy vocabulary `{tell}`: `{message}`"
+                );
+            }
+        }
     }
 }

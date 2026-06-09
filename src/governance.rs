@@ -274,6 +274,12 @@ impl GovState {
         // and the per-key resolution below re-checks/refreshes this key's own entry for `window`
         // regardless of whether the sweep ran, so nothing the sweep does (or skips) can admit a
         // request that should be rejected or vice versa.
+        // MSRV NOTE: `u32::is_multiple_of` was stabilized in Rust 1.86 (April 2025). It is used here
+        // (and clippy's `manual_is_multiple_of` actively REWRITES the equivalent `% N == 0` form back
+        // to it, so the two cannot both be satisfied without a declared MSRV), which makes 1.86 the
+        // effective minimum supported toolchain. Cargo.toml does not yet declare `rust-version =
+        // "1.86"`; it SHOULD, so the constraint is visible to toolchain installers and CI matrices
+        // rather than surfacing as a silent compile failure on an older pinned stable.
         if self
             .rate_sweep_ticker
             .fetch_add(1, Ordering::Relaxed)
@@ -682,15 +688,35 @@ impl SqliteStore {
     }
 }
 
-fn pools_to_csv(pools: &[String]) -> String {
-    pools.join(",")
+// `allowed_pools` is stored in the `allowed_pools TEXT` column. The historical format was a bare
+// comma-delimited string, which CORRUPTS any pool name containing a comma: a single intended pool
+// `"prod,special"` round-trips as two pools `["prod", "special"]`, so `pool_allowed` matches EITHER
+// fragment (a silent privilege expansion) and never matches the real compound name (a silent deny).
+// A JSON array is delimiter-safe for arbitrary string values, so we now SERIALIZE as JSON. We still
+// READ legacy comma-delimited rows transparently (a value that is not valid JSON array TEXT — i.e.
+// every row written before this change — falls back to the comma split), so an existing on-disk DB
+// keeps working without a migration. New writes are always JSON, so a comma-bearing name survives a
+// write/read round-trip exactly.
+fn pools_to_storage(pools: &[String]) -> String {
+    // serde_json::to_string over a `&[String]` is infallible (no map keys, no non-finite floats),
+    // but we must not panic on the admin write path: on the unreachable error fall back to the empty
+    // JSON array, which `pools_from_storage` reads back as "no restriction" — fail-safe, and far
+    // better than aborting the request task.
+    serde_json::to_string(pools).unwrap_or_else(|_| "[]".to_string())
 }
-fn csv_to_pools(csv: &str) -> Vec<String> {
-    if csv.is_empty() {
-        Vec::new()
-    } else {
-        csv.split(',').map(String::from).collect()
+fn pools_from_storage(stored: &str) -> Vec<String> {
+    let trimmed = stored.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
     }
+    // New format: a JSON array of strings. Parse it as the source of truth.
+    if let Ok(pools) = serde_json::from_str::<Vec<String>>(trimmed) {
+        return pools;
+    }
+    // Legacy format (written before the JSON migration): bare comma-delimited string. A comma-free
+    // legacy value round-trips identically; a comma-bearing one is preserved as-is by future JSON
+    // writes once the key is next persisted.
+    trimmed.split(',').map(String::from).collect()
 }
 
 impl Store for SqliteStore {
@@ -708,7 +734,7 @@ impl Store for SqliteStore {
                 key.id,
                 key.key_hash,
                 key.name,
-                pools_to_csv(&key.allowed_pools),
+                pools_to_storage(&key.allowed_pools),
                 key.max_budget_cents,
                 key.budget_period,
                 key.rpm_limit,
@@ -828,7 +854,7 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
         id: r.get(0)?,
         key_hash: r.get(1)?,
         name: r.get(2)?,
-        allowed_pools: csv_to_pools(&r.get::<_, String>(3)?),
+        allowed_pools: pools_from_storage(&r.get::<_, String>(3)?),
         max_budget_cents: r.get(4)?,
         budget_period: r.get(5)?,
         rpm_limit: r.get::<_, Option<i64>>(6)?.map(|v| v as u32),
@@ -879,6 +905,50 @@ mod tests {
 
         s.delete_key("k1").unwrap();
         assert_eq!(s.get_key("k1").unwrap(), None);
+    }
+
+    /// A pool name CONTAINING a comma must survive a persist/read round-trip as ONE pool, not be
+    /// split into fragments. The old comma-delimited CSV storage corrupted such names (a key for
+    /// `"prod,special"` round-tripped as `["prod", "special"]`, an implicit privilege expansion that
+    /// also failed to match its own compound name). JSON-array storage is delimiter-safe.
+    #[test]
+    fn test_comma_bearing_pool_name_roundtrips_as_single_pool() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let mut k = sample_key("kc", "hashCOMMA");
+        k.allowed_pools = vec!["prod,special".to_string(), "plain".to_string()];
+        s.put_key(&k).unwrap();
+
+        let got = s.get_key("kc").unwrap().unwrap();
+        assert_eq!(
+            got.allowed_pools,
+            vec!["prod,special".to_string(), "plain".to_string()],
+            "comma-bearing pool name must not be split on read"
+        );
+        // The compound name matches; neither split fragment is authorized on its own.
+        assert!(pool_allowed(&got, "prod,special"));
+        assert!(!pool_allowed(&got, "prod"));
+        assert!(!pool_allowed(&got, "special"));
+    }
+
+    /// `pools_from_storage` must still read a LEGACY bare comma-delimited row (written before the
+    /// JSON migration) so an existing on-disk DB keeps working without a migration step.
+    #[test]
+    fn test_pools_from_storage_reads_legacy_csv() {
+        // New JSON format.
+        assert_eq!(
+            pools_from_storage("[\"a\",\"b\"]"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // Legacy comma-delimited format (not valid JSON) falls back to the comma split.
+        assert_eq!(
+            pools_from_storage("a,b"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // A single legacy comma-free value.
+        assert_eq!(pools_from_storage("solo"), vec!["solo".to_string()]);
+        // Empty stays empty (= no restriction).
+        assert!(pools_from_storage("").is_empty());
+        assert!(pools_from_storage("[]").is_empty());
     }
 
     #[test]
