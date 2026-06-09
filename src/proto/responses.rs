@@ -157,12 +157,15 @@ fn image_url_from_ir(media_type: &str, data: &str) -> String {
 fn responses_error_code(error_type: &str) -> serde_json::Value {
     match error_type {
         "authentication_error" => serde_json::Value::String("invalid_api_key".to_string()),
+        // Native OpenAI/Responses carries a populated machine-readable `code` for the over-quota
+        // path: `{"type":"insufficient_quota","code":"insufficient_quota"}`. Emitting `null` here
+        // (as the older code did) was a fingerprintable divergence on the budget-exceeded 429.
+        "insufficient_quota" => serde_json::Value::String("insufficient_quota".to_string()),
         "invalid_request_error"
         | "permission_error"
         | "not_found_error"
         | "rate_limit_error"
-        | "server_error"
-        | "insufficient_quota" => serde_json::Value::Null,
+        | "server_error" => serde_json::Value::Null,
         other => {
             // A caller-supplied passthrough type we model no code for: OpenAI carries no
             // machine-readable code for these, so `null` matches the native shape. Named binding
@@ -4294,8 +4297,9 @@ mod tests {
         }
     }
 
-    /// Regression (MEDIUM/conformance): non-auth error kinds keep `code:null` — the native shape
-    /// when no machine-readable code applies — so only the auth path is special-cased.
+    /// Regression (MEDIUM/conformance): non-auth, non-quota error kinds keep `code:null` — the
+    /// native shape when no machine-readable code applies — so only the auth and quota paths are
+    /// special-cased.
     #[test]
     fn write_error_keeps_null_code_for_non_auth_errors() {
         let writer = ResponsesWriter;
@@ -4305,13 +4309,34 @@ mod tests {
             "not_found",
             "rate_limit",
             "server_error",
-            "billing",
         ] {
             let body = writer.write_error(400, kind, "msg");
             assert_eq!(
                 body["error"]["code"],
                 serde_json::Value::Null,
-                "non-auth kind {kind} must keep code=null"
+                "non-auth/non-quota kind {kind} must keep code=null"
+            );
+        }
+    }
+
+    /// Regression (LOW/conformance): the over-quota path carries a populated machine-readable
+    /// `code` — native OpenAI/Responses emits `{"type":"insufficient_quota","code":"insufficient_quota"}`
+    /// — so a `code:null` here (the old behavior) would be a fingerprintable divergence. The
+    /// `billing` kind (router vocabulary) is normalized to the native `insufficient_quota` type.
+    #[test]
+    fn write_error_insufficient_quota_keeps_type_and_sets_code() {
+        let writer = ResponsesWriter;
+        for kind in ["insufficient_quota", "billing"] {
+            let body = writer.write_error(429, kind, "over quota");
+            assert_eq!(
+                body["error"]["type"],
+                serde_json::json!("insufficient_quota"),
+                "kind {kind} maps to the native insufficient_quota type"
+            );
+            assert_eq!(
+                body["error"]["code"],
+                serde_json::json!("insufficient_quota"),
+                "kind {kind} must carry code=insufficient_quota, not null"
             );
         }
     }

@@ -253,8 +253,13 @@ pub(crate) fn encode_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
 /// on a mid-stream upstream failure instead of an SSE `event: error` text frame — writing SSE text
 /// into a binary eventstream body produces an undecodable prelude/CRC for the SDK's decoder.
 pub(crate) fn encode_exception_frame(exception_type: &str, message: &str) -> Vec<u8> {
+    // Fallback only if serializing `{"message": <string>}` somehow fails (effectively unreachable
+    // for a plain string). Use AWS's own generic phrasing rather than any busbar-internal routing
+    // vocabulary like "upstream" — a native Bedrock exception frame would never carry that word, so
+    // leaking it here would be a protocol-indistinguishability tell (mirrors the scrub already done
+    // for the Gemini truncation path in proto/mod.rs::GeminiJsonArrayFramer::finish_with_error).
     let payload = serde_json::to_vec(&serde_json::json!({ "message": message }))
-        .unwrap_or_else(|_| b"{\"message\":\"upstream stream error\"}".to_vec());
+        .unwrap_or_else(|_| b"{\"message\":\"An internal server error occurred.\"}".to_vec());
     let mut headers = Vec::new();
     if !push_string_header(&mut headers, ":exception-type", exception_type)
         || !push_string_header(&mut headers, ":content-type", "application/json")

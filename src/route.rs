@@ -62,8 +62,8 @@ fn affinity_header_for<'a>(app: &'a Arc<App>, pool: &str) -> &'a str {
     }
 }
 
-/// reject (402) before forwarding when the resolved virtual key is already over its
-/// budget for the current window. No-op when governance is off or the key has no budget cap.
+/// Reject before forwarding when the resolved virtual key is already over its budget for the
+/// current window. No-op when governance is off or the key has no budget cap.
 /// Async: the budget read is a (blocking) SQLite query offloaded to the blocking pool inside
 /// `is_over_budget_async`, so the request path never stalls a Tokio worker thread.
 async fn budget_check(
@@ -82,9 +82,20 @@ async fn budget_check(
             // The client-facing message carries only vendor-plausible quota copy — never the
             // internal key id or governance vocabulary. The key id is recorded server-side.
             tracing::info!(key_id = %key.id, "governance: key over budget");
+            // Native quota status differs by vendor: OpenAI/Responses/Gemini/Anthropic/Cohere all
+            // surface an over-quota condition as 429 (Gemini's RESOURCE_EXHAUSTED bucket), whereas
+            // Bedrock's `ServiceQuotaExceededException` is a 400-class error. No real provider
+            // returns 402 here, so the previous blanket 402 was a vendor-agnostic tell. Pick the
+            // status that makes each ingress writer map to its native quota shape; the body `kind`
+            // (`insufficient_quota`) already drives the per-protocol error vocabulary.
+            let status = if proto == "bedrock" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            };
             return Some(ingress_error(
                 proto,
-                StatusCode::PAYMENT_REQUIRED,
+                status,
                 "insufficient_quota",
                 "You have exceeded your current quota. Please check your plan and billing details.",
             ));
@@ -334,6 +345,11 @@ async fn ingress_path_model(
         }
     }
 
+    // Re-serializing a `serde_json::Value` we just parsed (with only `String`/`Bool` keys spliced
+    // in) cannot fail in practice — `to_vec` on an in-memory `Value` has no fallible component. The
+    // `Err` arm is kept as a non-panicking, protocol-shaped guard (never `unwrap`) so the request
+    // path stays panic-free even if a future change introduces a non-serializable injected value;
+    // it is effectively unreachable today, hence not exercised by a dedicated test.
     let injected: Bytes = match serde_json::to_vec(&v) {
         Ok(b) => b.into(),
         Err(e) => {
@@ -1485,7 +1501,9 @@ mod tests {
             "x-amzn-RequestId is UUID-v4 shaped (8-4-4-4-12); got {req_id}"
         );
         assert!(
-            req_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+            req_id
+                .chars()
+                .all(|c| (c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) || c == '-'),
             "x-amzn-RequestId is lowercase hex with dashes; got {req_id}"
         );
 
@@ -2796,17 +2814,37 @@ mod tests {
         let body = body_string(resp).await;
         assert_leak_free(&body, &key.id, "denied-pool");
 
-        // --- 402: over budget. A key with a zero budget cap is immediately over budget. ---
+        // --- over budget. A key with a zero budget cap is immediately over budget. The
+        // body-model protocols surface this as 429 (native OpenAI/Gemini quota semantics); no
+        // vendor returns 402 here. ---
         let (app2, key2) = governed_app_over_budget();
         let gov2 = crate::governance::GovCtx {
             key: Some(key2.clone()),
         };
         let resp = budget_check(&app2, &gov2, "openai")
             .await
-            .expect("zero-budget key ⇒ 402 response");
-        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+            .expect("zero-budget key ⇒ over-budget response");
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let body = body_string(resp).await;
         assert_leak_free(&body, &key2.id, "any-pool");
+
+        // Bedrock ingress maps the same over-budget condition to a 400-class
+        // ServiceQuotaExceededException (the native AWS shape), NOT 429.
+        let (app2b, key2b) = governed_app_over_budget();
+        let gov2b = crate::governance::GovCtx {
+            key: Some(key2b.clone()),
+        };
+        let resp = budget_check(&app2b, &gov2b, "bedrock")
+            .await
+            .expect("zero-budget key ⇒ over-budget response (bedrock)");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("ServiceQuotaExceededException"),
+            "bedrock over-budget body carries native quota exception: {body}"
+        );
+        assert_leak_free(&body, &key2b.id, "any-pool");
+        let _ = &app2b;
 
         // --- 429: rate limited. A key with rpm_limit=0 is rate-limited on the first request. ---
         let (app3, key3) = governed_app_rate_limited();
@@ -2924,8 +2962,10 @@ mod tests {
             "request id is UUID-shaped: {req_id}"
         );
         assert!(
-            req_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
-            "request id is hex: {req_id}"
+            req_id
+                .chars()
+                .all(|c| (c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) || c == '-'),
+            "request id is lowercase hex: {req_id}"
         );
         let errortype = resp
             .headers()
@@ -2961,7 +3001,7 @@ mod tests {
             ),
             (
                 "insufficient_quota",
-                StatusCode::PAYMENT_REQUIRED,
+                StatusCode::BAD_REQUEST,
                 "ServiceQuotaExceededException",
             ),
         ] {

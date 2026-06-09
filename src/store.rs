@@ -141,8 +141,9 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     // budget) are identical across both — only the breaker FSM is isolated.
     // `usable` (mutating, lane-default cell) is exercised by the unit tests; in release, dispatch
     // goes through `usable_in`/`acquire_for_dispatch_in` and observers use the side-effect-free
-    // `is_ready` (so /stats can't steal a recovery probe), leaving the bare form test-only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // `is_ready` (so /stats can't steal a recovery probe), leaving the bare form test-only — so it
+    // is `#[cfg(test)]`-gated out of the release binary entirely rather than merely silenced.
+    #[cfg(test)]
     fn usable(&self, lane: usize, now: u64) -> bool;
     fn usable_in(&self, pool: &str, lane: usize, now: u64) -> bool;
     /// Side-effect-FREE readiness check: would this lane admit a request right now, WITHOUT
@@ -173,13 +174,14 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     // `record_success` is the exception — it has a genuine production caller (the degraded
     // `forward_once` failover path at forward.rs:2497, which has no pool context and uses the
     // bare-lane forms), so it carries NO dead-code allow. `breaker_state`, `usable`,
-    // `record_rate_limit`, `record_hard_down` are genuinely release-dead and keep the allow.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // `record_rate_limit`, `record_hard_down` are genuinely release-dead and `#[cfg(test)]`-gated
+    // out of the release binary entirely rather than merely silenced with a dead-code allow.
+    #[cfg(test)]
     fn breaker_state(&self, lane: usize) -> BreakerState;
     // `snapshot()` now reports the lane-GLOBAL (worst-across-all-pool-cells) cooldown via
     // `lane_max_cooldown_remaining`, not the default-cell-only `cooldown_remaining` (which stayed 0
     // for pool-routed traffic), so this bare-lane form is release-dead and exercised only by tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn cooldown_remaining(&self, lane: usize, now: u64) -> u64;
     fn cooldown_remaining_in(&self, pool: &str, lane: usize, now: u64) -> u64;
     /// True if the breaker is suppressing this lane in ANY cell (default or any pool) — either a
@@ -205,7 +207,7 @@ pub(crate) trait StateStore: Send + Sync + 'static {
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
     );
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn record_rate_limit(&self, lane: usize, now: u64, cfg: &BreakerCfg, retry_after: Option<u64>);
     fn record_rate_limit_in(
         &self,
@@ -220,7 +222,7 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     // through the all-cells `record_hard_down_all_cells` primitive (which inlines the per-cell trip to
     // avoid re-locking `pool_cells`), so this bare form is exercised only by the unit tests in release
     // — hence the not(test) dead-code allow, matching the other release-dead bare mutators above.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn record_hard_down(&self, lane: usize, reason: &str);
     /// Hard-down the lane in EVERY cell (the default/direct-route cell AND every existing per-pool
     /// cell), mirroring the all-cells reach of `recover_lane` / `record_probe_failure_all_cells`. A
@@ -260,7 +262,7 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// `candidates` are indices into the store's lane array.
     /// `weights` is the per-member weight for each candidate (must match candidates length).
     /// Returns None if no healthy members or all candidates are unusable.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn select_weighted(&self, candidates: &[usize], weights: &[u32], now: u64) -> Option<usize>;
     fn select_weighted_in(
         &self,
@@ -1273,6 +1275,7 @@ impl InMemoryStore {
 }
 
 impl StateStore for InMemoryStore {
+    #[cfg(test)]
     fn usable(&self, lane: usize, now: u64) -> bool {
         self.usable_for("", lane, now)
     }
@@ -1295,10 +1298,12 @@ impl StateStore for InMemoryStore {
         Self::cell_release_probe(self.cell(pool, lane).as_ref());
     }
 
+    #[cfg(test)]
     fn breaker_state(&self, lane: usize) -> BreakerState {
         self.breaker_state_for("", lane)
     }
 
+    #[cfg(test)]
     fn cooldown_remaining(&self, lane: usize, now: u64) -> u64 {
         self.cooldown_remaining_for("", lane, now)
     }
@@ -1343,6 +1348,7 @@ impl StateStore for InMemoryStore {
         self.record_failure_for(pool, lane, Self::now_secs(), cfg, retry_after);
     }
 
+    #[cfg(test)]
     fn record_rate_limit(
         &self,
         lane: usize,
@@ -1364,6 +1370,7 @@ impl StateStore for InMemoryStore {
         self.record_failure_for(pool, lane, now_time, cfg, retry_after);
     }
 
+    #[cfg(test)]
     fn record_hard_down(&self, lane: usize, reason: &str) {
         self.record_hard_down_for("", lane, reason);
     }
@@ -1535,6 +1542,7 @@ impl StateStore for InMemoryStore {
     }
 
     // SWRR selection over the healthy subset (ADR-0001 algorithm). Uses the lane-default cells.
+    #[cfg(test)]
     fn select_weighted(&self, candidates: &[usize], weights: &[u32], now: u64) -> Option<usize> {
         self.select_weighted_for("", candidates, weights, now)
     }

@@ -82,9 +82,13 @@ pub(crate) fn interpolate_env(s: &str) -> Result<String, String> {
     Ok(result)
 }
 
-#[derive(Debug, Deserialize)]
+/// The fully-resolved runtime config. NOT deserialized from YAML: the on-disk shape is `DeployCfg`
+/// (+ provider definitions), and `RootCfg` is constructed exclusively by [`resolve`]. It therefore
+/// carries no `Deserialize` derive and no field-level serde defaults — those would be inert, and
+/// implying a YAML parse path here would mislead a reader into reasoning about defaults that never
+/// fire.
+#[derive(Debug)]
 pub(crate) struct RootCfg {
-    #[serde(default = "default_listen")]
     pub(crate) listen: String,
     pub(crate) auth: Option<AuthCfg>,
     pub(crate) providers: HashMap<String, ProviderCfg>,

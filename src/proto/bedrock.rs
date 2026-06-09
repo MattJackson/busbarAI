@@ -799,12 +799,29 @@ impl ProtocolReader for BedrockReader {
                     .get("message")
                     .and_then(|m| m.as_str())
                     .map(String::from);
+                // Map each of the five outer-bound exception strings to its StatusClass. Every one
+                // the outer `Some(exc @ (...))` arm can bind is listed explicitly (the two
+                // server-error strings inclusive) so the class mapping is co-located with the string
+                // set rather than hiding behind a `_ => ServerError` default — a new exception added
+                // to the outer union without a class here would surface as the documented
+                // `other =>` arm, which we keep (not a `_` wildcard) only because `&str` matches are
+                // never type-exhaustive; the outer pattern is the real guard.
                 let class = match exc {
                     "throttlingException" => StatusClass::RateLimit,
                     "validationException" => StatusClass::ClientError,
                     "serviceUnavailableException" => StatusClass::Overloaded,
-                    // internalServerException | modelStreamErrorException
-                    _ => StatusClass::ServerError,
+                    "internalServerException" | "modelStreamErrorException" => {
+                        StatusClass::ServerError
+                    }
+                    // Unreachable given the outer `Some(exc @ (...))` guard restricts `exc` to the
+                    // five strings above. A NAMED binding (not a `_` wildcard, per the no-catch-all
+                    // rule — mirrors the `other =>` pattern in responses.rs::responses_error_code)
+                    // keeps the arm explicit; ServerError is the safe class for any exception event
+                    // whose class is otherwise unknown.
+                    other => {
+                        let _ = other;
+                        StatusClass::ServerError
+                    }
                 };
                 out.push(IrStreamEvent::Error(crate::proto::IrError {
                     class,

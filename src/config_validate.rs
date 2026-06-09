@@ -370,6 +370,36 @@ fn effective_client_tokens_empty(auth: &crate::config::AuthCfg) -> bool {
 /// first `/`, `?`, or `#`, drop any `user@` prefix, then separate an IPv6 `[...]` literal or an
 /// `host:port` from its port. IP literals are parsed with `IpAddr` and checked against the blocked
 /// ranges; non-IP hostnames are matched case-insensitively against the metadata hostname list.
+/// Percent-decode a host string (`%XX` → byte), mirroring the RFC 3986 decoding the `url` crate
+/// applies to host components at request time. Invalid escapes (`%` not followed by two hex digits)
+/// are left verbatim so a malformed host stays malformed (it will still fail every IP/hostname check
+/// and be allowed, but it can never be SMUGGLED PAST a check by hiding a blocked literal behind an
+/// escape). Only ASCII results are surfaced as decoded bytes; non-UTF-8 decoded output falls back to
+/// the original so we never fabricate a misleading host. No new dependency — a small manual scan.
+fn percent_decode_host(host: &str) -> String {
+    let bytes = host.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    match String::from_utf8(out) {
+        Ok(s) => s,
+        // Decoded bytes are not valid UTF-8: keep the original literal rather than a lossy host.
+        Err(_) => host.to_string(),
+    }
+}
+
 fn ssrf_blocked_host(url: &str) -> Option<String> {
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -401,6 +431,15 @@ fn ssrf_blocked_host(url: &str) -> Option<String> {
     if host.is_empty() {
         return None;
     }
+
+    // Percent-decode the host BEFORE any check below. The guard operates on the literal config
+    // string, but the `url` crate `reqwest` uses percent-decodes host components per RFC 3986 at
+    // request time — so a `base_url` like `https://169%2E254%2E169%2E254/` would pass every check
+    // here (not in METADATA_HOSTS, not a parseable `IpAddr`, and the `%` defeats
+    // `is_alternate_ipv4_encoding`) yet could resolve to the IMDS target downstream. Decoding here
+    // makes the guard's safety property independent of the URL library's normalization details.
+    let host_decoded = percent_decode_host(host);
+    let host = host_decoded.as_str();
 
     // Normalize a single trailing FQDN-root dot off the host BEFORE any check below. glibc
     // getaddrinfo (reqwest's default resolver) treats a trailing dot as a rooted FQDN and still
@@ -1498,6 +1537,12 @@ mod tests {
             "https://169.254.169.254./",  // IMDS, trailing dot
             "https://10.0.0.1./v1",       // RFC1918, trailing dot
             "https://192.168.1.1.:8443/", // RFC1918 with port, trailing dot
+            // Percent-encoded host components. The `url` crate `reqwest` uses decodes these per
+            // RFC 3986, so the guard must decode them too — otherwise the `%` defeats every check
+            // and a blocked literal is smuggled past config validation (SSRF credential-relay).
+            "https://169%2E254%2E169%2E254/", // IMDS, percent-encoded dots
+            "https://127%2e0%2e0%2e1/",       // loopback, percent-encoded dots (lowercase hex)
+            "https://%31%30.0.0.1/",          // "10.0.0.1" with first octet percent-encoded
         ] {
             assert!(
                 ssrf_blocked_host(blocked).is_some(),

@@ -647,7 +647,6 @@ impl TestApp {
     }
 }
 
-#[allow(dead_code)]
 fn weighted(members: &[(usize, u32)]) -> Vec<crate::state::WeightedLane> {
     members
         .iter()
@@ -1253,7 +1252,7 @@ mod tests {
         handle.abort();
     }
 
-    /// a virtual key over its budget is rejected with 402 before forwarding.
+    /// a virtual key over its budget is rejected (429 for body/Anthropic ingress) before forwarding.
     #[tokio::test]
     async fn test_governance_budget_402() {
         use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
@@ -1295,33 +1294,33 @@ mod tests {
             .unwrap();
         assert_eq!(
             r.status().as_u16(),
-            402,
-            "over-budget key → payment required"
+            429,
+            "over-budget key → 429 (native quota status; no vendor returns 402 here)"
         );
-        // The 402 must carry the NATIVE Anthropic error envelope with the CANONICAL quota
+        // The rejection must carry the NATIVE Anthropic error envelope with the CANONICAL quota
         // `error.type` ("insufficient_quota"), not merely the right status code. A regression that
         // reverted the budget kind to the non-canonical `billing_error` token (which the writers pass
-        // through verbatim) would still be a 402 but would emit an `error.type` an SDK's typed
+        // through verbatim) would still be a 429 but would emit an `error.type` an SDK's typed
         // exception mapping does not recognize — a router-side tell this assertion guards.
         assert_eq!(
             r.headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|h| h.to_str().ok()),
             Some("application/json"),
-            "402 budget rejection is application/json"
+            "budget rejection is application/json"
         );
         let body: serde_json::Value = r.json().await.unwrap();
         assert_eq!(
             body.get("type").and_then(|t| t.as_str()),
             Some("error"),
-            "anthropic 402 envelope has top-level type:error; got {body}"
+            "anthropic over-budget envelope has top-level type:error; got {body}"
         );
         assert_eq!(
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
             Some("insufficient_quota"),
-            "anthropic 402 carries canonical insufficient_quota error.type; got {body}"
+            "anthropic over-budget carries canonical insufficient_quota error.type; got {body}"
         );
 
         handle.abort();
@@ -1380,7 +1379,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(r.status().as_u16(), 402, "openai over-budget → 402");
+        assert_eq!(r.status().as_u16(), 429, "openai over-budget → 429");
         assert_eq!(
             r.headers()
                 .get(reqwest::header::CONTENT_TYPE)
@@ -1412,14 +1411,21 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(r.status().as_u16(), 402, "responses over-budget → 402");
+        assert_eq!(r.status().as_u16(), 429, "responses over-budget → 429");
         let body: serde_json::Value = r.json().await.unwrap();
         assert_eq!(
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
             Some("insufficient_quota"),
-            "responses 402 carries insufficient_quota error.type; got {body}"
+            "responses over-budget carries insufficient_quota error.type; got {body}"
+        );
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str()),
+            Some("insufficient_quota"),
+            "responses over-budget carries populated code=insufficient_quota (not null); got {body}"
         );
         handle.abort();
     }
@@ -1438,7 +1444,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(r.status().as_u16(), 402, "cohere over-budget → 402");
+        assert_eq!(r.status().as_u16(), 429, "cohere over-budget → 429");
         let body: serde_json::Value = r.json().await.unwrap();
         assert!(
             body.get("message").and_then(|m| m.as_str()).is_some(),
@@ -1451,8 +1457,9 @@ mod tests {
         handle.abort();
     }
 
-    /// Gemini ingress (`/v1beta/models/x:generateContent`): an over-budget 402 must carry the native
-    /// Gemini error envelope — `error.code == 402` and `error.status` set.
+    /// Gemini ingress (`/v1beta/models/x:generateContent`): an over-budget rejection must carry the
+    /// native Gemini quota envelope — `error.code == 429` and `error.status == "RESOURCE_EXHAUSTED"`
+    /// (the canonical quota shape; the old 402 yielded a mismatched INVALID_ARGUMENT status).
     #[tokio::test]
     async fn test_budget_402_gemini_envelope() {
         crate::metrics::init();
@@ -1467,28 +1474,29 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(r.status().as_u16(), 402, "gemini over-budget → 402");
+        assert_eq!(r.status().as_u16(), 429, "gemini over-budget → 429");
         let body: serde_json::Value = r.json().await.unwrap();
         assert_eq!(
             body.get("error")
                 .and_then(|e| e.get("code"))
                 .and_then(|c| c.as_u64()),
-            Some(402),
-            "gemini 402 envelope carries error.code == 402; got {body}"
+            Some(429),
+            "gemini over-budget envelope carries error.code == 429; got {body}"
         );
-        assert!(
+        assert_eq!(
             body.get("error")
                 .and_then(|e| e.get("status"))
-                .and_then(|s| s.as_str())
-                .is_some(),
-            "gemini 402 envelope carries error.status; got {body}"
+                .and_then(|s| s.as_str()),
+            Some("RESOURCE_EXHAUSTED"),
+            "gemini over-budget envelope carries the native RESOURCE_EXHAUSTED status; got {body}"
         );
         handle.abort();
     }
 
-    /// Bedrock ingress (`/model/x/converse`): an over-budget 402 must carry the native AWS JSON-1.1
-    /// error envelope (`__type == "ServiceQuotaExceededException"`) AND the `x-amzn-errortype` /
-    /// `x-amzn-RequestId` headers a native Bedrock runtime response always carries.
+    /// Bedrock ingress (`/model/x/converse`): an over-budget rejection must carry the native AWS
+    /// JSON-1.1 error envelope (`__type == "ServiceQuotaExceededException"`) at a 400-class status
+    /// (the native AWS shape for ServiceQuotaExceededException — NOT 429/402) AND the
+    /// `x-amzn-errortype` / `x-amzn-RequestId` headers a native Bedrock runtime response carries.
     #[tokio::test]
     async fn test_budget_402_bedrock_envelope() {
         crate::metrics::init();
@@ -1501,7 +1509,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(r.status().as_u16(), 402, "bedrock over-budget → 402");
+        assert_eq!(r.status().as_u16(), 400, "bedrock over-budget → 400");
         // Headers: a native Bedrock error always carries x-amzn-RequestId and x-amzn-errortype.
         let errortype_hdr = r
             .headers()
@@ -1511,17 +1519,17 @@ mod tests {
         assert_eq!(
             errortype_hdr.as_deref(),
             Some("ServiceQuotaExceededException"),
-            "bedrock 402 carries x-amzn-errortype header matching __type"
+            "bedrock over-budget carries x-amzn-errortype header matching __type"
         );
         assert!(
             r.headers().get("x-amzn-requestid").is_some(),
-            "bedrock 402 carries an x-amzn-RequestId header"
+            "bedrock over-budget carries an x-amzn-RequestId header"
         );
         let body: serde_json::Value = r.json().await.unwrap();
         assert_eq!(
             body.get("__type").and_then(|t| t.as_str()),
             Some("ServiceQuotaExceededException"),
-            "bedrock 402 envelope carries __type == ServiceQuotaExceededException; got {body}"
+            "bedrock over-budget envelope carries __type == ServiceQuotaExceededException; got {body}"
         );
         handle.abort();
     }

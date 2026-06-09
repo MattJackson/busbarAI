@@ -109,11 +109,14 @@ pub(crate) fn proto_for_path(path: &str) -> &'static str {
         // error envelope. Distinguish the Gemini `:<action>` form by matching ONLY the known Gemini
         // method suffixes; anything else (including colon-bearing OpenAI model ids) → OpenAI.
         let last_segment = path.rsplit('/').next().unwrap_or("");
-        const GEMINI_ACTIONS: [&str; 4] = [
+        const GEMINI_ACTIONS: [&str; 7] = [
             ":generateContent",
             ":streamGenerateContent",
             ":countTokens",
             ":embedContent",
+            ":batchGenerateContent",
+            ":generateAnswer",
+            ":batchEmbedContents",
         ];
         if GEMINI_ACTIONS.iter().any(|a| last_segment.ends_with(a)) {
             "gemini"
@@ -2060,10 +2063,11 @@ mod tests {
             );
         }
 
-        // message_delta with usage
+        // message_delta with usage. Native Anthropic ALWAYS carries `delta.stop_sequence` (explicit
+        // `null` when no stop sequence fired), so the round-tripped frame includes it.
         let data = serde_json::json!({
             "type": "message_delta",
-            "delta": { "stop_reason": "end_turn" },
+            "delta": { "stop_reason": "end_turn", "stop_sequence": null },
             "usage": {
                 "input_tokens": 10,
                 "output_tokens": 20,
@@ -3136,11 +3140,12 @@ mod tests {
             }
 
             // 5. message_delta w/ usage, no matched stop_sequence (the common case). The source
-            // carried no `stop_sequence`, so the IR's `stop_sequence` is `None` and the writer omits
-            // the key — the round-trip stays byte-identical.
+            // carried no matched `stop_sequence`, so the IR's `stop_sequence` is `None`. Native
+            // Anthropic ALWAYS carries `delta.stop_sequence` (explicit `null` when none fired), so
+            // the writer emits it as `null` and the round-trip preserves that native shape.
             let data = serde_json::json!({
                 "type": "message_delta",
-                "delta": {"stop_reason": "end_turn"},
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
                 "usage": {
                     "input_tokens": 10,
                     "output_tokens": 20,

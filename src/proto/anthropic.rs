@@ -30,14 +30,16 @@ fn unix_now_secs() -> u64 {
 const BASE62_ALPHABET: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-/// Encode a `u64` as exactly 11 base62 digits, zero-padded (most-significant first). `62^11`
-/// exceeds `2^64`, so 11 digits cover the whole `u64` range, and the FIXED width keeps the encoding
-/// injective — concatenating two fixed-width fields never lets one field's overflow bleed into the
-/// next (the property that makes a `(timestamp, counter)` pair collision-free). Pure arithmetic, no
-/// allocation beyond the returned string, and never panics.
+/// Encode a `u64` as exactly 12 base62 digits, zero-padded (most-significant first). `62^11`
+/// already exceeds `2^64`, so 12 digits cover the whole `u64` range with one digit of headroom, and
+/// the FIXED width keeps the encoding injective — concatenating two fixed-width fields never lets one
+/// field's overflow bleed into the next (the property that makes a `(timestamp, counter)` pair
+/// collision-free). Two 12-digit fields after the `01` version marker give the native 24-char suffix
+/// (total `msg_01` + 24 = 30 chars). Pure arithmetic, no allocation beyond the returned string, and
+/// never panics.
 fn base62_u64_fixed(mut n: u64) -> String {
-    // 11 digits, filled from the least-significant end, then reversed to MSB-first.
-    let mut buf = [b'0'; 11];
+    // 12 digits, filled from the least-significant end, then reversed to MSB-first.
+    let mut buf = [b'0'; 12];
     for slot in buf.iter_mut().rev() {
         *slot = BASE62_ALPHABET[(n % 62) as usize];
         n /= 62;
@@ -1267,13 +1269,17 @@ impl ProtocolWriter for AnthropicWriter {
                 } else {
                     delta_obj.insert("stop_reason".to_string(), serde_json::Value::Null);
                 }
-                // `stop_sequence`: emit the matched stop string when the source carried one (a
-                // same-protocol Anthropic delta whose stop sequence actually fired). Omitted when
-                // `None` — both a native `null`/absent stop_sequence and any cross-protocol source —
-                // so we never add a field a non-Anthropic source's output never had.
-                if let Some(seq) = stop_sequence {
-                    delta_obj.insert("stop_sequence".to_string(), serde_json::json!(seq));
-                }
+                // `stop_sequence`: native Anthropic `message_delta` ALWAYS carries this key —
+                // the matched stop string when a stop sequence fired, else explicit `null`. Emit
+                // `null` rather than omitting the key so a strict property-presence validator sees
+                // the native shape (the TS SDK already treats `undefined`/`null` alike).
+                delta_obj.insert(
+                    "stop_sequence".to_string(),
+                    stop_sequence
+                        .as_deref()
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                );
                 let mut usage_map = serde_json::Map::new();
                 usage_map.insert(
                     "input_tokens".to_string(),
@@ -2107,14 +2113,28 @@ mod anthropic_hardening_tests {
             n,
             "every synthesized message id must be unique (fixed-width counter is injective)"
         );
-        // Every suffix after `msg_<ts-hex>` carries a 16-hex-digit zero-padded counter, so the
-        // timestamp and counter fields are unambiguously separable — the property that kills the
-        // bare-concat collision.
+        // Every id matches the native Anthropic shape: `msg_` + `01` version marker + two
+        // 12-digit base62 fields (unix second, counter) = 30 chars total, with the timestamp and
+        // counter fields unambiguously separable (the fixed widths kill the bare-concat collision).
+        // The 30-char total matches native `msg_01` + 24 random chars, removing the id-LENGTH tell
+        // a client could use to distinguish a synthesized id.
         for id in &ids {
-            let suffix = id.strip_prefix("msg_").expect("msg_ prefix");
+            assert_eq!(
+                id.len(),
+                30,
+                "synthesized message id must match the native 30-char length, got {id}"
+            );
+            let suffix = id
+                .strip_prefix("msg_01")
+                .expect("msg_01 version-marker prefix");
+            assert_eq!(
+                suffix.len(),
+                24,
+                "the post-`01` token must be the native 24-char width, got {suffix}"
+            );
             assert!(
-                suffix.len() >= 16,
-                "suffix must hold at least the 16-hex counter field, got {suffix}"
+                suffix.bytes().all(|b| b.is_ascii_alphanumeric()),
+                "the token is base62 (alphanumeric only), got {suffix}"
             );
         }
     }
@@ -2434,11 +2454,12 @@ mod anthropic_hardening_tests {
                 "{id} must carry the native `01` version marker after the prefix"
             );
             let token = &suffix[2..];
-            // 11 base62 digits per u64 field × 2 fields = 22 chars, fixed-width.
+            // 12 base62 digits per u64 field × 2 fields = 24 chars, fixed-width — matching the
+            // native `<prefix>01` + 24-char token (30 chars total for `msg_`/`req_`).
             assert_eq!(
                 token.len(),
-                22,
-                "token must be fixed-length (2×11 base62 digits), got `{token}`"
+                24,
+                "token must be fixed-length (2×12 base62 digits), got `{token}`"
             );
             assert!(
                 token.bytes().all(|b| b.is_ascii_alphanumeric()),

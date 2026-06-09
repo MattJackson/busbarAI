@@ -219,7 +219,6 @@ impl ProtocolReader for CohereReader {
 
         let mut extra = serde_json::Map::new();
         let mut system_blocks: Vec<crate::ir::IrBlock> = Vec::new();
-        let _model = obj.get("model").and_then(|v| v.as_str()).map(String::from);
 
         let mut messages: Vec<crate::ir::IrMessage> = Vec::new();
         if let Some(messages_val) = obj.get("messages") {

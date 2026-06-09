@@ -595,9 +595,10 @@ impl From<rusqlite::Error> for StoreError {
 pub(crate) trait Store: Send + Sync + 'static {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()>;
     fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>>;
-    // Lookup by key hash — part of the Store contract and unit-tested, but the hot-path key
-    // resolution uses the in-memory cache by id, so it's not called in release.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Lookup by key hash — exercised only by unit tests that probe the DB directly; the hot-path
+    // key resolution uses the in-memory `by_hash` cache and never calls through the trait. Gated to
+    // test builds so it (and its `SqliteStore` impl) leaves no dead surface in the release binary.
+    #[cfg(test)]
     fn get_key_by_hash(&self, key_hash: &str) -> StoreResult<Option<VirtualKey>>;
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>>;
     fn delete_key(&self, id: &str) -> StoreResult<()>;
@@ -664,8 +665,19 @@ impl SqliteStore {
         Ok(store)
     }
 
+    /// Acquire the SQLite connection mutex, recovering from a poisoned lock instead of panicking.
+    /// Mirrors `rate_write`/`by_hash_read`: this lock is reachable from the request path (the budget
+    /// read in `is_over_budget_async` → `get_usage` runs inside `spawn_blocking`), and the project
+    /// rule is no panic on the request path. A panic under the connection lock would otherwise poison
+    /// it and cascade into a governance-wide outage on every subsequent CRUD/usage call. SQLite's own
+    /// state stays consistent across a recovered guard (a panicked statement is rolled back by
+    /// rusqlite's Drop), so continuing with `into_inner()` is safe.
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn migrate(&self) -> StoreResult<()> {
-        self.conn.lock().unwrap().execute_batch(SCHEMA)?;
+        self.lock_conn().execute_batch(SCHEMA)?;
         Ok(())
     }
 }
@@ -683,7 +695,7 @@ fn csv_to_pools(csv: &str) -> Vec<String> {
 
 impl Store for SqliteStore {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT INTO virtual_keys
                 (id, key_hash, name, allowed_pools, max_budget_cents, budget_period, rpm_limit, tpm_limit, enabled, created_at)
@@ -709,7 +721,7 @@ impl Store for SqliteStore {
     }
 
     fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let row = conn
             .query_row(
                 "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at
@@ -721,8 +733,9 @@ impl Store for SqliteStore {
         Ok(row)
     }
 
+    #[cfg(test)]
     fn get_key_by_hash(&self, key_hash: &str) -> StoreResult<Option<VirtualKey>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let row = conn
             .query_row(
                 "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at
@@ -735,7 +748,7 @@ impl Store for SqliteStore {
     }
 
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at
              FROM virtual_keys ORDER BY created_at",
@@ -755,7 +768,7 @@ impl Store for SqliteStore {
         // any future key re-created with the same id with stale usage. Wrap both in one transaction
         // so they commit together or not at all. The Mutex already serializes us against other
         // writers, so the transaction cannot deadlock against a concurrent busbar caller.
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM virtual_keys WHERE id=?1", params![id])?;
         tx.execute("DELETE FROM usage_counters WHERE key_id=?1", params![id])?;
@@ -772,7 +785,7 @@ impl Store for SqliteStore {
         count_request: bool,
     ) -> StoreResult<()> {
         let req_delta = i64::from(count_request);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
              VALUES (?1,?2,?3,?4,?5)
@@ -792,7 +805,7 @@ impl Store for SqliteStore {
     }
 
     fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn();
         let row = conn
             .query_row(
                 "SELECT spend_cents, tokens, requests FROM usage_counters WHERE key_id=?1 AND window_start=?2",
