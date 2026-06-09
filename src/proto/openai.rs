@@ -479,13 +479,26 @@ impl ProtocolReader for OpenAiReader {
         })
     }
 
+    /// Singular-event entry point. OpenAI's wire stream is flat (one `chat.completion.chunk` may
+    /// carry role + content + finish at once), so the real translation lives in the fan-out
+    /// [`read_response_events`]; the production response-translation path always calls that plural
+    /// form on this reader. This singular method exists only because the `ProtocolReader` trait
+    /// requires it. Rather than a dead `None` stub that SILENTLY DROPS every event if the
+    /// call-path invariant is ever broken (a correctness failure that is both silent and hard to
+    /// diagnose), delegate to the canonical fan-out over fresh decode state and surface its FIRST
+    /// IR event. A single OpenAI chunk that maps to multiple IR events (e.g. role + content) loses
+    /// the trailing events through this 1:1 adapter — which is exactly why production uses the
+    /// plural path — but no event is silently swallowed wholesale. Never panics on the request
+    /// path: `StreamDecodeState::default()` is infallible and the fan-out is total.
     fn read_response_event(
         &self,
         event_type: &str,
         data: &serde_json::Value,
     ) -> Option<IrStreamEvent> {
-        let _ = (event_type, data);
-        None
+        let mut state = crate::ir::StreamDecodeState::default();
+        self.read_response_events(event_type, data, &mut state)
+            .into_iter()
+            .next()
     }
 
     /// OpenAI's flat stream → IR block-structured events. One chat.completion.chunk
@@ -3421,5 +3434,32 @@ mod tests {
             _ => None,
         });
         assert_eq!(stop.as_deref(), Some("safety"));
+    }
+
+    // Regression: the singular `read_response_event` must not be a dead `None` stub that silently
+    // drops every event. It now delegates to the fan-out and surfaces the first IR event, so a
+    // chunk that carries a role delta yields a MessageStart rather than vanishing.
+    #[test]
+    fn singular_read_response_event_delegates_to_fanout() {
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-x",
+            "object": "chat.completion.chunk",
+            "created": 1u64,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+        });
+        let ev = OpenAiReader.read_response_event("", &chunk);
+        assert!(
+            matches!(ev, Some(IrStreamEvent::MessageStart { .. })),
+            "singular event must surface the fan-out's first event, got {ev:?}"
+        );
+    }
+
+    // Regression: a chunk that produces no IR events (the `[DONE]` sentinel) yields None from the
+    // singular adapter — confirming the delegation is faithful at the empty boundary.
+    #[test]
+    fn singular_read_response_event_empty_chunk_yields_none() {
+        let done = serde_json::Value::String("[DONE]".to_string());
+        assert!(OpenAiReader.read_response_event("", &done).is_none());
     }
 }

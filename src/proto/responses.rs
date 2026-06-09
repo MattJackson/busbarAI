@@ -13,6 +13,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// index arithmetic. Mirrors `openai.rs::MAX_TOOL_INDEX`.
 const MAX_OUTPUT_INDEX: usize = 127;
 
+/// Fallback `model` name emitted when the IR carries none. The official OpenAI Responses SDK types
+/// `Response.model` as a REQUIRED non-nullable string, so a `response.created`/full response that
+/// omits `model` fails a strict Pydantic/Zod decoder — and a real `/v1/responses` endpoint never
+/// omits it, making the omission a distinguishability tell. On any cross-protocol path
+/// (Anthropic→Responses, Bedrock→Responses) the IR `model` is `None`; emit this fallback rather
+/// than dropping the key. Mirrors `openai.rs::DEFAULT_MODEL`.
+const DEFAULT_MODEL: &str = "gpt-4o";
+
 /// Hard cap on the number of DISTINCT output indices tracked per stream in `StreamDecodeState`
 /// (`open_tools`) and in the writer's open-item sets. Bounds per-request memory against a
 /// pathological backend that emits a unique `output_index` per event (a per-connection amplification
@@ -1142,6 +1150,17 @@ pub(crate) struct ResponsesWriter {
     /// `response_id`; a poisoned lock degrades to the synthesize-fresh (`now_unix_secs`) fallback
     /// rather than panicking on the request path.
     created_at: std::sync::Mutex<Option<u64>>,
+    /// Per-stream `response.model`. Captured on the opening `MessageStart` (the model written into
+    /// `response.created`, after the DEFAULT_MODEL fallback) and replayed verbatim onto EVERY
+    /// subsequent lifecycle event (`response.completed`/`response.incomplete`/`response.failed`). A
+    /// native OpenAI Responses stream carries the SAME `model` on the full `Response` object of
+    /// every event, and the official SDK types `Response.model` as a REQUIRED non-nullable string —
+    /// so a terminal event whose inner `response` omits `model` fails a strict decoder and is a
+    /// distinguishability tell. The IR `MessageDelta`/`Error` events carry no model, so the terminal
+    /// arms replay this captured value (falling back to DEFAULT_MODEL only if the cell was never
+    /// populated). Per-stream INSTANCE state for the same reason as `response_id`/`created_at`; a
+    /// poisoned lock degrades to the DEFAULT_MODEL fallback rather than panicking on the request path.
+    model: std::sync::Mutex<Option<String>>,
     /// Output indices for which this writer emitted a function-call `output_item.added`. The IR
     /// `BlockStop` carries only the integer index (no block kind), but a native Responses stream
     /// emits `output_item.done` ONLY for items it previously `added` — and the Text `BlockStart`
@@ -1221,6 +1240,7 @@ pub(crate) const ResponsesWriter: ResponsesWriter = ResponsesWriter {
     sequence: AtomicU64::new(0),
     response_id: std::sync::Mutex::new(None),
     created_at: std::sync::Mutex::new(None),
+    model: std::sync::Mutex::new(None),
     open_tool_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
     open_text_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
     item_ids: std::sync::Mutex::new(std::collections::BTreeMap::new()),
@@ -1243,6 +1263,10 @@ impl Clone for ResponsesWriter {
             // writer's terminal events replay the SAME timestamp; a poisoned lock degrades to None
             // (terminal arm then falls back to `now_unix_secs`).
             created_at: std::sync::Mutex::new(self.created_at.lock().map(|c| *c).unwrap_or(None)),
+            // Carry the captured `model` across a mid-stream `Protocol::clone` so the cloned
+            // writer's terminal events replay the SAME model; a poisoned lock degrades to None
+            // (terminal arm then falls back to DEFAULT_MODEL).
+            model: std::sync::Mutex::new(self.model.lock().map(|m| m.clone()).unwrap_or(None)),
             open_tool_indices: std::sync::Mutex::new(
                 self.open_tool_indices
                     .lock()
@@ -1311,6 +1335,12 @@ impl ResponsesWriter {
         if let Ok(mut created) = self.created_at.lock() {
             *created = None;
         }
+        // Clear the carried `model` alongside the id/created_at: a reused/cloned writer must not
+        // leak a previous stream's model onto a new stream's terminal events. The new value is
+        // stored when this stream's `MessageStart` is written.
+        if let Ok(mut model) = self.model.lock() {
+            *model = None;
+        }
     }
 
     /// Store the per-stream `response.id` captured on `MessageStart` so terminal events replay it
@@ -1348,6 +1378,27 @@ impl ResponsesWriter {
             .ok()
             .and_then(|c| *c)
             .unwrap_or_else(now_unix_secs)
+    }
+
+    /// Store the per-stream `model` captured on `MessageStart` so terminal events replay it
+    /// verbatim. Lock poisoning degrades to a no-op (the terminal arm then falls back to
+    /// `DEFAULT_MODEL`) rather than panicking on the request path.
+    fn set_model(&self, model: &str) {
+        if let Ok(mut slot) = self.model.lock() {
+            *slot = Some(model.to_string());
+        }
+    }
+
+    /// Return the per-stream `model` captured on `MessageStart`, falling back to `DEFAULT_MODEL` if
+    /// it was never set (a malformed stream whose terminal event preceded `MessageStart`, or a
+    /// poisoned lock). Replaying the captured value keeps every event's `model` identical and
+    /// non-null, matching a native Responses stream and the SDK's required-field contract.
+    fn carried_model(&self) -> String {
+        self.model
+            .lock()
+            .ok()
+            .and_then(|m| m.clone())
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
     }
 
     /// Return the next `sequence_number` for this stream and advance the counter. The first call
@@ -1705,9 +1756,15 @@ impl ProtocolWriter for ResponsesWriter {
                 resp_obj.insert("object".to_string(), serde_json::json!("response"));
                 resp_obj.insert("created_at".to_string(), serde_json::json!(created_at));
                 resp_obj.insert("status".to_string(), serde_json::json!("in_progress"));
-                if let Some(model) = model {
-                    resp_obj.insert("model".to_string(), serde_json::json!(model));
-                }
+                // `Response.model` is a REQUIRED non-nullable string in the official SDK; emit it
+                // unconditionally with the DEFAULT_MODEL fallback when the IR carries none (a
+                // cross-protocol stream where `translate_event` strips the model to None) rather
+                // than omitting the key — omission breaks strict decoders and is a proxy tell.
+                let model_name = model.as_deref().unwrap_or(DEFAULT_MODEL);
+                // Carry this stream's model forward so the terminal events (and any failure) replay
+                // the SAME `model` — a native stream's `model` is constant across every event.
+                self.set_model(model_name);
+                resp_obj.insert("model".to_string(), serde_json::json!(model_name));
                 // The native `response.created` carries the FULL Response skeleton, not just its
                 // identity: an official SDK constructs a `Response` object from this event and reads
                 // `usage`/`output`/`error` unconditionally. At stream start there are no tokens yet
@@ -1953,6 +2010,12 @@ impl ProtocolWriter for ResponsesWriter {
                     serde_json::json!(self.carried_created_at()),
                 );
                 resp_obj.insert("status".to_string(), serde_json::json!(status));
+                // Replay the `model` captured on this stream's opening `MessageStart` so the
+                // terminal event's inner `response` carries the SAME required non-nullable `model`
+                // as `response.created`. The IR `MessageDelta` carries no model, and omitting it
+                // fails a strict SDK decoder and is a distinguishability tell; `carried_model`
+                // falls back to DEFAULT_MODEL only if the cell was never populated.
+                resp_obj.insert("model".to_string(), serde_json::json!(self.carried_model()));
 
                 if status == "incomplete" {
                     let reason = match stop_reason.as_deref() {
@@ -2051,6 +2114,11 @@ impl ProtocolWriter for ResponsesWriter {
                             // it mid-flight); falls back to the current time only if the failure
                             // preceded any `MessageStart`.
                             "created_at": self.carried_created_at(),
+                            // Replay the captured `model` so `response.failed`'s inner `response`
+                            // carries the SAME required non-nullable `model` as `response.created`;
+                            // falls back to DEFAULT_MODEL only if the failure preceded any
+                            // `MessageStart`.
+                            "model": self.carried_model(),
                             "status": "failed",
                             "error": {
                                 "code": code,
@@ -2157,10 +2225,14 @@ impl ProtocolWriter for ResponsesWriter {
         obj.insert("object".to_string(), serde_json::json!("response"));
         obj.insert("created_at".to_string(), serde_json::json!(created_at));
         obj.insert("status".to_string(), serde_json::json!(status));
-        // model that served the response (preserved across cross-protocol translation)
-        if let Some(ref model) = resp.model {
-            obj.insert("model".to_string(), serde_json::json!(model));
-        }
+        // model that served the response (preserved across cross-protocol translation). The
+        // official SDK types `Response.model` as a REQUIRED non-nullable string, so emit it
+        // unconditionally with the DEFAULT_MODEL fallback when the IR carries none rather than
+        // omitting the key — omission breaks strict decoders and is a distinguishability tell.
+        obj.insert(
+            "model".to_string(),
+            serde_json::json!(resp.model.as_deref().unwrap_or(DEFAULT_MODEL)),
+        );
         obj.insert("output".to_string(), serde_json::Value::Array(output_arr));
         obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
 
@@ -2555,11 +2627,15 @@ mod tests {
     fn test_write_response_roundtrip_text_only() {
         // Carries `id`/`created_at` so same-protocol read→write is byte-identical: the writer now
         // always emits the SDK-required top-level identity, and a native response carries both.
+        // Carries `model` too: a native completed response always carries the required
+        // non-nullable `model`, and the writer now always re-emits it, so the round-trip stays
+        // byte-identical only when the source includes it.
         let json = serde_json::json!({
             "id": "resp_abc123",
             "object": "response",
             "created_at": 1_700_000_000_u64,
             "status": "completed",
+            "model": "gpt-4o",
             "output": [
                 {
                     "type": "message",
@@ -3641,9 +3717,13 @@ mod tests {
             resp2.get("created_at").and_then(|c| c.as_u64()).is_some(),
             "synthesized created_at must be present"
         );
-        assert!(
-            resp2.get("model").is_none(),
-            "absent model must not be emitted"
+        // `Response.model` is a REQUIRED non-nullable SDK field, so an absent IR model must emit
+        // the DEFAULT_MODEL fallback — NOT omit the key (which fails a strict decoder and is a
+        // proxy tell).
+        assert_eq!(
+            resp2.get("model").and_then(|m| m.as_str()),
+            Some(DEFAULT_MODEL),
+            "absent model must fall back to DEFAULT_MODEL, not be omitted"
         );
     }
 
@@ -5516,5 +5596,128 @@ mod tests {
             close_text[0],
             crate::ir::IrStreamEvent::BlockStop { index: 1 }
         ));
+    }
+
+    /// Regression (MEDIUM/conformance): `write_response` must emit the SDK-required non-nullable
+    /// `model` even when the IR carries none (cross-protocol path, e.g. Bedrock/Anthropic →
+    /// Responses). A prior revision emitted `model` only when `resp.model` was `Some`, dropping the
+    /// key entirely on cross-protocol responses — a strict-decoder failure and a distinguishability
+    /// tell. Absent IR model must fall back to DEFAULT_MODEL; a present model is preserved verbatim.
+    #[test]
+    fn test_write_response_emits_model_fallback() {
+        let make_resp = |model: Option<String>| crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model,
+            id: Some("resp_x".to_string()),
+            created: Some(1),
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+
+        // Cross-protocol: no model in the IR → DEFAULT_MODEL, never an absent key.
+        let writer = ResponsesWriter;
+        let out_none = writer.write_response(&make_resp(None));
+        assert_eq!(
+            out_none.get("model").and_then(|m| m.as_str()),
+            Some(DEFAULT_MODEL),
+            "absent model must fall back to DEFAULT_MODEL, not be omitted"
+        );
+
+        // Same-protocol passthrough: the upstream model is preserved verbatim.
+        let writer_some = ResponsesWriter;
+        let out_some = writer_some.write_response(&make_resp(Some("gpt-4o-mini".to_string())));
+        assert_eq!(
+            out_some.get("model").and_then(|m| m.as_str()),
+            Some("gpt-4o-mini"),
+            "present model must be preserved verbatim"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance): on a cross-protocol stream (IR `model` is `None` on
+    /// `MessageStart`), `response.created` AND every terminal lifecycle event
+    /// (`response.completed`/`.incomplete`/`.failed`) must carry the same non-nullable `model`
+    /// (DEFAULT_MODEL here). The terminal arms previously emitted no `model` at all — an inner
+    /// `response` missing the required field, a strict-decoder failure and a proxy tell.
+    #[test]
+    fn test_stream_terminal_events_carry_model_fallback() {
+        // --- cross-protocol completed stream: model None throughout the IR ---
+        let writer = ResponsesWriter;
+        let start = crate::ir::IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        };
+        let (_, created) = writer.write_response_event(&start).expect("created event");
+        assert_eq!(
+            created
+                .get("response")
+                .and_then(|r| r.get("model"))
+                .and_then(|m| m.as_str()),
+            Some(DEFAULT_MODEL),
+            "response.created must carry DEFAULT_MODEL when IR model is None"
+        );
+
+        let delta = crate::ir::IrStreamEvent::MessageDelta {
+            stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (ename, completed) = writer.write_response_event(&delta).expect("terminal event");
+        assert_eq!(ename, "response.completed");
+        assert_eq!(
+            completed
+                .get("response")
+                .and_then(|r| r.get("model"))
+                .and_then(|m| m.as_str()),
+            Some(DEFAULT_MODEL),
+            "response.completed must replay the required model field"
+        );
+
+        // --- same-protocol stream: the captured model is replayed onto the terminal event ---
+        let writer2 = ResponsesWriter;
+        let start2 = crate::ir::IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: Some("resp_keep".to_string()),
+            created: Some(1_720_000_000),
+            model: Some("gpt-4o-mini".to_string()),
+        };
+        writer2
+            .write_response_event(&start2)
+            .expect("created event");
+        let err = crate::ir::IrStreamEvent::Error(IrError {
+            class: StatusClass::ServerError,
+            provider_signal: Some("boom".to_string()),
+            retry_after: None,
+        });
+        let (ename2, failed) = writer2.write_response_event(&err).expect("failed event");
+        assert_eq!(ename2, "response.failed");
+        assert_eq!(
+            failed
+                .get("response")
+                .and_then(|r| r.get("model"))
+                .and_then(|m| m.as_str()),
+            Some("gpt-4o-mini"),
+            "response.failed must replay the captured stream model"
+        );
     }
 }

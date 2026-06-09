@@ -85,6 +85,15 @@ fn bedrock_stream_exception_for(err: &crate::proto::IrError) -> (&'static str, S
     (exception_name, message)
 }
 
+/// Bedrock-local media_type SENTINEL marking that an IR `Image`'s `data` field holds a
+/// JSON-serialized Converse `s3Location` source object (`{"uri":...,"bucketOwner":...}`) rather
+/// than a base64 byte string. The Converse `ImageSource` union has an `s3Location` member with no
+/// IR counterpart field, so the Bedrock reader stashes it under this sentinel (mirroring the
+/// `image_url` sentinel for arbitrary URLs) and `bedrock_image_block` re-emits it on same-protocol
+/// egress instead of silently dropping the block. A real image media_type is always `image/<fmt>`,
+/// so a bare `image_s3` token can never collide with one.
+const IMAGE_S3_SENTINEL: &str = "image_s3";
+
 /// Build a native Bedrock Converse `image` block body (`{ "format", "source": { "bytes" } }`) from
 /// an IR `Image (media_type, data)` pair, or `None` when the image cannot be represented natively.
 ///
@@ -99,7 +108,47 @@ fn bedrock_stream_exception_for(err: &crate::proto::IrError) -> (&'static str, S
 /// of an arbitrary-URL image onto Converse, so we DROP the block (with a trace) rather than emit a
 /// corrupt one — mirroring how non-representable Thinking blocks are dropped. A genuine base64 image
 /// (any `media_type` other than the sentinel) is emitted natively as before.
+///
+/// The `IMAGE_S3_SENTINEL` media_type marks that `data` holds a JSON-serialized Converse
+/// `s3Location` source object captured by this reader (a native AWS client referenced an S3 image
+/// instead of inlining bytes). That source has no arbitrary-URL ambiguity — it is a real native
+/// Converse source shape — so we re-emit it as `source.s3Location`, preserving `uri`/`bucketOwner`
+/// for a faithful same-protocol round-trip. If the stashed payload fails to parse back into an
+/// object (it always should, since this reader serialized it), the block is dropped with a trace
+/// rather than emitting a corrupt source.
 fn bedrock_image_block(media_type: &str, data: &str) -> Option<serde_json::Value> {
+    if media_type == IMAGE_S3_SENTINEL {
+        match serde_json::from_str::<serde_json::Value>(data) {
+            Ok(s3_location) if s3_location.is_object() => {
+                // `format` is carried inside the serialized payload (the reader stored it there);
+                // re-emit the whole block shape it captured.
+                let format_str = s3_location
+                    .get("__format")
+                    .and_then(|f| f.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("png");
+                let mut source = serde_json::Map::new();
+                if let Some(obj) = s3_location.as_object() {
+                    for (k, v) in obj {
+                        if k != "__format" {
+                            source.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                return Some(serde_json::json!({
+                    "format": format_str,
+                    "source": { "s3Location": serde_json::Value::Object(source) }
+                }));
+            }
+            _ => {
+                tracing::warn!(
+                    "dropping S3-source image (media_type=\"image_s3\"): stashed s3Location \
+                     payload did not parse back into an object"
+                );
+                return None;
+            }
+        }
+    }
     if media_type == "image_url" {
         tracing::warn!(
             "dropping URL-source image (media_type=\"image_url\"): Bedrock Converse has no \
@@ -186,6 +235,56 @@ fn derive_sigv4_region(host: &str) -> Option<&str> {
             }
         }
     }
+    None
+}
+
+/// Read a native Bedrock Converse `image` content block into an `IrBlock::Image`, or `None` when
+/// the block carries no usable source.
+///
+/// The Converse `ImageSource` union has TWO members: `source.bytes` (base64) and
+/// `source.s3Location` (`{"uri":...,"bucketOwner":...}`). The old reader only decoded `bytes`, so an
+/// S3-referenced image read with `data = ""` — silently dropping the image, diverging from a direct
+/// AWS call and breaking a same-protocol passthrough. We now ALSO probe `source.s3Location` and,
+/// when present, stash the whole s3Location object (plus the captured `format`) as JSON under the
+/// `IMAGE_S3_SENTINEL` media_type so `bedrock_image_block` can re-emit `source.s3Location` on
+/// same-protocol egress (mirroring the `image_url` sentinel for arbitrary URLs). A block with
+/// neither source yields `None` so a content-less image is not injected as an empty-bytes block.
+fn read_bedrock_image_block(image: &serde_json::Value) -> Option<crate::ir::IrBlock> {
+    let format_str = image
+        .get("format")
+        .and_then(|f| f.as_str())
+        .unwrap_or("")
+        .to_string();
+    let source = image.get("source");
+
+    // Prefer inline base64 `bytes`.
+    if let Some(bytes) = source.and_then(|s| s.get("bytes")).and_then(|b| b.as_str()) {
+        return Some(crate::ir::IrBlock::Image {
+            media_type: format!("image/{}", format_str),
+            data: bytes.to_string(),
+        });
+    }
+
+    // Otherwise, an `s3Location` source. Stash the whole object (with the captured `format` under a
+    // private `__format` key) as JSON under the S3 sentinel media_type so the writer can re-emit a
+    // faithful `source.s3Location` block on same-protocol egress instead of dropping the image.
+    if let Some(s3_location) = source.and_then(|s| s.get("s3Location")) {
+        if let Some(obj) = s3_location.as_object() {
+            let mut stash = obj.clone();
+            stash.insert(
+                "__format".to_string(),
+                serde_json::Value::String(format_str),
+            );
+            // serde_json::to_string on a Map never fails; fall back defensively rather than panic.
+            let data = serde_json::to_string(&serde_json::Value::Object(stash))
+                .unwrap_or_else(|_| "{}".to_string());
+            return Some(crate::ir::IrBlock::Image {
+                media_type: IMAGE_S3_SENTINEL.to_string(),
+                data,
+            });
+        }
+    }
+
     None
 }
 
@@ -439,6 +538,21 @@ impl ProtocolReader for BedrockReader {
                                             cache_control: None,
                                             citations: Vec::new(),
                                         });
+                                    } else if let Some(image) = inner_val.get("image") {
+                                        // The Converse `ToolResultContentBlock` union also includes
+                                        // `image` (and `document`/`video`). Decode `image`
+                                        // symmetric with the WRITER, which emits an `image` inside a
+                                        // toolResult (see `write_request`) — the old reader skipped
+                                        // any non-text/json block, silently dropping image tool
+                                        // results and making read/write asymmetric. `document` and
+                                        // `video` have no IR block counterpart (the IR models only
+                                        // Text/Thinking/ToolUse/ToolResult/Image), so they remain
+                                        // unrepresentable and are left undecoded — a documented
+                                        // limitation, not a silent class-wide loss of all binary
+                                        // tool-result content.
+                                        if let Some(block) = read_bedrock_image_block(image) {
+                                            inner_content.push(block);
+                                        }
                                     }
                                 }
                             }
@@ -455,24 +569,14 @@ impl ProtocolReader for BedrockReader {
                                 is_error,
                             });
                         } else if let Some(image) = content_val.get("image") {
-                            let format_str = image
-                                .get("format")
-                                .and_then(|f| f.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let media_type = format!("image/{}", format_str);
-
-                            let data = if let Some(source) = image.get("source") {
-                                source
-                                    .get("bytes")
-                                    .and_then(|b| b.as_str())
-                                    .unwrap_or("")
-                                    .to_string()
-                            } else {
-                                String::new()
-                            };
-
-                            msg_content.push(crate::ir::IrBlock::Image { media_type, data });
+                            // Decode both `source.bytes` (base64) AND `source.s3Location` (an S3
+                            // URI) — the two members of the Converse `ImageSource` union. An
+                            // S3-referenced image is stashed under the `image_s3` sentinel so the
+                            // writer re-emits `source.s3Location` on same-protocol egress instead of
+                            // dropping it (the old reader only read `bytes`, silently losing it).
+                            if let Some(block) = read_bedrock_image_block(image) {
+                                msg_content.push(block);
+                            }
                         }
                     }
                 }
@@ -3877,5 +3981,233 @@ mod tests {
         });
         let ir = reader.read_request(&body).unwrap();
         assert_eq!(ir.max_tokens, None);
+    }
+
+    /// Regression (reader, S3 image source): a message-level `image` block whose source is
+    /// `s3Location` (not `bytes`) must be captured under the `image_s3` sentinel — not dropped with
+    /// `data = ""` — so a same-protocol passthrough re-emits `source.s3Location` faithfully.
+    #[test]
+    fn test_read_request_image_s3_location_captured() {
+        let reader = BedrockReader;
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "image": {
+                        "format": "jpeg",
+                        "source": {
+                            "s3Location": {
+                                "uri": "s3://my-bucket/img.jpg",
+                                "bucketOwner": "123456789012"
+                            }
+                        }
+                    }
+                }]
+            }]
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        let block = &ir.messages[0].content[0];
+        match block {
+            crate::ir::IrBlock::Image { media_type, data } => {
+                assert_eq!(
+                    media_type, IMAGE_S3_SENTINEL,
+                    "S3-source image must use the image_s3 sentinel, not be dropped; got {block:?}"
+                );
+                let stashed: serde_json::Value =
+                    serde_json::from_str(data).expect("stash must be valid JSON");
+                assert_eq!(
+                    stashed.pointer("/uri").and_then(|v| v.as_str()),
+                    Some("s3://my-bucket/img.jpg")
+                );
+                assert_eq!(
+                    stashed.pointer("/bucketOwner").and_then(|v| v.as_str()),
+                    Some("123456789012")
+                );
+                assert_eq!(
+                    stashed.pointer("/__format").and_then(|v| v.as_str()),
+                    Some("jpeg")
+                );
+            }
+            other => panic!("expected Image block, got {other:?}"),
+        }
+    }
+
+    /// Regression (round-trip, S3 image source): a Bedrock body carrying an S3-sourced image must
+    /// survive a reader→writer round-trip with its `source.s3Location` (uri + bucketOwner) and
+    /// `format` intact — the old reader dropped the source, so the writer emitted nothing.
+    #[test]
+    fn test_image_s3_location_round_trip() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "image": {
+                        "format": "png",
+                        "source": {
+                            "s3Location": {
+                                "uri": "s3://b/k.png",
+                                "bucketOwner": "999988887777"
+                            }
+                        }
+                    }
+                }]
+            }]
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        let out = writer.write_request(&ir);
+        let img = out
+            .pointer("/messages/0/content/0/image")
+            .expect("image block must be re-emitted, not dropped");
+        assert_eq!(
+            img.pointer("/format").and_then(|v| v.as_str()),
+            Some("png"),
+            "format must round-trip; got {img}"
+        );
+        assert_eq!(
+            img.pointer("/source/s3Location/uri")
+                .and_then(|v| v.as_str()),
+            Some("s3://b/k.png"),
+            "s3Location.uri must round-trip; got {img}"
+        );
+        assert_eq!(
+            img.pointer("/source/s3Location/bucketOwner")
+                .and_then(|v| v.as_str()),
+            Some("999988887777"),
+            "s3Location.bucketOwner must round-trip; got {img}"
+        );
+        // The sentinel media_type must never leak onto the wire.
+        let wire = serde_json::to_string(&out).unwrap();
+        assert!(
+            !wire.contains(IMAGE_S3_SENTINEL),
+            "the image_s3 sentinel must not appear on the wire; got {wire}"
+        );
+        // No empty/base64 `bytes` source for an S3 image.
+        assert!(
+            img.pointer("/source/bytes").is_none(),
+            "an S3 image must not be emitted with a bytes source; got {img}"
+        );
+    }
+
+    /// Regression (reader, toolResult image): an `image` block inside a `toolResult.content` array
+    /// must be decoded into an IR Image — symmetric with the writer's toolResult-image emission.
+    /// The old reader skipped any non-text/json inner block, silently dropping image tool results.
+    #[test]
+    fn test_read_request_tool_result_decodes_image() {
+        let reader = BedrockReader;
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "toolResult": {
+                        "toolUseId": "t1",
+                        "status": "success",
+                        "content": [
+                            {"text": "see image"},
+                            {"image": {"format": "png", "source": {"bytes": "QQ=="}}}
+                        ]
+                    }
+                }]
+            }]
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        match &ir.messages[0].content[0] {
+            crate::ir::IrBlock::ToolResult { content, .. } => {
+                assert_eq!(
+                    content.len(),
+                    2,
+                    "both inner blocks must decode; got {content:?}"
+                );
+                match &content[1] {
+                    crate::ir::IrBlock::Image { media_type, data } => {
+                        assert_eq!(media_type, "image/png");
+                        assert_eq!(data, "QQ==");
+                    }
+                    other => panic!("expected inner Image block, got {other:?}"),
+                }
+            }
+            other => panic!("expected ToolResult block, got {other:?}"),
+        }
+    }
+
+    /// Regression (round-trip, toolResult image): an S3-sourced image inside a toolResult survives
+    /// reader→writer with its `source.s3Location` intact (the writer already emits `image` inside a
+    /// toolResult; the reader must now decode it symmetrically).
+    #[test]
+    fn test_tool_result_image_s3_round_trip() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "toolResult": {
+                        "toolUseId": "t9",
+                        "status": "success",
+                        "content": [
+                            {"image": {"format": "gif", "source": {"s3Location": {"uri": "s3://x/y.gif"}}}}
+                        ]
+                    }
+                }]
+            }]
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        let out = writer.write_request(&ir);
+        let inner = out
+            .pointer("/messages/0/content/0/toolResult/content/0/image")
+            .expect("toolResult image must round-trip, not be dropped");
+        assert_eq!(
+            inner.pointer("/format").and_then(|v| v.as_str()),
+            Some("gif")
+        );
+        assert_eq!(
+            inner
+                .pointer("/source/s3Location/uri")
+                .and_then(|v| v.as_str()),
+            Some("s3://x/y.gif"),
+            "toolResult s3Location.uri must round-trip; got {inner}"
+        );
+    }
+
+    /// Regression (writer): the `bedrock_image_block` helper re-emits `source.s3Location` for the
+    /// `image_s3` sentinel and drops a sentinel whose stashed payload is not a JSON object (rather
+    /// than panicking or emitting a corrupt source).
+    #[test]
+    fn test_bedrock_image_block_s3_sentinel() {
+        let stash = r#"{"uri":"s3://bk/i.png","bucketOwner":"111122223333","__format":"png"}"#;
+        let block =
+            bedrock_image_block(IMAGE_S3_SENTINEL, stash).expect("s3 sentinel must emit a block");
+        assert_eq!(
+            block.pointer("/format").and_then(|f| f.as_str()),
+            Some("png")
+        );
+        assert_eq!(
+            block
+                .pointer("/source/s3Location/uri")
+                .and_then(|v| v.as_str()),
+            Some("s3://bk/i.png")
+        );
+        assert_eq!(
+            block
+                .pointer("/source/s3Location/bucketOwner")
+                .and_then(|v| v.as_str()),
+            Some("111122223333")
+        );
+        // The private `__format` key must not leak into the emitted s3Location source.
+        assert!(
+            block.pointer("/source/s3Location/__format").is_none(),
+            "the private __format key must be stripped from s3Location; got {block}"
+        );
+
+        // A malformed (non-object) stash is dropped, not panicked on.
+        assert!(
+            bedrock_image_block(IMAGE_S3_SENTINEL, "not json").is_none(),
+            "a non-JSON s3 stash must be dropped"
+        );
+        assert!(
+            bedrock_image_block(IMAGE_S3_SENTINEL, "[1,2,3]").is_none(),
+            "a non-object s3 stash must be dropped"
+        );
     }
 }

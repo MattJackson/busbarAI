@@ -782,31 +782,63 @@ impl ProtocolReader for GeminiReader {
     }
 }
 
-/// Process-global counter feeding synthesized `responseId`s, mirroring the Anthropic writer's
-/// `SYNTH_ID_COUNTER`. Combined with the unix second it makes two synthesized ids astronomically
-/// unlikely to collide without pulling in a uuid/rand crate.
+/// Process-global counter folded into every synthesized `responseId`, mirroring the Responses
+/// writer's `SYNTH_COUNTER`. It is overlaid onto the leading characters of the CSPRNG token so two
+/// synthesized ids are guaranteed distinct WITHIN a process even if the OS RNG returns identical
+/// bytes — without an embedded clock or a uuid/rand crate.
 static SYNTH_RESPONSE_ID_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Current unix time in whole seconds, or 0 if the system clock predates the epoch. Never panics.
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+/// Lowercase+uppercase+digit base62 alphabet — the mixed-case alphanumeric character class a native
+/// Gemini `responseId` draws from (e.g. `PXmFaPzVMI…`). Carries no `-`/`_`, so no separator or
+/// hyphen leaks the synthetic boundary the old `{:x}-{:x}` form exposed.
+const RESPONSE_ID_ALPHABET: &[u8; 62] =
+    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// Width of a synthesized Gemini `responseId`. Native Gemini bodies/streams carry a short opaque
+/// base64url-style token (~11–16 chars) with NO positional structure; 16 base62 chars stays in that
+/// length/entropy profile so a client that length-checks or regex-validates `responseId` cannot
+/// fingerprint it as non-native.
+const RESPONSE_ID_TOKEN_LEN: usize = 16;
 
 /// Mint a Gemini-shaped `responseId` for the cross-protocol path where the backend supplied none.
-/// Real `responseId`s are opaque strings with no documented prefix a native SDK could reject, so a
-/// timestamp+counter suffix is indistinguishable in shape. No new dependency.
 ///
-/// The two components are joined by a `-` separator (NOT a bare hex concat). A bare `{:x}{:x}` of
-/// `(secs, seq)` is NOT collision-free: e.g. `(0x1ab, 0xc)` and `(0x1a, 0xbc)` both render as
-/// `"1abc"`, so two distinct (time, counter) pairs could mint the SAME id within a process. The
-/// separator makes the boundary unambiguous so every distinct pair yields a distinct id.
+/// A native Gemini `responseId` is an opaque, mixed-case alphanumeric base64url-style token with NO
+/// embedded structure (no hyphen, no lowercase-hex-only restriction, no embedded timestamp). The
+/// previous `format!("{:x}-{:x}", unix_now_secs(), seq)` form was structurally distinguishable on two
+/// counts: (a) the `-` separator plus `[0-9a-f]`-only character class is a shape no native id has,
+/// and (b) the leading hex segment leaked the proxy host's wall-clock second to anyone holding a
+/// response id. This mints an opaque CSPRNG-backed base62 token of native length instead, mirroring
+/// the Responses writer's `synth_token`: fill from `getrandom`, then overlay the monotonic process
+/// counter MSB-first across the leading characters so the per-process uniqueness guarantee holds
+/// regardless of the RNG. No embedded clock, no separator, no new dependency. Never panics on the
+/// request path: on entropy failure the buffer stays the base62 zero char and the counter overlay
+/// still makes the token unique. 62^11 > u64::MAX, so 11 leading chars fully encode the counter.
 fn synth_response_id() -> String {
+    const _: () = assert!(
+        RESPONSE_ID_TOKEN_LEN >= 11,
+        "token must be wide enough to encode a u64 counter MSB-first"
+    );
     let seq = SYNTH_RESPONSE_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{:x}-{:x}", unix_now_secs(), seq)
+
+    let mut rand_bytes = [0u8; RESPONSE_ID_TOKEN_LEN];
+    let _ = getrandom::getrandom(&mut rand_bytes);
+    let mut token = [b'0'; RESPONSE_ID_TOKEN_LEN];
+    for (slot, &byte) in token.iter_mut().zip(rand_bytes.iter()) {
+        *slot = RESPONSE_ID_ALPHABET[(byte % 62) as usize];
+    }
+
+    // Overlay the monotonic counter MSB-first across the leading characters so adjacent ids differ
+    // in those positions even when the CSPRNG returns identical bytes.
+    let mut counter = seq;
+    for slot in token.iter_mut().take(11).rev() {
+        *slot = RESPONSE_ID_ALPHABET[(counter % 62) as usize];
+        counter /= 62;
+    }
+
+    // `token` is ASCII base62 by construction, hence always valid UTF-8; the fallback only guards an
+    // impossible non-ASCII byte and keeps the path panic-free (no unwrap/expect on the request path).
+    String::from_utf8(token.to_vec()).unwrap_or_else(|_| "0".repeat(RESPONSE_ID_TOKEN_LEN))
 }
 
 /// Synthesize a stable, non-empty tool-call id for a Gemini `functionCall`.
@@ -3519,24 +3551,72 @@ mod tests {
         );
     }
 
-    // --- Round 5 fix: synth_response_id is collision-free (separator, not bare hex concat) ---
+    // --- Round 14 fix: synth_response_id is an opaque CSPRNG token of native Gemini shape ---
 
-    /// Regression: `synth_response_id` joins its (unix_secs, counter) components with a `-`
-    /// separator so distinct pairs cannot alias to the same string (a bare `{:x}{:x}` concat could:
-    /// e.g. (0x1ab, 0xc) and (0x1a, 0xbc) both render "1abc"). The id must contain a separator.
+    /// Regression (HIGH/conformance): a synthesized `responseId` must be a native-shaped opaque
+    /// token — mixed-case alphanumeric base62 of native length, with NO hyphen separator and NO
+    /// lowercase-hex-only restriction. The old `format!("{:x}-{:x}", unix_now_secs(), seq)` form was
+    /// structurally distinguishable (the `-` plus `[0-9a-f]`-only class is a shape no native id has)
+    /// AND leaked the proxy host clock in its leading hex segment. Assert the shape never regresses.
     #[test]
-    fn test_synth_response_id_has_separator() {
+    fn test_synth_response_id_is_opaque_native_shape() {
         let id = synth_response_id();
+        assert_eq!(
+            id.len(),
+            RESPONSE_ID_TOKEN_LEN,
+            "synthesized responseId must be exactly the native token length: {id}"
+        );
         assert!(
-            id.contains('-'),
-            "synthesized responseId must carry a separator between time and counter: {id}"
+            !id.contains('-'),
+            "synthesized responseId must carry NO hyphen separator (a non-native tell): {id}"
+        );
+        assert!(
+            id.chars().all(|c| c.is_ascii_alphanumeric()),
+            "synthesized responseId must be mixed-case alphanumeric (no `-`/`_`): {id}"
+        );
+        // A lowercase-hex-only token (`[0-9a-f]*`) is the old timestamp-hex tell. Across a batch the
+        // synthesized ids must NOT be confinable to that class — at least one carries an uppercase
+        // letter or a digit/letter outside `[0-9a-f]`, proving the wider base62 character class.
+        let saw_non_hex = (0..64).map(|_| synth_response_id()).any(|s| {
+            s.chars()
+                .any(|c| !c.is_ascii_hexdigit() || c.is_ascii_uppercase())
+        });
+        assert!(
+            saw_non_hex,
+            "synthesized responseIds must draw from mixed-case base62, not lowercase-hex only"
         );
     }
 
-    /// Two consecutive synthesized ids (same process second) differ because the counter advances —
-    /// guards the collision-free property within a single unix second.
+    /// The synthesized id must embed NO unix-second prefix: the old form's leading segment WAS the
+    /// server clock. Mint two ids and assert neither equals the hex of the current unix second (the
+    /// old leading segment), and that they are not hyphen-delimited time+counter pairs.
     #[test]
-    fn test_synth_response_id_distinct_within_same_second() {
+    fn test_synth_response_id_leaks_no_timestamp() {
+        let now_hex = format!(
+            "{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        );
+        for _ in 0..16 {
+            let id = synth_response_id();
+            assert!(
+                !id.starts_with(&now_hex),
+                "synthesized responseId must not lead with the unix-second hex (clock leak): {id}"
+            );
+            assert!(
+                !id.contains('-'),
+                "synthesized responseId must not be a hyphenated time-counter pair: {id}"
+            );
+        }
+    }
+
+    /// Two consecutive synthesized ids differ because the monotonic counter is overlaid onto the
+    /// token's leading characters — guards the collision-free per-process uniqueness property
+    /// regardless of the RNG.
+    #[test]
+    fn test_synth_response_id_distinct_consecutive() {
         let a = synth_response_id();
         let b = synth_response_id();
         assert_ne!(a, b, "consecutive synthesized ids must differ: {a} vs {b}");

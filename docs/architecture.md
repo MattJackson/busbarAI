@@ -18,6 +18,7 @@ pipeline**.
         │   /v1/chat/completions        → openai           │
         │   /v1/responses               → responses        │
         │   /v2/chat                    → cohere           │
+        │   /v1/models/{model}:...      → gemini           │
         │   /v1beta/models/{model}:...  → gemini           │
         │   /model/{id}/converse[-stream] → bedrock        │
         └───────────────┬──────────────────────────────────┘

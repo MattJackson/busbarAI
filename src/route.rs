@@ -560,39 +560,81 @@ pub(crate) async fn gemini_ingress(
     let api_version = gemini_api_version(uri.path());
 
     // `rest` is everything after `/{version}/models/`, e.g. `foo:generateContent`. Split on the LAST
-    // colon into (model, action). A missing colon means the client sent a malformed Gemini path.
+    // colon into (model, action). A missing colon (or an empty model/action) is NOT necessarily a
+    // malformed Gemini path: the stable `/v1/models/{id}` prefix is SHARED with the OpenAI SDK's
+    // `model.retrieve` (`GET`/`POST /v1/models/{id}`), which carries no `:<action>`. Hardcoding a
+    // Gemini-shaped NOT_FOUND for every colon-less `/v1/models/...` request would hand an OpenAI
+    // client an undecodable Gemini envelope on this ambiguous prefix — and would diverge from the
+    // `proto_for_path` classifier the fallback/405 handlers use (which maps a colon-less
+    // `/v1/models/{id}` to "openai", `/v1beta/models/...` to "gemini"). Resolve the error
+    // ENVELOPE protocol from that same canonical classifier so a colon-less hit gets the shape its
+    // most-likely client expects: `/v1beta/...` (Gemini-only surface) stays Gemini; a colon-less
+    // `/v1/models/...` (or a `/v1/models/{ft:..:..}` whose colons are NOT a Gemini action suffix)
+    // gets the canonical `not_found_error` OpenAI envelope. There is no `_ =>` catch-all on the
+    // resulting protocol: the classifier returns a registered literal and only "gemini" keeps the
+    // native Gemini NOT_FOUND envelope; every other literal shares the canonical not-found shape.
     let (model, action) = match rest.rsplit_once(':') {
         Some((m, a)) if !m.is_empty() && !a.is_empty() => (m, a),
         _ => {
-            return ingress_error(
-                "gemini",
-                StatusCode::NOT_FOUND,
-                "NOT_FOUND",
-                &format!(
+            if crate::proto::proto_for_path(uri.path()) == "gemini" {
+                return ingress_error(
+                    "gemini",
+                    StatusCode::NOT_FOUND,
+                    "NOT_FOUND",
+                    &format!(
                 "Invalid resource path: models/{rest} is not found for API version {api_version}."
             ),
-            )
+                );
+            }
+            // Non-Gemini (ambiguous `/v1/models/...` without a Gemini action suffix): emit the
+            // canonical OpenAI-shaped 404 the fallback handler uses for this path, so a GET/POST on
+            // `/v1/models/{id}` produces the SAME envelope shape whether it hits this route or the
+            // method fallback — no GET-vs-POST error-shape divergence a client could probe.
+            return ingress_error(
+                crate::proto::proto_for_path(uri.path()),
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+                "the requested resource was not found",
+            );
         }
     };
 
-    // Only the two generate actions are proxied (see the route doc above). Any other action —
-    // including valid-but-unproxied Gemini methods such as `countTokens`/`embedContent` — is an
-    // intentional limitation and returns the native NOT_FOUND envelope. No `_ =>` catch-all: the
-    // two supported actions are listed explicitly, with the unsupported-action fallback handled
+    // Only the two generate actions are proxied (see the route doc above). Any other action is an
+    // intentional limitation and returns a NOT_FOUND envelope. No `_ =>` catch-all: the two
+    // supported actions are listed explicitly, with the unsupported-action fallback handled
     // afterwards.
+    //
+    // The unsupported-action envelope SHAPE must match the same `proto::proto_for_path` classifier
+    // the no-colon branch (and the fallback/405 handlers) use, for the same reason: the stable
+    // `/v1/models/...` prefix is SHARED with the OpenAI surface. `rsplit_once(':')` on an OpenAI
+    // fine-tune id like `ft:gpt-3.5-turbo:my-org::abc` splits a NON-empty `action` (`abc`) that is
+    // NOT a Gemini method — so this branch fires for a request a real OpenAI client made. Classify
+    // by KNOWN Gemini action suffix (what `proto_for_path` does): a genuine Gemini method such as
+    // `:countTokens`/`:embedContent` stays Gemini-shaped (a real Gemini NOT_FOUND naming the
+    // unsupported method); a colon-bearing OpenAI id whose tail is not a Gemini action gets the
+    // canonical OpenAI `not_found_error` envelope, so the same path never yields two different error
+    // shapes depending on how the client (Gemini SDK vs OpenAI SDK) reached it.
     let stream = match action {
         "streamGenerateContent" => true,
         "generateContent" => false,
         other => {
+            if crate::proto::proto_for_path(uri.path()) == "gemini" {
+                return ingress_error(
+                    "gemini",
+                    StatusCode::NOT_FOUND,
+                    "NOT_FOUND",
+                    &format!(
+                        "models/{model} is not found for API version {api_version}, \
+                         or is not supported for {other}."
+                    ),
+                );
+            }
             return ingress_error(
-                "gemini",
+                crate::proto::proto_for_path(uri.path()),
                 StatusCode::NOT_FOUND,
-                "NOT_FOUND",
-                &format!(
-                    "models/{model} is not found for API version {api_version}, \
-                     or is not supported for {other}."
-                ),
-            )
+                "not_found_error",
+                "the requested resource was not found",
+            );
         }
     };
 
@@ -1732,6 +1774,130 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// HIGH/test-coverage: SAME-PROTOCOL bedrock NON-STREAM passthrough (native AWS SDK speaking
+    /// `Converse` → a Bedrock backend). This is the most common Bedrock call pattern, and it takes a
+    /// COMPLETELY DIFFERENT code branch from the streaming case asserted by
+    /// `test_bedrock_same_protocol_stream_passthrough_forwards_upstream_request_id`: a non-stream
+    /// `/converse` flows through the buffered/verbatim same-protocol relay (`is_sse == false`,
+    /// `cross_protocol == false`) where forward.rs forwards the upstream `x-amzn-RequestId` verbatim
+    /// (`upstream_amzn_id.or_else(synth)`). A real `Converse` body carries NO body-level identity
+    /// (`id`/`created`/`model` are all absent — only `output`/`stopReason`/`usage`), so the ONLY
+    /// request-id surface the AWS SDK exposes (`*Output::request_id()`) is the `x-amzn-RequestId`
+    /// response header. If that header is dropped on this path, every non-stream Bedrock call's
+    /// `request_id()` returns None — an impossibility against the real API and a deterministic proxy
+    /// tell that would stay invisible until an SDK user noticed.
+    ///
+    /// A `MockResponse::Ok` cannot set a custom response header (and a synthesized fallback id would
+    /// not prove VERBATIM passthrough), so this test stands up a tiny ad-hoc upstream that returns a
+    /// native Converse JSON body with a FIXED, NON-UUID `x-amzn-RequestId` — the only way the
+    /// verbatim assertion can pass is true passthrough, never a freshly-minted UUID. Asserts: (a)
+    /// status 200, (b) the response `x-amzn-RequestId` EQUALS the upstream's fixed value verbatim,
+    /// (c) Content-Type is `application/json` (no SSE/eventstream reframe on a non-stream relay), (d)
+    /// the body carries the native Converse shape (`output`/`usage`).
+    #[tokio::test]
+    async fn test_bedrock_same_protocol_converse_non_stream_forwards_upstream_request_id() {
+        crate::metrics::init();
+        // Fixed upstream request id: NOT UUID-shaped, so a synthesized id can never accidentally
+        // match — the assertion passes ONLY on verbatim passthrough.
+        const UPSTREAM_REQ_ID: &str = "fixed-upstream-amzn-req-id-nonstream-0001";
+
+        // Ad-hoc Bedrock-shaped upstream: a native Converse JSON body + a fixed `x-amzn-RequestId`
+        // header on a 200. Served on every path so the bedrock egress writer's model-scoped path
+        // reaches it (the same-protocol relay keys off the upstream Content-Type, not the URL).
+        let upstream = axum::Router::new().fallback(axum::routing::any(|| async {
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("x-amzn-requestid", UPSTREAM_REQ_ID)
+                .body(axum::body::Body::from(
+                    json!({
+                        "output": {
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"text": "hi there"}]
+                            }
+                        },
+                        "stopReason": "end_turn",
+                        "usage": {"inputTokens": 5, "outputTokens": 3, "totalTokens": 8}
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }));
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_handle =
+            tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
+        let upstream_base = format!("http://{upstream_addr}");
+
+        // Bedrock ingress → BEDROCK backend (same-protocol). Point the lane at a served path; the
+        // relay under test is path-independent (it keys off the upstream Content-Type).
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("foo", crate::proto::Protocol::bedrock(), &upstream_base)
+                    .provider("aws")
+                    .path("/v1/messages"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/model/foo/converse"))
+            .bearer_auth("t")
+            .body(
+                json!({
+                    "messages": [{"role": "user", "content": [{"text": "hello"}]}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        // (a) 2xx round-trip.
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "bedrock→bedrock /converse (non-stream) 2xx round-trip"
+        );
+
+        // (c) the non-stream relay preserves the upstream JSON Content-Type (no eventstream reframe).
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "same-protocol non-stream bedrock preserves the upstream JSON CT; got {ct}"
+        );
+
+        // (b) the upstream's REAL x-amzn-RequestId is forwarded VERBATIM (not a synthesized UUID).
+        let req_id = resp
+            .headers()
+            .get("x-amzn-requestid")
+            .and_then(|h| h.to_str().ok())
+            .expect("bedrock /converse (non-stream) success carries x-amzn-RequestId")
+            .to_string();
+        assert_eq!(
+            req_id, UPSTREAM_REQ_ID,
+            "same-protocol non-stream passthrough must forward the upstream x-amzn-RequestId \
+             verbatim, not synthesize a fresh UUID; got {req_id}"
+        );
+
+        // (d) the body is the native Converse shape, relayed verbatim.
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body.get("output").is_some() || body.get("usage").is_some(),
+            "native Converse JSON shape (output/usage) is relayed; got {body}"
+        );
+
+        handle.abort();
+        upstream_handle.abort();
+    }
+
     /// CORE-deferred cross-file test: a TRUE mid-stream TRANSPORT failure on a SAME-PROTOCOL
     /// bedrock→bedrock streaming passthrough. The companion
     /// `test_bedrock_ingress_mid_stream_transport_error_appends_binary_exception` drives the
@@ -2755,7 +2921,13 @@ mod tests {
             "v1-surface error must NOT leak 'v1beta'; got message: {msg}"
         );
 
-        // Malformed-path branch (no colon) on the v1 surface echoes "v1" too.
+        // No-colon branch on the v1 surface: a colon-less `/v1/models/{id}` is the OpenAI
+        // `model.retrieve` shape on this AMBIGUOUS stable prefix, so the MEDIUM/conformance fix
+        // returns the canonical OpenAI `not_found_error` envelope here (matching `proto_for_path`
+        // and the method fallback), NOT a Gemini-shaped NOT_FOUND. (The Gemini-shaped no-colon 404
+        // is reserved for the unambiguous `/v1beta/...` surface — see
+        // `test_gemini_v1beta_surface_error_still_echoes_v1beta`.) The v1-version-echo coverage is
+        // carried by the unsupported-ACTION (`countTokens`) case above, which stays Gemini-shaped.
         let resp2 = reqwest::Client::new()
             .post(format!("http://{addr}/v1/models/gemini-flash"))
             .bearer_auth("t")
@@ -2763,16 +2935,16 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp2.status().as_u16(), 404, "malformed path ⇒ 404");
+        assert_eq!(resp2.status().as_u16(), 404, "no-colon v1 path ⇒ 404");
         let body2: serde_json::Value = resp2.json().await.unwrap();
-        let msg2 = body2
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("");
-        assert!(
-            msg2.contains("API version v1.") && !msg2.contains("v1beta"),
-            "v1-surface malformed-path error must echo 'v1', not 'v1beta'; got: {msg2}"
+        assert_eq!(
+            body2
+                .get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("not_found_error"),
+            "colon-less /v1/models/{{id}} returns the canonical OpenAI not_found_error envelope, \
+             not a Gemini NOT_FOUND; got {body2}"
         );
 
         handle.abort();
@@ -2803,6 +2975,108 @@ mod tests {
             msg.contains("v1beta"),
             "v1beta-surface error must still echo 'v1beta'; got: {msg}"
         );
+        handle.abort();
+    }
+
+    /// MEDIUM/conformance regression: the AMBIGUOUS stable `/v1/models/{id}` prefix is SHARED between
+    /// the Gemini `:<action>` surface and the OpenAI `model.retrieve` (`/v1/models/{id}`) surface.
+    /// A colon-less `/v1/models/{id}` (or a `/v1/models/{id}` whose colons are NOT a Gemini action
+    /// suffix, e.g. an OpenAI fine-tune id `ft:gpt:org::abc`) must therefore return the canonical
+    /// OpenAI `not_found_error` envelope — the SAME shape the method/fallback handler emits for the
+    /// path — rather than a Gemini-shaped NOT_FOUND, so a client probing GET vs POST on
+    /// `/v1/models/{id}` cannot distinguish busbar by a divergent error shape. The unambiguous
+    /// `/v1beta/...` surface (Gemini-only; OpenAI has no v1beta) stays Gemini-shaped. This locks the
+    /// `gemini_ingress` no-colon branch's delegation to `proto::proto_for_path`.
+    #[tokio::test]
+    async fn test_gemini_v1_no_action_returns_openai_shaped_404() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+
+        // (a) Colon-less stable `/v1/models/{id}` ⇒ OpenAI `not_found_error` (the model.retrieve
+        // surface), NOT a Gemini NOT_FOUND.
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/models/gpt-4o"))
+            .bearer_auth("t")
+            .body(json!({"contents": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "no-action /v1/models/{{id}} ⇒ 404"
+        );
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "OpenAI not-found envelope is JSON; got {ct}"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("not_found_error"),
+            "colon-less /v1/models/{{id}} returns the OpenAI not_found_error envelope; got {body}"
+        );
+        // A Gemini NOT_FOUND would carry a `status: NOT_FOUND` field; the OpenAI envelope does not.
+        assert!(
+            body.get("error").and_then(|e| e.get("status")).is_none(),
+            "OpenAI not-found envelope has no Gemini-style `status`; got {body}"
+        );
+
+        // (b) An OpenAI fine-tune id whose segment CONTAINS colons but NO Gemini action suffix is
+        // still the OpenAI surface (the action split would otherwise mis-read `:abc` as the action).
+        let resp_ft = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/v1/models/ft:gpt-3.5-turbo:my-org::abc"
+            ))
+            .bearer_auth("t")
+            .body(json!({"contents": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_ft.status().as_u16(),
+            404,
+            "fine-tune id (no action) ⇒ 404"
+        );
+        let body_ft: serde_json::Value = resp_ft.json().await.unwrap();
+        assert_eq!(
+            body_ft
+                .get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("not_found_error"),
+            "colon-bearing OpenAI fine-tune id (no Gemini action) ⇒ OpenAI not_found_error; got {body_ft}"
+        );
+
+        // (c) The unambiguous `/v1beta/...` surface (Gemini-only) keeps the Gemini NOT_FOUND shape
+        // for a colon-less path: its envelope carries the Gemini `status: NOT_FOUND`.
+        let resp_beta = reqwest::Client::new()
+            .post(format!("http://{addr}/v1beta/models/gemini-flash"))
+            .bearer_auth("t")
+            .body(json!({"contents": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp_beta.status().as_u16(), 404, "v1beta no-colon ⇒ 404");
+        let body_beta: serde_json::Value = resp_beta.json().await.unwrap();
+        assert_eq!(
+            body_beta
+                .get("error")
+                .and_then(|e| e.get("status"))
+                .and_then(|s| s.as_str()),
+            Some("NOT_FOUND"),
+            "v1beta no-colon path stays Gemini-shaped (status: NOT_FOUND); got {body_beta}"
+        );
+
         handle.abort();
     }
 
@@ -3435,6 +3709,107 @@ mod tests {
                 .and_then(|t| t.as_str()),
             Some("invalid_request_error"),
             "responses empty-model 400 carries invalid_request_error; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// MEDIUM/test-coverage: a syntactically valid JSON body whose `"model"` is NOT a string (a
+    /// number / bool / null) is a distinct branch from MISSING and EMPTY in `ingress_body_model`'s
+    /// guard. `v.get("model").and_then(|m| m.as_str())` returns `None` for any non-string value, so
+    /// it MUST fall into the same native 400 `invalid_request_error` branch — never be coerced
+    /// (e.g. `as_str().unwrap_or("")` or a `to_string()` of the number) and passed to
+    /// `forward_resolved`, where a numeric "model" would 404 (model-not-found) instead of 400. A
+    /// native vendor API rejects a non-string `model` with a 400, so a 404 here is a status-code
+    /// distinguishability tell for SDK-generated requests. These three tests (openai/cohere/
+    /// responses) lock the 400 for the body-model protocols; each asserts the protocol's native
+    /// 400 envelope shape so the guard cannot be weakened to coerce a numeric model.
+    #[tokio::test]
+    async fn test_openai_numeric_model_is_400_native_envelope() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("t")
+            .body(json!({"model": 42, "messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "numeric model ⇒ 400 (not 404 from resolution)"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("invalid_request_error"),
+            "openai numeric-model 400 carries invalid_request_error; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// MEDIUM/test-coverage twin: Cohere `/v2/chat` with a non-string `"model"` (here `null`) ⇒
+    /// native Cohere 400 envelope (a BARE top-level `message`, NO `error`/`type` wrapper). A `null`
+    /// model is the exact case a guard weakened to `.is_some()` would mishandle (it IS present but
+    /// not a string), so it must still 400 rather than fall through to a 404.
+    #[tokio::test]
+    async fn test_cohere_numeric_model_is_400_native_envelope() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v2/chat"))
+            .bearer_auth("t")
+            .body(json!({"model": null, "messages": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "non-string model ⇒ 400 (not 404)"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body.get("message").and_then(|m| m.as_str()).is_some(),
+            "cohere non-string-model 400 envelope carries a bare top-level message; got {body}"
+        );
+        assert!(
+            body.get("error").is_none() && body.get("type").is_none(),
+            "cohere non-string-model 400 envelope has NO error/type wrapper; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// MEDIUM/test-coverage twin: Responses `/v1/responses` with a non-string `"model"` (here a
+    /// bool) ⇒ native Responses 400 envelope (`{"error":{"type":"invalid_request_error"}}`).
+    #[tokio::test]
+    async fn test_responses_numeric_model_is_400_native_envelope() {
+        crate::metrics::init();
+        let app = TestApp::new().build();
+        let (addr, handle) = serve(app).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/responses"))
+            .bearer_auth("t")
+            .body(json!({"model": true, "input": "hi"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "non-string model ⇒ 400 (not 404)"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("invalid_request_error"),
+            "responses non-string-model 400 carries invalid_request_error; got {body}"
         );
         handle.abort();
     }

@@ -698,4 +698,67 @@ mod tests {
         assert!(hs.contains(":message-type"));
         assert!(hs.contains("event"));
     }
+
+    /// REGRESSION (MEDIUM/test-coverage, eventstream.rs:48,61): the SMALLEST valid frame —
+    /// `total_len == 16` (12-byte prelude + 0-byte headers + 0-byte payload + 4-byte message CRC) —
+    /// must decode cleanly. This is the lower boundary of the `(16..=MAX_FRAME_BYTES)` guard at line
+    /// 61: a frame this small carries an empty header block and an empty payload (e.g. a
+    /// `contentBlockStop` with no body). It is hand-crafted here (the production `encode_frame`
+    /// always writes three headers, so it can never emit a 16-byte frame) so that tightening the
+    /// guard from `16..=` to `17..=` — which would wrongly abandon a valid minimum frame — is caught.
+    #[test]
+    fn test_drain_frames_minimum_valid_frame() {
+        // 16-byte frame: prelude(12) + headers(0) + payload(0) + message_crc(4).
+        let mut frame = Vec::with_capacity(16);
+        frame.extend_from_slice(&16u32.to_be_bytes()); // total_len = 16 (the minimum valid value)
+        frame.extend_from_slice(&0u32.to_be_bytes()); // headers_len = 0
+        let prelude_crc = crc32fast::hash(&frame[..8]);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes()); // prelude CRC over [0..8]
+                                                             // No headers, no payload. message_crc over everything written so far ([0..12]).
+        let message_crc = crc32fast::hash(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        assert_eq!(
+            frame.len(),
+            16,
+            "hand-crafted frame is exactly the minimum size"
+        );
+
+        let mut buf = frame;
+        let frames = drain_frames(&mut buf);
+        assert_eq!(
+            frames.len(),
+            1,
+            "the minimum 16-byte frame decodes to one frame"
+        );
+        assert_eq!(frames[0].0, "", "no :event-type header → empty event type");
+        assert!(frames[0].1.is_empty(), "empty payload round-trips");
+        assert!(buf.is_empty(), "minimum frame is fully consumed");
+    }
+
+    /// REGRESSION (MEDIUM/test-coverage, eventstream.rs:48): the smallest frame with a NON-empty
+    /// payload that carries no headers — `total_len == 18` (12 prelude + 0 headers + 2 payload + 4
+    /// CRC). Sits one above the empty-payload minimum and guards the `12 + headers_len .. total_len
+    /// - 4` payload slice arithmetic at its lower edge.
+    #[test]
+    fn test_drain_frames_two_byte_payload_no_headers() {
+        let payload = b"hi";
+        // total_len = prelude(12) + headers(0) + payload + message_crc(4) = 18.
+        let total_len = 12u32 + payload.len() as u32 + 4;
+        let mut frame = Vec::with_capacity(total_len as usize);
+        frame.extend_from_slice(&total_len.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes()); // headers_len = 0
+        let prelude_crc = crc32fast::hash(&frame[..8]);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(payload);
+        let message_crc = crc32fast::hash(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        assert_eq!(frame.len(), 18);
+
+        let mut buf = frame;
+        let frames = drain_frames(&mut buf);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, "", "no :event-type header → empty event type");
+        assert_eq!(frames[0].1, payload, "two-byte payload round-trips");
+        assert!(buf.is_empty());
+    }
 }

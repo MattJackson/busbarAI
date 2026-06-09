@@ -6,12 +6,11 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Monotonic per-process counter mixed into a synthesized response id so two responses minted
-/// within the same wall-clock second still get distinct ids. Combined with the unix-second prefix
-/// this gives a collision-resistant id without pulling in a uuid/rand crate (a new dependency is
-/// out of scope for this wave).
+/// Monotonic per-process counter folded into a synthesized response id so two responses minted in
+/// quick succession (even if the OS CSPRNG were to return identical bytes) still get distinct ids.
+/// This is a uniqueness backstop ONLY — the id's entropy comes from `getrandom`, NOT from this
+/// counter or any clock, so the value carries no observable timestamp (see `synthesize_cohere_id`).
 static COHERE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Hard cap on the number of distinct tool-call frame indices recorded in `state.open_tools` for a
@@ -59,43 +58,59 @@ fn cohere_modeled_keys() -> &'static std::collections::HashSet<&'static str> {
     })
 }
 
-/// Format 128 bits as a UUID-shaped (8-4-4-4-12 lowercase hex) token. Real Cohere v2 chat response
-/// ids are bare UUIDs (e.g. `c14c80c3-18eb-4519-9460-6c92edd8cfb4`) with NO literal prefix, so a
-/// synthesized id must match that hex layout to stay shape-indistinguishable from a native one.
-fn format_uuid_layout(hi: u64, lo: u64) -> String {
+/// Format 16 bytes as a UUID-shaped (8-4-4-4-12 lowercase hex) token. Real Cohere v2 chat response
+/// ids are bare RFC-4122 UUIDv4s (e.g. `c14c80c3-18eb-4519-9460-6c92edd8cfb4` — note the version
+/// nibble `4` opening the 3rd group and the variant nibble `9` (`10xx`) opening the 4th), with NO
+/// literal prefix, so a synthesized id must match that layout to stay shape-indistinguishable from
+/// a native one. The caller is responsible for having already stamped the version/variant bits.
+fn format_uuid_layout(bytes: &[u8; 16]) -> String {
+    // One allocation for the 32-char lowercase hex string (no per-byte `format!`).
+    let s = hex::encode(bytes);
     format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (hi >> 32) as u32,
-        ((hi >> 16) & 0xffff) as u16,
-        (hi & 0xffff) as u16,
-        ((lo >> 48) & 0xffff) as u16,
-        lo & 0x0000_ffff_ffff_ffff,
+        "{}-{}-{}-{}-{}",
+        &s[0..8],
+        &s[8..12],
+        &s[12..16],
+        &s[16..20],
+        &s[20..32]
     )
 }
 
-/// Current unix epoch seconds, saturating to 0 if the clock is somehow before the epoch (never
-/// panics on the request path).
-fn unix_now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Synthesize a Cohere-shaped response id for the cross-protocol case where the backend supplied
-/// none. Native Cohere v2 ids are bare UUIDs (8-4-4-4-12 hex, no prefix), so we emit that exact
-/// shape — seeded from the unix-second and the atomic counter — rather than a `cohere-<…>` token
-/// that a client comparing against the documented UUID shape could use as a proxy tell. The
-/// unix-second seeds the high bits and the monotonic counter the low bits, so two ids minted in the
-/// same second remain distinct without pulling in a uuid/rand crate.
+/// none. Native Cohere v2 ids are bare RFC-4122 UUIDv4s (8-4-4-4-12 hex, no prefix), so we emit a
+/// PROPER v4: all 128 bits seeded from the OS CSPRNG (`getrandom`), with the version nibble forced
+/// to `4` and the variant bits forced to `10xx`. A client (or any observer) that validates the id
+/// as a UUIDv4 — Cohere's are — sees a well-formed value, so this is no longer a proxy tell, and no
+/// timestamp is embedded (the earlier `secs << 32` layout leaked the server clock in the first
+/// group). The monotonic counter is folded into the low 64 bits AFTER the random draw purely as a
+/// per-process uniqueness backstop should the CSPRNG ever return identical bytes; it does not
+/// reduce the version/variant guarantee or reintroduce a clock leak. Never panics on the request
+/// path: on the near-impossible `getrandom` failure the buffer stays zeroed and the counter overlay
+/// still yields a unique, well-formed v4.
 fn synthesize_cohere_id() -> String {
     let n = COHERE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let secs = unix_now_secs();
-    // Mix the second and counter across both 64-bit halves so neither half is trivially zero and
-    // the layout fills all 32 hex nibbles like a real UUID.
-    let hi = (secs << 32) ^ (n.rotate_left(17));
-    let lo = (n << 16) ^ secs.rotate_left(31);
-    format_uuid_layout(hi, lo)
+
+    let mut bytes = [0u8; 16];
+    // OS CSPRNG. Ignore failure (no unwrap/expect/panic on the request path): the counter fold
+    // below keeps the id unique even if the buffer stays all-zero, and the version/variant stamping
+    // still produces a valid v4.
+    let _ = getrandom::getrandom(&mut bytes);
+
+    // Fold the monotonic counter into the trailing 8 bytes (big-endian) so two ids minted in quick
+    // succession differ even if `getrandom` returned identical bytes. XOR (not overwrite) preserves
+    // the random entropy in those bytes.
+    let counter = n.to_be_bytes();
+    for (b, c) in bytes[8..16].iter_mut().zip(counter.iter()) {
+        *b ^= *c;
+    }
+
+    // RFC-4122 v4: high nibble of byte 6 (the 3rd group's first nibble) = 4; top two bits of byte 8
+    // (the 4th group's first nibble) = 10. Applied AFTER the counter fold so neither bit field can
+    // be clobbered.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    format_uuid_layout(&bytes)
 }
 
 /// Resolve the STABLE IR block index for a Cohere stream tool call identified by its wire
@@ -953,11 +968,26 @@ impl ProtocolWriter for CohereWriter {
     }
 
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
-        vec![(
-            HeaderName::from_static("authorization"),
-            HeaderValue::from_str(&format!("Bearer {key}"))
-                .unwrap_or_else(|_| HeaderValue::from_static("")),
-        )]
+        // Validate the composed `Bearer <key>` value against the HTTP header-value byte rules
+        // (`HeaderValue::from_str` rejects ASCII control bytes such as a newline or NUL — e.g. a
+        // stray CR/LF injected by a config system). The prior `unwrap_or_else(HeaderValue::from_static(""))`
+        // SILENTLY emitted a syntactically invalid `Authorization: ` header: Cohere then 401s every
+        // request on the lane with NO proxy-side signal, and the empty-Bearer form is itself a tell
+        // a backend can compare against well-formed tokens. Instead — mirroring `GeminiWriter::auth_headers`
+        // and `BedrockWriter::sign_request` — surface a `tracing::warn!` and OMIT the header entirely
+        // (empty vec). The request is still sent (the trait can't refuse it here) and Cohere answers
+        // 401, but the warn line tells the operator the lane's credential bytes are invalid. The key
+        // itself is NEVER logged (it is the secret); only the fact that it is malformed.
+        match HeaderValue::from_str(&format!("Bearer {key}")) {
+            Ok(value) => vec![(HeaderName::from_static("authorization"), value)],
+            Err(_) => {
+                tracing::warn!(
+                    "cohere: authorization credential contains invalid header bytes (ASCII \
+                     control character); omitting auth header — upstream will reject with 401"
+                );
+                Vec::new()
+            }
+        }
     }
 
     fn rewrite_model(&self, body: &mut serde_json::Value, model: &str) {
@@ -1299,7 +1329,14 @@ impl ProtocolWriter for CohereWriter {
                     Some("end_turn") | Some("stop_sequence") => "COMPLETE".to_string(),
                     Some("max_tokens") => "MAX_TOKENS".to_string(),
                     Some("tool_use") => "TOOL_CALL".to_string(),
-                    Some("safety") => "ERROR".to_string(),
+                    // IR `safety` is Cohere's content-moderation stop. The reader normalises BOTH
+                    // native `ERROR_TOXIC` (content-moderated output) and `ERROR` (infrastructure
+                    // failure) to `safety`, but only `ERROR_TOXIC` is the content-moderation signal,
+                    // so write that back: it round-trips a Cohere->Cohere `ERROR_TOXIC` cleanly and
+                    // is the closest native analog for a cross-protocol `safety` arriving from a
+                    // non-Cohere source. Writing `ERROR` here mislabelled a moderation stop as a
+                    // server error (the finding).
+                    Some("safety") => "ERROR_TOXIC".to_string(),
                     Some(reason) => reason.to_uppercase(),
                     None => "COMPLETE".to_string(),
                 };
@@ -1365,7 +1402,10 @@ impl ProtocolWriter for CohereWriter {
             Some("end_turn") | Some("stop_sequence") => "COMPLETE".to_string(),
             Some("max_tokens") => "MAX_TOKENS".to_string(),
             Some("tool_use") => "TOOL_CALL".to_string(),
-            Some("safety") => "ERROR".to_string(),
+            // See the streaming path: IR `safety` writes back as `ERROR_TOXIC` (the native
+            // content-moderation stop), which round-trips cleanly and never mislabels a moderation
+            // stop as a server-side `ERROR`.
+            Some("safety") => "ERROR_TOXIC".to_string(),
             Some(reason) => reason.to_uppercase(),
             None => "COMPLETE".to_string(),
         };
@@ -2079,10 +2119,27 @@ mod tests {
         let groups: Vec<&str> = s.split('-').collect();
         let expected_lens = [8usize, 4, 4, 4, 12];
         groups.len() == 5
-            && groups
-                .iter()
-                .zip(expected_lens.iter())
-                .all(|(g, &len)| g.len() == len && g.bytes().all(|b| b.is_ascii_hexdigit()))
+            && groups.iter().zip(expected_lens.iter()).all(|(g, &len)| {
+                g.len() == len
+                    && g.bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+    }
+
+    /// Test helper: validate that a UUID string is a proper RFC-4122 UUIDv4 — version nibble `4`
+    /// (first char of the 3rd group) and variant nibble in `{8,9,a,b}` (`10xx`, first char of the
+    /// 4th group). Real Cohere ids are v4, so a synthesized id must satisfy this.
+    fn is_uuid_v4(s: &str) -> bool {
+        if !is_uuid_shaped(s) {
+            return false;
+        }
+        let groups: Vec<&str> = s.split('-').collect();
+        let version_ok = groups[2].starts_with('4');
+        let variant_ok = matches!(
+            groups[3].bytes().next(),
+            Some(b'8') | Some(b'9') | Some(b'a') | Some(b'b')
+        );
+        version_ok && variant_ok
     }
 
     /// Regression (MEDIUM/conformance): the synthesized id must be a bare UUID (8-4-4-4-12 hex),
@@ -2101,13 +2158,172 @@ mod tests {
         );
     }
 
-    /// Two successive synthesized ids within the same process must be distinct (the atomic counter
-    /// guarantees uniqueness even inside one wall-clock second).
+    /// Regression (HIGH/conformance): the synthesized id must be a PROPER RFC-4122 UUIDv4 — version
+    /// nibble `4` and variant bits `10xx` — because real Cohere ids are v4. The previous
+    /// `secs << 32 ^ counter` layout almost never landed `4` in the version position and left the
+    /// variant unconstrained, so a client validating the id as a UUIDv4 saw an invalid value (a
+    /// deterministic proxy tell). Sample many ids: the stamping is deterministic, so EVERY one must
+    /// pass regardless of the random/counter bits underneath.
+    #[test]
+    fn test_synthesized_id_is_valid_uuid_v4() {
+        for _ in 0..1000 {
+            let id = synthesize_cohere_id();
+            assert!(
+                is_uuid_v4(&id),
+                "synthesized id must be a valid RFC-4122 UUIDv4 (version nibble 4, variant 10xx), \
+                 got {id}"
+            );
+        }
+    }
+
+    /// Regression (HIGH/security): the synthesized id must NOT embed the server clock. The previous
+    /// layout placed `secs << 32` in the high 32 bits, so the first UUID group leaked the unix
+    /// second. Mint two ids and assert their first groups differ from a unix-second-derived value —
+    /// more robustly, assert the first group is not equal to the current/last-second seconds in hex
+    /// (the old code produced exactly that). With CSPRNG seeding the first group is random.
+    #[test]
+    fn test_synthesized_id_does_not_leak_timestamp() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // The old leaky layout put `(secs as u32)` straight into the first 8 hex chars.
+        let leaked_prefix = format!("{:08x}", secs as u32);
+        // Sample several: a single random collision is astronomically unlikely, but sampling makes
+        // the intent (no deterministic clock prefix) unambiguous.
+        let mut matched = 0u32;
+        for _ in 0..256 {
+            let id = synthesize_cohere_id();
+            let first_group = id.split('-').next().unwrap_or("");
+            if first_group == leaked_prefix {
+                matched += 1;
+            }
+        }
+        assert_eq!(
+            matched, 0,
+            "first UUID group must not deterministically equal the unix-second hex {leaked_prefix} \
+             (server-clock leak)"
+        );
+    }
+
+    /// Two successive synthesized ids within the same process must be distinct. Entropy comes from
+    /// the CSPRNG; the monotonic counter fold is a backstop guaranteeing distinctness even if the
+    /// RNG returned identical bytes.
     #[test]
     fn test_synthesized_ids_are_unique() {
         let a = synthesize_cohere_id();
         let b = synthesize_cohere_id();
         assert_ne!(a, b, "the atomic counter must make synthesized ids unique");
+    }
+
+    /// A well-formed credential produces a single `Authorization: Bearer <key>` header.
+    #[test]
+    fn test_auth_headers_valid_key_emits_bearer() {
+        let writer = CohereWriter;
+        let headers = writer.auth_headers("valid-key-123");
+        assert_eq!(headers.len(), 1, "exactly one auth header");
+        assert_eq!(headers[0].0.as_str(), "authorization");
+        assert_eq!(
+            headers[0].1.to_str().expect("valid header bytes"),
+            "Bearer valid-key-123"
+        );
+    }
+
+    /// Regression (MEDIUM/security): a credential carrying bytes `HeaderValue::from_str` rejects
+    /// (e.g. a newline injected by a config system) must OMIT the header entirely — NOT emit an
+    /// empty `Authorization: ` value. The empty-Bearer form silently 401s the lane with no operator
+    /// signal and is a backend-detectable tell. Mirrors
+    /// `gemini.rs::test_auth_headers_invalid_key_omits_header_no_empty_value`.
+    #[test]
+    fn test_auth_headers_invalid_key_omits_header_no_empty_value() {
+        let writer = CohereWriter;
+        let headers = writer.auth_headers("bad\nkey");
+        assert!(
+            headers.is_empty(),
+            "an invalid credential must omit the auth header entirely, got {headers:?}"
+        );
+    }
+
+    /// A NUL control byte in the credential is also rejected and the header omitted (not emitted as
+    /// an empty value).
+    #[test]
+    fn test_auth_headers_control_byte_key_omits_header() {
+        let writer = CohereWriter;
+        let headers = writer.auth_headers("key\u{0000}bad");
+        assert!(
+            headers.is_empty(),
+            "a control-byte credential must omit the auth header entirely, got {headers:?}"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance): a Cohere->Cohere passthrough where the upstream returned
+    /// `ERROR_TOXIC` (content-moderation stop) must NOT be downgraded to `ERROR` (infrastructure
+    /// failure). The reader normalises `ERROR_TOXIC` to IR `safety`; the writer must map `safety`
+    /// back to `ERROR_TOXIC` so the moderation signal round-trips. Covers both the non-streaming
+    /// `write_response` and the streaming `message-end` paths.
+    #[test]
+    fn test_safety_finish_reason_writes_error_toxic_non_stream() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "moderated".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("safety".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: Some("r1".to_string()),
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let writer = CohereWriter;
+        let body = writer.write_response(&resp);
+        assert_eq!(
+            body.get("finish_reason").and_then(|v| v.as_str()),
+            Some("ERROR_TOXIC"),
+            "IR safety must write back as the native content-moderation stop ERROR_TOXIC"
+        );
+
+        // Round-trips: ERROR_TOXIC reads back to IR safety (the reader normalises both ERROR forms
+        // to safety, so the value is stable on a Cohere->Cohere passthrough).
+        let back = CohereReader
+            .read_response(&body)
+            .expect("read self-written body");
+        assert_eq!(back.stop_reason.as_deref(), Some("safety"));
+    }
+
+    #[test]
+    fn test_safety_finish_reason_writes_error_toxic_stream() {
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: Some("safety".to_string()),
+            stop_sequence: None,
+            usage: crate::ir::IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let writer = CohereWriter;
+        let (_, frame) = writer
+            .write_response_event(&ev)
+            .expect("message-end must serialize");
+        assert_eq!(
+            frame
+                .get("delta")
+                .and_then(|d| d.get("finish_reason"))
+                .and_then(|v| v.as_str()),
+            Some("ERROR_TOXIC"),
+            "streamed safety stop must emit ERROR_TOXIC, not ERROR"
+        );
     }
 
     /// Regression (HIGH/conformance): `write_response` must nest `tool_calls` INSIDE the `message`
