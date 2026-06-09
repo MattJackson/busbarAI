@@ -8,7 +8,38 @@ use serde::Deserialize;
 // Re-export status_class_from_str for config validation
 pub(crate) use crate::breaker::status_class_from_str;
 
-/// Expand ${VAR} tokens from environment. Unset var → error (fail loud).
+/// Reject an env-var value that could break out of the surrounding YAML scalar when substituted
+/// into the raw config text BEFORE parsing. `interpolate_env` splices each value in verbatim, so a
+/// value carrying a YAML-structural control character — most critically a NEWLINE or carriage
+/// return — can close the quoted scalar it sits inside and inject sibling YAML nodes (e.g. an extra
+/// `client_tokens` entry, or a rewritten `admin_token`). Since both `client_tokens` and
+/// `admin_token` are interpolated from env vars inside double-quoted scalars in the shipped
+/// `config.yaml`, whoever controls those env vars (a CI pipeline, secret store, orchestrator) could
+/// otherwise silently widen the auth allowlist without editing the config file.
+///
+/// No legitimate secret, token, URL, or path value contains a raw control character, so blocking
+/// the entire C0 control range (plus DEL and the C1 NEL/LS/PS line-breaks YAML also treats as line
+/// boundaries) closes the structural-injection vector with effectively zero false positives. A
+/// double-quote or `#` on its own is harmless without a line break to terminate the current scalar,
+/// and YAML's own quoting handles them, so we do not over-reject those.
+fn reject_yaml_unsafe_value(var_name: &str, value: &str) -> Result<(), String> {
+    if let Some(bad) = value.chars().find(|c| {
+        // C0 controls (incl. \n, \r, \t, NUL) and DEL, plus the Unicode line/paragraph separators
+        // and NEL that YAML treats as line breaks (U+0085 NEL, U+2028 LS, U+2029 PS).
+        c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+    }) {
+        return Err(format!(
+            "environment variable '{var_name}' contains a control character (U+{:04X}) that could \
+             inject YAML structure during config interpolation; remove it",
+            bad as u32
+        ));
+    }
+    Ok(())
+}
+
+/// Expand ${VAR} tokens from environment. Unset var → error (fail loud). A substituted value that
+/// carries a YAML-structural control character is rejected (see `reject_yaml_unsafe_value`) so an
+/// env var cannot break out of the quoted scalar it lands in and inject extra YAML nodes.
 pub(crate) fn interpolate_env(s: &str) -> Result<String, String> {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -39,6 +70,9 @@ pub(crate) fn interpolate_env(s: &str) -> Result<String, String> {
             }
             let value = std::env::var(&var_name)
                 .map_err(|_| format!("unset environment variable: {}", var_name))?;
+            // Reject a structurally-unsafe value BEFORE splicing it in, so it cannot break out of
+            // the surrounding YAML scalar and inject sibling nodes (e.g. extra client_tokens).
+            reject_yaml_unsafe_value(&var_name, &value)?;
             result.push_str(&value);
         } else {
             result.push(ch);
@@ -770,6 +804,71 @@ models:
         let input = "plain-text-no-vars";
         let result = interpolate_env(input).unwrap();
         assert_eq!(result, "plain-text-no-vars");
+    }
+
+    /// Regression (YAML-structure injection): an env value containing a NEWLINE (the structural
+    /// break that closes a quoted YAML scalar) must be rejected, not spliced into the raw config
+    /// text. The exploit shape from the finding — a value that ends a quoted `client_tokens` entry
+    /// and injects an extra list item — must fail loudly at interpolation time. Uses a unique
+    /// per-test var name (process-global env, parallel tests).
+    #[test]
+    fn test_interpolate_env_rejects_newline_yaml_injection() {
+        // The double-quote/newline breakout payload the finding calls out for client_tokens.
+        std::env::set_var("BUSBAR_T_INJECT_NL", "real-tok\"\n    - \"injected-tok");
+        let input = "client_tokens:\n    - \"${BUSBAR_T_INJECT_NL}\"";
+        let result = interpolate_env(input);
+        std::env::remove_var("BUSBAR_T_INJECT_NL");
+        assert!(
+            result.is_err(),
+            "an env value with a newline must be rejected to prevent YAML injection"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("control character") && err.contains("BUSBAR_T_INJECT_NL"),
+            "error must name the offending variable and the control-character reason, got: {err}"
+        );
+    }
+
+    /// A bare carriage return is also a YAML line break and must be rejected on the same grounds.
+    #[test]
+    fn test_interpolate_env_rejects_carriage_return() {
+        std::env::set_var("BUSBAR_T_INJECT_CR", "tok\r- injected");
+        let result = interpolate_env("x: \"${BUSBAR_T_INJECT_CR}\"");
+        std::env::remove_var("BUSBAR_T_INJECT_CR");
+        assert!(
+            result.is_err(),
+            "an env value with a carriage return must be rejected"
+        );
+    }
+
+    /// The guard must NOT over-reject: ordinary token / URL values (including ones with `:`, `/`,
+    /// `@`, `.`, `-`, and even an embedded double-quote or `#`, which are harmless without a line
+    /// break) interpolate cleanly. This keeps real opaque API keys working.
+    #[test]
+    fn test_interpolate_env_allows_ordinary_values_with_punctuation() {
+        std::env::set_var("BUSBAR_T_OK_TOK", "sk-bb-aB3#9/x.y@z:1234567890abcdef");
+        let result = interpolate_env("token: \"${BUSBAR_T_OK_TOK}\"").unwrap();
+        std::env::remove_var("BUSBAR_T_OK_TOK");
+        assert_eq!(result, "token: \"sk-bb-aB3#9/x.y@z:1234567890abcdef\"");
+    }
+
+    /// End-to-end: an env value carrying a newline-based injection must NOT smuggle an extra
+    /// `client_tokens` entry into the parsed config. The interpolation rejects it before serde ever
+    /// sees the malformed YAML, so the allowlist cannot be silently widened via a compromised env
+    /// var.
+    #[test]
+    fn test_env_injection_cannot_widen_client_tokens_allowlist() {
+        std::env::set_var(
+            "BUSBAR_T_ALLOWLIST_INJECT",
+            "legit\"\n    - \"smuggled-admin-token",
+        );
+        let yaml = "auth:\n  mode: token\n  client_tokens:\n    - \"${BUSBAR_T_ALLOWLIST_INJECT}\"";
+        let result = interpolate_env(yaml);
+        std::env::remove_var("BUSBAR_T_ALLOWLIST_INJECT");
+        assert!(
+            result.is_err(),
+            "newline injection into client_tokens must be rejected at interpolation, not parsed"
+        );
     }
 
     /// An unclosed `${FOO` (missing `}`) must fail loudly with an "unclosed" error rather than be

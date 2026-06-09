@@ -418,11 +418,24 @@ async fn forward_resolved(
     // `not_found_error` is the canonical token every writer maps (OpenAI, Responses, Anthropic →
     // their native not-found type; Gemini → NOT_FOUND). The older generic `not_found` leaked
     // verbatim through the OpenAI writer as a non-canonical `error.type`.
-    ingress_error(
+    //
+    // Model/pool miss: wrap the 404 in `finish` so it is still counted in REQUESTS_TOTAL /
+    // REQUEST_DURATION_SECONDS and fires the request-log webhook — the same observability invariant
+    // the governance rejections and the `named`/`adhoc` 404s already enforce. A raw early-return
+    // made every unknown-model miss on the universal-ingress routes (openai/cohere/responses/
+    // gemini/bedrock) invisible to Prometheus and the webhook.
+    finish(
+        app,
+        gov,
         proto,
-        StatusCode::NOT_FOUND,
-        "not_found_error",
-        &format!("The model '{model}' does not exist or you do not have access to it."),
+        model,
+        started,
+        ingress_error(
+            proto,
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!("The model '{model}' does not exist or you do not have access to it."),
+        ),
     )
 }
 
@@ -2031,6 +2044,35 @@ mod tests {
         assert!(
             ct.starts_with("text/event-stream"),
             "gemini streaming ingress WITH ?alt=sse is SSE-framed; got {ct}"
+        );
+        // MEDIUM/test-coverage: text/event-stream alone does not prove the SSE FRAMES carry the
+        // native Gemini `GenerateContentResponse` vocabulary. A regression that relayed the raw
+        // OpenAI `chat.completion.chunk` objects verbatim would still be `text/event-stream` and
+        // pass a header-only assertion — a protocol-indistinguishability break. Parse each SSE
+        // `data:` payload as JSON and assert at least one carries a `candidates` array (mirroring
+        // the JSON-array path's assertion in
+        // `test_gemini_stream_generate_content_no_alt_sse_is_json_array`), and that none leaks the
+        // OpenAI `choices` shape.
+        let body = resp.text().await.unwrap();
+        let payloads: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .filter(|data| !data.is_empty() && *data != "[DONE]")
+            .filter_map(|data| serde_json::from_str(data).ok())
+            .collect();
+        assert!(
+            !payloads.is_empty(),
+            "SSE body carries at least one JSON data: frame; got {body:?}"
+        );
+        assert!(
+            payloads.iter().any(|c| c.get("candidates").is_some()),
+            "at least one SSE frame is a native gemini GenerateContentResponse (candidates[]); \
+             got {body:?}"
+        );
+        assert!(
+            payloads.iter().all(|c| c.get("choices").is_none()),
+            "no OpenAI `choices` field may leak into the gemini SSE frames; got {body:?}"
         );
         handle.abort();
         server.shutdown().await;

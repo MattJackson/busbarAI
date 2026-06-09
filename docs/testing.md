@@ -176,6 +176,14 @@ Patterns this enables:
   assert the same-protocol path relays the binary event-stream verbatim,
   preserves the `application/vnd.amazon.eventstream` content type, and forwards
   the upstream `x-amzn-RequestId` rather than synthesizing a fresh one.
+  Note: `MockServer` only routes `/v1/messages` and `/v1/chat/completions`,
+  but Bedrock's native egress path is `/model/{model}/converse-stream`, which
+  the mock does **not** serve — a lane left at its default path would 404 on
+  every upstream call. Override the lane's path with `.path("/v1/messages")`
+  (any served route works; the same-protocol relay keys off the upstream
+  Content-Type, not the URL) so the request reaches the mock. See
+  `test_bedrock_same_protocol_stream_passthrough_forwards_upstream_request_id`
+  in `src/route.rs` for the full pattern.
 - **on_exhausted** — populate `on_exhausted_cfgs` with `LeastBad` /
   `FallbackPool(..)` and pre-trip all members; assert the configured behavior
   (and loop-guarding for fallback chains).

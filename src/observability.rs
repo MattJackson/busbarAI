@@ -8,11 +8,16 @@
 
 use reqwest::Client;
 use serde_json::Value;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-static WEBHOOK_URL: OnceLock<Option<String>> = OnceLock::new();
+/// The configured webhook URL, stored as an `Arc<String>` so the per-request fast path in
+/// `fire_request_log` clones a reference-count bump (8 bytes) rather than heap-copying the whole URL
+/// on every served request. The outer `Option` is gone: an UNSET `OnceLock` (webhook disabled, or a
+/// URL that failed validation) is the "not configured" signal, so there is no per-request
+/// `Option<String>::clone` allocation on the hot path.
+static WEBHOOK_URL: OnceLock<Arc<String>> = OnceLock::new();
 static CLIENT: OnceLock<Client> = OnceLock::new();
 
 /// Cap on in-flight request-log deliveries. The webhook is an explicitly best-effort telemetry
@@ -253,7 +258,12 @@ pub(crate) fn configure_webhook(url: Option<String>, client: Client) {
             None
         }
     };
-    let _ = WEBHOOK_URL.set(validated);
+    // Only seed the OnceLock when a URL survived validation. An unset lock IS the "disabled"
+    // signal, so `fire_request_log` can `.get().cloned()` (a refcount bump) with no per-request
+    // `Option` allocation.
+    if let Some(u) = validated {
+        let _ = WEBHOOK_URL.set(Arc::new(u));
+    }
     let _ = CLIENT.set(client);
 }
 
@@ -281,7 +291,10 @@ pub(crate) fn build_request_log(
 /// drops logs rather than piling up unbounded tasks), and each POST has its own short timeout
 /// independent of the shared client's upstream timeout.
 pub(crate) fn fire_request_log(payload: Value) {
-    let Some(url) = WEBHOOK_URL.get().and_then(|o| o.clone()) else {
+    // Refcount bump, NOT a heap copy of the URL: `WEBHOOK_URL` holds an `Arc<String>` and an unset
+    // lock means "not configured". `.cloned()` on `Option<&Arc<String>>` is 8 bytes, so the
+    // per-request webhook fast-path allocates nothing.
+    let Some(url) = WEBHOOK_URL.get().cloned() else {
         return;
     };
     let Some(client) = CLIENT.get().cloned() else {
@@ -301,7 +314,7 @@ pub(crate) fn fire_request_log(payload: Value) {
     tokio::spawn(async move {
         let _guard = guard;
         let _ = client
-            .post(&url)
+            .post(url.as_str())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
             .timeout(WEBHOOK_DELIVERY_TIMEOUT)
@@ -437,6 +450,26 @@ mod tests {
     async fn test_fire_is_noop_when_unconfigured() {
         // With no webhook URL configured, firing must be a harmless no-op (no panic, no spawn leak).
         fire_request_log(build_request_log(0, "openai", "p", "ok", 1));
+    }
+
+    #[test]
+    fn test_webhook_url_clone_is_arc_refcount_bump_not_heap_copy() {
+        // Regression for the per-request heap allocation: `WEBHOOK_URL` must store an `Arc<String>`
+        // so the hot-path clone in `fire_request_log` is a refcount bump that shares the SAME heap
+        // buffer, not a fresh `String` allocation. Assert the two clones alias the same allocation
+        // (identical data pointer) and that the refcount tracks clones. Uses a local `OnceLock` to
+        // avoid mutating the process-wide static (which other tests rely on staying unset).
+        let lock: OnceLock<Arc<String>> = OnceLock::new();
+        let _ = lock.set(Arc::new("https://hook.example.com/log".to_string()));
+        let first = lock.get().cloned().expect("configured");
+        assert_eq!(Arc::strong_count(&first), 2, "lock holds one + our clone");
+        let second = lock.get().cloned().expect("configured");
+        assert_eq!(Arc::strong_count(&first), 3, "second clone bumps the count");
+        // Both clones must point at the SAME heap buffer (a refcount bump), not independent copies.
+        assert!(
+            std::ptr::eq(first.as_str().as_ptr(), second.as_str().as_ptr()),
+            "Arc clones must share the underlying String allocation (no per-request heap copy)"
+        );
     }
 
     #[test]

@@ -417,12 +417,24 @@ pub(crate) async fn auth_middleware(
                 );
             });
         }
-        match gov.lookup(client_token.as_deref().unwrap_or("")) {
+        // Reject a missing / empty token BEFORE the governance lookup, mirroring the
+        // `validate_token` guard that the static-token path applies. Without this, an
+        // unauthenticated request would call `gov.lookup(sha256(""))` — admitting the caller if any
+        // virtual key in the store ever hashed an empty secret (reachable via direct DB writes or a
+        // future seeding path that bypasses `generate_secret`). Making the empty-token reject
+        // explicit removes that latent hash-collision dependency rather than relying on the absence
+        // of a `sha256("")` entry in the key store.
+        let Some(client_token) = client_token.as_deref().filter(|t| !t.is_empty()) else {
+            return Err(unauthorized_response(&path));
+        };
+        match gov.lookup(client_token) {
             Some(key) if key.enabled => {
                 req.extensions_mut()
                     .insert(crate::governance::GovCtx { key: Some(key) });
             }
-            _ => return Err(unauthorized_response(&path)),
+            // A resolved-but-disabled key and a no-such-key both reject. Spelled out (no `_ =>`
+            // catch-all) so a future `GovKey` field or lookup outcome can't silently fall through.
+            Some(_) | None => return Err(unauthorized_response(&path)),
         }
     } else {
         // /stats requires auth by default (per spec decision).
@@ -1935,6 +1947,95 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("application/json"),
             "401 must carry the native application/json envelope, not text/plain"
+        );
+
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// Regression for the empty-token governance bypass (finding auth.rs:420): the governance branch
+    /// must reject a request that presents NO credential BEFORE calling `gov.lookup`, rather than
+    /// looking up `sha256("")`. We deliberately seed a virtual key whose `key_hash == sha256("")` —
+    /// the exact pathological state (reachable via direct DB writes / a future seeding path that
+    /// bypasses `generate_secret`) the finding warns about — and confirm an unauthenticated request
+    /// is STILL rejected 401 instead of resolving to that key. Before the fix, the no-token request
+    /// would call `gov.lookup("")`, match this enabled key, and be admitted unauthenticated.
+    #[tokio::test]
+    async fn test_governance_rejects_empty_token_even_if_empty_secret_key_exists() {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+        use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        crate::metrics::init();
+
+        // No upstream call should happen — auth must reject before routing.
+        let state = Arc::new(MockServerState::new());
+        let server = MockServer::new(state).await;
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        // The pathological key: its hash is sha256("") — what an empty-token lookup would compute.
+        store
+            .put_key(&VirtualKey {
+                id: "empty".to_string(),
+                key_hash: crate::sigv4::sha256_hex(b""),
+                name: "empty".to_string(),
+                allowed_pools: vec!["pa".to_string()],
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "test-model",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .api_key("busbar-upstream-key"),
+            )
+            .pool("pa", &[(0, 1)])
+            .governance(gov)
+            .build();
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/pa/v1/messages");
+        let body = json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+            .to_string();
+
+        // No credential at all → must be 401 (NOT admitted by the sha256("") key).
+        let r_none = client.post(&url).body(body.clone()).send().await.unwrap();
+        assert_eq!(
+            r_none.status().as_u16(),
+            401,
+            "an unauthenticated request must be rejected even when a key hashing the empty secret \
+             exists in the store (got {})",
+            r_none.status()
+        );
+
+        // A present-but-empty x-api-key must also reject (empty carrier is treated as absent).
+        let r_empty = client
+            .post(&url)
+            .header("x-api-key", "")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r_empty.status().as_u16(),
+            401,
+            "a present-but-empty credential must be rejected (got {})",
+            r_empty.status()
         );
 
         handle.abort();

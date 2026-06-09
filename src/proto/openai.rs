@@ -102,6 +102,12 @@ fn synth_completion_id() -> String {
 fn openai_error_code(error_type: &str) -> serde_json::Value {
     match error_type {
         "authentication_error" => serde_json::Value::String("invalid_api_key".to_string()),
+        // Real OpenAI quota-exhaustion errors carry BOTH `type` and `code` set to
+        // `insufficient_quota` (HTTP 429). The over-budget governance path
+        // (route.rs `ingress_error(..., "insufficient_quota", ...)`) reaches this writer with that
+        // type; emitting `code: null` for it is an SDK-visible mismatch (the official client surfaces
+        // `error.code == "insufficient_quota"`) and a proxy tell, so we mirror the native pairing.
+        "insufficient_quota" => serde_json::Value::String("insufficient_quota".to_string()),
         "invalid_request_error"
         | "permission_error"
         | "not_found_error"
@@ -657,6 +663,13 @@ impl ProtocolReader for OpenAiReader {
                 "stop" => "end_turn".to_string(),
                 "length" => "max_tokens".to_string(),
                 "tool_calls" => "tool_use".to_string(),
+                // Normalize OpenAI-specific finish reasons to the canonical IR vocabulary so they do
+                // not leak verbatim to other protocols' writers. `content_filter` (a common
+                // moderation outcome) becomes the canonical `safety` token the Gemini writer maps to
+                // its SAFETY enum; legacy `function_call` becomes `tool_use`. Leaving them verbatim
+                // produced invalid cross-protocol enum values (e.g. Gemini `CONTENT_FILTER`).
+                "content_filter" => "safety".to_string(),
+                "function_call" => "tool_use".to_string(),
                 other => other.to_string(),
             });
             let usage = chunk_usage.unwrap_or(IrUsage {
@@ -812,6 +825,12 @@ impl ProtocolReader for OpenAiReader {
             "stop" => Some("end_turn".to_string()),
             "length" => Some("max_tokens".to_string()),
             "tool_calls" => Some("tool_use".to_string()),
+            // Normalize OpenAI-specific finish reasons to the canonical IR vocabulary so they do not
+            // leak verbatim into IrResponse.stop_reason and out through other protocols' writers.
+            // `content_filter` -> the canonical `safety` token (Gemini writer maps it to SAFETY);
+            // legacy `function_call` -> `tool_use`. (Mirrors the stream path.)
+            "content_filter" => Some("safety".to_string()),
+            "function_call" => Some("tool_use".to_string()),
             other if !other.is_empty() => Some(other.to_string()),
             _ => None,
         };
@@ -904,11 +923,35 @@ fn read_openai_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock
             let (media_type, data) = parse_image_url(url);
             Ok(crate::ir::IrBlock::Image { media_type, data })
         }
-        _ => Err(IrError {
-            class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".to_string()),
-            retry_after: None,
-        }),
+        // OpenAI gpt-4o-and-later responses carry `refusal` content parts; a client replaying its
+        // OpenAI conversation history through busbar will include them. Map a refusal to a Text block
+        // carrying the refusal string so the turn survives translation rather than being rejected with
+        // a 400 (the prior `_ => Err` behavior turned legitimate replayed history into a hard error).
+        "refusal" => {
+            let text = obj
+                .get("refusal")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(crate::ir::IrBlock::Text {
+                text,
+                cache_control: None,
+                citations: Vec::new(),
+            })
+        }
+        // Forward-compatibility: an unknown/future content-part type (one OpenAI adds after this
+        // build) must not break otherwise-valid conversation history. Degrade gracefully to an empty
+        // Text block — preserving the part's position in the turn without injecting foreign data —
+        // rather than failing the whole request with a ClientError. This is a content-shape match, not
+        // a disposition/breaker match, so a named graceful-degradation arm is correct here.
+        other => {
+            let _ = other;
+            Ok(crate::ir::IrBlock::Text {
+                text: String::new(),
+                cache_control: None,
+                citations: Vec::new(),
+            })
+        }
     }
 }
 
@@ -1188,16 +1231,21 @@ impl ProtocolWriter for OpenAiWriter {
 
         out.insert("stream".to_string(), serde_json::json!(req.stream));
 
-        // Add tools if present
+        // Add tools if present. The Chat Completions API requires the NESTED tool shape
+        // `{"type":"function","function":{"name":...,"description":...,"parameters":...}}` — name,
+        // description, and parameters live INSIDE the `function` sub-object, not at the top level.
+        // Emitting the flat `{"type":"function","name":...,"parameters":...}` shape is rejected with a
+        // 400 by every native Chat Completions backend and SDK since late 2023, and the off-spec shape
+        // is itself a proxy tell. `read_openai_tool` already reads from the nested `function` object,
+        // so this writer is the inverse of the reader.
         if !req.tools.is_empty() {
             let mut tools_arr: Vec<serde_json::Value> = Vec::new();
             for tool in &req.tools {
-                let mut tool_obj = serde_json::Map::new();
-                tool_obj.insert("type".to_string(), serde_json::json!("function"));
-                tool_obj.insert("name".to_string(), serde_json::json!(tool.name));
+                let mut function_obj = serde_json::Map::new();
+                function_obj.insert("name".to_string(), serde_json::json!(tool.name));
 
                 if let Some(desc) = &tool.description {
-                    tool_obj.insert("description".to_string(), serde_json::json!(desc));
+                    function_obj.insert("description".to_string(), serde_json::json!(desc));
                 }
 
                 // Map OpenAI's "parameters" to our input_schema
@@ -1206,7 +1254,14 @@ impl ProtocolWriter for OpenAiWriter {
                 } else {
                     serde_json::json!({})
                 };
-                tool_obj.insert("parameters".to_string(), params);
+                function_obj.insert("parameters".to_string(), params);
+
+                let mut tool_obj = serde_json::Map::new();
+                tool_obj.insert("type".to_string(), serde_json::json!("function"));
+                tool_obj.insert(
+                    "function".to_string(),
+                    serde_json::Value::Object(function_obj),
+                );
 
                 tools_arr.push(serde_json::Value::Object(tool_obj));
             }
@@ -1338,6 +1393,11 @@ impl ProtocolWriter for OpenAiWriter {
                     Some("end_turn") | Some("stop_sequence") => serde_json::json!("stop"),
                     Some("max_tokens") => serde_json::json!("length"),
                     Some("tool_use") => serde_json::json!("tool_calls"),
+                    // Canonical `safety` -> OpenAI's native `content_filter` (the inverse of the
+                    // reader's content_filter -> safety normalization), so a cross-protocol or
+                    // same-protocol moderation finish emits a valid OpenAI enum value rather than the
+                    // off-spec `safety` token.
+                    Some("safety") => serde_json::json!("content_filter"),
                     Some(reason) => serde_json::json!(reason),
                     None => serde_json::Value::Null,
                 };
@@ -1417,6 +1477,24 @@ impl ProtocolWriter for OpenAiWriter {
             "rate_limit_error" | "rate_limit" | "too_many_requests" => "rate_limit_error",
             "server_error" | "internal_error" | "internal_server_error" => "server_error",
             "api_error" => "api_error",
+            // Quota exhaustion is a first-class native OpenAI type (HTTP 429); preserve it so the
+            // over-budget governance path keeps the real `insufficient_quota` type AND its matching
+            // `code` (set in `openai_error_code`).
+            "insufficient_quota" => "insufficient_quota",
+            // The all-lanes-exhausted 503 path and the request-timeout 503 path pass the
+            // Anthropic-vocabulary kind `overloaded` to EVERY ingress writer. `overloaded` is not an
+            // OpenAI error type — real OpenAI reports a 503 / transient upstream failure as
+            // `server_error` — so emitting `type:"overloaded"` is both a conformance break (the
+            // official SDK's typed-exception mapping fails on an unknown type) and a cross-protocol
+            // vocabulary leak. Map every transient/unavailable spelling onto OpenAI's native 5xx type.
+            "overloaded"
+            | "overloaded_error"
+            | "service_unavailable"
+            | "unavailable"
+            | "transient"
+            | "timeout"
+            | "network"
+            | "5xx" => "server_error",
             "context_length_exceeded" => "invalid_request_error",
             // Empty kind: derive a valid OpenAI type from the HTTP status bucket rather than emitting
             // an empty `type`, so the SDK still sees a real error type.
@@ -1505,6 +1583,9 @@ impl ProtocolWriter for OpenAiWriter {
             Some("end_turn") | Some("stop_sequence") => serde_json::json!("stop"),
             Some("max_tokens") => serde_json::json!("length"),
             Some("tool_use") => serde_json::json!("tool_calls"),
+            // Canonical `safety` -> OpenAI's native `content_filter` (inverse of the reader's
+            // content_filter -> safety normalization), keeping the emitted enum value valid.
+            Some("safety") => serde_json::json!("content_filter"),
             Some(reason) => serde_json::json!(reason),
             None => serde_json::Value::Null,
         };
@@ -2925,5 +3006,247 @@ mod tests {
             serde_json::json!("authentication_error")
         );
         assert_eq!(chunk["error"]["code"], serde_json::json!("invalid_api_key"));
+    }
+
+    // --- Round 11: tool objects must use the nested Chat Completions shape ---
+
+    fn req_with_tool(
+        input_schema: serde_json::Value,
+        description: Option<&str>,
+    ) -> crate::ir::IrRequest {
+        crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: Vec::new(),
+            tools: vec![crate::ir::IrTool {
+                name: "get_weather".to_string(),
+                description: description.map(String::from),
+                input_schema,
+            }],
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn write_request_tools_use_nested_function_shape() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}}
+        });
+        let req = req_with_tool(schema.clone(), Some("Look up the weather"));
+        let out = OpenAiWriter.write_request(&req);
+        let tool = &out["tools"][0];
+        // Native Chat Completions shape: {"type":"function","function":{name,description,parameters}}.
+        assert_eq!(tool["type"], serde_json::json!("function"));
+        assert_eq!(tool["function"]["name"], serde_json::json!("get_weather"));
+        assert_eq!(
+            tool["function"]["description"],
+            serde_json::json!("Look up the weather")
+        );
+        assert_eq!(tool["function"]["parameters"], schema);
+        // name/parameters/description must NOT appear flat at the top level (the off-spec shape).
+        assert!(tool.get("name").is_none(), "name must not be flat");
+        assert!(
+            tool.get("parameters").is_none(),
+            "parameters must not be flat"
+        );
+        assert!(
+            tool.get("description").is_none(),
+            "description must not be flat"
+        );
+    }
+
+    #[test]
+    fn write_request_tool_round_trips_through_read_openai_tool() {
+        // The writer's nested output must be readable by the reader (writer is the reader's inverse).
+        let schema = serde_json::json!({"type": "object"});
+        let req = req_with_tool(schema.clone(), Some("desc"));
+        let out = OpenAiWriter.write_request(&req);
+        let ir = read_openai_tool(&out["tools"][0]).expect("nested tool parses");
+        assert_eq!(ir.name, "get_weather");
+        assert_eq!(ir.description.as_deref(), Some("desc"));
+        assert_eq!(ir.input_schema, schema);
+    }
+
+    #[test]
+    fn write_request_tool_without_description_omits_it_inside_function() {
+        let req = req_with_tool(serde_json::json!({"type": "object"}), None);
+        let out = OpenAiWriter.write_request(&req);
+        let func = &out["tools"][0]["function"];
+        assert!(func.get("description").is_none());
+        // parameters always present (defaults to {} when schema is null) inside `function`.
+        assert!(func.get("parameters").is_some());
+    }
+
+    #[test]
+    fn write_request_tool_null_schema_defaults_to_empty_object_in_function() {
+        let req = req_with_tool(serde_json::Value::Null, None);
+        let out = OpenAiWriter.write_request(&req);
+        assert_eq!(
+            out["tools"][0]["function"]["parameters"],
+            serde_json::json!({})
+        );
+    }
+
+    // --- Round 11: overloaded kind maps to a native OpenAI error type (503 = server_error) ---
+
+    #[test]
+    fn write_error_overloaded_maps_to_server_error() {
+        // The all-lanes-exhausted / request-timeout 503 path passes kind "overloaded" to every
+        // ingress writer; OpenAI has no "overloaded" type, so it must map to native server_error.
+        for kind in [
+            "overloaded",
+            "overloaded_error",
+            "service_unavailable",
+            "unavailable",
+            "transient",
+            "timeout",
+            "network",
+            "5xx",
+        ] {
+            let v = OpenAiWriter.write_error(503, kind, "Service overloaded");
+            assert_eq!(
+                v["error"]["type"],
+                serde_json::json!("server_error"),
+                "kind={kind} must map to server_error"
+            );
+            // No Anthropic-vocabulary leak: the literal token must never appear as the type.
+            assert_ne!(v["error"]["type"], serde_json::json!("overloaded"));
+            assert_eq!(v["error"]["code"], serde_json::Value::Null);
+        }
+    }
+
+    #[test]
+    fn write_error_insufficient_quota_keeps_type_and_sets_code() {
+        // The over-budget governance path passes "insufficient_quota"; real OpenAI sets BOTH the type
+        // and the code to that value.
+        let v = OpenAiWriter.write_error(429, "insufficient_quota", "quota exceeded");
+        assert_eq!(v["error"]["type"], serde_json::json!("insufficient_quota"));
+        assert_eq!(v["error"]["code"], serde_json::json!("insufficient_quota"));
+    }
+
+    // --- Round 11: refusal content blocks degrade gracefully instead of erroring ---
+
+    #[test]
+    fn read_openai_block_refusal_maps_to_text() {
+        let block = serde_json::json!({"type": "refusal", "refusal": "I cannot help with that."});
+        let ir = read_openai_block(&block).expect("refusal must not error");
+        match ir {
+            crate::ir::IrBlock::Text { text, .. } => {
+                assert_eq!(text, "I cannot help with that.")
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_openai_block_unknown_type_degrades_to_empty_text() {
+        // A future/unknown content-part type must not break otherwise-valid history.
+        let block = serde_json::json!({"type": "some_future_part", "foo": "bar"});
+        let ir = read_openai_block(&block).expect("unknown type must degrade, not error");
+        match ir {
+            crate::ir::IrBlock::Text { text, .. } => assert_eq!(text, ""),
+            other => panic!("expected empty Text, got {other:?}"),
+        }
+    }
+
+    // --- Round 11: finish_reason normalization (content_filter -> safety, function_call -> tool_use) ---
+
+    fn response_with_finish(finish: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl-x",
+            "object": "chat.completion",
+            "created": 1u64,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": finish
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })
+    }
+
+    #[test]
+    fn read_response_normalizes_content_filter_to_safety() {
+        let ir = OpenAiReader
+            .read_response(&response_with_finish("content_filter"))
+            .expect("parses");
+        assert_eq!(ir.stop_reason.as_deref(), Some("safety"));
+    }
+
+    #[test]
+    fn read_response_normalizes_function_call_to_tool_use() {
+        let ir = OpenAiReader
+            .read_response(&response_with_finish("function_call"))
+            .expect("parses");
+        assert_eq!(ir.stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[test]
+    fn write_response_safety_round_trips_to_content_filter() {
+        // The canonical `safety` token must serialize back to OpenAI's native `content_filter`.
+        let resp = crate::ir::IrResponse {
+            role: IrRole::Assistant,
+            content: vec![text_block("hi")],
+            stop_reason: Some("safety".to_string()),
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("gpt-4o".to_string()),
+            id: Some("chatcmpl-x".to_string()),
+            created: Some(1),
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = OpenAiWriter.write_response(&resp);
+        assert_eq!(
+            out["choices"][0]["finish_reason"],
+            serde_json::json!("content_filter")
+        );
+    }
+
+    #[test]
+    fn stream_message_delta_safety_round_trips_to_content_filter() {
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: Some("safety".to_string()),
+            stop_sequence: None,
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (_, chunk) = OpenAiWriter
+            .write_response_event(&ev)
+            .expect("message delta emits a chunk");
+        assert_eq!(
+            chunk["choices"][0]["finish_reason"],
+            serde_json::json!("content_filter")
+        );
+    }
+
+    #[test]
+    fn stream_read_normalizes_content_filter_to_safety() {
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-x",
+            "object": "chat.completion.chunk",
+            "created": 1u64,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "content_filter"}]
+        });
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = OpenAiReader.read_response_events("", &chunk, &mut state);
+        let stop = events.iter().find_map(|e| match e {
+            IrStreamEvent::MessageDelta { stop_reason, .. } => stop_reason.clone(),
+            _ => None,
+        });
+        assert_eq!(stop.as_deref(), Some("safety"));
     }
 }

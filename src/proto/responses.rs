@@ -19,20 +19,71 @@ const MAX_OUTPUT_INDEX: usize = 127;
 /// DoS). Matches `openai.rs::MAX_OPEN_TOOLS` (OpenAI's documented parallel-tool-call limit, 128).
 const MAX_OPEN_TOOLS: usize = 128;
 
-/// Monotonic per-process counter mixed into synthesized response ids so two responses minted in
-/// the same wall-clock second still get distinct `resp_` ids. Paired with the unix timestamp this
-/// gives a collision-free id without pulling in a UUID/random crate (no new dependency).
-static RESPONSE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Process-local monotonic counter folded into synthesized `resp_`/`msg_`/`fc_` ids so two ids
+/// minted in the same instant (even on an entropy-starved host) are still distinct. It never repeats
+/// while the process lives, giving an unconditional uniqueness guarantee independent of the CSPRNG.
+/// No crate dependency beyond `std`.
+static SYNTH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Synthesize a stable per-output-item id for the streaming writer. Native Responses events carry an
+/// Lowercase+uppercase+digit base62 alphabet — the character class native Responses ids draw their
+/// opaque suffix from. Shared by [`synthesize_item_id`] and [`synthesize_response_id`].
+const BASE62: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// Width of the opaque base62 suffix on a synthesized item id (`msg_…`/`fc_…`). Native Responses
+/// item ids carry a long opaque random token with no positional structure; 48 base62 chars matches
+/// the entropy/length profile of native ids so a client that length-checks or regex-validates the
+/// `item_id` cannot fingerprint a too-short or structured suffix as non-native.
+const ITEM_ID_TOKEN_LEN: usize = 48;
+
+/// Width of the opaque base62 suffix on a synthesized `resp_` id. Native OpenAI Responses ids are
+/// ~38+ chars of opaque random data after the `resp_` prefix; 48 base62 chars stays in that profile.
+const RESPONSE_ID_TOKEN_LEN: usize = 48;
+
+/// Fill a fixed-width base62 token from the OS CSPRNG and overlay the monotonic process counter
+/// MSB-first across the leading characters so the per-process uniqueness guarantee holds regardless
+/// of the RNG. On entropy failure the buffer stays zeroed (all '0'); the counter overlay still makes
+/// the token unique, so this never panics on the request path. 62^11 > u64::MAX, so 11 leading
+/// characters fully encode any `u64` counter; the remaining characters stay random. `N` must be
+/// >= 11. Returns an owned `String` of exactly `N` base62 characters.
+fn synth_token<const N: usize>() -> String {
+    let n = SYNTH_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut rand_bytes = [0u8; N];
+    let _ = getrandom::getrandom(&mut rand_bytes);
+    let mut token = [b'0'; N];
+    for (slot, &byte) in token.iter_mut().zip(rand_bytes.iter()) {
+        *slot = BASE62[(byte % 62) as usize];
+    }
+
+    // Overlay the monotonic counter MSB-first across the leading characters so adjacent ids differ
+    // in those positions even when the CSPRNG returns identical bytes.
+    let mut counter = n;
+    for slot in token.iter_mut().take(11).rev() {
+        *slot = BASE62[(counter % 62) as usize];
+        counter /= 62;
+    }
+
+    // `token` is ASCII base62 by construction, hence always valid UTF-8; the fallback only guards an
+    // impossible non-ASCII byte and keeps the path panic-free (no unwrap/expect on the request path).
+    String::from_utf8(token.to_vec()).unwrap_or_else(|_| "0".repeat(N))
+}
+
+/// Synthesize a per-output-item id for the streaming writer. Native Responses events carry an
 /// `item_id` (`msg_…` for message parts, `fc_…` for function-call parts) that is constant across the
 /// `output_item.added` → deltas → `output_item.done` lifecycle of a single output item. The IR's
 /// block events carry only the integer `output_index` (and, for tool use, the call id), not a wire
-/// `item_id`, so synthesize a deterministic id from the item kind + index. Determinism per index is
-/// what matters: the same `(kind, index)` always yields the same id within a stream, so the
-/// added/delta/done events of one item correlate, mirroring the native shape. No new dependency.
-fn synthesize_item_id(prefix: &str, index: usize) -> String {
-    format!("{prefix}_{index:08x}")
+/// `item_id`, so the writer must mint one.
+///
+/// Per-INDEX determinism within a stream is what the lifecycle correlation needs: the
+/// added/delta/done events of one item must share an `item_id`. The previous implementation used a
+/// sequential zero-padded hex index (`msg_00000000`, `msg_00000001`, …) — a positional structure no
+/// native opaque id has, letting any observer fingerprint a proxied response from the id pattern.
+/// We replace the suffix with an opaque CSPRNG-backed base62 token of native length, while keeping
+/// per-`(prefix, index)` determinism within a stream via a per-writer cache (see
+/// `ResponsesWriter::item_id_for`). This free function mints a FRESH opaque id; callers that need
+/// the stream-stable id go through the writer's cache.
+fn synthesize_item_id(prefix: &str) -> String {
+    format!("{prefix}_{}", synth_token::<ITEM_ID_TOKEN_LEN>())
 }
 
 /// Current unix epoch seconds, or 0 if the clock is before the epoch (never on a sane host).
@@ -44,14 +95,17 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Synthesize a protocol-correct Responses id (`resp_<hex>`) for cross-protocol responses where the
-/// backend supplied none. Uniqueness comes from concatenating the unix timestamp and a monotonic
-/// per-process counter as separate hex fields — no XOR folding (which would collide once the counter
-/// advances by 2^24 within a second) and no new crate dependency. Native passthrough never calls
-/// this: it carries the upstream id verbatim.
+/// Synthesize a protocol-correct Responses id (`resp_<opaque base62>`) for cross-protocol responses
+/// where the backend supplied none. Native OpenAI Responses ids are `resp_` followed by ~38+ chars
+/// of opaque random data with NO embedded structure; the previous form encoded the unix timestamp as
+/// the leading hex segment (`resp_{timestamp_hex}{counter_hex}`), which both made the id shorter than
+/// native AND leaked the proxy's server clock to within one second to anyone holding a response id.
+/// The opaque CSPRNG token here matches the native length/entropy profile and embeds no timestamp;
+/// the monotonic process counter folded into the token (via `synth_token`) preserves the
+/// collision-free per-process uniqueness guarantee without an embedded clock. Native passthrough
+/// never calls this: it carries the upstream id verbatim.
 fn synthesize_response_id() -> String {
-    let counter = RESPONSE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("resp_{:x}{:016x}", now_unix_secs(), counter)
+    format!("resp_{}", synth_token::<RESPONSE_ID_TOKEN_LEN>())
 }
 
 /// Parse a Responses `image_url` string into an IR `(media_type, data)` pair.
@@ -1038,6 +1092,18 @@ pub(crate) struct ResponsesWriter {
     /// BlockStop emits the text terminal frames for THIS index only. Per-stream INSTANCE state for
     /// the same reason as the other fields; a poisoned lock degrades safely.
     open_text_indices: std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    /// Per-stream cache of synthesized opaque `item_id`s, keyed by `(kind-prefix, output_index)`.
+    /// A native /v1/responses stream carries a CONSTANT `item_id` across the
+    /// `output_item.added → delta* → output_item.done` lifecycle of one output item; the official
+    /// SDK correlates that lifecycle by the shared id. The IR block events carry only the integer
+    /// `output_index`, so the writer mints the id — but it must be STABLE per `(prefix, index)` for
+    /// the duration of the stream, while still being an opaque CSPRNG token (not the old sequential
+    /// `msg_00000000` hex, whose positional structure fingerprinted a proxied response). This cache
+    /// gives both: the first reference to a `(prefix, index)` mints a fresh opaque id; every later
+    /// reference within the stream returns the same one. Per-stream INSTANCE state for the same
+    /// reason as the other fields; a poisoned lock degrades to a freshly-minted id (still opaque,
+    /// still valid) rather than panicking on the request path.
+    item_ids: std::sync::Mutex<std::collections::BTreeMap<(&'static str, usize), String>>,
 }
 
 /// Value-namespace constructor for [`ResponsesWriter`]. A `const` and a struct may share a name
@@ -1060,6 +1126,7 @@ pub(crate) const ResponsesWriter: ResponsesWriter = ResponsesWriter {
     response_id: std::sync::Mutex::new(None),
     open_tool_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
     open_text_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+    item_ids: std::sync::Mutex::new(std::collections::BTreeMap::new()),
 };
 
 impl Clone for ResponsesWriter {
@@ -1086,6 +1153,12 @@ impl Clone for ResponsesWriter {
                     .map(|set| set.clone())
                     .unwrap_or_default(),
             ),
+            // Carry the minted `item_id` cache across a mid-stream `Protocol::clone` so the cloned
+            // writer keeps emitting the SAME opaque id for an already-opened item's remaining
+            // lifecycle frames; a poisoned lock degrades to an empty cache (later refs re-mint).
+            item_ids: std::sync::Mutex::new(
+                self.item_ids.lock().map(|m| m.clone()).unwrap_or_default(),
+            ),
         }
     }
 }
@@ -1103,6 +1176,11 @@ impl ResponsesWriter {
         }
         if let Ok(mut set) = self.open_text_indices.lock() {
             set.clear();
+        }
+        // Clear the per-stream `item_id` cache so a reused/cloned writer mints fresh opaque ids for
+        // the new stream rather than replaying a previous stream's item ids.
+        if let Ok(mut map) = self.item_ids.lock() {
+            map.clear();
         }
         // Clear the carried `response.id` alongside the sequence counter: a reused/cloned writer
         // must not leak a previous stream's id onto a new stream's terminal events. The new id is
@@ -1185,6 +1263,23 @@ impl ResponsesWriter {
             .lock()
             .map(|mut set| set.remove(&index))
             .unwrap_or(false)
+    }
+
+    /// Return the stream-stable opaque `item_id` for the output item identified by
+    /// `(prefix, index)`, minting a fresh CSPRNG-backed token on first reference and returning the
+    /// cached one thereafter. This is what keeps the `output_item.added → delta* → output_item.done`
+    /// frames of a single item sharing one `item_id` (the SDK's lifecycle-correlation key) while the
+    /// id itself stays opaque — no positional/sequential structure for an observer to fingerprint.
+    /// A poisoned lock degrades to a freshly-minted opaque id (still structurally native, just not
+    /// cached) rather than panicking on the request path.
+    fn item_id_for(&self, prefix: &'static str, index: usize) -> String {
+        match self.item_ids.lock() {
+            Ok(mut map) => map
+                .entry((prefix, index))
+                .or_insert_with(|| synthesize_item_id(prefix))
+                .clone(),
+            Err(_) => synthesize_item_id(prefix),
+        }
     }
 }
 
@@ -1461,7 +1556,7 @@ impl ProtocolWriter for ResponsesWriter {
                     if !self.open_text_item(*index) {
                         return None;
                     }
-                    let item_id = synthesize_item_id("msg", *index);
+                    let item_id = self.item_id_for("msg", *index);
                     Some((
                         "response.output_item.added".to_string(),
                         serde_json::json!({
@@ -1483,7 +1578,7 @@ impl ProtocolWriter for ResponsesWriter {
                     // carried on the native `output_item.added`/`.done` pair so a client correlates the
                     // item's lifecycle. Synthesize it deterministically from the output index so the
                     // matching `.done` (which sees only the index) reconstructs the same id.
-                    let item_id = synthesize_item_id("fc", *index);
+                    let item_id = self.item_id_for("fc", *index);
                     // Record the open function-call index so the matching `BlockStop` emits
                     // `output_item.done` for THIS index only — a text block's BlockStop (whose
                     // BlockStart produced no `output_item.added`) must emit no `done`.
@@ -1518,7 +1613,7 @@ impl ProtocolWriter for ResponsesWriter {
                         serde_json::json!({
                             "type": "response.output_text.delta",
                             "output_index": index,
-                            "item_id": synthesize_item_id("msg", *index),
+                            "item_id": self.item_id_for("msg", *index),
                             "content_index": 0,
                             "delta": text
                         }),
@@ -1529,7 +1624,7 @@ impl ProtocolWriter for ResponsesWriter {
                     serde_json::json!({
                         "type": "response.function_call_arguments.delta",
                         "output_index": index,
-                        "item_id": synthesize_item_id("fc", *index),
+                        "item_id": self.item_id_for("fc", *index),
                         "delta": json_str
                     }),
                 )),
@@ -1565,9 +1660,9 @@ impl ProtocolWriter for ResponsesWriter {
                     // Native `response.output_item.done` carries the SAME stable `item_id` as the
                     // matching `output_item.added` (so a client correlates the `added → done`
                     // lifecycle) plus the finalized `item` object (a typed SDK reads `event.item`).
-                    // The function-call `output_item.added` used `synthesize_item_id("fc", index)`,
-                    // so the same deterministic id reconstructs the matching pair here.
-                    let item_id = synthesize_item_id("fc", *index);
+                    // The function-call `output_item.added` used `item_id_for("fc", index)`,
+                    // so the cached id reconstructs the matching pair here.
+                    let item_id = self.item_id_for("fc", *index);
                     Some((
                         "response.output_item.done".to_string(),
                         serde_json::json!({
@@ -1581,10 +1676,10 @@ impl ProtocolWriter for ResponsesWriter {
                         }),
                     ))
                 } else if self.take_text_open(*index) {
-                    // Close the message item opened by the Text BlockStart. The same deterministic
-                    // `msg_…` id (also carried on every `output_text.delta`) reconstructs the
-                    // matching `added → done` pair the SDK uses to finalize `response.output[]`.
-                    let item_id = synthesize_item_id("msg", *index);
+                    // Close the message item opened by the Text BlockStart. The same cached `msg_…`
+                    // id (also carried on every `output_text.delta`) reconstructs the matching
+                    // `added → done` pair the SDK uses to finalize `response.output[]`.
+                    let item_id = self.item_id_for("msg", *index);
                     Some((
                         "response.output_item.done".to_string(),
                         serde_json::json!({
@@ -1672,11 +1767,26 @@ impl ProtocolWriter for ResponsesWriter {
                 );
                 resp_obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
 
-                // `status` is now always `completed`/`incomplete` (genuine failures arrive via
-                // IrStreamEvent::Error, never here), so the terminal event is `response.completed`.
+                // The terminal event's NAME and inner `type` MUST agree with the inner
+                // `response.status`: a native /v1/responses stream emits `response.completed` for a
+                // completed response and a DISTINCT `response.incomplete` for a truncated/safety-
+                // stopped one, and the official Python/Node SDKs dispatch on the event `type`
+                // (`ResponseCompletedEvent` vs `ResponseIncompleteEvent`). Emitting a
+                // `response.completed` envelope around an inner `status:"incomplete"` (plus
+                // `incomplete_details`) is a shape impossible from real OpenAI and mislabels a
+                // max_tokens-truncated or safety-stopped generation to the client. So select the
+                // envelope from `status`. `status` is only ever `completed`/`incomplete` here
+                // (genuine failures arrive via IrStreamEvent::Error → `response.failed`, never this
+                // arm); the match is over those two with a defensive fallback to `completed` for any
+                // future status string, never a `response.failed` (which would invent a failure).
+                let (event_name, event_type) = match status {
+                    "incomplete" => ("response.incomplete", "response.incomplete"),
+                    "completed" => ("response.completed", "response.completed"),
+                    _ => ("response.completed", "response.completed"),
+                };
                 Some((
-                    "response.completed".to_string(),
-                    serde_json::json!({ "type": "response.completed", "response": resp_obj }),
+                    event_name.to_string(),
+                    serde_json::json!({ "type": event_type, "response": resp_obj }),
                 ))
             }
 
@@ -1874,6 +1984,16 @@ impl ProtocolWriter for ResponsesWriter {
             "not_found" | "not_found_error" => "not_found_error",
             "rate_limit" | "rate_limit_error" => "rate_limit_error",
             "server_error" | "internal" | "internal_error" => "server_error",
+            // A 503 exhaustion/timeout is reported by forward.rs as kind `"overloaded"` (an
+            // Anthropic-vocabulary token). The OpenAI/Responses error vocabulary has no
+            // `overloaded` type — a 5xx is `server_error` — so without this arm `other => other`
+            // would leak `{"error":{"type":"overloaded",...}}` to an OpenAI-family client on every
+            // exhaustion/timeout, a non-native type and a deterministic cross-protocol tell. Map the
+            // overloaded/unavailable family onto the native `server_error`. Same class as the OpenAI
+            // writer's 5xx bucket.
+            "overloaded" | "overloaded_error" | "service_unavailable" | "unavailable" => {
+                "server_error"
+            }
             "billing" | "insufficient_quota" => "insufficient_quota",
             other => other,
         };
@@ -4452,5 +4572,266 @@ mod tests {
             opened <= MAX_OPEN_TOOLS,
             "writer must open at most MAX_OPEN_TOOLS text items, opened {opened}"
         );
+    }
+
+    /// Regression (HIGH/conformance, Round 11): a max_tokens-truncated stream's terminal event must
+    /// be `response.incomplete` (event name AND inner `type`), NOT `response.completed`. A native
+    /// stream never wraps a `status:"incomplete"` response in a `response.completed` envelope; the
+    /// SDKs dispatch on the event `type`, so the previous always-`response.completed` arm mislabelled
+    /// every truncated generation.
+    #[test]
+    fn test_terminal_incomplete_emits_response_incomplete_for_max_tokens() {
+        let writer = ResponsesWriter;
+        let _ = writer.write_response_event(&IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        });
+        let (etype, body) = writer
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("max_tokens".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            })
+            .expect("MessageDelta emits a terminal event");
+        assert_eq!(
+            etype, "response.incomplete",
+            "max_tokens truncation must use the response.incomplete event name"
+        );
+        assert_eq!(
+            body["type"].as_str(),
+            Some("response.incomplete"),
+            "inner dispatch type must agree with the event name"
+        );
+        assert_eq!(
+            body["response"]["status"].as_str(),
+            Some("incomplete"),
+            "inner status stays incomplete"
+        );
+        assert_eq!(
+            body["response"]["incomplete_details"]["reason"].as_str(),
+            Some("max_output_tokens"),
+            "incomplete_details.reason maps max_tokens → max_output_tokens"
+        );
+    }
+
+    /// Regression (HIGH/conformance, Round 11): a safety/content-filter stop is also `incomplete`,
+    /// so its terminal event is `response.incomplete` with reason `content_filter`.
+    #[test]
+    fn test_terminal_incomplete_emits_response_incomplete_for_safety() {
+        let writer = ResponsesWriter;
+        let _ = writer.write_response_event(&IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        });
+        let (etype, body) = writer
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("safety".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            })
+            .expect("MessageDelta emits a terminal event");
+        assert_eq!(etype, "response.incomplete");
+        assert_eq!(body["type"].as_str(), Some("response.incomplete"));
+        assert_eq!(
+            body["response"]["incomplete_details"]["reason"].as_str(),
+            Some("content_filter")
+        );
+    }
+
+    /// Regression (HIGH/conformance, Round 11): a normally-completed stream still emits
+    /// `response.completed` with inner type/status `completed` — the fix must not regress the
+    /// success path. The carried id must still match `response.created`.
+    #[test]
+    fn test_terminal_completed_unchanged_for_end_turn() {
+        let writer = ResponsesWriter;
+        let (_, created) = writer
+            .write_response_event(&IrStreamEvent::MessageStart {
+                role: crate::ir::IrRole::Assistant,
+                usage: None,
+                id: None,
+                created: None,
+                model: None,
+            })
+            .expect("created");
+        let created_id = created["response"]["id"].as_str().unwrap().to_string();
+        let (etype, body) = writer
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            })
+            .expect("terminal");
+        assert_eq!(etype, "response.completed");
+        assert_eq!(body["type"].as_str(), Some("response.completed"));
+        assert_eq!(body["response"]["status"].as_str(), Some("completed"));
+        assert!(body["response"].get("incomplete_details").is_none());
+        assert_eq!(body["response"]["id"].as_str(), Some(created_id.as_str()));
+    }
+
+    /// Regression (HIGH/conformance, Round 11): write_error must NOT leak the Anthropic-vocabulary
+    /// `overloaded` type to an OpenAI-family client. A 503 exhaustion/timeout (forward.rs passes
+    /// kind `"overloaded"`) maps onto the native `server_error`.
+    #[test]
+    fn test_write_error_maps_overloaded_to_server_error() {
+        let writer = ResponsesWriter;
+        for kind in [
+            "overloaded",
+            "overloaded_error",
+            "service_unavailable",
+            "unavailable",
+        ] {
+            let v = writer.write_error(503, kind, "upstream busy");
+            assert_eq!(
+                v["error"]["type"].as_str(),
+                Some("server_error"),
+                "kind {kind:?} must map to server_error, never leak overloaded"
+            );
+            // `server_error` carries no machine-readable code in the native shape.
+            assert!(v["error"]["code"].is_null(), "server_error code is null");
+        }
+    }
+
+    /// Regression (MEDIUM/security, Round 11): synthesized `resp_` ids must be opaque base62 of
+    /// native length with NO embedded timestamp or sequential structure, so an observer cannot
+    /// fingerprint a proxied response or extract the server clock from the id.
+    #[test]
+    fn test_synthesize_response_id_is_opaque_native_length() {
+        let id = synthesize_response_id();
+        let suffix = id.strip_prefix("resp_").expect("resp_ prefix");
+        assert_eq!(
+            suffix.len(),
+            RESPONSE_ID_TOKEN_LEN,
+            "native-length suffix: {id}"
+        );
+        assert!(
+            suffix.len() >= 38,
+            "at least the native ~38-char profile: {id}"
+        );
+        assert!(
+            suffix.bytes().all(|b| b.is_ascii_alphanumeric()),
+            "opaque base62 suffix only: {id}"
+        );
+        // Exactly one delimiter (the prefix's underscore) — no internal timestamp/counter fields.
+        assert_eq!(
+            id.matches('_').count(),
+            1,
+            "no internal field delimiter: {id}"
+        );
+    }
+
+    /// Regression (MEDIUM/security, Round 11): synthesized `msg_`/`fc_` item ids must be opaque
+    /// base62 of native length, NOT the old sequential `msg_00000000` positional hex.
+    #[test]
+    fn test_synthesize_item_id_is_opaque_native_length() {
+        for prefix in ["msg", "fc"] {
+            let id = synthesize_item_id(prefix);
+            let suffix = id
+                .strip_prefix(&format!("{prefix}_"))
+                .expect("prefix present");
+            assert_eq!(
+                suffix.len(),
+                ITEM_ID_TOKEN_LEN,
+                "native-length suffix: {id}"
+            );
+            assert!(
+                suffix.bytes().all(|b| b.is_ascii_alphanumeric()),
+                "opaque base62 suffix: {id}"
+            );
+            // The old form was zero-padded hex (all low chars); assert it is no longer a pure
+            // zero-prefixed positional counter by requiring it differ from the sequential shape.
+            assert_ne!(
+                suffix,
+                "0".repeat(ITEM_ID_TOKEN_LEN),
+                "not all-zero positional: {id}"
+            );
+        }
+    }
+
+    /// Synthesized ids must be unique across calls even in a tight loop (the monotonic counter folded
+    /// into the token guarantees this independent of the RNG).
+    #[test]
+    fn test_synthesized_ids_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            assert!(seen.insert(synthesize_response_id()), "duplicate resp_ id");
+            assert!(seen.insert(synthesize_item_id("msg")), "duplicate msg_ id");
+        }
+    }
+
+    /// The writer's `item_id_for` cache must return the SAME opaque id for a `(prefix, index)` across
+    /// the item's lifecycle (so `output_item.added`/delta/`output_item.done` correlate), distinct ids
+    /// for different indices, and a fresh id for a new stream after `reset_sequence_number`.
+    #[test]
+    fn test_item_id_for_is_stream_stable_and_opaque() {
+        let writer = ResponsesWriter;
+        let a1 = writer.item_id_for("msg", 0);
+        let a2 = writer.item_id_for("msg", 0);
+        assert_eq!(
+            a1, a2,
+            "same (prefix,index) yields a stable id within a stream"
+        );
+        assert!(a1.starts_with("msg_"));
+        let b = writer.item_id_for("msg", 1);
+        assert_ne!(a1, b, "different indices get distinct ids");
+        let fc = writer.item_id_for("fc", 0);
+        assert_ne!(
+            a1, fc,
+            "different prefixes at the same index get distinct ids"
+        );
+        assert!(fc.starts_with("fc_"));
+
+        // A new stream (reset) mints a fresh id for the same key.
+        writer.reset_sequence_number();
+        let a_after = writer.item_id_for("msg", 0);
+        assert_ne!(
+            a1, a_after,
+            "a reused writer must not replay a previous stream's item id"
+        );
+    }
+
+    /// Full streamed text item: the `output_item.added`, every `output_text.delta`, and the closing
+    /// `output_item.done` must all carry the SAME `item_id` so a typed SDK correlates the lifecycle.
+    #[test]
+    fn test_streamed_text_item_shares_one_item_id() {
+        let writer = ResponsesWriter;
+        let _ = writer.write_response_event(&IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        });
+        let (_, added) = writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::Text,
+            })
+            .expect("output_item.added");
+        let added_id = added["item_id"].as_str().unwrap().to_string();
+        assert!(added_id.starts_with("msg_"));
+
+        let (_, delta) = writer
+            .write_response_event(&IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::TextDelta("hello".to_string()),
+            })
+            .expect("output_text.delta");
+        assert_eq!(delta["item_id"].as_str(), Some(added_id.as_str()));
+
+        let (_, done) = writer
+            .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
+            .expect("output_item.done");
+        assert_eq!(
+            done["item_id"].as_str(),
+            Some(added_id.as_str()),
+            "added/delta/done must share one item_id"
+        );
+        assert_eq!(done["item"]["id"].as_str(), Some(added_id.as_str()));
     }
 }
