@@ -25,11 +25,22 @@ fn modeled_request_keys() -> &'static std::collections::HashSet<&'static str> {
     static MODELED_KEYS: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
         std::sync::OnceLock::new();
     MODELED_KEYS.get_or_init(|| {
+        // NB: `generationConfig` is deliberately ABSENT. The reader promotes 5 of its sub-fields
+        // (`maxOutputTokens`/`temperature`/`topP`/`topK`/`stopSequences`) into typed IR fields, but
+        // a native Gemini client may also send unmodeled sub-fields (`responseMimeType` for JSON
+        // mode, `thinkingConfig` for extended thinking, `candidateCount`, `seed`,
+        // `presence/frequencyPenalty`, `responseModalities`, `speechConfig`, …). Were
+        // `generationConfig` modeled-out of `extra`, the writer — which rebuilds it from only the 5
+        // typed fields — would SILENTLY DROP every unmodeled sub-field on cross-protocol ingress.
+        // Keeping the raw `generationConfig` object in `extra` lets the writer OVERLAY the 5 typed
+        // fields onto the original object (the same pattern `BedrockWriter` uses for
+        // `inferenceConfig`), preserving unknown sub-fields. Same-protocol Gemini→Gemini is
+        // unaffected (byte-identical), and the cross-protocol seam (`forward.rs ir.extra.clear()`)
+        // still prevents foreign Gemini sub-fields from leaking onto a non-Gemini backend.
         [
             "contents",
             "tools",
             "systemInstruction",
-            "generationConfig",
             "model",
             crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY,
         ]
@@ -1161,8 +1172,22 @@ impl ProtocolWriter for GeminiWriter {
             );
         }
 
-        // generationConfig{maxOutputTokens, temperature, topP, topK, stopSequences}
-        let mut gen_config = serde_json::Map::new();
+        // generationConfig{maxOutputTokens, temperature, topP, topK, stopSequences, …}
+        //
+        // Start from the RAW `generationConfig` the reader preserved in `extra` (if any) so any
+        // unmodeled sub-field — `responseMimeType` (JSON mode), `thinkingConfig` (extended-thinking
+        // budget), `candidateCount`, `seed`, `presencePenalty`, `frequencyPenalty`,
+        // `responseModalities`, `speechConfig`, `routingConfig`, … — survives, then OVERLAY the 5
+        // typed IR fields on top. This mirrors `BedrockWriter`'s `inferenceConfig` overlay. On
+        // same-protocol Gemini→Gemini the overlay reproduces the original values byte-for-byte; on
+        // cross-protocol egress `extra` is already cleared at the forward seam, so this object holds
+        // only the 5 typed fields and no foreign Gemini sub-field leaks to a non-Gemini backend.
+        let mut gen_config = req
+            .extra
+            .get("generationConfig")
+            .and_then(|gc| gc.as_object())
+            .cloned()
+            .unwrap_or_default();
         if let Some(max_tokens) = req.max_tokens {
             gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(max_tokens));
         }
@@ -1198,8 +1223,14 @@ impl ProtocolWriter for GeminiWriter {
         // `stream` before the upstream call. (An earlier version of this comment wrongly claimed the
         // reader excludes `stream` via `modeled_keys`; it does not — the accurate behavior is here.)
 
-        // Merge extra fields (may override, but that's expected behavior)
+        // Merge extra fields (may override, but that's expected behavior). `generationConfig` is
+        // SKIPPED here: its raw `extra` copy was already folded into the typed-overlay `gen_config`
+        // object emitted above, so re-inserting the raw copy would clobber the merge and drop the 5
+        // typed overlays. Every OTHER unmodeled top-level key still round-trips verbatim.
         for (key, value) in &req.extra {
+            if key == "generationConfig" {
+                continue;
+            }
             out.insert(key.clone(), value.clone());
         }
 
@@ -1241,6 +1272,10 @@ impl ProtocolWriter for GeminiWriter {
 
         // Map busbar/router `kind` categories onto google.rpc.Code names where one exists. An
         // unknown `kind` yields `None` so the HTTP-status mapping (always defined) is authoritative.
+        // `overloaded` (no `_error` suffix) is the bare alias `forward.rs::cross_protocol_error_kind`
+        // emits for a relayed upstream 503 — it MUST map to UNAVAILABLE alongside `overloaded_error`,
+        // otherwise a cross-protocol 503 fell through to `None` and (when the status arm below was
+        // bypassed) could surface the wrong code/status pairing.
         fn status_name_for_kind(kind: &str) -> Option<&'static str> {
             match kind {
                 "invalid_request_error" | "invalid_argument" | "bad_request" => {
@@ -1252,7 +1287,7 @@ impl ProtocolWriter for GeminiWriter {
                 "rate_limit_error" | "resource_exhausted" | "rate_limit" => {
                     Some("RESOURCE_EXHAUSTED")
                 }
-                "overloaded_error" | "unavailable" => Some("UNAVAILABLE"),
+                "overloaded_error" | "overloaded" | "unavailable" => Some("UNAVAILABLE"),
                 "deadline_exceeded" | "timeout" => Some("DEADLINE_EXCEEDED"),
                 "api_error" | "internal" | "server_error" => Some("INTERNAL"),
                 "unimplemented" | "not_implemented" => Some("UNIMPLEMENTED"),
@@ -1260,7 +1295,36 @@ impl ProtocolWriter for GeminiWriter {
             }
         }
 
-        let status_str = status_name_for_kind(kind).unwrap_or_else(|| status_name_for_http(status));
+        // Canonical HTTP status a google.rpc.Code name pairs with — the inverse of
+        // `status_name_for_http`. Used to detect a code/status DISAGREEMENT: the real Generative
+        // Language API never emits, e.g., `code:503` with `status:INTERNAL` (INTERNAL pairs with
+        // 500; UNAVAILABLE pairs with 503). Exhaustive over the names `status_name_for_kind` can
+        // return (no `_ =>` collapse) so a new kind→name arm forces a conscious choice here.
+        fn http_for_status_name(name: &str) -> Option<u16> {
+            match name {
+                "INVALID_ARGUMENT" => Some(400),
+                "UNAUTHENTICATED" => Some(401),
+                "PERMISSION_DENIED" => Some(403),
+                "NOT_FOUND" => Some(404),
+                "RESOURCE_EXHAUSTED" => Some(429),
+                "UNAVAILABLE" => Some(503),
+                "DEADLINE_EXCEEDED" => Some(504),
+                "INTERNAL" => Some(500),
+                "UNIMPLEMENTED" => Some(501),
+                _ => None,
+            }
+        }
+
+        // Prefer the `kind`-derived google.rpc.Code name ONLY when it is internally CONSISTENT with
+        // the emitted `code` (the HTTP status). On a cross-protocol upstream 5xx the relay collapses
+        // distinct subtypes onto a single `kind` (e.g. a 503 relayed as `api_error`→INTERNAL), which
+        // would emit a `code:503 / status:INTERNAL` pair the real API never produces — a
+        // distinguishability tell. When the kind-derived name's canonical HTTP status disagrees with
+        // `status`, the HTTP status drives the code/status pairing so the two always stay consistent.
+        let status_str = match status_name_for_kind(kind) {
+            Some(name) if http_for_status_name(name) == Some(status) => name,
+            _ => status_name_for_http(status),
+        };
 
         serde_json::json!({
             "error": {
@@ -2286,6 +2350,46 @@ mod tests {
         assert_eq!(v["error"]["status"], serde_json::json!("INTERNAL"));
     }
 
+    /// Regression (R15): the emitted `code`/`status` pair must always be an INTERNALLY CONSISTENT
+    /// google.rpc.Status pairing — the real Generative Language API never emits `code:503` with
+    /// `status:INTERNAL`. On a cross-protocol upstream 503 the relay collapses the subtype onto a
+    /// generic 5xx `kind` (`api_error`→INTERNAL); when that kind-derived name's canonical HTTP status
+    /// disagrees with the actual `code`, the HTTP status drives the pairing (503→UNAVAILABLE) so the
+    /// two stay consistent. The bare `overloaded` alias `cross_protocol_error_kind` emits for a 503
+    /// also resolves to UNAVAILABLE.
+    #[test]
+    fn test_write_error_code_status_pair_stays_consistent() {
+        let writer = GeminiWriter;
+
+        // 503 relayed as the generic `api_error` kind (would have been INTERNAL) → HTTP status wins.
+        let v = writer.write_error(503, "api_error", "upstream overloaded");
+        assert_eq!(v["error"]["code"], serde_json::json!(503));
+        assert_eq!(
+            v["error"]["status"],
+            serde_json::json!("UNAVAILABLE"),
+            "code:503 must pair with UNAVAILABLE, never INTERNAL: {v}"
+        );
+
+        // The bare `overloaded` alias (cross_protocol_error_kind's 503 kind) maps to UNAVAILABLE.
+        let v = writer.write_error(503, "overloaded", "upstream overloaded");
+        assert_eq!(v["error"]["status"], serde_json::json!("UNAVAILABLE"));
+
+        // A genuine 500 with `api_error` stays INTERNAL (consistent: INTERNAL pairs with 500).
+        let v = writer.write_error(500, "api_error", "boom");
+        assert_eq!(v["error"]["code"], serde_json::json!(500));
+        assert_eq!(v["error"]["status"], serde_json::json!("INTERNAL"));
+
+        // A 504 relayed as `timeout` stays DEADLINE_EXCEEDED (canonical 504 == 504).
+        let v = writer.write_error(504, "timeout", "slow");
+        assert_eq!(v["error"]["status"], serde_json::json!("DEADLINE_EXCEEDED"));
+
+        // A kind whose canonical status disagrees with the code (auth→401 vs code 403) lets the HTTP
+        // status drive so the pair stays a real google.rpc pairing (403→PERMISSION_DENIED).
+        let v = writer.write_error(403, "auth", "denied");
+        assert_eq!(v["error"]["code"], serde_json::json!(403));
+        assert_eq!(v["error"]["status"], serde_json::json!("PERMISSION_DENIED"));
+    }
+
     /// Same-protocol (Gemini→Gemini) passthrough preserves the upstream `responseId` and
     /// `modelVersion` exactly: read_response captures them, write_response emits them verbatim.
     #[test]
@@ -3075,6 +3179,116 @@ mod tests {
         );
     }
 
+    /// Regression (R15): unmodeled `generationConfig` sub-fields (`responseMimeType` for JSON mode,
+    /// `thinkingConfig` for extended thinking, `candidateCount`, `seed`, …) MUST survive read→write
+    /// instead of being silently dropped. The reader keeps the raw `generationConfig` in `extra`; the
+    /// writer overlays the 5 typed fields onto it. Both the typed fields AND every unmodeled sub-field
+    /// must appear on the re-emitted body.
+    #[test]
+    fn test_generation_config_unmodeled_subfields_survive_roundtrip() {
+        let reader = GeminiReader;
+        let writer = GeminiWriter;
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "maxOutputTokens": 256,
+                "temperature": 0.3,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingBudget": 1024},
+                "candidateCount": 2,
+                "seed": 42
+            }
+        });
+
+        let ir = reader.read_request(&body).expect("read_request");
+        // The raw generationConfig is preserved in extra (not modeled-out).
+        assert!(
+            ir.extra.contains_key("generationConfig"),
+            "raw generationConfig must be preserved in extra: {:?}",
+            ir.extra
+        );
+        // The 5 typed sub-fields are still promoted.
+        assert_eq!(ir.max_tokens, Some(256));
+        assert_eq!(ir.temperature, Some(0.3));
+
+        let wire = writer.write_request(&ir);
+        let gc = wire
+            .get("generationConfig")
+            .and_then(|g| g.as_object())
+            .expect("generationConfig must be emitted");
+        // Typed overlays present.
+        assert_eq!(gc.get("maxOutputTokens"), Some(&serde_json::json!(256)));
+        assert_eq!(gc.get("temperature"), Some(&serde_json::json!(0.3)));
+        // Unmodeled sub-fields preserved (the defect was silently dropping these).
+        assert_eq!(
+            gc.get("responseMimeType"),
+            Some(&serde_json::json!("application/json")),
+            "responseMimeType (JSON mode) must survive: {wire}"
+        );
+        assert_eq!(
+            gc.get("thinkingConfig"),
+            Some(&serde_json::json!({"thinkingBudget": 1024})),
+            "thinkingConfig (extended thinking) must survive: {wire}"
+        );
+        assert_eq!(gc.get("candidateCount"), Some(&serde_json::json!(2)));
+        assert_eq!(gc.get("seed"), Some(&serde_json::json!(42)));
+        // The raw generationConfig must NOT also appear as a duplicate top-level extra echo (the
+        // writer skips it in the extra merge loop).
+        assert_eq!(
+            wire.as_object()
+                .map(|o| o.keys().filter(|k| *k == "generationConfig").count()),
+            Some(1),
+            "generationConfig must appear exactly once: {wire}"
+        );
+    }
+
+    /// Regression (R15): the typed IR fields OVERLAY the raw extra copy — if the IR's typed
+    /// `max_tokens` differs from the raw `generationConfig.maxOutputTokens` (e.g. a cross-protocol
+    /// edit), the typed value wins, mirroring BedrockWriter's inferenceConfig overlay.
+    #[test]
+    fn test_generation_config_typed_fields_override_raw_extra() {
+        let writer = GeminiWriter;
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "generationConfig".to_string(),
+            serde_json::json!({"maxOutputTokens": 100, "responseMimeType": "text/plain"}),
+        );
+        let ir = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: Some(999),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: Vec::new(),
+            stream: false,
+            extra,
+        };
+        let wire = writer.write_request(&ir);
+        let gc = wire
+            .get("generationConfig")
+            .and_then(|g| g.as_object())
+            .expect("generationConfig must be emitted");
+        assert_eq!(
+            gc.get("maxOutputTokens"),
+            Some(&serde_json::json!(999)),
+            "typed max_tokens must overlay the raw extra value: {wire}"
+        );
+        assert_eq!(
+            gc.get("responseMimeType"),
+            Some(&serde_json::json!("text/plain")),
+            "unmodeled sub-field must survive the overlay: {wire}"
+        );
+    }
+
     // --- Round 3 fix 4: streamed and whole-body usageMetadata include totalTokenCount ---
 
     /// Regression: the streamed `MessageDelta` usage frame must include `totalTokenCount`
@@ -3338,7 +3552,6 @@ mod tests {
             "contents",
             "tools",
             "systemInstruction",
-            "generationConfig",
             "model",
             crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY,
         ] {
@@ -3346,6 +3559,12 @@ mod tests {
         }
         // An arbitrary caller field is NOT modeled, so the reader sweeps it into `extra`.
         assert!(!a.contains("toolConfig"), "toolConfig must not be modeled");
+        // `generationConfig` is INTENTIONALLY not modeled-out of `extra`: the reader keeps the raw
+        // object so the writer can overlay the 5 typed fields and preserve unmodeled sub-fields.
+        assert!(
+            !a.contains("generationConfig"),
+            "generationConfig must NOT be modeled-out of extra (raw object is preserved for overlay)"
+        );
     }
 
     /// Regression (R9): hoisting the set must not change read behavior — an unmodeled top-level key

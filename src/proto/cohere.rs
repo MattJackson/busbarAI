@@ -1326,7 +1326,13 @@ impl ProtocolWriter for CohereWriter {
                 stop_sequence: _,
             } => {
                 let cohere_finish_reason = match stop_reason.as_deref() {
-                    Some("end_turn") | Some("stop_sequence") => "COMPLETE".to_string(),
+                    Some("end_turn") => "COMPLETE".to_string(),
+                    // A stop sequence firing is a DISTINCT native Cohere stop condition from a
+                    // normal end-of-turn; write back the native `STOP_SEQUENCE` so the reader's
+                    // `STOP_SEQUENCE` -> IR `stop_sequence` mapping round-trips symmetrically and a
+                    // Cohere client inspecting `finish_reason` sees the real stop condition instead
+                    // of a masked `COMPLETE` (the conformance finding).
+                    Some("stop_sequence") => "STOP_SEQUENCE".to_string(),
                     Some("max_tokens") => "MAX_TOKENS".to_string(),
                     Some("tool_use") => "TOOL_CALL".to_string(),
                     // IR `safety` is Cohere's content-moderation stop. The reader normalises BOTH
@@ -1399,7 +1405,13 @@ impl ProtocolWriter for CohereWriter {
         }
 
         let cohere_finish_reason = match resp.stop_reason.as_deref() {
-            Some("end_turn") | Some("stop_sequence") => "COMPLETE".to_string(),
+            Some("end_turn") => "COMPLETE".to_string(),
+            // A stop sequence firing is a DISTINCT native Cohere stop condition from a normal
+            // end-of-turn; write back the native `STOP_SEQUENCE` so the reader's `STOP_SEQUENCE`
+            // -> IR `stop_sequence` mapping round-trips symmetrically and a Cohere client inspecting
+            // `finish_reason` sees the real stop condition instead of a masked `COMPLETE` (the
+            // conformance finding).
+            Some("stop_sequence") => "STOP_SEQUENCE".to_string(),
             Some("max_tokens") => "MAX_TOKENS".to_string(),
             Some("tool_use") => "TOOL_CALL".to_string(),
             // See the streaming path: IR `safety` writes back as `ERROR_TOXIC` (the native
@@ -3736,6 +3748,125 @@ mod tests {
             second.get("type").and_then(|t| t.as_str()),
             Some("content-end"),
             "a tool index consumed on first close must not re-report tool-call-end"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance): the non-streaming `write_response` path must write IR
+    /// `stop_reason = "stop_sequence"` back as the native `STOP_SEQUENCE`, NOT `COMPLETE`. The
+    /// reader maps `STOP_SEQUENCE` -> IR `stop_sequence` and `COMPLETE` -> IR `end_turn`, so
+    /// collapsing both IR reasons onto `COMPLETE` made the round-trip asymmetric and masked a
+    /// stop-sequence stop as a normal end-of-turn for a Cohere client.
+    #[test]
+    fn test_write_response_stop_sequence_maps_to_stop_sequence() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("stop_sequence".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: Some("c14c80c3-18eb-4519-9460-6c92edd8cfb4".to_string()),
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let writer = CohereWriter;
+        let out = writer.write_response(&resp);
+        assert_eq!(
+            out.get("finish_reason").and_then(|r| r.as_str()),
+            Some("STOP_SEQUENCE"),
+            "IR stop_sequence must serialize as native STOP_SEQUENCE, not COMPLETE"
+        );
+    }
+
+    /// Companion: IR `end_turn` still maps to `COMPLETE` (the split must not regress the normal
+    /// end-of-turn case).
+    #[test]
+    fn test_write_response_end_turn_maps_to_complete() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: Some("c14c80c3-18eb-4519-9460-6c92edd8cfb4".to_string()),
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let writer = CohereWriter;
+        let out = writer.write_response(&resp);
+        assert_eq!(
+            out.get("finish_reason").and_then(|r| r.as_str()),
+            Some("COMPLETE")
+        );
+    }
+
+    /// Regression (MEDIUM/conformance): the streaming `MessageDelta` path must likewise write IR
+    /// `stop_sequence` back as native `STOP_SEQUENCE` (not `COMPLETE`) in the message-end frame.
+    #[test]
+    fn test_stream_message_delta_stop_sequence_maps_to_stop_sequence() {
+        let writer = CohereWriter;
+        let (_, frame) = writer
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("stop_sequence".to_string()),
+                stop_sequence: None,
+                usage: crate::ir::IrUsage {
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            })
+            .expect("message-end frame");
+        assert_eq!(
+            frame
+                .get("delta")
+                .and_then(|d| d.get("finish_reason"))
+                .and_then(|r| r.as_str()),
+            Some("STOP_SEQUENCE"),
+            "streamed IR stop_sequence must serialize as native STOP_SEQUENCE, not COMPLETE"
+        );
+    }
+
+    /// Full round-trip: a native Cohere `STOP_SEQUENCE` read into IR must write back as
+    /// `STOP_SEQUENCE` through both response paths — proving the reader/writer mapping is now
+    /// symmetric for stop-sequence stops (the asymmetry the finding flagged).
+    #[test]
+    fn test_stop_sequence_roundtrips_symmetrically() {
+        let reader = CohereReader;
+        let native = serde_json::json!({
+            "id": "c14c80c3-18eb-4519-9460-6c92edd8cfb4",
+            "finish_reason": "STOP_SEQUENCE",
+            "message": { "role": "assistant", "content": [{ "type": "text", "text": "x" }] },
+            "usage": { "tokens": { "input_tokens": 1, "output_tokens": 1 } }
+        });
+        let ir = reader.read_response(&native).expect("read native response");
+        assert_eq!(ir.stop_reason.as_deref(), Some("stop_sequence"));
+
+        let writer = CohereWriter;
+        let out = writer.write_response(&ir);
+        assert_eq!(
+            out.get("finish_reason").and_then(|r| r.as_str()),
+            Some("STOP_SEQUENCE"),
+            "STOP_SEQUENCE must survive a Cohere -> IR -> Cohere round-trip unchanged"
         );
     }
 }

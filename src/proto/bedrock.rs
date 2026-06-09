@@ -433,11 +433,22 @@ impl ProtocolReader for BedrockReader {
         // Bedrock->Bedrock passthrough re-emit `stopSequences`/`topP`/`topK` faithfully.
         // The modeled top-level keys this reader handles structurally (so they must NOT be swept into
         // `extra`). Held as a sorted `&'static` slice and probed with `binary_search`: a fixed,
-        // five-element membership set that was previously a `HashSet` rebuilt (and heap-allocated) on
+        // four-element membership set that was previously a `HashSet` rebuilt (and heap-allocated) on
         // every `read_request` call on the Bedrock ingress hot path. A sorted-slice binary search is
         // allocation-free and faster than hashing for a set this small. MUST stay sorted for
         // `binary_search` — keep alphabetical when editing.
-        const MODELED_KEYS: &[&str] = &["messages", "model", "stream", "system", "toolConfig"];
+        // NOTE: `toolConfig` is DELIBERATELY NOT modeled-out here (mirroring `inferenceConfig`). This
+        // reader only typed ONE of its sub-fields — `tools` (extracted into `ir.tools` below) — while
+        // the rest, notably `toolChoice` (`{auto:{}}` / `{any:{}}` / `{tool:{name:...}}`, the
+        // force-tool-use control) and any future AWS-defined sub-field, were silently dropped on a
+        // same-protocol passthrough whenever the writer rebuilt the body. A native AWS client that sets
+        // `toolChoice: {any: {}}` to force mandatory tool use would have that constraint stripped,
+        // changing model behaviour (the model may skip the tool) and diverging from a direct AWS call.
+        // So we capture the WHOLE raw `toolConfig` object into `extra` (preserving `toolChoice`
+        // verbatim) and let `write_request` overlay the typed `tools` array onto that raw object. The
+        // `tools` array is still parsed into the structured IR below for cross-protocol egress; the raw
+        // capture is what makes a Bedrock->Bedrock passthrough re-emit `toolChoice` faithfully.
+        const MODELED_KEYS: &[&str] = &["messages", "model", "stream", "system"];
         debug_assert!(
             MODELED_KEYS.windows(2).all(|w| w[0] < w[1]),
             "MODELED_KEYS must stay sorted for binary_search"
@@ -1362,6 +1373,24 @@ impl ProtocolWriter for BedrockWriter {
             );
         }
 
+        // Rebuild `toolConfig` by OVERLAYING the typed `tools` array onto the RAW `toolConfig` object
+        // the reader captured into `extra`. This preserves every sub-field the reader does not model —
+        // notably `toolChoice` (`{auto:{}}` / `{any:{}}` / `{tool:{name:...}}`, the force-tool-use
+        // control) and any future AWS addition — on a same-protocol passthrough while still letting a
+        // cross-protocol egress (where `extra` carries no `toolConfig`) emit a config built purely from
+        // the typed IR `tools`. The typed `tools` array WINS over any same-named raw entry so the
+        // structured IR remains the source of truth for the tools it models. `extra`'s raw `toolConfig`
+        // is consumed here (not re-emitted by the trailing extra-merge), so there is no double-emit.
+        //
+        // The whole `toolConfig` is emitted only when there is something to emit — either typed tools
+        // OR a non-empty raw object (e.g. a `toolChoice` with no tools). AWS rejects a `toolConfig`
+        // with an empty `tools` array, so we never write a bare `{}`/`{tools:[]}` shape.
+        let mut tool_config = req
+            .extra
+            .get("toolConfig")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
         if !req.tools.is_empty() {
             let mut tools_arr: Vec<serde_json::Value> = Vec::new();
             for tool in &req.tools {
@@ -1384,8 +1413,13 @@ impl ProtocolWriter for BedrockWriter {
                 tools_arr.push(serde_json::Value::Object(tool_obj));
             }
 
-            let mut tool_config = serde_json::Map::new();
             tool_config.insert("tools".to_string(), serde_json::Value::Array(tools_arr));
+        }
+        // Emit only when the resulting `toolConfig` actually carries a tools array. A raw `toolConfig`
+        // that survived in `extra` but had no `tools` (only `toolChoice`) is meaningless to AWS without
+        // tools, so dropping `toolChoice` in that degenerate case matches AWS's own validation rather
+        // than emitting an invalid `toolConfig`.
+        if tool_config.contains_key("tools") {
             out.insert(
                 "toolConfig".to_string(),
                 serde_json::Value::Object(tool_config),
@@ -1393,10 +1427,11 @@ impl ProtocolWriter for BedrockWriter {
         }
 
         for (key, value) in &req.extra {
-            // `inferenceConfig` was already consumed above (typed fields overlaid onto the raw
-            // object); re-inserting the raw copy here would clobber that overlay and drop the typed
-            // `maxTokens`/`temperature`. Every other unmodeled field passes through verbatim.
-            if key == "inferenceConfig" {
+            // `inferenceConfig` and `toolConfig` were already consumed above (typed fields overlaid
+            // onto the raw object); re-inserting the raw copy here would clobber that overlay and drop
+            // the typed `maxTokens`/`temperature` (inferenceConfig) or `tools` (toolConfig). Every
+            // other unmodeled field passes through verbatim.
+            if key == "inferenceConfig" || key == "toolConfig" {
                 continue;
             }
             out.insert(key.clone(), value.clone());
@@ -3013,9 +3048,19 @@ mod tests {
             "inferenceConfig must be captured into extra verbatim"
         );
 
+        // `toolConfig` IS now captured verbatim into `extra` (it is only partially modeled — only
+        // `tools` is typed into `ir.tools`; `toolChoice` and future sub-fields are unmodeled — so the
+        // raw object preserves them for passthrough; R15 toolChoice fix).
+        assert_eq!(
+            ir.extra.get("toolConfig"),
+            Some(&serde_json::json!({"tools": []})),
+            "toolConfig must be captured into extra verbatim"
+        );
+
         // Fully-modeled keys must NOT be duplicated into `extra` (avoids double-emit / echoed
-        // `stream`). `inferenceConfig` is intentionally absent from this list now (see above).
-        for k in ["system", "messages", "toolConfig", "stream"] {
+        // `stream`). `inferenceConfig` and `toolConfig` are intentionally absent from this list now
+        // (they are only partially modeled; see above).
+        for k in ["system", "messages", "stream"] {
             assert!(
                 ir.extra.get(k).is_none(),
                 "modeled key `{k}` must not leak into extra; got {:?}",
@@ -3043,6 +3088,125 @@ mod tests {
             out.get("top_p").and_then(|v| v.as_f64()),
             Some(0.95),
             "unmodeled `top_p` must survive a Bedrock->Bedrock passthrough; got {out}"
+        );
+    }
+
+    /// Regression (R15 toolChoice): `toolConfig.toolChoice` (the force-tool-use control:
+    /// `{auto:{}}` / `{any:{}}` / `{tool:{name:...}}`) is an UNMODELED sub-field of `toolConfig` —
+    /// only `toolConfig.tools` is typed into `ir.tools`. The old code listed `toolConfig` in
+    /// `MODELED_KEYS`, so the raw object never reached `extra` and the writer rebuilt `toolConfig`
+    /// from `ir.tools` ALONE, silently dropping `toolChoice` on a Bedrock->Bedrock passthrough
+    /// whenever the body was rebuilt. A native AWS client that sent `toolChoice: {any: {}}` to force a
+    /// tool call would have that constraint stripped, changing model behaviour. The reader now
+    /// captures the whole raw `toolConfig` into `extra` and the writer overlays the typed `tools`
+    /// array onto it, preserving `toolChoice`.
+    #[test]
+    fn test_request_passthrough_preserves_tool_choice() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let j = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"text": "weather?"}]}],
+            "toolConfig": {
+                "tools": [{
+                    "toolSpec": {
+                        "name": "get_weather",
+                        "inputSchema": {"json": {"type": "object"}}
+                    }
+                }],
+                "toolChoice": {"any": {}}
+            }
+        });
+        let ir = reader.read_request(&j).expect("read_request");
+
+        // The tools array is parsed into the structured IR (for cross-protocol egress)...
+        assert_eq!(ir.tools.len(), 1);
+        assert_eq!(ir.tools[0].name, "get_weather");
+        // ...and the whole raw toolConfig (incl. toolChoice) is preserved in `extra` for passthrough.
+        assert_eq!(
+            ir.extra
+                .get("toolConfig")
+                .and_then(|tc| tc.get("toolChoice")),
+            Some(&serde_json::json!({"any": {}})),
+            "raw toolChoice must be captured into extra; got {:?}",
+            ir.extra
+        );
+
+        let out = writer.write_request(&ir);
+        let tc = out
+            .get("toolConfig")
+            .and_then(|v| v.as_object())
+            .expect("toolConfig must be re-emitted");
+        // toolChoice survives the round-trip...
+        assert_eq!(
+            tc.get("toolChoice"),
+            Some(&serde_json::json!({"any": {}})),
+            "toolChoice must survive a Bedrock->Bedrock passthrough; got {out}"
+        );
+        // ...and the typed tools array is re-emitted (one toolSpec).
+        assert_eq!(
+            tc.get("tools").and_then(|t| t.as_array()).map(|a| a.len()),
+            Some(1),
+            "rebuilt tools array must be present; got {out}"
+        );
+    }
+
+    /// Regression (R15 toolChoice): on the CROSS-protocol seam `extra` is cleared, so a writer driven
+    /// by an IR with `ir.tools` but no `extra.toolConfig` must still emit a valid `toolConfig` built
+    /// purely from the typed tools (no `toolChoice`, since the IR has no field for it). And a degenerate
+    /// IR with neither typed tools nor a raw `toolConfig` must NOT emit a bare/empty `toolConfig` (AWS
+    /// rejects a `toolConfig` with no `tools`).
+    #[test]
+    fn test_write_request_tool_config_cross_protocol_and_empty() {
+        let writer = BedrockWriter;
+
+        // Cross-protocol shape: typed tools, empty extra (seam cleared it).
+        let ir_tools = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![crate::ir::IrTool {
+                name: "f".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = writer.write_request(&ir_tools);
+        let tc = out
+            .get("toolConfig")
+            .and_then(|v| v.as_object())
+            .expect("toolConfig must be emitted from typed tools alone");
+        assert_eq!(
+            tc.get("tools").and_then(|t| t.as_array()).map(|a| a.len()),
+            Some(1)
+        );
+        assert!(
+            tc.get("toolChoice").is_none(),
+            "no toolChoice should appear cross-protocol (IR has no field for it); got {out}"
+        );
+
+        // No tools, no raw toolConfig → no toolConfig key at all.
+        let ir_empty = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out_empty = writer.write_request(&ir_empty);
+        assert!(
+            out_empty.get("toolConfig").is_none(),
+            "no toolConfig must be emitted when there are no tools; got {out_empty}"
         );
     }
 

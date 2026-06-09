@@ -132,7 +132,7 @@ Busbar's scope is the **protocol count (6)**, not the provider count. Each proto
 
 ¹ Bedrock **ingress** requires `auth.mode: passthrough` (or `none`). busbar does not verify inbound AWS SigV4 — `src/sigv4.rs` is sign-only, with no inbound verifier — so under `token`/governance mode a native SigV4-signed Bedrock request carries no bearer-style token busbar can match and is rejected `403` (AccessDenied — matching a genuine SigV4 rejection, which is 403, not 401). Egress to a Bedrock backend (where busbar signs the request) is unconditional. The ✅ marks for request/response/stream/tools describe ingress behaviour once admitted under `passthrough`/`none`.
 
-Streaming is first-class for all six: Gemini via `:streamGenerateContent` — either with `?alt=sse` (SSE framing) or without it (native JSON-array framing, which the google-generativeai SDK uses by default) — Bedrock by decoding the binary `application/vnd.amazon.eventstream` frames and re-framing them as the caller's protocol, the rest via SSE.
+Streaming is first-class for all six: Gemini via `:streamGenerateContent` — either with `?alt=sse` (SSE framing) or without it (native JSON-array framing, which the google-generativeai SDK uses by default) — Bedrock in both directions — on egress, by decoding the binary `application/vnd.amazon.eventstream` frames from a Bedrock backend and re-framing them as the caller's protocol; on ingress, by re-encoding translated upstream events into CRC32-valid binary event-stream frames so a native AWS SDK client receives the ConverseStream response it expects — the rest via SSE.
 
 ## Routing
 

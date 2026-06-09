@@ -272,12 +272,17 @@ async fn ingress_body_model(
     let v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
+            // Log the parser's real cause (line/column/expectation) for operators, but NEVER leak it
+            // into the client-facing 400 body: the serde_json Display detail is a busbar-internal tell
+            // (no native vendor surfaces it) and can echo fragments of the malformed body. The client
+            // gets the generic, vendor-plausible message only — matching the CORE fix in forward.rs.
+            tracing::debug!(error = %e, "request body JSON parse failed");
             return ingress_error(
                 proto,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("We could not parse the JSON body of your request: {e}"),
-            )
+                "We could not parse the JSON body of your request.",
+            );
         }
     };
 
@@ -338,12 +343,17 @@ async fn ingress_path_model(
     let mut v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
+            // Log the parser's real cause (line/column/expectation) for operators, but NEVER leak it
+            // into the client-facing 400 body: the serde_json Display detail is a busbar-internal tell
+            // (no native vendor surfaces it) and can echo fragments of the malformed body. The client
+            // gets the generic, vendor-plausible message only — matching the CORE fix in forward.rs.
+            tracing::debug!(error = %e, "request body JSON parse failed");
             return ingress_error(
                 proto,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("We could not parse the JSON body of your request: {e}"),
-            )
+                "We could not parse the JSON body of your request.",
+            );
         }
     };
 
@@ -382,12 +392,15 @@ async fn ingress_path_model(
     let injected: Bytes = match serde_json::to_vec(&v) {
         Ok(b) => b.into(),
         Err(e) => {
+            // Same leak class as the parse arms above: the serde_json Display detail is a
+            // busbar-internal tell, so it is logged for operators but never returned to the client.
+            tracing::debug!(error = %e, "injected request body re-serialization failed");
             return ingress_error(
                 proto,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("The request body could not be processed: {e}"),
-            )
+                "The request body could not be processed.",
+            );
         }
     };
 
@@ -4611,6 +4624,49 @@ mod tests {
                 .and_then(|t| t.as_str()),
             Some("permission_error"),
             "responses 403 carries the permission_error type; got {body}"
+        );
+        handle.abort();
+    }
+
+    /// OpenAI `/v1/chat/completions` governance pool-ACL 403 must carry the OpenAI-native error
+    /// envelope (`{"error":{"type":"permission_error"}}`), served as application/json. The native
+    /// OpenAI ingress route (`openai_ingress` → `ingress_body_model(..., "openai")`) shares the
+    /// `forward_resolved` → `governance_guard` path with the other four ingresses, so a regression in
+    /// `ingress_error` writer dispatch / `permission_error` kind mapping for the `openai` writer is
+    /// caught here exactly as the symmetric four tests catch it for their protocols.
+    #[tokio::test]
+    async fn test_governance_pool_acl_403_openai_native_envelope() {
+        crate::metrics::init();
+        let (addr, handle, secret) =
+            governed_pool_acl_router("gpt-4o", crate::proto::Protocol::openai(), "openai").await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth(secret)
+            .body(
+                json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]})
+                    .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "openai pool-ACL ⇒ 403");
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "openai 403 envelope is JSON; got {ct}"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("permission_error"),
+            "openai 403 carries the permission_error type; got {body}"
         );
         handle.abort();
     }

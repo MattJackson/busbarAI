@@ -9,19 +9,13 @@ use super::*;
 /// targets). Bump when adopting a newer Anthropic API version.
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
-/// Monotonic counter that disambiguates synthesized ids minted within the same clock second (or
-/// when the clock is non-monotonic). Combined with the unix timestamp it makes a collision between
-/// two synthesized ids astronomically unlikely without pulling in a uuid/rand crate.
+/// Process-local monotonic counter that GUARANTEES synthesized-id uniqueness within a process: it
+/// never repeats while the process lives, so even on the astronomically unlikely event of the OS
+/// CSPRNG returning a duplicate draw (or being unavailable, when we fall back to it entirely) two
+/// distinct calls still mint distinct ids. It is folded into the token only as a uniqueness
+/// BACKSTOP — never the entropy source — so it cannot reduce randomness or leak the wall clock. No
+/// crate dependency beyond `std`.
 static SYNTH_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Current unix time in whole seconds, or 0 if the system clock predates the epoch. Used as
-/// `created` synthesis and as the high bits of a synthesized id; never panics on a bad clock.
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// Mixed-case base62 alphabet (`[0-9A-Za-z]`), matching the character set of a native Anthropic id
 /// token. A native `msg_`/`req_` id is `01` followed by a fixed-length mixed-case alphanumeric
@@ -30,31 +24,17 @@ fn unix_now_secs() -> u64 {
 const BASE62_ALPHABET: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-/// Encode a `u64` as exactly 12 base62 digits, zero-padded (most-significant first). `62^11`
-/// already exceeds `2^64`, so 12 digits cover the whole `u64` range with one digit of headroom, and
-/// the FIXED width keeps the encoding injective — concatenating two fixed-width fields never lets one
-/// field's overflow bleed into the next (the property that makes a `(timestamp, counter)` pair
-/// collision-free). Two 12-digit fields after the `01` version marker give the native 24-char suffix
-/// (total `msg_01` + 24 = 30 chars). Pure arithmetic, no allocation beyond the returned string, and
-/// never panics.
-fn base62_u64_fixed(mut n: u64) -> String {
-    // 12 digits, filled from the least-significant end, then reversed to MSB-first.
-    let mut buf = [b'0'; 12];
-    for slot in buf.iter_mut().rev() {
-        *slot = BASE62_ALPHABET[(n % 62) as usize];
-        n /= 62;
-    }
-    // `buf` is ASCII base62 by construction, so the conversion cannot fail; fall back to the
-    // lossy form rather than `unwrap()` to keep this off any panic path.
-    String::from_utf8(buf.to_vec()).unwrap_or_else(|_| String::from_utf8_lossy(&buf).into_owned())
-}
+/// Width of a synthesized Anthropic id's token (the part after the `01` version marker): a native
+/// `msg_`/`req_` id is `<prefix>01` followed by a fixed-width 24-char mixed-case base62 token, so
+/// `msg_`/`req_` + `01` + 24 = 30 chars total. Matching this exact length AND alphabet is what keeps
+/// the synthesized id structurally indistinguishable from a native one.
+const SYNTH_ID_TOKEN_LEN: usize = 24;
 
 /// Mint a protocol-correct Anthropic message id for the cross-protocol path, where the backend
 /// supplied none. A native id is `msg_01` + a fixed-length mixed-case base62 token; an official
 /// Anthropic SDK only requires the `msg_` prefix and a non-empty unique suffix (it does not parse
-/// the body), but matching the native alphabet/version-prefix/length removes the structural tell a
-/// client could use to spot a synthesized id. No new dependency: uniqueness comes from the unix
-/// second plus a process-global atomic counter, each encoded at fixed base62 width.
+/// the body), but matching the native alphabet/version-prefix/length AND drawing the token from the
+/// OS CSPRNG removes the structural/entropy tell a client could use to spot a synthesized id.
 fn synth_message_id() -> String {
     synth_id_with_prefix("msg_")
 }
@@ -62,24 +42,53 @@ fn synth_message_id() -> String {
 /// Mint a protocol-correct Anthropic request id (`req_01<token>`) for the top level of an error
 /// envelope, where busbar synthesizes the error itself and has no upstream request id to forward.
 /// Current Anthropic API error responses carry a top-level `request_id`; emitting one whose shape
-/// (version prefix, mixed-case base62 alphabet, fixed length) matches the native form keeps the
-/// envelope indistinguishable. Same uniqueness construction as `synth_message_id`.
+/// (version prefix, mixed-case base62 alphabet, fixed length) AND entropy match the native form
+/// keeps the envelope indistinguishable. Same CSPRNG construction as `synth_message_id`.
 fn synth_request_id() -> String {
     synth_id_with_prefix("req_")
 }
 
 /// Shared id construction for both `msg_` and `req_`. The suffix is the native `01` version marker
-/// followed by two fixed-width base62 fields — the unix second and a process-global atomic counter.
-/// Fixed widths make the `(timestamp, seq)` encoding injective (no bare-concat collision where a
-/// counter that advances between two adjacent seconds renders the same digits), and the base62
-/// alphabet plus the `01` prefix match a native id's character set, version marker, and length.
+/// followed by a fixed-width 24-char mixed-case base62 token drawn from the OS CSPRNG (mirroring
+/// `proto::mod::synth_anthropic_request_id` and `openai::synth_completion_id`). The earlier
+/// `(unix_second, counter)` encoding was a deterministic clock+counter fingerprint — at the current
+/// epoch its base62 timestamp field zero-pads to a fixed `01000000…` run that no native Anthropic id
+/// ever carries — so it is replaced entirely by CSPRNG bytes. The process-monotonic counter is
+/// folded MSB-first into only the leading characters as a pure uniqueness BACKSTOP: it guarantees
+/// two calls differ even if the RNG repeats or is unavailable, but it never supplies the entropy and
+/// (carrying no wall-clock component) cannot leak the clock. Never panics on the request path.
 fn synth_id_with_prefix(prefix: &str) -> String {
-    let seq = SYNTH_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!(
-        "{prefix}01{}{}",
-        base62_u64_fixed(unix_now_secs()),
-        base62_u64_fixed(seq)
-    )
+    let n = SYNTH_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Fill the token with CSPRNG bytes mapped into base62. On entropy failure we leave the buffer
+    // zeroed (all '0'); the counter overlay below still makes the id unique, so we never panic and
+    // never `?`-out on the request path.
+    let mut rand_bytes = [0u8; SYNTH_ID_TOKEN_LEN];
+    let _ = getrandom::getrandom(&mut rand_bytes);
+    let mut token = [b'0'; SYNTH_ID_TOKEN_LEN];
+    for (slot, &byte) in token.iter_mut().zip(rand_bytes.iter()) {
+        *slot = BASE62_ALPHABET[(byte % 62) as usize];
+    }
+
+    // Overlay the monotonic counter into the TRAILING 11 characters so the per-process uniqueness
+    // guarantee holds regardless of the RNG, WITHOUT recreating the very leading-zero tell this fix
+    // removes. 62^11 > 2^65 > u64::MAX, so 11 characters fully encode any `u64` counter; the LEADING
+    // 13 stay purely random. Folding the counter into the tail (least-significant digits first, from
+    // the end) is deliberate: the counter starts at 0 and stays small, so its high base62 digits are
+    // '0' for the entire practical life of the process — placing those at the FRONT (as a naive
+    // MSB-first overlay would) would zero-pad the leading characters and reintroduce a structural
+    // `01000…` prefix. Keeping the leading 13 random guarantees the token never has a run of leading
+    // zeros longer than chance allows, so a synthesized id is entropy-indistinguishable from native.
+    let mut counter = n;
+    for slot in token.iter_mut().rev().take(11) {
+        *slot = BASE62_ALPHABET[(counter % 62) as usize];
+        counter /= 62;
+    }
+
+    // `token` is ASCII base62 by construction, hence always valid UTF-8; the fallback only guards
+    // against an impossible non-ASCII byte and keeps the path panic-free.
+    let token = std::str::from_utf8(&token).unwrap_or("000000000000000000000000");
+    format!("{prefix}01{token}")
 }
 
 #[derive(Clone)]
@@ -294,25 +303,31 @@ impl ProtocolReader for AnthropicReader {
         let stop = crate::ir::read_stop_sequences(obj.get("stop_sequences"));
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        // Collect unmodeled top-level keys into extra
-        let modeled_keys: std::collections::HashSet<&str> = [
-            "model",
-            "system",
-            "messages",
-            "tools",
+        // Collect unmodeled top-level keys into `extra`. The set of modeled keys is a static,
+        // never-changing list of `&'static str` literals, so it lives as a compile-time SORTED slice
+        // and membership is an O(log n) `binary_search` — zero allocation, zero hashing, on every
+        // inbound request (the previous per-call `HashSet` allocated + hashed up to 10 entries and
+        // dropped the set immediately, pure churn on the hot ingress path). Kept sorted by hand;
+        // `debug_assert` below pins that invariant so a future edit that breaks ordering fails tests.
+        const MODELED_KEYS: &[&str] = &[
             "max_tokens",
-            "temperature",
-            "top_p",
-            "top_k",
+            "messages",
+            "model",
             "stop_sequences",
             "stream",
-        ]
-        .iter()
-        .cloned()
-        .collect();
+            "system",
+            "temperature",
+            "tools",
+            "top_k",
+            "top_p",
+        ];
+        debug_assert!(
+            MODELED_KEYS.windows(2).all(|w| w[0] < w[1]),
+            "MODELED_KEYS must stay sorted for binary_search"
+        );
 
         for (key, value) in obj.iter() {
-            if !modeled_keys.contains(key.as_str()) {
+            if MODELED_KEYS.binary_search(&key.as_str()).is_err() {
                 extra.insert(key.clone(), value.clone());
             }
         }
@@ -2644,9 +2659,112 @@ mod anthropic_hardening_tests {
                 token.bytes().all(|b| b.is_ascii_alphanumeric()),
                 "token must be mixed-case base62 (no hex-only/non-alphanumeric chars), got `{token}`"
             );
+            // Round-15 HIGH (clock+counter fingerprint): the previous `(unix_second, counter)`
+            // encoding base62-padded the timestamp to a fixed `000000…` run, so every synthesized
+            // id began `01000000…` — a structural tell impossible in a native (CSPRNG) Anthropic id.
+            // Assert the CSPRNG-backed token carries no run of six or more leading '0' chars.
+            let leading_zeros = token.bytes().take_while(|&b| b == b'0').count();
+            assert!(
+                leading_zeros < 6,
+                "token must not have a 6+ run of leading '0' (the clock+counter fingerprint), got `{token}`"
+            );
         };
         check(&synth_message_id(), "msg_");
         check(&synth_request_id(), "req_");
+    }
+
+    /// Round-15 HIGH regression: synthesized ids must come from the CSPRNG, not a deterministic
+    /// clock+counter scheme. Two back-to-back calls within the same clock tick must differ (the old
+    /// scheme relied on the second-resolution clock for its high bits, so rapid calls within one
+    /// second shared a 12-char prefix and differed only in the counter tail — here the leading 13
+    /// chars are random and the counter backstop still forces distinctness). Also asserts the token
+    /// is not all-zero (which would mean the RNG path silently produced no entropy).
+    #[test]
+    fn synth_ids_are_csprng_unique_within_tick() {
+        let a = synth_message_id();
+        let b = synth_message_id();
+        assert_ne!(a, b, "two synthesized message ids must never collide");
+        let ra = synth_request_id();
+        let rb = synth_request_id();
+        assert_ne!(ra, rb, "two synthesized request ids must never collide");
+
+        // The full 24-char token must never be all-'0' (that would mean no entropy AND a degenerate
+        // counter overlay) — a stronger form of the no-leading-zero-run check.
+        for id in [&a, &b, &ra, &rb] {
+            let token = &id[id.len() - 24..];
+            assert!(
+                token.bytes().any(|c| c != b'0'),
+                "token must carry entropy, not be all-zero, got `{token}`"
+            );
+        }
+    }
+
+    /// Round-15 HIGH regression: the leading characters of the token must vary across calls. The old
+    /// clock+counter scheme produced an IDENTICAL leading prefix for every id minted in the same
+    /// second; the CSPRNG scheme keeps the leading 13 chars random, so across many samples the first
+    /// character must take on more than one distinct value (a deterministic prefix would yield one).
+    #[test]
+    fn synth_id_leading_chars_are_not_constant() {
+        let mut firsts = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let id = synth_message_id();
+            let token = &id[id.len() - 24..];
+            firsts.insert(token.as_bytes()[0]);
+        }
+        assert!(
+            firsts.len() > 1,
+            "leading token char is constant across 64 samples — looks deterministic, not CSPRNG"
+        );
+    }
+
+    /// Round-15 MEDIUM regression: the modeled-key filter (now a sorted `binary_search` slice rather
+    /// than a per-request `HashSet`) must still route every unmodeled top-level key into `extra` and
+    /// must still EXCLUDE every modeled key. Guards against a typo/ordering break in `MODELED_KEYS`.
+    #[test]
+    fn read_request_routes_unmodeled_keys_to_extra() {
+        let body = serde_json::json!({
+            "model": "claude-3",
+            "system": "sys",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [],
+            "max_tokens": 10,
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "top_k": 40,
+            "stop_sequences": ["x"],
+            "stream": true,
+            // Unmodeled passthrough keys:
+            "metadata": {"user_id": "u1"},
+            "service_tier": "auto"
+        });
+        let ir = AnthropicReader
+            .read_request(&body)
+            .expect("request must parse");
+        assert!(
+            ir.extra.contains_key("metadata"),
+            "unmodeled `metadata` must flow into extra"
+        );
+        assert!(
+            ir.extra.contains_key("service_tier"),
+            "unmodeled `service_tier` must flow into extra"
+        );
+        for modeled in [
+            "model",
+            "system",
+            "messages",
+            "tools",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "stop_sequences",
+            "stream",
+        ] {
+            assert!(
+                !ir.extra.contains_key(modeled),
+                "modeled key `{modeled}` must NOT leak into extra"
+            );
+        }
     }
 
     /// Round-13 HIGH (error-message proxy vocabulary): the in-stream `error` event's

@@ -530,6 +530,21 @@ fn ssrf_blocked_host(url: &str) -> Option<String> {
         return Some(host.to_string());
     }
 
+    // Block any `*.localhost` subdomain too. RFC 6761 reserves the entire `.localhost` TLD to
+    // loopback, and glibc getaddrinfo (reqwest's default resolver) resolves `api.localhost`,
+    // `service.localhost`, etc. to 127.0.0.1 — so a `base_url: https://api.localhost:11434/` would
+    // forward inbound API keys to a co-located loopback service (SSRF credential-relay) exactly as
+    // the bare `localhost` entry guards against. The exact-label `localhost` spelling is already
+    // covered by METADATA_HOSTS above; here we catch the subdomain case by testing the right-most
+    // label. This mirrors `observability::host_is_internal` so the two SSRF guards stay at parity.
+    // The trailing-dot FQDN-root spelling (`sub.localhost.`) was normalized off above.
+    if host_lc
+        .rsplit_once('.')
+        .is_some_and(|(_, tld)| tld == "localhost")
+    {
+        return Some(host.to_string());
+    }
+
     // Alternate / non-canonical IP encodings that Rust's `IpAddr::from_str` REJECTS but the OS
     // resolver (glibc getaddrinfo, used by reqwest's default resolver) still interprets as an
     // IPv4 address — decimal int (`2130706433` = 127.0.0.1), hex (`0x7f000001`), octal
@@ -1666,6 +1681,18 @@ mod tests {
             "https://169%2E254%2E169%2E254/", // IMDS, percent-encoded dots
             "https://127%2e0%2e0%2e1/",       // loopback, percent-encoded dots (lowercase hex)
             "https://%31%30.0.0.1/",          // "10.0.0.1" with first octet percent-encoded
+            // The well-known loopback name and any `*.localhost` subdomain. RFC 6761 reserves the
+            // whole `.localhost` TLD to loopback and glibc getaddrinfo resolves these to 127.0.0.1,
+            // so a `base_url` using one would relay inbound API keys to a co-located loopback
+            // service (SSRF credential-relay). Must be at parity with `host_is_internal`.
+            "https://localhost/",
+            "https://localhost:11434/v1",
+            "https://localhost./", // trailing-dot FQDN-root spelling, normalized off
+            "https://api.localhost/",
+            "https://api.localhost:11434/v1",
+            "https://service.internal.localhost/",
+            "https://API.LOCALHOST/",    // case-insensitive
+            "https://sub.localhost./v1", // subdomain + trailing dot
         ] {
             assert!(
                 ssrf_blocked_host(blocked).is_some(),
@@ -1750,6 +1777,12 @@ mod tests {
             "https://example.com:8443/v1",
             "https://8.8.8.8/",
             "https://[2606:4700:4700::1111]/",
+            // Public hostnames whose right-most label merely CONTAINS "localhost" but is not the
+            // reserved `.localhost` TLD must NOT be flagged — only an exact right-most `localhost`
+            // label is loopback. These are ordinary public DNS names.
+            "https://mylocalhost.com/",
+            "https://notlocalhost.example.com/",
+            "https://localhost.example.com/", // `localhost` is a left label, TLD is `com`
         ] {
             assert!(
                 ssrf_blocked_host(ok).is_none(),

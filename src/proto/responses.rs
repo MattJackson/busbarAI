@@ -1009,6 +1009,30 @@ impl ProtocolReader for ResponsesReader {
                     _ => {}
                 }
             }
+        } else if status == "failed" {
+            // A non-streaming Responses body with `status:"failed"` legitimately carries
+            // `output: null` (or omits it) and a populated top-level `error` object — this is an
+            // upstream provider failure (rate_limit, content_filter, server_error, etc.), NOT a
+            // parse failure. Surface it as a ServerError IrError carrying the upstream signal so the
+            // real error reaches the client (and the breaker sees a failure) instead of masking it
+            // as an internal `ir_parse`. Mirror the streaming `response.failed` arm: prefer the
+            // `error.code` enum, fall back to `error.type`, then a generic `response_failed`.
+            let provider_signal = obj
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str())
+                .or_else(|| {
+                    obj.get("error")
+                        .and_then(|e| e.get("type"))
+                        .and_then(|t| t.as_str())
+                })
+                .map(String::from)
+                .or_else(|| Some("response_failed".to_string()));
+            return Err(IrError {
+                class: StatusClass::ServerError,
+                provider_signal,
+                retry_after: None,
+            });
         } else {
             return Err(IrError {
                 class: StatusClass::ClientError,
@@ -2041,6 +2065,18 @@ impl ProtocolWriter for ResponsesWriter {
                     serde_json::json!(usage.output_tokens),
                 );
                 resp_obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
+                // The native terminal `response.completed`/`response.incomplete` event carries the
+                // FULLY assembled inner `response` object: the official Python/Node SDK reads
+                // `event.response.output` to finalize the assembled `Response`, and `output` is a
+                // REQUIRED field a strict typed decoder raises on when absent. The IR `MessageDelta`
+                // did not retain the assembled `output` items (they streamed as deltas), but the
+                // native shape requires the key present, so emit a present-but-empty array — never
+                // omit it. `error` is likewise REQUIRED and `null` on a non-failed terminal event
+                // (a genuine failure arrives via IrStreamEvent::Error → `response.failed`, never
+                // this arm). This mirrors the `response.created` skeleton, which already emits
+                // `output: []` and `error: null`.
+                resp_obj.insert("output".to_string(), serde_json::json!([]));
+                resp_obj.insert("error".to_string(), serde_json::Value::Null);
 
                 // The terminal event's NAME and inner `type` MUST agree with the inner
                 // `response.status`: a native /v1/responses stream emits `response.completed` for a
@@ -2120,6 +2156,10 @@ impl ProtocolWriter for ResponsesWriter {
                             // `MessageStart`.
                             "model": self.carried_model(),
                             "status": "failed",
+                            // A native terminal event's inner `response` always carries `output`
+                            // (REQUIRED by the SDK's typed `Response`); a failed response produced
+                            // no assistant items, so emit a present-but-empty array — never omit it.
+                            "output": [],
                             "error": {
                                 "code": code,
                                 "message": message,
@@ -2235,6 +2275,15 @@ impl ProtocolWriter for ResponsesWriter {
         );
         obj.insert("output".to_string(), serde_json::Value::Array(output_arr));
         obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
+        // The official SDK types `Response.error` as a REQUIRED nullable field present on EVERY
+        // Response object: `null` on success/incomplete, a populated object on failure. The
+        // streaming `response.created` skeleton already emits `error: null`; the non-streaming body
+        // must match. Omitting the key breaks strict SDK/Pydantic/Zod decoders that read
+        // `response.error` unconditionally and is a distinguishability tell (a real non-streaming
+        // `/v1/responses` body always carries `error`). A genuine upstream failure is surfaced as
+        // an error envelope via `write_error`, never through this success/incomplete body, so `null`
+        // is correct here.
+        obj.insert("error".to_string(), serde_json::Value::Null);
 
         if status == "incomplete" {
             let reason = match resp.stop_reason.as_deref() {
@@ -2630,6 +2679,9 @@ mod tests {
         // Carries `model` too: a native completed response always carries the required
         // non-nullable `model`, and the writer now always re-emits it, so the round-trip stays
         // byte-identical only when the source includes it.
+        // Carries `error: null` too: a native non-streaming response always includes the required
+        // nullable `error` field (null on success), and the writer now always re-emits it, so the
+        // round-trip stays byte-identical only when the source includes it.
         let json = serde_json::json!({
             "id": "resp_abc123",
             "object": "response",
@@ -2643,7 +2695,8 @@ mod tests {
                     "content": [{"type": "output_text", "text": "Hello world"}]
                 }
             ],
-            "usage": {"input_tokens": 10, "output_tokens": 5}
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "error": serde_json::Value::Null
         });
 
         let reader = ResponsesReader;
@@ -5718,6 +5771,199 @@ mod tests {
                 .and_then(|m| m.as_str()),
             Some("gpt-4o-mini"),
             "response.failed must replay the captured stream model"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance, Round 15): the non-streaming `write_response` body must carry
+    /// the REQUIRED nullable `error` field (`null` on a non-failed response), mirroring the
+    /// streaming `response.created` skeleton. A real `/v1/responses` non-streaming body always
+    /// includes `error`; omitting it breaks strict SDK/Pydantic/Zod decoders that read
+    /// `response.error` unconditionally and is a distinguishability tell.
+    #[test]
+    fn test_write_response_emits_error_null_for_completed_and_incomplete() {
+        let make_resp = |stop: &str| crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some(stop.to_string()),
+            usage: usage_fixture(),
+            model: Some("gpt-4o-mini".to_string()),
+            id: Some("resp_x".to_string()),
+            created: Some(1),
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let writer = ResponsesWriter;
+
+        // Completed: error key present and explicitly null.
+        let completed = writer.write_response(&make_resp("end_turn"));
+        assert_eq!(completed["status"].as_str(), Some("completed"));
+        assert!(
+            completed.get("error").is_some(),
+            "non-streaming body must include the required error key"
+        );
+        assert!(
+            completed["error"].is_null(),
+            "error must be null on a completed response"
+        );
+
+        // Incomplete (max_tokens): error is still present and null (the failure path is the error
+        // envelope, never this success/incomplete body).
+        let incomplete = writer.write_response(&make_resp("max_tokens"));
+        assert_eq!(incomplete["status"].as_str(), Some("incomplete"));
+        assert!(
+            incomplete["error"].is_null(),
+            "error must be null on an incomplete response"
+        );
+    }
+
+    /// Regression (MEDIUM/correctness, Round 15): a non-streaming Responses body with
+    /// `status:"failed"` and `output:null` is an upstream provider failure, NOT a parse error. The
+    /// reader must surface it as a ServerError IrError carrying the upstream `error.code`, never
+    /// misclassify it as an internal `ir_parse` ClientError.
+    #[test]
+    fn test_read_response_failed_surfaces_upstream_error() {
+        let reader = ResponsesReader;
+
+        // status:"failed" with output:null and a populated error.code.
+        let body = serde_json::json!({
+            "id": "resp_fail",
+            "object": "response",
+            "status": "failed",
+            "output": serde_json::Value::Null,
+            "error": { "code": "rate_limit_exceeded", "message": "slow down" },
+            "usage": { "input_tokens": 1, "output_tokens": 0 },
+            "model": "gpt-4o-mini"
+        });
+        let err = reader
+            .read_response(&body)
+            .expect_err("failed status must surface as an error");
+        assert_eq!(
+            err.class,
+            StatusClass::ServerError,
+            "an upstream failure is a ServerError, not a ClientError ir_parse"
+        );
+        assert_eq!(
+            err.provider_signal.as_deref(),
+            Some("rate_limit_exceeded"),
+            "the upstream error.code must be surfaced as the provider signal"
+        );
+
+        // error.type fallback when code is absent.
+        let body_type = serde_json::json!({
+            "status": "failed",
+            "error": { "type": "content_filter", "message": "blocked" },
+            "usage": { "input_tokens": 1, "output_tokens": 0 }
+        });
+        let err_type = reader
+            .read_response(&body_type)
+            .expect_err("failed status must surface as an error");
+        assert_eq!(err_type.class, StatusClass::ServerError);
+        assert_eq!(err_type.provider_signal.as_deref(), Some("content_filter"));
+
+        // failed with no usable error object → generic response_failed signal, still ServerError.
+        let body_bare = serde_json::json!({ "status": "failed" });
+        let err_bare = reader
+            .read_response(&body_bare)
+            .expect_err("failed status must surface as an error");
+        assert_eq!(err_bare.class, StatusClass::ServerError);
+        assert_eq!(err_bare.provider_signal.as_deref(), Some("response_failed"));
+
+        // A genuinely malformed body (no status, no output) is STILL an ir_parse ClientError — the
+        // failed-status path must not swallow real parse failures.
+        let body_parse = serde_json::json!({ "id": "resp_x" });
+        let err_parse = reader
+            .read_response(&body_parse)
+            .expect_err("missing output must surface as a parse error");
+        assert_eq!(err_parse.class, StatusClass::ClientError);
+        assert_eq!(err_parse.provider_signal.as_deref(), Some("ir_parse"));
+    }
+
+    /// Regression (MEDIUM/conformance, Round 15): the terminal `response.completed`/
+    /// `response.incomplete`/`response.failed` events' inner `response` object must carry the
+    /// REQUIRED `output` array (present-but-empty) and (on non-failed terminals) `error: null`,
+    /// mirroring the `response.created` skeleton. The SDK reads `event.response.output` to finalize
+    /// the assembled Response; omitting it breaks strict decoders and is a distinguishability tell.
+    #[test]
+    fn test_stream_terminal_events_carry_output_and_error() {
+        // --- completed terminal ---
+        let writer = ResponsesWriter;
+        let _ = writer.write_response_event(&IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        });
+        let (_, completed) = writer
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            })
+            .expect("terminal event");
+        assert!(
+            completed["response"]["output"].is_array(),
+            "response.completed inner response must carry an output array"
+        );
+        assert!(
+            completed["response"]["error"].is_null(),
+            "response.completed inner response must carry error: null"
+        );
+
+        // --- incomplete terminal ---
+        let writer2 = ResponsesWriter;
+        let _ = writer2.write_response_event(&IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        });
+        let (_, incomplete) = writer2
+            .write_response_event(&IrStreamEvent::MessageDelta {
+                stop_reason: Some("max_tokens".to_string()),
+                stop_sequence: None,
+                usage: usage_fixture(),
+            })
+            .expect("terminal event");
+        assert!(
+            incomplete["response"]["output"].is_array(),
+            "response.incomplete inner response must carry an output array"
+        );
+        assert!(
+            incomplete["response"]["error"].is_null(),
+            "response.incomplete inner response must carry error: null"
+        );
+
+        // --- failed terminal: output present-but-empty alongside the populated error object ---
+        let writer3 = ResponsesWriter;
+        let _ = writer3.write_response_event(&IrStreamEvent::MessageStart {
+            role: crate::ir::IrRole::Assistant,
+            usage: None,
+            id: None,
+            created: None,
+            model: None,
+        });
+        let (ename, failed) = writer3
+            .write_response_event(&IrStreamEvent::Error(IrError {
+                class: StatusClass::ServerError,
+                provider_signal: Some("boom".to_string()),
+                retry_after: None,
+            }))
+            .expect("failed event");
+        assert_eq!(ename, "response.failed");
+        assert!(
+            failed["response"]["output"].is_array(),
+            "response.failed inner response must carry an output array"
+        );
+        assert_eq!(
+            failed["response"]["error"]["code"].as_str(),
+            Some("boom"),
+            "response.failed must still carry its populated error object"
         );
     }
 }

@@ -250,8 +250,15 @@ impl ProtocolReader for OpenAiReader {
         // Extract scalar fields and extra
         let _model = obj.get("model").and_then(|v| v.as_str()).map(String::from);
 
+        // Read the caller's output-token cap. `max_tokens` is the legacy field; `max_completion_tokens`
+        // is the current Chat Completions parameter and is MANDATORY for reasoning models (o1/o3/...),
+        // which REJECT `max_tokens`. Fall back to `max_completion_tokens` when `max_tokens` is absent so
+        // a request carrying only the modern field still populates the modeled IR `max_tokens`. Without
+        // this, the value stays only in `extra` and is stripped at the cross-protocol seam (extra is
+        // cleared there), silently dropping the caller's explicit limit on e.g. OpenAI -> Anthropic.
         let max_tokens = obj
             .get("max_tokens")
+            .or_else(|| obj.get("max_completion_tokens"))
             .and_then(|v| v.as_i64())
             .filter(|&v| v > 0)
             .map(|v| v as u32);
@@ -450,6 +457,12 @@ impl ProtocolReader for OpenAiReader {
             "messages",
             "tools",
             "max_tokens",
+            // `max_completion_tokens` is now modeled via the IR `max_tokens` field (read above), so it
+            // must be excluded from `extra` like `max_tokens` is. Leaving it in `extra` would make the
+            // writer emit BOTH the promoted cap AND a verbatim `max_completion_tokens`, and on a same-
+            // protocol passthrough also re-emit `max_tokens` alongside it — a conflicting duplicate that
+            // reasoning models (which reject `max_tokens`) would 400 on.
+            "max_completion_tokens",
             "temperature",
             "top_p",
             "stop",
@@ -1263,6 +1276,10 @@ impl ProtocolWriter for OpenAiWriter {
             serde_json::Value::Array(messages_array),
         );
 
+        // Emit the modeled output-token cap as `max_tokens`. The reader promotes BOTH `max_tokens` and
+        // the modern `max_completion_tokens` into this one IR field (so a caller's limit survives the
+        // cross-protocol seam); on a same-protocol OpenAI passthrough this re-emits the canonical
+        // `max_tokens`, preserving wire identity for the common (non-reasoning) case.
         if let Some(max_tokens) = req.max_tokens {
             out.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
         }
@@ -1842,6 +1859,116 @@ mod tests {
         });
         let ir = OpenAiReader.read_request(&body).expect("parses");
         assert_eq!(ir.system, vec![text_block("")]);
+    }
+
+    // --- read_request: `max_completion_tokens` is a modeled output-token cap (R15 finding)
+
+    #[test]
+    fn read_request_promotes_max_completion_tokens_into_ir() {
+        // A request carrying only the modern `max_completion_tokens` (the field reasoning models
+        // require) must populate the modeled IR `max_tokens` so it survives the cross-protocol seam.
+        let body = serde_json::json!({
+            "model": "o3",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_completion_tokens": 256
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        assert_eq!(ir.max_tokens, Some(256));
+        // It must NOT also linger in `extra` (which is cleared at the seam and would otherwise make
+        // the writer emit a conflicting duplicate).
+        assert!(!ir.extra.contains_key("max_completion_tokens"));
+    }
+
+    #[test]
+    fn read_request_prefers_max_tokens_over_max_completion_tokens() {
+        // When both are present the legacy `max_tokens` wins (it is the explicit primary field);
+        // neither lingers in `extra`.
+        let body = serde_json::json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 100,
+            "max_completion_tokens": 999
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        assert_eq!(ir.max_tokens, Some(100));
+        assert!(!ir.extra.contains_key("max_tokens"));
+        assert!(!ir.extra.contains_key("max_completion_tokens"));
+    }
+
+    #[test]
+    fn read_request_ignores_nonpositive_max_completion_tokens() {
+        // A zero/negative cap is invalid and must not populate the IR (mirrors the `max_tokens` filter).
+        let body = serde_json::json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_completion_tokens": 0
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        assert_eq!(ir.max_tokens, None);
+    }
+
+    // --- write_request: the modeled cap re-emits as `max_tokens`; a `max_completion_tokens` ingress
+    //     value survives the read→write round-trip via the IR field (R15 finding)
+
+    #[test]
+    fn write_request_emits_max_tokens_from_modeled_cap() {
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![text_block("hi")],
+            }],
+            tools: Vec::new(),
+            max_tokens: Some(512),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = OpenAiWriter.write_request(&req);
+        assert_eq!(out["max_tokens"], serde_json::json!(512));
+        // No stray `max_completion_tokens` (it is folded into the single modeled cap).
+        assert!(out
+            .as_object()
+            .expect("object")
+            .get("max_completion_tokens")
+            .is_none());
+    }
+
+    #[test]
+    fn max_completion_tokens_survives_read_write_roundtrip() {
+        // An ingress request carrying only `max_completion_tokens` is promoted into the IR cap and
+        // re-emitted (as `max_tokens`) rather than being dropped at the seam.
+        let body = serde_json::json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_completion_tokens": 777
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        let out = OpenAiWriter.write_request(&ir);
+        assert_eq!(out["max_tokens"], serde_json::json!(777));
+    }
+
+    #[test]
+    fn write_request_omits_token_cap_when_absent() {
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![text_block("hi")],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = OpenAiWriter.write_request(&req);
+        let obj = out.as_object().expect("object");
+        assert!(obj.get("max_completion_tokens").is_none());
+        assert!(obj.get("max_tokens").is_none());
     }
 
     // --- write_request: ToolUse on a non-assistant message must not be dropped (fix 6)
