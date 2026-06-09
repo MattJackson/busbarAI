@@ -499,6 +499,15 @@ async fn main() {
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(UPSTREAM_REQUEST_TIMEOUT_SECS))
             .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+            // SSRF guard: do NOT follow redirects. The startup SSRF blocklist (config_validate.rs
+            // ssrf_blocked_host) only vets the configured base_url; it does not see redirect targets.
+            // reqwest's default policy follows up to 10 redirects, so a compromised/malicious upstream
+            // could 30x-redirect a vetted base_url to an internal address (169.254.169.254 metadata,
+            // localhost, RFC1918) and busbar would follow it — forwarding the signed request
+            // (x-api-key / SigV4 Authorization on same-host redirects) to the internal target,
+            // defeating the blocklist at runtime. Upstream AI provider APIs do not redirect as part of
+            // normal operation, so disabling redirect following entirely closes the vector at no cost.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("build upstream HTTP client"),
         auth: auth_mw.clone(),

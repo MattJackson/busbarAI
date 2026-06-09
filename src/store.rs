@@ -30,6 +30,19 @@ const ST_HALF_OPEN: u64 = 2;
 // error-rate trip computation).
 const OUTCOME_WINDOW_CAPACITY: usize = 1024;
 
+/// Lock a `std::sync::Mutex` on the production request path WITHOUT panicking on poison.
+///
+/// `.lock().unwrap()` panics if the mutex is poisoned (a thread panicked while holding the guard).
+/// On the Tokio request path this is catastrophic and silent: one poisoned `pool_cells` / `swrr_lock`
+/// / `outcome_window` / `dead_reason` mutex would make EVERY subsequent request that touches it panic
+/// too — a poisoned-mutex DoS cascade. The data behind these mutexes is always still valid after a
+/// poison (the critical sections only push to a bounded ring, mutate a small map, or swap a String),
+/// so we recover the inner guard via `into_inner()` instead of propagating the poison. This keeps the
+/// no-panic-on-request-path invariant: a single stray panic can never wedge the whole router.
+fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Get current time in seconds since epoch.
 pub(crate) fn now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -155,8 +168,12 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// already transitioned it) or when the probe flag was already clear.
     fn release_probe_in(&self, pool: &str, lane: usize);
     // The bare lane-default breaker mutators below are exercised by the unit tests; in release,
-    // routing always goes through the `_in(pool, …)` variants, so they're unreachable there — hence
-    // the not(test) dead-code allow (they remain a tested part of the lane-default API).
+    // pool-routed dispatch goes through the `_in(pool, …)` variants, so most are unreachable there —
+    // hence the not(test) dead-code allow (they remain a tested part of the lane-default API). NOTE:
+    // `record_success` is the exception — it has a genuine production caller (the degraded
+    // `forward_once` failover path at forward.rs:2497, which has no pool context and uses the
+    // bare-lane forms), so it carries NO dead-code allow. `breaker_state`, `usable`,
+    // `record_rate_limit`, `record_hard_down` are genuinely release-dead and keep the allow.
     #[cfg_attr(not(test), allow(dead_code))]
     fn breaker_state(&self, lane: usize) -> BreakerState;
     fn cooldown_remaining(&self, lane: usize, now: u64) -> u64;
@@ -168,7 +185,8 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     fn lane_needs_probe(&self, lane: usize, now: u64) -> bool;
 
     // ── Outcome recording (the breaker's write path) ─────────────────────────────────────────────
-    #[cfg_attr(not(test), allow(dead_code))]
+    // `record_success` is NOT release-dead: the degraded `forward_once` path (forward.rs:2497) calls
+    // it with no pool context, so the compiler sees a real caller — no dead-code allow here.
     fn record_success(&self, lane: usize);
     fn record_success_in(&self, pool: &str, lane: usize);
     fn record_client_fault(&self, lane: usize);
@@ -479,7 +497,7 @@ impl InMemoryStore {
         if pool.is_empty() {
             return self.lanes[lane].clone();
         }
-        let mut cells = self.pool_cells.lock().unwrap();
+        let mut cells = lock_recover(&self.pool_cells);
         cells
             .entry((Box::from(pool), lane))
             .or_insert_with(|| {
@@ -489,8 +507,24 @@ impl InMemoryStore {
                 // created while the lane is healthy, so this is normally a no-op.
                 let ls = &self.lanes[lane];
                 let c = BreakerCell::new();
-                c.breaker_state
-                    .store(ls.breaker_state.load(Ordering::Acquire), Ordering::Release);
+                // Normalize an inherited HalfOpen to Open. HalfOpen encodes "some cell owns the
+                // single-flight probe right now" — but `probe_in_flight` lives on the cell that won
+                // it, NOT on this freshly-created sibling (born with `probe_in_flight == false`). A
+                // sibling cell born ST_HALF_OPEN is wedged: both `cell_ready_breaker` and
+                // `cell_acquire_breaker` return false unconditionally for HalfOpen, and no probe
+                // outcome (cell_open/cell_closed) ever runs against it, so it never self-recovers —
+                // organic traffic to this (pool, lane) is benched until an out-of-band recover_lane
+                // happens to touch it (indefinitely when health probing is disabled). Storing Open
+                // instead lets the inherited (already-expired) cooldown drive a fresh probe
+                // acquisition on this cell's first request. The Open+cooldown inheritance below is
+                // still honored verbatim so a sibling created mid-cooldown respects it.
+                let inherited = ls.breaker_state.load(Ordering::Acquire);
+                let normalized = if inherited == ST_HALF_OPEN {
+                    ST_OPEN
+                } else {
+                    inherited
+                };
+                c.breaker_state.store(normalized, Ordering::Release);
                 c.cooldown_until
                     .store(ls.cooldown_until.load(Ordering::Acquire), Ordering::Release);
                 c.streak
@@ -507,7 +541,7 @@ impl InMemoryStore {
 
     /// Evaluate trip condition for Closed → Open transition. Returns true if the cell should trip.
     fn should_trip(c: &dyn BreakerCellAccess, now: u64, cfg: &BreakerCfg) -> bool {
-        let window = c.outcome_window().lock().unwrap();
+        let window = lock_recover(c.outcome_window());
 
         match cfg.trip.mode {
             TripMode::ErrorRate => {
@@ -645,7 +679,7 @@ impl InMemoryStore {
     fn cell_closed(c: &dyn BreakerCellAccess) {
         c.streak().store(0, Ordering::Release);
         c.err().store(0, Ordering::Release);
-        c.outcome_window().lock().unwrap().clear();
+        lock_recover(c.outcome_window()).clear();
         c.cooldown_until().store(0, Ordering::Release);
         c.breaker_state().store(ST_CLOSED, Ordering::Release);
         c.probe_in_flight().store(false, Ordering::Release);
@@ -762,7 +796,7 @@ impl InMemoryStore {
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
     ) {
-        c.outcome_window().lock().unwrap().push(now_time, true); // error outcome
+        lock_recover(c.outcome_window()).push(now_time, true); // error outcome
         c.err().fetch_add(1, Ordering::Relaxed);
         c.streak().fetch_add(1, Ordering::Relaxed);
 
@@ -802,7 +836,7 @@ impl InMemoryStore {
     fn cell_record_success(c: &dyn BreakerCellAccess, now_time: u64) {
         let was_half_open = c.breaker_state().load(Ordering::Acquire) == ST_HALF_OPEN;
         c.streak().store(0, Ordering::Release);
-        c.outcome_window().lock().unwrap().push(now_time, false); // success outcome
+        lock_recover(c.outcome_window()).push(now_time, false); // success outcome
         if was_half_open {
             Self::cell_closed(c);
         }
@@ -1077,7 +1111,7 @@ impl InMemoryStore {
         // Hard-down is RECOVERABLE — long sticky cooldown + Open, recovered via the half-open
         // probe. We do NOT set `dead` (that would block recovery). Per (pool, lane): only the
         // routing pool's view is tripped; other pools discover the bad upstream independently.
-        *ls.dead_reason.lock().unwrap() = reason.to_string();
+        *lock_recover(&ls.dead_reason) = reason.to_string();
         tracing::warn!(
             model = %ls.model,
             reason,
@@ -1139,7 +1173,7 @@ impl InMemoryStore {
         // current_weight. The add/find-max/subtract is one logical step, so serialize it across
         // concurrent selections (otherwise interleaving corrupts the `Σ current_weight == 0`
         // invariant and biases distribution).
-        let _swrr = self.swrr_lock.lock().unwrap();
+        let _swrr = lock_recover(&self.swrr_lock);
         let total: i64 = healthy.iter().map(|(_, _, w)| *w).sum();
         for (_, cell, eff_wt) in &healthy {
             cell.current_weight().fetch_add(*eff_wt, Ordering::Relaxed);
@@ -1264,7 +1298,7 @@ impl StateStore for InMemoryStore {
         let ls = self.get_lane(lane);
         // Hard-down is RECOVERABLE: a sticky cooldown + Open, recovered via the half-open probe; do
         // NOT set `dead` (that would block recovery). Record the reason once, lane-wide.
-        *ls.dead_reason.lock().unwrap() = reason.to_string();
+        *lock_recover(&ls.dead_reason) = reason.to_string();
         tracing::warn!(
             model = %ls.model,
             reason,
@@ -1288,7 +1322,7 @@ impl StateStore for InMemoryStore {
         // Every existing per-pool cell for this lane — the cells organic pool-routed traffic is
         // selected against. (A cell not yet created inherits the lane default lazily on first
         // access.)
-        let cells = self.pool_cells.lock().unwrap();
+        let cells = lock_recover(&self.pool_cells);
         for ((_, l), cell) in cells.iter() {
             if *l == lane {
                 trip(cell.as_ref());
@@ -1309,7 +1343,7 @@ impl StateStore for InMemoryStore {
         if suppressed(ls.as_ref()) {
             Self::cell_closed(ls.as_ref());
         }
-        let cells = self.pool_cells.lock().unwrap();
+        let cells = lock_recover(&self.pool_cells);
         for ((_, l), cell) in cells.iter() {
             if *l == lane && suppressed(cell.as_ref()) {
                 Self::cell_closed(cell.as_ref());
@@ -1327,7 +1361,7 @@ impl StateStore for InMemoryStore {
         Self::cell_record_failure(self.get_lane(lane).as_ref(), now, cfg, None);
         // Every existing per-pool cell for this lane — the cells organic traffic is selected
         // against. (A cell not yet created inherits health lazily on first access via `cell`.)
-        let cells = self.pool_cells.lock().unwrap();
+        let cells = lock_recover(&self.pool_cells);
         for ((_, l), cell) in cells.iter() {
             if *l == lane {
                 Self::cell_record_failure(cell.as_ref(), now, cfg, None);
@@ -1343,7 +1377,7 @@ impl StateStore for InMemoryStore {
         if suppressed(self.get_lane(lane).as_ref()) {
             return true;
         }
-        let cells = self.pool_cells.lock().unwrap();
+        let cells = lock_recover(&self.pool_cells);
         cells
             .iter()
             .any(|((_, l), cell)| *l == lane && suppressed(cell.as_ref()))
@@ -1411,7 +1445,7 @@ impl StateStore for InMemoryStore {
             // reports the same admission verdict without touching the breaker FSM.
             usable: self.is_ready(lane, t),
             dead: ls.dead.load(Ordering::Relaxed),
-            dead_reason: ls.dead_reason.lock().unwrap().clone(),
+            dead_reason: lock_recover(&ls.dead_reason).clone(),
             cooldown_remaining_s: self.cooldown_remaining(lane, t),
             streak: ls.streak.load(Ordering::Relaxed),
             budget: if ls.limited {
@@ -1447,7 +1481,7 @@ impl InMemoryStore {
         let ls = self.get_lane(lane);
 
         // Add to sliding window
-        let mut window = ls.outcome_window.lock().unwrap();
+        let mut window = lock_recover(&ls.outcome_window);
         window.push(now_time, true);
 
         ls.err.fetch_add(1, Ordering::Relaxed);
@@ -1461,7 +1495,7 @@ impl InMemoryStore {
         ls.streak.store(0, Ordering::Release);
 
         // Add to sliding window
-        let mut window = ls.outcome_window.lock().unwrap();
+        let mut window = lock_recover(&ls.outcome_window);
         window.push(now_time, false);
 
         ls.ok.fetch_add(1, Ordering::Relaxed);
@@ -2149,6 +2183,105 @@ mod tests {
         assert!(
             store.acquire_for_dispatch_in("p", 0, cooled),
             "after release_probe_in the lane must be re-probeable (not wedged HalfOpen)"
+        );
+    }
+
+    /// HIGH (forward.rs pick_among SESSION-AFFINITY fast path): `usable_in` is the sticky-path
+    /// admission call, and — like `acquire_for_dispatch_in` — it WINS the single-flight probe as a
+    /// SIDE EFFECT (Open→HalfOpen + probe CAS) for an expired-Open lane. If the sticky path then fails
+    /// to get a concurrency permit and falls through WITHOUT `release_probe_in`, the cell is wedged
+    /// HalfOpen + probe_in_flight and benched forever. This proves both halves of the fix's premise:
+    /// (1) `usable_in` really does win/consume the probe (so a release is mandatory on the no-dispatch
+    /// exit), and (2) `release_probe_in` un-wedges it so organic traffic resumes.
+    #[test]
+    fn test_usable_in_wins_probe_and_must_be_released_on_sticky_path() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(1000);
+        let cfg = BreakerCfg::default();
+
+        // Trip the lane Open, then advance past the cooldown so it is probe-eligible.
+        for _ in 0..50 {
+            store.record_transient_in("p", 0, "5xx", &cfg, None);
+        }
+        let cooled = 1000 + store.cooldown_remaining_in("p", 0, 1000) + 1;
+        set_now_for_test(cooled);
+
+        // The sticky fast path calls `usable_in` first. For an expired-Open lane this transitions to
+        // HalfOpen and CAS-WINS the probe — returning true.
+        assert!(
+            store.usable_in("p", 0, cooled),
+            "usable_in admits (and wins the probe for) an expired-Open lane on the sticky path"
+        );
+        // Proof the probe was consumed as a side effect: nobody else can win it now (HalfOpen).
+        assert!(
+            !store.acquire_for_dispatch_in("p", 0, cooled),
+            "usable_in already won the single-flight probe; the lane is now HalfOpen and benched"
+        );
+
+        // The sticky path's `try_acquire` failed (permits saturated), so the request was NOT
+        // dispatched. WITHOUT the fix the cell stays wedged HalfOpen forever; the fix releases it.
+        store.release_probe_in("p", 0);
+        assert!(
+            store.acquire_for_dispatch_in("p", 0, cooled),
+            "after the sticky path releases the won-but-undispatched probe, the lane is re-probeable"
+        );
+    }
+
+    /// MEDIUM/correctness (store.rs lock sites): `lock_recover` must recover the inner data from a
+    /// POISONED mutex instead of panicking. A `.lock().unwrap()` on the request path would panic on a
+    /// poisoned mutex, cascading into a total DoS (every later request touching it also panics). The
+    /// data is still valid after a poison, so we recover it.
+    #[test]
+    fn test_lock_recover_recovers_from_poison() {
+        let m = std::sync::Arc::new(std::sync::Mutex::new(42u32));
+        // Poison the mutex: panic while holding the guard, in a separate thread so this test survives.
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("poison the mutex while holding the guard");
+        })
+        .join();
+        assert!(
+            m.is_poisoned(),
+            "the mutex must be poisoned after the panic"
+        );
+        // A bare `.lock().unwrap()` would now panic; `lock_recover` returns the still-valid inner data.
+        let g = lock_recover(&m);
+        assert_eq!(
+            *g, 42,
+            "lock_recover recovers the inner value past the poison"
+        );
+    }
+
+    /// MEDIUM/correctness (store.rs cell() inheritance): a lazily-created per-pool cell must NOT
+    /// inherit a sibling's HalfOpen state. HalfOpen means "some OTHER cell owns the in-flight probe";
+    /// a freshly-created cell is born `probe_in_flight == false`, so an inherited HalfOpen wedges it
+    /// (both ready/acquire return false for HalfOpen, and no probe outcome ever runs against it) until
+    /// an out-of-band recover_lane fires — indefinitely with health probing disabled. The fix
+    /// normalizes inherited HalfOpen → Open so the (already-expired) cooldown drives a fresh probe.
+    #[test]
+    fn test_new_pool_cell_does_not_inherit_wedged_halfopen() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(1000);
+        let cfg = BreakerCfg::default();
+
+        // Drive the lane-DEFAULT cell (pool "") to HalfOpen: trip it Open, cool down, win the probe.
+        for _ in 0..50 {
+            store.record_transient(0, "5xx", &cfg, None);
+        }
+        let cooled = 1000 + store.cooldown_remaining(0, 1000) + 1;
+        set_now_for_test(cooled);
+        assert!(
+            store.acquire_for_dispatch_in("", 0, cooled),
+            "the default cell transitions Open → HalfOpen (probe won) here"
+        );
+
+        // Now a NEW pool's first request materializes a fresh cell while the sibling is HalfOpen.
+        // With the fix it is born Open (cooldown already expired) → immediately probe-eligible, NOT a
+        // wedged HalfOpen. So this first dispatch must be able to WIN a probe on the new cell.
+        assert!(
+            store.acquire_for_dispatch_in("freshpool", 0, cooled),
+            "a new pool cell created while a sibling is HalfOpen must be probe-eligible, not wedged"
         );
     }
 

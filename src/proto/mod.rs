@@ -54,6 +54,34 @@ pub(crate) fn synth_amzn_request_id() -> Option<String> {
     ))
 }
 
+/// Mint a protocol-correct Anthropic request id (`req_01<token>`) for the `request-id` RESPONSE HEADER
+/// a native Anthropic response always carries. The official SDK reads this header into
+/// `APIError.request_id` / `Message._request_id` (NOT the body), so a busbar anthropic response that
+/// omitted it left `request_id == None` — impossible against the real API and a deterministic proxy
+/// tell. Used by `forward.rs` on anthropic-ingress success/relay 2xx responses that have NO upstream
+/// `request-id` to forward (the error path mirrors the writer's own body `request_id` into the header
+/// instead; the same-protocol passthrough forwards the UPSTREAM `request-id` verbatim and never calls
+/// this). The shape mirrors a native id: the `req_` prefix, the `01` version marker, then a fixed-width
+/// lowercase-base62 token from the OS CSPRNG. Returns `None` (caller OMITS the header) only if entropy
+/// is unavailable — on the request path, must never panic.
+pub(crate) fn synth_anthropic_request_id() -> Option<String> {
+    // 96 bits of CSPRNG entropy → 16 base62 chars (collision-free in practice), matching the
+    // fixed-width base62 token shape of a native `req_01…` id.
+    let mut buf = [0u8; 12];
+    getrandom::getrandom(&mut buf).ok()?;
+    const ALPHABET: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    // Accumulate the 12 bytes as a u128 and emit 16 base62 digits (62^16 > 2^95, so 12 bytes fit).
+    let mut n = buf.iter().fold(0u128, |acc, &b| (acc << 8) | b as u128);
+    let mut token = [0u8; 16];
+    for slot in token.iter_mut().rev() {
+        *slot = ALPHABET[(n % 62) as usize];
+        n /= 62;
+    }
+    // token is ASCII base62, always valid UTF-8.
+    let token = std::str::from_utf8(&token).unwrap_or("0000000000000000");
+    Some(format!("req_01{token}"))
+}
+
 /// The CANONICAL ingress-protocol classifier: infer the wire protocol a request targets from its
 /// path prefix. This is the single source of truth shared by every site that must shape an error
 /// (or otherwise reason about protocol) from a path alone — `auth.rs::unauthorized_response`,
@@ -75,11 +103,19 @@ pub(crate) fn proto_for_path(path: &str) -> &'static str {
     } else if path.starts_with("/v1/models/") {
         // `/v1/models/...` is ambiguous: Gemini packs a `:<action>` into the LAST path segment
         // (`/v1/models/gemini-pro:generateContent`), whereas the OpenAI SDK's `model.retrieve`
-        // issues `GET /v1/models/{id}` with NO colon action. A colon in the final segment → Gemini;
-        // otherwise OpenAI (so an OpenAI SDK probing model availability gets an OpenAI-decodable
-        // envelope, not an undecodable Gemini one).
+        // issues `GET /v1/models/{id}`. A naive `contains(':')` mis-classifies OpenAI model ids that
+        // legitimately contain colons (fine-tuned `ft:gpt-3.5-turbo:my-org::abc123`, deployment-style
+        // `gpt-4o:deployment`) as Gemini, handing a real OpenAI `model.retrieve` an undecodable Gemini
+        // error envelope. Distinguish the Gemini `:<action>` form by matching ONLY the known Gemini
+        // method suffixes; anything else (including colon-bearing OpenAI model ids) → OpenAI.
         let last_segment = path.rsplit('/').next().unwrap_or("");
-        if last_segment.contains(':') {
+        const GEMINI_ACTIONS: [&str; 4] = [
+            ":generateContent",
+            ":streamGenerateContent",
+            ":countTokens",
+            ":embedContent",
+        ];
+        if GEMINI_ACTIONS.iter().any(|a| last_segment.ends_with(a)) {
             "gemini"
         } else {
             "openai"
@@ -690,14 +726,27 @@ impl StreamTranslate {
             // forward-layer `UsageTap` can scan JSON text rather than the binary frame bytes below.
             // This is the bedrock-ingress token-accounting fix: brace-scanning the encoded binary
             // frame (length prefix / CRC32 / header block) mis-parses or zeroes usage.
-            if let Some(obj) = out_data.as_object().cloned() {
-                let mut tap_obj = obj;
-                tap_obj.insert(
-                    "type".to_string(),
-                    serde_json::Value::String(out_et.clone()),
-                );
-                if let Ok(tap_bytes) = serde_json::to_vec(&serde_json::Value::Object(tap_obj)) {
-                    self.tap_json.extend_from_slice(&tap_bytes);
+            // Splice the `type` key into the ALREADY-serialized `payload` bytes instead of deep-cloning
+            // the whole `out_data` Value (which can be kilobytes for a metadata/tool-result frame) just
+            // to insert one key. `payload` is the serialization of `out_data`; when `out_data` is a JSON
+            // object it begins with `{`, so `{"type":<enc>,` + payload[1..] yields the same object with
+            // `type` prepended — zero Value clone, one small format alloc. Guard on the object shape (a
+            // non-object out_data would not serialize to a leading `{`); fall back to the explicit
+            // build only in that (unexpected) case so the tap is never fed malformed JSON.
+            if out_data.is_object() {
+                if let Ok(enc_et) = serde_json::to_string(&out_et) {
+                    // payload is `{...}`; replace the leading `{` with `{"type":<enc_et>,` (or
+                    // `{"type":<enc_et>}` for the empty-object `{}` case, which has no trailing field).
+                    self.tap_json.extend_from_slice(b"{\"type\":");
+                    self.tap_json.extend_from_slice(enc_et.as_bytes());
+                    if payload.len() > 2 {
+                        // non-empty object: `{` + rest → `,` + rest-after-`{`
+                        self.tap_json.push(b',');
+                        self.tap_json.extend_from_slice(&payload[1..]);
+                    } else {
+                        // `{}` → close immediately
+                        self.tap_json.push(b'}');
+                    }
                 }
             }
             out.extend_from_slice(&crate::eventstream::encode_frame(&out_et, &payload));
@@ -1073,9 +1122,12 @@ impl GeminiJsonArrayFramer {
                 500,
                 "INTERNAL",
                 // Client-facing wire body: must carry NO product/internal vocabulary (the
-                // protocol-indistinguishability promise). A real Gemini client only ever sees a
-                // generic upstream-error message here.
-                "upstream stream was truncated due to an internal error",
+                // protocol-indistinguishability promise). "upstream" is busbar-internal routing
+                // vocabulary no real Gemini API ever emits — a fingerprintable tell. Mirror Gemini's
+                // own canonical 500 status message text instead (the `google.rpc.Status.message` a
+                // real Generative Language API 500 carries), so substring-matching clients can't
+                // distinguish the proxy.
+                "Internal error encountered.",
             );
         }
         self.finished = true;
@@ -1187,6 +1239,91 @@ mod tests {
             serde_json::json!("model 'x' not found")
         );
         assert_eq!(reparsed["error"]["type"], serde_json::json!("not_found"));
+    }
+
+    /// MEDIUM/conformance (proto_for_path:75-86): a `GET /v1/models/<id>` whose id legitimately
+    /// CONTAINS a colon (OpenAI fine-tuned `ft:...`, deployment-style `gpt-4o:deployment`) must
+    /// classify as OpenAI — NOT Gemini — so `model.retrieve` gets an OpenAI-decodable error envelope.
+    /// Only the known Gemini ACTION suffixes (`:generateContent`, …) are Gemini.
+    #[test]
+    fn test_proto_for_path_colon_model_id_is_openai_not_gemini() {
+        // OpenAI fine-tuned model id (multiple colons) on the model.retrieve path → OpenAI.
+        assert_eq!(
+            proto_for_path("/v1/models/ft:gpt-3.5-turbo:my-org::abc123"),
+            "openai",
+            "a colon-bearing OpenAI fine-tuned model id must stay OpenAI"
+        );
+        // Azure-style deployment id with a colon → OpenAI.
+        assert_eq!(proto_for_path("/v1/models/gpt-4o:deployment"), "openai");
+        // Plain model id (no colon) → OpenAI.
+        assert_eq!(proto_for_path("/v1/models/gpt-4o"), "openai");
+        // A genuine Gemini action suffix → Gemini.
+        assert_eq!(
+            proto_for_path("/v1/models/gemini-pro:generateContent"),
+            "gemini",
+            "the Gemini :generateContent action suffix still classifies as Gemini"
+        );
+        assert_eq!(
+            proto_for_path("/v1/models/gemini-pro:streamGenerateContent"),
+            "gemini"
+        );
+        assert_eq!(
+            proto_for_path("/v1/models/text-embedding-004:embedContent"),
+            "gemini"
+        );
+        assert_eq!(
+            proto_for_path("/v1/models/gemini-pro:countTokens"),
+            "gemini"
+        );
+    }
+
+    /// MEDIUM/conformance (synth_anthropic_request_id): the synthesized `request-id` header value must
+    /// carry the native Anthropic shape (`req_01` prefix + non-empty token) so the official SDK reads
+    /// a well-formed `Message._request_id` / `APIError.request_id`.
+    #[test]
+    fn test_synth_anthropic_request_id_is_well_formed() {
+        let id = synth_anthropic_request_id().expect("entropy available in test");
+        assert!(
+            id.starts_with("req_01"),
+            "anthropic request-id must carry the native req_01 prefix; got {id}"
+        );
+        assert!(
+            id.len() > "req_01".len(),
+            "anthropic request-id must have a token suffix; got {id}"
+        );
+        // ASCII base62 token (no padding/special chars that a native id never carries).
+        let token = &id["req_01".len()..];
+        assert!(
+            token.bytes().all(|b| b.is_ascii_alphanumeric()),
+            "the token must be base62 (alphanumeric); got {token}"
+        );
+        // Distinct across calls (CSPRNG-backed) — no fixed/predictable id.
+        let id2 = synth_anthropic_request_id().expect("entropy available in test");
+        assert_ne!(id, id2, "successive ids must differ");
+    }
+
+    /// MEDIUM/conformance (GeminiJsonArrayFramer::finish_with_error): the truncation error element must
+    /// carry NO busbar-internal vocabulary ("upstream"). A real Gemini API never emits that word, so it
+    /// is a fingerprintable tell. The message must read like Gemini's own canonical 500 body.
+    #[test]
+    fn test_gemini_truncation_error_carries_no_internal_vocabulary() {
+        let mut f = GeminiJsonArrayFramer::new();
+        // Force the truncation/abort path: a frame with NO terminator that overruns MAX_BUF, mirroring
+        // `test_gemini_json_array_framer_finish_signals_abort`.
+        let huge = vec![b'x'; GeminiJsonArrayFramer::MAX_BUF + 16];
+        let mut pre = Vec::from(&b"data: {\"k\":\""[..]);
+        pre.extend_from_slice(&huge);
+        let _ = f.feed(&pre);
+        let tail = f.finish();
+        let body = String::from_utf8_lossy(&tail);
+        assert!(
+            !body.to_lowercase().contains("upstream"),
+            "the truncation error must NOT contain the busbar-internal word 'upstream': {body}"
+        );
+        assert!(
+            body.contains("Internal error encountered."),
+            "the truncation error must mirror Gemini's own 500 body text: {body}"
+        );
     }
 
     /// A fresh `IrResponse` constructed with the new identity fields left at their documented

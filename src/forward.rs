@@ -54,6 +54,32 @@ fn maybe_attach_bedrock_amzn_id(
     }
 }
 
+/// Attach the `request-id` RESPONSE HEADER to an anthropic-ingress 2xx/relay response. A real
+/// Anthropic endpoint ALWAYS sends `request-id`, and the official SDK reads it into
+/// `APIError.request_id` / `Message._request_id` (the body `request_id` is NOT what the SDK uses on
+/// the read path), so omitting it left the SDK's `request_id == None` on every busbar anthropic
+/// response — impossible against the real API and a deterministic proxy tell. No-op for non-anthropic
+/// ingress (mirroring `maybe_attach_bedrock_amzn_id`'s proto guard, so other protocols never get a
+/// spurious anthropic header). Forwards the captured UPSTREAM id verbatim on a same-protocol
+/// passthrough; synthesizes a shape-correct `req_…` id otherwise. Synthesis failure (no entropy)
+/// simply OMITS the header rather than panicking on the request path.
+fn maybe_attach_anthropic_request_id(
+    rb: axum::http::response::Builder,
+    ingress_protocol: &str,
+    upstream_request_id: Option<&str>,
+) -> axum::http::response::Builder {
+    if ingress_protocol != "anthropic" {
+        return rb;
+    }
+    match upstream_request_id
+        .map(|s| s.to_string())
+        .or_else(crate::proto::synth_anthropic_request_id)
+    {
+        Some(id) => rb.header("request-id", id),
+        None => rb,
+    }
+}
+
 /// The CANONICAL per-protocol error-response builder. Every forward-layer error returned to the
 /// caller goes through here so the body is the INGRESS protocol's native error envelope
 /// (`application/json`) rather than `text/plain`, which an official SDK cannot decode (it raises a
@@ -97,6 +123,19 @@ pub(crate) fn ingress_error(ingress: &str, status: StatusCode, kind: &str, msg: 
     // drift from `route.rs`/`auth.rs`.
     if ingress == "bedrock" {
         crate::proto::attach_bedrock_error_headers(resp.headers_mut(), kind);
+    }
+    // Anthropic ingress: a real Anthropic response ALWAYS carries the request id in the `request-id`
+    // RESPONSE HEADER (the official SDK reads `request-id` into `APIError.request_id` /
+    // `Message._request_id`, NOT the body), so an anthropic error that omitted the header left
+    // `err.request_id == None` on every response — impossible against the real API and a deterministic
+    // tell. The writer already mints a top-level body `request_id`; mirror it into the header so body
+    // and header AGREE and the SDK populates `request_id`.
+    if ingress == "anthropic" {
+        if let Some(rid) = envelope.get("request_id").and_then(|v| v.as_str()) {
+            if let Ok(hv) = axum::http::HeaderValue::from_str(rid) {
+                resp.headers_mut().insert("request-id", hv);
+            }
+        }
     }
     resp
 }
@@ -1224,8 +1263,19 @@ async fn pick_among(
 
             if !request_ctx.excluded.contains(&sticky) && app.store.usable_in(pool_name, sticky, t)
             {
+                // CLASS GUARD (single-flight recovery probe), sticky fast path: `usable_in` →
+                // `cell_acquire_breaker` transitions an expired-Open lane to HalfOpen and CAS-wins
+                // the single-flight `probe_in_flight` flag as a SIDE EFFECT. If we then fail to get a
+                // concurrency permit, NO request is dispatched on this lane, so neither
+                // `record_success` (→ cell_closed) nor a failure (→ cell_open) ever runs to clear the
+                // probe. Falling through to the SWRR loop without releasing it would leave the lane
+                // wedged HalfOpen + probe_in_flight, benching it until the slow out-of-band prober
+                // resets it — the SAME leak the main loop guards below. So: keep the probe only on the
+                // dispatch (try_acquire success); release it on every other exit before falling through.
                 if let Some(p) = app.store.try_acquire(sticky) {
                     return Some((sticky, p));
+                } else {
+                    app.store.release_probe_in(pool_name, sticky);
                 }
             }
         }
@@ -2032,6 +2082,13 @@ pub(crate) async fn forward_with_pool(
                     .get("x-amzn-requestid")
                     .and_then(|h| h.to_str().ok())
                     .map(|s| s.to_string());
+                // Anthropic-ingress: capture the upstream `request-id` so a same-protocol passthrough
+                // forwards it verbatim; cross-protocol/synthetic cases mint one in the attach helper.
+                let upstream_request_id = r
+                    .headers()
+                    .get("request-id")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_string());
                 let is_sse = ct
                     .as_ref()
                     .map(|h| is_streaming_content_type(h.to_str().unwrap_or("")))
@@ -2138,6 +2195,11 @@ pub(crate) async fn forward_with_pool(
                                     .status(status)
                                     .header(CONTENT_TYPE, "application/json");
                                 let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
+                                // Anthropic-ingress 2xx carries `request-id`. This is the
+                                // CROSS-protocol translate path (ingress != egress), so there is no
+                                // upstream anthropic id to forward — synthesize one.
+                                let rb =
+                                    maybe_attach_anthropic_request_id(rb, ingress_protocol, None);
                                 return rb
                                     .body(Body::from(translated.to_string()))
                                     .unwrap_or_else(|_| status.into_response());
@@ -2230,6 +2292,13 @@ pub(crate) async fn forward_with_pool(
                         rb = rb.header("x-amzn-requestid", id);
                     }
                 }
+                // Anthropic-ingress streaming 2xx must carry `request-id` (a real Anthropic stream
+                // always does; the SDK reads it into `Message._request_id`).
+                rb = maybe_attach_anthropic_request_id(
+                    rb,
+                    ingress_protocol,
+                    upstream_request_id.as_deref(),
+                );
                 return rb
                     .body(axum_body)
                     .unwrap_or_else(|_| status.into_response());
@@ -2461,6 +2530,13 @@ async fn forward_once(
                 .get("x-amzn-requestid")
                 .and_then(|h| h.to_str().ok())
                 .map(|s| s.to_string());
+            // Anthropic-ingress `request-id` (same-protocol degraded relay forwards it verbatim;
+            // cross-protocol synthesizes). See `maybe_attach_anthropic_request_id`.
+            let upstream_request_id = r
+                .headers()
+                .get("request-id")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string());
             let cross_protocol = ingress_protocol != egress_name;
 
             if !status.is_success() {
@@ -2483,6 +2559,14 @@ async fn forward_once(
                 if let Some(ct) = ct {
                     rb = rb.header(CONTENT_TYPE, ct);
                 }
+                // Anthropic-ingress same-protocol error relay: forward the upstream `request-id`
+                // verbatim (a native Anthropic error always carries it; the SDK reads it into
+                // `APIError.request_id`).
+                rb = maybe_attach_anthropic_request_id(
+                    rb,
+                    ingress_protocol,
+                    upstream_request_id.as_deref(),
+                );
                 return Ok(rb
                     .body(Body::from(bytes))
                     .unwrap_or_else(|_| status.into_response()));
@@ -2574,6 +2658,9 @@ async fn forward_once(
                                 .status(status)
                                 .header(CONTENT_TYPE, "application/json");
                             let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
+                            // Cross-protocol degraded translate (ingress != egress): no upstream
+                            // anthropic id to forward — synthesize the `request-id` header.
+                            let rb = maybe_attach_anthropic_request_id(rb, ingress_protocol, None);
                             return Ok(rb
                                 .body(Body::from(translated.to_string()))
                                 .unwrap_or_else(|_| status.into_response()));
@@ -2647,6 +2734,13 @@ async fn forward_once(
                     rb = rb.header("x-amzn-requestid", id);
                 }
             }
+            // Anthropic-ingress 2xx carries `request-id`: forward the upstream's verbatim on a
+            // same-protocol passthrough, else synthesize. Non-anthropic ingress: omit.
+            rb = maybe_attach_anthropic_request_id(
+                rb,
+                ingress_protocol,
+                upstream_request_id.as_deref(),
+            );
             Ok(rb
                 .body(guarded_body.into_body())
                 .unwrap_or_else(|_| status.into_response()))
@@ -3635,6 +3729,41 @@ mod ingress_indistinguishability_tests {
                 .and_then(|v| v.to_str().ok()),
             Some("application/json")
         );
+        // OpenAI ingress must NOT receive the anthropic-only `request-id` header.
+        assert!(
+            oai.headers().get("request-id").is_none(),
+            "non-anthropic ingress must not carry an anthropic request-id header"
+        );
+    }
+
+    /// MEDIUM/conformance (forward.rs:73-101): the anthropic-ingress error `request-id` HEADER equals
+    /// the body `request_id`, and non-anthropic ingress carries no such header.
+    #[tokio::test]
+    async fn test_anthropic_ingress_error_request_id_header_matches_body() {
+        use http_body_util::BodyExt as _;
+        let resp = ingress_error(
+            "anthropic",
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "bad json",
+        );
+        let header_rid = resp
+            .headers()
+            .get("request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .expect("anthropic error must carry a request-id header");
+        assert!(
+            header_rid.starts_with("req_"),
+            "request-id header carries the Anthropic req_ shape; got {header_rid}"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["request_id"].as_str(),
+            Some(header_rid.as_str()),
+            "the request-id header MUST equal the body request_id so they agree"
+        );
     }
 
     /// The streaming response Content-Type is driven by the ingress protocol, not the upstream:
@@ -3798,6 +3927,66 @@ mod ingress_indistinguishability_tests {
         );
         // UUID-v4 shaped: 36 chars, 8-4-4-4-12.
         assert_eq!(amzn.len(), 36, "x-amzn-RequestId is a UUID; got {amzn}");
+        server.shutdown().await;
+    }
+
+    /// MEDIUM/conformance (forward.rs:73-101, relay paths): an anthropic-INGRESS 2xx must carry a
+    /// `request-id` RESPONSE HEADER — a real Anthropic response always does (the SDK reads it into
+    /// `Message._request_id`). On this CROSS-protocol hop (OpenAI backend → Anthropic client) there is
+    /// no upstream anthropic id to forward, so busbar must SYNTHESIZE a shape-correct `req_…` one.
+    #[tokio::test]
+    async fn test_anthropic_ingress_success_carries_request_id_header() {
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "id": "chatcmpl-ok",
+                "object": "chat.completion",
+                "created": 1234567890,
+                "model": "glm-4.5",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "glm-4.5",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("pa", &[(0, 1)])
+            .build();
+        let body = serde_json::to_vec(
+            &json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50}),
+        )
+        .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            body.into(),
+            None,
+            "pa",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let rid = resp
+            .headers()
+            .get("request-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            rid.starts_with("req_"),
+            "anthropic-ingress 2xx MUST carry a synthesized `request-id` header in the native req_ \
+             shape; got {rid:?}"
+        );
         server.shutdown().await;
     }
 
