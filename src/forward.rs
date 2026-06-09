@@ -191,8 +191,7 @@ fn shape_cross_protocol_error(
     bytes: &[u8],
 ) -> Response {
     let kind = cross_protocol_error_kind(status);
-    let msg =
-        extract_error_message(bytes).unwrap_or_else(|| "upstream rejected the request".to_string());
+    let msg = extract_error_message(bytes).unwrap_or_else(|| GENERIC_REJECTED_DETAIL.to_string());
     ingress_error(ingress_protocol, status, kind, &msg)
 }
 
@@ -483,7 +482,28 @@ fn extract_error_message(bytes: &[u8]) -> Option<String> {
 /// AI vendor emits hyper/reqwest strings) and an infrastructure-disclosure leak. The real cause is
 /// logged server-side via `tracing`; only this static string ever reaches the client. Single source of
 /// truth so a future edit cannot reintroduce `e.to_string()` at one site unnoticed.
-pub(crate) const MID_STREAM_GENERIC_DETAIL: &str = "upstream stream interrupted";
+///
+/// The phrasing must also be VENDOR-PLAUSIBLE: the word "upstream" (and "proxy"/"gateway"/"backend"/
+/// "lane") is itself busbar-internal reverse-proxy vocabulary that a native vendor SDK would never
+/// emit in an error body or stream exception frame. A real Bedrock `ConverseStream` exception, an
+/// SSE `error` event, or a Gemini `google.rpc.Status` element carries generic service phrasing, never
+/// the word "upstream" — leaking it is a protocol-indistinguishability tell on the most-exercised
+/// cross-protocol error path. Keep this generic and free of any intermediary/translation vocabulary.
+pub(crate) const MID_STREAM_GENERIC_DETAIL: &str = "The response stream was interrupted.";
+
+/// Vendor-neutral fallback `error.message` for a NON-2xx response whose body carried no extractable
+/// human message. Rendered into the CLIENT's native error envelope via `ingress_error`, so it must
+/// read like copy a real single-vendor API would emit — NOT reverse-proxy vocabulary like "upstream".
+/// The real status/cause is logged server-side; only this generic string reaches the client.
+pub(crate) const GENERIC_REJECTED_DETAIL: &str = "The request could not be processed.";
+
+/// Vendor-neutral fallback detail for a cross-protocol response that could not be relayed (a body
+/// transfer failure mid-read, an over-cap body, or an untranslatable shape). Rendered into the
+/// client's native error envelope, so it must NOT disclose the existence of a translating
+/// intermediary ("translate"/"untranslatable") or proxy vocabulary ("upstream"); a native vendor
+/// returns a generic internal-error message here. The precise cause is logged server-side.
+pub(crate) const GENERIC_RESPONSE_ERROR_DETAIL: &str =
+    "An internal error occurred while processing the response.";
 
 /// Build the bytes for a mid-stream error to send to the CLIENT, framed in the INGRESS protocol.
 ///
@@ -714,6 +734,12 @@ pub(crate) struct UsageTap {
     /// recorded synchronously), whereas a stream that carried an explicit error frame ended
     /// abnormally (→ record one breaker failure). Holds the error message for observability.
     pub terminal_error: Option<String>,
+    /// Cross-chunk reassembly buffer for the BINARY `application/vnd.amazon.eventstream` body of a
+    /// same-protocol bedrock→bedrock passthrough (`feed_eventstream`). The JSON `feed` path keeps no
+    /// cross-chunk state (it scans complete objects per chunk), but binary eventstream frames carry a
+    /// u32 length prefix + CRCs and routinely span chunk boundaries, so the terminal `metadata` /
+    /// `exception` frame must be reassembled across polls. Bounded by `drain_frames`' MAX_FRAME_BYTES.
+    eventstream_buf: Vec<u8>,
 }
 
 impl UsageTap {
@@ -762,6 +788,62 @@ impl UsageTap {
                 }
             } else {
                 break;
+            }
+        }
+    }
+
+    /// Feed a chunk of a BINARY `application/vnd.amazon.eventstream` body (a same-protocol
+    /// bedrock→bedrock passthrough). The JSON `feed` scanner cannot be used here: the eventstream
+    /// frames carry u32 length prefixes, header blocks and CRC32 trailers, so a stray `{` byte inside
+    /// a prelude/CRC/payload would mislead the brace scanner into parsing garbage or a partial object
+    /// (wrong/zero token counts, non-deterministic terminal-error detection). Instead, reassemble
+    /// complete frames across chunk boundaries with `drain_frames` and inspect each by event type:
+    ///   - a `metadata` frame carries the native Converse `usage.{inputTokens,outputTokens}` — the
+    ///     only place per-request token usage appears on a ConverseStream — so TPM / spend budget can
+    ///     be charged for passthrough traffic (otherwise always zero);
+    ///   - an `*Exception` frame (`:message-type: exception`, surfaced by `event_type_for_frame` as a
+    ///     `…Exception` union-member token) is an in-band terminal error AWS delivers while the HTTP
+    ///     response stays 200 and closes cleanly — set `terminal_error` so the stream-end breaker arm
+    ///     records a failure (otherwise the lane looks healthy after every in-band bedrock error).
+    pub(crate) fn feed_eventstream(&mut self, chunk: &Bytes) {
+        // Same MAX_SCAN_BYTES guard as `feed`: `drain_frames` itself caps a single frame at
+        // MAX_FRAME_BYTES, but a chunk far larger than a realistically coalesced terminal flush is
+        // skipped to bound per-poll scan time on the Tokio worker, with a warn so the accounting gap
+        // is observable rather than silent.
+        const MAX_SCAN_BYTES: usize = 512 * 1024;
+        if self.eventstream_buf.len().saturating_add(chunk.len()) > MAX_SCAN_BYTES {
+            tracing::warn!(
+                buffered = self.eventstream_buf.len(),
+                chunk_len = chunk.len(),
+                cap = MAX_SCAN_BYTES,
+                "usage tap skipped an oversized eventstream chunk; if it carried the terminal \
+                 metadata/exception frame, tokens are undercounted or an in-band error is missed"
+            );
+            // Drop the partial buffer too: it can no longer be completed within the cap.
+            self.eventstream_buf.clear();
+            return;
+        }
+        self.eventstream_buf.extend_from_slice(chunk);
+        for (event_type, payload) in crate::eventstream::drain_frames(&mut self.eventstream_buf) {
+            if event_type == "metadata" {
+                if let Ok(obj) = serde_json::from_slice::<Value>(&payload) {
+                    // Native Converse usage shape (inputTokens / outputTokens) — handled by the
+                    // protocol-agnostic extractor, which already recognizes the bedrock keys.
+                    self.extract_usage_any(&obj);
+                }
+            } else if event_type.ends_with("Exception") {
+                // In-band modeled exception (e.g. internalServerException, modelStreamErrorException,
+                // throttlingException). Record it as the terminal error so the stream-end breaker arm
+                // trips this lane. Lift the payload `message` for observability where present.
+                let msg = serde_json::from_slice::<Value>(&payload)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("message")
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| event_type.clone());
+                self.terminal_error = Some(msg);
             }
         }
     }
@@ -1104,7 +1186,13 @@ where
                     // native bedrock ConverseStream passthrough is best handled off the JSON tap.) Every
                     // other same-protocol passthrough (the five SSE protocols) IS JSON-bearing text, so
                     // it still feeds the tap as before.
-                    if !this.ingress_eventstream {
+                    if this.ingress_eventstream {
+                        // Binary `application/vnd.amazon.eventstream` passthrough: scan the native
+                        // frames for the `metadata` usage frame and any in-band `*Exception` frame so
+                        // bedrock→bedrock streaming is token-accounted AND in-band errors trip the
+                        // breaker — neither of which the JSON `feed` scanner can do over binary frames.
+                        this.tap.feed_eventstream(&chunk);
+                    } else {
                         this.tap.feed(&chunk);
                     }
                     // Gemini same-protocol passthrough WITHOUT `?alt=sse`: the upstream chunk is
@@ -1983,7 +2071,7 @@ pub(crate) async fn forward_with_pool(
                             if ingress_protocol != egress_name {
                                 let kind = client_fault_kind(sig.class);
                                 let msg = extract_error_message(&bytes)
-                                    .unwrap_or_else(|| "upstream rejected the request".to_string());
+                                    .unwrap_or_else(|| GENERIC_REJECTED_DETAIL.to_string());
                                 return ingress_error(ingress_protocol, status, kind, &msg);
                             }
                             use axum::body::Body;
@@ -2079,7 +2167,7 @@ pub(crate) async fn forward_with_pool(
                                 | StatusClass::Network
                                 | StatusClass::ClientError
                                 | StatusClass::ContextLength => {
-                                    format!("upstream rejected request (HTTP {})", status.as_u16())
+                                    format!("request rejected (HTTP {})", status.as_u16())
                                 }
                             };
                             // A hard-down (auth rejection / billing exhaustion) is a property of the
@@ -2271,7 +2359,7 @@ pub(crate) async fn forward_with_pool(
                             ingress_protocol,
                             StatusCode::BAD_GATEWAY,
                             "api_error",
-                            "upstream response transfer failed mid-body",
+                            GENERIC_RESPONSE_ERROR_DETAIL,
                         );
                     }
                     // Token accounting: no FirstByteBody on this buffered path, so tap here.
@@ -2288,7 +2376,7 @@ pub(crate) async fn forward_with_pool(
                             ingress_protocol,
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "api_error",
-                            "upstream response was too large to translate",
+                            GENERIC_RESPONSE_ERROR_DETAIL,
                         );
                     }
                     if let Ok(rv) = serde_json::from_slice::<Value>(&bytes) {
@@ -2424,7 +2512,7 @@ pub(crate) async fn forward_with_pool(
                         ingress_protocol,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "api_error",
-                        "upstream returned an untranslatable response",
+                        GENERIC_RESPONSE_ERROR_DETAIL,
                     );
                 }
 
@@ -2824,7 +2912,7 @@ async fn forward_once(
                         ingress_protocol,
                         StatusCode::BAD_GATEWAY,
                         "api_error",
-                        "upstream response transfer failed mid-body",
+                        GENERIC_RESPONSE_ERROR_DETAIL,
                     ));
                 }
                 // Token accounting: no FirstByteBody on this buffered path, so tap the usage here and
@@ -2842,7 +2930,7 @@ async fn forward_once(
                         ingress_protocol,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "api_error",
-                        "upstream response was too large to translate",
+                        GENERIC_RESPONSE_ERROR_DETAIL,
                     ));
                 }
                 if let Ok(rv) = serde_json::from_slice::<Value>(&bytes) {
@@ -2913,7 +3001,7 @@ async fn forward_once(
                     ingress_protocol,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "api_error",
-                    "upstream returned an untranslatable response",
+                    GENERIC_RESPONSE_ERROR_DETAIL,
                 ));
             }
 
@@ -3234,6 +3322,58 @@ mod usage_tap_tests {
         let mut t = UsageTap::new();
         t.feed(&Bytes::from(r#"{"choices":[],"error":null}"#));
         assert_eq!(t.terminal_error, None);
+    }
+
+    /// MEDIUM (forward.rs same-protocol bedrock passthrough): a bedrock→bedrock streaming passthrough
+    /// is BINARY `application/vnd.amazon.eventstream`, so the JSON `feed` scanner is skipped. The
+    /// bedrock-aware `feed_eventstream` must instead reassemble the native frames and (a) charge the
+    /// `metadata` frame's `usage.{inputTokens,outputTokens}` so TPM/spend governance is not silently
+    /// bypassed, and (b) flag an in-band `*Exception` frame as `terminal_error` so the stream-end
+    /// breaker arm trips the lane even though the HTTP response was a clean 200.
+    #[test]
+    fn test_eventstream_tap_counts_usage_and_detects_exception() {
+        use crate::eventstream::{encode_exception_frame, encode_frame};
+
+        // A `metadata` frame carrying the native Converse usage shape → tokens are counted.
+        let mut t = UsageTap::new();
+        let meta = encode_frame(
+            "metadata",
+            br#"{"usage":{"inputTokens":42,"outputTokens":13}}"#,
+        );
+        t.feed_eventstream(&Bytes::from(meta));
+        assert_eq!(t.input_tokens, Some(42));
+        assert_eq!(t.output_tokens, Some(13));
+        // A clean stream (no exception frame) leaves terminal_error unset → no breaker trip.
+        assert_eq!(t.terminal_error, None);
+
+        // An in-band modeled exception frame → terminal_error set (breaker trips at stream end).
+        let mut t = UsageTap::new();
+        let exc = encode_exception_frame(
+            "InternalServerException",
+            "An internal error occurred during request processing.",
+        );
+        t.feed_eventstream(&Bytes::from(exc));
+        assert_eq!(
+            t.terminal_error.as_deref(),
+            Some("An internal error occurred during request processing.")
+        );
+
+        // Frames split across chunk boundaries must still be reassembled: feed the metadata frame one
+        // byte at a time, then assert the usage was extracted only once the final byte completes it.
+        let mut t = UsageTap::new();
+        let meta = encode_frame(
+            "metadata",
+            br#"{"usage":{"inputTokens":5,"outputTokens":7}}"#,
+        );
+        let split = meta.len();
+        for (idx, b) in meta.iter().enumerate() {
+            t.feed_eventstream(&Bytes::copy_from_slice(&[*b]));
+            if idx + 1 < split {
+                assert_eq!(t.input_tokens, None, "must not parse a partial frame");
+            }
+        }
+        assert_eq!(t.input_tokens, Some(5));
+        assert_eq!(t.output_tokens, Some(7));
     }
 }
 
@@ -3565,8 +3705,12 @@ mod mid_stream_error_tests {
     /// both error-framing helpers it feeds emit a body free of them.
     #[test]
     fn test_mid_stream_generic_detail_has_no_leak_markers() {
-        let detail = MID_STREAM_GENERIC_DETAIL;
-        for marker in [
+        // Markers: transport/infrastructure tells (URLs, hyper/reqwest internals) AND busbar-internal
+        // reverse-proxy VOCABULARY ("upstream"/"proxy"/"gateway"/"backend"/"lane"/"translate"). A
+        // native vendor SDK never emits the latter in an error body or stream exception frame, so the
+        // word "upstream" was itself a protocol-indistinguishability tell — pin it out here so it
+        // cannot creep back into any client-facing fallback constant.
+        const LEAK_MARKERS: &[&str] = &[
             "http://",
             "https://",
             "reqwest",
@@ -3577,11 +3721,26 @@ mod mid_stream_error_tests {
             "amazonaws",
             "url",
             "error sending request",
+            "upstream",
+            "proxy",
+            "gateway",
+            "backend",
+            "lane",
+            "translat", // matches "translate" / "translation" / "untranslatable"
+        ];
+        // Every client-facing fallback string, not just the mid-stream detail: all are rendered into
+        // a native error envelope / stream frame and must read like a real single-vendor API.
+        for detail in [
+            MID_STREAM_GENERIC_DETAIL,
+            super::GENERIC_REJECTED_DETAIL,
+            super::GENERIC_RESPONSE_ERROR_DETAIL,
         ] {
-            assert!(
-                !detail.to_ascii_lowercase().contains(marker),
-                "generic mid-stream detail must not contain leak marker {marker:?}: {detail:?}"
-            );
+            for marker in LEAK_MARKERS {
+                assert!(
+                    !detail.to_ascii_lowercase().contains(marker),
+                    "client-facing fallback must not contain leak marker {marker:?}: {detail:?}"
+                );
+            }
         }
         // The Gemini JSON-array path (the HIGH finding): a `google.rpc.Status` element whose message
         // is exactly the generic detail, with no transport/URL markers spliced in.

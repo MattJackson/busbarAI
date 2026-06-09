@@ -929,10 +929,22 @@ impl InMemoryStore {
     /// half-open probe — complete recovery to Closed. (The lane-global `ok` counter is bumped by the
     /// caller, since it is shared across pools.)
     fn cell_record_success(c: &dyn BreakerCellAccess, now_time: u64) {
-        let was_half_open = c.breaker_state().load(Ordering::Acquire) == ST_HALF_OPEN;
         c.streak().store(0, Ordering::Release);
         lock_recover(c.outcome_window()).push(now_time, false); // success outcome
-        if was_half_open {
+                                                                // CAS HalfOpen → Closed rather than a plain load-then-act. A non-atomic
+                                                                // `load(HalfOpen) … store(Closed)` opens a TOCTOU window: a concurrent
+                                                                // `record_hard_down_all_cells` / `record_probe_failure_all_cells` can move the cell
+                                                                // HalfOpen → Open (re-arming the sticky cooldown) between the read and the write, and the
+                                                                // unconditional `cell_closed` store would then silently recover a lane the hard-down just
+                                                                // parked — bypassing the cooldown and dropping the hard-down entirely. Only the thread that
+                                                                // wins this CAS owns the HalfOpen → Closed recovery; if the cell is no longer HalfOpen
+                                                                // (already Open, or already Closed by a peer), we record the success outcome but leave the
+                                                                // state transition to whoever owns it. Mirrors the CAS pattern in `cell_acquire_breaker`
+                                                                // (Open → HalfOpen) and `cell_release_probe` (HalfOpen → Open).
+        if c.breaker_state()
+            .compare_exchange(ST_HALF_OPEN, ST_CLOSED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             Self::cell_closed(c);
         }
     }
@@ -2348,6 +2360,85 @@ mod tests {
                 BreakerState::Open { .. } => {
                     // Acceptable transient end-state only if the probe is not stuck held.
                     assert!(!probe_held, "an Open cell must not retain the probe flag");
+                }
+            }
+        }
+    }
+
+    /// HIGH (store.rs `cell_record_success` TOCTOU): a half-open probe SUCCESS racing a concurrent
+    /// `record_hard_down_all_cells` (billing exhaustion / invalid credential) must NEVER silently
+    /// recover the lane and drop the hard-down's sticky 30-minute cooldown. Before the fix the success
+    /// recorder did a plain `load(HalfOpen)` then an UNCONDITIONAL `store(ST_CLOSED)` (clearing the
+    /// cooldown), so a hard-down landing in the window between the read and the write was clobbered —
+    /// the parked credential-failure lane was instantly re-readied. The CAS (HalfOpen→Closed) makes
+    /// success own the transition only when it wins the race; if the hard-down moved the cell to Open
+    /// first, success leaves the sticky cooldown intact. Invariant pinned here: the final state is
+    /// never a Closed cell that still carries the hard-down cooldown, and an Open end-state always
+    /// keeps that cooldown — i.e. the hard-down is never silently dropped.
+    #[test]
+    fn test_concurrent_success_racing_hard_down_never_drops_sticky_cooldown() {
+        use std::sync::Barrier;
+
+        for _ in 0..2000 {
+            let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+            let now = 3000u64;
+            // Park the cell in HalfOpen (expired prior cooldown), as if a probe was just acquired.
+            store
+                .get_lane(0)
+                .cooldown_until
+                .store(1000, Ordering::Relaxed);
+            store
+                .get_lane(0)
+                .breaker_state
+                .store(ST_HALF_OPEN, Ordering::Relaxed);
+            store
+                .get_lane(0)
+                .probe_in_flight
+                .store(true, Ordering::Relaxed);
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            // Thread A: the half-open probe SUCCEEDS (organic recovery path).
+            let store_a = Arc::clone(&store);
+            let barrier_a = Arc::clone(&barrier);
+            let a = std::thread::spawn(move || {
+                barrier_a.wait();
+                store_a.record_success(0);
+            });
+
+            // Thread B: a concurrent hard-down (billing/auth) parks the lane with a sticky cooldown.
+            let store_b = Arc::clone(&store);
+            let barrier_b = Arc::clone(&barrier);
+            let b = std::thread::spawn(move || {
+                barrier_b.wait();
+                store_b.record_hard_down_all_cells(0, "billing / insufficient balance");
+            });
+
+            a.join().expect("A must not panic");
+            b.join().expect("B must not panic");
+
+            let state = store.breaker_state(0);
+            let cooldown = store.get_lane(0).cooldown_until.load(Ordering::Relaxed);
+            match state {
+                // Success won the CAS before the hard-down's store landed: legitimate full recovery,
+                // cooldown cleared. (The hard-down's store(Open) must then have lost the race; if it
+                // had landed last the state would be Open, handled below.)
+                BreakerState::Closed => assert_eq!(
+                    cooldown, 0,
+                    "a Closed (recovered) cell must not retain a stale cooldown"
+                ),
+                // The hard-down won: the sticky cooldown MUST survive — success must not have cleared
+                // it. This is the exact regression: a non-CAS success would have left state Open (from
+                // the hard-down) but cleared the cooldown, re-readying a parked credential-failure lane.
+                BreakerState::Open { until } => {
+                    assert!(
+                        cooldown > now,
+                        "a hard-down Open cell must keep its sticky cooldown (got {cooldown}, now {now})"
+                    );
+                    assert!(until > now, "Open until must be in the future");
+                }
+                BreakerState::HalfOpen => {
+                    panic!("cell must not remain HalfOpen after both writers ran")
                 }
             }
         }
