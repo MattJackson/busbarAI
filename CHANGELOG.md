@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.3] — 2026-06-10
+
+This is a hardening release: a multi-round security/correctness audit campaign over the rc.2 code,
+plus the universal-ingress feature. No API changes vs rc.2 beyond the new ingress routes.
+
 ### Added
 - **Universal ingress — all six protocols are now first-class ingress.** Previously
   clients could only speak Anthropic (`/<...>/v1/messages`) or OpenAI
@@ -28,6 +33,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface. Only `/healthz` remains unconditionally open. In `none`/`passthrough`
   mode `/metrics` is still admitted unconditionally. This supersedes the 0.16.2
   security-review note that described `/metrics` as intentionally open.
+- **SSRF guard hardened against trailing-dot hosts.** The webhook and OTLP endpoint
+  validators stripped a trailing FQDN-root dot only inside one branch, so
+  `127.0.0.1.` / `metadata.google.internal.` slipped past the IP-literal and
+  cloud-metadata checks and resolved to internal targets. The dot is now stripped
+  before every check, matching the upstream-config SSRF guard.
+- **Admin reserved-name collision now rejected for models too.** A model named
+  `admin` was reachable at `/admin/v1/messages` (the operator admin surface),
+  making it unreachable to clients and bypassing per-model governance. Config
+  validation now rejects it, symmetric with the pool/provider checks.
+- **Anthropic egress no longer emits a dual-credential header.** An ambiguous
+  credential previously sent both `x-api-key` and `authorization: Bearer` — a
+  request shape no native client produces. The wire path now resolves it to the
+  single native header the auth mode implies.
+
+### Fixed
+- **Cohere streaming text no longer dropped.** The content-delta reader could not
+  decode the native object shape (`delta.message.content = {type,text}`) the writer
+  emits, silently dropping streamed assistant text on the Cohere read/proxy path.
+- **OpenAI `include_usage` streams.** A `usage: null` non-final chunk no longer
+  synthesizes a spurious mid-stream `message_delta`; and a trailing usage-only chunk
+  no longer produces a `message_delta` after `message_stop` on non-Bedrock ingress.
+- **Gemini safety-filtered responses.** A `finishReason: SAFETY` candidate with no
+  `content` field (a legitimate Gemini shape) is decoded normally instead of
+  returning a spurious 500.
+- **Bedrock conformance:** cross-protocol degraded error relays now forward
+  `x-amzn-requestid` / `x-amzn-errortype`; tool-call ids are remapped to the client's
+  native shape on the degraded path; prompt-cache token fields round-trip.
+- **Responses non-streaming output items** now carry the native `id` / `status` /
+  `annotations` the streaming path emits.
+- Numerous lower-severity correctness/conformance fixes across the breaker cooldown
+  jitter, SigV4 header canonicalization, health-probe Retry-After handling, and id
+  synthesis (unbiased base62). Active health probes now send the same `User-Agent` /
+  `Accept` as organic traffic. Admin key creation rejects negative budgets.
+
+### Changed
+- **MSRV is now Rust 1.87** (declared via `rust-version`), reflecting use of
+  `u32::is_multiple_of`.
+- Internal: the auth mode is now a single source of truth on the auth middleware
+  (removed a denormalized copy on the app state).
 
 ## [1.0.0-rc.2] — 2026-06-04
 
