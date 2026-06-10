@@ -669,9 +669,28 @@ where
 {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_otlp::WithExportConfig as _;
+    use opentelemetry_otlp::WithHttpConfig as _;
+
+    // Build a hyper-based HTTP client for trace export that does NOT follow redirects. hyper is a
+    // low-level client (unlike reqwest it performs no automatic redirect handling), so a validated
+    // OTLP endpoint cannot 3xx-redirect the exporter to an internal/metadata target at runtime —
+    // closing the redirect-SSRF vector the bundled reqwest client left open. Using hyper-rustls also
+    // keeps OTLP on busbar's single client stack (no duplicate reqwest major). `https_or_http` accepts
+    // an `http://` collector (e.g. a localhost sidecar) as well as `https://`.
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .build();
+    let http_client = opentelemetry_http::hyper::HyperClient::new(
+        https,
+        std::time::Duration::from_secs(10),
+        None,
+    );
 
     let exporter = match opentelemetry_otlp::SpanExporter::builder()
         .with_http()
+        .with_http_client(http_client)
         .with_endpoint(endpoint)
         .build()
     {

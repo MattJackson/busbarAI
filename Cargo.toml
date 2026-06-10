@@ -43,23 +43,32 @@ metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 opentelemetry = "0.32.0"
 opentelemetry_sdk = "0.32.1"
-# Pin OTLP to the HTTP/proto trace path busbar uses (`SpanExporter::builder().with_http()`), with
-# the reqwest client on rustls so HTTPS export actually works. Dropping default features removes
-# `reqwest-blocking-client` (a blocking reqwest busbar never uses) and the OTLP metrics/logs paths
-# (busbar exports metrics via Prometheus, not OTLP).
+# Pin OTLP to the HTTP/proto trace path busbar uses (`SpanExporter::builder().with_http()`). The
+# default bundled client is dropped; busbar injects its OWN HTTP client via `with_http_client` (see
+# observability::build_otlp) so trace export shares busbar's hyper/rustls stack and — critically —
+# does NOT follow redirects (a redirect-following exporter is a runtime SSRF vector: a validated OTLP
+# endpoint that 3xx-redirects to an internal/metadata target would be followed). Dropping default
+# features also removes `reqwest-blocking-client` and the OTLP metrics/logs paths (busbar exports
+# metrics via Prometheus, not OTLP).
 #
-# KNOWN DUPLICATION (accepted, not removable here): opentelemetry-otlp 0.32 transitively pulls a
-# SECOND reqwest major (0.13 via opentelemetry-http + rustls-platform-verifier) alongside the 0.12
-# we pin for the request path, so `cargo tree -d` shows reqwest 0.12.x AND 0.13.x (plus duplicate
-# getrandom 0.2/0.3 and hashbrown 0.16/0.17 majors). The request path uses 0.12; OTLP uses 0.13
-# only for low-volume trace export. The "minimal surface" feature-trimming above therefore does NOT
-# yield a single client stack — collapsing to one reqwest major would require an opentelemetry
-# release aligned to reqwest 0.12 (or dropping OTLP HTTP export). We accept the duplication rather
-# than imply (via the trimming comments) a single stack that the resolved graph does not deliver.
+# SINGLE CLIENT STACK: by dropping the `reqwest-rustls` feature and supplying a hyper-based
+# `opentelemetry_http::HyperClient` over a hyper-rustls connector (all already in the graph for the
+# axum server), the SECOND reqwest major (0.13) that the bundled OTLP client used to pull is gone —
+# `cargo tree -d` no longer lists a duplicate reqwest. The request path's reqwest 0.12 is the only
+# reqwest major.
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = [
     "trace",
     "http-proto",
-    "reqwest-rustls",
+] }
+opentelemetry-http = { version = "0.32.0", default-features = false, features = [
+    "hyper",
+] }
+# HTTPS connector for the OTLP HyperClient (rustls, http/1.1). Already in the graph via the server
+# stack; named directly so build_otlp can construct a redirect-free TLS client.
+hyper-rustls = { version = "0.27", default-features = false, features = [
+    "http1",
+    "ring",
+    "webpki-tokio",
 ] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
