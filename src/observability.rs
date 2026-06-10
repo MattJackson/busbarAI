@@ -310,9 +310,15 @@ pub(crate) fn fire_request_log(payload: Value) {
     // panics — rather than via a manual `add_permits` that an unwind would skip (leaking the slot).
     permit.forget();
     let guard = InflightGuard;
-    let body = payload.to_string();
     tokio::spawn(async move {
         let _guard = guard;
+        // Serialize the payload INSIDE the spawned task, not on the request-serving thread. The
+        // full-Value `to_string()` is a heap allocation plus a complete JSON walk; doing it before
+        // `tokio::spawn` charged it to the async executor thread on the hot path of every served
+        // request — undermining the "allocates nothing" fast-path above and the best-effort,
+        // non-blocking contract. `payload` is moved into the closure, so relocating the line costs
+        // no lifetime change.
+        let body = payload.to_string();
         let _ = client
             .post(url.as_str())
             .header(reqwest::header::CONTENT_TYPE, "application/json")

@@ -7,7 +7,7 @@ vendor integrations. It implements a small set of protocols losslessly:
 
 | Protocol | Surface | Auth shape |
 |---|---|---|
-| `anthropic` | `/v1/messages` | bearer (`Authorization`) |
+| `anthropic` | `/v1/messages` | `x-api-key` (API key, `sk-ant-api…`) or `Authorization: Bearer` (OAuth, `sk-ant-oat…`); unrecognized credentials get both. See configuration.md. |
 | `openai` | `/v1/chat/completions` | bearer |
 | `responses` | `/v1/responses` | bearer |
 | `gemini` | `:generateContent` / `:streamGenerateContent` | api-key header (`x-goog-api-key`) |

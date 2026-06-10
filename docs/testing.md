@@ -63,7 +63,9 @@ server.shutdown().await;                          // aborts the task
 ## Injecting time into the breaker FSM
 
 Breaker/cooldown tests must not depend on wall-clock. The breaker reads time via
-`store::now_secs()`, which under `#[cfg(test)]` calls `now_for_test()`:
+`store::now()` (the public crate function at `src/store.rs:61`), which under
+`#[cfg(test)]` is shadowed inside `InMemoryStore` by a private `now_secs()` that
+delegates to `now_for_test()`:
 
 - `set_now_for_test(t)` pins the test clock to `t` (epoch seconds).
 - `now_for_test()` returns the pinned value (falling back to real `now()` if

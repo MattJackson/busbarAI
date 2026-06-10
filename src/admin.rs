@@ -118,6 +118,23 @@ pub(crate) async fn create_key(
             }),
         );
     }
+    // Reject a negative budget at the ingress. `max_budget_cents` is a signed `i64` (the store column
+    // is signed and the field is optional/unset = unlimited), so serde does NOT reject a negative the
+    // way it auto-rejects the unsigned `rpm_limit`/`tpm_limit: u32` fields below. A negative cap is
+    // not "unlimited"; governance evaluates `spend_cents >= max_budget_cents`, so `max_budget_cents:
+    // -1` makes a brand-new key (spend 0) read as over budget from its first request — a silent,
+    // unrecoverable DoS that still echoes 201 + the bogus value. A typo like `-100` for a $1 cap is
+    // the realistic source. Bound it to `>= 0` (0 = a hard "no spend allowed" cap, still a coherent
+    // semantic) and 400 otherwise. The `rpm_limit`/`tpm_limit` siblings are unsigned, so a negative
+    // for them is already a 400 at deserialization — no parallel range check is reachable here.
+    if let Some(budget) = req.max_budget_cents {
+        if budget < 0 {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "max_budget_cents must be >= 0"}),
+            );
+        }
+    }
     let spec = NewKeySpec {
         name: req.name,
         allowed_pools: req.allowed_pools,
@@ -363,6 +380,86 @@ mod tests {
         assert_eq!(
             body["budget_period"], "total",
             "omitted period defaults to total"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_create_key_rejects_negative_max_budget_cents() {
+        // Regression (HIGH/correctness): a negative `max_budget_cents` is a signed-i64 value serde
+        // does NOT auto-reject (unlike the unsigned rpm/tpm limits). A negative cap makes governance
+        // read a brand-new key (spend 0) as over budget from request one — a silent DoS. It must be
+        // rejected with 400 and no key minted; `0` (a hard no-spend cap) and a positive value, and an
+        // omitted field (unlimited), must all still create the key.
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (addr, handle) = serve_with_gov(gov).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/admin/keys");
+
+        for bad in [-1_i64, -100, i64::MIN] {
+            let resp = client
+                .post(&url)
+                .header("x-admin-token", "admintok")
+                .json(&serde_json::json!({"name": "k", "max_budget_cents": bad}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                400,
+                "negative max_budget_cents {bad} must be rejected with 400"
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("max_budget_cents"),
+                "400 body must name max_budget_cents: {body}"
+            );
+        }
+
+        // Zero (hard no-spend cap) and a positive value both create the key with that exact cap.
+        for good in [0_i64, 1, 100_000] {
+            let resp = client
+                .post(&url)
+                .header("x-admin-token", "admintok")
+                .json(&serde_json::json!({"name": "k", "max_budget_cents": good}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                201,
+                "non-negative max_budget_cents {good} must create the key"
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(
+                body["max_budget_cents"], good,
+                "stored cap must match request"
+            );
+        }
+
+        // Omitted field → unlimited (null), still 201.
+        let resp = client
+            .post(&url)
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"name": "k"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            201,
+            "omitted budget must create key"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["max_budget_cents"].is_null(),
+            "omitted budget is unlimited (null)"
         );
 
         handle.abort();

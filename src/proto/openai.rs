@@ -1467,7 +1467,9 @@ impl ProtocolWriter for OpenAiWriter {
                 }
             },
             IrStreamEvent::BlockStop { .. } => None,
-            IrStreamEvent::MessageDelta { stop_reason, .. } => {
+            IrStreamEvent::MessageDelta {
+                stop_reason, usage, ..
+            } => {
                 // Map the IR stop_reason onto OpenAI's finish_reason enum. A non-terminal delta with
                 // no stop_reason must serialize finish_reason as JSON `null` — NOT the empty string.
                 // OpenAI chat.completion.chunk uses null for in-progress chunks and a valid enum
@@ -1486,7 +1488,7 @@ impl ProtocolWriter for OpenAiWriter {
                     None => serde_json::Value::Null,
                 };
                 let delta_obj = serde_json::json!({});
-                let chunk_obj = serde_json::json!({
+                let mut chunk_obj = serde_json::json!({
                     "object": "chat.completion.chunk",
                     "choices": [{
                         "index": 0,
@@ -1494,6 +1496,36 @@ impl ProtocolWriter for OpenAiWriter {
                         "finish_reason": finish_reason
                     }]
                 });
+                // Carry real token usage on the terminal chunk. On a cross-protocol egress (e.g.
+                // Anthropic/Bedrock -> OpenAI ingress) the IR's terminal MessageDelta holds the true
+                // prompt/completion counts; the prior code discarded `usage` entirely, so an
+                // OpenAI-ingress client that requested `stream_options:{include_usage:true}` received
+                // ZERO usage data — both a token-accounting loss and a distinguishability tell, since a
+                // native include_usage stream ALWAYS ends with a usage-bearing chunk. We attach a
+                // top-level `usage:{prompt_tokens, completion_tokens, total_tokens}` object here.
+                //
+                // Native OpenAI carries this on a SEPARATE trailing `{choices:[], usage:{...}}` chunk
+                // after the finish chunk; emitting that second chunk would require returning two events
+                // from this 1:1 `write_response_event`, which the `ProtocolWriter` trait (shared, not
+                // owned here) does not allow. Folding `usage` onto the finish chunk recovers the
+                // accounting and the SDK still surfaces `chunk.usage`. We emit it only when a count is
+                // nonzero (a same-protocol passthrough without include_usage carries zeroed usage in
+                // the IR; suppressing the field there avoids stamping a usage object onto a stream that
+                // never asked for one). `total_tokens` is the prompt+completion sum, the native shape.
+                let prompt_tokens = usage.input_tokens;
+                let completion_tokens = usage.output_tokens;
+                if prompt_tokens != 0 || completion_tokens != 0 {
+                    if let Some(obj) = chunk_obj.as_object_mut() {
+                        obj.insert(
+                            "usage".to_string(),
+                            serde_json::json!({
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": prompt_tokens.saturating_add(completion_tokens),
+                            }),
+                        );
+                    }
+                }
                 Some(("".to_string(), chunk_obj))
             }
             IrStreamEvent::MessageStop => None,
@@ -1510,7 +1542,16 @@ impl ProtocolWriter for OpenAiWriter {
                 let error_type = match err.class {
                     crate::breaker::StatusClass::RateLimit => "rate_limit_error",
                     crate::breaker::StatusClass::Auth => "authentication_error",
-                    crate::breaker::StatusClass::Billing => "permission_error",
+                    // Billing exhaustion is OpenAI's `insufficient_quota` (HTTP 429), NOT
+                    // `permission_error`. Real OpenAI reserves `permission_error` for access-control
+                    // denials (feature/org restrictions); an over-quota error carries
+                    // `type:"insufficient_quota"` AND `code:"insufficient_quota"`. Emitting
+                    // `permission_error` for a billing class made a client switch-casing on
+                    // `error.type` misroute quota errors as permission denials, and is a detectable
+                    // protocol tell. `openai_error_code` pairs the matching `code` below. This mirrors
+                    // the non-stream `write_error` path, which already maps the `"insufficient_quota"`
+                    // kind to this type + code.
+                    crate::breaker::StatusClass::Billing => "insufficient_quota",
                     crate::breaker::StatusClass::ContextLength
                     | crate::breaker::StatusClass::ClientError => "invalid_request_error",
                     crate::breaker::StatusClass::Overloaded
@@ -2647,7 +2688,7 @@ mod tests {
         let cases = [
             (crate::breaker::StatusClass::RateLimit, "rate_limit_error"),
             (crate::breaker::StatusClass::Auth, "authentication_error"),
-            (crate::breaker::StatusClass::Billing, "permission_error"),
+            (crate::breaker::StatusClass::Billing, "insufficient_quota"),
             (
                 crate::breaker::StatusClass::ClientError,
                 "invalid_request_error",
@@ -3429,6 +3470,97 @@ mod tests {
             serde_json::json!("authentication_error")
         );
         assert_eq!(chunk["error"]["code"], serde_json::json!("invalid_api_key"));
+    }
+
+    // --- Round 17: streaming Billing error -> insufficient_quota (type AND code), not
+    //     permission_error ---
+
+    #[test]
+    fn stream_error_billing_event_maps_to_insufficient_quota() {
+        let w = OpenAiWriter;
+        let ev = IrStreamEvent::Error(IrError {
+            class: crate::breaker::StatusClass::Billing,
+            provider_signal: Some("over quota".to_string()),
+            retry_after: None,
+        });
+        let (_, chunk) = w
+            .write_response_event(&ev)
+            .expect("error event emits a body");
+        // Quota exhaustion is `insufficient_quota`, NOT the access-control `permission_error`.
+        assert_eq!(
+            chunk["error"]["type"],
+            serde_json::json!("insufficient_quota")
+        );
+        assert_ne!(
+            chunk["error"]["type"],
+            serde_json::json!("permission_error")
+        );
+        // Native OpenAI pairs the matching machine-readable code.
+        assert_eq!(
+            chunk["error"]["code"],
+            serde_json::json!("insufficient_quota")
+        );
+        // The streaming Billing mapping matches the non-stream `write_error("insufficient_quota")`.
+        let non_stream = w.write_error(429, "insufficient_quota", "over quota");
+        assert_eq!(
+            chunk["error"]["type"], non_stream["error"]["type"],
+            "stream and non-stream billing type must agree"
+        );
+        assert_eq!(
+            chunk["error"]["code"], non_stream["error"]["code"],
+            "stream and non-stream billing code must agree"
+        );
+    }
+
+    // --- Round 17: terminal MessageDelta carries real token usage on a translated stream ---
+
+    #[test]
+    fn stream_message_delta_emits_usage_when_counts_nonzero() {
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
+            usage: IrUsage {
+                input_tokens: 12,
+                output_tokens: 34,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (_, chunk) = OpenAiWriter
+            .write_response_event(&ev)
+            .expect("message delta emits a chunk");
+        // finish_reason still maps correctly...
+        assert_eq!(
+            chunk["choices"][0]["finish_reason"],
+            serde_json::json!("stop")
+        );
+        // ...and the terminal chunk now carries native-shaped token usage instead of dropping it.
+        assert_eq!(chunk["usage"]["prompt_tokens"], serde_json::json!(12));
+        assert_eq!(chunk["usage"]["completion_tokens"], serde_json::json!(34));
+        assert_eq!(chunk["usage"]["total_tokens"], serde_json::json!(46));
+    }
+
+    #[test]
+    fn stream_message_delta_omits_usage_when_all_counts_zero() {
+        // A same-protocol passthrough without include_usage carries zeroed usage in the IR; do not
+        // stamp a usage object onto a stream that never asked for one.
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
+            usage: IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (_, chunk) = OpenAiWriter
+            .write_response_event(&ev)
+            .expect("message delta emits a chunk");
+        assert!(
+            chunk.get("usage").is_none(),
+            "zero usage must not emit a usage object: {chunk}"
+        );
     }
 
     // --- Round 11: tool objects must use the nested Chat Completions shape ---

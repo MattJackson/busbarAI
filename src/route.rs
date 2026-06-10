@@ -4324,17 +4324,30 @@ mod tests {
             !text.contains("chat.completion.chunk"),
             "cohere mid-stream error leaked an OpenAI chunk object; got:\n{text}"
         );
-        // The LAST `data:` frame is the native Cohere error envelope (a flat `message`, possibly with
-        // a `type`), NOT a top-level OpenAI `{"error":{...}}`-only shape.
+        // The LAST `data:` frame is the native Cohere v2 stream terminator on error: a `message-end`
+        // event with `delta.finish_reason: "ERROR"` and NO top-level free-text `message` (a native
+        // client never sees a proxy-detail string; the cause is logged server-side), and NOT a
+        // top-level OpenAI `{"error":{...}}` shape.
         let last_data = sse_frames(&text)
             .into_iter()
             .next_back()
             .map(|(_, d)| d)
             .expect("a trailing data: error frame");
         let v: Value = serde_json::from_str(&last_data).expect("native Cohere JSON envelope");
+        assert_eq!(
+            v.get("type").and_then(|t| t.as_str()),
+            Some("message-end"),
+            "cohere mid-stream error is a native message-end frame; got {v}"
+        );
         assert!(
-            v.get("message").is_some(),
-            "cohere mid-stream error carries a native flat `message`; got {v}"
+            v.pointer("/delta/finish_reason")
+                .and_then(|f| f.as_str())
+                .is_some_and(|f| f.starts_with("ERROR")),
+            "cohere message-end carries delta.finish_reason ERROR; got {v}"
+        );
+        assert!(
+            v.get("message").is_none(),
+            "cohere native message-end must not carry a top-level free-text message; got {v}"
         );
         handle.abort();
         server.shutdown().await;
@@ -5159,6 +5172,245 @@ mod tests {
         assert!(
             arr.iter().all(|c| c.get("choices").is_none()),
             "no OpenAI `choices` field may leak into the stable v1 JSON-array frames; got {body:?}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    // ---- MEDIUM/test-coverage: governance 429 (rate) and over-budget paths on the new ingress ----
+    //
+    // The route.rs governance suite above (`test_governance_pool_acl_403_*`) only exercises the
+    // pool-ACL 403 guard end-to-end. The OTHER two `governance_guard` rejections — `rate_check`
+    // (429 + Retry-After) and `budget_check` (over-quota) — share the same `forward_resolved`
+    // dispatch but map to DIFFERENT per-protocol `kind`s (`rate_limit_error` / `insufficient_quota`)
+    // and (for budget) DIFFERENT statuses (429 for openai/cohere/gemini, 400 for bedrock). A
+    // regression in either kind-to-envelope mapping on a new ingress protocol would slip past the
+    // 403-only set. These drive a virtual key that is over its rate cap / budget through the REAL
+    // router on each first-class ingress route and assert the protocol-native rejection shape.
+    //
+    // The rejection fires in `governance_guard` BEFORE model resolution, so no lane/pool/backend is
+    // needed — only a parseable body carrying `model` where the body-model protocols expect it.
+
+    /// Build a governance-enabled router whose single virtual key is over its limit, selected by
+    /// `rpm` (`Some(0)` ⇒ rate-limited on the first request) and/or `max_budget_cents` (`Some(0)` ⇒
+    /// over budget on the first request). `allowed_pools: vec![]` admits every pool so the ACL never
+    /// short-circuits the gate under test. Returns `(addr, handle, secret)`.
+    async fn governed_limit_router(
+        rpm: Option<u32>,
+        max_budget_cents: Option<i64>,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        &'static str,
+    ) {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+        const SECRET: &str = "sk-vk-limit-route";
+        let store = StdArc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .put_key(&VirtualKey {
+                id: "klimit".to_string(),
+                key_hash: crate::sigv4::sha256_hex(SECRET.as_bytes()),
+                name: "limit".to_string(),
+                allowed_pools: vec![], // all pools — ACL never short-circuits
+                max_budget_cents,
+                budget_period: "total".to_string(),
+                rpm_limit: rpm,
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        let gov = StdArc::new(GovState::new(store, 1, 0, None).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let (addr, handle) = serve(app).await;
+        (addr, handle, SECRET)
+    }
+
+    /// Each first-class ingress route: an over-RPM virtual key is rejected with a PROTOCOL-NATIVE
+    /// 429 (`Retry-After` set) before resolution. Asserts the per-protocol `kind`-to-envelope
+    /// mapping (`rate_limit_error` for the body-model/anthropic writers, the native quota envelope
+    /// for gemini/bedrock) that the 403-only set above does not reach.
+    #[tokio::test]
+    async fn test_governance_rate_limit_429_native_envelope_all_ingress() {
+        crate::metrics::init();
+
+        // openai / responses / cohere: body-model routes, native error envelope is JSON.
+        for (path, payload) in [
+            (
+                "/v1/chat/completions",
+                json!({"model": "m", "messages": []}),
+            ),
+            ("/v1/responses", json!({"model": "m", "input": "hi"})),
+            ("/v2/chat", json!({"model": "m", "messages": []})),
+        ] {
+            let (addr, handle, secret) = governed_limit_router(Some(0), None).await;
+            let resp = reqwest::Client::new()
+                .post(format!("http://{addr}{path}"))
+                .bearer_auth(secret)
+                .body(payload.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 429, "{path} over-RPM ⇒ 429");
+            assert!(
+                resp.headers().get(reqwest::header::RETRY_AFTER).is_some(),
+                "{path} 429 carries Retry-After"
+            );
+            handle.abort();
+        }
+
+        // gemini path-model route: native quota envelope is error.code 429 + RESOURCE_EXHAUSTED.
+        {
+            let (addr, handle, secret) = governed_limit_router(Some(0), None).await;
+            let resp = reqwest::Client::new()
+                .post(format!("http://{addr}/v1beta/models/m:generateContent"))
+                .bearer_auth(secret)
+                .body(json!({"contents": []}).to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 429, "gemini over-RPM ⇒ 429");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(
+                body.get("error")
+                    .and_then(|e| e.get("status"))
+                    .and_then(|s| s.as_str()),
+                Some("RESOURCE_EXHAUSTED"),
+                "gemini 429 envelope carries RESOURCE_EXHAUSTED; got {body}"
+            );
+            handle.abort();
+        }
+
+        // bedrock path-model route: native 429 carries the ThrottlingException envelope + headers.
+        {
+            let (addr, handle, secret) = governed_limit_router(Some(0), None).await;
+            let resp = reqwest::Client::new()
+                .post(format!("http://{addr}/model/m/converse"))
+                .bearer_auth(secret)
+                .body(json!({"messages": []}).to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 429, "bedrock over-RPM ⇒ 429");
+            assert!(
+                resp.headers().get("x-amzn-errortype").is_some(),
+                "bedrock 429 carries x-amzn-errortype header"
+            );
+            assert!(
+                resp.headers().get("x-amzn-requestid").is_some(),
+                "bedrock 429 carries x-amzn-RequestId header"
+            );
+            handle.abort();
+        }
+    }
+
+    /// Each first-class ingress route: an over-budget virtual key is rejected with the protocol's
+    /// native quota shape before resolution. The over-quota `kind` is `insufficient_quota`; the
+    /// status is 429 for every protocol EXCEPT bedrock (whose native `ServiceQuotaExceededException`
+    /// is a 400-class error — see `budget_check`). Closes the route.rs gap the 403-only set left on
+    /// the `budget_check` guard.
+    #[tokio::test]
+    async fn test_governance_over_budget_native_envelope_all_ingress() {
+        crate::metrics::init();
+
+        // 429-mapping protocols: openai / responses / cohere / gemini.
+        for (path, payload) in [
+            (
+                "/v1/chat/completions",
+                json!({"model": "m", "messages": []}),
+            ),
+            ("/v1/responses", json!({"model": "m", "input": "hi"})),
+            ("/v2/chat", json!({"model": "m", "messages": []})),
+            ("/v1beta/models/m:generateContent", json!({"contents": []})),
+        ] {
+            let (addr, handle, secret) = governed_limit_router(None, Some(0)).await;
+            let resp = reqwest::Client::new()
+                .post(format!("http://{addr}{path}"))
+                .bearer_auth(secret)
+                .body(payload.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 429, "{path} over-budget ⇒ 429");
+            handle.abort();
+        }
+
+        // bedrock: native ServiceQuotaExceededException is a 400-class error, not 429.
+        {
+            let (addr, handle, secret) = governed_limit_router(None, Some(0)).await;
+            let resp = reqwest::Client::new()
+                .post(format!("http://{addr}/model/m/converse"))
+                .bearer_auth(secret)
+                .body(json!({"messages": []}).to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 400, "bedrock over-budget ⇒ 400");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(
+                body.get("__type").and_then(|t| t.as_str()),
+                Some("ServiceQuotaExceededException"),
+                "bedrock over-budget body __type is ServiceQuotaExceededException; got {body}"
+            );
+            handle.abort();
+        }
+    }
+
+    // ---- MEDIUM/test-coverage: the `named` handler's `by_model` fallback branch ----
+    //
+    // `named` (`POST /<name>/v1/messages`) resolves `name` against `app.pools` first, then falls
+    // back to `app.by_model` (the line-853 arm). The pool path is covered by
+    // `test_adhoc_success_round_trip_via_router` and the governance pool-ACL set; the by_model
+    // fallback — where `name` is a configured single-model lane with NO pool entry, routed via
+    // `crate::forward::forward` — had no test. A refactor that dropped the fallback, or fed the
+    // wrong model string, would go undetected. This wires ONLY a by_model lane (no `.pool(...)`),
+    // POSTs an Anthropic body to `/<model>/v1/messages`, and asserts the 2xx plus that the upstream
+    // received the (translated) forwarded request.
+
+    /// `named` by_model fallback: a single-model lane (no pool) reached via `/<model>/v1/messages`
+    /// round-trips through `forward` to its backend and returns 2xx; the upstream sees the request.
+    #[tokio::test]
+    async fn test_named_by_model_fallback_round_trip_via_router() {
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: anthropic_ok_body(),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        // Lane registered in by_model only — no `.pool(...)`, so the `named` pool lookup misses and
+        // the by_model fallback arm (line 853) handles the request.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "claude-x",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .provider("anthropic"),
+            )
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/claude-x/v1/messages"))
+            .bearer_auth("t")
+            .body(json!({"model": "claude-x", "messages": [], "max_tokens": 16}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "named by_model fallback (no pool) resolves and 2xx round-trips"
+        );
+
+        // The backend must have actually received the forwarded request — proves the fallback
+        // routed through `forward` rather than 404-ing on the pool miss.
+        assert!(
+            state.get_last_request_body().is_some(),
+            "upstream received the forwarded request via the named by_model fallback"
         );
         handle.abort();
         server.shutdown().await;

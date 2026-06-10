@@ -842,12 +842,14 @@ impl ProtocolReader for CohereReader {
             _ => None,
         };
 
-        let usage_val = obj.get("usage").ok_or(IrError {
-            class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".into()),
-            retry_after: None,
-        })?;
-        let tokens_val = usage_val.get("tokens");
+        // Treat an absent `usage` object leniently — fall back to zero counts rather than hard-
+        // erroring. A missing `usage` is an upstream response-format quirk (a mock/staging/proxy
+        // Cohere-compatible backend that omits it), NOT a client mistake, so returning a
+        // `ClientError` here mislabels the cause and breaks retry logic; the Bedrock and Gemini
+        // readers tolerate the same condition with a zero-usage fallback (the MEDIUM/correctness
+        // finding). `usage_val` is an `Option`, so each token lookup below already defaults to 0.
+        let usage_val = obj.get("usage");
+        let tokens_val = usage_val.and_then(|u| u.get("tokens"));
         let usage = crate::ir::IrUsage {
             input_tokens: tokens_val
                 .and_then(|t| t.as_object())
@@ -1385,23 +1387,34 @@ impl ProtocolWriter for CohereWriter {
                     .as_deref()
                     .is_some_and(cohere_error_is_content_moderation);
                 let finish_reason = if toxic { "ERROR_TOXIC" } else { "ERROR" };
-                // Carry the human-readable detail in a top-level `message` field. The native v2
-                // `message-end` error termination's load-bearing discriminant is `finish_reason`
-                // (`ERROR`/`ERROR_TOXIC`), which the reader maps back to IR `safety`; the `message`
-                // is an additive, non-structural detail string so an operator/observer is not left
-                // with an opaque error and the SSE framing layer can surface the cause. The earlier
-                // `{"type":"error", ...}` frame (a NON-native v2 event type a strict SDK ignores or
-                // rejects) is gone; the frame is now the native `message-end` shape.
-                let message = err
-                    .provider_signal
-                    .clone()
-                    .unwrap_or_else(|| "error".to_string());
+                // Emit the native `message-end` shape EXACTLY — `type` + `delta.{finish_reason,
+                // usage}` — and nothing else. A native Cohere v2 `message-end` frame (the one the
+                // normal MessageDelta arm above produces) carries ONLY `type` and `delta`; it never
+                // carries a top-level `message`, and it ALWAYS includes `delta.usage`. A prior
+                // revision added a top-level `"message": <detail>` field and omitted `delta.usage`,
+                // both of which diverge from the native wire shape and let a client (or passive
+                // observer) fingerprint the proxy — and a strict v2 SDK may reject the unexpected
+                // field (the MEDIUM/conformance findings). The load-bearing discriminant is
+                // `finish_reason` (`ERROR`/`ERROR_TOXIC`), which the reader maps back to IR
+                // `safety`, so the detail string carries no protocol value on the wire; surface it
+                // server-side instead so operators are not left with an opaque error.
+                if let Some(detail) = err.provider_signal.as_deref() {
+                    tracing::warn!(
+                        finish_reason,
+                        detail,
+                        "cohere: mid-stream error terminating with native message-end frame"
+                    );
+                }
                 Some((
                     "".to_string(),
                     serde_json::json!({
                         "type": "message-end",
-                        "message": message,
-                        "delta": { "finish_reason": finish_reason }
+                        "delta": {
+                            "finish_reason": finish_reason,
+                            "usage": {
+                                "tokens": { "input_tokens": 0, "output_tokens": 0 }
+                            }
+                        }
                     }),
                 ))
             }
@@ -2396,6 +2409,39 @@ mod tests {
             Some("error"),
             "the non-native `type: error` frame must not be emitted"
         );
+        // The native message-end frame carries ONLY `type` + `delta`; a top-level `message` field
+        // is a proxy fingerprint a genuine Cohere v2 stream never emits (the MEDIUM/conformance
+        // finding). Assert its absence explicitly.
+        assert!(
+            frame.get("message").is_none(),
+            "error message-end must not carry a top-level `message` field (proxy fingerprint), \
+             got {frame:?}"
+        );
+        assert_eq!(
+            frame.get("delta").and_then(|d| d.as_object()).map(|d| {
+                let mut keys: Vec<&str> = d.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                keys
+            }),
+            Some(vec!["finish_reason", "usage"]),
+            "error message-end `delta` must carry exactly `finish_reason` and `usage`, \
+             mirroring the native MessageDelta shape"
+        );
+        // Native message-end always includes delta.usage.tokens.{input_tokens,output_tokens}; the
+        // error frame must too (an absent usage is itself a fingerprint).
+        let err_tokens = frame
+            .get("delta")
+            .and_then(|d| d.get("usage"))
+            .and_then(|u| u.get("tokens"))
+            .expect("error message-end must carry delta.usage.tokens");
+        assert_eq!(
+            err_tokens.get("input_tokens").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            err_tokens.get("output_tokens").and_then(|v| v.as_u64()),
+            Some(0)
+        );
         assert_eq!(
             frame
                 .get("delta")
@@ -2433,6 +2479,10 @@ mod tests {
             Some("ERROR_TOXIC"),
             "a content-moderation signal maps to the native ERROR_TOXIC finish_reason"
         );
+        assert!(
+            toxic_frame.get("message").is_none(),
+            "toxic error message-end must not carry a top-level `message` field"
+        );
 
         // An absent provider_signal still produces a native ERROR termination (never `type: error`).
         let bare = IrStreamEvent::Error(crate::proto::IrError {
@@ -2454,6 +2504,45 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("ERROR")
         );
+        assert!(
+            bare_frame.get("message").is_none(),
+            "bare error message-end must not carry a top-level `message` field"
+        );
+    }
+
+    /// Regression (MEDIUM/correctness): `read_response` must tolerate a missing `usage` object,
+    /// falling back to zero counts rather than hard-erroring with a `ClientError`. A
+    /// Cohere-compatible backend (mock/staging/proxy) that omits `usage` is an upstream
+    /// response-format quirk, not a caller mistake; Bedrock and Gemini both handle this leniently.
+    #[test]
+    fn test_read_response_missing_usage_defaults_to_zero() {
+        let json = serde_json::json!({
+            "id": "c14c80c3-18eb-4519-9460-6c92edd8cfb4",
+            "finish_reason": "COMPLETE",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}]
+            }
+            // NOTE: no `usage` key at all.
+        });
+        let resp = CohereReader
+            .read_response(&json)
+            .expect("missing usage must not hard-error (zero-usage fallback)");
+        assert_eq!(resp.usage.input_tokens, 0);
+        assert_eq!(resp.usage.output_tokens, 0);
+        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
+
+        // A present-but-empty usage object (no `tokens`) is also tolerated.
+        let json_empty_usage = serde_json::json!({
+            "finish_reason": "COMPLETE",
+            "message": { "role": "assistant", "content": [{"type": "text", "text": "hi"}] },
+            "usage": {}
+        });
+        let resp2 = CohereReader
+            .read_response(&json_empty_usage)
+            .expect("empty usage object must not hard-error");
+        assert_eq!(resp2.usage.input_tokens, 0);
+        assert_eq!(resp2.usage.output_tokens, 0);
     }
 
     /// Regression (HIGH/conformance): `write_response` must nest `tool_calls` INSIDE the `message`

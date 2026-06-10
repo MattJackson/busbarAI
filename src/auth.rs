@@ -435,6 +435,23 @@ pub(crate) async fn auth_middleware(
                 );
             });
         }
+        // Same class of silent contradiction for `auth.mode=none`: none is an open relay (the static
+        // path admits every request unconditionally), but the governance branch below requires a
+        // valid enabled virtual key on EVERY request, so a server an operator believes is open
+        // silently rejects every caller without a key. `validate_governance` accepts the pairing (it
+        // is a supported combination — governance simply wins), so there is no boot-time error;
+        // mirror the passthrough advisory with a parallel one-shot warning at the first request that
+        // exercises it, rather than leaving the override undiagnosed.
+        if app.auth_mode == AuthMode::None {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    "auth.mode=none with governance enabled: governance supersedes the open-relay \
+                     mode — every request must present a valid enabled virtual key; none mode's \
+                     accept-every-request semantics are NOT honoured."
+                );
+            });
+        }
         // Reject a missing / empty token BEFORE the governance lookup, mirroring the
         // `validate_token` guard that the static-token path applies. Without this, an
         // unauthenticated request would call `gov.lookup(sha256(""))` — admitting the caller if any
@@ -1756,6 +1773,101 @@ mod tests {
             401,
             "an enabled virtual key must pass auth (got {})",
             r_ena.status()
+        );
+
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// Regression (MEDIUM/correctness): `auth.mode=none` is an open relay, but governance supersedes
+    /// it. With governance enabled AND auth.mode explicitly None, a request that presents NO token
+    /// must still be rejected 401 — none-mode's accept-every-request semantics are NOT honoured. This
+    /// pins the documented override (and the parallel one-shot operator warning the override emits)
+    /// so a future refactor can't accidentally let none-mode short-circuit the governance lookup and
+    /// silently re-open the relay.
+    #[tokio::test]
+    async fn test_none_mode_with_governance_still_requires_virtual_key() {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+        use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        crate::metrics::init();
+
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: axum::http::StatusCode::OK,
+            body: json!({
+                "model": "glm-4.5",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }),
+        });
+        let server = MockServer::new(state).await;
+
+        let secret = "sk-vk-ok";
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .put_key(&VirtualKey {
+                id: "k".to_string(),
+                key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
+                name: "k".to_string(),
+                allowed_pools: vec!["pa".to_string()],
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                enabled: true,
+                created_at: 0,
+            })
+            .unwrap();
+        let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "glm-4.5",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("pa", &[(0, 1)])
+            .auth_mode(AuthMode::None)
+            .governance(gov)
+            .build();
+
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/pa/v1/messages");
+        let req =
+            json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+                .to_string();
+
+        // No token at all → 401, even though auth.mode=none would normally admit every request.
+        let r_none = client.post(&url).body(req.clone()).send().await.unwrap();
+        assert_eq!(
+            r_none.status().as_u16(),
+            401,
+            "none-mode must NOT open the relay when governance is enabled"
+        );
+
+        // A valid enabled key still passes auth (governance is what is honoured).
+        let r_ok = client
+            .post(&url)
+            .bearer_auth(secret)
+            .body(req)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r_ok.status().as_u16(),
+            401,
+            "a valid enabled key must pass auth under governance+none (got {})",
+            r_ok.status()
         );
 
         handle.abort();

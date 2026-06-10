@@ -463,6 +463,37 @@ impl ProtocolReader for GeminiReader {
             return out;
         }
 
+        // 0. Inline error envelope. A native Gemini `streamGenerateContent?alt=sse` stream can
+        // deliver a `{"error":{"code","message","status"}}` (google.rpc.Status) object as a
+        // 200-status SSE data chunk mid-stream (e.g. an upstream RESOURCE_EXHAUSTED that surfaces
+        // after the connection is established). The chunk is a JSON object (not `[DONE]`) carrying
+        // NO `candidates`, so without this arm the reader would emit a bare `MessageStart` and then
+        // EOF — no `IrStreamEvent::Error`, no terminal MessageDelta/MessageStop — silently swallowing
+        // the failure and leaving the downstream client (or cross-protocol ingress writer) on a
+        // hung/non-terminated stream while the breaker/observability never see it. forward.rs only
+        // converts HTTP-status-level errors, so an inline 200-status error object bypasses that path
+        // entirely. Mirror the Bedrock reader's inline `*Exception` surfacing (bedrock.rs:906-946)
+        // and the Cohere terminal `ERROR` mapping (cohere.rs:629): map `error.status`/`error.code`
+        // to a canonical `StatusClass` and push a single `IrStreamEvent::Error` so the downstream
+        // writer terminates the stream with a native error frame. This is handled BEFORE the
+        // MessageStart/candidates block so an error-only chunk never emits a stray MessageStart.
+        if let Some(error_obj) = data.get("error").and_then(|e| e.as_object()) {
+            let status_str = error_obj.get("status").and_then(|s| s.as_str());
+            let code = error_obj.get("code").and_then(|c| c.as_u64());
+            let class = gemini_error_status_class(status_str, code);
+            let message = error_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(String::from)
+                .or_else(|| status_str.map(String::from));
+            out.push(IrStreamEvent::Error(crate::proto::IrError {
+                class,
+                provider_signal: message,
+                retry_after: None,
+            }));
+            return out;
+        }
+
         // 1. MessageStart exactly once on first chunk. Capture the stream identity from the first
         // chunk so same-protocol passthrough preserves it: streamed Gemini chunks carry the same
         // `responseId`/`modelVersion` as the whole-response body. Gemini streams carry no `created`
@@ -869,6 +900,60 @@ fn gemini_stream_error_code_status(class: StatusClass) -> (u16, &'static str) {
         StatusClass::Billing => (403, "PERMISSION_DENIED"),
         StatusClass::ClientError => (400, "INVALID_ARGUMENT"),
         StatusClass::ContextLength => (400, "INVALID_ARGUMENT"),
+    }
+}
+
+/// Map an inline google.rpc.Status `(status name, code)` — as delivered in a 200-status SSE error
+/// chunk's `error` object — onto a canonical `StatusClass`. This is the read-side inverse of
+/// `gemini_stream_error_code_status` (which maps `StatusClass` back onto `(code, name)` for the
+/// writer): an inline upstream error is mapped to a class so the downstream ingress writer can
+/// terminate the stream with a protocol-shaped error frame.
+///
+/// Preference order: the UPPER_SNAKE google.rpc.Code `status` string when present (the authoritative
+/// field a native Gemini SDK branches on), falling back to the numeric HTTP `code` when `status` is
+/// absent or unrecognized. The `status` arm is exhaustive over the google.rpc.Code names the real
+/// Generative Language API emits; an unrecognized string falls through to the numeric-code mapping,
+/// and a name we do not model is bound to a NAMED arm (not a `_` wildcard that silently degrades —
+/// per the no-catch-all rule; `&str`/`Option<&str>` matches are never type-exhaustive so a named
+/// fallback is the explicit-choice equivalent here). An absent/unknown code defaults to
+/// `ServerError` — the safe class for an unclassified upstream failure (it is retryable and trips
+/// the breaker, never masking a real failure as success).
+fn gemini_error_status_class(status: Option<&str>, code: Option<u64>) -> StatusClass {
+    if let Some(name) = status {
+        match name {
+            "RESOURCE_EXHAUSTED" => return StatusClass::RateLimit,
+            "UNAVAILABLE" => return StatusClass::Overloaded,
+            "DEADLINE_EXCEEDED" => return StatusClass::Timeout,
+            "UNAUTHENTICATED" => return StatusClass::Auth,
+            "PERMISSION_DENIED" => return StatusClass::Billing,
+            "INVALID_ARGUMENT"
+            | "FAILED_PRECONDITION"
+            | "OUT_OF_RANGE"
+            | "NOT_FOUND"
+            | "ALREADY_EXISTS"
+            | "ABORTED"
+            | "CANCELLED" => return StatusClass::ClientError,
+            "INTERNAL" | "UNKNOWN" | "DATA_LOSS" | "UNIMPLEMENTED" => {
+                return StatusClass::ServerError
+            }
+            // An UPPER_SNAKE status string outside the modeled google.rpc.Code set: fall through to
+            // the numeric `code` mapping below rather than guessing. Named (not `_`) per the
+            // no-catch-all rule; `other` is intentionally unused beyond falling through.
+            other => {
+                let _ = other;
+            }
+        }
+    }
+    match code {
+        Some(429) => StatusClass::RateLimit,
+        Some(503) => StatusClass::Overloaded,
+        Some(504) => StatusClass::Timeout,
+        Some(401) => StatusClass::Auth,
+        Some(403) => StatusClass::Billing,
+        Some(c) if (400..500).contains(&c) => StatusClass::ClientError,
+        // Any 5xx, or an absent/unknown code: ServerError is the safe, breaker-tripping default for
+        // an unclassified upstream failure rather than masking it as a client error.
+        Some(_) | None => StatusClass::ServerError,
     }
 }
 
@@ -1307,13 +1392,50 @@ impl ProtocolWriter for GeminiWriter {
             _ => status_name_for_http(status),
         };
 
-        serde_json::json!({
-            "error": {
-                "code": status,
-                "message": message,
-                "status": status_str,
-            }
-        })
+        // The real Generative Language API's bad/missing-key 400 ALWAYS carries an
+        // `error.details[]` array with a single google.rpc.ErrorInfo whose `reason` is
+        // `API_KEY_INVALID` (domain `googleapis.com`, service metadata
+        // `generativelanguage.googleapis.com`). The `google-genai` SDK and many clients key their
+        // auth-error handling off `details[].reason == "API_KEY_INVALID"`, so omitting the array on
+        // our auth-failure envelope (produced by `auth.rs::unauthorized_response` for a
+        // Gemini-inferred path) is a deterministic proxy tell on exactly the auth-failure surface.
+        //
+        // The Gemini auth-failure path (`auth.rs::auth_failure_status_and_kind`) calls this with
+        // status 400, kind `invalid_request_error` (→ INVALID_ARGUMENT), and the distinctive
+        // canonical bad-key message `"API key not valid. Please pass a valid API key."`
+        // (`proto::vendor_auth_failure_message("gemini")`). We gate the `details[]` array on that
+        // exact triple so ONLY the bad-key 400 grows the ErrorInfo — a generic malformed-request
+        // 400/INVALID_ARGUMENT (which carries a DIFFERENT message and does NOT carry API_KEY_INVALID
+        // at real Google) is left untouched, so we neither under-fill the auth surface nor over-fill
+        // an unrelated 400 with a reason it should not carry.
+        const GEMINI_BAD_KEY_MESSAGE: &str = "API key not valid. Please pass a valid API key.";
+        let is_auth_bad_key =
+            status == 400 && status_str == "INVALID_ARGUMENT" && message == GEMINI_BAD_KEY_MESSAGE;
+        if is_auth_bad_key {
+            serde_json::json!({
+                "error": {
+                    "code": status,
+                    "message": message,
+                    "status": status_str,
+                    "details": [{
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "API_KEY_INVALID",
+                        "domain": "googleapis.com",
+                        "metadata": {
+                            "service": "generativelanguage.googleapis.com"
+                        }
+                    }]
+                }
+            })
+        } else {
+            serde_json::json!({
+                "error": {
+                    "code": status,
+                    "message": message,
+                    "status": status_str,
+                }
+            })
+        }
     }
 
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
@@ -4010,6 +4132,173 @@ mod tests {
         assert_eq!(
             content["parts"][0]["functionCall"]["name"], "get_weather",
             "functionCall must be preserved under the model turn: {wire}"
+        );
+    }
+
+    /// Regression (MEDIUM/correctness): an inline `{"error":{...}}` google.rpc.Status object
+    /// delivered as a 200-status SSE data chunk mid-stream MUST surface as a single
+    /// `IrStreamEvent::Error` (mapped from `error.status`) rather than being silently swallowed.
+    /// Before the fix the reader emitted a bare MessageStart and then nothing — a hung,
+    /// non-terminated stream — because the chunk carried no `candidates`.
+    #[test]
+    fn test_stream_inline_error_envelope_surfaces_ir_error() {
+        let events = collect_stream(&[serde_json::json!({
+            "error": {
+                "code": 429,
+                "message": "Resource has been exhausted (e.g. check quota).",
+                "status": "RESOURCE_EXHAUSTED"
+            }
+        })]);
+
+        // Exactly one event, an Error mapped to RateLimit, carrying the upstream message. NO
+        // MessageStart precedes it (an error-only chunk must not emit a stray start frame).
+        match events.as_slice() {
+            [IrStreamEvent::Error(err)] => {
+                assert_eq!(err.class, StatusClass::RateLimit, "events: {events:?}");
+                assert_eq!(
+                    err.provider_signal.as_deref(),
+                    Some("Resource has been exhausted (e.g. check quota)."),
+                    "events: {events:?}"
+                );
+            }
+            other => panic!("expected exactly one IrStreamEvent::Error, got {other:?}"),
+        }
+    }
+
+    /// An inline error whose `status` is absent falls back to the numeric `code` mapping (503 →
+    /// Overloaded), and a missing/unknown code defaults to ServerError — never silently dropped.
+    #[test]
+    fn test_stream_inline_error_code_fallback_and_default() {
+        // status absent → 503 maps to Overloaded.
+        let by_code = collect_stream(&[serde_json::json!({
+            "error": { "code": 503, "message": "backend overloaded" }
+        })]);
+        match by_code.as_slice() {
+            [IrStreamEvent::Error(err)] => {
+                assert_eq!(err.class, StatusClass::Overloaded, "events: {by_code:?}")
+            }
+            other => panic!("expected one Error, got {other:?}"),
+        }
+
+        // Neither status nor a recognized code → ServerError default (safe, breaker-tripping).
+        let bare = collect_stream(&[serde_json::json!({
+            "error": { "message": "something failed" }
+        })]);
+        match bare.as_slice() {
+            [IrStreamEvent::Error(err)] => {
+                assert_eq!(err.class, StatusClass::ServerError, "events: {bare:?}");
+                assert_eq!(
+                    err.provider_signal.as_deref(),
+                    Some("something failed"),
+                    "events: {bare:?}"
+                );
+            }
+            other => panic!("expected one Error, got {other:?}"),
+        }
+    }
+
+    /// `gemini_error_status_class` prefers the UPPER_SNAKE `status` over the numeric `code`, and an
+    /// unrecognized status string falls through to the code mapping.
+    #[test]
+    fn test_gemini_error_status_class_mapping() {
+        assert_eq!(
+            gemini_error_status_class(Some("UNAVAILABLE"), Some(503)),
+            StatusClass::Overloaded
+        );
+        assert_eq!(
+            gemini_error_status_class(Some("UNAUTHENTICATED"), Some(401)),
+            StatusClass::Auth
+        );
+        assert_eq!(
+            gemini_error_status_class(Some("PERMISSION_DENIED"), Some(403)),
+            StatusClass::Billing
+        );
+        assert_eq!(
+            gemini_error_status_class(Some("DEADLINE_EXCEEDED"), Some(504)),
+            StatusClass::Timeout
+        );
+        assert_eq!(
+            gemini_error_status_class(Some("INVALID_ARGUMENT"), Some(400)),
+            StatusClass::ClientError
+        );
+        // status wins over code: an INTERNAL status with a (nonsensical) 429 code is ServerError.
+        assert_eq!(
+            gemini_error_status_class(Some("INTERNAL"), Some(429)),
+            StatusClass::ServerError
+        );
+        // Unknown status string → fall through to the numeric code (429 → RateLimit).
+        assert_eq!(
+            gemini_error_status_class(Some("SOME_FUTURE_CODE"), Some(429)),
+            StatusClass::RateLimit
+        );
+    }
+
+    /// Regression (MEDIUM/conformance): the Gemini bad-key auth-failure envelope MUST carry the
+    /// canonical `error.details[]` array with a google.rpc.ErrorInfo whose `reason` is
+    /// `API_KEY_INVALID`. The `google-genai` SDK keys auth handling off `details[].reason`, so the
+    /// real Generative Language API always populates it on the bad-key 400. The triple of (status
+    /// 400, INVALID_ARGUMENT, the canonical bad-key message) is exactly what
+    /// `auth.rs::unauthorized_response` produces for a Gemini-inferred path.
+    #[test]
+    fn test_write_error_bad_key_carries_api_key_invalid_details() {
+        let writer = GeminiWriter;
+        let envelope = writer.write_error(
+            400,
+            "invalid_request_error",
+            "API key not valid. Please pass a valid API key.",
+        );
+
+        assert_eq!(
+            envelope.pointer("/error/code"),
+            Some(&serde_json::json!(400)),
+            "envelope: {envelope}"
+        );
+        assert_eq!(
+            envelope.pointer("/error/status").and_then(|s| s.as_str()),
+            Some("INVALID_ARGUMENT"),
+            "envelope: {envelope}"
+        );
+        let detail = envelope
+            .pointer("/error/details/0")
+            .expect("bad-key envelope must carry error.details[0]");
+        assert_eq!(
+            detail.get("@type").and_then(|t| t.as_str()),
+            Some("type.googleapis.com/google.rpc.ErrorInfo"),
+            "detail: {detail}"
+        );
+        assert_eq!(
+            detail.get("reason").and_then(|r| r.as_str()),
+            Some("API_KEY_INVALID"),
+            "detail: {detail}"
+        );
+        assert_eq!(
+            detail.get("domain").and_then(|d| d.as_str()),
+            Some("googleapis.com"),
+            "detail: {detail}"
+        );
+        assert_eq!(
+            detail.pointer("/metadata/service").and_then(|s| s.as_str()),
+            Some("generativelanguage.googleapis.com"),
+            "detail: {detail}"
+        );
+    }
+
+    /// A NON-auth 400/INVALID_ARGUMENT (e.g. a generic malformed-request body) must NOT grow the
+    /// API_KEY_INVALID details array — real Google does not carry that reason on a non-key 400, so
+    /// over-filling it would itself be a tell. Only the canonical bad-key message triggers details.
+    #[test]
+    fn test_write_error_generic_invalid_argument_has_no_details() {
+        let writer = GeminiWriter;
+        let envelope =
+            writer.write_error(400, "invalid_request_error", "Invalid value at 'contents'.");
+        assert_eq!(
+            envelope.pointer("/error/status").and_then(|s| s.as_str()),
+            Some("INVALID_ARGUMENT"),
+            "envelope: {envelope}"
+        );
+        assert!(
+            envelope.pointer("/error/details").is_none(),
+            "a non-bad-key 400 must NOT carry API_KEY_INVALID details: {envelope}"
         );
     }
 }

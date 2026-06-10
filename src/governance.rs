@@ -280,9 +280,20 @@ impl GovState {
         // effective minimum supported toolchain. Cargo.toml does not yet declare `rust-version =
         // "1.86"`; it SHOULD, so the constraint is visible to toolchain installers and CI matrices
         // rather than surfacing as a silent compile failure on an older pinned stable.
+        // POST-increment semantics: test the value AFTER this call's increment, not the
+        // pre-increment value `fetch_add` returns. This fixes two off-by-one defects of the naive
+        // `fetch_add(..).is_multiple_of(N)`:
+        //  1. The ticker starts at 0, so the pre-increment value on the very first call is 0, which
+        //     IS a multiple of N — the sweep would fire immediately on startup against an empty map.
+        //  2. When the u32 wraps, the pre-increment value 0xFFFFFFFF is NOT a multiple of N, so one
+        //     sweep cycle would be silently skipped every ~4B calls.
+        // Using `wrapping_add(1)` on the returned pre-increment value reproduces the value now stored
+        // in the atomic: the sweep fires on calls N, 2N, 3N, ... and the wrap boundary (pre = 0xFFFF…F
+        // -> post = 0, a multiple of N) is handled correctly with no skipped cycle.
         if self
             .rate_sweep_ticker
             .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
             .is_multiple_of(RATE_SWEEP_INTERVAL)
         {
             let mut sweep = self.rate_write();
@@ -1164,13 +1175,15 @@ mod tests {
             "W0 second rejected (RPM=1)"
         );
 
-        // Force the sweep ticker to a NON-multiple of the interval so the eager retain does NOT run
-        // on the next call — proving the per-key reset (not the sweep) is what clears the stale W0
-        // entry. (The two calls above advanced the ticker to 2; set it to 1 so the next is 1 % N.)
+        // Force the sweep ticker so the eager retain does NOT run on the next call — proving the
+        // per-key reset (not the sweep) is what clears the stale W0 entry. The sweep test is now
+        // POST-increment: a call fires the sweep when the value AFTER its increment is a multiple of
+        // N. Set the ticker to 1 so the next call's post-increment value is 2, which is not a
+        // multiple of N.
         gov.rate_sweep_ticker.store(1, Ordering::Relaxed);
         assert!(
-            !1u32.is_multiple_of(RATE_SWEEP_INTERVAL),
-            "test precondition: next call must skip the eager sweep"
+            !2u32.is_multiple_of(RATE_SWEEP_INTERVAL),
+            "test precondition: next call's post-increment value must skip the eager sweep"
         );
 
         // A request a full window later must be admitted: the stale W0 entry is reset in place.
@@ -1207,8 +1220,11 @@ mod tests {
             "10 W0 entries present"
         );
 
-        // Force the next call to run the eager sweep (ticker at a multiple of the interval).
-        gov.rate_sweep_ticker.store(0, Ordering::Relaxed);
+        // Force the next call to run the eager sweep. POST-increment: the sweep fires when the value
+        // AFTER the increment is a multiple of N, so set the ticker to N-1 (the next call's
+        // post-increment value is N, a multiple of the interval).
+        gov.rate_sweep_ticker
+            .store(RATE_SWEEP_INTERVAL - 1, Ordering::Relaxed);
         let mut survivor = sample_key("survivor", "hs");
         survivor.rpm_limit = Some(5);
         survivor.tpm_limit = None;
@@ -1222,6 +1238,90 @@ mod tests {
             "sweep evicted all 10 stale W0 entries, leaving only the current-window survivor"
         );
         assert!(map.contains_key("survivor"));
+    }
+
+    #[test]
+    fn test_check_rate_sweep_cadence_post_increment_no_off_by_one() {
+        // Regression for the sweep-cadence off-by-one. The sweep must use POST-increment semantics:
+        //  - It must NOT fire on the very first call (ticker starts at 0; the pre-increment value 0
+        //    is a multiple of N, but the post-increment value 1 is not), so startup against an empty
+        //    map does no wasted scan.
+        //  - It must fire on calls N, 2N, 3N, ...
+        //  - The u32 wrap boundary must NOT skip a cycle: when the pre-increment value is 0xFFFFFFFF
+        //    (not a multiple of N), the post-increment value wraps to 0 (a multiple of N) and the
+        //    sweep still fires.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 0, 0, None).unwrap();
+        let mut k = sample_key("k1", "h1");
+        k.rpm_limit = Some(1_000_000);
+        k.tpm_limit = None;
+        let w0 = 1_700_000_040 / 60 * 60;
+
+        // Seed a STALE entry under an older window so a sweep would evict it. Use a distinct key so
+        // we can observe whether the sweep ran by whether the stale entry survives.
+        {
+            let mut map = gov.rate.write().unwrap_or_else(|p| p.into_inner());
+            map.insert(
+                "stale".to_string(),
+                RateState {
+                    window_start: w0 - RATE_WINDOW_SECS,
+                    requests: 0,
+                    tokens: 0,
+                },
+            );
+        }
+
+        // FIRST call: ticker is 0, post-increment value is 1 (not a multiple of N) -> NO sweep.
+        // The stale entry must survive.
+        assert_eq!(gov.rate_sweep_ticker.load(Ordering::Relaxed), 0);
+        assert!(gov.check_rate(&k, w0).is_ok());
+        assert!(
+            gov.rate
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key("stale"),
+            "first call must NOT sweep (post-increment value 1 is not a multiple of N)"
+        );
+
+        // Drive the ticker to N-1 so the next call's post-increment value is exactly N -> sweep runs.
+        gov.rate_sweep_ticker
+            .store(RATE_SWEEP_INTERVAL - 1, Ordering::Relaxed);
+        assert!(gov.check_rate(&k, w0).is_ok());
+        assert!(
+            !gov.rate
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key("stale"),
+            "call N must run the sweep and evict the stale entry"
+        );
+
+        // WRAP boundary: pre-increment value 0xFFFFFFFF is NOT a multiple of N, but post-increment
+        // wraps to 0 (a multiple of N) so the sweep must still fire — no skipped cycle.
+        {
+            let mut map = gov.rate.write().unwrap_or_else(|p| p.into_inner());
+            map.insert(
+                "stale2".to_string(),
+                RateState {
+                    window_start: w0 - RATE_WINDOW_SECS,
+                    requests: 0,
+                    tokens: 0,
+                },
+            );
+        }
+        gov.rate_sweep_ticker.store(u32::MAX, Ordering::Relaxed);
+        assert!(gov.check_rate(&k, w0).is_ok());
+        assert_eq!(
+            gov.rate_sweep_ticker.load(Ordering::Relaxed),
+            0,
+            "ticker wrapped to 0"
+        );
+        assert!(
+            !gov.rate
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key("stale2"),
+            "wrap boundary must still sweep (post-increment 0 is a multiple of N) — no skipped cycle"
+        );
     }
 
     #[tokio::test]

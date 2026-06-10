@@ -197,9 +197,10 @@ checklist as authoritative.
 - **`error_map` is data, not code.** Provider quirks belong in YAML, not in a
   match arm.
 - **Test time is injectable, not real.** Breaker/FSM logic reads time via
-  `store::now_secs()`, which uses `now_for_test()` under `#[cfg(test)]`; tests set
-  it with `set_now_for_test`. Don't call `SystemTime::now()` directly in
-  breaker-adjacent code.
+  `store::now()` (the public crate function), which `InMemoryStore` internally
+  wraps in a private `now_secs()` that, under `#[cfg(test)]`, is shadowed to
+  delegate to `now_for_test()`; tests inject time via `store::set_now_for_test`.
+  Don't call `SystemTime::now()` directly in breaker-adjacent code.
 - **`#[cfg_attr(not(test), allow(dead_code))]`** marks the lane-default breaker
   methods that release code reaches only via the `_in` variants but tests exercise
   directly — keep that pattern when adding parallel default/`_in` methods.

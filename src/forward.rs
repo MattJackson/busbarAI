@@ -4357,7 +4357,10 @@ mod mid_stream_error_tests {
             );
         }
         // The SSE ingress twins carry the same generic detail in their native error envelope.
-        for proto in ["openai", "anthropic", "gemini", "cohere", "responses"] {
+        // (Cohere is excluded: its native v2 mid-stream error is a `message-end` frame with
+        // `delta.finish_reason: "ERROR"` and NO free-text field — a native client never sees a
+        // detail string, so the cause is logged server-side instead of placed on the wire.)
+        for proto in ["openai", "anthropic", "gemini", "responses"] {
             let bytes = mid_stream_error_bytes(proto, false, MID_STREAM_GENERIC_DETAIL);
             let text = String::from_utf8_lossy(&bytes);
             assert!(
@@ -4365,6 +4368,17 @@ mod mid_stream_error_tests {
                 "{proto} mid-stream error must carry the generic detail; got {text}"
             );
         }
+        // Cohere: native `message-end` with ERROR finish_reason, and NO leaked detail on the wire.
+        let cohere_bytes = mid_stream_error_bytes("cohere", false, MID_STREAM_GENERIC_DETAIL);
+        let cohere_text = String::from_utf8_lossy(&cohere_bytes);
+        assert!(
+            cohere_text.contains("message-end") && cohere_text.contains("ERROR"),
+            "cohere mid-stream error is a native message-end ERROR frame; got {cohere_text}"
+        );
+        assert!(
+            !cohere_text.contains(MID_STREAM_GENERIC_DETAIL),
+            "cohere native message-end must not carry a free-text detail; got {cohere_text}"
+        );
     }
 
     /// HIGH (forward.rs:353-380 / 372-380): a mid-stream upstream failure on a BEDROCK-ingress stream
@@ -4439,9 +4453,15 @@ mod mid_stream_error_tests {
                 .find_map(|l| l.strip_prefix("data: "))
                 .expect("a data: line");
             let v: Value = serde_json::from_str(data).expect("native JSON envelope");
-            // OpenAI/Gemini wrap in `error`; Cohere uses a flat `type`+`message`. Either way the
-            // detail is carried in the protocol's native streaming-error shape.
-            let has_native_shape = v.get("error").is_some() || v.get("message").is_some();
+            // OpenAI/Gemini wrap in `error`; Cohere's native mid-stream error is its `message-end`
+            // frame with `delta.finish_reason: "ERROR"` (no top-level `message`/`error` — a native
+            // v2 client never sees a proxy-detail string; the cause is logged server-side).
+            let cohere_message_end = v.get("type").and_then(|t| t.as_str()) == Some("message-end")
+                && v.pointer("/delta/finish_reason")
+                    .and_then(|f| f.as_str())
+                    .is_some_and(|f| f.starts_with("ERROR"));
+            let has_native_shape =
+                v.get("error").is_some() || v.get("message").is_some() || cohere_message_end;
             assert!(has_native_shape, "{proto} native envelope: {v}");
         }
 
