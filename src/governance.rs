@@ -274,11 +274,11 @@ impl GovState {
         // and the per-key resolution below re-checks/refreshes this key's own entry for `window`
         // regardless of whether the sweep ran, so nothing the sweep does (or skips) can admit a
         // request that should be rejected or vice versa.
-        // MSRV NOTE: `u32::is_multiple_of` was stabilized in Rust 1.86 (April 2025). It is used here
-        // (and clippy's `manual_is_multiple_of` actively REWRITES the equivalent `% N == 0` form back
-        // to it, so the two cannot both be satisfied without a declared MSRV), which makes 1.86 the
-        // effective minimum supported toolchain. Cargo.toml does not yet declare `rust-version =
-        // "1.86"`; it SHOULD, so the constraint is visible to toolchain installers and CI matrices
+        // MSRV NOTE: `u32::is_multiple_of` was stabilized in Rust 1.87. It is used here (and clippy's
+        // `manual_is_multiple_of` actively REWRITES the equivalent `% N == 0` form back to it, so the
+        // two cannot both be satisfied without a declared MSRV), which makes 1.87 the effective
+        // minimum supported toolchain. Cargo.toml declares `rust-version = "1.87"` so the constraint
+        // is visible to toolchain installers, CI matrices, and clippy's `incompatible_msrv` lint,
         // rather than surfacing as a silent compile failure on an older pinned stable.
         // POST-increment semantics: test the value AFTER this call's increment, not the
         // pre-increment value `fetch_add` returns. This fixes two off-by-one defects of the naive

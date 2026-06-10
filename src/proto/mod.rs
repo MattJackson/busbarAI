@@ -772,6 +772,15 @@ pub(crate) struct StreamTranslate {
     /// itself carries none, so input tokens survive the seam regardless of how the egress protocol
     /// split start-vs-terminal usage. `None` until the first `MessageStart` carrying usage is seen.
     start_usage: Option<crate::ir::IrUsage>,
+    /// Set once a terminal `MessageStop` has been emitted for this stream. Guards against an
+    /// out-of-order trailing usage-only `MessageDelta{stop_reason: None}` (the OpenAI `include_usage`
+    /// convention puts token totals in a chunk that arrives AFTER the finish chunk) being written
+    /// AFTER the terminal frame on a NON-eventstream ingress — e.g. an Anthropic `message_delta`
+    /// after `message_stop`, which is invalid stream framing and a proxy tell. The bedrock
+    /// (`ingress_eventstream`) path folds that late usage into its single `metadata` frame and so is
+    /// handled separately above; for every other ingress the late usage delta is dropped once the
+    /// message has stopped (matching v1.0.0-rc.2, which did not read trailing usage at all).
+    message_stopped: bool,
 }
 
 /// The OpenAI stream-start identity replayed onto every `chat.completion.chunk` (see
@@ -809,6 +818,7 @@ impl StreamTranslate {
             tap_json: Vec::new(),
             tool_id_remap: ToolIdRemap::default(),
             start_usage: None,
+            message_stopped: false,
         })
     }
 
@@ -962,6 +972,28 @@ impl StreamTranslate {
                     self.emit_ir_event(&ev, out);
                     continue;
                 }
+            }
+
+            // Non-eventstream ingress ordering guard: once the terminal `MessageStop` has been
+            // emitted, drop a trailing usage-only `MessageDelta{stop_reason: None}` (OpenAI
+            // `include_usage` delivers token totals in a chunk that arrives AFTER the finish chunk).
+            // Writing it now would put a `message_delta` AFTER `message_stop` on the wire — invalid
+            // stream framing and a proxy tell for SSE ingress (Anthropic/Gemini/Cohere/OpenAI). The
+            // bedrock (`ingress_eventstream`) path already folded such usage into its single
+            // `metadata` frame above and returned via `continue`, so it never reaches here.
+            if self.message_stopped
+                && matches!(
+                    ev,
+                    crate::ir::IrStreamEvent::MessageDelta {
+                        stop_reason: None,
+                        ..
+                    }
+                )
+            {
+                continue;
+            }
+            if matches!(ev, crate::ir::IrStreamEvent::MessageStop) {
+                self.message_stopped = true;
             }
 
             self.emit_ir_event(&ev, out);
@@ -4971,6 +5003,44 @@ mod stream_translate_tests {
         // And exactly one messageStop frame (the stop discriminant).
         let stops = frames.iter().filter(|(et, _)| et == "messageStop").count();
         assert_eq!(stops, 1, "exactly one messageStop frame");
+    }
+
+    // Regression (MEDIUM, release-gate file-by-file audit): for NON-eventstream (SSE) ingress, the
+    // trailing OpenAI `include_usage` usage-only chunk arrives AFTER the finish chunk that already
+    // produced the terminal frame. Translating it would put a `message_delta` AFTER `message_stop` on
+    // an Anthropic-ingress wire — invalid stream framing and a proxy tell. `StreamTranslate` must
+    // drop the post-stop usage-only delta for SSE ingress (the bedrock path folds it into metadata
+    // instead, covered by the test above).
+    #[test]
+    fn test_translate_openai_include_usage_to_anthropic_ingress_no_post_stop_message_delta() {
+        let mut t =
+            StreamTranslate::new("anthropic", "openai").expect("anthropic ingress translator");
+        let mut raw: Vec<u8> = Vec::new();
+        for frame in [
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            // include_usage trailing chunk (empty choices, real usage) — arrives after the finish.
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":11}}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            raw.extend_from_slice(&t.feed(frame.as_bytes()));
+        }
+        raw.extend_from_slice(&t.finish());
+        let wire = String::from_utf8_lossy(&raw);
+
+        // The SSE event sequence must end the message with `message_stop`; NO `message_delta` may
+        // appear after it. Find the byte offsets of the last message_stop and any later message_delta.
+        let stop_at = wire
+            .rfind("event: message_stop")
+            .or_else(|| wire.rfind("\"type\":\"message_stop\""))
+            .or_else(|| wire.rfind("message_stop"))
+            .expect("anthropic stream must emit a message_stop");
+        let after = &wire[stop_at..];
+        assert!(
+            !after.contains("message_delta"),
+            "no message_delta may follow message_stop on the wire; tail after stop:\n{after}"
+        );
     }
 
     // MEDIUM/conformance (proto/mod.rs fan-out): DEFAULT OpenAI streaming — NO

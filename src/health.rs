@@ -152,8 +152,11 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
         .await;
 
     // Classify the probe outcome through the organic disposition pipeline so auth/billing failures
-    // reach HardDown instead of being mis-filed as transient cooldowns.
-    let disposition = match res {
+    // reach HardDown instead of being mis-filed as transient cooldowns. Carry the server-requested
+    // `Retry-After` alongside the disposition so a transient probe failure honors the upstream's
+    // cooldown floor (the captured value is otherwise dropped by `classify`, which returns only the
+    // Disposition).
+    let (disposition, retry_after_secs) = match res {
         Ok(r) if r.status().is_success() => {
             if app.store.lane_needs_probe(i, now()) {
                 // Probe tests the shared upstream → recover the lane in every cell (all pools +
@@ -177,11 +180,14 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
             let body = read_capped_error_body(r).await;
             let mut raw: RawUpstreamError = lane.protocol.reader().extract_error(status, &body);
             raw.retry_after_secs = retry_after_secs;
-            classify(&normalize_raw_error(&raw, &lane.error_map))
+            (
+                classify(&normalize_raw_error(&raw, &lane.error_map)),
+                retry_after_secs,
+            )
         }
         // Transport error (connect/timeout/reset): treat as a transient network failure, as the
-        // organic path does.
-        Err(_) => Disposition::TransientUpstream,
+        // organic path does. No HTTP response, so no Retry-After.
+        Err(_) => (Disposition::TransientUpstream, None),
     };
 
     match disposition {
@@ -204,8 +210,12 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
             // clears — the default cell AND every per-pool cell — because organic traffic routes
             // against per-pool cells. (The single BreakerCfg is used for all cells; per-pool
             // trip-threshold nuance is a known limitation of the out-of-band prober.)
-            app.store
-                .record_probe_failure_all_cells(i, "health-probe", &BreakerCfg::default());
+            app.store.record_probe_failure_all_cells(
+                i,
+                "health-probe",
+                &BreakerCfg::default(),
+                retry_after_secs,
+            );
         }
         // The lane is healthy; the probe REQUEST was rejected (malformed / too large for the model).
         // Record nothing — do not bench a working lane over a probe-construction issue.

@@ -3213,6 +3213,18 @@ async fn forward_once(
                             if ir.created.is_none() {
                                 ir.created = Some(unix_now_secs());
                             }
+                            // CROSS-PROTOCOL tool-id native remap — the SAME seam transform the main
+                            // forward path applies at 2666-2667. This degraded (LeastBad/FallbackPool)
+                            // route reaches the cross-protocol buffered-translate block too, so without
+                            // it a tool-call response emits the egress backend's RAW native id (e.g. an
+                            // OpenAI `call_…`) verbatim to a different-protocol client: a foreign-format
+                            // proxy tell AND a broken round-trip (the `tool_result` the client echoes
+                            // next round would not decode back to the egress id at the request seam).
+                            // Reshape each tool id to the ingress client's native form here.
+                            // (`cross_protocol` gates this whole block, so same-protocol passthrough is
+                            // never remapped; the transform is a deterministic reversible bijection.)
+                            crate::proto::ToolIdRemap::default()
+                                .remap_response(ingress_protocol, &mut ir);
                             // Bedrock ConverseStream request answered by a buffered (non-SSE) 2xx:
                             // emit the native binary eventstream frame sequence, not an
                             // `application/json` Converse body the SDK's stream decoder cannot parse
@@ -5540,6 +5552,99 @@ data: {"type":"message_stop"}"#
         );
         // Modeled fields still translated across.
         assert!(obj.contains_key("messages"), "messages translated: {ev}");
+        server.shutdown().await;
+    }
+
+    /// Regression (MEDIUM, release-gate file-by-file audit): the `forward_once` degraded
+    /// (LeastBad/FallbackPool) cross-protocol path must apply the SAME tool-id native remap the main
+    /// forward path does. Before the fix it stripped identity + stamped `created` but omitted
+    /// `ToolIdRemap::remap_response`, so a tool-call response emitted the egress backend's RAW native
+    /// id (an Anthropic `toolu_…`) verbatim to an OpenAI client — a foreign-format proxy tell and a
+    /// broken tool round-trip. Assert the client sees an OpenAI-native `call_…` id, never the raw one.
+    #[tokio::test]
+    async fn test_forward_once_cross_protocol_remaps_tool_call_id() {
+        use crate::store::now as store_now;
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // Anthropic backend returns a tool_use response carrying a native anthropic tool id.
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "id": "msg_x",
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_origRAW123",
+                    "name": "get_weather",
+                    "input": {"city": "SF"}
+                }],
+                "model": "claude-3",
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 3, "output_tokens": 2}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let t0 = store_now();
+        // Lane speaks ANTHROPIC; ingress OpenAI → cross-protocol; lane in cooldown so LeastBad serves
+        // via the degraded forward_once path.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "claude-3",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .provider("anthropic")
+                .cooldown_until(t0 + 600)
+                .streak(3)
+                .err(5),
+            )
+            .pool("leastbad", &[(0, 1)])
+            .on_exhausted("leastbad", crate::config::OnExhausted::LeastBad)
+            .build();
+
+        let req_body = serde_json::to_vec(&json!({
+            "model": "leastbad",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "max_tokens": 16
+        }))
+        .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+            "leastbad",
+            None,
+            "openai",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200, "LeastBad serves the 2xx");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let v: Value = serde_json::from_slice(&body).expect("client body is JSON");
+        // OpenAI ingress → the tool call id lives at choices[0].message.tool_calls[0].id.
+        let tool_id = v
+            .pointer("/choices/0/message/tool_calls/0/id")
+            .and_then(|s| s.as_str())
+            .unwrap_or_else(|| panic!("expected an OpenAI tool_calls id in: {v}"));
+        assert!(
+            tool_id.starts_with("call_"),
+            "tool id must be remapped to the OpenAI-native `call_` shape, got {tool_id}"
+        );
+        assert_ne!(
+            tool_id, "toolu_origRAW123",
+            "the raw Anthropic egress tool id must NOT leak verbatim to the OpenAI client"
+        );
+        assert!(
+            !body
+                .windows("toolu_origRAW123".len())
+                .any(|w| w == b"toolu_origRAW123"),
+            "the raw Anthropic tool id must not appear anywhere in the client response"
+        );
         server.shutdown().await;
     }
 

@@ -579,6 +579,23 @@ impl ProtocolReader for CohereReader {
                                     delta: crate::ir::IrDelta::TextDelta(text.to_string()),
                                 });
                             }
+                        } else if let Some(block_obj) = content_obj.as_object() {
+                            // Native Cohere v2 content-delta shape: `content` is a single
+                            // `{ "type": "text", "text": "<chunk>" }` object (the exact shape this
+                            // file's writer emits at delta.message.content). Without this branch the
+                            // object falls through both the string and array arms and the streamed
+                            // text is silently dropped — a writer→reader roundtrip break and data
+                            // loss on a real Cohere v2 backend stream.
+                            if block_obj.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                if let Some(text) = block_obj.get("text").and_then(|t| t.as_str()) {
+                                    if !text.is_empty() {
+                                        out.push(IrStreamEvent::BlockDelta {
+                                            index: idx,
+                                            delta: crate::ir::IrDelta::TextDelta(text.to_string()),
+                                        });
+                                    }
+                                }
+                            }
                         } else if let Some(content_arr) = content_obj.as_array() {
                             for block_val in content_arr {
                                 if let Some(block_obj) = block_val.as_object() {
@@ -2638,6 +2655,45 @@ mod tests {
         );
         assert_eq!(content.get("type").and_then(|t| t.as_str()), Some("text"));
         assert_eq!(content.get("text").and_then(|t| t.as_str()), Some("chunk"));
+    }
+
+    /// Regression (HIGH/correctness): the content-delta WRITER emits `delta.message.content` as a
+    /// `{type:text, text:…}` object (the native Cohere v2 shape), so the READER must decode that
+    /// exact object back to a TextDelta. Before the object branch was added, the reader handled only
+    /// the bare-string and array forms, so the writer's own frame round-tripped to ZERO events —
+    /// streamed assistant text was silently dropped on the Cohere read/proxy path. Lock the
+    /// writer→reader symmetry.
+    #[test]
+    fn test_content_delta_writer_reader_roundtrip_object_shape() {
+        let writer = CohereWriter;
+        let (_, frame) = writer
+            .write_response_event(&IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::TextDelta("hi".to_string()),
+            })
+            .expect("content-delta must serialize");
+        // Sanity: the writer really emitted the object shape this test guards.
+        assert!(
+            frame
+                .pointer("/delta/message/content")
+                .is_some_and(|c| c.is_object()),
+            "writer must emit object-shaped content: {frame}"
+        );
+        // Feed the writer's own frame back through the reader.
+        let mut state = crate::ir::StreamDecodeState::default();
+        let evs = CohereReader.read_response_events("", &frame, &mut state);
+        let decoded_text: Option<String> = evs.iter().find_map(|e| match e {
+            IrStreamEvent::BlockDelta {
+                delta: crate::ir::IrDelta::TextDelta(t),
+                ..
+            } => Some(t.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            decoded_text.as_deref(),
+            Some("hi"),
+            "object-shaped content-delta must round-trip to the original text, got events: {evs:?}"
+        );
     }
 
     /// Regression (LOW/correctness): a streaming tool call (tool-call-start / tool-call-delta /

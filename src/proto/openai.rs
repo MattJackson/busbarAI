@@ -675,18 +675,27 @@ impl ProtocolReader for OpenAiReader {
         // than only inside the finish_reason block, as the prior code did) ensures the trailing
         // usage chunk is not silently discarded, preserving token accounting across translated /
         // passthrough OpenAI streams that follow the spec'd trailing-usage convention.
-        let chunk_usage = data.get("usage").map(|u| IrUsage {
-            input_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            output_tokens: u
-                .get("completion_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: u
-                .get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(|v| v.as_u64()),
-        });
+        //
+        // CRITICAL: under `include_usage` the OpenAI API sets `usage: null` on EVERY non-final chunk.
+        // `serde_json::Value::get("usage")` returns `Some(Value::Null)` for a present-but-null key,
+        // so a naive `.map(...)` would synthesize `Some(IrUsage{0,0,..})` on every content chunk and
+        // (via the trailing-usage branch below) emit a spurious mid-stream `MessageDelta` per chunk.
+        // Filter to a real usage OBJECT so `usage: null` reads as `None`.
+        let chunk_usage = data
+            .get("usage")
+            .filter(|u| u.is_object())
+            .map(|u| IrUsage {
+                input_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                output_tokens: u
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: u
+                    .get("prompt_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(|v| v.as_u64()),
+            });
 
         // 5. finish_reason → close open blocks (text first, then tools ascending), MessageDelta, MessageStop.
         let finish_reason = choice0
@@ -737,17 +746,26 @@ impl ProtocolReader for OpenAiReader {
             });
             out.push(IrStreamEvent::MessageStop);
         } else if let Some(usage) = chunk_usage {
-            // Trailing usage-only chunk (include_usage convention): no finish_reason and no choices,
-            // but a top-level `usage` object. Fold it into a MessageDelta with `stop_reason: None`
-            // (in-progress finish per the chunk shape) so cross-protocol consumers — e.g. an
-            // Anthropic client reading `message_delta.usage` — see real input/output token counts
-            // instead of zeros. No MessageStop is emitted here: the terminal finish_reason chunk
-            // (or the stream's `[DONE]`) still ends the message; this only carries the late usage.
-            out.push(IrStreamEvent::MessageDelta {
-                stop_reason: None,
-                stop_sequence: None,
-                usage,
-            });
+            // Trailing usage-only chunk (include_usage convention): no finish_reason and (per the
+            // null-filter above) a REAL top-level `usage` object with an EMPTY `choices` array. Emit a
+            // MessageDelta carrying the late usage so consumers that fold it (Bedrock ingress builds
+            // its single `metadata` frame from this) see real token counts instead of zeros.
+            //
+            // `choice0.is_none()` guards the genuine usage-only chunk shape: a normal content chunk
+            // (which still carries a finish-less choice) never reaches this branch even if some
+            // non-standard intermediary attached a real usage object to it. This reader is ingress-
+            // AGNOSTIC, so it always emits the faithful IR; the cross-protocol ORDERING concern (this
+            // delta arrives after the finish chunk's MessageStop, which would be an invalid
+            // `message_delta`-after-`message_stop` frame for non-Bedrock SSE ingress) is handled where
+            // the ingress IS known — `StreamTranslate::translate_event` drops a terminal-class
+            // MessageDelta that arrives after MessageStop for non-eventstream ingress.
+            if choice0.is_none() {
+                out.push(IrStreamEvent::MessageDelta {
+                    stop_reason: None,
+                    stop_sequence: None,
+                    usage,
+                });
+            }
         }
 
         out
@@ -3887,5 +3905,78 @@ mod tests {
     fn singular_read_response_event_empty_chunk_yields_none() {
         let done = serde_json::Value::String("[DONE]".to_string());
         assert!(OpenAiReader.read_response_event("", &done).is_none());
+    }
+
+    // Regression (HIGH): under `stream_options:{include_usage:true}` the OpenAI API sets
+    // `usage: null` on EVERY non-final chunk. `Value::get("usage")` returns `Some(Null)` for that,
+    // so without the object-filter the reader synthesized `Some(IrUsage{0,..})` and emitted a
+    // spurious mid-stream `MessageDelta` on every content chunk. A content chunk carrying
+    // `usage: null` must yield only the text events — NO MessageDelta.
+    #[test]
+    fn null_usage_on_content_chunk_emits_no_message_delta() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let chunk = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"content": "hello"}, "finish_reason": null}],
+            "usage": null
+        });
+        let evs = OpenAiReader.read_response_events("", &chunk, &mut state);
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, IrStreamEvent::MessageDelta { .. })),
+            "usage:null content chunk must not emit a MessageDelta, got {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockDelta { delta: crate::ir::IrDelta::TextDelta(t), .. } if t == "hello"
+            )),
+            "text content must still decode, got {evs:?}"
+        );
+    }
+
+    // Regression (MEDIUM): the reader is ingress-AGNOSTIC, so it must faithfully translate the
+    // trailing `include_usage` usage-only chunk (empty `choices`, real top-level `usage`) into a
+    // `MessageDelta{stop_reason: None, usage}` carrying the REAL token counts — Bedrock ingress folds
+    // exactly this into its single `metadata` frame. (The cross-protocol ORDERING concern — this
+    // delta arriving after the finish chunk's `MessageStop` — is handled in `StreamTranslate` for
+    // non-eventstream ingress, not here.)
+    #[test]
+    fn trailing_usage_only_chunk_emits_message_delta_with_real_tokens() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let mut all = Vec::new();
+        // content chunk (usage:null), finish chunk (finish_reason, usage:null), trailing usage chunk.
+        for chunk in [
+            serde_json::json!({"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}],"usage":null}),
+            serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}),
+            serde_json::json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+        ] {
+            all.extend(OpenAiReader.read_response_events("", &chunk, &mut state));
+        }
+        // The trailing usage-only chunk yields a MessageDelta with stop_reason:None and real tokens.
+        let trailing = all.iter().rev().find_map(|e| match e {
+            IrStreamEvent::MessageDelta {
+                stop_reason: None,
+                usage,
+                ..
+            } => Some(usage.clone()),
+            _ => None,
+        });
+        let usage =
+            trailing.expect("trailing usage-only chunk must emit a stop_reason:None MessageDelta");
+        assert_eq!(
+            usage.input_tokens, 7,
+            "real prompt tokens must survive, got {usage:?}"
+        );
+        assert_eq!(
+            usage.output_tokens, 3,
+            "real completion tokens must survive, got {usage:?}"
+        );
+        // And exactly one terminal MessageStop (from the finish chunk).
+        assert_eq!(
+            all.iter()
+                .filter(|e| matches!(e, IrStreamEvent::MessageStop))
+                .count(),
+            1
+        );
     }
 }

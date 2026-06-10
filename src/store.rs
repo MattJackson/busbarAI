@@ -260,7 +260,15 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// all-cells iteration. The probe tests the shared upstream, and organic traffic routes against
     /// per-pool cells, so a probe failure that only hit the default cell could never trip the
     /// per-pool breakers real traffic is selected against. `cfg` drives the trip/cooldown decision.
-    fn record_probe_failure_all_cells(&self, lane: usize, what: &str, cfg: &BreakerCfg);
+    /// `retry_after` (server-requested cooldown floor, e.g. a 429 `Retry-After`) is honored when
+    /// `cfg.honor_retry_after` is set, exactly as on the organic failure path.
+    fn record_probe_failure_all_cells(
+        &self,
+        lane: usize,
+        what: &str,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    );
 
     // concurrency + budget — lane-global (shared across every pool fronting the lane).
     fn try_acquire(&self, lane: usize) -> Option<Permit>;
@@ -1674,19 +1682,27 @@ impl StateStore for InMemoryStore {
         }
     }
 
-    fn record_probe_failure_all_cells(&self, lane: usize, _what: &str, cfg: &BreakerCfg) {
+    fn record_probe_failure_all_cells(
+        &self,
+        lane: usize,
+        _what: &str,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    ) {
         // Administratively-dead lanes ignore failure recording (matches record_failure_for).
         if self.get_lane(lane).dead.load(Ordering::Relaxed) {
             return;
         }
         let now = Self::now_secs();
-        // Default cell (direct/ad-hoc routes).
-        Self::cell_record_failure(self.get_lane(lane).as_ref(), now, cfg, None);
+        // Default cell (direct/ad-hoc routes). `retry_after` (the probe's server-requested cooldown
+        // floor) is forwarded so a 429/Retry-After probe honors the upstream's backoff, same as the
+        // organic path; `cell_record_failure` applies it only when `cfg.honor_retry_after` is set.
+        Self::cell_record_failure(self.get_lane(lane).as_ref(), now, cfg, retry_after);
         // Every existing per-pool cell for this lane — the cells organic traffic is selected
         // against. (A cell not yet created inherits health lazily on first access via `cell`.)
         let cells = read_recover(&self.pool_cells);
         for (_, cell) in cells.get(&lane).into_iter().flatten() {
-            Self::cell_record_failure(cell.as_ref(), now, cfg, None);
+            Self::cell_record_failure(cell.as_ref(), now, cfg, retry_after);
         }
     }
 
@@ -2232,6 +2248,53 @@ mod tests {
             }
             _ => panic!("should transition to Open on probe failure"),
         }
+    }
+
+    /// Regression (release-gate file-by-file audit): a failed health probe carrying a `Retry-After`
+    /// must honor that server-requested cooldown floor — the prober now threads `retry_after` into
+    /// `record_probe_failure_all_cells` instead of hardcoding `None`. A probe failing with
+    /// retry_after=90s (larger than the streak-0 base backoff of 15s) must set the cooldown to at
+    /// least the retry_after floor.
+    #[test]
+    fn test_probe_failure_honors_retry_after_floor() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(50_000);
+        store.get_lane(0).streak.store(0, Ordering::Relaxed);
+
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 15,
+            max_cooldown_secs: 120,
+            honor_retry_after: true,
+            trip: TripConfig::default(),
+        };
+        // Put the default cell in HalfOpen so a SINGLE probe failure reopens it with the BASE
+        // (un-escalated) ~15s backoff — small enough that a retry_after=90 clearly dominates,
+        // isolating the floor from cooldown escalation.
+        store
+            .get_lane(0)
+            .breaker_state
+            .store(ST_HALF_OPEN, Ordering::Relaxed);
+        store.record_probe_failure_all_cells(0, "health-probe", &cfg, Some(90));
+        let until = store.get_lane(0).cooldown_until.load(Ordering::Relaxed);
+        assert!(
+            until >= 50_000 + 90,
+            "probe failure must honor the retry_after=90 floor (got cooldown_until={until}, base ~15s would be ~50015)"
+        );
+        // Control: identical single reopen WITHOUT retry_after lands only the base backoff, well
+        // below the 90s floor — proving the floor came from the threaded retry_after, not the base.
+        let store2 = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(50_000);
+        store2.get_lane(0).streak.store(0, Ordering::Relaxed);
+        store2
+            .get_lane(0)
+            .breaker_state
+            .store(ST_HALF_OPEN, Ordering::Relaxed);
+        store2.record_probe_failure_all_cells(0, "health-probe", &cfg, None);
+        let until_no_ra = store2.get_lane(0).cooldown_until.load(Ordering::Relaxed);
+        assert!(
+            until_no_ra < 50_000 + 90,
+            "without retry_after the cooldown must be the base backoff (< 90s floor), got {until_no_ra}"
+        );
     }
 
     #[test]

@@ -2,6 +2,11 @@
 name = "busbar"
 version = "1.0.0-rc.2"
 edition = "2021"
+# Effective MSRV: governance.rs uses `u32::is_multiple_of` (stabilized in Rust 1.87), and clippy's
+# `manual_is_multiple_of` lint rewrites `% N == 0` back to it, so 1.87 is the genuine minimum. Declare
+# it so a build on an older toolchain fails fast with a clear message instead of a cryptic
+# "method not found", and so MSRV-aware tooling resolves compatible deps.
+rust-version = "1.87"
 description = "Native-protocol LLM gateway: lossless cross-protocol translation, weighted pools, per-(pool,lane) circuit breaking, and governance — in one static Rust binary."
 license = "AGPL-3.0-or-later"
 
