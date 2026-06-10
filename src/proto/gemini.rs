@@ -694,17 +694,20 @@ impl ProtocolReader for GeminiReader {
 
         let candidate = &candidates[0];
 
-        // Parse content → IrResponse.content
-        let content_val = candidate.get("content").ok_or(IrError {
-            class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".into()),
-            retry_after: None,
-        })?;
-
+        // Parse content → IrResponse.content. `content` is ABSENT on a safety/recitation-filtered
+        // candidate: a native Gemini response with `finishReason: SAFETY` (or RECITATION, etc.)
+        // carries only `finishReason` + `safetyRatings` and NO `content` field. Treat missing content
+        // as an empty content list and continue to the `finishReason` mapping below — mirroring the
+        // STREAMING reader, which guards content with `if let Some(content)` and skips it when absent.
+        // Hard-failing here turned a legitimate filtered response into a spurious 500.
         let mut content: Vec<crate::ir::IrBlock> = Vec::new();
         // Per-response tool-call index feeding `synth_tool_call_id` (Gemini carries no tool id).
         let mut tool_call_index: usize = 0;
-        if let Some(parts_arr) = content_val.get("parts").and_then(|p| p.as_array()) {
+        if let Some(parts_arr) = candidate
+            .get("content")
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array())
+        {
             for part in parts_arr {
                 // Text part → IrBlock::Text
                 if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
@@ -3165,6 +3168,34 @@ mod tests {
         assert!(
             id.is_some_and(|i| !i.is_empty()),
             "response ToolUse must carry a non-empty id"
+        );
+    }
+
+    /// Regression (MEDIUM/correctness, final audit): a SAFETY-filtered Gemini candidate carries only
+    /// `finishReason` + `safetyRatings` and NO `content` field. `read_response` must decode it as an
+    /// empty-content response with the mapped stop reason, NOT hard-fail (which forward.rs turned into
+    /// a spurious 500). Mirrors the streaming reader's `if let Some(content)` tolerance.
+    #[test]
+    fn test_read_response_safety_filtered_candidate_no_content_is_ok() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "candidates": [{
+                "finishReason": "SAFETY",
+                "safetyRatings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}]
+            }],
+            "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 0}
+        });
+        let ir = reader
+            .read_response(&body)
+            .expect("safety-filtered candidate (no content) must decode, not error");
+        assert!(
+            ir.content.is_empty(),
+            "filtered candidate has no content blocks, got {:?}",
+            ir.content
+        );
+        assert!(
+            ir.stop_reason.is_some(),
+            "the SAFETY finishReason must still map to a stop_reason"
         );
     }
 

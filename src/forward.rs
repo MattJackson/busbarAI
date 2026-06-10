@@ -1754,7 +1754,7 @@ const EGRESS_UA_DEFAULT: &str = "okhttp/4.12.0";
 /// real first-party SDK emits for that provider's API. (Backend-facing only; does not affect client
 /// indistinguishability.) The version numbers are PINNED and drift over time — see the
 /// `EGRESS_UA_*` constant block above for the release-time audit obligation that keeps them current.
-fn egress_user_agent(egress_protocol: &str) -> &'static str {
+pub(crate) fn egress_user_agent(egress_protocol: &str) -> &'static str {
     match egress_protocol {
         "anthropic" => EGRESS_UA_ANTHROPIC,
         "openai" | "responses" => EGRESS_UA_OPENAI,
@@ -1774,7 +1774,7 @@ fn egress_user_agent(egress_protocol: &str) -> &'static str {
 /// `egress_user_agent` lookup: set to what the real SDK emits so the backend cannot separate busbar
 /// traffic from native traffic on this header. Enumerated (no disposition wildcard) — a header-string
 /// lookup, not a breaker/disposition decision.
-fn egress_accept(egress_protocol: &str, wants_stream: bool) -> &'static str {
+pub(crate) fn egress_accept(egress_protocol: &str, wants_stream: bool) -> &'static str {
     match egress_protocol {
         // botocore/boto3 sends `application/vnd.amazon.eventstream` on a ConverseStream call and
         // `application/json` on a non-stream Converse call — the headline Bedrock egress surface.
@@ -3080,6 +3080,16 @@ async fn forward_once(
                 .get("x-amzn-requestid")
                 .and_then(|h| h.to_str().ok())
                 .map(|s| s.to_string());
+            // The upstream Bedrock `x-amzn-errortype` (a native ConverseStream/Converse error always
+            // carries it; AWS SDKs dispatch the typed exception from this header FIRST, before the
+            // body `__type`). Captured here so the same-protocol degraded error relay below can
+            // forward it verbatim — its absence makes an SDK fall back to body-based dispatch and is a
+            // detectable proxy tell against a native Bedrock endpoint.
+            let upstream_amzn_errortype = r
+                .headers()
+                .get("x-amzn-errortype")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string());
             // Anthropic-ingress `request-id` (same-protocol degraded relay forwards it verbatim;
             // cross-protocol synthesizes). See `maybe_attach_anthropic_request_id`.
             let upstream_request_id = r
@@ -3117,6 +3127,20 @@ async fn forward_once(
                     ingress_protocol,
                     upstream_request_id.as_deref(),
                 );
+                // Bedrock-ingress same-protocol error relay: forward BOTH `x-amzn-requestid` and
+                // `x-amzn-errortype` verbatim, mirroring the main `forward_with_pool` path. Without
+                // them a native AWS SDK's `request_id()` returns None and the typed-exception dispatch
+                // falls back from header-first to body `__type` — both detectable tells. (The main
+                // path forwards these on its same-protocol error branches; this degraded route
+                // previously captured the id but never attached it, and dropped the errortype.)
+                if ingress_protocol == "bedrock" {
+                    if let Some(id) = upstream_amzn_id.as_deref() {
+                        rb = rb.header("x-amzn-requestid", id);
+                    }
+                    if let Some(et) = upstream_amzn_errortype.as_deref() {
+                        rb = rb.header("x-amzn-errortype", et);
+                    }
+                }
                 return Ok(rb
                     .body(Body::from(bytes))
                     .unwrap_or_else(|_| status.into_response()));

@@ -2327,6 +2327,11 @@ impl ProtocolWriter for ResponsesWriter {
                         serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                     output_arr.push(serde_json::json!({
                         "type": "function_call",
+                        // Native function_call items carry an item-level opaque `id` (`fc_…`) DISTINCT
+                        // from `call_id` — the streaming `output_item.done` emits it, so the non-stream
+                        // body must too or a typed SDK reading `item.id` sees a missing field (a proxy
+                        // tell). The IR has no per-item id, so synthesize one of the native shape.
+                        "id": synthesize_item_id("fc"),
                         "call_id": id,
                         "name": name,
                         "arguments": args_str
@@ -2345,14 +2350,21 @@ impl ProtocolWriter for ResponsesWriter {
 
         if !text_blocks.is_empty() {
             let text_content = text_blocks.join("");
+            // Match the native message-item shape the STREAMING `output_item.done` emits: an
+            // item-level `id` (`msg_…`), a `status`, and `annotations: []` on the `output_text`
+            // content part. Omitting them is a proxy tell — a typed SDK reading `item.id` /
+            // `item.status` / `content[0].annotations` sees missing fields on the non-stream path.
             output_arr.insert(
                 0,
                 serde_json::json!({
                     "type": "message",
+                    "id": synthesize_item_id("msg"),
                     "role": "assistant",
+                    "status": "completed",
                     "content": [{
                         "type": "output_text",
-                        "text": text_content
+                        "text": text_content,
+                        "annotations": []
                     }]
                 }),
             );
@@ -2788,14 +2800,13 @@ mod tests {
 
     #[test]
     fn test_write_response_roundtrip_text_only() {
-        // Carries `id`/`created_at` so same-protocol read→write is byte-identical: the writer now
-        // always emits the SDK-required top-level identity, and a native response carries both.
-        // Carries `model` too: a native completed response always carries the required
-        // non-nullable `model`, and the writer now always re-emits it, so the round-trip stays
-        // byte-identical only when the source includes it.
-        // Carries `error: null` too: a native non-streaming response always includes the required
-        // nullable `error` field (null on success), and the writer now always re-emits it, so the
-        // round-trip stays byte-identical only when the source includes it.
+        // The writer re-emits the SDK-required top-level identity (`id`/`created_at`/`model`/`status`/
+        // `error:null`) AND a CONFORMANT message output item: a native message item carries an
+        // item-level opaque `id` (`msg_…`), a `status`, and `annotations: []` on the `output_text`
+        // part — exactly what the streaming `output_item.done` emits. The non-stream writer must too,
+        // or a typed SDK reading `item.id`/`item.status`/`content[0].annotations` sees missing fields
+        // (a proxy tell). Because the synthesized item id is opaque/random (as native ids are), this
+        // asserts CONFORMANCE + field preservation rather than byte-equality.
         let json = serde_json::json!({
             "id": "resp_abc123",
             "object": "response",
@@ -2817,9 +2828,75 @@ mod tests {
         let writer = ResponsesWriter;
 
         let ir_resp = reader.read_response(&json).expect("read should succeed");
-        let roundtrip_json = writer.write_response(&ir_resp);
+        let out = writer.write_response(&ir_resp);
 
-        assert_eq!(roundtrip_json, json);
+        // Top-level identity preserved verbatim.
+        assert_eq!(out["id"], json["id"]);
+        assert_eq!(out["object"], "response");
+        assert_eq!(out["created_at"], json["created_at"]);
+        assert_eq!(out["status"], "completed");
+        assert_eq!(out["model"], "gpt-4o");
+        assert_eq!(out["usage"], json["usage"]);
+        assert!(out["error"].is_null());
+
+        // The message output item is conformant: native opaque id, status, and annotations.
+        let item = &out["output"][0];
+        assert_eq!(item["type"], "message");
+        assert_eq!(item["role"], "assistant");
+        assert_eq!(item["status"], "completed");
+        let id = item["id"].as_str().expect("message item carries an id");
+        assert!(
+            id.starts_with("msg_") && id.len() > 4,
+            "item id must be a native opaque msg_ token, got {id}"
+        );
+        let part = &item["content"][0];
+        assert_eq!(part["type"], "output_text");
+        assert_eq!(part["text"], "Hello world");
+        assert!(
+            part["annotations"].as_array().is_some_and(|a| a.is_empty()),
+            "output_text part must carry annotations: [], got {part}"
+        );
+    }
+
+    /// Regression (MEDIUM/conformance, final audit): the NON-streaming `write_response` function_call
+    /// item must carry the item-level opaque `id` (`fc_…`, distinct from `call_id`) that the streaming
+    /// `output_item.done` emits, or a typed SDK reading `item.id` sees a missing field.
+    #[test]
+    fn test_write_response_function_call_item_has_native_id() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            id: Some("resp_x".to_string()),
+            model: Some("gpt-4o".to_string()),
+            created: Some(1_700_000_000),
+            content: vec![crate::ir::IrBlock::ToolUse {
+                id: "call_abc".to_string(),
+                name: "get_weather".to_string(),
+                input: serde_json::json!({"city": "SF"}),
+            }],
+            stop_reason: Some("tool_use".to_string()),
+            stop_sequence: None,
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            system_fingerprint: None,
+        };
+        let writer = ResponsesWriter;
+        let out = writer.write_response(&resp);
+        let fc = out["output"]
+            .as_array()
+            .and_then(|a| a.iter().find(|i| i["type"] == "function_call"))
+            .expect("a function_call output item");
+        assert_eq!(fc["call_id"], "call_abc", "call_id preserved");
+        let id = fc["id"]
+            .as_str()
+            .expect("function_call item carries an item-level id");
+        assert!(
+            id.starts_with("fc_") && id.len() > 3,
+            "function_call item id must be a native opaque fc_ token, got {id}"
+        );
     }
 
     /// The native Responses error envelope an official SDK decodes: a JSON object whose `error`

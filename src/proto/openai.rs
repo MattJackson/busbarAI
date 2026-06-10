@@ -1253,7 +1253,12 @@ impl ProtocolWriter for OpenAiWriter {
                             "content": "",
                         });
 
-                        // Concatenate text content
+                        // Concatenate text content with NO separator, matching the OpenAI READ path
+                        // (which uses `push_str` with no separator at the symmetric site). Joining
+                        // with a space injected spurious spaces between adjacent text blocks on an
+                        // Anthropic→OpenAI ToolResult hop (`["A","B"]` → `"A B"`), corrupting content
+                        // that is boundary-sensitive (base64, JSON split across blocks). `concat()`
+                        // keeps the cross-protocol round-trip lossless.
                         if !content.is_empty() {
                             let text_parts: Vec<String> = content
                                 .iter()
@@ -1266,7 +1271,7 @@ impl ProtocolWriter for OpenAiWriter {
                                 })
                                 .collect();
 
-                            tool_result_obj["content"] = serde_json::json!(text_parts.join(" "));
+                            tool_result_obj["content"] = serde_json::json!(text_parts.concat());
                         }
 
                         messages_array.push(tool_result_obj);
@@ -1980,6 +1985,44 @@ mod tests {
 
     // --- write_request: the modeled cap re-emits as `max_tokens`; a `max_completion_tokens` ingress
     //     value survives the read→write round-trip via the IR field (R15 finding)
+
+    /// Regression (LOW/conformance, final audit): a ToolResult whose content is multiple Text blocks
+    /// (e.g. from an Anthropic tool_result content array) must serialize to OpenAI `content` by
+    /// CONCATENATION with NO separator — matching the read path (`push_str`, no separator). Joining
+    /// with a space injected spurious spaces (`["A","B"]` → `"A B"`), corrupting boundary-sensitive
+    /// content (base64 / split JSON) on the cross-protocol round-trip.
+    #[test]
+    fn write_request_tool_result_multi_text_concatenates_without_separator() {
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![IrMessage {
+                role: IrRole::Tool,
+                content: vec![crate::ir::IrBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: vec![text_block("AAA"), text_block("BBB")],
+                    is_error: false,
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = OpenAiWriter.write_request(&req);
+        let tool_msg = out["messages"]
+            .as_array()
+            .and_then(|a| a.iter().find(|m| m["role"] == "tool"))
+            .expect("a tool-role message");
+        assert_eq!(
+            tool_msg["content"], "AAABBB",
+            "multi-text ToolResult content must concatenate with NO separator, got {}",
+            tool_msg["content"]
+        );
+    }
 
     #[test]
     fn write_request_emits_max_tokens_from_modeled_cap() {

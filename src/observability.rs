@@ -219,6 +219,13 @@ fn host_is_internal(url: &reqwest::Url) -> bool {
             // `Url::host_str` keeps IPv6 literals bracketed; strip for `IpAddr` parsing.
             let host = host.strip_prefix('[').unwrap_or(host);
             let host = host.strip_suffix(']').unwrap_or(host);
+            // Strip a single trailing FQDN-root dot BEFORE every check. `Url` preserves it, and
+            // getaddrinfo resolves `127.0.0.1.` / `metadata.google.internal.` / `localhost.` to the
+            // SAME internal targets as the bare spelling — but without stripping here, the trailing
+            // dot makes the IP-literal parse fail (slipping into the DNS arm) and the METADATA_HOSTS
+            // exact-compare miss (lengths differ by one), so a trailing-dot host bypassed BOTH the
+            // metadata and IP-literal guards. Mirrors `config_validate::ssrf_blocked_host`.
+            let host = host.strip_suffix('.').unwrap_or(host);
 
             // Cloud-metadata DNS names (e.g. `metadata.google.internal`) resolve to internal/IMDS
             // targets but are not IP literals, so check them BEFORE the parse() fallthrough.
@@ -262,18 +269,13 @@ fn host_is_internal(url: &reqwest::Url) -> bool {
                 }
                 // Not an IP literal — a DNS name. Block the well-known loopback name `localhost`
                 // (and any `*.localhost` subdomain, which RFC 6761 reserves to loopback) so it can't
-                // be used as an SSRF target; allow any other external-collector hostname. Normalise a
-                // trailing-dot FQDN-root spelling FIRST: `localhost.` (and `sub.localhost.`) resolve
-                // to loopback via getaddrinfo exactly like `localhost`, yet without stripping the dot
-                // the bare-label compare misses `localhost.` and the `rsplit_once('.')` TLD becomes
-                // the empty string — so `https://localhost./exfil` slipped past this guard while
-                // `config_validate::ssrf_blocked_host` (which lists `localhost.` in METADATA_HOSTS)
-                // blocked it. Strip the single trailing dot so both spellings are caught and the two
-                // validators stay at parity.
+                // be used as an SSRF target; allow any other external-collector hostname. The
+                // trailing FQDN-root dot was already stripped above, so `localhost.` and
+                // `sub.localhost.` are caught here too.
                 Err(_) => {
-                    let h = host.strip_suffix('.').unwrap_or(host);
-                    h.eq_ignore_ascii_case("localhost")
-                        || h.rsplit_once('.')
+                    host.eq_ignore_ascii_case("localhost")
+                        || host
+                            .rsplit_once('.')
                             .is_some_and(|(_, tld)| tld.eq_ignore_ascii_case("localhost"))
                 }
             }
@@ -503,6 +505,13 @@ fn otlp_host_is_blocked(url: &reqwest::Url) -> bool {
         Some(host) => {
             let host = host.strip_prefix('[').unwrap_or(host);
             let host = host.strip_suffix(']').unwrap_or(host);
+            // Strip a single trailing FQDN-root dot BEFORE every check — otherwise a trailing-dot
+            // metadata name (`metadata.google.internal.`) misses the exact METADATA_HOSTS compare and
+            // a trailing-dot internal IP literal (`169.254.169.254.`) fails to parse and falls into
+            // the allow-by-default DNS arm, bypassing the block. Mirrors host_is_internal /
+            // config_validate::ssrf_blocked_host. (Loopback `127.0.0.1.` still canonicalizes to the
+            // allowed collector carve-out below.)
+            let host = host.strip_suffix('.').unwrap_or(host);
 
             if METADATA_HOSTS.iter().any(|m| host.eq_ignore_ascii_case(m)) {
                 return true;
@@ -881,6 +890,42 @@ mod tests {
                 "cloud-metadata DNS name webhook URL '{bad}' must be rejected by the SSRF guard; got {res:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_trailing_dot_internal_hosts() {
+        // Regression (HIGH SSRF, final audit): a trailing FQDN-root dot made the IP-literal parse
+        // fail (slipping into the allow-by-default DNS arm) and the METADATA_HOSTS exact-compare miss,
+        // so a trailing-dot internal target bypassed BOTH guards. getaddrinfo resolves these to the
+        // same internal targets as the bare spelling, so they MUST be rejected.
+        for bad in [
+            "https://127.0.0.1./exfil",
+            "https://169.254.169.254./latest/meta-data/",
+            "https://metadata.google.internal./computeMetadata/v1/",
+            "https://metadata.internal./x",
+            "https://localhost./exfil",
+        ] {
+            let res = validate_webhook_url(Some(bad.to_string()));
+            assert!(
+                res.is_err(),
+                "trailing-dot internal host '{bad}' must be rejected by the SSRF guard; got {res:?}"
+            );
+        }
+        // OTLP twin: link-local/metadata trailing-dot hosts blocked; loopback collector still allowed.
+        for bad in [
+            "https://169.254.169.254./v1/traces",
+            "https://metadata.google.internal./v1/traces",
+        ] {
+            assert!(
+                validate_otlp_endpoint(Some(bad)).is_err(),
+                "trailing-dot internal OTLP endpoint '{bad}' must be rejected"
+            );
+        }
+        // The loopback collector carve-out survives the dot strip (allowed for OTLP).
+        assert!(
+            validate_otlp_endpoint(Some("https://127.0.0.1./v1/traces")).is_ok(),
+            "trailing-dot loopback OTLP collector must remain allowed (carve-out)"
+        );
     }
 
     #[test]

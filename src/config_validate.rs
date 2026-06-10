@@ -53,6 +53,20 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 model_name
             ));
         }
+        // Reserved-name check (same rule as the pool and provider loops below): a model named `admin`
+        // is reached at `POST /admin/v1/messages`, which the auth middleware classifies as the
+        // operator admin surface (guarded by admin_token, not a client/virtual-key token). So the
+        // model is unreachable to normal clients AND, in governance mode, the admin branch inserts
+        // `GovCtx::default()` (key: None) which skips per-model `allowed_pools` enforcement — a
+        // governance bypass. Reject at boot rather than ship a silently-inaccessible / governance-
+        // bypassing model. (`reserved_admin_name` centralises the rule across models/pools/providers
+        // so none can drift from the auth-middleware `is_admin` boundary.)
+        if reserved_admin_name(model_name) {
+            errors.push(format!(
+                "model name '{}' is reserved: 'admin' is a built-in management prefix (the auth middleware routes /admin and /admin/* to the operator admin surface), so a model reachable via /{}/v1/messages is unreachable to clients and bypasses per-model governance; rename it",
+                model_name, model_name
+            ));
+        }
     }
 
     // All model names, used for the pool/model collision check below (the `named` route resolves
@@ -1277,6 +1291,27 @@ mod tests {
             errs.iter()
                 .any(|e| e.contains("provider name 'admin' is reserved")),
             "expected a reserved-admin-name error for the provider; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_model_named_admin() {
+        // Regression (MEDIUM, final audit): a MODEL named `admin` is reached at `/admin/v1/messages`,
+        // which the auth middleware intercepts as the operator admin surface — unreachable to clients
+        // and (in governance mode) a per-model `allowed_pools` bypass via the GovCtx::default() admin
+        // branch. The model loop previously skipped the reserved-name check the pool/provider loops
+        // run. Must fail loud at boot, symmetric with the pool and provider cases.
+        let (mut providers, mut models, pools) = valid_maps();
+        providers
+            .entry("myprovider".to_string())
+            .or_insert_with(|| make_provider("anthropic", "https://api.example.com", "API_KEY"));
+        models.insert("admin".to_string(), make_model("myprovider", 10));
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg).expect_err("a model named 'admin' must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("model name 'admin' is reserved")),
+            "expected a reserved-admin-name error for the model; got: {errs:?}"
         );
     }
 

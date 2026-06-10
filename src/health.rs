@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{ACCEPT, CONTENT_TYPE, USER_AGENT};
 
 use crate::breaker::{classify, normalize_raw_error, Disposition, RawUpstreamError};
 use crate::config::HealthMode;
@@ -141,11 +141,19 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
     };
     let auth = crate::forward::lane_auth_headers(lane, &lane.api_key, &signing_ctx);
 
+    // Send the SAME native-SDK fingerprint headers the organic forward path sends, so a probe is
+    // indistinguishable from real traffic to the backend: reqwest emits no default User-Agent (its
+    // absence is a proxy tell), and a missing Accept differs from what a native SDK sends. The probe
+    // is non-streaming, so `wants_stream = false`. Without these, a backend could fingerprint and
+    // special-case busbar's health probes — defeating the indistinguishability guarantee.
+    let egress_name = lane.protocol.name();
     let res = app
         .client
         .post(format!("{}{}", lane.base_url, wire_path))
         .headers(convert_headers(auth))
         .header(CONTENT_TYPE, "application/json")
+        .header(USER_AGENT, crate::forward::egress_user_agent(egress_name))
+        .header(ACCEPT, crate::forward::egress_accept(egress_name, false))
         .timeout(timeout)
         .body(body)
         .send()
