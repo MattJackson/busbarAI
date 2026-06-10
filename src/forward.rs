@@ -1709,28 +1709,52 @@ pub(crate) fn lane_auth_headers(
     }
 }
 
+// ─── EGRESS User-Agent strings — RELEASE-CHECKLIST AUDIT SURFACE ──────────────────────────────────
+//
+// These mirror the `User-Agent` a real first-party SDK emits for each provider's API. They embed
+// PINNED SDK VERSION NUMBERS that drift from upstream as those SDKs publish new releases (the OpenAI
+// Python SDK alone ships several times per quarter). A backend that logs/filters by UA version can
+// eventually observe a frozen, implausible version and separate busbar traffic from native traffic —
+// a silent decay of the backend-facing indistinguishability guarantee.
+//
+// CONTAINMENT (no config/CI feature added here, per the 1.0 hardening scope): every pinned string is
+// hoisted into a single named-constant block so the drift hazard lives on ONE auditable surface
+// instead of being scattered as inline literals across `egress_user_agent`, and `egress_ua_versions_*`
+// tests pin each protocol's UA to its constant so any silent edit/drift trips a test that forces a
+// CONSCIOUS update. **RELEASE OBLIGATION:** before each busbar release, re-verify every version below
+// against the latest published SDK release (PyPI / Crates.io / etc.) and bump as needed; the test
+// guard ensures this block can never change unnoticed.
+//
+// Anthropic Python SDK UA shape (api.anthropic.com).
+const EGRESS_UA_ANTHROPIC: &str = "anthropic-sdk-python/0.39.0";
+// OpenAI Python SDK shape; the Responses API is served by the same SDK/UA.
+const EGRESS_UA_OPENAI: &str = "OpenAI/Python 1.54.0";
+// Google GenAI SDK shape (generativelanguage.googleapis.com).
+const EGRESS_UA_GEMINI: &str = "google-genai-sdk/0.8.0 gl-python/3.11";
+// AWS Bedrock is reached via boto3/botocore.
+const EGRESS_UA_BEDROCK: &str = "Boto3/1.35.0 md/Botocore#1.35.0";
+// Cohere Python SDK shape (api.cohere.com).
+const EGRESS_UA_COHERE: &str = "cohere-python/5.11.0";
+// Unknown/foreign egress protocol: a generic-but-present UA still beats sending none.
+const EGRESS_UA_DEFAULT: &str = "okhttp/4.12.0";
+
 /// Plausible native-SDK `User-Agent` for the chosen EGRESS protocol. reqwest sends NO default
 /// User-Agent unless one is set, so without this every proxied upstream request reaches the backend
 /// with no UA at all — a trivial backend-side fingerprint distinguishing busbar-proxied traffic from
 /// a native vendor SDK (which always sends a recognizable UA). Returned strings mirror the shape a
 /// real first-party SDK emits for that provider's API. (Backend-facing only; does not affect client
-/// indistinguishability.)
+/// indistinguishability.) The version numbers are PINNED and drift over time — see the
+/// `EGRESS_UA_*` constant block above for the release-time audit obligation that keeps them current.
 fn egress_user_agent(egress_protocol: &str) -> &'static str {
     match egress_protocol {
-        // Anthropic Python SDK UA shape (api.anthropic.com).
-        "anthropic" => "anthropic-sdk-python/0.39.0",
-        // OpenAI Python SDK shape; the Responses API is served by the same SDK/UA.
-        "openai" | "responses" => "OpenAI/Python 1.54.0",
-        // Google GenAI SDK shape (generativelanguage.googleapis.com).
-        "gemini" => "google-genai-sdk/0.8.0 gl-python/3.11",
-        // AWS Bedrock is reached via boto3/botocore.
-        "bedrock" => "Boto3/1.35.0 md/Botocore#1.35.0",
-        // Cohere Python SDK shape (api.cohere.com).
-        "cohere" => "cohere-python/5.11.0",
-        // Unknown/foreign egress protocol: a generic-but-present UA still beats sending none (no UA
-        // at all is the most distinctive tell). Enumerated default, not a wildcard on a disposition
-        // match — this is a UA-string lookup, not a breaker/disposition decision.
-        _ => "okhttp/4.12.0",
+        "anthropic" => EGRESS_UA_ANTHROPIC,
+        "openai" | "responses" => EGRESS_UA_OPENAI,
+        "gemini" => EGRESS_UA_GEMINI,
+        "bedrock" => EGRESS_UA_BEDROCK,
+        "cohere" => EGRESS_UA_COHERE,
+        // Enumerated default, not a wildcard on a disposition match — this is a UA-string lookup,
+        // not a breaker/disposition decision.
+        _ => EGRESS_UA_DEFAULT,
     }
 }
 
@@ -1995,6 +2019,11 @@ pub(crate) async fn forward_with_pool(
             Ok(v) => v,
             // `body` already parsed once successfully into `v` above; this re-parse is infallible.
             Err(_) => {
+                // Probe class guard: this lane may have CAS-won the single-flight recovery probe in
+                // `pick_among`. We bail BEFORE dispatching any request, so no outcome will be
+                // recorded to clear `probe_in_flight` — release it here or the recovering lane stays
+                // wedged HalfOpen until the slow out-of-band prober resets it.
+                app.store.release_probe_in(pool_name, i);
                 drop(permit);
                 return ingress_error(
                     ingress_protocol,
@@ -2011,6 +2040,10 @@ pub(crate) async fn forward_with_pool(
         let payload = match translate_request_cross_protocol(&app, i, ingress_protocol, hop_v) {
             Ok(p) => p,
             Err(resp) => {
+                // Probe class guard: a translation failure also bails before dispatch, so release
+                // the (possibly won) single-flight probe before returning — same wedged-HalfOpen
+                // leak as the re-parse path above.
+                app.store.release_probe_in(pool_name, i);
                 drop(permit);
                 return *resp;
             }
@@ -2163,11 +2196,20 @@ pub(crate) async fn forward_with_pool(
                         // ClientFault branch does the same). The passthrough breaker invariant is
                         // unchanged either way: no breaker penalty for a caller-key auth failure.
                         if ingress_protocol != egress_name {
+                            // Probe class guard: a passthrough 401/403 is the CALLER's own key
+                            // failing — no breaker penalty — so no failure outcome is recorded to
+                            // clear `probe_in_flight`. If this lane won the recovery probe, release
+                            // it before relaying or the lane stays wedged HalfOpen.
+                            app.store.release_probe_in(pool_name, i);
                             // Reshape via the shared finalizer so the kind→native-envelope mapping
                             // (401→authentication_error, 403→permission_error, …) is identical on the
                             // main path, the degraded path, and the ClientFault branch below.
                             return shape_cross_protocol_error(ingress_protocol, status, &bytes);
                         }
+                        // Probe class guard (same-protocol passthrough 401/403): caller-key auth
+                        // failure carries no breaker penalty, so nothing clears `probe_in_flight`.
+                        // Release the won probe before the verbatim relay or the lane wedges HalfOpen.
+                        app.store.release_probe_in(pool_name, i);
                         use axum::body::Body;
                         let mut rb = Response::builder().status(status);
                         if let Some(ct) = ct {
@@ -2202,6 +2244,15 @@ pub(crate) async fn forward_with_pool(
                             // ADR-0002: Client fault (caller's bad input) → no breaker penalty.
                             // Track client_fault separately from upstream err.
                             app.store.record_client_fault(i);
+                            // Probe class guard: `record_client_fault` only bumps an observability
+                            // counter — it does NOT clear `probe_in_flight`. If this lane CAS-won the
+                            // single-flight recovery probe in `pick_among`, both ClientFault exits
+                            // below (cross-protocol reshape and same-protocol verbatim relay) return
+                            // without recording any breaker outcome, so neither would release the
+                            // probe — leaving the recovering lane wedged HalfOpen until the slow
+                            // out-of-band prober resets it. Release it once here, before either exit,
+                            // so the lane is immediately re-probeable on the next cooldown.
+                            app.store.release_probe_in(pool_name, i);
                             // Same-protocol passthrough relays the upstream 4xx body + CT verbatim
                             // (it is already in the client's native shape). Cross-protocol must
                             // RESHAPE the error into the ingress protocol's native envelope —
@@ -2418,6 +2469,13 @@ pub(crate) async fn forward_with_pool(
                                 "reason" => "context_length"
                             )
                             .increment(1);
+                            // Probe class guard: ContextLength is a client-fault variant (the request
+                            // is too large for THIS lane's window) — no breaker penalty, so nothing
+                            // records an outcome to clear `probe_in_flight`. If this lane won the
+                            // recovery probe, this `continue` would abandon it set, wedging the lane
+                            // HalfOpen until the slow out-of-band prober rescues it. Release it so the
+                            // lane is immediately probe-eligible again for normal-size requests.
+                            app.store.release_probe_in(pool_name, i);
                             drop(permit);
                             continue;
                         }
@@ -4590,8 +4648,8 @@ mod mid_stream_error_tests {
 #[cfg(test)]
 mod ingress_indistinguishability_tests {
     use super::{
-        cross_protocol_error_kind, egress_accept, forward_with_pool, ingress_error,
-        ingress_stream_content_type, shape_cross_protocol_error,
+        cross_protocol_error_kind, egress_accept, egress_user_agent, forward_with_pool,
+        ingress_error, ingress_stream_content_type, shape_cross_protocol_error,
     };
     use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
     use reqwest::StatusCode;
@@ -4618,6 +4676,46 @@ mod ingress_indistinguishability_tests {
         // Unknown egress still gets a present, plausible Accept (never absent).
         assert_eq!(egress_accept("mystery", true), "text/event-stream");
         assert_eq!(egress_accept("mystery", false), "application/json");
+    }
+
+    /// REGRESSION (R17 MEDIUM/technique): every egress request must carry a native-SDK `User-Agent`
+    /// (a UA-less request is the most distinctive backend-side proxy fingerprint), and each per-protocol
+    /// UA embeds a PINNED SDK version that silently drifts from the real SDK over time. This test pins
+    /// each protocol to its `EGRESS_UA_*` constant so the version strings cannot be edited or drift
+    /// unnoticed — any change trips this test and forces a conscious bump (the in-code half of the
+    /// drift-containment; the release-checklist obligation is documented on the constant block). It
+    /// also guards the never-absent invariant: every branch, including the foreign-egress default,
+    /// returns a non-empty, plausibly-versioned UA.
+    #[test]
+    fn test_egress_ua_versions_are_pinned_and_present() {
+        // Each known egress protocol maps to its named constant — drift can only happen by editing
+        // the constant (which trips this assertion), never silently.
+        assert_eq!(egress_user_agent("anthropic"), super::EGRESS_UA_ANTHROPIC);
+        assert_eq!(egress_user_agent("openai"), super::EGRESS_UA_OPENAI);
+        assert_eq!(egress_user_agent("responses"), super::EGRESS_UA_OPENAI);
+        assert_eq!(egress_user_agent("gemini"), super::EGRESS_UA_GEMINI);
+        assert_eq!(egress_user_agent("bedrock"), super::EGRESS_UA_BEDROCK);
+        assert_eq!(egress_user_agent("cohere"), super::EGRESS_UA_COHERE);
+        // Foreign/unknown egress still gets a present, plausible UA (never empty / never absent).
+        assert_eq!(egress_user_agent("mystery"), super::EGRESS_UA_DEFAULT);
+        for p in [
+            "anthropic",
+            "openai",
+            "responses",
+            "gemini",
+            "bedrock",
+            "cohere",
+            "mystery",
+        ] {
+            let ua = egress_user_agent(p);
+            assert!(!ua.is_empty(), "{p} egress UA must never be empty");
+            // Each native-SDK UA carries a version token (a `/` or `#` separated number) — the exact
+            // shape a backend keys off; a versionless UA would itself be a tell.
+            assert!(
+                ua.chars().any(|c| c.is_ascii_digit()),
+                "{p} egress UA must carry a version number: {ua}"
+            );
+        }
     }
 
     /// CANONICAL status→kind mapping shared by the main and degraded cross-protocol error shaping.

@@ -2780,6 +2780,92 @@ mod tests {
         );
     }
 
+    /// MEDIUM/correctness (forward.rs ClientFault arm probe leak): a HalfOpen lane that wins the
+    /// single-flight recovery probe and then serves a request the upstream answers with a 4xx
+    /// (`Disposition::ClientFault`) must NOT be left wedged. The forward path's ClientFault arm calls
+    /// `record_client_fault` — which by design bumps ONLY an observability counter and does NOT clear
+    /// `probe_in_flight` (no breaker penalty for a caller's bad input) — and then returns. Without an
+    /// explicit `release_probe_in` the cell stays HalfOpen + probe_in_flight, benching the recovering
+    /// lane until the slow out-of-band prober resets it. This test pins both halves: (1)
+    /// `record_client_fault` alone leaves the probe held (proving the leak is real), and (2) the
+    /// `release_probe_in` the forward arm now calls makes the lane re-probeable on the next cooldown.
+    #[test]
+    fn test_client_fault_on_halfopen_lane_releases_probe() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(1000);
+        let cfg = BreakerCfg::default();
+
+        // Trip the lane Open, then advance past the cooldown so it is probe-eligible.
+        for _ in 0..50 {
+            store.record_transient_in("p", 0, "5xx", &cfg, None);
+        }
+        let cooled = 1000 + store.cooldown_remaining_in("p", 0, 1000) + 1;
+        set_now_for_test(cooled);
+
+        // The dispatched request CAS-wins the recovery probe (Open → HalfOpen + probe true).
+        assert!(
+            store.acquire_for_dispatch_in("p", 0, cooled),
+            "the client-fault request wins the recovery probe"
+        );
+
+        // The upstream answered 4xx → ClientFault. The forward arm records the client fault, which is
+        // (correctly) breaker-neutral: it neither trips the lane nor releases the probe.
+        store.record_client_fault(0);
+        assert!(
+            !store.acquire_for_dispatch_in("p", 0, cooled),
+            "record_client_fault must NOT release the probe (still wedged HalfOpen at this point)"
+        );
+
+        // The forward ClientFault arm now releases the probe before returning, so the recovering lane
+        // is immediately re-probeable rather than benched until the out-of-band prober rescues it.
+        store.release_probe_in("p", 0);
+        assert!(
+            store.acquire_for_dispatch_in("p", 0, cooled),
+            "after the ClientFault arm releases the probe the lane must be re-probeable (not wedged)"
+        );
+    }
+
+    /// MEDIUM/correctness (forward.rs ContextLength arm probe leak): a HalfOpen lane that wins the
+    /// recovery probe and then serves a request the upstream rejects as too large for its context
+    /// window (`Disposition::ContextLength`) must NOT be left wedged. ContextLength is a client-fault
+    /// variant — no breaker penalty — so the arm `continue`s to failover without recording any outcome
+    /// that clears `probe_in_flight`. Without an explicit `release_probe_in` the cell stays HalfOpen +
+    /// probe_in_flight and the lane is benched for normal-size requests until the slow prober resets
+    /// it. Proves the forward arm's `release_probe_in` leaves the lane re-probeable.
+    #[test]
+    fn test_context_length_on_halfopen_lane_releases_probe() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(1000);
+        let cfg = BreakerCfg::default();
+
+        // Trip the lane Open, then advance past the cooldown so it is probe-eligible.
+        for _ in 0..50 {
+            store.record_transient_in("p", 0, "5xx", &cfg, None);
+        }
+        let cooled = 1000 + store.cooldown_remaining_in("p", 0, 1000) + 1;
+        set_now_for_test(cooled);
+
+        // The oversized request CAS-wins the recovery probe (Open → HalfOpen + probe true).
+        assert!(
+            store.acquire_for_dispatch_in("p", 0, cooled),
+            "the context-length request wins the recovery probe"
+        );
+        // The ContextLength arm records NO breaker outcome (it only excludes context-bound candidates
+        // and continues), so nothing has cleared the probe — the lane is wedged at this point.
+        assert!(
+            !store.acquire_for_dispatch_in("p", 0, cooled),
+            "no breaker outcome was recorded; the probe is still held (wedged HalfOpen)"
+        );
+
+        // The forward ContextLength arm now releases the probe before `continue`, so the lane becomes
+        // probe-eligible again immediately for normal-size requests.
+        store.release_probe_in("p", 0);
+        assert!(
+            store.acquire_for_dispatch_in("p", 0, cooled),
+            "after the ContextLength arm releases the probe the lane must be re-probeable (not wedged)"
+        );
+    }
+
     /// MEDIUM/correctness (store.rs lock sites): `lock_recover` must recover the inner data from a
     /// POISONED mutex instead of panicking. A `.lock().unwrap()` on the request path would panic on a
     /// poisoned mutex, cascading into a total DoS (every later request touching it also panics). The
