@@ -5672,6 +5672,89 @@ data: {"type":"message_stop"}"#
         server.shutdown().await;
     }
 
+    /// Regression (MEDIUM/indistinguishability, final audit): the `forward_once` degraded
+    /// (LeastBad/FallbackPool) SAME-protocol Bedrock error relay must forward BOTH `x-amzn-requestid`
+    /// and `x-amzn-errortype` verbatim, mirroring the main path. Before the fix it captured neither on
+    /// this path — a native AWS SDK's `request_id()` would return None and typed-exception dispatch
+    /// would fall back from header-first to body `__type`, both detectable tells.
+    #[tokio::test]
+    async fn test_forward_once_bedrock_error_relays_amzn_headers() {
+        use crate::store::now as store_now;
+        use http_body_util::BodyExt as _;
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // A native Bedrock error carries x-amzn-requestid + x-amzn-errortype response headers.
+        state.push(MockResponse::ServerErrorWithHeaders {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: json!({"message": "service unavailable", "__type": "ServiceUnavailableException"}),
+            headers: vec![
+                ("x-amzn-requestid", "amzn-req-id-XYZ789"),
+                ("x-amzn-errortype", "ServiceUnavailableException"),
+            ],
+        });
+        let server = MockServer::new(state.clone()).await;
+        let t0 = store_now();
+        // Bedrock lane, same-protocol bedrock ingress. The lane points at /v1/messages (a route the
+        // mock answers) — the same-protocol relay under test keys off the upstream response, not the
+        // URL. Cooled down so LeastBad serves via the degraded forward_once path.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "claude-3",
+                    crate::proto::Protocol::bedrock(),
+                    &server.base_url(),
+                )
+                .provider("aws")
+                .path("/v1/messages")
+                .cooldown_until(t0 + 600)
+                .streak(3)
+                .err(5),
+            )
+            .pool("leastbad", &[(0, 1)])
+            .on_exhausted("leastbad", crate::config::OnExhausted::LeastBad)
+            .build();
+
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            serde_json::to_vec(
+                &json!({"messages": [{"role": "user", "content": [{"text": "hi"}]}]}),
+            )
+            .unwrap()
+            .into(),
+            None,
+            "leastbad",
+            None,
+            "bedrock",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 503, "upstream 503 relayed verbatim");
+        // Both x-amzn headers must be present on the relayed response, verbatim.
+        let headers = resp.headers();
+        assert_eq!(
+            headers
+                .get("x-amzn-requestid")
+                .and_then(|v| v.to_str().ok()),
+            Some("amzn-req-id-XYZ789"),
+            "x-amzn-requestid must be relayed verbatim on the degraded same-protocol bedrock path"
+        );
+        assert_eq!(
+            headers
+                .get("x-amzn-errortype")
+                .and_then(|v| v.to_str().ok()),
+            Some("ServiceUnavailableException"),
+            "x-amzn-errortype must be relayed verbatim (was dropped entirely before the fix)"
+        );
+        // Body relayed verbatim too.
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            body.windows(b"__type".len()).any(|w| w == b"__type"),
+            "native bedrock error body relayed verbatim"
+        );
+        server.shutdown().await;
+    }
+
     /// HIGH/conformance (R9, forward.rs error sites): no forward-layer error body returned to a client
     /// may begin with the wire-visible internal `router:` prefix — a deterministic proxy tell no native
     /// endpoint emits. The route-layer regression test never reaches the forward layer; this drives the

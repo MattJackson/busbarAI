@@ -297,6 +297,42 @@ mod tests {
         (app, server)
     }
 
+    /// Regression (MEDIUM/conformance, final audit): an active health probe must send the SAME
+    /// native-SDK fingerprint headers organic traffic sends — `User-Agent` and `Accept` — or a
+    /// backend could fingerprint and special-case busbar's probes (defeating indistinguishability).
+    /// reqwest emits no default User-Agent, so its absence on the probe was a tell.
+    #[tokio::test]
+    async fn test_probe_sends_native_user_agent_and_accept_headers() {
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: serde_json::json!({"ok": true}),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("claude", Protocol::anthropic(), &server.base_url())
+                    .api_key("sk-test")
+                    .health(health_active()),
+            )
+            .pool("p", &[(0, 1)])
+            .build();
+        probe_lane(&app, 0, Duration::from_secs(5)).await;
+        // The probe carries the protocol's native-SDK User-Agent and Accept (non-streaming), exactly
+        // as the organic forward path does (egress_user_agent / egress_accept).
+        assert_eq!(
+            state.get_last_request_header("user-agent").as_deref(),
+            Some(crate::forward::egress_user_agent("anthropic")),
+            "probe must send the native User-Agent organic traffic sends"
+        );
+        assert_eq!(
+            state.get_last_request_header("accept").as_deref(),
+            Some(crate::forward::egress_accept("anthropic", false)),
+            "probe must send the native Accept organic traffic sends"
+        );
+        server.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_probe_auth_failure_is_hard_down_not_transient() {
         // Regression: a 401 probe must classify as HardDown (auth) and PARK the lane dead in the

@@ -45,6 +45,13 @@ pub(crate) enum MockResponse {
         status: StatusCode,
         body: Value,
     },
+    /// A non-2xx error that ALSO carries arbitrary response headers (e.g. a native Bedrock error's
+    /// `x-amzn-requestid` + `x-amzn-errortype`), so a test can assert the proxy relays them verbatim.
+    ServerErrorWithHeaders {
+        status: StatusCode,
+        body: Value,
+        headers: Vec<(&'static str, &'static str)>,
+    },
     Sse {
         events: Vec<String>,
         abort_at_index: Option<usize>,
@@ -102,6 +109,7 @@ pub(crate) struct MockServerState {
     responses: Mutex<Vec<MockResponse>>,
     last_auth_header: std::sync::Mutex<Option<String>>,
     last_request_body: std::sync::Mutex<Option<Vec<u8>>>,
+    last_request_headers: std::sync::Mutex<Option<axum::http::HeaderMap>>,
 }
 
 impl MockServerState {
@@ -138,6 +146,23 @@ impl MockServerState {
     /// Get the last received request body bytes (for assertions in tests).
     pub(crate) fn get_last_request_body(&self) -> Option<Vec<u8>> {
         self.last_request_body.lock().unwrap().clone()
+    }
+
+    /// Record the full set of request headers the upstream received (for indistinguishability
+    /// assertions — e.g. that a health probe sends the same User-Agent/Accept as organic traffic).
+    pub(crate) fn record_request_headers(&self, headers: &axum::http::HeaderMap) {
+        *self.last_request_headers.lock().unwrap() = Some(headers.clone());
+    }
+
+    /// Get a single request header value the upstream received, by name (case-insensitive).
+    pub(crate) fn get_last_request_header(&self, name: &str) -> Option<String> {
+        self.last_request_headers
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|h| h.get(name))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
     }
 }
 
@@ -187,6 +212,9 @@ async fn mock_handler(
     request: Request<Body>,
 ) -> Response<Body> {
     let (parts, body) = request.into_parts();
+
+    // Record the full header set the upstream received (indistinguishability assertions).
+    state.record_request_headers(&parts.headers);
 
     // Record the Authorization header for passthrough token forwarding tests
     if let Some(auth_header) = parts
@@ -254,6 +282,19 @@ async fn mock_handler(
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
             .unwrap(),
+        MockResponse::ServerErrorWithHeaders {
+            status,
+            body,
+            headers,
+        } => {
+            let mut rb = Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/json");
+            for (k, v) in headers {
+                rb = rb.header(k, v);
+            }
+            rb.body(Body::from(body.to_string())).unwrap()
+        }
         MockResponse::Sse {
             events,
             abort_at_index,
