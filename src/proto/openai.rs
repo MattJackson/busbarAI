@@ -265,12 +265,18 @@ impl ProtocolReader for OpenAiReader {
         // a request carrying only the modern field still populates the modeled IR `max_tokens`. Without
         // this, the value stays only in `extra` and is stripped at the cross-protocol seam (extra is
         // cleared there), silently dropping the caller's explicit limit on e.g. OpenAI -> Anthropic.
+        // Narrow with `u32::try_from` (NOT a bare `as u32`): a value above `u32::MAX` (or negative)
+        // would otherwise wrap/truncate silently into a tiny or nonsensical token cap. `as_u64`
+        // already rejects negatives and non-integers, `try_from` rejects > u32::MAX, and the final
+        // `> 0` filter rejects a zero cap (an invalid limit, not a real bound). This matches the
+        // hardened sibling readers (gemini/anthropic/cohere/bedrock) while preserving the existing
+        // non-positive-rejection contract.
         let max_tokens = obj
             .get("max_tokens")
             .or_else(|| obj.get("max_completion_tokens"))
-            .and_then(|v| v.as_i64())
-            .filter(|&v| v > 0)
-            .map(|v| v as u32);
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&v| v > 0);
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
         let top_p = obj.get("top_p").and_then(|v| v.as_f64());
         // OpenAI's `stop` is a string OR an array of strings; normalize to the IR's Vec<String>.
@@ -550,9 +556,17 @@ impl ProtocolReader for OpenAiReader {
         // 2. Reasoning (chain-of-thought) → a Thinking block at index 0, ahead of the answer. When
         //    present it shifts the text/tool indices up by one (`offset`) so the thinking block
         //    precedes them. Reasoning streams before content on these models.
+        //
+        //    GATE: only honor a reasoning delta as a Thinking-at-index-0 block while the answer phase
+        //    has NOT started (no text block and no tool blocks opened yet). A late reasoning delta
+        //    arriving after text/tools have opened would otherwise flip `reasoning_seen`, bumping
+        //    `offset` from 0 to 1 and retroactively shifting the IR index of ALREADY-OPENED blocks —
+        //    corrupting BlockStart/BlockStop pairing downstream. Once the answer phase is underway,
+        //    index 0 is no longer available for a thinking block, so the stray reasoning is dropped.
         if let Some(reasoning) = delta
             .and_then(|d| d.get("reasoning_content").or_else(|| d.get("reasoning")))
             .and_then(|r| r.as_str())
+            .filter(|_| !state.text_block_open && state.open_tools.is_empty())
         {
             if !reasoning.is_empty() {
                 state.reasoning_seen = true;
@@ -4133,5 +4147,146 @@ mod tests {
             &serde_json::Value::String(raw),
             "string tool arguments must be emitted verbatim, not double-encoded, got {args}"
         );
+    }
+
+    // Regression (MED #10): a reasoning delta arriving AFTER the text block has opened must NOT be
+    // honored as a Thinking-at-index-0 block. Doing so would flip `reasoning_seen`, bumping `offset`
+    // from 0 to 1, and retroactively shift the IR index of the already-opened text block — corrupting
+    // BlockStart/BlockStop pairing. The late reasoning delta must be dropped: no BlockStart{index:0},
+    // no thinking BlockDelta, and `reasoning_seen`/`offset` must stay put.
+    #[test]
+    fn late_reasoning_delta_after_text_does_not_shift_indices() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        // First chunk opens the text block at index 0 (no reasoning seen yet).
+        let c1 = serde_json::json!({
+            "id": "chatcmpl-x", "object": "chat.completion.chunk", "created": 1u64, "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"content": "hello"}, "finish_reason": null}]
+        });
+        let evs1 = OpenAiReader.read_response_events("", &c1, &mut state);
+        assert!(
+            evs1.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: crate::ir::IrBlockMeta::Text
+                }
+            )),
+            "text block must open at index 0, got {evs1:?}"
+        );
+        assert!(state.text_block_open);
+        assert!(!state.reasoning_seen);
+
+        // A late reasoning delta now arrives. It must be IGNORED (answer phase already started).
+        let c2 = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"reasoning_content": "late thought"}, "finish_reason": null}]
+        });
+        let evs2 = OpenAiReader.read_response_events("", &c2, &mut state);
+        assert!(
+            !evs2.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    block: crate::ir::IrBlockMeta::Thinking,
+                    ..
+                }
+            )),
+            "late reasoning must NOT open a thinking block, got {evs2:?}"
+        );
+        assert!(
+            !evs2.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockDelta {
+                    delta: crate::ir::IrDelta::ThinkingDelta(_),
+                    ..
+                }
+            )),
+            "late reasoning must NOT emit a ThinkingDelta, got {evs2:?}"
+        );
+        assert!(
+            !state.reasoning_seen,
+            "late reasoning must NOT flip reasoning_seen (which would shift already-opened indices)"
+        );
+        assert!(!state.thinking_block_open);
+
+        // A subsequent text delta must still land on index 0 — proving the index was not shifted.
+        let c3 = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"content": " world"}, "finish_reason": null}]
+        });
+        let evs3 = OpenAiReader.read_response_events("", &c3, &mut state);
+        let text_idx = evs3.iter().find_map(|e| match e {
+            IrStreamEvent::BlockDelta {
+                index,
+                delta: crate::ir::IrDelta::TextDelta(_),
+            } => Some(*index),
+            _ => None,
+        });
+        assert_eq!(
+            text_idx,
+            Some(0),
+            "text must stay at index 0 after a stray late reasoning delta, got {evs3:?}"
+        );
+    }
+
+    // Companion: a reasoning delta that legitimately precedes any answer content still opens the
+    // Thinking block at index 0 (the gate must not break the normal reasoning-first path).
+    #[test]
+    fn early_reasoning_delta_still_opens_thinking_at_index_0() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let c = serde_json::json!({
+            "id": "chatcmpl-x", "object": "chat.completion.chunk", "created": 1u64, "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"reasoning_content": "thinking..."}, "finish_reason": null}]
+        });
+        let evs = OpenAiReader.read_response_events("", &c, &mut state);
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: crate::ir::IrBlockMeta::Thinking
+                }
+            )),
+            "early reasoning must open a thinking block at index 0, got {evs:?}"
+        );
+        assert!(state.reasoning_seen);
+    }
+
+    // Regression (MED #15): `max_tokens` / `max_completion_tokens` must be narrowed with a
+    // bounds-checked `u32::try_from`, NOT a raw `as u32`. A value above `u32::MAX` previously
+    // truncated (wrapped) into a tiny token cap; it must now be rejected (None), never wrapped.
+    #[test]
+    fn max_tokens_above_u32_max_is_rejected_not_truncated() {
+        let reader = OpenAiReader;
+        // u32::MAX + 1 = 4_294_967_296. A raw `as u32` would wrap this to 0.
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4_294_967_296u64
+        });
+        let ir = reader.read_request(&body).expect("request parses");
+        assert_eq!(
+            ir.max_tokens, None,
+            "max_tokens above u32::MAX must be rejected (None), not truncated to {:?}",
+            ir.max_tokens
+        );
+
+        // The same rule applies to the modern `max_completion_tokens` field.
+        let body2 = serde_json::json!({
+            "model": "o3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 4_294_967_296u64
+        });
+        let ir2 = reader.read_request(&body2).expect("request parses");
+        assert_eq!(
+            ir2.max_tokens, None,
+            "max_completion_tokens above u32::MAX must be rejected, not truncated"
+        );
+
+        // A sane in-range value still survives unchanged.
+        let body3 = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1024u64
+        });
+        let ir3 = reader.read_request(&body3).expect("request parses");
+        assert_eq!(ir3.max_tokens, Some(1024));
     }
 }

@@ -161,6 +161,38 @@ fn parse_image_url(url: &str) -> (String, String) {
     ("image_url".to_string(), url.to_string())
 }
 
+/// Accumulate the content of a Responses `system`/`developer` input turn into `system_blocks`
+/// (which feeds `IrRequest.system` -> the provider's top-level instructions/system prompt).
+/// These turns are NOT conversation messages; routing their text here prevents the system prompt
+/// from being silently dropped on a cross-protocol hop. Content may be a bare string or an array
+/// of `{"type":"input_text","text":...}` blocks (or `output_text`); both are handled. Empty text
+/// is skipped to avoid emitting blank system blocks.
+fn push_system_content(
+    system_blocks: &mut Vec<crate::ir::IrBlock>,
+    content: Option<&serde_json::Value>,
+) {
+    let mut push_text = |text: &str| {
+        if !text.is_empty() {
+            system_blocks.push(crate::ir::IrBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            });
+        }
+    };
+    match content {
+        Some(serde_json::Value::String(s)) => push_text(s),
+        Some(serde_json::Value::Array(arr)) => {
+            for block in arr {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    push_text(text);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Reconstruct a Responses `image_url` string from the IR `Image` (media_type, data) pair — the
 /// inverse of [`parse_image_url`]. A URL-sentinel image is emitted verbatim; a base64 image is
 /// re-wrapped into a `data:<mime>;base64,<payload>` URI.
@@ -454,6 +486,16 @@ impl ProtocolReader for ResponsesReader {
                             // map the content blocks via `responses_block`, mirroring the untyped
                             // branch.
                             let role_str = item.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                            // `system`/`developer` turns carry the system prompt. They have no
+                            // IrRole and must NOT become conversation messages — accumulate their
+                            // text into `system_blocks` (which feeds `IrRequest.system` ->
+                            // top-level instructions), or the system prompt is silently lost on a
+                            // cross-protocol hop. Content can be an array of `input_text` blocks or
+                            // a bare string; handle both.
+                            if role_str == "system" || role_str == "developer" {
+                                push_system_content(&mut system_blocks, item.get("content"));
+                                continue;
+                            }
                             let role = match role_str {
                                 "user" => Some(crate::ir::IrRole::User),
                                 "assistant" => Some(crate::ir::IrRole::Assistant),
@@ -485,6 +527,14 @@ impl ProtocolReader for ResponsesReader {
                     if item.get("type").is_none() && item.get("role").is_some() {
                         let role_str = item.get("role").and_then(|r| r.as_str()).unwrap_or("");
                         let content_val = item.get("content");
+
+                        // As in the typed `message` arm, untyped `system`/`developer` turns carry
+                        // the system prompt and must be accumulated into `system_blocks` rather than
+                        // dropped (the prior `_ => continue` lost them on cross-protocol hops).
+                        if role_str == "system" || role_str == "developer" {
+                            push_system_content(&mut system_blocks, content_val);
+                            continue;
+                        }
 
                         let role = match role_str {
                             "user" => crate::ir::IrRole::User,
@@ -539,11 +589,15 @@ impl ProtocolReader for ResponsesReader {
             }
         }
 
+        // Read `max_output_tokens` as u64 and fall back to None on out-of-range values rather than
+        // silently truncating a value larger than u32::MAX via `as u32` (matches the anthropic and
+        // bedrock readers). `try_from` also rejects negatives, so an explicit `> 0` filter is moot;
+        // a value of 0 is preserved as Some(0) just as the prior code dropped it — keep dropping it.
         let max_tokens = obj
             .get("max_output_tokens")
-            .and_then(|v| v.as_i64())
+            .and_then(|v| v.as_u64())
             .filter(|&v| v > 0)
-            .map(|v| v as u32);
+            .and_then(|v| u32::try_from(v).ok());
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
         // The Responses API supports `top_p` but has NO `top_k` and no top-level stop-sequence param,
         // so only top_p is promoted here; `top_k`/`stop` stay None/empty (any unmodeled knob remains
@@ -931,6 +985,36 @@ impl ProtocolReader for ResponsesReader {
         })?;
 
         let status = obj.get("status").and_then(|s| s.as_str()).unwrap_or("");
+
+        // A non-streaming Responses body with `status:"failed"` is an upstream provider failure
+        // (rate_limit, content_filter, server_error, etc.), NOT a parse failure. The writer emits
+        // `{"status":"failed","output":[],"error":{...}}` — note `output` is a PRESENT EMPTY array,
+        // not null/absent — so this MUST be handled before the `output`-array branch below, or an
+        // empty `output:[]` would iterate zero items, fail the usage check, and mask the real error
+        // as an internal `ir_parse` (ClientFault, no-retry) — the wrong breaker transition. Handle
+        // failed bodies uniformly here whether `output` is `[]`, null, or absent. Surface the
+        // upstream signal as a ServerError so the real error reaches the client and the breaker sees
+        // a retryable server failure. Mirror the streaming `response.failed` arm: prefer the
+        // `error.code` enum, fall back to `error.type`, then a generic `response_failed`.
+        if status == "failed" {
+            let provider_signal = obj
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str())
+                .or_else(|| {
+                    obj.get("error")
+                        .and_then(|e| e.get("type"))
+                        .and_then(|t| t.as_str())
+                })
+                .map(String::from)
+                .or_else(|| Some("response_failed".to_string()));
+            return Err(IrError {
+                class: StatusClass::ServerError,
+                provider_signal,
+                retry_after: None,
+            });
+        }
+
         let mut stop_reason: Option<String> = match status {
             "completed" => Some("end_turn".to_string()),
             "incomplete" => {
@@ -1011,31 +1095,9 @@ impl ProtocolReader for ResponsesReader {
                     _ => {}
                 }
             }
-        } else if status == "failed" {
-            // A non-streaming Responses body with `status:"failed"` legitimately carries
-            // `output: null` (or omits it) and a populated top-level `error` object — this is an
-            // upstream provider failure (rate_limit, content_filter, server_error, etc.), NOT a
-            // parse failure. Surface it as a ServerError IrError carrying the upstream signal so the
-            // real error reaches the client (and the breaker sees a failure) instead of masking it
-            // as an internal `ir_parse`. Mirror the streaming `response.failed` arm: prefer the
-            // `error.code` enum, fall back to `error.type`, then a generic `response_failed`.
-            let provider_signal = obj
-                .get("error")
-                .and_then(|e| e.get("code"))
-                .and_then(|c| c.as_str())
-                .or_else(|| {
-                    obj.get("error")
-                        .and_then(|e| e.get("type"))
-                        .and_then(|t| t.as_str())
-                })
-                .map(String::from)
-                .or_else(|| Some("response_failed".to_string()));
-            return Err(IrError {
-                class: StatusClass::ServerError,
-                provider_signal,
-                retry_after: None,
-            });
         } else {
+            // `status:"failed"` is handled by the early return above, so a missing/non-array
+            // `output` here is a genuine parse failure (malformed body).
             return Err(IrError {
                 class: StatusClass::ClientError,
                 provider_signal: Some("ir_parse".to_string()),
@@ -6308,6 +6370,119 @@ mod tests {
             .expect_err("missing output must surface as a parse error");
         assert_eq!(err_parse.class, StatusClass::ClientError);
         assert_eq!(err_parse.provider_signal.as_deref(), Some("ir_parse"));
+    }
+
+    /// Regression (HIGH, re-audit R20): the writer emits a failed body as
+    /// `{"status":"failed","output":[],"error":{...}}` — `output` is a PRESENT EMPTY array, not
+    /// null/absent. Before the fix the empty array took the `if let Some(output_arr)` branch,
+    /// iterated zero items, then failed the usage check and returned a ClientError `ir_parse`,
+    /// MASKING the real upstream error and feeding the breaker the wrong (ClientFault, no-retry)
+    /// transition. The failed-status early return must fire regardless of `output` shape.
+    #[test]
+    fn test_read_response_failed_with_empty_output_array_not_masked() {
+        let reader = ResponsesReader;
+        let body = serde_json::json!({
+            "id": "resp_fail",
+            "object": "response",
+            "status": "failed",
+            "output": [],
+            "error": { "code": "server_error", "message": "boom" },
+            // No `usage` on purpose: pre-fix this body fell through to the usage check and that
+            // was part of what masked the error. The failed early return must not require usage.
+        });
+        let err = reader
+            .read_response(&body)
+            .expect_err("failed status with output:[] must surface as an error, not be masked");
+        assert_eq!(
+            err.class,
+            StatusClass::ServerError,
+            "output:[] on a failed body must still be a ServerError, not a ClientError ir_parse"
+        );
+        assert_eq!(
+            err.provider_signal.as_deref(),
+            Some("server_error"),
+            "the upstream error.code must be carried through even with output:[]"
+        );
+    }
+
+    /// Regression (MEDIUM #5, re-audit R20): `system`/`developer` input turns carry the system
+    /// prompt. The reader previously dropped them (handled by neither the typed `message` arm nor
+    /// the untyped role arm), losing the system prompt on a cross-protocol hop. They must now be
+    /// accumulated into `IrRequest.system`. Covers typed + untyped items, and array + bare-string
+    /// content.
+    #[test]
+    fn test_read_request_system_and_developer_turns_feed_system() {
+        let reader = ResponsesReader;
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [
+                // typed message, system role, array content
+                { "type": "message", "role": "system",
+                  "content": [{ "type": "input_text", "text": "you are terse" }] },
+                // typed message, developer role, bare-string content
+                { "type": "message", "role": "developer", "content": "be precise" },
+                // untyped item, system role, array content
+                { "role": "system",
+                  "content": [{ "type": "input_text", "text": "no emojis" }] },
+                // a normal user turn must still land in messages
+                { "type": "input_text", "text": "hello" }
+            ]
+        });
+        let req = reader.read_request(&body).expect("request must parse");
+        let system_text: Vec<&str> = req
+            .system
+            .iter()
+            .filter_map(|b| match b {
+                crate::ir::IrBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            system_text,
+            vec!["you are terse", "be precise", "no emojis"],
+            "system/developer turns (typed+untyped, array+string) must feed IrRequest.system in order"
+        );
+        // The user turn must NOT have been swallowed into system.
+        assert_eq!(
+            req.messages.len(),
+            1,
+            "only the user turn becomes a message"
+        );
+        assert!(
+            matches!(req.messages[0].role, crate::ir::IrRole::User),
+            "the surviving message is the user turn"
+        );
+    }
+
+    /// Regression (MEDIUM #16, re-audit R20): `max_output_tokens` was read via
+    /// `.as_i64()...map(|v| v as u32)`, silently truncating a value larger than `u32::MAX`. It must
+    /// now drop an out-of-range value to None (matching the anthropic/bedrock readers) instead of
+    /// wrapping it to a bogus small cap.
+    #[test]
+    fn test_read_request_max_output_tokens_out_of_range_drops_to_none() {
+        let reader = ResponsesReader;
+
+        // u32::MAX + 1 — pre-fix `as u32` would truncate this to 0, a wildly wrong cap.
+        let big = u64::from(u32::MAX) + 1;
+        let body_big = serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "max_output_tokens": big
+        });
+        let req_big = reader.read_request(&body_big).expect("request must parse");
+        assert_eq!(
+            req_big.max_tokens, None,
+            "an out-of-range max_output_tokens must drop to None, not truncate"
+        );
+
+        // An in-range value still round-trips.
+        let body_ok = serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "max_output_tokens": 4096
+        });
+        let req_ok = reader.read_request(&body_ok).expect("request must parse");
+        assert_eq!(req_ok.max_tokens, Some(4096));
     }
 
     /// Regression (MEDIUM/conformance, Round 15): the terminal `response.completed`/

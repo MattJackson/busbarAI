@@ -4453,27 +4453,58 @@ mod tests {
     }
 
     /// Test 2: Sticky member tripped → yields to healthy member.
+    ///
+    /// REGRESSION GUARD (R20 MED #19): this test must actually exercise the
+    /// "sticky member's breaker is Open" branch of `pick_among`'s affinity fast
+    /// path — i.e. the `usable_in(pool, sticky, t)` guard returning false and the
+    /// pick falling through to SWRR over the healthy remainder. That requires TWO
+    /// things to line up deterministically:
+    ///
+    ///   1. the session key must hash onto the TRIPPED member, and
+    ///   2. the tripped member's breaker must actually be Open at selection time.
+    ///
+    /// `pick_among` computes `pos = stable_hash(key) % cands.len()` and treats
+    /// `cands[pos].idx` as the sticky member. With `cands = [lane0, lane1]`,
+    /// `cands.len() == 2`, so the sticky member is lane 0 iff `stable_hash(key)`
+    /// is even. `stable_hash("session-abc") % 2 == 0` (verified against the FNV-1a
+    /// constants in forward.rs), so the sticky member here is the TRIPPED lane 0 —
+    /// NOT the healthy lane 1. (The previous revision used `"session-to-lane-0"`,
+    /// whose hash is ODD → sticky member was lane 1, the *healthy* lane, so the
+    /// affinity fast path simply succeeded and the tripped-member yield branch was
+    /// never reached: the test was green for the wrong reason.)
+    ///
+    /// Lane 0 is parked Open via a future `cooldown_until` (the same idiom the
+    /// LeastBad tests use) so `usable_in` returns false for it. If the affinity
+    /// logic regressed to PIN the sticky member regardless of breaker health
+    /// (dropping the `usable_in` guard), the request would route to tripped lane 0
+    /// and the `contains("lane1")` / `!contains("lane0")` assertions below would
+    /// fail.
     #[tokio::test]
     async fn test_sticky_yields_when_tripped() {
-        // Separate mock servers for each lane
+        use crate::store::now as store_now;
+
+        // Separate mock servers for each lane, each returning a distinguishable body
+        // so we can assert WHICH member served.
         let state0 = Arc::new(MockServerState::new());
         let server0 = MockServer::new(state0.clone()).await;
+        // Lane 0 is the sticky-but-tripped member. It should NOT be selected; if it
+        // ever is (affinity pinned past the Open breaker), this body unmasks the bug.
+        state0.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({ "served_by": "lane0", "content": [] }),
+        });
 
         let state1 = Arc::new(MockServerState::new());
         let server1 = MockServer::new(state1.clone()).await;
+        state1.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({ "served_by": "lane1", "content": [] }),
+        });
 
-        // Lane 0 returns error, lane 1 always succeeds with its identifier
-        for _ in 0..2 {
-            state0.push(MockResponse::ServerError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                body: json!({ "error": "lane 0 failed" }),
-            });
-            state1.push(MockResponse::Ok {
-                status: StatusCode::OK,
-                body: json!({ "served_by": "lane1", "content": [] }),
-            });
-        }
-
+        // Lane 0 Open (future cooldown) → `usable_in(pool, 0, t)` is false, so the
+        // sticky affinity fast path must skip it and fall through to SWRR. Lane 1 is
+        // a fresh, healthy lane.
+        let t0 = store_now();
         let app = TestApp::new()
             .lane(
                 LaneSpec::new(
@@ -4482,7 +4513,10 @@ mod tests {
                     &server0.base_url(),
                 )
                 .api_key("test-key-0")
-                .max(1),
+                .max(1)
+                .cooldown_until(t0 + 600)
+                .streak(3)
+                .err(5),
             )
             .lane(
                 LaneSpec::new(
@@ -4498,7 +4532,8 @@ mod tests {
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
-        // Use a session id that hashes to lane 0 (first lane)
+        // `stable_hash("session-abc") % 2 == 0` → sticky member is cands[0] == lane 0
+        // (the TRIPPED lane). This is the case the test name claims to cover.
         let response = forward_with_pool(
             app.clone(),
             vec![
@@ -4508,13 +4543,14 @@ mod tests {
             req_body.into(),
             None,
             "failover-test",
-            Some("session-to-lane-0"),
+            Some("session-abc"),
             "anthropic",
             None,
         )
         .await;
 
-        // Should succeed by falling through to lane 1 (healthy)
+        // Should succeed by yielding to lane 1 (healthy), since the sticky member
+        // (lane 0) is tripped.
         assert_eq!(response.status().as_u16(), 200);
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -4522,10 +4558,15 @@ mod tests {
             .unwrap();
         let body_str = String::from_utf8_lossy(&body);
 
-        // Should be served by lane 1, NOT lane 0 (affinity is preference, not pin)
+        // Served by lane 1, NOT the tripped sticky member lane 0 (affinity is a
+        // preference, not a pin: a tripped sticky member yields).
         assert!(
             body_str.contains("lane1"),
-            "Should fall through to healthy member when sticky lane fails; got: {body_str}"
+            "sticky member (lane 0) is tripped → must yield to healthy lane 1; got: {body_str}"
+        );
+        assert!(
+            !body_str.contains("lane0"),
+            "must NOT route to the tripped sticky member (lane 0); got: {body_str}"
         );
 
         server0.shutdown().await;

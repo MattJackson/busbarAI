@@ -26,7 +26,29 @@ const MAX_TRACKED_TOOL_FRAMES: usize = 4096;
 /// the sentinel never collides with a genuine tool frame and is trivially excluded from the
 /// rank computation below. Recording it in the existing `open_tools` set keeps the fix entirely
 /// within this protocol module (the shared `StreamDecodeState` carries no text-high-water field).
+///
+/// The wire `index` is upstream-controlled, so a hostile/buggy backend could send exactly
+/// `usize::MAX` and collide with this sentinel — corrupting tool tracking. Every read site clamps
+/// the wire index to `MAX_TOOL_FRAME_INDEX` (well below `usize::MAX`) before use, so no real
+/// `frame_idx` can ever equal the sentinel. See `clamp_frame_index`.
 const TEXT_BLOCK_SEEN_SENTINEL: usize = usize::MAX;
+
+/// Upper bound applied to the upstream-controlled stream-frame `index` at every tool-call read
+/// site. The wire value is attacker-controllable; an `index` of `usize::MAX` would collide with
+/// `TEXT_BLOCK_SEEN_SENTINEL` and corrupt tool tracking. Clamping to a small bounded cap (matching
+/// `MAX_TRACKED_TOOL_FRAMES`, far below the sentinel) guarantees no genuine `frame_idx` can equal
+/// the sentinel, while leaving every realistic stream (small sequential indices) untouched. Mirrors
+/// the OpenAI reader's `MAX_TOOL_INDEX` clamp.
+const MAX_TOOL_FRAME_INDEX: u64 = MAX_TRACKED_TOOL_FRAMES as u64;
+
+/// Read the upstream-controlled stream-frame `index`, defaulting to 0 when absent/non-numeric, and
+/// clamp it to `MAX_TOOL_FRAME_INDEX` so it can never collide with `TEXT_BLOCK_SEEN_SENTINEL`.
+fn clamp_frame_index(data: &serde_json::Value) -> usize {
+    data.get("index")
+        .and_then(|i| i.as_u64())
+        .unwrap_or(0)
+        .min(MAX_TOOL_FRAME_INDEX) as usize
+}
 
 /// The request keys this reader models explicitly (and therefore must NOT echo back through
 /// `extra`). Built once per process via `OnceLock` instead of being reconstructed on every
@@ -650,7 +672,13 @@ impl ProtocolReader for CohereReader {
                     "MAX_TOKENS" => Some("max_tokens".to_string()),
                     "TOOL_CALL" => Some("tool_use".to_string()),
                     "STOP_SEQUENCE" => Some("stop_sequence".to_string()),
-                    "ERROR" | "ERROR_TOXIC" => Some("safety".to_string()),
+                    // Only `ERROR_TOXIC` (content-moderated output) is the moderation/`safety`
+                    // signal. The generic `ERROR` is an infrastructure failure and must NOT be
+                    // folded into `safety`: doing so turned a Cohere->Cohere passthrough of a
+                    // server error into a fabricated content-moderation stop. Let `ERROR` fall
+                    // through to the generic lowercase arm (-> IR `"error"`), which the writers
+                    // round-trip back to the native `ERROR` via their `reason.to_uppercase()` arm.
+                    "ERROR_TOXIC" => Some("safety".to_string()),
                     other if !other.is_empty() => Some(other.to_lowercase()),
                     _ => None,
                 };
@@ -708,7 +736,7 @@ impl ProtocolReader for CohereReader {
             // increasing order, that rank is fixed once assigned regardless of earlier tools closing
             // — so start/delta/end for a given tool all resolve to the same IR block index.
             "tool-call-start" => {
-                let frame_idx = data.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let frame_idx = clamp_frame_index(data);
                 let tc = data
                     .get("delta")
                     .and_then(|d| d.get("message"))
@@ -765,7 +793,7 @@ impl ProtocolReader for CohereReader {
                 }
             }
             "tool-call-delta" => {
-                let frame_idx = data.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let frame_idx = clamp_frame_index(data);
                 // Only forward deltas for a frame we actually tracked (and therefore opened a
                 // BlockStart for). A frame past MAX_TRACKED_TOOL_FRAMES was never recorded and never
                 // opened, so its `cohere_tool_ir_index` would collide with the highest tracked tool;
@@ -791,7 +819,7 @@ impl ProtocolReader for CohereReader {
                 }
             }
             "tool-call-end" => {
-                let frame_idx = data.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let frame_idx = clamp_frame_index(data);
                 // Only close a tool we actually opened; resolve its stable IR index. We do NOT
                 // remove the frame_idx from `open_tools` — removing it would shift the rank of every
                 // later tool and collapse them onto reused indices (the defect this fix addresses).
@@ -879,7 +907,13 @@ impl ProtocolReader for CohereReader {
             "MAX_TOKENS" => Some("max_tokens".to_string()),
             "TOOL_CALL" => Some("tool_use".to_string()),
             "STOP_SEQUENCE" => Some("stop_sequence".to_string()),
-            "ERROR" | "ERROR_TOXIC" => Some("safety".to_string()),
+            // Only `ERROR_TOXIC` (content-moderated output) is the moderation/`safety` signal. The
+            // generic `ERROR` is an infrastructure failure and must NOT be folded into `safety`:
+            // doing so turned a Cohere->Cohere passthrough of a server error into a fabricated
+            // content-moderation stop. Let `ERROR` fall through to the generic lowercase arm (-> IR
+            // `"error"`), which the writers round-trip back to the native `ERROR` via their
+            // `reason.to_uppercase()` arm.
+            "ERROR_TOXIC" => Some("safety".to_string()),
             other if !other.is_empty() => Some(other.to_lowercase()),
             _ => None,
         };
@@ -1421,9 +1455,10 @@ impl ProtocolWriter for CohereWriter {
                 // moderation). Emitting a `type: "error"` frame was both non-native (a strict Cohere
                 // SDK ignores or rejects an unknown event type, silently dropping the error) and a
                 // protocol-indistinguishability tell. We therefore emit the native `message-end`
-                // termination instead. The reader maps BOTH `ERROR` and `ERROR_TOXIC` back to IR
-                // `safety` (see line ~610), so this round-trips: a content-moderation signal in the
-                // provider_signal maps to `ERROR_TOXIC`, everything else to the generic `ERROR`.
+                // termination instead. The reader maps `ERROR_TOXIC` back to IR `safety` and the
+                // generic `ERROR` to IR `error` (the lowercase passthrough), so this round-trips: a
+                // content-moderation signal in the provider_signal maps to `ERROR_TOXIC`, everything
+                // else to the generic `ERROR`.
                 let toxic = err
                     .provider_signal
                     .as_deref()
@@ -1438,8 +1473,9 @@ impl ProtocolWriter for CohereWriter {
                 // observer) fingerprint the proxy — and a strict v2 SDK may reject the unexpected
                 // field (the MEDIUM/conformance findings). The load-bearing discriminant is
                 // `finish_reason` (`ERROR`/`ERROR_TOXIC`), which the reader maps back to IR
-                // `safety`, so the detail string carries no protocol value on the wire; surface it
-                // server-side instead so operators are not left with an opaque error.
+                // (`error`/`safety` respectively), so the detail string carries no protocol value on
+                // the wire; surface it server-side instead so operators are not left with an opaque
+                // error.
                 if let Some(detail) = err.provider_signal.as_deref() {
                     tracing::warn!(
                         finish_reason,
@@ -2385,8 +2421,8 @@ mod tests {
             "IR safety must write back as the native content-moderation stop ERROR_TOXIC"
         );
 
-        // Round-trips: ERROR_TOXIC reads back to IR safety (the reader normalises both ERROR forms
-        // to safety, so the value is stable on a Cohere->Cohere passthrough).
+        // Round-trips: ERROR_TOXIC reads back to IR safety (the reader normalises only ERROR_TOXIC
+        // to safety; the generic ERROR is NOT a moderation signal — see the ERROR round-trip test).
         let back = CohereReader
             .read_response(&body)
             .expect("read self-written body");
@@ -2416,6 +2452,181 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("ERROR_TOXIC"),
             "streamed safety stop must emit ERROR_TOXIC, not ERROR"
+        );
+    }
+
+    /// Regression (MED #8): the readers must NOT fold the generic `ERROR` finish_reason into the
+    /// content-moderation `safety` bucket. Only `ERROR_TOXIC` is the moderation signal; a generic
+    /// `ERROR` (infrastructure failure) must fall through to the lowercase passthrough (-> IR
+    /// `error`), and round-trip back to the native `ERROR` via the writer's `to_uppercase` arm.
+    /// Before the fix BOTH `ERROR` and `ERROR_TOXIC` mapped to `safety`, so a Cohere->Cohere
+    /// passthrough silently rewrote a server error as a fabricated content-moderation stop. Covers
+    /// both readers (streaming `message-end` and non-streaming `read_response`) and both write-back
+    /// paths.
+    #[test]
+    fn test_generic_error_does_not_fold_into_safety_and_round_trips() {
+        let reader = CohereReader;
+
+        // --- Non-streaming reader (read_response) ---
+        // ERROR must read back as IR `error`, NOT `safety`.
+        let err_body = serde_json::json!({
+            "finish_reason": "ERROR",
+            "message": { "content": [] },
+            "usage": { "tokens": { "input_tokens": 1, "output_tokens": 1 } }
+        });
+        let err_ir = reader.read_response(&err_body).expect("read ERROR body");
+        assert_eq!(
+            err_ir.stop_reason.as_deref(),
+            Some("error"),
+            "generic ERROR must read back as IR `error`, not `safety`"
+        );
+        // ERROR_TOXIC still reads back as `safety`.
+        let toxic_body = serde_json::json!({
+            "finish_reason": "ERROR_TOXIC",
+            "message": { "content": [] },
+            "usage": { "tokens": { "input_tokens": 1, "output_tokens": 1 } }
+        });
+        let toxic_ir = reader
+            .read_response(&toxic_body)
+            .expect("read ERROR_TOXIC body");
+        assert_eq!(
+            toxic_ir.stop_reason.as_deref(),
+            Some("safety"),
+            "ERROR_TOXIC must still read back as IR `safety`"
+        );
+
+        // Write-back round-trips: IR `error` -> native `ERROR`; IR `safety` -> native `ERROR_TOXIC`.
+        let writer = CohereWriter;
+        let err_resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: Vec::new(),
+            stop_reason: Some("error".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: Some("e1".to_string()),
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let err_out = writer.write_response(&err_resp);
+        assert_eq!(
+            err_out.get("finish_reason").and_then(|v| v.as_str()),
+            Some("ERROR"),
+            "IR `error` must write back as the native generic `ERROR`, not `ERROR_TOXIC`"
+        );
+
+        // --- Streaming reader (message-end) ---
+        let mut state = crate::ir::StreamDecodeState::default();
+        let err_frame = serde_json::json!({
+            "type": "message-end",
+            "delta": { "finish_reason": "ERROR", "usage": { "tokens": {} } }
+        });
+        let evs = reader.read_response_events("", &err_frame, &mut state);
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::MessageDelta { stop_reason, .. }
+                    if stop_reason.as_deref() == Some("error")
+            )),
+            "streamed generic ERROR must decode to IR `error`, not `safety`, got {evs:?}"
+        );
+        let mut state2 = crate::ir::StreamDecodeState::default();
+        let toxic_frame = serde_json::json!({
+            "type": "message-end",
+            "delta": { "finish_reason": "ERROR_TOXIC", "usage": { "tokens": {} } }
+        });
+        let toxic_evs = reader.read_response_events("", &toxic_frame, &mut state2);
+        assert!(
+            toxic_evs.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::MessageDelta { stop_reason, .. }
+                    if stop_reason.as_deref() == Some("safety")
+            )),
+            "streamed ERROR_TOXIC must still decode to IR `safety`, got {toxic_evs:?}"
+        );
+    }
+
+    /// Regression (MED #9): an upstream-controlled stream tool-call frame `index` of `usize::MAX`
+    /// (or any huge value) must NOT collide with `TEXT_BLOCK_SEEN_SENTINEL` (== `usize::MAX`) and
+    /// corrupt tool tracking. Every read site clamps the wire index to `MAX_TOOL_FRAME_INDEX`, well
+    /// below the sentinel, so a tool block still opens at a real IR index and the sentinel's
+    /// text-high-water meaning is preserved. Before the fix, a `usize::MAX` frame_idx was inserted
+    /// into `open_tools`, became indistinguishable from the sentinel, and broke `cohere_tool_ir_index`.
+    #[test]
+    fn test_huge_tool_frame_index_clamped_below_sentinel() {
+        let reader = CohereReader;
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        // A tool-call-start whose wire index is usize::MAX (the sentinel value).
+        let huge = u64::MAX;
+        let start = serde_json::json!({
+            "type": "tool-call-start",
+            "index": huge,
+            "delta": { "message": { "tool_calls": {
+                "id": "call_huge",
+                "type": "function",
+                "function": { "name": "f", "arguments": "{}" }
+            }}}
+        });
+        let evs = reader.read_response_events("", &start, &mut state);
+
+        // The clamp must keep the recorded frame index strictly below the sentinel so it is never
+        // confused with the text-high-water marker.
+        assert!(
+            !state.open_tools.contains(&TEXT_BLOCK_SEEN_SENTINEL),
+            "a huge wire index must never be recorded as the sentinel value"
+        );
+        assert!(
+            state
+                .open_tools
+                .iter()
+                .all(|&i| i <= MAX_TOOL_FRAME_INDEX as usize),
+            "every recorded tool frame index must be clamped to MAX_TOOL_FRAME_INDEX, got {:?}",
+            state.open_tools
+        );
+
+        // The clamped frame still opens exactly one tool BlockStart (no corruption / no drop).
+        let starts = evs
+            .iter()
+            .filter(|e| matches!(e, IrStreamEvent::BlockStart { .. }))
+            .count();
+        assert_eq!(
+            starts, 1,
+            "a clamped huge-index tool-call-start must open exactly one block, got {evs:?}"
+        );
+
+        // The whole tool lifecycle (delta + end at the same huge index) resolves to the SAME IR
+        // index and closes cleanly — proving the clamp is applied consistently at all three sites.
+        let delta = serde_json::json!({
+            "type": "tool-call-delta",
+            "index": huge,
+            "delta": { "message": { "tool_calls": {
+                "function": { "arguments": "more" }
+            }}}
+        });
+        let delta_evs = reader.read_response_events("", &delta, &mut state);
+        assert_eq!(
+            delta_evs
+                .iter()
+                .filter(|e| matches!(e, IrStreamEvent::BlockDelta { .. }))
+                .count(),
+            1,
+            "a clamped tool-call-delta must forward to the open block, got {delta_evs:?}"
+        );
+        let end = serde_json::json!({ "type": "tool-call-end", "index": huge });
+        let end_evs = reader.read_response_events("", &end, &mut state);
+        assert_eq!(
+            end_evs
+                .iter()
+                .filter(|e| matches!(e, IrStreamEvent::BlockStop { .. }))
+                .count(),
+            1,
+            "a clamped tool-call-end must close the open block, got {end_evs:?}"
         );
     }
 
@@ -2492,16 +2703,18 @@ mod tests {
             Some("ERROR"),
             "an infrastructure error maps to the native ERROR finish_reason"
         );
-        // Round-trips through the reader back to IR safety (the reader maps ERROR -> safety).
+        // Round-trips through the reader back to IR `error` (the generic infra-failure passthrough).
+        // The reader maps ONLY `ERROR_TOXIC` to `safety`; a generic `ERROR` must NOT be folded into
+        // the moderation bucket (MED #8) — it falls through to the lowercase passthrough -> `error`.
         let mut state = crate::ir::StreamDecodeState::default();
         let decoded = CohereReader.read_response_events("", &frame, &mut state);
         assert!(
             decoded.iter().any(|e| matches!(
                 e,
                 IrStreamEvent::MessageDelta { stop_reason, .. }
-                    if stop_reason.as_deref() == Some("safety")
+                    if stop_reason.as_deref() == Some("error")
             )),
-            "emitted message-end must decode back to a safety stop, got {decoded:?}"
+            "emitted message-end must decode back to a generic `error` stop, got {decoded:?}"
         );
 
         // Content-moderation signal -> ERROR_TOXIC.

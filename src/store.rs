@@ -1384,26 +1384,33 @@ impl InMemoryStore {
             .saturating_sub(now)
     }
 
-    /// Lane-global readiness for `/stats`: true iff the lane is admissible (not dead / in budget) AND
-    /// at least one breaker cell (the default cell or ANY per-pool cell) would admit a request right
-    /// now. Production traffic routes through NAMED pools, whose cells the default-cell-only
-    /// `is_ready("", ...)` never sees — so reading only the default cell reports `usable=true` even
-    /// when every per-pool breaker for the lane is tripped Open. Iterating all known cells makes the
-    /// `/stats` `usable` flag reflect real admissibility. Side-effect-free (uses the non-mutating
-    /// `cell_ready_breaker`, never the probe-stealing `usable`).
+    /// Lane-global readiness for `/healthz` and `/stats`: true iff the lane is admissible (not dead /
+    /// in budget) AND at least one breaker cell that production ACTUALLY routes through would admit a
+    /// request right now. Production traffic routes through NAMED pools, whose per-pool cells trip
+    /// independently; the lane-default (pool `""`) cell is the `LaneState` itself, which starts
+    /// `ST_CLOSED`/`cooldown=0` and is written ONLY by direct/ad-hoc routes — pool-routed traffic
+    /// never touches it. So when a lane has per-pool cells, the default cell is (almost) always
+    /// "ready" and must NOT short-circuit the verdict: a lane whose every per-pool cell is tripped
+    /// Open is NOT serviceable for pool traffic even though its untouched default cell reads ready.
+    /// Therefore: if the lane HAS per-pool cells, readiness is purely whether ANY per-pool cell would
+    /// admit (the default cell is ignored — it does not reflect pool routing). Only a lane with NO
+    /// per-pool cells (direct/ad-hoc-only) falls back to the default cell. Side-effect-free (uses the
+    /// non-mutating `cell_ready_breaker`, never the probe-stealing `usable`).
     fn lane_usable_any_cell(&self, lane: usize, now: u64) -> bool {
         if !self.lane_admissible(lane) {
             return false;
         }
-        if Self::cell_ready_breaker(self.get_lane(lane).as_ref(), now) {
-            return true;
-        }
         let cells = read_recover(&self.pool_cells);
-        cells
-            .get(&lane)
-            .into_iter()
-            .flatten()
-            .any(|(_, cell)| Self::cell_ready_breaker(cell.as_ref(), now))
+        match cells.get(&lane) {
+            // Lane belongs to one or more pools: readiness reflects ONLY the per-pool cells that
+            // pool-routed traffic actually dispatches through. Do NOT short-circuit on the
+            // always-Closed default cell.
+            Some(per_lane) if !per_lane.is_empty() => per_lane
+                .iter()
+                .any(|(_, cell)| Self::cell_ready_breaker(cell.as_ref(), now)),
+            // Direct/ad-hoc-only lane (no per-pool cells): the default cell IS the routed cell.
+            _ => Self::cell_ready_breaker(self.get_lane(lane).as_ref(), now),
+        }
     }
 
     /// Worst-case remaining cooldown across the default cell and every per-pool cell for the lane.
@@ -2146,6 +2153,59 @@ mod tests {
         assert!(
             store.is_ready_any_cell(0, now),
             "after recovery the lane is serviceable in some cell → is_ready_any_cell must be ready"
+        );
+    }
+
+    /// REGRESSION (#18, R20 redo of R19): `lane_usable_any_cell` must NOT short-circuit on the
+    /// lane-default (`""`) cell when the lane has per-pool cells. The default cell IS the `LaneState`,
+    /// starts `ST_CLOSED`/`cooldown=0`, and is written ONLY by direct/ad-hoc routes — pool-routed
+    /// traffic NEVER touches it, so in production it stays "ready" forever. The R19 fix iterated all
+    /// cells but still checked the default cell FIRST and returned early on it, so `/healthz` and
+    /// `/stats usable` STILL over-reported ready when every per-pool cell was Open. Here every per-pool
+    /// cell is tripped Open while the default cell is left UNTOUCHED (its real production state). The
+    /// old short-circuit returns true (over-reports ready); the fix must return false.
+    #[test]
+    fn test_is_ready_any_cell_false_when_pool_cells_open_default_untouched() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        let now = 100_000;
+        // Materialize two per-pool cells, then trip BOTH Open. The default `""` cell is deliberately
+        // left in its pristine ST_CLOSED/cooldown=0 state — exactly what pool-routed traffic leaves it.
+        store.force_open_in("poolA", 0, now + 600);
+        store.force_open_in("poolB", 0, now + 600);
+        assert!(
+            store.is_ready(0, now),
+            "sanity: the untouched default cell reads ready (the over-reporting source)"
+        );
+        assert!(
+            !store.is_ready_any_cell(0, now),
+            "every per-pool cell Open → lane is unserviceable for pool traffic; the always-ready \
+             default cell must NOT make is_ready_any_cell report ready"
+        );
+        // Recover one per-pool cell → the lane can serve via that pool again → ready.
+        store.recover_lane(0);
+        assert!(
+            store.is_ready_any_cell(0, now),
+            "after recovery a per-pool cell admits → is_ready_any_cell must be ready"
+        );
+    }
+
+    /// REGRESSION (#18, positive/fallback case): a lane with NO per-pool cells (direct/ad-hoc-only)
+    /// must fall back to the lane-default cell. With the default cell Open and no pool cells present,
+    /// `is_ready_any_cell` must report NOT-ready; recovering the default cell flips it back to ready.
+    #[test]
+    fn test_is_ready_any_cell_falls_back_to_default_when_no_pool_cells() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        let now = 100_000;
+        // No per-pool cells materialized: the default cell is the only routed cell.
+        store.force_open_in("", 0, now + 600);
+        assert!(
+            !store.is_ready_any_cell(0, now),
+            "no pool cells + default cell Open → lane is unserviceable → not ready"
+        );
+        store.recover_lane(0);
+        assert!(
+            store.is_ready_any_cell(0, now),
+            "default cell recovered (only routed cell) → ready"
         );
     }
 

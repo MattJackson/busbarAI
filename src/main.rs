@@ -672,6 +672,50 @@ async fn method_not_allowed_handler(uri: axum::http::Uri) -> axum::response::Res
     )
 }
 
+/// Reshape an oversized-body rejection into a protocol-native error. axum's `DefaultBodyLimit`
+/// rejects a too-large request with HTTP 413 and a bare `text/plain` body (`"length limit
+/// exceeded"`) — a router/proxy tell no native vendor API emits (the §8.1 indistinguishability
+/// gap). This middleware wraps the body-limit layer: it captures the request path, runs the inner
+/// stack, and when the result is a 413 whose body is NOT already `application/json`, it replaces
+/// that response with the inferred ingress protocol's native JSON `request_too_large` envelope
+/// (Bedrock variants also gain `x-amzn-*` headers, via [`fallback_error_response`]). A 413 that a
+/// real ingress handler already shaped as JSON is passed through untouched.
+async fn reshape_body_limit_413(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path().to_owned();
+    let resp = next.run(req).await;
+    reshape_oversized_413(&path, resp)
+}
+
+/// Pure reshaping step of [`reshape_body_limit_413`], split out so it is unit-testable without
+/// constructing a `Next`. Returns `resp` unchanged unless it is a 413 with a non-JSON body — in
+/// which case it is replaced by the inferred ingress protocol's native JSON `request_too_large`
+/// envelope. A 413 a real ingress handler already shaped as `application/json` is passed through.
+fn reshape_oversized_413(path: &str, resp: axum::response::Response) -> axum::response::Response {
+    if resp.status() != axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+        return resp;
+    }
+    // Only reshape the bare-text rejection. If a handler already produced an `application/json`
+    // 413 (a native too-large envelope), leave it alone — re-wrapping would corrupt it.
+    let is_json = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    if is_json {
+        return resp;
+    }
+    fallback_error_response(
+        path,
+        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+        // CANONICAL kind for an oversized payload across the protocol writers.
+        "request_too_large",
+        "request body exceeds the maximum allowed size",
+    )
+}
+
 /// Build the busbar HTTP router for a given `App` state. Factored out of `main` so the full
 /// route table + auth middleware can be exercised end-to-end in tests.
 pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
@@ -717,6 +761,10 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
         ))
         // Cap request body size (buffered before the handler) to bound per-request memory.
         .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        // Outermost: reshape the body-limit layer's bare-text 413 into a protocol-native JSON
+        // envelope. Must wrap the `DefaultBodyLimit` layer above, so it is applied LAST (the last
+        // `.layer()` is the outermost on the response path) and therefore sees that layer's 413.
+        .layer(axum::middleware::from_fn(reshape_body_limit_413))
         .with_state(app)
 }
 
@@ -962,6 +1010,133 @@ mod tests {
         assert!(
             resp.headers().get("x-amzn-requestid").is_none(),
             "non-bedrock fallback must NOT carry x-amzn-* headers"
+        );
+    }
+
+    /// REGRESSION (MED #14, security/indistinguishability): axum's `DefaultBodyLimit` rejects an
+    /// oversized body with a bare `text/plain` 413 (`"length limit exceeded"`) — a router/proxy
+    /// tell. `reshape_oversized_413` must turn that into a protocol-native `application/json`
+    /// envelope. Against the OLD code (no reshaping layer) the response stayed `text/plain`, so this
+    /// assertion on `application/json` fails; after the fix it passes.
+    #[tokio::test]
+    async fn test_oversized_body_413_reshaped_to_json_not_plain_text() {
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt as _;
+
+        // Simulate exactly what axum's DefaultBodyLimit emits: a 413 with a bare text/plain body.
+        let axum_native_413 = (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            "length limit exceeded",
+        )
+            .into_response();
+
+        let reshaped = reshape_oversized_413("/v1/chat/completions", axum_native_413);
+        assert_eq!(reshaped.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        let ct = reshaped
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok());
+        assert_eq!(
+            ct,
+            Some("application/json"),
+            "oversized-body 413 must be reshaped to application/json, not the bare text/plain tell"
+        );
+        let bytes = reshaped.into_body().collect().await.unwrap().to_bytes();
+        // Must be valid JSON (not the plain-text "length limit exceeded" string).
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("reshaped 413 body must be valid JSON");
+        assert!(
+            v.get("error").is_some(),
+            "OpenAI-inferred 413 must carry an `error` envelope; got {v}"
+        );
+        assert_ne!(
+            String::from_utf8_lossy(&bytes),
+            "length limit exceeded",
+            "the axum plain-text body must not survive reshaping"
+        );
+    }
+
+    /// REGRESSION (MED #14): a Bedrock-inferred oversized-body 413 must carry the native AWS
+    /// `__type` envelope AND the `x-amzn-*` headers, indistinguishable from a real Bedrock reject.
+    #[tokio::test]
+    async fn test_oversized_body_413_bedrock_native_envelope_with_amzn_headers() {
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt as _;
+
+        let axum_native_413 = (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            "length limit exceeded",
+        )
+            .into_response();
+
+        let reshaped = reshape_oversized_413("/model/some.model/converse", axum_native_413);
+        assert_eq!(reshaped.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            reshaped
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|h| h.to_str().ok()),
+            Some("application/json")
+        );
+        assert!(
+            reshaped.headers().get("x-amzn-requestid").is_some(),
+            "bedrock 413 must carry x-amzn-RequestId"
+        );
+        assert!(
+            reshaped.headers().get("x-amzn-errortype").is_some(),
+            "bedrock 413 must carry x-amzn-errortype"
+        );
+        let bytes = reshaped.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("reshaped bedrock 413 body must be valid JSON");
+        assert!(
+            v.get("__type").is_some(),
+            "bedrock 413 must carry the native __type envelope; got {v}"
+        );
+    }
+
+    /// A non-413 response (or a 413 a handler already shaped as JSON) must pass through
+    /// `reshape_oversized_413` untouched — the layer only rewrites the bare-text body-limit reject.
+    #[tokio::test]
+    async fn test_reshape_oversized_413_passthrough() {
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt as _;
+
+        // Non-413: untouched.
+        let ok = (axum::http::StatusCode::OK, "hello").into_response();
+        let passed = reshape_oversized_413("/v1/chat/completions", ok);
+        assert_eq!(passed.status(), axum::http::StatusCode::OK);
+        let bytes = passed.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            &bytes[..],
+            b"hello",
+            "non-413 body must pass through verbatim"
+        );
+
+        // 413 that is ALREADY application/json: untouched (re-wrapping would corrupt it).
+        let already_json = (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            )],
+            r#"{"error":{"type":"request_too_large","message":"native"}}"#,
+        )
+            .into_response();
+        let passed = reshape_oversized_413("/v1/chat/completions", already_json);
+        let bytes = passed.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["error"]["message"], "native",
+            "an already-JSON 413 must be passed through, not re-wrapped"
         );
     }
 }

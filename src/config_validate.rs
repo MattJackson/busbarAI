@@ -166,6 +166,36 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 provider_name, provider_cfg.base_url, host
             ));
         }
+
+        // The `path` override is appended to `base_url` VERBATIM at request time
+        // (`format!("{base}{wire_path}")` in forward.rs), and the composed string is then parsed by
+        // reqwest's `url` crate to choose the connect host. base_url validation alone is therefore
+        // NOT sufficient: a `path` that does not begin with `/` FUSES into the authority — e.g.
+        // base_url `https://api.openai.com` + path `.evil.com/v1` yields
+        // `https://api.openai.com.evil.com/v1`, whose host is `api.openai.com.evil.com`, redirecting
+        // the lane's signed (API-key-bearing) traffic to an attacker host (credential-relay SSRF).
+        // Likewise a `path` smuggling a `@` / `//` / `\` could re-home the authority. Defend in two
+        // layers: (1) require a leading `/` so the override can only ever extend the PATH, never the
+        // authority; (2) re-run the COMPOSED url through the same ssrf_blocked_host guard so any host
+        // it could still introduce is caught with the identical internal/metadata block set as
+        // base_url. (The composed string is only checked when base_url is itself an accepted https
+        // URL — a bad base_url already errors above.)
+        if let Some(path) = &provider_cfg.path {
+            if !path.starts_with('/') {
+                errors.push(format!(
+                    "provider '{}' path '{}' must begin with '/': a path override is appended to base_url verbatim, so a path that does not start with '/' fuses into the host (e.g. base_url + '{}') and can redirect signed traffic to an attacker-controlled host",
+                    provider_name, path, path
+                ));
+            } else if provider_cfg.base_url.starts_with("https://") {
+                let composed = format!("{}{}", provider_cfg.base_url, path);
+                if let Some(host) = ssrf_blocked_host(&composed) {
+                    errors.push(format!(
+                        "provider '{}' base_url+path '{}' targets a blocked internal/metadata host '{}' (loopback, link-local, RFC-1918 private, or cloud metadata endpoints are not permitted)",
+                        provider_name, composed, host
+                    ));
+                }
+            }
+        }
     }
 
     // Rule 2 & 3: Validate each pool's members
@@ -278,6 +308,26 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     "pool '{}' failover.deadline_secs must be >= 1; a 0 budget rejects the primary attempt before it runs (every request 503s)",
                     pool_name
                 ));
+            }
+            // Rule 6c: Each `failover.exclusions` entry is a MEMBER MODEL NAME removed from this
+            // pool's candidate set at runtime (the selector benches it; primary and failover never
+            // pick it). The exclusions are matched against the pool's member targets, so a misspelled
+            // or stale entry (e.g. `betaa` for member `beta`) resolves to nothing and silently fails
+            // to bench the member the operator intended — and an exclusion that DOES name a member,
+            // applied across every member, empties the pool. Mirror the member-target resolution rule
+            // (`member.target` is the candidate name) and fail loud on an exclusion that names no
+            // member of THIS pool, the same way Rule 7 catches a dangling fallback-pool reference.
+            if let Some(exclusions) = &failover.exclusions {
+                let member_targets: HashSet<&str> =
+                    pool_cfg.members.iter().map(|m| m.target.as_str()).collect();
+                for excluded in exclusions {
+                    if !member_targets.contains(excluded.as_str()) {
+                        errors.push(format!(
+                            "pool '{}' failover.exclusions references '{}', which is not a member of the pool; an exclusion must name one of the pool's members (otherwise it silently benches nothing)",
+                            pool_name, excluded
+                        ));
+                    }
+                }
             }
         }
 
@@ -480,8 +530,17 @@ fn ssrf_blocked_host(url: &str) -> Option<String> {
 
     // Strip "https://" (caller guarantees this prefix).
     let rest = url.strip_prefix("https://")?;
+    // Normalize backslashes to forward slashes BEFORE splitting the authority. `https` is a WHATWG
+    // "special" scheme, so reqwest's `url` crate converts every `\` to `/` while parsing — meaning a
+    // `base_url` like `https://10.0.0.1\x.allowed.com` is parsed by reqwest with authority `10.0.0.1`
+    // (the `\` terminates the authority exactly as `/` would) and then CONNECTS to `10.0.0.1` /
+    // `169.254.169.254`, even though a hand-parser that split only on `['/', '?', '#']` would see the
+    // whole `10.0.0.1\x.allowed.com` as the host (which passes every internal/metadata check) — an
+    // SSRF credential-relay bypass. Mirroring reqwest's `\`→`/` rewrite here makes the guard see the
+    // SAME authority boundary the connecting stack will, closing the bypass.
+    let rest = rest.replace('\\', "/");
     // Authority is everything before the first path/query/fragment delimiter.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest.as_str());
     // Drop any "userinfo@" prefix.
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
 
@@ -1493,6 +1552,56 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_unknown_failover_exclusion() {
+        // Regression (MEDIUM, re-audit): a `failover.exclusions` entry is a member model name benched
+        // from the pool's candidate set at runtime; the runtime matches it against member targets. A
+        // misspelled / stale entry resolves to nothing and silently fails to bench the intended
+        // member, so it must fail loud at boot (mirroring the dangling-fallback-pool rule).
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut pool = make_pool(vec![make_member("mymodel")]);
+        pool.failover = Some(config::FailoverCfg {
+            deadline_secs: 30,
+            exclusions: Some(vec!["mymodell".to_string()]), // typo: pool member is `mymodel`
+            cap: 3,
+        });
+        pools.insert("mypool".to_string(), pool);
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg).expect_err("an unknown failover exclusion must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("failover.exclusions references 'mymodell'")
+                    && e.contains("not a member of the pool")),
+            "expected an unknown-exclusion error naming 'mymodell'; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_known_failover_exclusion() {
+        // An exclusion that names a real member of the pool is the supported case and must validate.
+        let (mut providers, mut models, _) = valid_maps();
+        providers
+            .entry("myprovider".to_string())
+            .or_insert_with(|| make_provider("anthropic", "https://api.example.com", "API_KEY"));
+        models
+            .entry("secondmodel".to_string())
+            .or_insert_with(|| make_model("myprovider", 10));
+        let mut pools = HashMap::new();
+        let mut pool = make_pool(vec![make_member("mymodel"), make_member("secondmodel")]);
+        pool.failover = Some(config::FailoverCfg {
+            deadline_secs: 30,
+            exclusions: Some(vec!["secondmodel".to_string()]), // a real member — benched on purpose
+            cap: 3,
+        });
+        pools.insert("mypool".to_string(), pool);
+        let cfg = make_root_cfg(providers, models, pools);
+        assert!(
+            validate(&cfg).is_ok(),
+            "a failover exclusion naming a real pool member must validate"
+        );
+    }
+
+    #[test]
     fn test_validate_governance_requires_admin_token_when_enabled() {
         // governance.enabled with no admin_token silently locks the /admin API (every call 401s);
         // must fail loud at boot. An empty-string token is treated as absent (GovState::admin_token
@@ -1734,6 +1843,99 @@ mod tests {
                 "expected '{blocked}' to be flagged as an SSRF target"
             );
         }
+    }
+
+    #[test]
+    fn test_ssrf_blocks_backslash_authority_bypass() {
+        // Regression (HIGH, re-audit): `https` is a WHATWG special scheme, so reqwest's `url` crate
+        // rewrites every `\` to `/` while parsing — terminating the authority at the FIRST `\`. A
+        // hand-parser that split only on `['/', '?', '#']` saw the whole `10.0.0.1\x.allowed.com` as
+        // the host (passing every internal/metadata check) while reqwest connected to `10.0.0.1` /
+        // `169.254.169.254` with the lane API key attached — a credential-relay SSRF. The guard must
+        // normalize `\`→`/` BEFORE splitting so it sees the SAME authority boundary reqwest will.
+        for blocked in [
+            "https://10.0.0.1\\x.allowed.com",
+            "https://10.0.0.1\\x.allowed.com/v1/messages",
+            "https://169.254.169.254\\a.b",
+            "https://127.0.0.1\\evil.example.com/",
+            "https://localhost\\x.allowed.com",
+            // Mixed delimiters: the backslash must still terminate the authority before the slash.
+            "https://10.0.0.1\\@allowed.com/path",
+        ] {
+            assert!(
+                ssrf_blocked_host(blocked).is_some(),
+                "expected '{blocked}' to be flagged: the backslash terminates the authority \
+                 (reqwest rewrites \\ to /), so the real host is the internal target before it"
+            );
+        }
+        // A full validate() pass must reject a base_url using the backslash-authority trick.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            make_provider("anthropic", "https://10.0.0.1\\x.allowed.com", "API_KEY"),
+        );
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        let errs = validate(&cfg).expect_err("backslash-authority base_url must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("blocked internal/metadata host") && e.contains("10.0.0.1")),
+            "expected an SSRF/metadata-host error naming the real internal host; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_path_override_host_fusion() {
+        // Regression (MEDIUM, re-audit): a provider `path` override is appended to base_url VERBATIM
+        // at request time (`format!("{base}{wire_path}")`), and the composed string chooses the
+        // connect host. base_url validation alone misses this: a path NOT starting with '/' fuses
+        // into the authority — base_url `https://api.example.com` + path `.evil.com/v1` connects to
+        // host `api.example.com.evil.com` with the lane API key attached (credential-relay SSRF).
+        let mut providers = HashMap::new();
+        let mut fused = make_provider("openai", "https://api.example.com", "API_KEY");
+        fused.path = Some(".evil.com/v1/chat/completions".to_string());
+        providers.insert("fused".to_string(), fused);
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        let errs = validate(&cfg).expect_err("a host-fusing path override must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("fused") && e.contains("must begin with '/'")),
+            "expected a leading-slash path error for 'fused'; got: {errs:?}"
+        );
+
+        // The host-fusion vector is symmetric for any non-slash leading char that extends the host
+        // label — a `@` (userinfo flip) or a bare label both fuse. base_url `https://api.example.com`
+        // + path `@169.254.169.254/x` composes to `https://api.example.com@169.254.169.254/x`, whose
+        // host is the IMDS endpoint with `api.example.com` demoted to userinfo. The leading-slash
+        // rule rejects it (it does not start with '/'), and as belt-and-suspenders the composed url
+        // is also an SSRF target — assert at minimum the leading-slash diagnostic fires.
+        let mut providers2 = HashMap::new();
+        let mut imds = make_provider("openai", "https://api.example.com", "API_KEY");
+        imds.path = Some("@169.254.169.254/latest/meta-data".to_string());
+        providers2.insert("imds".to_string(), imds);
+        let cfg2 = make_root_cfg(providers2, HashMap::new(), HashMap::new());
+        let errs2 =
+            validate(&cfg2).expect_err("a userinfo-flip path override must fail validation");
+        assert!(
+            errs2
+                .iter()
+                .any(|e| e.contains("imds") && e.contains("must begin with '/'")),
+            "expected a leading-slash path error for the userinfo-flip override; got: {errs2:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_well_formed_path_override() {
+        // The shipped catalog form — a leading-slash path on a public host — must validate. Mirrors
+        // the `zai-payg` provider (`base_url: .../api/paas/v4` + `path: /chat/completions`).
+        let mut providers = HashMap::new();
+        let mut p = make_provider("openai", "https://api.example.com/api/paas/v4", "API_KEY");
+        p.path = Some("/chat/completions".to_string());
+        providers.insert("ok".to_string(), p);
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        assert!(
+            validate(&cfg).is_ok(),
+            "a leading-slash path override on a public host must validate"
+        );
     }
 
     #[test]

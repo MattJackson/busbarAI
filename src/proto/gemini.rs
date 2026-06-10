@@ -528,10 +528,12 @@ impl ProtocolReader for GeminiReader {
 
                 if role_val == "model" || role_val.is_empty() {
                     if let Some(parts_arr) = content.get("parts").and_then(|p| p.as_array()) {
-                        // The text block always owns IR index 0. Tool blocks take indices 1..n.
-                        // The next tool index is derived from persistent state (`open_tools`)
-                        // rather than a per-chunk local, so indices stay stable across the
-                        // multiple SSE chunks of a single response.
+                        // A text block, when one opens this stream, owns IR index 0; tool blocks
+                        // then take indices 1..n. A tool-only stream reserves nothing for text and
+                        // starts its tools at index 0 (see the tool branch below). The next tool
+                        // index is derived from persistent state (`open_tools`) rather than a
+                        // per-chunk local, so indices stay stable across the multiple SSE chunks of
+                        // a single response.
                         for part in parts_arr {
                             // Text block
                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
@@ -570,11 +572,16 @@ impl ProtocolReader for GeminiReader {
                                 if !name_val.is_empty()
                                     && state.open_tools.len() < MAX_GEMINI_TOOL_FRAMES
                                 {
-                                    // Tool blocks follow the text block (index 0). The next
-                                    // index is 1 + however many tool blocks are already open.
-                                    // Record it in `open_tools` so the finishReason handler
-                                    // emits a matching BlockStop for every tool block.
-                                    let ir_idx = 1 + state.open_tools.len();
+                                    // Tool blocks follow any text block. Reserve index 0 for a
+                                    // text block ONLY when one actually opened this stream;
+                                    // otherwise a tool-only response would leave index 0
+                                    // permanently empty and make content indices non-contiguous.
+                                    // Base the first tool index on whether text opened, then add
+                                    // however many tool blocks are already open. Recorded in
+                                    // `open_tools` so the finishReason handler emits a matching
+                                    // BlockStop for every tool block. Mirrors the Cohere reader.
+                                    let text_base = usize::from(state.text_block_open);
+                                    let ir_idx = text_base + state.open_tools.len();
                                     state.open_tools.insert(ir_idx);
 
                                     let args = func_call
@@ -585,9 +592,10 @@ impl ProtocolReader for GeminiReader {
                                     // Gemini streams carry no tool-call id; synthesize a stable,
                                     // non-empty one keyed by (tool-position, name) so the
                                     // Anthropic/OpenAI stream writers emit a non-empty id on the
-                                    // content_block_start. Tool blocks occupy indices 1..n, so
-                                    // `ir_idx - 1` is the 0-based tool position.
-                                    let id = synth_tool_call_id(ir_idx - 1, &name_val);
+                                    // content_block_start. Tool blocks occupy indices
+                                    // `text_base..text_base+n`, so `ir_idx - text_base` is the
+                                    // 0-based tool position.
+                                    let id = synth_tool_call_id(ir_idx - text_base, &name_val);
                                     out.push(IrStreamEvent::BlockStart {
                                         index: ir_idx,
                                         block: crate::ir::IrBlockMeta::ToolUse {
@@ -2055,7 +2063,9 @@ mod tests {
             _ => None,
         });
         let idx = start_idx.expect("tool BlockStart must be emitted");
-        assert_eq!(idx, 1, "tool block must take index 1 (text owns 0)");
+        // No text block opened this stream, so the tool owns index 0 (contiguous from 0);
+        // reserving 0 for an absent text block would leave a permanent hole.
+        assert_eq!(idx, 0, "tool-only stream: tool block must take index 0");
         assert!(
             events
                 .iter()
@@ -2064,7 +2074,8 @@ mod tests {
         );
     }
 
-    /// Regression: two functionCalls in one response get distinct indices (1 and 2) and both close.
+    /// Regression: two functionCalls in a tool-only response get distinct, contiguous indices
+    /// (0 and 1 — no text block opened, so nothing reserves index 0) and both close.
     #[test]
     fn test_stream_two_tools_distinct_indices() {
         let events = collect_stream(&[serde_json::json!({
@@ -2091,9 +2102,13 @@ mod tests {
             })
             .collect();
         tool_indices.sort_unstable();
-        assert_eq!(tool_indices, vec![1, 2], "two tools must take indices 1,2");
+        assert_eq!(
+            tool_indices,
+            vec![0, 1],
+            "tool-only stream: two tools must take contiguous indices 0,1"
+        );
 
-        for idx in [1usize, 2usize] {
+        for idx in [0usize, 1usize] {
             assert!(
                 events
                     .iter()
@@ -2101,6 +2116,113 @@ mod tests {
                 "tool block {idx} must be closed"
             );
         }
+    }
+
+    /// Regression for MED #6: a tool-only streaming response must produce content block indices
+    /// contiguous from 0. Previously the first tool index was `1 + open_tools.len()`, which reserved
+    /// index 0 for a text block that never opened — leaving IR index 0 permanently empty and content
+    /// indices non-contiguous (0 hole, then 1..n). Now the base is keyed on whether a text block
+    /// actually opened (`usize::from(state.text_block_open)`), so a tool-only stream starts at 0.
+    #[test]
+    fn test_stream_tool_only_indices_contiguous_from_zero() {
+        let events = collect_stream(&[serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"functionCall": {"name": "a", "args": {}}},
+                        {"functionCall": {"name": "b", "args": {}}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        })]);
+
+        // No text block must open: a tool-only response carries no text part.
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    block: IrBlockMeta::Text,
+                    ..
+                }
+            )),
+            "tool-only stream must not open a text block: {events:?}"
+        );
+
+        let mut tool_indices: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                IrStreamEvent::BlockStart {
+                    index,
+                    block: IrBlockMeta::ToolUse { .. },
+                } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        tool_indices.sort_unstable();
+        assert_eq!(
+            tool_indices,
+            vec![0, 1],
+            "tool-only stream: content indices must be contiguous from 0 (no reserved-but-empty 0): {events:?}"
+        );
+
+        // Both tool blocks must be closed at their own indices.
+        for idx in [0usize, 1usize] {
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, IrStreamEvent::BlockStop { index } if *index == idx)),
+                "tool block {idx} must be closed: {events:?}"
+            );
+        }
+    }
+
+    /// Regression for MED #6 (interleaving): when a text block DOES open, the reserved index 0
+    /// must still hold, and tool blocks follow at 1..n — the fix must not regress text+tool order.
+    #[test]
+    fn test_stream_text_then_tool_keeps_text_at_zero() {
+        let events = collect_stream(&[serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "hi"},
+                        {"functionCall": {"name": "a", "args": {}}},
+                        {"functionCall": {"name": "b", "args": {}}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        })]);
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::Text
+                }
+            )),
+            "text block must open at index 0: {events:?}"
+        );
+
+        let mut tool_indices: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                IrStreamEvent::BlockStart {
+                    index,
+                    block: IrBlockMeta::ToolUse { .. },
+                } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        tool_indices.sort_unstable();
+        assert_eq!(
+            tool_indices,
+            vec![1, 2],
+            "text+tool stream: tools must follow text at indices 1,2: {events:?}"
+        );
     }
 
     /// Regression: the tool BlockStart now BUFFERS the name and emits NO frame; a native Gemini

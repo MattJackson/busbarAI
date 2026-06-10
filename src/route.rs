@@ -281,11 +281,24 @@ async fn ingress_body_model(
             // (no native vendor surfaces it) and can echo fragments of the malformed body. The client
             // gets the generic, vendor-plausible message only — matching the CORE fix in forward.rs.
             tracing::debug!(error = %e, "request body JSON parse failed");
-            return ingress_error(
+            // Pre-routing failures (the model was never resolved) must still be counted in
+            // REQUESTS_TOTAL / REQUEST_DURATION_SECONDS and fire the request-log webhook, the same
+            // observability invariant the governance rejections and the model-miss 404s enforce. A
+            // raw early-return made every malformed-body request invisible to Prometheus and the
+            // webhook. The model is unresolved here, so stamp the bounded `"unresolved"` sentinel as
+            // the `pool` label (metrics.rs:24-38), never a raw client string.
+            return finish(
+                app,
+                gov,
                 proto,
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "We could not parse the JSON body of your request.",
+                "unresolved",
+                started,
+                ingress_error(
+                    proto,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "We could not parse the JSON body of your request.",
+                ),
             );
         }
     };
@@ -293,12 +306,21 @@ async fn ingress_body_model(
     let model = match v.get("model").and_then(|m| m.as_str()) {
         Some(m) if !m.is_empty() => m.to_string(),
         _ => {
-            return ingress_error(
+            // Missing/empty model is a pre-routing failure: route through `finish` (bounded
+            // `"unresolved"` label) so it is observable in metrics + the webhook.
+            return finish(
+                app,
+                gov,
                 proto,
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "Missing required parameter: 'model'.",
-            )
+                "unresolved",
+                started,
+                ingress_error(
+                    proto,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "Missing required parameter: 'model'.",
+                ),
+            );
         }
     };
 
@@ -352,11 +374,22 @@ async fn ingress_path_model(
             // (no native vendor surfaces it) and can echo fragments of the malformed body. The client
             // gets the generic, vendor-plausible message only — matching the CORE fix in forward.rs.
             tracing::debug!(error = %e, "request body JSON parse failed");
-            return ingress_error(
+            // Pre-routing failure (model never resolved): route through `finish` with the bounded
+            // `"unresolved"` label so the malformed-body request is still counted in REQUESTS_TOTAL /
+            // REQUEST_DURATION_SECONDS and fires the request-log webhook, mirroring the model-miss
+            // path. A raw early-return made it invisible to Prometheus and the webhook.
+            return finish(
+                app,
+                gov,
                 proto,
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "We could not parse the JSON body of your request.",
+                "unresolved",
+                started,
+                ingress_error(
+                    proto,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "We could not parse the JSON body of your request.",
+                ),
             );
         }
     };
@@ -379,12 +412,22 @@ async fn ingress_path_model(
             }
         }
         None => {
-            return ingress_error(
+            // Pre-routing failure (body is not a JSON object → model never resolved): route through
+            // `finish` with the bounded `"unresolved"` label so it is observable in metrics + the
+            // webhook, not a silent early-return.
+            return finish(
+                app,
+                gov,
                 proto,
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "Request body must be a JSON object.",
-            )
+                "unresolved",
+                started,
+                ingress_error(
+                    proto,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "Request body must be a JSON object.",
+                ),
+            );
         }
     }
 
@@ -399,11 +442,22 @@ async fn ingress_path_model(
             // Same leak class as the parse arms above: the serde_json Display detail is a
             // busbar-internal tell, so it is logged for operators but never returned to the client.
             tracing::debug!(error = %e, "injected request body re-serialization failed");
-            return ingress_error(
+            // Pre-routing failure (model never reached resolution): route through `finish` with the
+            // bounded `"unresolved"` label so it is observable in metrics + the webhook. This arm is
+            // effectively unreachable today (see the comment above), but keeping it on `finish`
+            // preserves the observability invariant for every pre-routing exit.
+            return finish(
+                app,
+                gov,
                 proto,
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "The request body could not be processed.",
+                "unresolved",
+                started,
+                ingress_error(
+                    proto,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "The request body could not be processed.",
+                ),
             );
         }
     };
@@ -576,6 +630,12 @@ pub(crate) async fn gemini_ingress(
     // back to "v1beta" only if the path is unexpectedly shaped (it always carries one of the two).
     let api_version = gemini_api_version(uri.path());
 
+    // Captured BEFORE the path-parse guards so a malformed-path / unsupported-action rejection
+    // (which never reaches `ingress_path_model`, where `started` is otherwise taken) is still
+    // counted through `finish` — the same pre-routing observability invariant the body/path cores
+    // enforce. Without it, a malformed gemini path was invisible to Prometheus and the webhook.
+    let started = Instant::now();
+
     // `rest` is everything after `/{version}/models/`, e.g. `foo:generateContent`. Split on the LAST
     // colon into (model, action). A missing colon (or an empty model/action) is NOT necessarily a
     // malformed Gemini path: the stable `/v1/models/{id}` prefix is SHARED with the OpenAI SDK's
@@ -593,25 +653,45 @@ pub(crate) async fn gemini_ingress(
     let (model, action) = match rest.rsplit_once(':') {
         Some((m, a)) if !m.is_empty() && !a.is_empty() => (m, a),
         _ => {
-            if crate::proto::proto_for_path(uri.path()) == "gemini" {
-                return ingress_error(
+            // Pre-routing failure (no parsable model/action in the path): the envelope protocol is
+            // the bounded `proto_for_path` literal, which doubles as the bounded metric
+            // `ingress_protocol` label; the model was never resolved, so the `pool` label is the
+            // bounded `"unresolved"` sentinel. Routing through `finish` keeps this malformed-path
+            // rejection observable in metrics + the webhook instead of a silent early-return.
+            let envelope_proto = crate::proto::proto_for_path(uri.path());
+            if envelope_proto == "gemini" {
+                return finish(
+                    &app,
+                    &gov,
                     "gemini",
-                    StatusCode::NOT_FOUND,
-                    "NOT_FOUND",
-                    &format!(
+                    "unresolved",
+                    started,
+                    ingress_error(
+                        "gemini",
+                        StatusCode::NOT_FOUND,
+                        "NOT_FOUND",
+                        &format!(
                 "Invalid resource path: models/{rest} is not found for API version {api_version}."
             ),
+                    ),
                 );
             }
             // Non-Gemini (ambiguous `/v1/models/...` without a Gemini action suffix): emit the
             // canonical OpenAI-shaped 404 the fallback handler uses for this path, so a GET/POST on
             // `/v1/models/{id}` produces the SAME envelope shape whether it hits this route or the
             // method fallback — no GET-vs-POST error-shape divergence a client could probe.
-            return ingress_error(
-                crate::proto::proto_for_path(uri.path()),
-                StatusCode::NOT_FOUND,
-                "not_found_error",
-                "the requested resource was not found",
+            return finish(
+                &app,
+                &gov,
+                envelope_proto,
+                "unresolved",
+                started,
+                ingress_error(
+                    envelope_proto,
+                    StatusCode::NOT_FOUND,
+                    "not_found_error",
+                    "the requested resource was not found",
+                ),
             );
         }
     };
@@ -635,22 +715,40 @@ pub(crate) async fn gemini_ingress(
         "streamGenerateContent" => true,
         "generateContent" => false,
         other => {
-            if crate::proto::proto_for_path(uri.path()) == "gemini" {
-                return ingress_error(
+            // Pre-routing failure (unsupported native action → model never resolved): route through
+            // `finish` with the bounded `proto_for_path` literal as both envelope + metric protocol
+            // and the bounded `"unresolved"` pool label, keeping it observable in metrics + webhook.
+            let envelope_proto = crate::proto::proto_for_path(uri.path());
+            if envelope_proto == "gemini" {
+                return finish(
+                    &app,
+                    &gov,
                     "gemini",
-                    StatusCode::NOT_FOUND,
-                    "NOT_FOUND",
-                    &format!(
-                        "models/{model} is not found for API version {api_version}, \
-                         or is not supported for {other}."
+                    "unresolved",
+                    started,
+                    ingress_error(
+                        "gemini",
+                        StatusCode::NOT_FOUND,
+                        "NOT_FOUND",
+                        &format!(
+                            "models/{model} is not found for API version {api_version}, \
+                             or is not supported for {other}."
+                        ),
                     ),
                 );
             }
-            return ingress_error(
-                crate::proto::proto_for_path(uri.path()),
-                StatusCode::NOT_FOUND,
-                "not_found_error",
-                "the requested resource was not found",
+            return finish(
+                &app,
+                &gov,
+                envelope_proto,
+                "unresolved",
+                started,
+                ingress_error(
+                    envelope_proto,
+                    StatusCode::NOT_FOUND,
+                    "not_found_error",
+                    "the requested resource was not found",
+                ),
             );
         }
     };
@@ -2493,6 +2591,195 @@ mod tests {
         assert!(
             scrape.contains("pool=\"unresolved\""),
             "unresolved model stamps the bounded `unresolved` sentinel; got:\n{scrape}"
+        );
+        handle.abort();
+    }
+
+    /// Sum every `busbar_requests_total` counter value whose label set contains BOTH the given
+    /// `pool="…"` and `outcome="…"` fragments, parsed straight out of the Prometheus text exposition.
+    /// Used by the pre-routing-observability regressions to assert a STRICT increase (the metric was
+    /// actually incremented) rather than mere label presence — the only signal that distinguishes the
+    /// fixed code (request flows through `finish`) from the old early-return (no counter at all).
+    fn requests_total_for(scrape: &str, pool: &str, outcome: &str) -> u64 {
+        let pool_frag = format!("pool=\"{pool}\"");
+        let outcome_frag = format!("outcome=\"{outcome}\"");
+        scrape
+            .lines()
+            .filter(|l| l.starts_with(crate::metrics::REQUESTS_TOTAL))
+            .filter(|l| l.contains(&pool_frag) && l.contains(&outcome_frag))
+            .filter_map(|l| l.rsplit(' ').next())
+            .filter_map(|v| v.trim().parse::<u64>().ok())
+            .sum()
+    }
+
+    /// MED #4 (re-audit, completeness): a JSON-parse failure on a BODY-MODEL ingress (openai) is a
+    /// PRE-ROUTING error — the model is never resolved. It must still flow through `finish` so it is
+    /// counted in `REQUESTS_TOTAL` (and the duration histogram + request-log webhook), with the
+    /// bounded `pool="unresolved"` label. The old code early-returned `ingress_error` directly,
+    /// leaving the malformed-body request invisible to Prometheus — this test asserts a STRICT
+    /// increase of the `unresolved`/`client_error` counter across the request, so it fails against
+    /// that old behavior.
+    #[tokio::test]
+    async fn test_body_model_parse_error_is_observable() {
+        crate::metrics::init();
+        // No backend needed: the request never gets past the body parse.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "foo",
+                    crate::proto::Protocol::openai(),
+                    "http://127.0.0.1:1",
+                )
+                .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let before = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("t")
+            .body("{ this is not json ")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "malformed body is a 400");
+
+        let after = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+        assert!(
+            after > before,
+            "a parse-error pre-routing failure must increment REQUESTS_TOTAL \
+             (pool=unresolved,outcome=client_error): before={before} after={after}"
+        );
+        handle.abort();
+    }
+
+    /// MED #4 (re-audit, completeness): a MISSING `model` field on a body-model ingress is likewise a
+    /// pre-routing failure and must flow through `finish` (bounded `pool="unresolved"`), not a silent
+    /// early-return. Asserts a strict counter increase, so it fails against the old early-return.
+    #[tokio::test]
+    async fn test_body_model_missing_model_is_observable() {
+        crate::metrics::init();
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "foo",
+                    crate::proto::Protocol::openai(),
+                    "http://127.0.0.1:1",
+                )
+                .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let before = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("t")
+            // Valid JSON object, but no `model`.
+            .body(json!({"messages": [{"role": "user", "content": "hi"}]}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "missing model is a 400");
+
+        let after = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+        assert!(
+            after > before,
+            "a missing-model pre-routing failure must increment REQUESTS_TOTAL \
+             (pool=unresolved,outcome=client_error): before={before} after={after}"
+        );
+        handle.abort();
+    }
+
+    /// MED #4 (re-audit, completeness): a NON-OBJECT body on a PATH-MODEL ingress (bedrock) is a
+    /// pre-routing failure (`v.as_object_mut()` is `None`) and must flow through `finish` with the
+    /// bounded `pool="unresolved"` label. Asserts a strict counter increase; fails against the old
+    /// early-return that bypassed `finish`.
+    #[tokio::test]
+    async fn test_path_model_non_object_body_is_observable() {
+        crate::metrics::init();
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "foo",
+                    crate::proto::Protocol::openai(),
+                    "http://127.0.0.1:1",
+                )
+                .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let before = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+
+        // Valid JSON, but a top-level ARRAY (not an object) — `as_object_mut` returns `None`.
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/model/foo/converse"))
+            .bearer_auth("t")
+            .body(json!([1, 2, 3]).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "non-object body is a 400");
+
+        let after = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+        assert!(
+            after > before,
+            "a non-object-body pre-routing failure must increment REQUESTS_TOTAL \
+             (pool=unresolved,outcome=client_error): before={before} after={after}"
+        );
+        handle.abort();
+    }
+
+    /// MED #4 (re-audit, completeness — sibling sweep): an UNSUPPORTED gemini action (e.g.
+    /// `:countTokens`) rejected in `gemini_ingress` BEFORE `ingress_path_model` runs is the same
+    /// pre-routing observability blind spot. It must now flow through `finish` (bounded
+    /// `pool="unresolved"`, gemini protocol). Asserts a strict counter increase; fails against the
+    /// old early-return.
+    #[tokio::test]
+    async fn test_gemini_unsupported_action_is_observable() {
+        crate::metrics::init();
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "foo",
+                    crate::proto::Protocol::openai(),
+                    "http://127.0.0.1:1",
+                )
+                .provider("zai"),
+            )
+            .pool("foo", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let before = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+
+        // `:countTokens` is a genuine Gemini action suffix (so the path stays gemini-classified) but
+        // is NOT one of the two proxied generate actions → unsupported-action 404 in gemini_ingress.
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1beta/models/foo:countTokens"))
+            .bearer_auth("t")
+            .body(json!({"contents": []}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "unsupported gemini action is a 404"
+        );
+
+        let after = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+        assert!(
+            after > before,
+            "an unsupported-action pre-routing failure must increment REQUESTS_TOTAL \
+             (pool=unresolved,outcome=client_error): before={before} after={after}"
         );
         handle.abort();
     }

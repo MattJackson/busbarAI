@@ -94,6 +94,32 @@ fn bedrock_stream_exception_for(err: &crate::proto::IrError) -> (&'static str, S
 /// so a bare `image_s3` token can never collide with one.
 const IMAGE_S3_SENTINEL: &str = "image_s3";
 
+/// `extra` key under which the Bedrock reader stashes the positions of native Converse `cachePoint`
+/// content blocks (the prompt-cache markers, `{"cachePoint": {"type": "default"}}`) that appear
+/// INSIDE the `system` array and inside each message's `content` array.
+///
+/// A `cachePoint` block has NO IR `IrBlock` counterpart (the IR models only
+/// Text/Thinking/ToolUse/ToolResult/Image), so without this capture the reader silently DROPPED
+/// every `cachePoint` on a same-protocol Bedrock passthrough — disabling prompt caching the caller
+/// explicitly requested and turning a cache HIT into a full re-bill of the cached prefix on every
+/// turn (a real cost regression). It is a Bedrock-NATIVE marker with no cross-protocol meaning, so
+/// stashing it in `extra` is exactly right: it survives a same-protocol round-trip and is correctly
+/// dropped on the cross-protocol seam (where `extra` is cleared) rather than leaking a Bedrock-only
+/// token onto a foreign wire.
+///
+/// The stash records each block's ORIGINAL absolute index in its native array so `write_request`
+/// can splice it back at the same position. Shape:
+/// ```json
+/// {
+///   "system":   [ { "i": <usize>, "block": <cachePoint value> }, ... ],
+///   "messages": [ { "m": <usize>, "i": <usize>, "block": <cachePoint value> }, ... ]
+/// }
+/// ```
+/// The leading `__busbar` prefix keeps it from colliding with any real Bedrock top-level key, and
+/// `write_request` consumes it (never re-emitting it via the trailing extra-merge), so the sentinel
+/// never appears on the wire.
+const CACHE_POINTS_SENTINEL: &str = "__busbar_bedrock_cache_points";
+
 /// Build a native Bedrock Converse `image` block body (`{ "format", "source": { "bytes" } }`) from
 /// an IR `Image (media_type, data)` pair, or `None` when the image cannot be represented natively.
 ///
@@ -170,6 +196,38 @@ fn bedrock_image_block(media_type: &str, data: &str) -> Option<serde_json::Value
         "format": format_str,
         "source": { "bytes": data }
     }))
+}
+
+/// Splice captured `cachePoint` blocks back into a freshly-written content array at the ORIGINAL
+/// absolute positions the reader recorded, reconstructing the native ordering on a same-protocol
+/// passthrough. `entries` are the per-array stash records (`{ "i": <usize>, "block": <value> }`)
+/// pulled from the `CACHE_POINTS_SENTINEL` object; a record missing `i`/`block`, or whose index
+/// exceeds the current array length, is skipped rather than mis-placed (defensive — the reader
+/// always writes both fields with an in-range index, but `extra` survives an arbitrary
+/// cross-protocol hop and an out-of-range index must never panic on the request path).
+///
+/// Records are applied in ASCENDING index order: each insertion shifts later elements right by one,
+/// and because the reader recorded indices against the ORIGINAL array (which contained the
+/// cachePoints), inserting at the recorded index in ascending order reproduces the original layout
+/// exactly. Insertion uses a bounds-clamped `min(len)` so a stale/foreign index lands at the end
+/// instead of panicking.
+fn splice_cache_points(arr: &mut Vec<serde_json::Value>, entries: &[serde_json::Value]) {
+    // Collect (index, block) pairs, then sort by index so ascending insertion preserves layout.
+    let mut pending: Vec<(usize, serde_json::Value)> = Vec::new();
+    for entry in entries {
+        let Some(idx) = entry.get("i").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let Some(block) = entry.get("block") else {
+            continue;
+        };
+        pending.push((idx as usize, block.clone()));
+    }
+    pending.sort_by_key(|(idx, _)| *idx);
+    for (idx, block) in pending {
+        let pos = idx.min(arr.len());
+        arr.insert(pos, block);
+    }
 }
 
 /// Derive the AWS region for SigV4 scope from a Bedrock endpoint host.
@@ -502,22 +560,36 @@ impl ProtocolReader for BedrockReader {
             }
         }
 
+        // Captures native `cachePoint` markers (with their ORIGINAL absolute array index) so the
+        // writer can re-emit them at the same position on a same-protocol passthrough. See
+        // `CACHE_POINTS_SENTINEL`. Kept as `Value`s ready to nest under the sentinel object.
+        let mut system_cache_points: Vec<serde_json::Value> = Vec::new();
+        let mut message_cache_points: Vec<serde_json::Value> = Vec::new();
+
         let mut system_blocks: Vec<crate::ir::IrBlock> = Vec::new();
         if let Some(system_arr) = obj.get("system").and_then(|s| s.as_array()) {
-            for sys_val in system_arr {
+            for (idx, sys_val) in system_arr.iter().enumerate() {
                 if let Some(text_val) = sys_val.get("text").and_then(|t| t.as_str()) {
                     system_blocks.push(crate::ir::IrBlock::Text {
                         text: text_val.to_string(),
                         cache_control: None,
                         citations: Vec::new(),
                     });
+                } else if let Some(cache_point) = sys_val.get("cachePoint") {
+                    // No IR counterpart for a prompt-cache marker; stash it with its original index
+                    // so the writer re-emits it verbatim at the same position (a same-protocol
+                    // passthrough keeps prompt caching enabled instead of silently dropping it).
+                    system_cache_points.push(serde_json::json!({
+                        "i": idx,
+                        "block": { "cachePoint": cache_point.clone() },
+                    }));
                 }
             }
         }
 
         let mut messages: Vec<crate::ir::IrMessage> = Vec::new();
         if let Some(msgs_arr) = obj.get("messages").and_then(|m| m.as_array()) {
-            for msg_val in msgs_arr {
+            for (msg_idx, msg_val) in msgs_arr.iter().enumerate() {
                 let role_str = msg_val.get("role").and_then(|r| r.as_str()).unwrap_or("");
 
                 let role = match role_str {
@@ -534,7 +606,7 @@ impl ProtocolReader for BedrockReader {
 
                 let mut msg_content: Vec<crate::ir::IrBlock> = Vec::new();
                 if let Some(content_arr) = msg_val.get("content").and_then(|c| c.as_array()) {
-                    for content_val in content_arr {
+                    for (block_idx, content_val) in content_arr.iter().enumerate() {
                         if let Some(text_val) = content_val.get("text").and_then(|t| t.as_str()) {
                             msg_content.push(crate::ir::IrBlock::Text {
                                 text: text_val.to_string(),
@@ -629,6 +701,16 @@ impl ProtocolReader for BedrockReader {
                             if let Some(block) = read_bedrock_image_block(image) {
                                 msg_content.push(block);
                             }
+                        } else if let Some(cache_point) = content_val.get("cachePoint") {
+                            // No IR counterpart for a prompt-cache marker; stash it with its
+                            // (message, block) index so the writer re-emits it verbatim at the same
+                            // position on a same-protocol passthrough (prompt caching stays enabled
+                            // instead of being silently dropped — a real cost regression otherwise).
+                            message_cache_points.push(serde_json::json!({
+                                "m": msg_idx,
+                                "i": block_idx,
+                                "block": { "cachePoint": cache_point.clone() },
+                            }));
                         }
                     }
                 }
@@ -704,6 +786,30 @@ impl ProtocolReader for BedrockReader {
         let top_p = inference_config.and_then(|ic| ic.get("topP").and_then(|v| v.as_f64()));
         let stop =
             crate::ir::read_stop_sequences(inference_config.and_then(|ic| ic.get("stopSequences")));
+
+        // Stash any captured `cachePoint` markers (with their original positions) under the sentinel
+        // so `write_request` re-emits them at the same spots on a same-protocol passthrough. Only
+        // inserted when at least one was present, so a request that never used prompt caching does
+        // not gain a stray key (and the byte-exact round-trip of a cache-free body is preserved).
+        if !system_cache_points.is_empty() || !message_cache_points.is_empty() {
+            let mut cache_points = serde_json::Map::new();
+            if !system_cache_points.is_empty() {
+                cache_points.insert(
+                    "system".to_string(),
+                    serde_json::Value::Array(system_cache_points),
+                );
+            }
+            if !message_cache_points.is_empty() {
+                cache_points.insert(
+                    "messages".to_string(),
+                    serde_json::Value::Array(message_cache_points),
+                );
+            }
+            extra.insert(
+                CACHE_POINTS_SENTINEL.to_string(),
+                serde_json::Value::Object(cache_points),
+            );
+        }
 
         Ok(crate::ir::IrRequest {
             system: system_blocks,
@@ -1249,8 +1355,24 @@ impl ProtocolWriter for BedrockWriter {
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
         let mut out = serde_json::Map::new();
 
-        if !req.system.is_empty() {
-            let text_arr: Vec<serde_json::Value> = req
+        // The captured native `cachePoint` markers (see `CACHE_POINTS_SENTINEL`). On a same-protocol
+        // passthrough this carries the prompt-cache markers the reader stashed; on cross-protocol
+        // egress `extra` is cleared so this is absent and no Bedrock-only marker leaks onto a foreign
+        // wire. Borrowed once here; the `system`/`messages` sub-arrays are spliced back below and the
+        // sentinel is then SKIPPED by the trailing extra-merge so it never reaches the wire.
+        let cache_points = req
+            .extra
+            .get(CACHE_POINTS_SENTINEL)
+            .and_then(|v| v.as_object());
+        let system_cache_points = cache_points
+            .and_then(|cp| cp.get("system"))
+            .and_then(|v| v.as_array());
+        let message_cache_points = cache_points
+            .and_then(|cp| cp.get("messages"))
+            .and_then(|v| v.as_array());
+
+        if !req.system.is_empty() || system_cache_points.is_some() {
+            let mut text_arr: Vec<serde_json::Value> = req
                 .system
                 .iter()
                 .filter_map(|block| match block {
@@ -1261,13 +1383,19 @@ impl ProtocolWriter for BedrockWriter {
                 })
                 .collect();
 
+            // Re-emit any captured `cachePoint` markers at their original positions so prompt
+            // caching survives a same-protocol round-trip instead of being silently dropped.
+            if let Some(entries) = system_cache_points {
+                splice_cache_points(&mut text_arr, entries);
+            }
+
             if !text_arr.is_empty() {
                 out.insert("system".to_string(), serde_json::Value::Array(text_arr));
             }
         }
 
         let mut msgs_arr: Vec<serde_json::Value> = Vec::new();
-        for msg in &req.messages {
+        for (msg_idx, msg) in req.messages.iter().enumerate() {
             let role_str = match msg.role {
                 crate::ir::IrRole::User => "user",
                 crate::ir::IrRole::Assistant => "assistant",
@@ -1356,6 +1484,21 @@ impl ProtocolWriter for BedrockWriter {
                     }
                     crate::ir::IrBlock::Thinking { .. } => {}
                 }
+            }
+
+            // Re-emit any captured `cachePoint` markers for THIS message at their original
+            // positions so prompt caching survives a same-protocol round-trip. Spliced BEFORE the
+            // empty-content placeholder below so a message whose only block was a `cachePoint`
+            // re-emits the marker rather than a bare `""` placeholder. `msg_idx` matches the
+            // reader's recorded message index on the Bedrock passthrough path (the Bedrock reader
+            // only emits User/Assistant turns, so no System-role `continue` desyncs the count).
+            if let Some(entries) = message_cache_points {
+                let for_this_msg: Vec<serde_json::Value> = entries
+                    .iter()
+                    .filter(|e| e.get("m").and_then(|v| v.as_u64()) == Some(msg_idx as u64))
+                    .cloned()
+                    .collect();
+                splice_cache_points(&mut content_arr, &for_this_msg);
             }
 
             // A user/assistant/tool turn whose blocks were ALL non-representable (e.g. a
@@ -1477,6 +1620,13 @@ impl ProtocolWriter for BedrockWriter {
             // the typed `maxTokens`/`temperature` (inferenceConfig) or `tools` (toolConfig). Every
             // other unmodeled field passes through verbatim.
             if key == "inferenceConfig" || key == "toolConfig" {
+                continue;
+            }
+            // The cachePoint stash is a busbar-internal sentinel, NOT a real Bedrock top-level
+            // field — it was already consumed above (spliced back into `system`/`messages`). Emitting
+            // it verbatim would leak the sentinel object onto the wire (an invalid body and a proxy
+            // tell), so skip it here. Mirrors the inferenceConfig/toolConfig consume-don't-re-emit.
+            if key == CACHE_POINTS_SENTINEL {
                 continue;
             }
             out.insert(key.clone(), value.clone());
@@ -4729,6 +4879,135 @@ mod tests {
                 .pointer("/usage/totalTokens")
                 .and_then(|v| v.as_u64()),
             Some(18)
+        );
+    }
+
+    /// Regression (R20 MED #7): native Converse `cachePoint` blocks (the prompt-cache markers) that
+    /// appear inside the `system` array and inside a message's `content` array were SILENTLY DROPPED
+    /// by `read_request` (no IR `IrBlock` counterpart), so a same-protocol Bedrock->Bedrock
+    /// passthrough re-emitted a body with prompt caching disabled — a real cost regression (a cache
+    /// HIT becomes a full re-bill of the cached prefix every turn). They must now survive the
+    /// read->write round-trip at their ORIGINAL positions. This test FAILS against the old code
+    /// (the cachePoint blocks vanish) and passes after.
+    #[test]
+    fn test_cache_point_round_trip() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let wire = serde_json::json!({
+            "system": [
+                {"text": "you are a helpful assistant with a long static preamble"},
+                {"cachePoint": {"type": "default"}}
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"text": "first big doc"},
+                    {"cachePoint": {"type": "default"}},
+                    {"text": "now the question"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"text": "an answer"}
+                ]}
+            ]
+        });
+
+        let ir = reader.read_request(&wire).expect("read_request");
+        // The markers are stashed under the busbar-internal sentinel (Bedrock-native, no
+        // cross-protocol meaning — so it lives in `extra`, not a first-class IR field).
+        assert!(
+            ir.extra.contains_key(CACHE_POINTS_SENTINEL),
+            "cachePoint markers must be captured into extra; got {:?}",
+            ir.extra
+        );
+
+        let out = writer.write_request(&ir);
+        // The sentinel must NEVER leak onto the wire.
+        assert!(
+            out.get(CACHE_POINTS_SENTINEL).is_none(),
+            "the cachePoint sentinel must not appear on the wire; got {out}"
+        );
+        // The whole body round-trips byte-identically: every cachePoint re-emitted at its position.
+        assert_eq!(
+            out, wire,
+            "cachePoint markers must survive the round-trip at their original positions; got {out}"
+        );
+    }
+
+    /// Regression (R20 MED #7): a message whose ONLY content block is a `cachePoint` (no
+    /// representable text/tool block) must re-emit the marker rather than the empty-content `""`
+    /// placeholder — the splice runs BEFORE the placeholder substitution, so the cachePoint keeps
+    /// the turn non-empty and the prompt-cache boundary intact.
+    #[test]
+    fn test_cache_point_only_message_round_trip() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let wire = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"text": "context block"}
+                ]},
+                {"role": "user", "content": [
+                    {"cachePoint": {"type": "default"}}
+                ]}
+            ]
+        });
+
+        let ir = reader.read_request(&wire).expect("read_request");
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out, wire,
+            "a cachePoint-only message must re-emit the marker, not a '' placeholder; got {out}"
+        );
+        // Specifically: the second message's single block is the cachePoint, NOT a bare text "".
+        assert_eq!(
+            out.pointer("/messages/1/content/0/cachePoint"),
+            Some(&serde_json::json!({"type": "default"})),
+            "the cachePoint-only message must carry the marker; got {out}"
+        );
+    }
+
+    /// A request that NEVER used prompt caching must not gain a stray sentinel key, and its body must
+    /// round-trip byte-identically (the cachePoint capture is opt-in: zero markers → no `extra`
+    /// entry, no behavioural change).
+    #[test]
+    fn test_no_cache_point_no_sentinel() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let wire = serde_json::json!({
+            "system": [{"text": "plain system"}],
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}]
+        });
+
+        let ir = reader.read_request(&wire).expect("read_request");
+        assert!(
+            !ir.extra.contains_key(CACHE_POINTS_SENTINEL),
+            "no cachePoint marker → no sentinel key; got {:?}",
+            ir.extra
+        );
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out, wire,
+            "cache-free body must round-trip byte-identically"
+        );
+    }
+
+    /// `splice_cache_points` must NOT panic on a stale/foreign index (e.g. an `extra` that survived
+    /// an unexpected hop): an out-of-range `i` is bounds-clamped to the array end, never indexing
+    /// past it. Guards the no-panic-on-the-request-path rule.
+    #[test]
+    fn test_splice_cache_points_out_of_range_does_not_panic() {
+        let mut arr = vec![serde_json::json!({"text": "only block"})];
+        let entries = vec![
+            serde_json::json!({"i": 999, "block": {"cachePoint": {"type": "default"}}}),
+            // Missing fields are skipped, not panicked on.
+            serde_json::json!({"block": {"cachePoint": {"type": "default"}}}),
+            serde_json::json!({"i": 0}),
+        ];
+        splice_cache_points(&mut arr, &entries);
+        // The valid (clamped) entry landed at the end; the malformed ones were skipped.
+        assert_eq!(arr.len(), 2);
+        assert_eq!(
+            arr[1].pointer("/cachePoint"),
+            Some(&serde_json::json!({"type": "default"}))
         );
     }
 }

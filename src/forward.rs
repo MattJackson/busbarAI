@@ -1165,6 +1165,13 @@ struct FirstByteBody<S, P> {
     /// When set, the token usage tapped from this response is charged to a virtual key's budget at
     /// stream end (token-accurate accounting). Taken (fired) exactly once when the stream completes.
     usage_sink: Option<UsageSink>,
+    /// True when the 2xx-headers `spend_budget(lane_idx)` on this request actually decremented the
+    /// lane's `max_requests` budget. A pre-first-byte upstream transport failure on the streaming
+    /// path delivers NO usable body, so it must refund that unit — symmetric with the buffered
+    /// `ReadEnd::TransportError` path (#21). Guarding the refund on this flag keeps `refund_budget`
+    /// (an unconditional `fetch_add`) from raising the budget above its cap when the spend was a
+    /// no-op (unlimited lane, or budget already 0). Cleared once a refund fires so it happens once.
+    budget_spent: bool,
     /// Set once the stream has fully ended (after any translation terminator), so a later poll
     /// returns None instead of re-polling a finished inner stream.
     ended: bool,
@@ -1187,6 +1194,7 @@ where
         translate: Option<crate::proto::StreamTranslate>,
         json_array: Option<crate::proto::GeminiJsonArrayFramer>,
         usage_sink: Option<UsageSink>,
+        budget_spent: bool,
     ) -> Self {
         Self {
             inner,
@@ -1203,6 +1211,7 @@ where
             translate,
             json_array,
             usage_sink,
+            budget_spent,
             ended: false,
         }
     }
@@ -1371,6 +1380,25 @@ where
                             error = %e,
                             "pre-first-byte upstream transport error; terminating body stream generically"
                         );
+                        // Symmetric with the buffered `ReadEnd::TransportError` path (#21): the 2xx
+                        // headers already spent one `max_requests` budget unit on this lane, but a
+                        // pre-first-byte body transport failure delivers NO usable response — so refund
+                        // that unit, or sustained streaming transport failures would permanently drain
+                        // the lane's serving-capacity budget one unit at a time (MED #3). The streaming
+                        // path previously refunded nothing here while the buffered paths did. Refund
+                        // ONLY when the headers-spend actually decremented (`budget_spent`): a no-op
+                        // spend (unlimited lane, or budget already 0) must not be refunded, since
+                        // `refund_budget` is an unconditional `fetch_add` that would otherwise push the
+                        // budget above its cap. Mark the stream ended and clear the flag so the inner
+                        // stream's trailing `Poll::Ready(None)` neither double-refunds nor token-bills.
+                        if this.budget_spent {
+                            if let Some(ref app) = this.app {
+                                app.store.refund_budget(this.lane_idx);
+                            }
+                            this.budget_spent = false;
+                        }
+                        drop(this.permit.take());
+                        this.ended = true;
                         return Poll::Ready(Some(Err(std::io::Error::other(
                             MID_STREAM_GENERIC_DETAIL,
                         ))));
@@ -1704,6 +1732,18 @@ pub(crate) fn host_from_base(base: &str) -> String {
         .strip_prefix("https://")
         .or_else(|| base.strip_prefix("http://"))
         .unwrap_or(base);
+    // Normalize backslash → forward slash BEFORE locating the authority boundary. The WHATWG URL
+    // parser the `url` crate (and thus reqwest) uses treats `\` as an authority/path delimiter
+    // exactly like `/`, so reqwest connects to the host that ENDS at the first backslash. Splitting
+    // here only on `/?#` (a backslash-blind split, the SAME defect `ssrf_blocked_host` had) would
+    // make this function read PAST the backslash: e.g. `https://evil.example.com\@victim.example/`
+    // connects to `evil.example.com` on the wire, but a `/?#`-only split yields authority
+    // `evil.example.com\@victim.example` whose `rfind('@')` returns `victim.example` — a signed
+    // `Host` that DESYNCS from the host actually contacted (SigV4 signs one host, the TCP/TLS layer
+    // dials another). Folding `\`→`/` first makes the authority boundary — and the returned signed
+    // host — match what reqwest dials, byte-for-byte.
+    let no_scheme = no_scheme.replace('\\', "/");
+    let no_scheme = no_scheme.as_str();
     // The authority ends at the first `/`, `?`, or `#`; userinfo (if any) precedes the LAST `@`
     // within that authority. Split on the authority boundary first so an `@` appearing later in a
     // path/query (not userinfo) is never mistaken for a userinfo delimiter. Only the authority is
@@ -2866,6 +2906,7 @@ pub(crate) async fn forward_with_pool(
                     translate,
                     json_array,
                     usage_sink,
+                    budget_spent,
                 );
                 let axum_body = guarded_body.into_body();
 
@@ -3446,6 +3487,7 @@ async fn forward_once(
                 translate,
                 json_array,
                 usage_sink,
+                budget_spent,
             );
             let mut rb = Response::builder().status(status);
             // Cross-protocol streaming: the body is reframed to the client's format, so the CT must
@@ -4407,6 +4449,38 @@ mod auth_style_tests {
         // Userinfo stripped AND path discarded together.
         assert_eq!(
             host_from_base("https://user:pass@host.example.com/p"),
+            "host.example.com"
+        );
+    }
+
+    #[test]
+    fn test_host_from_base_backslash_authority_matches_wire_host() {
+        // CLASS-SIBLING of the SSRF backslash defect: the WHATWG URL parser the `url` crate (and
+        // thus reqwest) uses treats `\` as an authority/path delimiter exactly like `/`, so reqwest
+        // dials the host that ENDS at the first backslash. A `/?#`-only split read PAST the
+        // backslash and (via `rfind('@')`) returned a DIFFERENT host than reqwest connects to,
+        // desyncing the SigV4-signed `Host` from the host actually contacted.
+        use super::host_from_base;
+        // Backslash where a `/` would normally start the path: reqwest connects to
+        // `evil.example.com`; the signed host must be the SAME, not the post-`@` `victim.example`.
+        assert_eq!(
+            host_from_base("https://evil.example.com\\@victim.example/path"),
+            "evil.example.com"
+        );
+        // Bare backslash path delimiter, no userinfo trickery: authority still ends at the `\`.
+        assert_eq!(
+            host_from_base("https://host.example.com\\some\\path"),
+            "host.example.com"
+        );
+        // Backslash before a port-bearing authority boundary: port survives, backslash path gone.
+        assert_eq!(
+            host_from_base("https://host.example.com:8443\\v1\\foo"),
+            "host.example.com:8443"
+        );
+        // Legitimate userinfo with a backslash path AFTER the real authority: userinfo stripped,
+        // authority ends at the backslash, the real host survives.
+        assert_eq!(
+            host_from_base("https://user:pass@host.example.com\\p"),
             "host.example.com"
         );
     }
@@ -6353,6 +6427,85 @@ data: {"type":"message_stop"}"#
                 "400 body must NOT leak serde_json Display internals ({needle:?}); got {text}"
             );
         }
+    }
+
+    /// REGRESSION (R20 MED #3, budget symmetry): on the STREAMING (`is_sse`) path the 2xx headers
+    /// already spent one `max_requests` budget unit, but a PRE-FIRST-BYTE upstream body transport
+    /// failure delivers no usable response. The buffered `ReadEnd::TransportError` paths refund that
+    /// unit (#21); the streaming path previously refunded NOTHING — every streaming transport failure
+    /// permanently drained one serving-capacity unit. `FirstByteBody`'s pre-first-byte error arm must
+    /// now refund symmetrically (guarded by `budget_spent`).
+    #[tokio::test]
+    async fn test_streaming_pre_first_byte_transport_error_refunds_budget() {
+        use super::FirstByteBody;
+        use bytes::Bytes;
+        use futures::StreamExt as _;
+
+        // Lane 0: budget-limited with a single remaining unit.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "m",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1",
+                )
+                .budget(1),
+            )
+            .pool("p", &[(0, 1)])
+            .build();
+
+        // Spend the one unit, exactly as the 2xx-headers path does before streaming. The budget is
+        // now 0 and `budget_spent` is true.
+        let budget_spent = app.store.spend_budget(0);
+        assert!(budget_spent, "the headers-spend must decrement the unit");
+        assert!(
+            !app.store.spend_budget(0),
+            "budget is exhausted after the single unit is spent (no refund yet)"
+        );
+
+        // A REAL `reqwest::Error`: connect-refused to a closed loopback port. This is the pre-first-
+        // byte failure shape the streaming body sees when the upstream socket dies before any byte.
+        let reqwest_err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/never")
+            .send()
+            .await
+            .expect_err("connect to a closed port must fail");
+
+        // The inner upstream stream yields ONLY that error — no byte ever reaches the client, so this
+        // exercises the pre-first-byte (`else`) arm, not the mid-stream arm. `Box::pin` makes the
+        // one-shot stream `Unpin`, which `FirstByteBody`'s `Stream` impl requires of its inner.
+        let inner = Box::pin(futures::stream::once(async move {
+            Err::<Bytes, reqwest::Error>(reqwest_err)
+        }));
+        let body = FirstByteBody::new(
+            inner,
+            true, // is_sse: streaming path
+            "anthropic",
+            (), // permit: a unit placeholder is sufficient for the Stream bounds
+            app.clone(),
+            0,
+            std::sync::Arc::new(crate::store::BreakerCfg::default()),
+            "p",
+            None,
+            None,
+            None,
+            budget_spent,
+        );
+        futures::pin_mut!(body);
+
+        // First poll surfaces the generic transport error item (the body terminates on it).
+        let first = body.next().await;
+        assert!(
+            matches!(first, Some(Err(_))),
+            "pre-first-byte transport failure must terminate the body with an error item"
+        );
+
+        // The compensating refund must have restored the unit: a fresh spend now succeeds. Without
+        // the fix the budget stays at 0 and this spend returns false.
+        assert!(
+            app.store.spend_budget(0),
+            "streaming pre-first-byte transport failure must refund the spent budget unit (MED #3)"
+        );
     }
 }
 
