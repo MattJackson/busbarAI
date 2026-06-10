@@ -261,6 +261,29 @@ impl ProtocolReader for ResponsesReader {
                 Err(_) => (None, None),
             };
 
+        // Native /v1/responses already carries `code: "context_length_exceeded"` on the oversized
+        // path, so the common case flows straight through. But some upstreams (and the OpenAI
+        // Chat-Completions-shaped surface this proxy also fronts) signal the same condition only via
+        // the error MESSAGE — e.g. `This model's maximum context length is 8192 tokens...` — with a
+        // null or generic `code`. Mirror anthropic.rs: when no canonical code was parsed, scan the
+        // body for the protocol's context-length phrasing and synthesize the canonical code so the
+        // breaker pipeline (normalize_raw_error, breaker.rs ~122) → StatusClass::ContextLength and
+        // oversized-request failover triggers WITHOUT penalizing the lane. This is the production
+        // counterpart of the `#[cfg(test)] classify()` helper's message scan below.
+        let provider_code = provider_code.or_else(|| {
+            let lower = String::from_utf8_lossy(body).to_lowercase();
+            if lower.contains("maximum context length")
+                || lower.contains("reduce the length")
+                || lower.contains("context length exceeded")
+                || (lower.contains("exceeds")
+                    && (lower.contains("context") || lower.contains("token limit")))
+            {
+                Some("context_length_exceeded".to_string())
+            } else {
+                None
+            }
+        });
+
         crate::breaker::RawUpstreamError {
             http_status: status.as_u16(),
             provider_code,
@@ -1549,8 +1572,19 @@ impl ResponsesWriter {
     /// Record that a function-call `output_item.added` was emitted at `index`, so the matching
     /// `BlockStop` knows to emit `output_item.done` for it. Lock poisoning degrades to a no-op
     /// rather than panicking on the request path.
+    ///
+    /// Applies the same cardinality discipline as `open_text_item`: a `contains` guard makes the
+    /// insert idempotent (a re-marked index does not grow the set), and a `MAX_OPEN_TOOLS` cap
+    /// bounds per-stream memory so a pathological backend streaming an unbounded run of distinct
+    /// function-call indices cannot grow `open_tool_indices` without limit (resource exhaustion).
     fn mark_tool_open(&self, index: usize) {
         if let Ok(mut set) = self.open_tool_indices.lock() {
+            if set.contains(&index) {
+                return;
+            }
+            if set.len() >= MAX_OPEN_TOOLS {
+                return;
+            }
             set.insert(index);
         }
     }
@@ -5471,6 +5505,80 @@ mod tests {
             opened <= MAX_OPEN_TOOLS,
             "writer must open at most MAX_OPEN_TOOLS text items, opened {opened}"
         );
+    }
+
+    /// Regression (LOW/resource, R21 #20): `mark_tool_open` must apply the same cardinality
+    /// discipline as `open_text_item` — a `contains` guard (idempotent re-mark) plus a
+    /// `MAX_OPEN_TOOLS` cap — so a pathological backend streaming an unbounded run of distinct
+    /// function-call indices cannot grow `open_tool_indices` without bound (memory exhaustion).
+    /// Before the fix this set grew one entry per distinct index with no ceiling.
+    #[test]
+    fn test_writer_open_tool_indices_capped() {
+        let writer = ResponsesWriter;
+        // Feed many distinct indices: re-marking is idempotent and the set is capped.
+        for i in 0..(MAX_OPEN_TOOLS + 200) {
+            writer.mark_tool_open(i);
+        }
+        // Re-mark already-tracked indices: must not grow the set further.
+        for i in 0..MAX_OPEN_TOOLS {
+            writer.mark_tool_open(i);
+        }
+        let len = writer
+            .open_tool_indices
+            .lock()
+            .map(|s| s.len())
+            .expect("lock held only by this test");
+        assert!(
+            len <= MAX_OPEN_TOOLS,
+            "open_tool_indices must be capped at MAX_OPEN_TOOLS, got {len}"
+        );
+    }
+
+    /// Regression (MED/completeness, R21 #17): production `extract_error` must synthesize the
+    /// canonical `context_length_exceeded` code when an oversized-context error carries the
+    /// condition only in its MESSAGE (null/generic `code`). Without this the breaker pipeline never
+    /// sees `StatusClass::ContextLength` and oversized-request failover does not trigger for this
+    /// protocol. Mirrors anthropic.rs's message-scan synthesis. Before the fix `provider_code` was
+    /// `None` here (only the `#[cfg(test)] classify()` helper recognized the message).
+    #[test]
+    fn test_extract_error_synthesizes_context_length_from_message() {
+        let reader = ResponsesReader;
+        // A real OpenAI-shaped oversized-context body: the canonical code is absent; the signal
+        // lives in the human-readable message.
+        let body = br#"{"error":{"message":"This model's maximum context length is 8192 tokens, however you requested 9000 tokens. Please reduce the length of the messages.","type":"invalid_request_error","param":"messages","code":null}}"#;
+        let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "message-only context-length error must synthesize the canonical code for failover"
+        );
+        assert_eq!(
+            raw.structured_type.as_deref(),
+            Some("invalid_request_error")
+        );
+    }
+
+    /// A native body that already carries `code: "context_length_exceeded"` must pass through
+    /// unchanged (the synthesis is `.or_else`, so a real code always wins).
+    #[test]
+    fn test_extract_error_preserves_native_context_length_code() {
+        let reader = ResponsesReader;
+        let body = br#"{"error":{"message":"too long","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("context_length_exceeded")
+        );
+    }
+
+    /// A non-context-length error must NOT be mislabelled as context-length (no false positives
+    /// from the message scan).
+    #[test]
+    fn test_extract_error_unrelated_error_not_context_length() {
+        let reader = ResponsesReader;
+        let body = br#"{"error":{"message":"Incorrect API key provided.","type":"authentication_error","code":"invalid_api_key"}}"#;
+        let raw = reader.extract_error(StatusCode::UNAUTHORIZED, body);
+        assert_eq!(raw.provider_code.as_deref(), Some("invalid_api_key"));
     }
 
     /// Regression (HIGH/conformance, Round 11): a max_tokens-truncated stream's terminal event must

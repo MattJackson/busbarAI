@@ -112,9 +112,21 @@ impl AuthCfg {
     #[allow(deprecated)] // accessing deprecated field for normalization logic
     pub(crate) fn normalize(mut self) -> Self {
         if let Some(tok) = self._legacy_token.take() {
-            // If client_tokens is empty and we have legacy token, promote it
+            // If client_tokens is empty and we have legacy token, promote it.
             if self.client_tokens.is_empty() {
                 self.client_tokens.push(tok);
+            } else {
+                // Both the deprecated `token` and the `client_tokens` allowlist were
+                // supplied. The allowlist wins and the legacy token is discarded; warn
+                // so the operator notices their `token:` is being ignored rather than
+                // silently merged (which could otherwise mask a stale credential).
+                // `normalize` returns Self with no error channel, so we warn rather
+                // than fail.
+                tracing::warn!(
+                    "auth config specifies both the deprecated `token` and a non-empty \
+                     `client_tokens` allowlist; the legacy `token` is being ignored. Remove \
+                     `token:` and add its value to `client_tokens` if it should remain valid."
+                );
             }
         }
         self
@@ -631,6 +643,94 @@ pub(crate) fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `tracing::Layer` that records the messages of WARN-level events it sees, so a test can
+    /// assert a particular `tracing::warn!` fired.
+    #[derive(Clone, Default)]
+    struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct Vis(String);
+            impl tracing::field::Visit for Vis {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut vis = Vis(String::new());
+            event.record(&mut vis);
+            if let Ok(mut msgs) = self.0.lock() {
+                msgs.push(vis.0);
+            }
+        }
+    }
+
+    /// Construct an `AuthCfg` directly for normalization tests (the deprecated `_legacy_token`
+    /// field is only settable inside the crate with the deprecation lint suppressed).
+    #[allow(deprecated)]
+    fn auth_cfg(legacy_token: Option<&str>, client_tokens: &[&str]) -> AuthCfg {
+        AuthCfg {
+            mode: "token".to_string(),
+            _legacy_token: legacy_token.map(str::to_string),
+            client_tokens: client_tokens.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// When only the deprecated `token` is supplied (no `client_tokens`), normalize promotes it
+    /// into the allowlist — the legacy single-token format keeps working.
+    #[test]
+    fn test_normalize_promotes_legacy_token_when_allowlist_empty() {
+        let normalized = auth_cfg(Some("sk-bb-legacy"), &[]).normalize();
+        assert_eq!(
+            normalized.client_tokens,
+            vec!["sk-bb-legacy".to_string()],
+            "a lone legacy `token` must be promoted into client_tokens"
+        );
+    }
+
+    /// REGRESSION (LOW #33, config.rs:113-121): when BOTH the deprecated `token` and a non-empty
+    /// `client_tokens` allowlist are supplied, `normalize` discards the legacy token (the allowlist
+    /// wins) — but that drop MUST be observable via a `tracing::warn!`, not silent. This captures
+    /// WARN events: against the old (silent) code it FAILS (no warning), and passes once the warn!
+    /// is emitted. It also asserts the allowlist is left untouched (no merge).
+    #[test]
+    fn test_normalize_dropping_legacy_token_warns() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let cap = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+
+        let normalized = tracing::subscriber::with_default(subscriber, || {
+            auth_cfg(Some("sk-bb-legacy-dropped"), &["sk-bb-allowlisted"]).normalize()
+        });
+
+        // The legacy token is NOT merged into the existing allowlist.
+        assert_eq!(
+            normalized.client_tokens,
+            vec!["sk-bb-allowlisted".to_string()],
+            "an existing client_tokens allowlist must win and not absorb the legacy token"
+        );
+
+        let msgs = cap.0.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("`token`")),
+            "dropping the legacy `token` when client_tokens is non-empty must emit an observable \
+             warn!, got: {msgs:?}"
+        );
+    }
 
     /// A minimal config without a `pools:` section parses fine — pools are optional (direct
     /// model routing). Only providers + models are required.

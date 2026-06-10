@@ -94,6 +94,21 @@ fn bedrock_stream_exception_for(err: &crate::proto::IrError) -> (&'static str, S
 /// so a bare `image_s3` token can never collide with one.
 const IMAGE_S3_SENTINEL: &str = "image_s3";
 
+/// `media_type` SENTINEL marking that an IR `Image` block is actually carrying a Bedrock Converse
+/// `{"json": <value>}` tool-result content block — NOT a real image. The Converse
+/// `ToolResultContentBlock` union has a `json` member (arbitrary structured data) with no IR
+/// counterpart: the IR models only Text/Thinking/ToolUse/ToolResult/Image. The previous reader
+/// round-tripped a `json` block as a TEXT block (serializing the value to a string), so a
+/// same-protocol Bedrock->Bedrock passthrough silently turned structured `{"json": {...}}` content
+/// into a `{"text": "{...}"}` string — losing the json/text distinction the model and downstream
+/// tool consumers rely on. Mirroring the `image_s3` sentinel, the reader now stashes the serialized
+/// json value under this sentinel `media_type` and `write_request` re-emits a faithful `json` block
+/// on same-protocol egress. A real image media_type is always `image/<fmt>`, so a bare
+/// `tool_result_json` token can never collide with one; the sentinel is a Bedrock-native marker with
+/// no cross-protocol meaning, so on the cross-protocol seam (where it cannot be re-emitted as a
+/// native `json` block) `bedrock_image_block` drops it rather than leaking a corrupt image.
+const JSON_BLOCK_SENTINEL: &str = "tool_result_json";
+
 /// `extra` key under which the Bedrock reader stashes the positions of native Converse `cachePoint`
 /// content blocks (the prompt-cache markers, `{"cachePoint": {"type": "default"}}`) that appear
 /// INSIDE the `system` array and inside each message's `content` array.
@@ -174,6 +189,18 @@ fn bedrock_image_block(media_type: &str, data: &str) -> Option<serde_json::Value
                 return None;
             }
         }
+    }
+    if media_type == JSON_BLOCK_SENTINEL {
+        // A `json` tool-result block stashed under this sentinel is NOT an image. It is re-emitted as
+        // a native `{"json": ...}` block by `write_request`'s toolResult arm BEFORE this function is
+        // reached, so the only way control gets here is a non-toolResult context (e.g. a stray
+        // cross-protocol egress where the sentinel cannot become a native `json` block). There is no
+        // lossless image projection of structured json, so drop it rather than emit a corrupt image.
+        tracing::warn!(
+            "dropping json tool-result sentinel (media_type=\"tool_result_json\") reached as an \
+             image source: structured json has no native image projection"
+        );
+        return None;
     }
     if media_type == "image_url" {
         tracing::warn!(
@@ -440,6 +467,28 @@ impl ProtocolReader for BedrockReader {
                 Err(_) => (None, None),
             };
 
+        // Bedrock has no distinct context-length error CODE: an oversized request comes back as a
+        // generic `ValidationException` whose human-readable `message` carries the signal (e.g.
+        // "Input is longer than the maximum number of tokens allowed" or a "maximum-tokens …
+        // requested" phrasing). Without surfacing the canonical `context_length_exceeded` code here,
+        // the breaker pipeline (normalize_raw_error → StatusClass) would route an oversized request
+        // as a plain ClientError and PENALIZE the lane instead of failing over without penalty. Mirror
+        // `AnthropicReader::extract_error`: scan the raw body for the context-length phrasing and
+        // override `provider_code` so the breaker (breaker.rs `code == "context_length_exceeded"`)
+        // maps it to `StatusClass::ContextLength`. Keep this in sync with the `classify` helper below.
+        let provider_code = {
+            let lower = String::from_utf8_lossy(body).to_lowercase();
+            if lower.contains("input is longer than the maximum number of tokens")
+                || (lower.contains("maximum-tokens") && lower.contains("requested"))
+                || (lower.contains("exceeds the maximum")
+                    && (lower.contains("token") || lower.contains("context")))
+            {
+                Some("context_length_exceeded".to_string())
+            } else {
+                provider_code
+            }
+        };
+
         crate::breaker::RawUpstreamError {
             http_status: status.as_u16(),
             provider_code,
@@ -655,13 +704,31 @@ impl ProtocolReader for BedrockReader {
                                             citations: Vec::new(),
                                         });
                                     } else if let Some(json_val) = inner_val.get("json") {
-                                        let text_repr = serde_json::to_string(json_val)
-                                            .unwrap_or_else(|_| "unknown".to_string());
-                                        inner_content.push(crate::ir::IrBlock::Text {
-                                            text: text_repr,
-                                            cache_control: None,
-                                            citations: Vec::new(),
-                                        });
+                                        // A native Converse `{"json": <value>}` tool-result block has
+                                        // no IR counterpart. The old reader serialized it into a TEXT
+                                        // block, so a same-protocol Bedrock->Bedrock passthrough
+                                        // silently turned structured json into a `{"text": "..."}`
+                                        // string (lost fidelity). Mirror the image-sentinel pattern:
+                                        // stash the serialized value behind `JSON_BLOCK_SENTINEL` so
+                                        // `write_request` re-emits a faithful `{"json": ...}` block.
+                                        // `serde_json::to_string` of an already-parsed `Value` is
+                                        // infallible; on the impossible error fall back to a Text
+                                        // block (never panic on the request path).
+                                        match serde_json::to_string(json_val) {
+                                            Ok(serialized) => {
+                                                inner_content.push(crate::ir::IrBlock::Image {
+                                                    media_type: JSON_BLOCK_SENTINEL.to_string(),
+                                                    data: serialized,
+                                                });
+                                            }
+                                            Err(_) => {
+                                                inner_content.push(crate::ir::IrBlock::Text {
+                                                    text: "unknown".to_string(),
+                                                    cache_control: None,
+                                                    citations: Vec::new(),
+                                                });
+                                            }
+                                        }
                                     } else if let Some(image) = inner_val.get("image") {
                                         // The Converse `ToolResultContentBlock` union also includes
                                         // `image` (and `document`/`video`). Decode `image`
@@ -868,21 +935,28 @@ impl ProtocolReader for BedrockReader {
 
                 if let Some(start_obj) = data.get("start").and_then(|s| s.as_object()) {
                     if let Some(tool_use) = start_obj.get("toolUse").and_then(|t| t.as_object()) {
-                        let tu_id = tool_use
-                            .get("toolUseId")
-                            .and_then(|id| id.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let name = tool_use
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                        // Mirror the `state.started` guard the text branch (below) enforces: a
+                        // BlockStart must NEVER precede the MessageStart it belongs to. Without this
+                        // guard, a `contentBlockStart` arriving before `messageStart` (malformed or
+                        // reordered stream) would emit a tool BlockStart ahead of MessageStart,
+                        // breaking the IR ordering invariant downstream consumers rely on. Skip it.
+                        if state.started {
+                            let tu_id = tool_use
+                                .get("toolUseId")
+                                .and_then(|id| id.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let name = tool_use
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
 
-                        out.push(IrStreamEvent::BlockStart {
-                            index: idx,
-                            block: crate::ir::IrBlockMeta::ToolUse { id: tu_id, name },
-                        });
+                            out.push(IrStreamEvent::BlockStart {
+                                index: idx,
+                                block: crate::ir::IrBlockMeta::ToolUse { id: tu_id, name },
+                            });
+                        }
                     } else if start_obj.is_empty() && state.started && !state.text_block_open {
                         // The native Bedrock ConverseStream wire sends `contentBlockStart` with an
                         // empty `start: {}` for a text block. Only that empty-object shape opens a
@@ -1436,6 +1510,25 @@ impl ProtocolWriter for BedrockWriter {
                                 // decodes). Preserve the actual content instead of collapsing it to
                                 // the constant string `"{}"`: a JSON-string Text-equivalent or a
                                 // structured result that arrives via the IR is re-encoded faithfully.
+                                crate::ir::IrBlock::Image { media_type, data }
+                                    if media_type == JSON_BLOCK_SENTINEL =>
+                                {
+                                    // A `json` tool-result block the reader stashed behind the
+                                    // sentinel: re-emit it as a native `{"json": <value>}` block,
+                                    // restoring same-protocol fidelity. If the stashed payload fails
+                                    // to parse back into a Value (it always should — the reader
+                                    // serialized a valid Value), fall back to a Text block rather than
+                                    // dropping the content.
+                                    match serde_json::from_str::<serde_json::Value>(data) {
+                                        Ok(value) => {
+                                            inner_content
+                                                .push(serde_json::json!({ "json": value }));
+                                        }
+                                        Err(_) => {
+                                            inner_content.push(serde_json::json!({ "text": data }));
+                                        }
+                                    }
+                                }
                                 crate::ir::IrBlock::Image { media_type, data } => {
                                     if let Some(image_block) = bedrock_image_block(media_type, data)
                                     {
@@ -5008,6 +5101,156 @@ mod tests {
         assert_eq!(
             arr[1].pointer("/cachePoint"),
             Some(&serde_json::json!({"type": "default"}))
+        );
+    }
+
+    // --- Round 21 regression tests: audit findings --------------------------------------------
+
+    /// Regression (R21 #1, ContextLength reachability): `extract_error` must synthesize the canonical
+    /// `context_length_exceeded` provider_code for a real Bedrock oversized-context error body.
+    /// Bedrock returns a generic `ValidationException` whose `message` carries the signal; the
+    /// PRODUCTION `extract_error` (not just the `#[cfg(test)]` classify helper) must detect it so the
+    /// breaker maps it to `StatusClass::ContextLength` and fails over without penalizing the lane.
+    #[test]
+    fn test_extract_error_synthesizes_context_length_exceeded() {
+        let reader = BedrockReader;
+        // The real AWS Bedrock validation message for an oversized request.
+        let body = br#"{"__type":"ValidationException","message":"Input is longer than the maximum number of tokens allowed (200000) for this model."}"#;
+        let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "an oversized-context ValidationException must surface the canonical \
+             context_length_exceeded code; got {raw:?}"
+        );
+
+        // The alternate "maximum-tokens … requested" phrasing is also recognized.
+        let body2 = br#"{"__type":"ValidationException","message":"The maximum-tokens limit was exceeded: 250000 requested."}"#;
+        let raw2 = reader.extract_error(StatusCode::BAD_REQUEST, body2);
+        assert_eq!(
+            raw2.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "the maximum-tokens/requested phrasing must also map to context_length_exceeded; got {raw2:?}"
+        );
+
+        // A plain validation error (not context-length) keeps its human-readable message code —
+        // the context-length scan must not over-trigger.
+        let body3 =
+            br#"{"__type":"ValidationException","message":"malformed request: unknown field foo"}"#;
+        let raw3 = reader.extract_error(StatusCode::BAD_REQUEST, body3);
+        assert_eq!(
+            raw3.provider_code.as_deref(),
+            Some("malformed request: unknown field foo"),
+            "a non-context-length validation error must keep its message; got {raw3:?}"
+        );
+    }
+
+    /// Regression (R21 #2, ordering invariant): the `contentBlockStart` toolUse arm must honor the
+    /// same `state.started` guard the text branch enforces — a tool BlockStart must NEVER precede the
+    /// MessageStart it belongs to. A `contentBlockStart` carrying a `toolUse` that arrives BEFORE
+    /// `messageStart` (reordered/malformed stream) must emit NO BlockStart.
+    #[test]
+    fn test_stream_tool_block_start_before_message_start_is_dropped() {
+        use crate::ir::IrStreamEvent;
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = BedrockReader;
+
+        // toolUse contentBlockStart BEFORE any messageStart: state.started is false → drop it.
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "contentBlockStart",
+                "contentBlockIndex": 0,
+                "start": {"toolUse": {"toolUseId": "t1", "name": "f"}}
+            }),
+            &mut state,
+        );
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    block: crate::ir::IrBlockMeta::ToolUse { .. },
+                    ..
+                }
+            )),
+            "a tool BlockStart must not precede MessageStart; got {evs:?}"
+        );
+
+        // After a proper messageStart, the same toolUse start DOES emit a BlockStart (sanity).
+        let _ = reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "messageStart", "role": "assistant"}),
+            &mut state,
+        );
+        let evs2 = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "contentBlockStart",
+                "contentBlockIndex": 0,
+                "start": {"toolUse": {"toolUseId": "t1", "name": "f"}}
+            }),
+            &mut state,
+        );
+        assert!(
+            evs2.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    block: crate::ir::IrBlockMeta::ToolUse { .. },
+                    ..
+                }
+            )),
+            "after messageStart, a toolUse start must emit a ToolUse BlockStart; got {evs2:?}"
+        );
+    }
+
+    /// Regression (R21 #3, json tool-result fidelity): a native Converse `{"json": <value>}` block
+    /// inside a `toolResult.content` array must survive a same-protocol reader→writer round-trip as a
+    /// `json` block — NOT be collapsed to a `text` block (the old behaviour, which lost the json/text
+    /// distinction). Mirrors the image-sentinel round-trip.
+    #[test]
+    fn test_tool_result_json_block_round_trip() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "toolResult": {
+                        "toolUseId": "t1",
+                        "status": "success",
+                        "content": [
+                            {"json": {"temperature": 72, "unit": "F", "nested": {"ok": true}}}
+                        ]
+                    }
+                }]
+            }]
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        let out = writer.write_request(&ir);
+        let inner = out
+            .pointer("/messages/0/content/0/toolResult/content/0/json")
+            .expect("toolResult json block must round-trip as `json`, not be collapsed to text");
+        assert_eq!(
+            inner,
+            &serde_json::json!({"temperature": 72, "unit": "F", "nested": {"ok": true}}),
+            "the json tool-result value must round-trip verbatim; got {inner}"
+        );
+        // It must NOT have been re-emitted as a `text` block.
+        assert!(
+            out.pointer("/messages/0/content/0/toolResult/content/0/text")
+                .is_none(),
+            "a json tool-result block must not degrade to a text block; got {out}"
+        );
+    }
+
+    /// `bedrock_image_block` drops the `JSON_BLOCK_SENTINEL` rather than emitting a corrupt image
+    /// (the sentinel is only re-emitted as a native `json` block by `write_request`'s toolResult arm;
+    /// reaching `bedrock_image_block` means no native projection exists).
+    #[test]
+    fn test_bedrock_image_block_json_sentinel_dropped() {
+        assert!(
+            bedrock_image_block(JSON_BLOCK_SENTINEL, r#"{"a":1}"#).is_none(),
+            "the json sentinel must never emit an image block"
         );
     }
 }

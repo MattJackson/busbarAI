@@ -1122,6 +1122,14 @@ pub(crate) struct UsageSink {
     pub gov: Arc<crate::governance::GovState>,
     pub key_id: String,
     pub period: String,
+    /// Wall-clock epoch (seconds) captured ONCE at header-arrival time for this request. Both the
+    /// flat per-request fee (`route::finish` → `record_request`) and the token fee (`record_tokens`,
+    /// fired at stream end / on the buffered path) are attributed to the window this epoch implies,
+    /// so a single streaming request whose stream completes in a later rate-limit/budget window than
+    /// its headers arrived cannot split its two charges across two windows (#29). Without it, the two
+    /// calls read the clock independently and could land in different 60s rate windows / budget
+    /// periods, mis-attributing spend and TPM.
+    pub charged_at: u64,
 }
 
 /// Integrated UsageTap for non-buffering usage extraction from streaming responses.
@@ -1470,8 +1478,17 @@ where
                         if this.tap.terminal_error.is_none() {
                             let tokens = this.tap.input_tokens.unwrap_or(0)
                                 + this.tap.output_tokens.unwrap_or(0);
-                            sink.gov
-                                .record_tokens(&sink.key_id, &sink.period, now(), tokens);
+                            // Attribute the token fee to the SAME window the flat per-request fee was
+                            // charged in (`sink.charged_at`, the header-arrival epoch), not the
+                            // stream-end clock — otherwise a stream that completes in a later window
+                            // than its headers arrived would split its two charges across two windows
+                            // (#29).
+                            sink.gov.record_tokens(
+                                &sink.key_id,
+                                &sink.period,
+                                sink.charged_at,
+                                tokens,
+                            );
                         }
                     }
                     if !done.is_empty() {
@@ -1890,8 +1907,10 @@ fn record_nonstream_usage(upstream_body: &[u8], usage_sink: &Option<UsageSink>) 
         tap.feed_whole(upstream_body);
         let tokens = tap.input_tokens.unwrap_or(0) + tap.output_tokens.unwrap_or(0);
         if tokens > 0 {
+            // Same window as the flat per-request fee (`sink.charged_at`, header-arrival epoch), so
+            // the buffered-path token fee and the per-request fee never split across windows (#29).
             sink.gov
-                .record_tokens(&sink.key_id, &sink.period, now(), tokens);
+                .record_tokens(&sink.key_id, &sink.period, sink.charged_at, tokens);
         }
     }
 }
@@ -3697,8 +3716,81 @@ async fn handle_least_bad(
 
 #[cfg(test)]
 mod usage_tap_tests {
-    use super::{find_matching_brace, stable_hash, UsageTap};
+    use super::{find_matching_brace, record_nonstream_usage, stable_hash, UsageSink, UsageTap};
     use bytes::Bytes;
+    use std::sync::Arc;
+
+    // Regression for #29: the token fee charged at response completion must be attributed to the
+    // SAME budget window the request was admitted in (`UsageSink::charged_at`, the header-arrival
+    // epoch), NOT a fresh `store::now()` read at completion time. With a `daily` budget period, a
+    // request that arrives on day N but whose (buffered or streamed) response is accounted "now" on
+    // day N+1 would, under the old `now()`-based code, charge the token fee into day N+1's window —
+    // splitting it from the flat per-request fee (charged into day N by `route::finish`). The fix
+    // threads `charged_at` so both land in day N. We pin `charged_at` to a fixed past day and assert
+    // the spend lands in THAT day's window regardless of the real wall clock (which is always later).
+    #[test]
+    fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+
+        let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+        // 0c per request, 100c per 1k tokens → a 1000-token response costs 100c.
+        let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov"));
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(1_000_000),
+                    budget_period: "daily".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .expect("create key");
+
+        // A fixed epoch on a specific UTC day, far in the past so the real clock is always a
+        // different (later) day — making the bug observable: the old code charged into "today".
+        let charged_at: u64 = 1_700_000_000; // 2023-11-14 (day window = 1_700_000_000/86400*86400)
+        let day_window = charged_at / 86_400 * 86_400;
+        let today_window = crate::store::now() / 86_400 * 86_400;
+        assert_ne!(
+            day_window, today_window,
+            "test precondition: charged_at must be a different day than now, or the bug is masked"
+        );
+
+        let sink = Some(UsageSink {
+            gov: gov.clone(),
+            key_id: key.id.clone(),
+            period: key.budget_period.clone(),
+            charged_at,
+        });
+
+        // A buffered Anthropic-style completion carrying 600 input + 400 output = 1000 tokens.
+        let body = br#"{"usage":{"input_tokens":600,"output_tokens":400}}"#;
+        record_nonstream_usage(body, &sink);
+
+        // The 100c token fee must be in the charged_at day's window...
+        let in_window = gov
+            .usage_for(&key.id, charged_at)
+            .expect("usage read")
+            .map(|u| u.spend_cents)
+            .unwrap_or(0);
+        assert_eq!(
+            in_window, 100,
+            "token fee must be attributed to the charged_at (header-arrival) day window"
+        );
+        // ...and NOT in today's window (which the old `now()`-based code would have used).
+        let in_today = gov
+            .usage_for(&key.id, crate::store::now())
+            .expect("usage read")
+            .map(|u| u.spend_cents)
+            .unwrap_or(0);
+        assert_eq!(
+            in_today, 0,
+            "token fee must NOT leak into the wall-clock 'now' window (the #29 split bug)"
+        );
+    }
 
     #[test]
     fn test_find_matching_brace_underflow_safe() {

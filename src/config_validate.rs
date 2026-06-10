@@ -129,7 +129,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         for (code, mapped_class) in &provider_cfg.error_map {
             if crate::config::status_class_from_str(mapped_class).is_none() {
                 errors.push(format!(
-                    "provider '{}' error_map code '{}': invalid StatusClass '{}', must be one of: rate_limit, overloaded, server_error, timeout, network, auth, billing, client_error",
+                    "provider '{}' error_map code '{}': invalid StatusClass '{}', must be one of: rate_limit, overloaded, server_error, timeout, network, auth, billing, client_error, context_length",
                     provider_name, code, mapped_class
                 ));
             }
@@ -827,6 +827,77 @@ mod tests {
             !errs.iter().any(|e| e.contains("invalid auth 'api-key'")),
             "'api-key' is a valid auth style and must not error; got: {errs:?}"
         );
+    }
+
+    #[test]
+    fn test_error_map_invalid_class_message_lists_full_valid_set() {
+        // The invalid-StatusClass diagnostic must enumerate EVERY class that
+        // breaker::status_class_from_str accepts; `context_length` was historically
+        // omitted from the message even though it is a valid mapping target, so an
+        // operator who saw the error could not learn it was an allowed value.
+        let mut providers = HashMap::new();
+        let mut p = make_provider("anthropic", "https://api.example.com", "API_KEY");
+        // Replace the minimal valid map with one bad entry to force the diagnostic.
+        p.error_map.clear();
+        p.error_map
+            .insert("429".to_string(), "not_a_class".to_string());
+        providers.insert("bad".to_string(), p);
+
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        let errs = validate(&cfg).expect_err("invalid StatusClass must fail validation");
+
+        let msg = errs
+            .iter()
+            .find(|e| e.contains("invalid StatusClass 'not_a_class'"))
+            .unwrap_or_else(|| panic!("expected invalid-StatusClass error; got: {errs:?}"));
+        assert!(
+            msg.contains("context_length"),
+            "valid-values list must include 'context_length' (it is accepted by status_class_from_str); got: {msg}"
+        );
+
+        // Guard against drift in the other direction: every class the breaker accepts
+        // must appear in the message's valid-values list.
+        for class in [
+            "rate_limit",
+            "overloaded",
+            "server_error",
+            "timeout",
+            "network",
+            "auth",
+            "billing",
+            "client_error",
+            "context_length",
+        ] {
+            assert!(
+                crate::config::status_class_from_str(class).is_some(),
+                "test invariant: '{class}' should be a real StatusClass"
+            );
+            assert!(
+                msg.contains(class),
+                "valid-values list must include '{class}'; got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_error_map_context_length_is_a_valid_class() {
+        // `context_length` must be accepted as an error_map target without producing
+        // an invalid-StatusClass error (it is a real breaker StatusClass).
+        let mut providers = HashMap::new();
+        let mut p = make_provider("anthropic", "https://api.example.com", "API_KEY");
+        p.error_map.clear();
+        p.error_map
+            .insert("400".to_string(), "context_length".to_string());
+        providers.insert("ctx".to_string(), p);
+
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        let result = validate(&cfg);
+        if let Err(errs) = result {
+            assert!(
+                !errs.iter().any(|e| e.contains("invalid StatusClass")),
+                "'context_length' is a valid StatusClass and must not error; got: {errs:?}"
+            );
+        }
     }
 
     #[test]

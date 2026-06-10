@@ -103,7 +103,13 @@ fn event_type_for_frame(headers: &[u8]) -> String {
     // matches. This is what was previously lost: such a frame yielded `""` and was silently dropped.
     if parsed.message_type.as_deref() == Some("exception") {
         if let Some(exc) = parsed.exception_type {
-            return lowercase_first(&exc);
+            // AWS may qualify the `:exception-type` with a Smithy namespace / shape ARN prefix
+            // (e.g. `com.amazon.coral.service#ThrottlingException`). Keep only the trailing bare
+            // exception name before lowercasing — mirroring `extract_error`'s
+            // `rsplit(['#', '/'])` in proto/bedrock.rs — so the normalized token matches the
+            // `read_response_events` exception arms rather than being a no-op long namespaced string.
+            let bare = exc.rsplit(['#', '/']).next().unwrap_or(&exc);
+            return lowercase_first(bare);
         }
     }
     parsed.event_type.unwrap_or_default()
@@ -555,6 +561,44 @@ mod tests {
         let mut h2 = string_header(":message-type", "exception");
         h2.extend_from_slice(&string_header(":exception-type", "ThrottlingException"));
         assert_eq!(event_type_for_frame(&h2), "throttlingException");
+    }
+
+    /// REGRESSION (LOW/conformance, eventstream.rs:104-109): AWS may qualify the `:exception-type`
+    /// header with a Smithy namespace / shape-ARN prefix (e.g. `com.amazon.coral.service#ThrottlingException`).
+    /// The prefix must be stripped before lowercasing — mirroring `extract_error`'s
+    /// `rsplit(['#', '/'])` in proto/bedrock.rs — so the bare normalized name still matches the
+    /// `read_response_events` exception arms. Before the fix this returned the whole namespaced
+    /// string lowercased only at its first char (`com.amazon...`), which matched nothing and dropped
+    /// the mid-stream error.
+    #[test]
+    fn test_event_type_exception_strips_namespace_prefix() {
+        // `#`-delimited Smithy shape id.
+        let mut h = string_header(":message-type", "exception");
+        h.extend_from_slice(&string_header(
+            ":exception-type",
+            "com.amazon.coral.service#ThrottlingException",
+        ));
+        assert_eq!(
+            event_type_for_frame(&h),
+            "throttlingException",
+            "namespace prefix stripped before lowercasing the bare exception name"
+        );
+
+        // `/`-delimited ARN-style suffix.
+        let mut h2 = string_header(":message-type", "exception");
+        h2.extend_from_slice(&string_header(
+            ":exception-type",
+            "aws.bedrock/InternalServerException",
+        ));
+        assert_eq!(event_type_for_frame(&h2), "internalServerException");
+
+        // A bare (unqualified) name is unaffected — no `#`/`/` to split on.
+        let mut h3 = string_header(":message-type", "exception");
+        h3.extend_from_slice(&string_header(
+            ":exception-type",
+            "ModelStreamErrorException",
+        ));
+        assert_eq!(event_type_for_frame(&h3), "modelStreamErrorException");
     }
 
     /// REGRESSION (MEDIUM/test-coverage, eventstream.rs:104-109): an exception-typed frame

@@ -135,6 +135,26 @@ pub(crate) async fn create_key(
             );
         }
     }
+    // Reject a zero rate limit. `rpm_limit`/`tpm_limit` are unsigned, so serde already rejects a
+    // negative at deserialization, but `0` parses fine and is NOT "unlimited" — omitting the field
+    // (None) is the unlimited semantic. Governance evaluates `requests >= rpm` / `tokens >= tpm` on a
+    // window that starts at 0, so `rpm_limit: 0` (0 >= 0) or `tpm_limit: 0` (0 >= 0) makes the key
+    // reject every request from creation: a permanently-unusable key minted with a 201 and no
+    // diagnostic. A literal `0` is almost always a typo for "no limit" (which is None/omitted). 400
+    // both so the operator gets a coherent error instead of a dead key. Any positive value, and an
+    // omitted field (unlimited), still create the key.
+    if req.rpm_limit == Some(0) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "rpm_limit must be >= 1 (omit the field for unlimited)"}),
+        );
+    }
+    if req.tpm_limit == Some(0) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "tpm_limit must be >= 1 (omit the field for unlimited)"}),
+        );
+    }
     let spec = NewKeySpec {
         name: req.name,
         allowed_pools: req.allowed_pools,
@@ -460,6 +480,80 @@ mod tests {
         assert!(
             body["max_budget_cents"].is_null(),
             "omitted budget is unlimited (null)"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_create_key_rejects_zero_rate_limits() {
+        // Regression (LOW/bug): `rpm_limit`/`tpm_limit` are unsigned, so serde rejects a negative but
+        // accepts `0`. A zero limit is NOT "unlimited" (that is the omitted/None case): governance
+        // checks `requests >= rpm` / `tokens >= tpm` against a window starting at 0, so `0` makes the
+        // key reject every request from creation — a permanently-dead key minted with 201 and no
+        // diagnostic. Both fields must 400; a positive value, and omission (unlimited), must create it.
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (addr, handle) = serve_with_gov(gov).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/admin/keys");
+
+        for field in ["rpm_limit", "tpm_limit"] {
+            let resp = client
+                .post(&url)
+                .header("x-admin-token", "admintok")
+                .json(&serde_json::json!({"name": "k", field: 0}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                400,
+                "{field}: 0 must be rejected with 400"
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert!(
+                body["error"].as_str().unwrap_or("").contains(field),
+                "400 body must name {field}: {body}"
+            );
+        }
+
+        // A positive limit on either field still creates the key.
+        for field in ["rpm_limit", "tpm_limit"] {
+            let resp = client
+                .post(&url)
+                .header("x-admin-token", "admintok")
+                .json(&serde_json::json!({"name": "k", field: 5}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                201,
+                "{field}: 5 must create the key"
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body[field], 5, "stored {field} must match request");
+        }
+
+        // Omitted limits → unlimited (null), still 201.
+        let resp = client
+            .post(&url)
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"name": "k"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            201,
+            "omitted limits must create key"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["rpm_limit"].is_null() && body["tpm_limit"].is_null(),
+            "omitted limits are unlimited (null): {body}"
         );
 
         handle.abort();

@@ -897,12 +897,21 @@ impl InMemoryStore {
     /// and release the single-flight probe. Acquires the per-cell transition lock so the Closed state
     /// and cleared cooldown move as a consistent pair against any racing transition (see
     /// `cell_closed_locked`).
+    ///
+    /// NOTE: this does NOT reset the cell's SWRR `current_weight`. That reset must run under the
+    /// per-pool SWRR shard lock (which serializes selection and owns the `Σ current_weight == 0`
+    /// invariant), and only the CALLER knows the pool the cell belongs to. Callers perform the reset
+    /// via `reset_swrr_for(pool, cell)` AFTER this returns (the transition lock is released by then,
+    /// so the shard lock is taken un-nested — no lock-order inversion against selection, which takes
+    /// the shard lock with no transition lock held).
     fn cell_closed(c: &dyn BreakerCellAccess) {
         let _tx = lock_recover(c.transition_lock());
         Self::cell_closed_locked(c);
     }
 
-    /// `cell_closed` body, assuming the caller already holds `c.transition_lock()`.
+    /// `cell_closed` body, assuming the caller already holds `c.transition_lock()`. Does NOT touch
+    /// `current_weight` — see `cell_closed` and `reset_swrr_for` for why the SWRR reset is the
+    /// caller's job (it must hold the per-pool shard lock).
     fn cell_closed_locked(c: &dyn BreakerCellAccess) {
         c.streak().store(0, Ordering::Release);
         c.err().store(0, Ordering::Release);
@@ -910,11 +919,24 @@ impl InMemoryStore {
         c.cooldown_until().store(0, Ordering::Release);
         c.breaker_state().store(ST_CLOSED, Ordering::Release);
         c.probe_in_flight().store(false, Ordering::Release);
-        // Reset the SWRR accumulator. While the member was tripped it was dropped from the healthy
-        // set in `select_weighted_for` and stopped receiving fetch_add/fetch_sub, freezing its
-        // `current_weight` at a stale value. On recovery it rejoins selection; carrying that stale
-        // value biases the first few selections and violates the `Σ current_weight == 0` invariant
-        // over the (now-changed) healthy set. Zeroing it here keeps the SWRR invariant exact.
+    }
+
+    /// Reset a recovered cell's SWRR accumulator to 0, UNDER the pool's SWRR shard lock.
+    ///
+    /// While the member was tripped it was dropped from the healthy set in `select_weighted_for` and
+    /// stopped receiving fetch_add/fetch_sub, freezing its `current_weight` at a stale value. On
+    /// recovery it rejoins selection; carrying that stale value biases the first few selections and
+    /// violates the `Σ current_weight == 0` invariant over the (now-changed) healthy set.
+    ///
+    /// This MUST hold `swrr_shard(pool)` while zeroing: selection (`select_weighted_for`) does the
+    /// add/find-max/subtract that maintains the invariant under that same shard lock, so a bare
+    /// `store(0)` from a concurrent recovery — not serialized against selection — could land between
+    /// selection's `fetch_add` and its compensating `fetch_sub(total)`, breaking `Σ == 0`. Taking the
+    /// shard lock here serializes the reset against any in-flight selection for the pool. The lock is
+    /// taken WITHOUT any transition lock held (callers invoke this after the cell-close transition has
+    /// returned), matching selection's lock discipline and avoiding lock-order inversion.
+    fn reset_swrr_for(&self, pool: &str, c: &dyn BreakerCellAccess) {
+        let _swrr = lock_recover(self.swrr_shard(pool));
         c.current_weight().store(0, Ordering::Release);
     }
 
@@ -1120,7 +1142,12 @@ impl InMemoryStore {
     /// Record a success against the cell: reset the streak (unless the cell is Open — see below),
     /// push the outcome, and — if this was the half-open probe — complete recovery to Closed. (The
     /// lane-global `ok` counter is bumped by the caller, since it is shared across pools.)
-    fn cell_record_success(c: &dyn BreakerCellAccess, now_time: u64) {
+    ///
+    /// Returns `true` iff this call won the HalfOpen→Closed recovery CAS (i.e. it actually closed the
+    /// cell). The caller uses that to perform the SWRR `current_weight` reset under the pool's shard
+    /// lock (`reset_swrr_for`) — the reset is NOT done here because this runs under the per-cell
+    /// transition lock and the SWRR reset must run under the per-pool SWRR shard lock instead.
+    fn cell_record_success(c: &dyn BreakerCellAccess, now_time: u64) -> bool {
         // Serialize the whole state-dependent transition (the streak-reset gate reads the state, and
         // the HalfOpen→Closed recovery writes the (state, cooldown) pair) under the transition lock,
         // so a concurrent hard-down trip (Open + sticky cooldown) can't interleave its pair with this
@@ -1157,7 +1184,9 @@ impl InMemoryStore {
             .is_ok()
         {
             Self::cell_closed_locked(c);
+            return true;
         }
+        false
     }
 
     // ── Thin lane-default wrappers ─────────────────────────────────────────────────────────────
@@ -1200,10 +1229,13 @@ impl InMemoryStore {
         Self::cell_open(self.get_lane(lane).as_ref(), now_time, cfg, retry_after);
     }
 
-    /// Transition to Closed state (probe success).
+    /// Transition to Closed state (probe success). Mirrors the production recovery path: close the
+    /// cell, then reset its SWRR accumulator under the (default-pool) shard lock.
     #[cfg(test)]
     pub(crate) fn closed_state(&self, lane: usize, _now_time: u64) {
-        Self::cell_closed(self.get_lane(lane).as_ref());
+        let cell = self.get_lane(lane);
+        Self::cell_closed(cell.as_ref());
+        self.reset_swrr_for("", cell.as_ref());
     }
 }
 
@@ -1484,7 +1516,16 @@ impl InMemoryStore {
             ls.ok.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        Self::cell_record_success(self.cell(pool, lane).as_ref(), Self::now_secs());
+        let cell = self.cell(pool, lane);
+        let recovered = Self::cell_record_success(cell.as_ref(), Self::now_secs());
+        // The HalfOpen→Closed recovery re-admits this cell to selection; zero its stale SWRR
+        // accumulator under the pool's shard lock (NOT inside the transition-locked close above) so
+        // the reset serializes against any concurrent selection for this pool and keeps the pool's
+        // `Σ current_weight == 0` invariant exact. The transition lock is already released here, so
+        // the shard lock is taken un-nested.
+        if recovered {
+            self.reset_swrr_for(pool, cell.as_ref());
+        }
         ls.ok.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1766,11 +1807,18 @@ impl StateStore for InMemoryStore {
         let ls = self.get_lane(lane);
         if suppressed(ls.as_ref()) {
             Self::cell_closed(ls.as_ref());
+            // Reset the recovered cell's SWRR accumulator under its pool's shard lock. The default
+            // cell belongs to the no-pool ("") set. Done after `cell_closed` returns (transition
+            // lock released), so the shard lock is taken un-nested — see `reset_swrr_for`.
+            self.reset_swrr_for("", ls.as_ref());
         }
         let cells = read_recover(&self.pool_cells);
-        for (_, cell) in cells.get(&lane).into_iter().flatten() {
+        for (pool_name, cell) in cells.get(&lane).into_iter().flatten() {
             if suppressed(cell.as_ref()) {
                 Self::cell_closed(cell.as_ref());
+                // Each per-pool cell's SWRR reset runs under ITS pool's shard lock (the map key is
+                // the pool name), serializing against that pool's selections.
+                self.reset_swrr_for(pool_name, cell.as_ref());
             }
         }
     }
@@ -4454,6 +4502,92 @@ mod tests {
         assert!(
             !store.usable(0, 1000),
             "member 0 in Open state should not be usable"
+        );
+    }
+
+    /// LOW #26 (concurrency): the SWRR `current_weight` reset on breaker recovery must happen UNDER
+    /// the per-pool SWRR shard lock that serializes selection — NOT as a bare store inside the
+    /// cell-level close. The old code zeroed `current_weight` inside `cell_closed_locked` with a plain
+    /// `store(0)`, not holding the shard lock, so a recovery racing a selection could land its zero
+    /// between selection's `fetch_add` and its compensating `fetch_sub(total)`, breaking the
+    /// `Σ current_weight == 0` invariant.
+    ///
+    /// This pins the lock discipline directly: hold the pool's SWRR shard lock on the test thread,
+    /// fire a recovery (`record_success_for`) on another thread, and assert the recovery's reset is
+    /// BLOCKED until the shard lock is released. Against the old code (reset not under the shard lock)
+    /// the zero lands immediately and the post-spawn assertion that `current_weight` is still stale
+    /// fails; against the fixed code the reset waits for the lock.
+    #[test]
+    fn test_swrr_reset_on_recovery_happens_under_shard_lock() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(5000);
+
+        // Seed a stale SWRR accumulator and park the default cell HalfOpen with the probe acquired,
+        // so a success drives the HalfOpen→Closed recovery that performs the reset.
+        const STALE: i64 = 777;
+        store
+            .get_lane(0)
+            .current_weight
+            .store(STALE, Ordering::Relaxed);
+        store
+            .get_lane(0)
+            .cooldown_until
+            .store(1000, Ordering::Relaxed);
+        store
+            .get_lane(0)
+            .breaker_state
+            .store(ST_HALF_OPEN, Ordering::Relaxed);
+        store
+            .get_lane(0)
+            .probe_in_flight
+            .store(true, Ordering::Relaxed);
+
+        // Signals the recovery thread has been spawned and is about to (or has) attempt the reset.
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Hold the default pool's SWRR shard lock for the whole critical section. While held, no
+        // recovery may reset `current_weight` (the fix takes this same lock to zero it).
+        let guard = lock_recover(store.swrr_shard(""));
+
+        let store_r = Arc::clone(&store);
+        let started_r = Arc::clone(&started);
+        let recoverer = std::thread::spawn(move || {
+            started_r.store(true, Ordering::Release);
+            // Recovery: success on the half-open probe → HalfOpen→Closed → SWRR reset (under shard
+            // lock). Blocks here until the test thread drops `guard`.
+            store_r.record_success_for("", 0);
+        });
+
+        // Wait until the recovery thread is running, then give it ample opportunity to (wrongly)
+        // perform the reset if it weren't gated on the shard lock.
+        while !started.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        for _ in 0..50 {
+            std::thread::yield_now();
+        }
+
+        // The shard lock is still held here. Under the fix the reset cannot have happened yet.
+        assert_eq!(
+            store.get_lane(0).current_weight.load(Ordering::Relaxed),
+            STALE,
+            "SWRR reset must be blocked while the pool's shard lock is held — it must run UNDER that lock, \
+             not as a bare store in cell_closed"
+        );
+
+        // Release the shard lock; the recovery may now reset and complete.
+        drop(guard);
+        recoverer.join().expect("recovery thread must not panic");
+
+        assert_eq!(
+            store.get_lane(0).current_weight.load(Ordering::Relaxed),
+            0,
+            "after recovery completes (shard lock released) the SWRR accumulator must be zeroed"
+        );
+        assert_eq!(
+            store.breaker_state(0),
+            BreakerState::Closed,
+            "the half-open probe success must have recovered the cell to Closed"
         );
     }
 

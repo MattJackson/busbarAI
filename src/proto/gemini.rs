@@ -87,6 +87,35 @@ impl ProtocolReader for GeminiReader {
             .and_then(|t| t.as_str())
             .map(String::from);
 
+        // Gemini signals context-length-exceeded as a 400 `INVALID_ARGUMENT` whose MESSAGE carries
+        // the token-overflow text (there is NO distinct google.rpc.Code for it — `INVALID_ARGUMENT`
+        // also covers every other malformed-request 400). The raw `provider_code` derived above is
+        // therefore the bare HTTP status int (`"400"`) / status name, which the breaker classifies as
+        // a generic ClientError that PENALIZES the lane instead of failing over. Detect the canonical
+        // context-length signal here and OVERRIDE `provider_code` with the canonical
+        // `context_length_exceeded` string the breaker recognizes (breaker.rs ~122) →
+        // StatusClass::ContextLength → fail over to a larger-context model WITHOUT penalty. Without
+        // this, oversized-request failover never triggered for the Gemini protocol in production
+        // (only the `#[cfg(test)]` `classify()` helper recognized the pattern). Mirrors
+        // `AnthropicReader::extract_error`, which surfaces the same canonical code from its own
+        // message heuristic. Scan the lowercased raw body so the match is independent of which
+        // structured field carried the text. The substring set mirrors `classify()` above.
+        let provider_code = {
+            let lower = String::from_utf8_lossy(body).to_lowercase();
+            if lower.contains("input is longer than the maximum number of tokens")
+                || (lower.contains("maximum-tokens") && lower.contains("requested"))
+                || (lower.contains("token count")
+                    && (lower.contains("exceeds") || lower.contains("exceed"))
+                    && lower.contains("maximum"))
+                || (lower.contains("exceeds the maximum")
+                    && (lower.contains("token") || lower.contains("context")))
+            {
+                Some("context_length_exceeded".to_string())
+            } else {
+                provider_code
+            }
+        };
+
         crate::breaker::RawUpstreamError {
             http_status: status.as_u16(),
             provider_code,
@@ -2628,6 +2657,58 @@ mod tests {
         let raw = reader.extract_error(StatusCode::FORBIDDEN, body);
         assert_eq!(raw.provider_code.as_deref(), Some("PERMISSION_DENIED"));
         assert_eq!(raw.structured_type.as_deref(), Some("PERMISSION_DENIED"));
+    }
+
+    /// Regression (R21 #17, ContextLength reachability): a real Gemini oversized-context error is a
+    /// 400 `INVALID_ARGUMENT` whose MESSAGE carries the token-overflow text — there is no distinct
+    /// google.rpc.Code for it. `extract_error` (the PRODUCTION path; `classify` is `#[cfg(test)]`
+    /// only) must synthesize the canonical `context_length_exceeded` provider code so the breaker
+    /// (breaker.rs ~122) maps it to StatusClass::ContextLength and fails over WITHOUT penalty,
+    /// instead of treating the bare `"400"` code as a lane-penalizing ClientError. Before the fix
+    /// `provider_code` was the bare HTTP-status int and this assertion failed.
+    #[test]
+    fn test_extract_error_oversized_context_yields_canonical_code() {
+        let reader = GeminiReader;
+        // Native Gemini token-overflow envelope (google.rpc.Status, INVALID_ARGUMENT 400).
+        let body = br#"{"error":{"code":400,"message":"The input token count (1050000) exceeds the maximum number of tokens allowed (1048576).","status":"INVALID_ARGUMENT"}}"#;
+        let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(raw.http_status, 400);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "oversized-context 400 must synthesize the canonical code so the breaker fails over"
+        );
+        // The structured google.rpc.Code name is preserved unchanged.
+        assert_eq!(raw.structured_type.as_deref(), Some("INVALID_ARGUMENT"));
+    }
+
+    /// A second real-world phrasing the official API emits ("input is longer than the maximum number
+    /// of tokens") must also synthesize the canonical code — mirroring the `classify()` substring set.
+    #[test]
+    fn test_extract_error_oversized_context_alternate_phrasing() {
+        let reader = GeminiReader;
+        let body = br#"{"error":{"code":400,"message":"input is longer than the maximum number of tokens","status":"INVALID_ARGUMENT"}}"#;
+        let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("context_length_exceeded")
+        );
+    }
+
+    /// A NON-context-length 400 (e.g. a malformed field) must NOT be misclassified as context-length:
+    /// the canonical override fires only on the token-overflow text, so an unrelated INVALID_ARGUMENT
+    /// keeps its bare status code (here `"400"`) and stays a lane-penalizing ClientError. Guards the
+    /// override against over-broad matching.
+    #[test]
+    fn test_extract_error_unrelated_invalid_argument_keeps_status_code() {
+        let reader = GeminiReader;
+        let body = br#"{"error":{"code":400,"message":"Invalid value at 'contents[0].role'.","status":"INVALID_ARGUMENT"}}"#;
+        let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("400"),
+            "a non-context-length 400 must not be misclassified as context_length_exceeded"
+        );
     }
 
     /// Malformed (non-JSON) error bodies yield None fields without panicking.

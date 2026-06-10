@@ -328,6 +328,22 @@ fn unauthorized_response(path: &str) -> Response {
     crate::forward::ingress_error(proto, status, kind, message)
 }
 
+/// Extract the operator admin token from the `x-admin-token` header, treating a present-but-blank
+/// value as ABSENT. This mirrors the empty-filter (`.filter(|t| !t.is_empty())`) that
+/// `extract_client_token` applies to the `x-api-key` / `x-goog-api-key` carriers, closing the same
+/// class of empty-credential bug on the admin carrier: a blank header never reaches the constant-time
+/// compare below, so it cannot match even if a future change paired the configured admin token with
+/// an empty string (the empty-token collision the `GovState` constructor guard in `governance.rs` is
+/// separately meant to prevent — that guard is not owned here). `None` when the header is absent,
+/// non-UTF-8, or blank.
+fn extract_admin_header_token(req: &Request<Body>) -> Option<String> {
+    req.headers()
+        .get("x-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+}
+
 /// Axum middleware layer that validates auth before routing.
 pub(crate) async fn auth_middleware(
     State(app): State<Arc<App>>,
@@ -356,11 +372,7 @@ pub(crate) async fn auth_middleware(
     // the exact `/admin` segment or a `/admin/` delimiter so only the four registered admin routes
     // (`/admin/keys`, `/admin/keys/:id`, `/admin/keys/:id/usage`) match.
     let is_admin = path == "/admin" || path.starts_with("/admin/");
-    let admin_header_token = req
-        .headers()
-        .get("x-admin-token")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+    let admin_header_token = extract_admin_header_token(&req);
     // The busbar client token, taken from whichever carrier the SDK used (Authorization: Bearer,
     // then x-api-key, then x-goog-api-key). This single value drives BOTH the static-allowlist
     // check and the governance virtual-key lookup, so every scheme is validated identically and in
@@ -1999,6 +2011,90 @@ mod tests {
 
         handle.abort();
         server.shutdown().await;
+    }
+
+    #[test]
+    fn test_extract_admin_header_token_empty_filtered() {
+        // Regression (LOW/security-hardening): a present-but-blank `x-admin-token` must be treated as
+        // ABSENT, mirroring the empty-filter `extract_client_token` applies to the vendor carriers.
+        // The OLD code mapped a blank header to `Some("")` (no `.filter(|t| !t.is_empty())`), so this
+        // unit test fails against it; the filtered helper now yields `None`.
+        let blank = req_with("x-admin-token", "");
+        assert_eq!(
+            extract_admin_header_token(&blank),
+            None,
+            "a blank x-admin-token must be treated as absent (None)"
+        );
+
+        // A whitespace-only value is NOT blank (it is a non-empty string); it is preserved verbatim
+        // and will simply fail the constant-time compare downstream — the filter is empty-only, not a
+        // trim, matching extract_client_token's carrier filter exactly.
+        let present = req_with("x-admin-token", "admintok");
+        assert_eq!(
+            extract_admin_header_token(&present),
+            Some("admintok".to_string()),
+            "a non-empty x-admin-token must be carried verbatim"
+        );
+
+        // Absent header → None (unchanged).
+        let absent = Request::builder()
+            .uri("/admin/keys")
+            .body(Body::empty())
+            .expect("test request must build");
+        assert_eq!(extract_admin_header_token(&absent), None);
+    }
+
+    /// Regression (LOW/security-hardening): a present-but-blank `x-admin-token` must be rejected on
+    /// the admin surface. Driven end-to-end through the real router + `auth_middleware` so the
+    /// extraction + constant-time compare are exercised together. A correct token via the same header
+    /// authorizes, proving the 401 is the empty-filter and not a blanket reject.
+    #[tokio::test]
+    async fn test_admin_blank_header_token_rejected() {
+        use crate::governance::{GovState, SqliteStore};
+        use crate::test_support::TestApp;
+        use std::sync::Arc;
+
+        crate::metrics::init();
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/admin/keys");
+
+        // Blank x-admin-token (and no Bearer) → 401: a blank header is treated as absent.
+        let r_blank = client
+            .get(&url)
+            .header("x-admin-token", "")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r_blank.status().as_u16(),
+            401,
+            "a blank x-admin-token must be rejected (treated as absent), got {}",
+            r_blank.status()
+        );
+
+        // Correct x-admin-token → authorized, proving the reject above is the empty-filter.
+        let r_ok = client
+            .get(&url)
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r_ok.status().as_u16(),
+            401,
+            "a correct x-admin-token must authorize, got {}",
+            r_ok.status()
+        );
+
+        handle.abort();
     }
 
     /// Regression for the admin-token carrier-level timing oracle (MEDIUM/security): the two admin

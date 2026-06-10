@@ -521,12 +521,17 @@ impl ProtocolReader for AnthropicReader {
                 // native Anthropic error event carries either a real type or `null`. The writer
                 // (write_response_event) already renders `None` as JSON `null`, so the absence
                 // round-trips faithfully.
-                let provider_signal = err_val
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .map(String::from);
+                let type_token = err_val.get("type").and_then(|t| t.as_str());
+                let provider_signal = type_token.map(String::from);
+                // Derive the breaker class from the upstream error `type`, mirroring the HTTP
+                // classifier intent (see `classify`/`write_error`'s Anthropic error vocabulary)
+                // instead of hardcoding ClientError. A mid-stream `overloaded_error`/
+                // `rate_limit_error`/`api_error` is a TRANSIENT upstream fault, not a client fault —
+                // hardcoding ClientError mapped every one of them to Disposition::ClientFault, so the
+                // breaker never recorded the transient/hard-down signal and took the wrong transition.
+                let class = stream_error_class(type_token);
                 Some(IrStreamEvent::Error(IrError {
-                    class: StatusClass::ClientError,
+                    class,
                     provider_signal,
                     retry_after: None,
                 }))
@@ -646,6 +651,43 @@ impl ProtocolReader for AnthropicReader {
             system_fingerprint: None,
             stop_sequence,
         })
+    }
+}
+
+/// Map an Anthropic streaming `error.type` token to its breaker `StatusClass`, mirroring the HTTP
+/// classifier intent (`AnthropicReader::classify`) and the `write_error` error vocabulary so a
+/// mid-stream error drives the SAME breaker transition an equivalent non-stream HTTP error would.
+///
+/// Native Anthropic error types and their canonical class (see the Anthropic Messages API error
+/// shape — `overloaded_error` is the 529 overload signal, `rate_limit_error` the 429):
+///   - `overloaded_error`      → Overloaded   (transient — upstream is shedding load)
+///   - `rate_limit_error`      → RateLimit    (transient — back off / retry-after)
+///   - `api_error`             → ServerError  (transient — upstream 5xx-family fault)
+///   - `timeout_error`         → Timeout      (transient — upstream timed out)
+///   - `authentication_error`  → Auth         (hard down — credential invalid)
+///   - `permission_error`      → Auth         (hard down — 403-family, key lacks access)
+///   - `billing_error`         → Billing      (hard down — account/balance issue)
+///   - `invalid_request_error` → ClientError  (caller fault — do NOT penalize the lane)
+///   - `not_found_error`       → ClientError
+///   - `request_too_large`     → ClientError
+///
+/// An ABSENT type (`None`) or an unrecognized token falls back to `ClientError`: it is the
+/// conservative non-penalizing disposition (ClientFault records nothing), so an unknown mid-stream
+/// error can never wrongly trip or hard-down a healthy lane. The fallback is a NAMED arm, not a
+/// `_ =>` swallow, so a future Anthropic error type surfaces as an explicit unmapped case here.
+fn stream_error_class(error_type: Option<&str>) -> StatusClass {
+    match error_type {
+        Some("overloaded_error") => StatusClass::Overloaded,
+        Some("rate_limit_error") => StatusClass::RateLimit,
+        Some("api_error") => StatusClass::ServerError,
+        Some("timeout_error") => StatusClass::Timeout,
+        Some("authentication_error") | Some("permission_error") => StatusClass::Auth,
+        Some("billing_error") => StatusClass::Billing,
+        Some("invalid_request_error")
+        | Some("not_found_error")
+        | Some("request_too_large")
+        | None => StatusClass::ClientError,
+        Some(_unrecognized) => StatusClass::ClientError,
     }
 }
 
@@ -2220,6 +2262,178 @@ mod anthropic_hardening_tests {
                 .and_then(|t| t.as_str()),
             Some("overloaded_error")
         );
+    }
+
+    /// Regression for LOW #34: the streaming `error` reader hardcoded `StatusClass::ClientError`
+    /// for EVERY error type, so a mid-stream transient/hard-down fault was misclassified as a client
+    /// fault (`Disposition::ClientFault` records nothing) and the breaker took the wrong transition.
+    /// The class must now derive from the upstream `error.type`, mirroring the HTTP classifier intent.
+    /// This drives `read_response_event` end-to-end (not just the helper) so it fails against the old
+    /// hardcoded code and passes after, AND asserts the downstream breaker disposition is correct.
+    fn read_stream_error_class(error_type: &str) -> StatusClass {
+        let data = serde_json::json!({ "error": { "type": error_type } });
+        let ev = AnthropicReader
+            .read_response_event("error", &data)
+            .expect("error event parses");
+        match ev {
+            IrStreamEvent::Error(err) => err.class,
+            other => panic!("expected Error event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_overloaded_is_transient_not_client_fault() {
+        assert_eq!(
+            read_stream_error_class("overloaded_error"),
+            StatusClass::Overloaded
+        );
+        let sig = CanonicalSignal {
+            class: read_stream_error_class("overloaded_error"),
+            provider_signal: None,
+            retry_after: None,
+        };
+        assert_eq!(
+            crate::breaker::classify(&sig),
+            crate::breaker::Disposition::TransientUpstream,
+            "a mid-stream overloaded_error is a transient upstream fault, not a client fault"
+        );
+    }
+
+    #[test]
+    fn stream_error_rate_limit_is_rate_limit_class() {
+        assert_eq!(
+            read_stream_error_class("rate_limit_error"),
+            StatusClass::RateLimit
+        );
+        let sig = CanonicalSignal {
+            class: read_stream_error_class("rate_limit_error"),
+            provider_signal: None,
+            retry_after: None,
+        };
+        assert_eq!(
+            crate::breaker::classify(&sig),
+            crate::breaker::Disposition::TransientUpstream
+        );
+    }
+
+    #[test]
+    fn stream_error_api_error_is_server_error_class() {
+        assert_eq!(
+            read_stream_error_class("api_error"),
+            StatusClass::ServerError
+        );
+        let sig = CanonicalSignal {
+            class: read_stream_error_class("api_error"),
+            provider_signal: None,
+            retry_after: None,
+        };
+        assert_eq!(
+            crate::breaker::classify(&sig),
+            crate::breaker::Disposition::TransientUpstream
+        );
+    }
+
+    #[test]
+    fn stream_error_timeout_is_timeout_class() {
+        assert_eq!(
+            read_stream_error_class("timeout_error"),
+            StatusClass::Timeout
+        );
+    }
+
+    #[test]
+    fn stream_error_authentication_is_auth_hard_down() {
+        assert_eq!(
+            read_stream_error_class("authentication_error"),
+            StatusClass::Auth
+        );
+        let sig = CanonicalSignal {
+            class: read_stream_error_class("authentication_error"),
+            provider_signal: None,
+            retry_after: None,
+        };
+        assert_eq!(
+            crate::breaker::classify(&sig),
+            crate::breaker::Disposition::HardDown,
+            "a mid-stream authentication_error must hard-down the lane, not record nothing"
+        );
+    }
+
+    #[test]
+    fn stream_error_permission_is_auth_hard_down() {
+        assert_eq!(
+            read_stream_error_class("permission_error"),
+            StatusClass::Auth
+        );
+    }
+
+    #[test]
+    fn stream_error_billing_is_billing_hard_down() {
+        assert_eq!(
+            read_stream_error_class("billing_error"),
+            StatusClass::Billing
+        );
+        let sig = CanonicalSignal {
+            class: read_stream_error_class("billing_error"),
+            provider_signal: None,
+            retry_after: None,
+        };
+        assert_eq!(
+            crate::breaker::classify(&sig),
+            crate::breaker::Disposition::HardDown
+        );
+    }
+
+    #[test]
+    fn stream_error_invalid_request_stays_client_error() {
+        assert_eq!(
+            read_stream_error_class("invalid_request_error"),
+            StatusClass::ClientError
+        );
+        let sig = CanonicalSignal {
+            class: read_stream_error_class("invalid_request_error"),
+            provider_signal: None,
+            retry_after: None,
+        };
+        assert_eq!(
+            crate::breaker::classify(&sig),
+            crate::breaker::Disposition::ClientFault,
+            "a genuine client-fault error type must still classify as ClientFault"
+        );
+    }
+
+    #[test]
+    fn stream_error_not_found_and_too_large_are_client_error() {
+        assert_eq!(
+            read_stream_error_class("not_found_error"),
+            StatusClass::ClientError
+        );
+        assert_eq!(
+            read_stream_error_class("request_too_large"),
+            StatusClass::ClientError
+        );
+    }
+
+    #[test]
+    fn stream_error_unknown_or_absent_type_falls_back_to_client_error() {
+        // Unknown token: conservative non-penalizing fallback (records nothing, never trips a
+        // healthy lane).
+        assert_eq!(
+            read_stream_error_class("some_future_error"),
+            StatusClass::ClientError
+        );
+        // Absent type: the event carries no `type`, so the class defaults to ClientError too.
+        let data = serde_json::json!({ "error": { "message": "boom" } });
+        let ev = AnthropicReader
+            .read_response_event("error", &data)
+            .expect("error event parses");
+        match ev {
+            IrStreamEvent::Error(err) => {
+                assert_eq!(err.class, StatusClass::ClientError);
+                assert_eq!(err.provider_signal, None);
+            }
+            other => panic!("expected Error event, got {other:?}"),
+        }
     }
 
     /// write_error must include a synthesized top-level `request_id` (`req_...`) to match the native

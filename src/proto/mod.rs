@@ -639,6 +639,12 @@ pub(crate) fn decode_native_tool_id(ingress_protocol: &str, id: &str) -> Option<
     let prefix = native_tool_id_prefix(ingress_protocol)?;
     let rest = id.strip_prefix(prefix)?;
     let hexpart = rest.strip_prefix(TOOL_ID_REMAP_MARKER)?;
+    // A marker-only id (empty hex tail) is NOT a busbar id — `native_for` always hex-encodes the
+    // egress id, so an empty tail can only come from a client-authored `<prefix>bb1`. Decoding it
+    // would yield an empty string and break the exact-inverse round-trip, so pass it through verbatim.
+    if hexpart.is_empty() {
+        return None;
+    }
     // A valid busbar id has an even-length lowercase-hex tail; reject anything else so a genuine
     // client id that merely happens to start with `<prefix>bb1` is not mangled.
     let bytes = hex::decode(hexpart).ok()?;
@@ -4723,8 +4729,10 @@ mod stream_translate_tests {
     fn test_translate_error_to_bedrock_ingress_is_exception_frame() {
         let mut t =
             StreamTranslate::new("bedrock", "anthropic").expect("bedrock ingress translator");
-        // Anthropic native mid-stream error envelope → IrStreamEvent::Error (the Anthropic reader
-        // classifies all stream errors as ClientError → ValidationException).
+        // Anthropic native mid-stream error envelope → IrStreamEvent::Error. The Anthropic reader now
+        // derives the breaker class from the error `type` (LOW #34): `overloaded_error` → Overloaded,
+        // which the bedrock-ingress writer frames as `ServiceUnavailableException` (the transient
+        // overload exception), NOT the generic `ValidationException` a client fault would yield.
         let err_frame = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream is overloaded\"}}\n\n";
         let raw = t.feed(err_frame.as_bytes());
         assert!(!raw.is_empty(), "an error event must emit a frame");
@@ -4748,10 +4756,10 @@ mod stream_translate_tests {
             headers.contains(":exception-type"),
             "frame carries an :exception-type header; headers: {headers}"
         );
-        // The exception-type is a real Converse exception name (ClientError → ValidationException).
+        // The exception-type is a real Converse exception name (Overloaded → ServiceUnavailableException).
         assert!(
-            headers.contains("ValidationException"),
-            ":exception-type names a real Converse exception; headers: {headers}"
+            headers.contains("ServiceUnavailableException"),
+            ":exception-type names the transient overload Converse exception; headers: {headers}"
         );
         // The whole frame must decode without trailing bytes (valid CRC + lengths).
         let total_len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
@@ -5966,6 +5974,21 @@ mod stream_translate_tests {
             decode_native_tool_id("anthropic", &bare_shaped),
             None,
             "a bare `bb1<hex>` (empty-prefix) id must not be decoded on a non-Cohere ingress"
+        );
+        // A marker-only id (`<prefix>bb1` with an EMPTY hex tail) is client-authored, not busbar:
+        // `native_for` always hex-encodes the egress id, so it can never emit an empty tail. Decoding
+        // it would yield `Some("")` and break the exact-inverse round-trip, so it must pass through
+        // verbatim (None). Covers both the ingress's own prefix and the bare empty-prefix form.
+        let marker_only = format!("toolu_{TOOL_ID_REMAP_MARKER}");
+        assert_eq!(
+            decode_native_tool_id("anthropic", &marker_only),
+            None,
+            "a marker-only id (empty hex tail) must not decode to an empty string"
+        );
+        assert_eq!(
+            decode_native_tool_id("anthropic", TOOL_ID_REMAP_MARKER),
+            None,
+            "a bare marker with no prefix and empty hex tail must pass through verbatim"
         );
         // Sanity: the matching ingress DOES decode its own prefix.
         assert_eq!(

@@ -4205,12 +4205,21 @@ mod tests {
         };
 
         // A→B→A: pool_a falls back to pool_b, pool_b falls back to pool_a.
+        //
+        // For the cycle to genuinely re-enter an already-visited pool (and thereby exercise the
+        // visited-set guard rather than the "fallback pool not configured" cascade), pool_a must
+        // ALSO be registered in `fallback_pools` — `handle_fallback_pool` resolves targets via
+        // `app.fallback_pools.get(...)`, not the primary `pools` map. With pool_a registered as a
+        // fallback target the chain runs pool_a→pool_b(marked)→pool_a(marked)→pool_b DETECTED
+        // VISITED → 503, so the visited-set is the terminating mechanism. Without that guard this
+        // chain would recurse forever (regression coverage).
         let app = TestApp::new()
             .lane(tripped("key-a0"))
             .lane(tripped("key-a1"))
             .lane(tripped("key-b0"))
             .lane(tripped("key-b1"))
             .pool("pool_a", &[(0, 1), (1, 1)])
+            .fallback_pool("pool_a", &[(0, 1), (1, 1)])
             .fallback_pool("pool_b", &[(2, 1), (3, 1)])
             .on_exhausted(
                 "pool_a",
@@ -4224,7 +4233,7 @@ mod tests {
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
 
-        // pool_a exhausted → pool_b (marked) → pool_a (marked) → pool_b detected visited → 503.
+        // pool_a (marked) → pool_b (marked) → pool_a re-entered (already visited) → 503 via guard.
         let response = forward_with_pool(
             app.clone(),
             vec![

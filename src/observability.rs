@@ -471,9 +471,13 @@ pub(crate) fn shutdown_tracing() {
 /// webhook guard (`validate_webhook_url`) so the documented invariant "observability sinks are
 /// SSRF-safe" holds for OTLP as well, not just the webhook. Two differences from the webhook guard,
 /// both deliberate:
-///   1. SCHEME: `http://` is permitted in addition to `https://`, because the standard OTLP
-///      collector deployment is a co-located `http://localhost:4318` (or a sidecar) — a plaintext
-///      loopback hop carries no exfiltration risk. Any other scheme is rejected.
+///   1. SCHEME: `http://` is permitted in addition to `https://`, but ONLY for a loopback/localhost
+///      target, because the standard OTLP collector deployment is a co-located
+///      `http://localhost:4318` (or a sidecar) — a plaintext loopback hop never leaves the host, so
+///      it carries no exfiltration risk. Plaintext `http://` to a NON-loopback (remote) collector is
+///      rejected: span data carries key_ids, pool names, and governance decisions, so a remote sink
+///      MUST use `https://` to avoid sending traces in cleartext over the network. Any other scheme
+///      is rejected.
 ///   2. LOOPBACK: a loopback / `localhost` target is ALLOWED (it IS the standard collector pattern),
 ///      whereas the webhook blocks it. Everything else `host_is_internal` blocks is STILL blocked:
 ///      `169.254.169.254` cloud-metadata, the `METADATA_HOSTS` DNS names, RFC1918 private, RFC6598
@@ -503,7 +507,54 @@ fn validate_otlp_endpoint(endpoint: Option<&str>) -> Result<Option<String>, Stri
              host (SSRF guard; loopback/localhost collectors are allowed); got '{e}'"
         ));
     }
+    // The `http://` carve-out is ONLY for the co-located loopback collector. A plaintext hop to a
+    // REMOTE collector would put span data (key_ids, pool names, governance decisions) on the wire in
+    // cleartext, so require `https://` for any non-loopback host. (`scheme_is` is case-insensitive,
+    // matching the scheme check above; the host already passed `otlp_host_is_blocked`, so a
+    // non-loopback host here is an allowed EXTERNAL collector — which must be reached over TLS.)
+    if scheme_is(e, "http") && !otlp_host_is_loopback(&parsed) {
+        return Err(format!(
+            "observability.otlp_endpoint must use https:// for a non-loopback collector (plaintext \
+             http:// is only permitted for a loopback/localhost collector; traces would otherwise be \
+             sent in cleartext); got '{e}'"
+        ));
+    }
     Ok(Some(e.to_string()))
+}
+
+/// True iff the OTLP endpoint URL's host is the loopback/localhost collector target — the exact
+/// carve-out `otlp_host_is_blocked` leaves un-blocked: the `localhost` / `*.localhost` DNS names
+/// (RFC 6761), the loopback v4 block `127.0.0.0/8`, IPv6 `::1` (incl. its `::ffff:127.x` mapped
+/// form), and the alternate-IPv4 spellings of `127.0.0.1` (`is_alternate_loopback_v4`). Used to gate
+/// the plaintext-`http://` allowance to loopback only. Mirrors the loopback arms of
+/// `otlp_host_is_blocked` so the two stay in lockstep: every host this returns `true` for is a host
+/// that guard intentionally permits.
+fn otlp_host_is_loopback(url: &reqwest::Url) -> bool {
+    use std::net::IpAddr;
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.strip_prefix('[').unwrap_or(host);
+    let host = host.strip_suffix(']').unwrap_or(host);
+    let host = host.strip_suffix('.').unwrap_or(host);
+
+    // Alternate (non-dotted-quad) IPv4 encodings: only the loopback spellings count (parity with the
+    // `is_alternate_ipv4_encoding` arm of `otlp_host_is_blocked`).
+    if is_alternate_ipv4_encoding(host) {
+        return is_alternate_loopback_v4(host);
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(IpAddr::V6(v6)) => v6.is_loopback() || v6.to_ipv4().is_some_and(|v4| v4.is_loopback()),
+        // DNS name: the loopback carve-out is `localhost` / `*.localhost` (RFC 6761). Any other DNS
+        // name is an external collector (NOT loopback) and so must use https.
+        Err(_) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .rsplit_once('.')
+                    .is_some_and(|(_, tld)| tld.eq_ignore_ascii_case("localhost"))
+        }
+    }
 }
 
 /// SSRF block predicate for the OTLP endpoint: identical to `host_is_internal` EXCEPT loopback and
@@ -1189,6 +1240,57 @@ mod tests {
             assert!(
                 res.is_err(),
                 "non-http(s) OTLP endpoint '{bad}' must be rejected; got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_otlp_endpoint_requires_https_for_remote_collector() {
+        // Regression (R21 LOW #30): the plaintext-`http://` allowance exists ONLY for the co-located
+        // loopback collector. A plaintext hop to a REMOTE collector would put span data (key_ids,
+        // pool names, governance decisions) on the wire in cleartext, so `http://` to a non-loopback
+        // host must be rejected; `https://` to the same host is accepted, and `http://` stays valid
+        // for loopback/localhost. Old code accepted `http://<external>` unconditionally.
+
+        // http:// to a NON-loopback external host -> rejected (would be cleartext over the network).
+        for bad in [
+            "http://1.2.3.4/v1/traces",
+            "http://1.2.3.4:4318",
+            "http://collector.example.com:4318/v1/traces",
+            "HTTP://collector.example.com/v1/traces", // case-insensitive scheme, still gated
+        ] {
+            let res = validate_otlp_endpoint(Some(bad));
+            assert!(
+                res.is_err(),
+                "plaintext http:// to a remote OTLP collector '{bad}' must be rejected; got {res:?}"
+            );
+        }
+
+        // https:// to the same remote hosts -> accepted (TLS protects the span data on the wire).
+        for ok in [
+            "https://1.2.3.4/v1/traces",
+            "https://1.2.3.4:4318",
+            "https://collector.example.com:4318/v1/traces",
+        ] {
+            let res = validate_otlp_endpoint(Some(ok));
+            assert!(
+                res.is_ok(),
+                "https:// to a remote OTLP collector '{ok}' must be accepted; got {res:?}"
+            );
+        }
+
+        // http:// to a loopback/localhost target stays valid (the co-located-collector exception).
+        for ok in [
+            "http://localhost:4318/v1/traces",
+            "http://127.0.0.1:4318/v1/traces",
+            "http://[::1]:4318/v1/traces",
+            "http://api.localhost:4318", // *.localhost -> loopback (RFC 6761)
+            "http://2130706433/v1/traces", // 127.0.0.1 alternate encoding
+        ] {
+            let res = validate_otlp_endpoint(Some(ok));
+            assert!(
+                res.is_ok(),
+                "plaintext http:// to a loopback OTLP collector '{ok}' must stay accepted; got {res:?}"
             );
         }
     }

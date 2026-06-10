@@ -42,12 +42,16 @@ fn pool_authorized(gov: &crate::governance::GovCtx, pool: &str, proto: &str) -> 
 fn usage_sink(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
+    charged_at: u64,
 ) -> Option<crate::forward::UsageSink> {
     match (&app.governance, &gov.key) {
         (Some(g), Some(key)) => Some(crate::forward::UsageSink {
             gov: g.clone(),
             key_id: key.id.clone(),
             period: key.budget_period.clone(),
+            // The header-arrival epoch this request was admitted at — reused for the token fee so it
+            // shares the flat per-request fee's window (#29). See `UsageSink::charged_at`.
+            charged_at,
         }),
         _ => None,
     }
@@ -121,6 +125,7 @@ async fn governance_guard(
     proto: &'static str,
     pool: &str,
     started: Instant,
+    charged_at: u64,
 ) -> Option<Response> {
     // A governance rejection fires BEFORE the model is resolved to a configured pool, so the raw
     // client-supplied `pool` string must be mapped to the bounded metric label (metrics.rs:24-38)
@@ -128,13 +133,13 @@ async fn governance_guard(
     // the request-log webhook). Passing it raw was an unbounded-cardinality DoS vector.
     let label = pool_label(app, pool);
     if let Some(resp) = pool_authorized(gov, pool, proto) {
-        return Some(finish(app, gov, proto, label, started, resp));
+        return Some(finish(app, gov, proto, label, started, charged_at, resp));
     }
     if let Some(resp) = budget_check(app, gov, proto).await {
-        return Some(finish(app, gov, proto, label, started, resp));
+        return Some(finish(app, gov, proto, label, started, charged_at, resp));
     }
     if let Some(resp) = rate_check(app, gov, proto) {
-        return Some(finish(app, gov, proto, label, started, resp));
+        return Some(finish(app, gov, proto, label, started, charged_at, resp));
     }
     None
 }
@@ -194,6 +199,7 @@ fn finish(
     ingress_protocol: &str,
     pool: &str,
     started: Instant,
+    charged_at: u64,
     resp: Response,
 ) -> Response {
     let outcome = match resp.status().as_u16() {
@@ -234,7 +240,12 @@ fn finish(
     let is_success = matches!(resp.status().as_u16(), 200..=299);
     if is_success {
         if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
-            g.record_request(key, crate::store::now(), 0);
+            // Charge the flat per-request fee against the SAME window the request was admitted in
+            // (`charged_at`, the header-arrival epoch), NOT a fresh `store::now()`. For a streaming
+            // request the token fee fires later (at stream end) against `UsageSink::charged_at` — the
+            // identical epoch — so the two charges can never split across two rate-limit/budget
+            // windows even when the stream straddles a window boundary (#29).
+            g.record_request(key, charged_at, 0);
         }
     }
     resp
@@ -273,6 +284,10 @@ async fn ingress_body_model(
 ) -> Response {
     let caller_token = caller.0.as_deref();
     let started = Instant::now();
+    // Wall-clock epoch pinned ONCE at header-arrival; reused for BOTH the flat per-request fee
+    // (`finish` → `record_request`) and the token fee (`UsageSink::charged_at` → `record_tokens`) so
+    // a streaming request's two charges share one rate-limit/budget window (#29).
+    let charged_at = crate::store::now();
     let v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -293,6 +308,7 @@ async fn ingress_body_model(
                 proto,
                 "unresolved",
                 started,
+                charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
@@ -314,6 +330,7 @@ async fn ingress_body_model(
                 proto,
                 "unresolved",
                 started,
+                charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
@@ -333,6 +350,7 @@ async fn ingress_body_model(
         body,
         caller_token,
         started,
+        charged_at,
         // Body-model protocols (openai/cohere/responses) are never gemini, so the model-not-found
         // 404 uses the canonical OpenAI-style message.
         None,
@@ -366,6 +384,8 @@ async fn ingress_path_model(
 ) -> Response {
     let caller_token = caller.0.as_deref();
     let started = Instant::now();
+    // Header-arrival epoch pinned once and reused for both the per-request and token fees (#29).
+    let charged_at = crate::store::now();
     let mut v: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -384,6 +404,7 @@ async fn ingress_path_model(
                 proto,
                 "unresolved",
                 started,
+                charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
@@ -421,6 +442,7 @@ async fn ingress_path_model(
                 proto,
                 "unresolved",
                 started,
+                charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
@@ -452,6 +474,7 @@ async fn ingress_path_model(
                 proto,
                 "unresolved",
                 started,
+                charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
@@ -471,6 +494,7 @@ async fn ingress_path_model(
         injected,
         caller_token,
         started,
+        charged_at,
         gemini_api_version,
     )
     .await
@@ -494,11 +518,12 @@ async fn forward_resolved(
     body: Bytes,
     caller_token: Option<&str>,
     started: Instant,
+    charged_at: u64,
     gemini_api_version: Option<&str>,
 ) -> Response {
     // Governance guards (pool-allowed / budget / rate). A rejection is finished through `finish`
     // so it is still counted in metrics and the request-log webhook.
-    if let Some(resp) = governance_guard(app, gov, proto, model, started).await {
+    if let Some(resp) = governance_guard(app, gov, proto, model, started, charged_at).await {
         return resp;
     }
 
@@ -514,10 +539,10 @@ async fn forward_resolved(
             model,
             affinity_key,
             proto,
-            usage_sink(app, gov),
+            usage_sink(app, gov, charged_at),
         )
         .await;
-        return finish(app, gov, proto, model, started, resp);
+        return finish(app, gov, proto, model, started, charged_at, resp);
     }
 
     if let Some(&i) = app.by_model.get(model) {
@@ -532,10 +557,10 @@ async fn forward_resolved(
             model,
             None,
             proto,
-            usage_sink(app, gov),
+            usage_sink(app, gov, charged_at),
         )
         .await;
-        return finish(app, gov, proto, model, started, resp);
+        return finish(app, gov, proto, model, started, charged_at, resp);
     }
 
     // `not_found_error` is the canonical token every writer maps (OpenAI, Responses, Anthropic →
@@ -556,6 +581,7 @@ async fn forward_resolved(
         proto,
         pool_label(app, model),
         started,
+        charged_at,
         ingress_error(
             proto,
             StatusCode::NOT_FOUND,
@@ -635,6 +661,10 @@ pub(crate) async fn gemini_ingress(
     // counted through `finish` — the same pre-routing observability invariant the body/path cores
     // enforce. Without it, a malformed gemini path was invisible to Prometheus and the webhook.
     let started = Instant::now();
+    // Header-arrival epoch for this handler's pre-routing `finish` calls. (The success path delegates
+    // to `ingress_path_model`, which pins its own `charged_at`; these pre-routing rejections are
+    // non-2xx so they never charge — `finish` still requires the arg for a uniform signature.) (#29)
+    let charged_at = crate::store::now();
 
     // `rest` is everything after `/{version}/models/`, e.g. `foo:generateContent`. Split on the LAST
     // colon into (model, action). A missing colon (or an empty model/action) is NOT necessarily a
@@ -666,6 +696,7 @@ pub(crate) async fn gemini_ingress(
                     "gemini",
                     "unresolved",
                     started,
+                    charged_at,
                     ingress_error(
                         "gemini",
                         StatusCode::NOT_FOUND,
@@ -686,6 +717,7 @@ pub(crate) async fn gemini_ingress(
                 envelope_proto,
                 "unresolved",
                 started,
+                charged_at,
                 ingress_error(
                     envelope_proto,
                     StatusCode::NOT_FOUND,
@@ -726,6 +758,7 @@ pub(crate) async fn gemini_ingress(
                     "gemini",
                     "unresolved",
                     started,
+                    charged_at,
                     ingress_error(
                         "gemini",
                         StatusCode::NOT_FOUND,
@@ -743,6 +776,7 @@ pub(crate) async fn gemini_ingress(
                 envelope_proto,
                 "unresolved",
                 started,
+                charged_at,
                 ingress_error(
                     envelope_proto,
                     StatusCode::NOT_FOUND,
@@ -929,9 +963,12 @@ pub(crate) async fn named(
     // `started` is taken BEFORE the governance guards so a governance-rejected request still
     // records a (small) wall-clock duration and is counted via `finish`.
     let started = Instant::now();
+    // Header-arrival epoch pinned once; reused for both the per-request and token fees (#29).
+    let charged_at = crate::store::now();
 
     // Governance guards (pool-allowed / budget / rate); a rejection is finished through `finish`.
-    if let Some(resp) = governance_guard(&app, &gov, "anthropic", &name, started).await {
+    if let Some(resp) = governance_guard(&app, &gov, "anthropic", &name, started, charged_at).await
+    {
         return resp;
     }
 
@@ -947,10 +984,10 @@ pub(crate) async fn named(
             &name,
             affinity_key,
             "anthropic",
-            usage_sink(&app, &gov),
+            usage_sink(&app, &gov, charged_at),
         )
         .await;
-        return finish(&app, &gov, "anthropic", &name, started, resp);
+        return finish(&app, &gov, "anthropic", &name, started, charged_at, resp);
     }
     if let Some(&i) = app.by_model.get(&name) {
         // Use forward for model-based routing (no pool name context needed)
@@ -959,10 +996,10 @@ pub(crate) async fn named(
             vec![WeightedLane { idx: i, weight: 1 }],
             body,
             caller_token,
-            usage_sink(&app, &gov),
+            usage_sink(&app, &gov, charged_at),
         )
         .await;
-        return finish(&app, &gov, "anthropic", &name, started, resp);
+        return finish(&app, &gov, "anthropic", &name, started, charged_at, resp);
     }
 
     // Model/pool miss: wrap the 404 in `finish` so it is still counted in REQUESTS_TOTAL /
@@ -977,6 +1014,7 @@ pub(crate) async fn named(
         "anthropic",
         pool_label(&app, &name),
         started,
+        charged_at,
         ingress_error(
             "anthropic",
             StatusCode::NOT_FOUND,
@@ -998,9 +1036,12 @@ pub(crate) async fn adhoc(
 ) -> Response {
     let caller_token = caller.0.as_deref();
     let started = Instant::now();
+    // Header-arrival epoch pinned once; reused for both the per-request and token fees (#29).
+    let charged_at = crate::store::now();
 
     // Governance guards (pool-allowed / budget / rate); a rejection is finished through `finish`.
-    if let Some(resp) = governance_guard(&app, &gov, "anthropic", &model, started).await {
+    if let Some(resp) = governance_guard(&app, &gov, "anthropic", &model, started, charged_at).await
+    {
         return resp;
     }
 
@@ -1012,10 +1053,10 @@ pub(crate) async fn adhoc(
                 vec![WeightedLane { idx: i, weight: 1 }],
                 body,
                 caller_token,
-                usage_sink(&app, &gov),
+                usage_sink(&app, &gov, charged_at),
             )
             .await;
-            finish(&app, &gov, "anthropic", &model, started, resp)
+            finish(&app, &gov, "anthropic", &model, started, charged_at, resp)
         }
         // Provider mismatch / model miss: wrap the 4xx in `finish` so the client error is counted
         // in REQUESTS_TOTAL / REQUEST_DURATION_SECONDS and fires the request-log webhook, matching
@@ -1037,6 +1078,7 @@ pub(crate) async fn adhoc(
                 "anthropic",
                 pool_label(&app, &model),
                 started,
+                charged_at,
                 ingress_error(
                     "anthropic",
                     StatusCode::BAD_REQUEST,
@@ -1054,6 +1096,7 @@ pub(crate) async fn adhoc(
             "anthropic",
             pool_label(&app, &model),
             started,
+            charged_at,
             ingress_error(
                 "anthropic",
                 StatusCode::NOT_FOUND,
@@ -1116,6 +1159,7 @@ mod tests {
             "openai",
             "mypool",
             Instant::now(),
+            crate::store::now(),
             resp,
         );
         // finish must pass the response through unchanged.
@@ -1232,7 +1276,15 @@ mod tests {
 
         // A 200 response charges the flat fee.
         let resp = (StatusCode::OK, "ok").into_response();
-        let _ = finish(&app, &gov, "openai", "p", Instant::now(), resp);
+        let _ = finish(
+            &app,
+            &gov,
+            "openai",
+            "p",
+            Instant::now(),
+            crate::store::now(),
+            resp,
+        );
         assert_eq!(
             key_spend(&app, &key.id),
             30,
@@ -1241,7 +1293,15 @@ mod tests {
 
         // A 503 (router-side exhaustion) must NOT charge again.
         let resp = (StatusCode::SERVICE_UNAVAILABLE, "x").into_response();
-        let _ = finish(&app, &gov, "openai", "p", Instant::now(), resp);
+        let _ = finish(
+            &app,
+            &gov,
+            "openai",
+            "p",
+            Instant::now(),
+            crate::store::now(),
+            resp,
+        );
         assert_eq!(
             key_spend(&app, &key.id),
             30,
@@ -1250,7 +1310,15 @@ mod tests {
 
         // An upstream 500 must NOT charge.
         let resp = (StatusCode::INTERNAL_SERVER_ERROR, "x").into_response();
-        let _ = finish(&app, &gov, "openai", "p", Instant::now(), resp);
+        let _ = finish(
+            &app,
+            &gov,
+            "openai",
+            "p",
+            Instant::now(),
+            crate::store::now(),
+            resp,
+        );
         assert_eq!(
             key_spend(&app, &key.id),
             30,
@@ -1259,7 +1327,15 @@ mod tests {
 
         // A 4xx upstream error must NOT charge.
         let resp = (StatusCode::BAD_REQUEST, "x").into_response();
-        let _ = finish(&app, &gov, "openai", "p", Instant::now(), resp);
+        let _ = finish(
+            &app,
+            &gov,
+            "openai",
+            "p",
+            Instant::now(),
+            crate::store::now(),
+            resp,
+        );
         assert_eq!(
             key_spend(&app, &key.id),
             30,
@@ -1277,11 +1353,83 @@ mod tests {
             "anthropic",
             "p2",
             Instant::now(),
+            crate::store::now(),
             resp,
         );
         assert!(
             crate::metrics::render().contains("outcome=\"exhausted\""),
             "503 maps to outcome=exhausted"
+        );
+    }
+
+    // Regression for #29 (flat-fee side): `finish` must charge the per-request fee into the window
+    // implied by the `charged_at` (header-arrival) epoch it is handed, NOT a fresh `store::now()`.
+    // Paired with `forward::usage_tap_tests::test_nonstream_token_fee_uses_charged_at_window_not_clock`
+    // (the token-fee side), this proves BOTH halves of a request's billing land in the same window.
+    // With a `daily` key and a `charged_at` on a past day, the flat fee must land in that day, not
+    // today — the old code (`record_request(key, store::now(), 0)`) charged into today and failed.
+    #[test]
+    fn test_finish_charges_per_request_fee_in_charged_at_window() {
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        crate::metrics::init();
+
+        let store = std::sync::Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = std::sync::Arc::new(GovState::new(store, 30, 0, None).unwrap()); // 30c/request
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(1_000_000),
+                    budget_period: "daily".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .unwrap();
+        let mut app = minimal_app();
+        Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov.clone());
+        let govctx = crate::governance::GovCtx {
+            key: Some(key.clone()),
+        };
+
+        let charged_at: u64 = 1_700_000_000; // a fixed past day
+        let day_window = charged_at / 86_400 * 86_400;
+        assert_ne!(
+            day_window,
+            crate::store::now() / 86_400 * 86_400,
+            "test precondition: charged_at must be a different day than now"
+        );
+
+        let resp = (StatusCode::OK, "ok").into_response();
+        let _ = finish(
+            &app,
+            &govctx,
+            "openai",
+            "p",
+            Instant::now(),
+            charged_at,
+            resp,
+        );
+
+        let in_window = gov
+            .usage_for(&key.id, charged_at)
+            .unwrap()
+            .map(|u| u.spend_cents)
+            .unwrap_or(0);
+        assert_eq!(
+            in_window, 30,
+            "flat per-request fee must be charged into the charged_at day window"
+        );
+        let in_today = gov
+            .usage_for(&key.id, crate::store::now())
+            .unwrap()
+            .map(|u| u.spend_cents)
+            .unwrap_or(0);
+        assert_eq!(
+            in_today, 0,
+            "flat fee must NOT leak into the wall-clock 'now' window (#29)"
         );
     }
 
@@ -3558,9 +3706,16 @@ mod tests {
         };
 
         // Request a pool the key is NOT allowed on → 403, and the guard returns Some(response).
-        let rejected = governance_guard(&app, &gov, "openai", "denied-pool", Instant::now())
-            .await
-            .expect("a disallowed pool must be rejected by the governance guard");
+        let rejected = governance_guard(
+            &app,
+            &gov,
+            "openai",
+            "denied-pool",
+            Instant::now(),
+            crate::store::now(),
+        )
+        .await
+        .expect("a disallowed pool must be rejected by the governance guard");
         assert_eq!(
             rejected.status(),
             StatusCode::FORBIDDEN,
@@ -3599,7 +3754,15 @@ mod tests {
         let gov = crate::governance::GovCtx {
             key: Some(key.clone()),
         };
-        let passed = governance_guard(&app, &gov, "openai", "allowed-only", Instant::now()).await;
+        let passed = governance_guard(
+            &app,
+            &gov,
+            "openai",
+            "allowed-only",
+            Instant::now(),
+            crate::store::now(),
+        )
+        .await;
         assert!(
             passed.is_none(),
             "an allowed, in-budget, in-rate request is not rejected"

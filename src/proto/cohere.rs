@@ -169,6 +169,25 @@ fn cohere_tool_ir_index(state: &crate::ir::StreamDecodeState, frame_idx: usize) 
 #[derive(Clone)]
 pub(crate) struct CohereReader;
 
+impl CohereReader {
+    /// True when the upstream error body carries Cohere v2's oversized-request ("context length
+    /// exceeded") phrasing. Cohere has no structured context-length code/type, so this is a
+    /// case-insensitive substring scan of the raw body. The phrases mirror the ones the
+    /// `#[cfg(test)] classify()` helper recognizes ("too many tokens", "maximum"+"tokens") plus the
+    /// broader provider wording the audit calls out ("input too long", "exceeds maximum context",
+    /// "token limit" — matched via the "too long" / "exceeds"+"context" substrings), so production
+    /// `extract_error` synthesizes the canonical
+    /// `context_length_exceeded` code that the breaker maps to `StatusClass::ContextLength`.
+    fn body_signals_context_length(body: &[u8]) -> bool {
+        let lower = String::from_utf8_lossy(body).to_lowercase();
+        lower.contains("too many tokens")
+            || lower.contains("too long")
+            || lower.contains("token limit")
+            || (lower.contains("exceeds") && lower.contains("context"))
+            || (lower.contains("maximum") && lower.contains("token"))
+    }
+}
+
 impl ProtocolReader for CohereReader {
     fn extract_error(&self, status: StatusCode, body: &[u8]) -> crate::breaker::RawUpstreamError {
         // Parse the body exactly once and derive both fields from the single binding — the Gemini
@@ -185,6 +204,27 @@ impl ProtocolReader for CohereReader {
             .and_then(|j| j.get("error_type"))
             .and_then(|e| e.as_str())
             .map(String::from);
+
+        // Cohere v2 signals an oversized request via the error MESSAGE only — it has no distinct
+        // structured code/type for context-length (its `error_type` is the generic
+        // `invalid_request_error`, and the `message` is free text like "too many tokens" /
+        // "...exceeds the maximum ... tokens"). Without normalization, `provider_code` would carry
+        // that raw message string, which the breaker cannot recognize, so an oversized-request
+        // failure would be classified by HTTP 400 as a plain ClientError and NEVER fail over. The
+        // `#[cfg(test)] classify()` helper above synthesized the canonical `context_length_exceeded`
+        // code, but that helper does not run in production — only `extract_error` does. Mirror
+        // `AnthropicReader::extract_error`: scan the body for Cohere's context-length phrasing and,
+        // when it matches, OVERRIDE `provider_code` with the canonical `context_length_exceeded`
+        // code. The breaker (breaker.rs `normalize_raw_error`) recognizes that code →
+        // `StatusClass::ContextLength` → fail over without penalty (the lane is healthy). Unlike the
+        // Anthropic reader's `or_else` (its `provider_code` is `None` when context-length triggers),
+        // Cohere always populates `provider_code` from `message`, so the canonical code must REPLACE
+        // it rather than only fill an empty slot.
+        let provider_code = if Self::body_signals_context_length(body) {
+            Some("context_length_exceeded".to_string())
+        } else {
+            provider_code
+        };
 
         crate::breaker::RawUpstreamError {
             http_status: status.as_u16(),
@@ -3037,6 +3077,71 @@ mod tests {
         assert_eq!(err.provider_code.as_deref(), Some("boom"));
         assert_eq!(err.structured_type.as_deref(), Some("invalid_request"));
         assert_eq!(err.http_status, 400);
+    }
+
+    /// Regression (PLUS #17, med-completeness): production `extract_error` must synthesize the
+    /// canonical `context_length_exceeded` provider code for an oversized-request error so the
+    /// breaker (`normalize_raw_error`) classifies it as `StatusClass::ContextLength` and fails over
+    /// without penalty. Before the fix `extract_error` carried the raw `message` string as the
+    /// provider code (the breaker could not recognize it → plain 400 ClientError, no failover); only
+    /// the `#[cfg(test)] classify()` helper — which does not run in production — recognized the
+    /// signal. This test feeds real Cohere v2 oversized-context error bodies and asserts the
+    /// production path yields `context_length_exceeded`, AND that the breaker then routes it to
+    /// ContextLength.
+    #[test]
+    fn test_extract_error_synthesizes_context_length_in_production() {
+        let reader = CohereReader;
+
+        // Several real-shaped Cohere v2 oversized-request error bodies (free-text `message`, generic
+        // `error_type`). Each must normalize to the canonical code in PRODUCTION extract_error.
+        let bodies: &[&[u8]] = &[
+            br#"{"message": "too many tokens: the request exceeds the model's context window", "error_type": "invalid_request_error"}"#,
+            br#"{"message": "the input is too long for the requested model; please reduce the prompt"}"#,
+            br#"{"message": "requested 200000 tokens but the maximum is 128000 tokens for this model"}"#,
+            br#"{"message": "prompt exceeds the maximum context length"}"#,
+        ];
+
+        let empty_map = std::collections::HashMap::new();
+        for body in bodies {
+            let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+            assert_eq!(
+                raw.provider_code.as_deref(),
+                Some("context_length_exceeded"),
+                "production extract_error must synthesize the canonical context-length code for body {}",
+                String::from_utf8_lossy(body)
+            );
+
+            // The breaker must then route the canonical code to ContextLength (fail over, no penalty)
+            // rather than treating the 400 as a plain ClientError.
+            let signal = crate::breaker::normalize_raw_error(&raw, &empty_map);
+            assert_eq!(
+                signal.class,
+                crate::breaker::StatusClass::ContextLength,
+                "breaker must map the synthesized code to ContextLength for body {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// A non-context-length Cohere error body must NOT be misclassified as context-length: the raw
+    /// `message` is preserved as the provider code and the breaker does not route it to
+    /// ContextLength (guards against the substring scan over-matching).
+    #[test]
+    fn test_extract_error_non_context_length_message_preserved() {
+        let reader = CohereReader;
+        let body = br#"{"message": "invalid api key", "error_type": "invalid_request_error"}"#;
+        let raw = reader.extract_error(StatusCode::UNAUTHORIZED, body);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("invalid api key"),
+            "a non-context-length message must be carried verbatim"
+        );
+        let signal = crate::breaker::normalize_raw_error(&raw, &std::collections::HashMap::new());
+        assert_ne!(
+            signal.class,
+            crate::breaker::StatusClass::ContextLength,
+            "a non-context-length error must not be classified as ContextLength"
+        );
     }
 
     /// Regression (MEDIUM/conformance): a non-streaming request must OMIT the `stream` key entirely
