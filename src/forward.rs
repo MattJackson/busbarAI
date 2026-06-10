@@ -2060,7 +2060,7 @@ pub(crate) async fn forward_with_pool(
         let base = &app.lanes[i].base_url;
 
         // Mode-aware key selection: passthrough uses caller token, others use lane's api_key
-        let key = match app.auth_mode {
+        let key = match app.auth_mode() {
             crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(&app.lanes[i].api_key),
             crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
         };
@@ -2087,7 +2087,7 @@ pub(crate) async fn forward_with_pool(
                 .to_string(),
             body: &payload,
             timestamp_epoch: now(),
-            auth_mode: app.auth_mode,
+            auth_mode: app.auth_mode(),
         };
         let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 
@@ -2155,7 +2155,7 @@ pub(crate) async fn forward_with_pool(
                 if !status.is_success() {
                     // caveat: passthrough 401/403 is caller's key failing, not busbar's
                     // Do NOT trip breaker / change member health; relay verbatim to caller
-                    let auth_mode = app.auth_mode;
+                    let auth_mode = app.auth_mode();
                     let is_passthrough_40x = auth_mode == crate::auth::AuthMode::Passthrough
                         && (status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN);
 
@@ -3021,7 +3021,7 @@ async fn forward_once(
     let base = &app.lanes[i].base_url;
 
     // Mode-aware key selection: passthrough uses caller token, others use lane's api_key.
-    let key = match app.auth_mode {
+    let key = match app.auth_mode() {
         crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(&app.lanes[i].api_key),
         crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
     };
@@ -3043,7 +3043,7 @@ async fn forward_once(
             .to_string(),
         body: &payload,
         timestamp_epoch: now(),
-        auth_mode: app.auth_mode,
+        auth_mode: app.auth_mode(),
     };
     let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 

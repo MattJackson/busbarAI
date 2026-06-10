@@ -561,7 +561,6 @@ impl LaneSpec {
 pub(crate) struct TestApp {
     lanes: Vec<LaneSpec>,
     pools: std::collections::HashMap<String, Vec<crate::state::WeightedLane>>,
-    auth_mode: crate::auth::AuthMode,
     auth: Option<std::sync::Arc<crate::auth::AuthMiddleware>>,
     governance: Option<std::sync::Arc<crate::governance::GovState>>,
     failover_cfg: Option<crate::config::FailoverCfg>,
@@ -576,7 +575,6 @@ impl TestApp {
         Self {
             lanes: Vec::new(),
             pools: std::collections::HashMap::new(),
-            auth_mode: crate::auth::AuthMode::None,
             auth: None,
             governance: None,
             failover_cfg: None,
@@ -594,8 +592,20 @@ impl TestApp {
         self.pools.insert(name.into(), weighted(members));
         self
     }
+    /// Set the auth mode by installing an `AuthMiddleware` configured for that mode (empty
+    /// `client_tokens`). The middleware is now the SINGLE source of the mode (see `App::auth_mode`),
+    /// so this drives BOTH the ingress gate and egress credential selection — matching production,
+    /// where the two are always the same value. Tests that need a specific `client_tokens` allowlist
+    /// (token-mode ingress) should use `.auth(...)` with an explicit middleware instead; calling both
+    /// is last-wins.
     pub(crate) fn auth_mode(mut self, m: crate::auth::AuthMode) -> Self {
-        self.auth_mode = m;
+        // Struct-update from `default_none()` (mode none, empty client_tokens) so we only override
+        // `mode` and never name the deprecated `_legacy_token` field.
+        let cfg = crate::config::AuthCfg {
+            mode: m.as_config_str().to_string(),
+            ..crate::config::AuthCfg::default_none()
+        };
+        self.auth = Some(std::sync::Arc::new(crate::auth::AuthMiddleware::new(&cfg)));
         self
     }
     pub(crate) fn auth(mut self, a: std::sync::Arc<crate::auth::AuthMiddleware>) -> Self {
@@ -643,7 +653,6 @@ impl TestApp {
             pools: self.pools,
             client: reqwest::Client::builder().build().unwrap(),
             auth,
-            auth_mode: self.auth_mode,
             failover_cfg: self.failover_cfg,
             pool_runtime: self.pool_runtime,
             fallback_pools: self.fallback_pools,
@@ -1323,7 +1332,6 @@ mod tests {
         };
         let app = TestApp::new()
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
-            .auth_mode(crate::auth::AuthMode::Token)
             .build();
 
         let router = crate::build_router(app);
@@ -2396,7 +2404,6 @@ mod tests {
             )
             .pool("default", &[(0, 1)])
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg_passthrough)))
-            .auth_mode(crate::auth::AuthMode::Passthrough)
             .build();
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2449,7 +2456,6 @@ mod tests {
             )
             .pool("default", &[(0, 1)])
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg_token)))
-            .auth_mode(crate::auth::AuthMode::Token)
             .build();
 
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2513,7 +2519,6 @@ mod tests {
             )
             .pool("default", &[(0, 1)])
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg_passthrough)))
-            .auth_mode(crate::auth::AuthMode::Passthrough)
             .build();
 
         // Caller's Bearer token (NOT busbar's key)

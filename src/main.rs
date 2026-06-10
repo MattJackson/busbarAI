@@ -516,7 +516,6 @@ async fn main() {
             .build()
             .expect("build upstream HTTP client"),
         auth: auth_mw.clone(),
-        auth_mode: auth_mw.mode,
         failover_cfg,
         pool_runtime,
         fallback_pools,

@@ -69,7 +69,6 @@ pub(crate) struct App {
     pub(crate) pools: HashMap<String, Vec<WeightedLane>>,
     pub(crate) client: Client,
     pub(crate) auth: Arc<crate::auth::AuthMiddleware>,
-    pub(crate) auth_mode: crate::auth::AuthMode,
     /// Default failover config (deadline_s and max_failover cap) when a pool has no override.
     pub(crate) failover_cfg: Option<crate::config::FailoverCfg>,
     /// Per-pool runtime config (failover/exclusions today; breaker/affinity as they're wired).
@@ -80,4 +79,14 @@ pub(crate) struct App {
     pub(crate) on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
     /// governance runtime (virtual keys + budgets/limits store). `None` = disabled.
     pub(crate) governance: Option<std::sync::Arc<crate::governance::GovState>>,
+}
+
+impl App {
+    /// The configured auth mode — SINGLE SOURCE OF TRUTH. The `AuthMiddleware` owns it (set once at
+    /// construction from `auth.mode`, never mutated), and ingress token-gating reads it there; this
+    /// accessor lets the EGRESS credential-selection path read the same value without a denormalized
+    /// copy on `App` that could (in principle) drift. Cheap: `AuthMode` is `Copy`.
+    pub(crate) fn auth_mode(&self) -> crate::auth::AuthMode {
+        self.auth.mode
+    }
 }

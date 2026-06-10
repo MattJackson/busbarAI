@@ -50,6 +50,19 @@ impl AuthMode {
             _ => None,
         }
     }
+
+    /// The canonical config/wire spelling of this mode — the exact inverse of `from_config_str`
+    /// (`from_config_str(m.as_config_str()) == Some(m)` for every variant). Lets callers build an
+    /// `AuthCfg` from a mode without hardcoding the strings. Currently only the test harness needs it
+    /// (to build a mode-carrying `AuthMiddleware`); gated `#[cfg(test)]` so it isn't dead in release.
+    #[cfg(test)]
+    pub(crate) fn as_config_str(self) -> &'static str {
+        match self {
+            AuthMode::Token => Self::TOKEN,
+            AuthMode::Passthrough => Self::PASSTHROUGH,
+            AuthMode::None => Self::NONE,
+        }
+    }
 }
 
 /// The caller's bearer token, threaded into request extensions by `auth_middleware` so handlers can
@@ -423,7 +436,7 @@ pub(crate) async fn auth_middleware(
         // that lacks a virtual key. There is no place in `validate(&RootCfg)` to catch this —
         // governance is read separately from the resolved config — so warn once here, at the first
         // request that exercises the combination, rather than letting it pass unremarked.
-        if app.auth_mode == AuthMode::Passthrough {
+        if app.auth_mode() == AuthMode::Passthrough {
             static WARN_ONCE: std::sync::Once = std::sync::Once::new();
             WARN_ONCE.call_once(|| {
                 tracing::warn!(
@@ -442,7 +455,7 @@ pub(crate) async fn auth_middleware(
         // is a supported combination — governance simply wins), so there is no boot-time error;
         // mirror the passthrough advisory with a parallel one-shot warning at the first request that
         // exercises it, rather than leaving the override undiagnosed.
-        if app.auth_mode == AuthMode::None {
+        if app.auth_mode() == AuthMode::None {
             static WARN_ONCE: std::sync::Once = std::sync::Once::new();
             WARN_ONCE.call_once(|| {
                 tracing::warn!(
@@ -1209,7 +1222,6 @@ mod tests {
             )
             .pool("pa", &[(0, 1)])
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
-            .auth_mode(AuthMode::Token)
             .build();
 
         let router = crate::build_router(app);
@@ -1342,7 +1354,6 @@ mod tests {
             )
             .pool("pa", &[(0, 1)])
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
-            .auth_mode(AuthMode::Token)
             .build();
 
         let router = crate::build_router(app);
@@ -1447,7 +1458,6 @@ mod tests {
             )
             .pool("pa", &[(0, 1)])
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
-            .auth_mode(AuthMode::Token)
             .build();
 
         let router = crate::build_router(app);
@@ -1535,7 +1545,6 @@ mod tests {
             )
             .pool("pa", &[(0, 1)])
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
-            .auth_mode(AuthMode::Token)
             .build();
 
         let router = crate::build_router(app);
@@ -1618,7 +1627,6 @@ mod tests {
             )
             .pool("adminx", &[(0, 1)])
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
-            .auth_mode(AuthMode::Token)
             .build();
 
         let router = crate::build_router(app);
