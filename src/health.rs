@@ -216,12 +216,22 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
         Disposition::TransientUpstream => {
             // A transient failed probe must trip the SAME cells a successful probe (recover_lane)
             // clears — the default cell AND every per-pool cell — because organic traffic routes
-            // against per-pool cells. (The single BreakerCfg is used for all cells; per-pool
-            // trip-threshold nuance is a known limitation of the out-of-band prober.)
+            // against per-pool cells. Each cell is evaluated against ITS OWN pool's resolved breaker
+            // config (trip thresholds + cooldown backoff): resolve the per-pool `BreakerCfg` from
+            // `app.pool_runtime` by pool name, falling back to the ADR-0002 default for the bare `""`
+            // default cell and any pool without its own breaker block — matching the per-pool cfg the
+            // organic forward path resolves (forward.rs `breaker_cfg`). This replaces the prior
+            // one-size `BreakerCfg::default()` that ignored per-pool thresholds/cooldowns (#24/#25).
+            let resolve_cfg = |pool: &str| -> BreakerCfg {
+                app.pool_runtime
+                    .get(pool)
+                    .and_then(|r| r.breaker.clone())
+                    .unwrap_or_default()
+            };
             app.store.record_probe_failure_all_cells(
                 i,
                 "health-probe",
-                &BreakerCfg::default(),
+                &resolve_cfg,
                 retry_after_secs,
             );
         }

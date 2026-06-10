@@ -904,24 +904,26 @@ impl ProtocolReader for OpenAiReader {
             _ => None,
         };
 
-        // Parse usage
-        let usage_val = obj.get("usage").ok_or(IrError {
-            class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".into()),
-            retry_after: None,
-        })?;
+        // Parse usage. Treat an absent `usage` object leniently — fall back to zero counts rather
+        // than hard-erroring. A missing `usage` is an upstream response-format quirk (a
+        // mock/staging/proxy OpenAI-compatible backend that omits it on an otherwise valid 200
+        // completion), NOT a client mistake: returning a `ClientError` here mislabels the cause and
+        // makes forward.rs discard a valid 200 body and emit a spurious 500. The sibling Gemini and
+        // Cohere readers tolerate the same condition with a zero-usage fallback. `usage_val` is an
+        // `Option`, so each token lookup below already defaults to 0.
+        let usage_val = obj.get("usage");
         let cache_read_input_tokens = usage_val
-            .get("prompt_tokens_details")
+            .and_then(|u| u.get("prompt_tokens_details"))
             .and_then(|d| d.get("cached_tokens"))
             .and_then(|v| v.as_u64());
 
         let usage = crate::ir::IrUsage {
             input_tokens: usage_val
-                .get("prompt_tokens")
+                .and_then(|u| u.get("prompt_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             output_tokens: usage_val
-                .get("completion_tokens")
+                .and_then(|u| u.get("completion_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             cache_creation_input_tokens: None, // OpenAI doesn't provide this split
@@ -952,6 +954,21 @@ impl ProtocolReader for OpenAiReader {
             system_fingerprint,
             stop_sequence: None,
         })
+    }
+}
+
+/// Render an IR ToolUse `input` value as the OpenAI `function.arguments` string.
+///
+/// OpenAI carries tool-call arguments as a *string* of JSON. The reader stores well-formed
+/// arguments as a parsed `Value`, but falls back to `Value::String(raw)` when the upstream sent
+/// arguments that are not valid JSON (a streaming-partial or malformed tool call). Re-serializing
+/// such a `Value::String` via `serde_json::to_string` would JSON-encode the string a second time —
+/// emitting an escaped, quoted blob on the wire (double-encoding). Emit a `Value::String` verbatim
+/// so the original argument text round-trips unchanged; any other `Value` is serialized normally.
+fn tool_arguments_to_string(input: &serde_json::Value) -> String {
+    match input {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
     }
 }
 
@@ -1217,8 +1234,7 @@ impl ProtocolWriter for OpenAiWriter {
                 for block in &msg.content {
                     if let crate::ir::IrBlock::ToolUse { id, name, input } = block {
                         // Serialize input to JSON string
-                        let args_str =
-                            serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                        let args_str = tool_arguments_to_string(input);
                         // Preserve the original tool_call id verbatim — it must round-trip so the
                         // assistant tool_call correlates with the tool-result `tool_call_id`.
                         tool_calls_arr.push(serde_json::json!({
@@ -1694,7 +1710,7 @@ impl ProtocolWriter for OpenAiWriter {
         for block in &resp.content {
             if let crate::ir::IrBlock::ToolUse { id, name, input } = block {
                 // Serialize input to JSON string
-                let args_str = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                let args_str = tool_arguments_to_string(input);
                 tool_calls_arr.push(serde_json::json!({
                     "type": "function",
                     "id": id,
@@ -4020,6 +4036,102 @@ mod tests {
                 .filter(|e| matches!(e, IrStreamEvent::MessageStop))
                 .count(),
             1
+        );
+    }
+
+    // Regression (#7/#8): a 200 completion body that omits `usage` entirely must still read back
+    // successfully with a zero-usage fallback — never a hard `IrError` (which forward.rs would
+    // swallow into a spurious 500, discarding the valid 200 body). Mirrors the Gemini/Cohere
+    // readers. Against the old hard-fail code this `.expect` panics; after the fix it passes.
+    #[test]
+    fn read_response_tolerates_missing_usage() {
+        let body = serde_json::json!({
+            "id": "chatcmpl-x",
+            "object": "chat.completion",
+            "created": 1u64,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }]
+            // NOTE: no "usage" field.
+        });
+        let ir = OpenAiReader
+            .read_response(&body)
+            .expect("a 200 body with no usage must read back, not hard-fail");
+        assert_eq!(ir.usage.input_tokens, 0);
+        assert_eq!(ir.usage.output_tokens, 0);
+        assert_eq!(ir.usage.cache_read_input_tokens, None);
+        // The rest of the response still parsed.
+        assert_eq!(ir.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(ir.model.as_deref(), Some("gpt-4o"));
+    }
+
+    // Regression (#20): a non-JSON tool `arguments` value (stored by the reader as
+    // `Value::String(raw)` when the upstream sent malformed/partial argument text) must be emitted
+    // verbatim, NOT re-serialized via `serde_json::to_string` (which would JSON-encode the string a
+    // second time and double-encode the wire payload). Covers both write sites.
+    #[test]
+    fn write_request_string_tool_arguments_emitted_verbatim() {
+        let raw = "not-json {oops".to_string();
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![IrMessage {
+                role: IrRole::Assistant,
+                content: vec![crate::ir::IrBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "do_it".to_string(),
+                    input: serde_json::Value::String(raw.clone()),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = OpenAiWriter.write_request(&req);
+        let args = &out["messages"][0]["tool_calls"][0]["function"]["arguments"];
+        assert_eq!(
+            args,
+            &serde_json::Value::String(raw),
+            "string tool arguments must be emitted verbatim, not double-encoded, got {args}"
+        );
+    }
+
+    #[test]
+    fn write_response_string_tool_arguments_emitted_verbatim() {
+        let raw = "not-json {oops".to_string();
+        let resp = crate::ir::IrResponse {
+            role: IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "do_it".to_string(),
+                input: serde_json::Value::String(raw.clone()),
+            }],
+            stop_reason: Some("tool_use".to_string()),
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("gpt-4o".to_string()),
+            id: Some("chatcmpl-x".to_string()),
+            created: Some(1),
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = OpenAiWriter.write_response(&resp);
+        let args = &out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"];
+        assert_eq!(
+            args,
+            &serde_json::Value::String(raw),
+            "string tool arguments must be emitted verbatim, not double-encoded, got {args}"
         );
     }
 }

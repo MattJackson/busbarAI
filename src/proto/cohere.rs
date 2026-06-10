@@ -542,7 +542,12 @@ impl ProtocolReader for CohereReader {
                 }
             }
             "content-start" => {
-                let idx = data.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                // The text content block ALWAYS occupies IR index 0 (matching gemini.rs and the
+                // `cohere_tool_ir_index` base-offset contract that keeps tool blocks off index 0).
+                // The raw upstream wire `index` is NOT forwarded into the IR stream: a backend that
+                // numbered its single text block other than 0 would emit a non-zero IR index that
+                // collides with a tool block (which assumes text lives at IR index 0), producing two
+                // BlockStart frames at the same IR index. Normalize to 0 on emit.
                 if !state.text_block_open {
                     state.text_block_open = true;
                     // Permanently record that a text block has occupied IR index 0 this stream so a
@@ -550,20 +555,23 @@ impl ProtocolReader for CohereReader {
                     // flag (see cohere_tool_ir_index / TEXT_BLOCK_SEEN_SENTINEL).
                     state.open_tools.insert(TEXT_BLOCK_SEEN_SENTINEL);
                     out.push(IrStreamEvent::BlockStart {
-                        index: idx,
+                        index: 0,
                         block: crate::ir::IrBlockMeta::Text,
                     });
                 }
             }
             "content-delta" => {
-                let idx = data.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                // The text content block ALWAYS occupies IR index 0 — see content-start. The raw
+                // upstream wire `index` is never forwarded into the IR stream; normalizing the text
+                // BlockStart/Delta to 0 keeps it off any tool block's IR index even when the backend
+                // numbers content frames with a non-zero index.
                 if !state.text_block_open {
                     state.text_block_open = true;
                     // See content-start: record the text block's claim on IR index 0 for the whole
                     // stream so a subsequent tool block never collides with it.
                     state.open_tools.insert(TEXT_BLOCK_SEEN_SENTINEL);
                     out.push(IrStreamEvent::BlockStart {
-                        index: idx,
+                        index: 0,
                         block: crate::ir::IrBlockMeta::Text,
                     });
                 }
@@ -575,7 +583,7 @@ impl ProtocolReader for CohereReader {
                         if let Some(text) = content_obj.as_str() {
                             if !text.is_empty() {
                                 out.push(IrStreamEvent::BlockDelta {
-                                    index: idx,
+                                    index: 0,
                                     delta: crate::ir::IrDelta::TextDelta(text.to_string()),
                                 });
                             }
@@ -590,7 +598,7 @@ impl ProtocolReader for CohereReader {
                                 if let Some(text) = block_obj.get("text").and_then(|t| t.as_str()) {
                                     if !text.is_empty() {
                                         out.push(IrStreamEvent::BlockDelta {
-                                            index: idx,
+                                            index: 0,
                                             delta: crate::ir::IrDelta::TextDelta(text.to_string()),
                                         });
                                     }
@@ -606,7 +614,7 @@ impl ProtocolReader for CohereReader {
                                             block_obj.get("text").and_then(|t| t.as_str())
                                         {
                                             out.push(IrStreamEvent::BlockDelta {
-                                                index: idx,
+                                                index: 0,
                                                 delta: crate::ir::IrDelta::TextDelta(
                                                     text.to_string(),
                                                 ),
@@ -620,9 +628,16 @@ impl ProtocolReader for CohereReader {
                 }
             }
             "content-end" => {
-                let idx = data.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                out.push(IrStreamEvent::BlockStop { index: idx });
-                state.text_block_open = false;
+                // content-end closes the text content block, which always lives at IR index 0 (see
+                // content-start/content-delta). Forwarding the raw wire `index` here would emit a
+                // BlockStop for an index the IR stream never opened (the matching BlockStart was
+                // normalized to 0), leaving the real text block unclosed and stopping a phantom one.
+                // Only emit the stop if a text block is actually open, so a stray content-end never
+                // produces an unbalanced BlockStop.
+                if state.text_block_open {
+                    state.text_block_open = false;
+                    out.push(IrStreamEvent::BlockStop { index: 0 });
+                }
             }
             "message-end" => {
                 let raw_finish_reason = data
@@ -709,52 +724,70 @@ impl ProtocolReader for CohereReader {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                // Record this tool frame so its IR index stays stable for its lifetime. Cap the
-                // tracked set so an adversarial/buggy upstream streaming an unbounded number of
-                // distinct frame indices cannot grow it without bound (the set is never shrunk).
-                // A frame already present is always re-inserted cheaply (no growth); only genuinely
-                // new frames past the cap are dropped from tracking.
-                if state.open_tools.contains(&frame_idx)
-                    || state.open_tools.len() < MAX_TRACKED_TOOL_FRAMES
-                {
+                // A DUPLICATE tool-call-start for a frame already being tracked is a no-op: the
+                // block is already open at its stable IR index, so re-emitting BlockStart would
+                // push a spurious second opening frame for the same block. Likewise, a genuinely
+                // new frame that the cap prevents us from tracking must emit NO tool block events:
+                // `cohere_tool_ir_index` would still compute an IR index for it, but that index is
+                // not backed by a tracked frame and collides with the index of the highest tracked
+                // tool (which keeps the same rank because the new frame was never recorded), and
+                // tool-call-delta / tool-call-end for the untracked frame are dropped — so its
+                // BlockStart would be orphaned. Only emit when the frame is (or becomes) tracked.
+                let tracked = if state.open_tools.contains(&frame_idx) {
+                    // Already open this stream: duplicate start, no-op (no re-emit).
+                    false
+                } else if state.open_tools.len() < MAX_TRACKED_TOOL_FRAMES {
+                    // New frame with room to track: record it and emit its block events.
                     state.open_tools.insert(frame_idx);
-                }
-                let ir_idx = cohere_tool_ir_index(state, frame_idx);
-                out.push(IrStreamEvent::BlockStart {
-                    index: ir_idx,
-                    block: crate::ir::IrBlockMeta::ToolUse { id, name },
-                });
-                // Cohere may include initial argument text on the start frame.
-                if let Some(args) = tc
-                    .and_then(|t| t.get("function"))
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    out.push(IrStreamEvent::BlockDelta {
+                    true
+                } else {
+                    // New frame past the cap: not tracked, emit nothing (see above).
+                    false
+                };
+                if tracked {
+                    let ir_idx = cohere_tool_ir_index(state, frame_idx);
+                    out.push(IrStreamEvent::BlockStart {
                         index: ir_idx,
-                        delta: crate::ir::IrDelta::InputJsonDelta(args.to_string()),
+                        block: crate::ir::IrBlockMeta::ToolUse { id, name },
                     });
+                    // Cohere may include initial argument text on the start frame.
+                    if let Some(args) = tc
+                        .and_then(|t| t.get("function"))
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        out.push(IrStreamEvent::BlockDelta {
+                            index: ir_idx,
+                            delta: crate::ir::IrDelta::InputJsonDelta(args.to_string()),
+                        });
+                    }
                 }
             }
             "tool-call-delta" => {
                 let frame_idx = data.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                // Resolve to the IR index assigned at start time. The mapping is stable because
-                // `open_tools` is never shrunk for the lifetime of the stream (see tool-call-start).
-                let ir_idx = cohere_tool_ir_index(state, frame_idx);
-                if let Some(args) = data
-                    .get("delta")
-                    .and_then(|d| d.get("message"))
-                    .and_then(|m| m.get("tool_calls"))
-                    .and_then(|t| t.get("function"))
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    out.push(IrStreamEvent::BlockDelta {
-                        index: ir_idx,
-                        delta: crate::ir::IrDelta::InputJsonDelta(args.to_string()),
-                    });
+                // Only forward deltas for a frame we actually tracked (and therefore opened a
+                // BlockStart for). A frame past MAX_TRACKED_TOOL_FRAMES was never recorded and never
+                // opened, so its `cohere_tool_ir_index` would collide with the highest tracked tool;
+                // emitting a delta there would corrupt that block's arguments. Mirrors the
+                // tool-call-end guard. The mapping is stable because `open_tools` is never shrunk
+                // for the lifetime of the stream (see tool-call-start).
+                if state.open_tools.contains(&frame_idx) {
+                    let ir_idx = cohere_tool_ir_index(state, frame_idx);
+                    if let Some(args) = data
+                        .get("delta")
+                        .and_then(|d| d.get("message"))
+                        .and_then(|m| m.get("tool_calls"))
+                        .and_then(|t| t.get("function"))
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        out.push(IrStreamEvent::BlockDelta {
+                            index: ir_idx,
+                            delta: crate::ir::IrDelta::InputJsonDelta(args.to_string()),
+                        });
+                    }
                 }
             }
             "tool-call-end" => {
@@ -4122,6 +4155,194 @@ mod tests {
             out.get("finish_reason").and_then(|r| r.as_str()),
             Some("STOP_SEQUENCE"),
             "STOP_SEQUENCE must survive a Cohere -> IR -> Cohere round-trip unchanged"
+        );
+    }
+
+    /// Test helper: count `BlockStart` events whose IR index equals `idx`.
+    fn count_block_starts_at(evs: &[IrStreamEvent], idx: usize) -> usize {
+        evs.iter()
+            .filter(|e| matches!(e, IrStreamEvent::BlockStart { index, .. } if *index == idx))
+            .count()
+    }
+
+    /// Regression (LOW #17): a DUPLICATE `tool-call-start` for a frame index that is already open
+    /// must be a no-op. The pre-fix code emitted a fresh `BlockStart` unconditionally on every
+    /// `tool-call-start`, so a backend that re-sent the start frame for an already-open tool block
+    /// produced two `BlockStart` events at the same IR index — a spurious second opening frame for
+    /// one block. After the fix the second start emits nothing.
+    #[test]
+    fn test_duplicate_tool_call_start_is_noop() {
+        let reader = CohereReader;
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        let start = serde_json::json!({
+            "type": "tool-call-start",
+            "index": 0,
+            "delta": { "message": { "tool_calls": {
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "get_weather", "arguments": "" }
+            }}}
+        });
+
+        let first = reader.read_response_events("", &start, &mut state);
+        // First start opens the block exactly once (text never appeared, so tool IR index is 0).
+        assert_eq!(
+            count_block_starts_at(&first, 0),
+            1,
+            "first tool-call-start must open the block once"
+        );
+
+        let second = reader.read_response_events("", &start, &mut state);
+        assert_eq!(
+            count_block_starts_at(&second, 0),
+            0,
+            "a duplicate tool-call-start for an already-open frame must emit no BlockStart"
+        );
+        assert!(
+            second.is_empty(),
+            "a duplicate tool-call-start must be a complete no-op, got {second:?}"
+        );
+    }
+
+    /// Regression (LOW #18): a `tool-call-start` for a frame BEYOND `MAX_TRACKED_TOOL_FRAMES` must
+    /// emit NO tool block events. The pre-fix code skipped *recording* the over-cap frame but still
+    /// computed an IR index via `cohere_tool_ir_index` and emitted a `BlockStart` for it. Because
+    /// the frame was never recorded, that index equalled the rank of the highest *tracked* tool —
+    /// a collision producing a second `BlockStart` at an already-used IR index. After the fix an
+    /// untracked frame emits nothing (and its later delta/end are likewise dropped).
+    #[test]
+    fn test_over_cap_tool_call_start_emits_no_block() {
+        let reader = CohereReader;
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        // Saturate the tracked set with distinct frame indices [0, MAX_TRACKED_TOOL_FRAMES).
+        for f in 0..MAX_TRACKED_TOOL_FRAMES {
+            let start = serde_json::json!({
+                "type": "tool-call-start",
+                "index": f,
+                "delta": { "message": { "tool_calls": {
+                    "id": format!("call_{f}"),
+                    "type": "function",
+                    "function": { "name": "f", "arguments": "" }
+                }}}
+            });
+            let _ = reader.read_response_events("", &start, &mut state);
+        }
+        assert_eq!(state.open_tools.len(), MAX_TRACKED_TOOL_FRAMES);
+
+        // A genuinely new frame past the cap: must produce NO events and not collide with the
+        // highest tracked tool's IR index (MAX_TRACKED_TOOL_FRAMES - 1).
+        let over = serde_json::json!({
+            "type": "tool-call-start",
+            "index": MAX_TRACKED_TOOL_FRAMES + 5,
+            "delta": { "message": { "tool_calls": {
+                "id": "call_over",
+                "type": "function",
+                "function": { "name": "f", "arguments": "abc" }
+            }}}
+        });
+        let evs = reader.read_response_events("", &over, &mut state);
+        assert!(
+            evs.is_empty(),
+            "an over-cap tool-call-start must emit no block events, got {evs:?}"
+        );
+        assert_eq!(
+            count_block_starts_at(&evs, MAX_TRACKED_TOOL_FRAMES - 1),
+            0,
+            "an over-cap tool-call-start must not collide with the highest tracked tool's index"
+        );
+    }
+
+    /// Regression (LOW #19): content-start / content-delta / content-end must NORMALIZE the text
+    /// block to IR index 0 regardless of the raw upstream wire `index`. The pre-fix code forwarded
+    /// the wire `index` verbatim, so a backend that numbered its single text block at (say) wire
+    /// index 2 produced a text `BlockStart`/`BlockDelta`/`BlockStop` at IR index 2 — while a tool
+    /// block (which assumes text is at IR index 0) takes IR index 1 after it, leaving index 0 unused
+    /// and the text/tool indices misaligned. After the fix the text block is always at IR index 0
+    /// and the tool block lands at IR index 1.
+    #[test]
+    fn test_text_block_normalized_to_ir_index_zero() {
+        let reader = CohereReader;
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        // Backend numbers the text content block at a NON-ZERO wire index.
+        let cs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "content-start",
+                "index": 2,
+                "delta": { "message": { "content": { "type": "text", "text": "" } } }
+            }),
+            &mut state,
+        );
+        match cs.as_slice() {
+            [IrStreamEvent::BlockStart { index, block }] => {
+                assert_eq!(
+                    *index, 0,
+                    "text BlockStart must be normalized to IR index 0"
+                );
+                assert!(matches!(block, crate::ir::IrBlockMeta::Text));
+            }
+            other => panic!("expected one text BlockStart, got {other:?}"),
+        }
+
+        let cd = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "content-delta",
+                "index": 2,
+                "delta": { "message": { "content": { "type": "text", "text": "hi" } } }
+            }),
+            &mut state,
+        );
+        match cd.as_slice() {
+            [IrStreamEvent::BlockDelta { index, delta }] => {
+                assert_eq!(
+                    *index, 0,
+                    "text BlockDelta must be normalized to IR index 0"
+                );
+                assert!(matches!(delta, crate::ir::IrDelta::TextDelta(t) if t == "hi"));
+            }
+            other => panic!("expected one text BlockDelta, got {other:?}"),
+        }
+
+        let ce = reader.read_response_events(
+            "",
+            &serde_json::json!({ "type": "content-end", "index": 2 }),
+            &mut state,
+        );
+        match ce.as_slice() {
+            [IrStreamEvent::BlockStop { index }] => {
+                assert_eq!(*index, 0, "text BlockStop must be normalized to IR index 0");
+            }
+            other => panic!("expected one text BlockStop, got {other:?}"),
+        }
+
+        // A tool block that follows the (now-closed) text block must take IR index 1, NOT reuse the
+        // wire index 2 the text block carried.
+        let ts = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "tool-call-start",
+                "index": 0,
+                "delta": { "message": { "tool_calls": {
+                    "id": "t1",
+                    "type": "function",
+                    "function": { "name": "f", "arguments": "" }
+                }}}
+            }),
+            &mut state,
+        );
+        assert_eq!(
+            count_block_starts_at(&ts, 1),
+            1,
+            "the tool block must open at IR index 1 (after the text block at index 0)"
+        );
+        assert_eq!(
+            count_block_starts_at(&ts, 2),
+            0,
+            "the tool block must NOT reuse the text block's non-zero wire index"
         );
     }
 }

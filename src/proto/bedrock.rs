@@ -1358,12 +1358,21 @@ impl ProtocolWriter for BedrockWriter {
                 }
             }
 
-            if !content_arr.is_empty() {
-                let mut msg_obj = serde_json::Map::new();
-                msg_obj.insert("role".to_string(), serde_json::json!(role_str));
-                msg_obj.insert("content".to_string(), serde_json::Value::Array(content_arr));
-                msgs_arr.push(serde_json::Value::Object(msg_obj));
+            // A user/assistant/tool turn whose blocks were ALL non-representable (e.g. a
+            // thinking-only assistant message, or a block kind that produced nothing above)
+            // would otherwise yield an empty `content_arr`. Dropping the whole message loses
+            // turn structure and can break strict user/assistant alternation that Bedrock
+            // Converse enforces (a 400 ValidationException). Mirror the Anthropic writer
+            // (`write_message`/`write_block`, which emit `""` for an empty content body) by
+            // substituting a minimal placeholder text block so the turn survives the seam.
+            // System-role messages never reach here (they `continue` during role mapping).
+            if content_arr.is_empty() {
+                content_arr.push(serde_json::json!({ "text": "" }));
             }
+            let mut msg_obj = serde_json::Map::new();
+            msg_obj.insert("role".to_string(), serde_json::json!(role_str));
+            msg_obj.insert("content".to_string(), serde_json::Value::Array(content_arr));
+            msgs_arr.push(serde_json::Value::Object(msg_obj));
         }
 
         if !msgs_arr.is_empty() {
@@ -3890,6 +3899,95 @@ mod tests {
             out2.pointer("/messages/0/content/0/image/source/bytes")
                 .and_then(|v| v.as_str()),
             Some("QkFTRTY0")
+        );
+    }
+
+    /// Regression (R19 #16): a user/assistant turn whose blocks are ALL non-representable on the
+    /// Bedrock wire (here a thinking-only assistant message, and a user message holding only a
+    /// URL-sentinel image) must NOT be silently dropped. Dropping it loses turn structure and can
+    /// break the strict user/assistant alternation Bedrock Converse enforces. The writer now mirrors
+    /// the Anthropic writer by emitting a minimal placeholder `{"text":""}` block so the turn (and
+    /// its role) survives.
+    #[test]
+    fn test_write_request_all_nonrepresentable_turn_kept_with_placeholder() {
+        let writer = BedrockWriter;
+        let req = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::User,
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "hello".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                },
+                // Assistant turn carrying ONLY a thinking block (non-representable on Bedrock).
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::Assistant,
+                    content: vec![crate::ir::IrBlock::Thinking {
+                        text: "internal reasoning".to_string(),
+                        signature: None,
+                    }],
+                },
+                // User turn carrying ONLY a URL-sentinel image (also non-representable here).
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::User,
+                    content: vec![crate::ir::IrBlock::Image {
+                        media_type: "image_url".to_string(),
+                        data: "https://example.com/cat.png".to_string(),
+                    }],
+                },
+            ],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = writer.write_request(&req);
+
+        // All three turns survive (old code dropped turns 1 and 2, yielding length 1).
+        let msgs = out
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array present");
+        assert_eq!(msgs.len(), 3, "no turn may be dropped; got {out:?}");
+
+        // Roles preserved in order — alternation intact.
+        assert_eq!(
+            msgs[0].pointer("/role").and_then(|v| v.as_str()),
+            Some("user")
+        );
+        assert_eq!(
+            msgs[1].pointer("/role").and_then(|v| v.as_str()),
+            Some("assistant")
+        );
+        assert_eq!(
+            msgs[2].pointer("/role").and_then(|v| v.as_str()),
+            Some("user")
+        );
+
+        // The two emptied turns each carry a single placeholder text block.
+        assert_eq!(
+            msgs[1].pointer("/content/0/text").and_then(|v| v.as_str()),
+            Some(""),
+            "thinking-only assistant turn must carry a placeholder text block"
+        );
+        assert_eq!(
+            msgs[1]
+                .pointer("/content")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(
+            msgs[2].pointer("/content/0/text").and_then(|v| v.as_str()),
+            Some(""),
+            "image-only (URL-sentinel) user turn must carry a placeholder text block"
         );
     }
 

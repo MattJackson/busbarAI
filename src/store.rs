@@ -157,17 +157,28 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     // across pools carries independent Open/Closed status per pool. Lane-global checks (dead /
     // budget) are identical across both — only the breaker FSM is isolated.
     // `usable` (mutating, lane-default cell) is exercised by the unit tests; in release, dispatch
-    // goes through `usable_in`/`acquire_for_dispatch_in` and observers use the side-effect-free
-    // `is_ready` (so /stats can't steal a recovery probe), leaving the bare form test-only — so it
-    // is `#[cfg(test)]`-gated out of the release binary entirely rather than merely silenced.
+    // goes through `usable_in`/`acquire_for_dispatch_in` and non-dispatching observers use the
+    // side-effect-free all-cells `is_ready_any_cell` (so /healthz and /stats can't steal a recovery
+    // probe), leaving the bare form test-only — so it is `#[cfg(test)]`-gated out of the release
+    // binary entirely rather than merely silenced.
     #[cfg(test)]
     fn usable(&self, lane: usize, now: u64) -> bool;
     fn usable_in(&self, pool: &str, lane: usize, now: u64) -> bool;
     /// Side-effect-FREE readiness check: would this lane admit a request right now, WITHOUT
-    /// transitioning an expired-Open lane to HalfOpen or CAS-acquiring its single-flight probe.
-    /// `/healthz` and any non-dispatching observer must use this so they don't steal recovery
-    /// probes from organic traffic. The bare-lane (pool `""`) form covers the default cell.
+    /// transitioning an expired-Open lane to HalfOpen or CAS-acquiring its single-flight probe. The
+    /// bare-lane (pool `""`) form covers ONLY the default cell — `/healthz` now uses the all-cells
+    /// `is_ready_any_cell` instead (production routes through NAMED pools whose cells trip
+    /// independently), leaving this default-cell-only form exercised by the unit tests, so it is
+    /// `#[cfg(test)]`-gated out of the release binary entirely.
+    #[cfg(test)]
     fn is_ready(&self, lane: usize, now: u64) -> bool;
+    /// Side-effect-FREE readiness across ANY cell: true iff the lane is admissible (not dead / in
+    /// budget) AND the default cell OR ANY per-pool cell would admit a request right now. `/healthz`
+    /// must use this, not the default-cell-only `is_ready`: production traffic routes through NAMED
+    /// pools whose cells trip independently, so a lane whose every per-pool cell is Open is NOT
+    /// serviceable even though its default `""` cell (which pool-routed traffic never touches) reads
+    /// ready — and `/healthz` would otherwise return 200 while every pool lane is circuit-broken.
+    fn is_ready_any_cell(&self, lane: usize, now: u64) -> bool;
     /// Mutating admission for a lane selection is about to DISPATCH to: performs the Open→HalfOpen
     /// transition + single-flight probe CAS exactly once. Returns false if the probe was already
     /// taken (lost the race) so the caller can pick another lane.
@@ -186,15 +197,24 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// already transitioned it) or when the probe flag was already clear.
     fn release_probe_in(&self, pool: &str, lane: usize);
     // The bare lane-default breaker mutators below are exercised by the unit tests; in release,
-    // pool-routed dispatch goes through the `_in(pool, …)` variants, so most are unreachable there —
-    // hence the not(test) dead-code allow (they remain a tested part of the lane-default API). NOTE:
-    // `record_success` is the exception — it has a genuine production caller (the degraded
-    // `forward_once` failover path at forward.rs:2497, which has no pool context and uses the
-    // bare-lane forms), so it carries NO dead-code allow. `breaker_state`, `usable`,
-    // `record_rate_limit`, `record_hard_down` are genuinely release-dead and `#[cfg(test)]`-gated
-    // out of the release binary entirely rather than merely silenced with a dead-code allow.
+    // ALL dispatch (including the degraded `forward_once` fallback/least-bad path) now routes through
+    // the `_in(pool, …)` variants against the ROUTING POOL cell — recording on the default `""` cell
+    // left the pool cell wedged HalfOpen forever (H1) — so the bare forms are release-dead. NOTE:
+    // `is_ready`, `breaker_state`, `usable`, `record_success`, `record_rate_limit`, `record_hard_down`
+    // are all `#[cfg(test)]`-gated out of the release binary entirely rather than merely silenced with
+    // a dead-code allow.
     #[cfg(test)]
     fn breaker_state(&self, lane: usize) -> BreakerState;
+    /// Per-(pool, lane) breaker FSM state — test-only, so regressions can assert the POOL cell (not
+    /// just the default `""` cell) transitions correctly on the degraded forward path (H1).
+    #[cfg(test)]
+    fn breaker_state_in(&self, pool: &str, lane: usize) -> BreakerState;
+    /// Force a (pool, lane) breaker cell into Open with the given `cooldown_until` — test-only. Set
+    /// `cooldown_until` in the PAST for an expired-Open cell, which `acquire_for_dispatch_in`
+    /// transitions to HalfOpen (the single-flight recovery probe) on the next dispatch — the exact
+    /// state the degraded-forward H1 regression requires on the ROUTING POOL cell.
+    #[cfg(test)]
+    fn force_open_in(&self, pool: &str, lane: usize, cooldown_until: u64);
     // `snapshot()` now reports the lane-GLOBAL (worst-across-all-pool-cells) cooldown via
     // `lane_max_cooldown_remaining`, not the default-cell-only `cooldown_remaining` (which stayed 0
     // for pool-routed traffic), so this bare-lane form is release-dead and exercised only by tests.
@@ -208,14 +228,25 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     fn lane_needs_probe(&self, lane: usize, now: u64) -> bool;
 
     // ── Outcome recording (the breaker's write path) ─────────────────────────────────────────────
-    // `record_success` is NOT release-dead: the degraded `forward_once` path (forward.rs:2497) calls
-    // it with no pool context, so the compiler sees a real caller — no dead-code allow here.
+    // `record_success` is now release-dead: the degraded `forward_once` path records against the
+    // ROUTING POOL cell via `record_success_in` (H1), so this bare default-cell form is test-only and
+    // `#[cfg(test)]`-gated out of the release binary.
+    #[cfg(test)]
     fn record_success(&self, lane: usize);
     fn record_success_in(&self, pool: &str, lane: usize);
     fn record_client_fault(&self, lane: usize);
     /// Record a transient upstream failure. `cfg` is the routing pool's resolved breaker config,
     /// which drives the trip decision (error-rate vs consecutive thresholds) and cooldown backoff.
-    fn record_transient(&self, lane: usize, what: &str, cfg: &BreakerCfg, retry_after: Option<u64>);
+    /// Returns `true` iff this failure drove a Closed→Open trip on the (pool, lane) cell, so the
+    /// caller emits `BREAKER_TRIPS_TOTAL` once per logical trip (#29).
+    #[cfg(test)]
+    fn record_transient(
+        &self,
+        lane: usize,
+        what: &str,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    ) -> bool;
     fn record_transient_in(
         &self,
         pool: &str,
@@ -223,9 +254,15 @@ pub(crate) trait StateStore: Send + Sync + 'static {
         what: &str,
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
-    );
+    ) -> bool;
     #[cfg(test)]
-    fn record_rate_limit(&self, lane: usize, now: u64, cfg: &BreakerCfg, retry_after: Option<u64>);
+    fn record_rate_limit(
+        &self,
+        lane: usize,
+        now: u64,
+        cfg: &BreakerCfg,
+        retry_after: Option<u64>,
+    ) -> bool;
     fn record_rate_limit_in(
         &self,
         pool: &str,
@@ -233,7 +270,7 @@ pub(crate) trait StateStore: Send + Sync + 'static {
         now: u64,
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
-    );
+    ) -> bool;
     // `record_hard_down` is the bare-lane (default-cell) hard-down primitive. The release hard-down
     // paths (the organic forward `HardDown` arm and the health prober's `HardDown` arm) both now go
     // through the all-cells `record_hard_down_all_cells` primitive (which inlines the per-cell trip to
@@ -259,14 +296,20 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// lane (the default cell AND every existing per-pool cell), mirroring `recover_lane`'s
     /// all-cells iteration. The probe tests the shared upstream, and organic traffic routes against
     /// per-pool cells, so a probe failure that only hit the default cell could never trip the
-    /// per-pool breakers real traffic is selected against. `cfg` drives the trip/cooldown decision.
-    /// `retry_after` (server-requested cooldown floor, e.g. a 429 `Retry-After`) is honored when
-    /// `cfg.honor_retry_after` is set, exactly as on the organic failure path.
+    /// per-pool breakers real traffic is selected against.
+    ///
+    /// `resolve_cfg` resolves the breaker config to apply to a given cell BY POOL NAME: it is called
+    /// with `""` for the default cell and with each per-pool cell's pool name, so a probe failure
+    /// trips/cools each cell against THAT pool's own configured thresholds and backoff (#24/#25) —
+    /// not a one-size `BreakerCfg::default()` that ignored per-pool trip thresholds and cooldowns.
+    /// The resolver falls back to the ADR-0002 default for any pool without its own config.
+    /// `retry_after` (server-requested cooldown floor, e.g. a 429 `Retry-After`) is honored when the
+    /// resolved cfg's `honor_retry_after` is set, exactly as on the organic failure path.
     fn record_probe_failure_all_cells(
         &self,
         lane: usize,
         what: &str,
-        cfg: &BreakerCfg,
+        resolve_cfg: &dyn Fn(&str) -> BreakerCfg,
         retry_after: Option<u64>,
     );
 
@@ -1012,12 +1055,18 @@ impl InMemoryStore {
 
     /// Record a failure (transient or rate-limit — identical breaker handling) against the cell:
     /// push the outcome, bump err + consecutive streak, then trip-or-cooldown per the config.
+    ///
+    /// RETURNS `true` IFF this failure drove a logical Closed→Open trip (a threshold breach that
+    /// transitioned the cell from Closed to Open). A HalfOpen→Open reopen (a failed recovery probe)
+    /// is NOT counted as a fresh trip — the lane was already tripped and is merely re-arming its
+    /// cooldown — nor is an already-Open no-op. The caller emits `BREAKER_TRIPS_TOTAL` once per
+    /// `true`, so the counter reflects logical trips, not per-cell or per-cooldown-bump events.
     fn cell_record_failure(
         c: &dyn BreakerCellAccess,
         now_time: u64,
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
-    ) {
+    ) -> bool {
         lock_recover(c.outcome_window()).push(now_time, true); // error outcome
         c.err().fetch_add(1, Ordering::Relaxed);
         c.streak().fetch_add(1, Ordering::Relaxed);
@@ -1033,6 +1082,8 @@ impl InMemoryStore {
             ST_CLOSED => {
                 if Self::should_trip(c, now_time, cfg) {
                     Self::cell_open_locked(c, now_time, cfg, retry_after);
+                    // A genuine Closed→Open trip — the only path that should mint a BREAKER_TRIPS_TOTAL.
+                    true
                 } else {
                     let duration =
                         Self::compute_cooldown_with_retry_after(c, now_time, cfg, retry_after);
@@ -1040,13 +1091,19 @@ impl InMemoryStore {
                     // debug-panic on a hostile upstream's unbounded Retry-After).
                     c.cooldown_until()
                         .store(now_time.saturating_add(duration), Ordering::Release);
+                    false
                 }
             }
-            ST_HALF_OPEN => Self::cell_open_locked(c, now_time, cfg, retry_after), // probe failed → reopen
+            // probe failed → reopen: the lane was already tripped (Open) and won the half-open probe;
+            // reopening it re-arms the cooldown but is NOT a fresh Closed→Open trip, so do NOT count it.
+            ST_HALF_OPEN => {
+                Self::cell_open_locked(c, now_time, cfg, retry_after);
+                false
+            }
             // Already Open: a failure while Open is an intentional no-op (the cooldown is already
             // armed; we don't re-escalate on every failed request during a cooldown). Enumerated
             // explicitly per the breaker-match hard rule — no `_ =>` catch-all.
-            ST_OPEN => {}
+            ST_OPEN => false,
             // Request-path failure recording: an unexpected state encoding is treated as a no-op
             // (like the already-Open case) rather than `unreachable!()`-panicking the task. Not
             // reachable under the atomic-sentinel invariant; this is the graceful backstop.
@@ -1055,6 +1112,7 @@ impl InMemoryStore {
                     state = other,
                     "unexpected breaker state in record_failure; no-op"
                 );
+                false
             }
         }
     }
@@ -1287,8 +1345,10 @@ impl InMemoryStore {
         Self::cell_acquire_breaker(self.cell(pool, lane).as_ref(), now)
     }
 
-    /// Side-effect-FREE readiness check (lane-global gates + a non-mutating breaker peek). Used by
-    /// the selection filter and `/healthz` so neither steals the recovery probe nor wedges a lane.
+    /// Side-effect-FREE readiness check (lane-global gates + a non-mutating breaker peek). Reached
+    /// only via the now-test-gated bare `is_ready` (`/healthz` uses the all-cells `is_ready_any_cell`
+    /// → `lane_usable_any_cell`), so it is dead in the release binary but a tested part of the API.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn ready_for(&self, pool: &str, lane: usize, now: u64) -> bool {
         if !self.lane_admissible(lane) {
             return false;
@@ -1378,6 +1438,8 @@ impl InMemoryStore {
         worst
     }
 
+    /// Returns `true` iff this failure drove a Closed→Open trip on the (pool, lane) cell — threaded
+    /// out so the forward.rs call site can emit `BREAKER_TRIPS_TOTAL` exactly once per logical trip.
     fn record_failure_for(
         &self,
         pool: &str,
@@ -1385,11 +1447,12 @@ impl InMemoryStore {
         now_time: u64,
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
-    ) {
+    ) -> bool {
         if self.get_lane(lane).dead.load(Ordering::Relaxed) {
-            return; // administratively down — ignore
+            return false; // administratively down — ignore
         }
-        Self::cell_record_failure(self.cell(pool, lane).as_ref(), now_time, cfg, retry_after);
+        let tripped =
+            Self::cell_record_failure(self.cell(pool, lane).as_ref(), now_time, cfg, retry_after);
         // Bump the lane-GLOBAL error counter as well — but ONLY for a NAMED pool. `cell_record_failure`
         // bumps the cell's own `err()`; for a named pool that is the per-pool `BreakerCell.err` (a
         // per-pool diagnostic, distinct from `LaneState.err`), so the `/stats` `LaneState.err` snapshot
@@ -1404,6 +1467,7 @@ impl InMemoryStore {
         if !pool.is_empty() {
             self.get_lane(lane).err.fetch_add(1, Ordering::Relaxed);
         }
+        tripped
     }
 
     fn record_success_for(&self, pool: &str, lane: usize) {
@@ -1526,8 +1590,13 @@ impl StateStore for InMemoryStore {
         self.usable_for(pool, lane, now)
     }
 
+    #[cfg(test)]
     fn is_ready(&self, lane: usize, now: u64) -> bool {
         self.ready_for("", lane, now)
+    }
+
+    fn is_ready_any_cell(&self, lane: usize, now: u64) -> bool {
+        self.lane_usable_any_cell(lane, now)
     }
 
     fn acquire_for_dispatch_in(&self, pool: &str, lane: usize, now: u64) -> bool {
@@ -1546,6 +1615,21 @@ impl StateStore for InMemoryStore {
     }
 
     #[cfg(test)]
+    fn breaker_state_in(&self, pool: &str, lane: usize) -> BreakerState {
+        self.breaker_state_for(pool, lane)
+    }
+
+    #[cfg(test)]
+    fn force_open_in(&self, pool: &str, lane: usize, cooldown_until: u64) {
+        let cell = self.cell(pool, lane);
+        let _tx = lock_recover(cell.transition_lock());
+        cell.cooldown_until()
+            .store(cooldown_until, Ordering::Release);
+        cell.breaker_state().store(ST_OPEN, Ordering::Release);
+        cell.probe_in_flight().store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
     fn cooldown_remaining(&self, lane: usize, now: u64) -> u64 {
         self.cooldown_remaining_for("", lane, now)
     }
@@ -1554,6 +1638,7 @@ impl StateStore for InMemoryStore {
         self.cooldown_remaining_for(pool, lane, now)
     }
 
+    #[cfg(test)]
     fn record_success(&self, lane: usize) {
         self.record_success_for("", lane);
     }
@@ -1569,14 +1654,15 @@ impl StateStore for InMemoryStore {
         ls.client_fault.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     fn record_transient(
         &self,
         lane: usize,
         _what: &str,
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
-    ) {
-        self.record_failure_for("", lane, Self::now_secs(), cfg, retry_after);
+    ) -> bool {
+        self.record_failure_for("", lane, Self::now_secs(), cfg, retry_after)
     }
 
     fn record_transient_in(
@@ -1586,8 +1672,8 @@ impl StateStore for InMemoryStore {
         _what: &str,
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
-    ) {
-        self.record_failure_for(pool, lane, Self::now_secs(), cfg, retry_after);
+    ) -> bool {
+        self.record_failure_for(pool, lane, Self::now_secs(), cfg, retry_after)
     }
 
     #[cfg(test)]
@@ -1597,8 +1683,8 @@ impl StateStore for InMemoryStore {
         now_time: u64,
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
-    ) {
-        self.record_failure_for("", lane, now_time, cfg, retry_after);
+    ) -> bool {
+        self.record_failure_for("", lane, now_time, cfg, retry_after)
     }
 
     fn record_rate_limit_in(
@@ -1608,8 +1694,8 @@ impl StateStore for InMemoryStore {
         now_time: u64,
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
-    ) {
-        self.record_failure_for(pool, lane, now_time, cfg, retry_after);
+    ) -> bool {
+        self.record_failure_for(pool, lane, now_time, cfg, retry_after)
     }
 
     #[cfg(test)]
@@ -1686,7 +1772,7 @@ impl StateStore for InMemoryStore {
         &self,
         lane: usize,
         _what: &str,
-        cfg: &BreakerCfg,
+        resolve_cfg: &dyn Fn(&str) -> BreakerCfg,
         retry_after: Option<u64>,
     ) {
         // Administratively-dead lanes ignore failure recording (matches record_failure_for).
@@ -1694,15 +1780,22 @@ impl StateStore for InMemoryStore {
             return;
         }
         let now = Self::now_secs();
-        // Default cell (direct/ad-hoc routes). `retry_after` (the probe's server-requested cooldown
-        // floor) is forwarded so a 429/Retry-After probe honors the upstream's backoff, same as the
-        // organic path; `cell_record_failure` applies it only when `cfg.honor_retry_after` is set.
-        Self::cell_record_failure(self.get_lane(lane).as_ref(), now, cfg, retry_after);
-        // Every existing per-pool cell for this lane — the cells organic traffic is selected
-        // against. (A cell not yet created inherits health lazily on first access via `cell`.)
+        // Default cell (direct/ad-hoc routes) — resolved against the `""` (no-pool) config. The
+        // returned trip bool is intentionally discarded: the out-of-band prober does not emit
+        // `BREAKER_TRIPS_TOTAL` (that counter is reserved for the organic request path). `retry_after`
+        // (the probe's server-requested cooldown floor) is forwarded so a 429/Retry-After probe honors
+        // the upstream's backoff; `cell_record_failure` applies it only when `honor_retry_after` is set.
+        let default_cfg = resolve_cfg("");
+        let _ =
+            Self::cell_record_failure(self.get_lane(lane).as_ref(), now, &default_cfg, retry_after);
+        // Every existing per-pool cell for this lane — the cells organic traffic is selected against,
+        // each evaluated against ITS OWN pool's resolved breaker config (trip thresholds + cooldown
+        // backoff), not a one-size default. (A cell not yet created inherits health lazily on first
+        // access via `cell`.)
         let cells = read_recover(&self.pool_cells);
-        for (_, cell) in cells.get(&lane).into_iter().flatten() {
-            Self::cell_record_failure(cell.as_ref(), now, cfg, retry_after);
+        for (pool_name, cell) in cells.get(&lane).into_iter().flatten() {
+            let cfg = resolve_cfg(pool_name);
+            let _ = Self::cell_record_failure(cell.as_ref(), now, &cfg, retry_after);
         }
     }
 
@@ -1914,6 +2007,167 @@ mod tests {
         assert!(
             !store.usable(0, 1000),
             "a tripped (Open) lane must not be usable during its cooldown"
+        );
+    }
+
+    /// REGRESSION (#29): `cell_record_failure` (via `record_transient`/`record_rate_limit`) must
+    /// RETURN `true` exactly on a logical Closed→Open trip, so the forward.rs call sites emit
+    /// `BREAKER_TRIPS_TOTAL` once per trip. Sub-threshold failures return `false`; the failure that
+    /// breaches the threshold returns `true`; further failures on the already-Open cell return `false`
+    /// (no multi-count); and a HalfOpen→Open reopen (failed recovery probe) is NOT a fresh trip.
+    #[test]
+    fn test_record_failure_returns_true_only_on_threshold_trip() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(1000);
+        // Default cfg: error-rate, min_requests=5, threshold=0.5. The first four errors are below the
+        // min_requests floor → no trip → false.
+        let cfg = BreakerCfg::default();
+        for n in 1..=4 {
+            assert!(
+                !store.record_transient(0, "5xx", &cfg, None),
+                "failure {n} (below min_requests floor) must NOT report a trip"
+            );
+        }
+        // The fifth error meets min_requests with fraction 1.0 >= 0.5 → Closed→Open trip → true.
+        assert!(
+            store.record_transient(0, "5xx", &cfg, None),
+            "the threshold-breaching failure must report a Closed→Open trip (true)"
+        );
+        assert!(matches!(store.breaker_state(0), BreakerState::Open { .. }));
+        // A further failure while already Open is a no-op → must NOT report a (duplicate) trip.
+        assert!(
+            !store.record_transient(0, "5xx", &cfg, None),
+            "a failure on an already-Open cell must NOT report a fresh trip (no multi-count)"
+        );
+
+        // HalfOpen→Open reopen (failed recovery probe) is NOT a fresh Closed→Open trip.
+        store
+            .get_lane(0)
+            .breaker_state
+            .store(ST_HALF_OPEN, Ordering::Relaxed);
+        assert!(
+            !store.record_transient(0, "5xx", &cfg, None),
+            "a HalfOpen→Open reopen (failed probe) must NOT report a fresh trip"
+        );
+        assert!(matches!(store.breaker_state(0), BreakerState::Open { .. }));
+    }
+
+    /// REGRESSION (#21): the spend/refund contract the forward path's over-refund guard relies on.
+    /// `spend_budget` is a NO-OP returning `false` when the budget is already 0 (never driven
+    /// negative), while `refund_budget` UNCONDITIONALLY fetch_adds. So an UNGUARDED refund paired with
+    /// a no-op spend raises the budget ABOVE its cap — which the forward path now prevents by refunding
+    /// only when the spend actually decremented. This asserts both halves: a real spend→refund is the
+    /// exact inverse (cap preserved), and a no-op spend reports `false` (the guard's signal).
+    #[test]
+    fn test_spend_refund_budget_contract() {
+        // Limited lane with budget 1.
+        let mut ld = make_lane_data(0, 10);
+        ld.limited = true;
+        ld.budget = 1;
+        let store = Arc::new(InMemoryStore::new(vec![ld]));
+
+        // A real spend decrements to 0 and reports success.
+        assert!(
+            store.spend_budget(0),
+            "spend on a positive budget must succeed"
+        );
+        assert_eq!(store.get_lane(0).budget.load(Ordering::Relaxed), 0);
+        // Its paired refund is the exact inverse — back to the cap of 1, never above.
+        store.refund_budget(0);
+        assert_eq!(
+            store.get_lane(0).budget.load(Ordering::Relaxed),
+            1,
+            "a refund paired with a real spend must restore the cap exactly"
+        );
+
+        // Now exhaust the budget and prove the no-op spend reports `false` (the guard signal): an
+        // UNGUARDED refund here would push the budget to 1 — ABOVE the now-0 effective ceiling.
+        assert!(store.spend_budget(0), "spend to drain to 0");
+        assert_eq!(store.get_lane(0).budget.load(Ordering::Relaxed), 0);
+        let spent_again = store.spend_budget(0);
+        assert!(
+            !spent_again,
+            "spend on an exhausted (0) budget must be a no-op reporting false"
+        );
+        assert_eq!(
+            store.get_lane(0).budget.load(Ordering::Relaxed),
+            0,
+            "the no-op spend must NOT drive the budget negative"
+        );
+        // The forward path guards on `spent_again == false` and SKIPS the refund. Demonstrate the
+        // hazard the guard avoids: an unconditional refund would over-raise the budget.
+        store.refund_budget(0); // simulates the OLD unconditional refund
+        assert_eq!(
+            store.get_lane(0).budget.load(Ordering::Relaxed),
+            1,
+            "an UNGUARDED refund over-raises the budget above its effective ceiling — this is why the \
+             forward path must refund ONLY when `budget_spent` is true (#21)"
+        );
+
+        // Unlimited lane: spend reports `true` (no-op success), refund is a no-op — so the forward
+        // guard never over- or under-counts an unlimited lane.
+        let mut un = make_lane_data(1, 10);
+        un.limited = false;
+        un.budget = -1;
+        let ustore = Arc::new(InMemoryStore::new(vec![un]));
+        assert!(
+            ustore.spend_budget(0),
+            "spend on an unlimited lane must report true (so the forward guard treats it as spent)"
+        );
+        ustore.refund_budget(0);
+        assert_eq!(
+            ustore.get_lane(0).budget.load(Ordering::Relaxed),
+            -1,
+            "refund on an unlimited lane must be a no-op (budget stays the unlimited sentinel)"
+        );
+    }
+
+    /// REGRESSION (#12): `is_ready_any_cell` (which `/healthz` uses) must report NOT-ready when the
+    /// lane is circuit-broken in EVERY cell — the default `""` cell AND every per-pool cell. Under
+    /// sustained pool-routed failures the per-pool cells trip Open while the default cell (touched only
+    /// by direct/adhoc routes) may also trip via hard-down/all-cells; once nothing can serve, healthz
+    /// must report not-ready. The default-cell-only `is_ready` could only ever see the `""` cell.
+    #[test]
+    fn test_is_ready_any_cell_false_when_every_cell_open() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        let now = 100_000;
+        // Trip the default cell AND two per-pool cells Open with a future cooldown — the lane is
+        // serviceable nowhere.
+        store.force_open_in("", 0, now + 600);
+        store.force_open_in("poolA", 0, now + 600);
+        store.force_open_in("poolB", 0, now + 600);
+        assert!(
+            !store.is_ready_any_cell(0, now),
+            "is_ready_any_cell must be NOT-ready when every cell (default + all pool cells) is Open"
+        );
+        // Recover ONE per-pool cell: the lane is serviceable again via that pool, so healthz must flip
+        // back to ready — proving the all-cells check, not a default-cell-only read.
+        store.recover_lane(0);
+        assert!(
+            store.is_ready_any_cell(0, now),
+            "after recovery the lane is serviceable in some cell → is_ready_any_cell must be ready"
+        );
+    }
+
+    /// REGRESSION (#12, positive case): with the default cell Open BUT one per-pool cell Closed,
+    /// `is_ready_any_cell` must report ready (a pool lane CAN still serve) even though the
+    /// default-cell-only `is_ready` reads not-ready.
+    #[test]
+    fn test_is_ready_any_cell_true_when_a_pool_cell_is_ready() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        let now = 100_000;
+        // Materialize a per-pool cell WHILE the lane is healthy (a fresh cell inherits the lane's
+        // current state, so create it before tripping the default cell) and leave it Closed.
+        let _ = store.usable_in("poolA", 0, now);
+        // Now trip ONLY the DEFAULT cell Open.
+        store.force_open_in("", 0, now + 600);
+        assert!(
+            !store.is_ready(0, now),
+            "default cell is Open → default-cell-only is_ready is not-ready"
+        );
+        assert!(
+            store.is_ready_any_cell(0, now),
+            "a Closed pool cell makes the lane serviceable → is_ready_any_cell must be ready"
         );
     }
 
@@ -2274,7 +2528,7 @@ mod tests {
             .get_lane(0)
             .breaker_state
             .store(ST_HALF_OPEN, Ordering::Relaxed);
-        store.record_probe_failure_all_cells(0, "health-probe", &cfg, Some(90));
+        store.record_probe_failure_all_cells(0, "health-probe", &|_pool| cfg.clone(), Some(90));
         let until = store.get_lane(0).cooldown_until.load(Ordering::Relaxed);
         assert!(
             until >= 50_000 + 90,
@@ -2289,7 +2543,7 @@ mod tests {
             .get_lane(0)
             .breaker_state
             .store(ST_HALF_OPEN, Ordering::Relaxed);
-        store2.record_probe_failure_all_cells(0, "health-probe", &cfg, None);
+        store2.record_probe_failure_all_cells(0, "health-probe", &|_pool| cfg.clone(), None);
         let until_no_ra = store2.get_lane(0).cooldown_until.load(Ordering::Relaxed);
         assert!(
             until_no_ra < 50_000 + 90,

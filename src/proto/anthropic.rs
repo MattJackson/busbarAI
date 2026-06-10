@@ -51,13 +51,32 @@ fn synth_request_id() -> String {
 /// pure CSPRNG output is collision-free in practice and every position stays fully random, exactly
 /// like a native Anthropic id. Never panics on the request path.
 fn synth_id_with_prefix(prefix: &str) -> String {
-    // Fill the entire token with CSPRNG bytes mapped into base62. On entropy failure we leave the
-    // buffer zeroed (all '0') rather than panic; there is no counter overlay.
-    let mut rand_bytes = [0u8; SYNTH_ID_TOKEN_LEN];
-    let _ = getrandom::getrandom(&mut rand_bytes);
+    // Fill the entire token with CSPRNG bytes mapped into base62 via REJECTION SAMPLING. A bare
+    // `byte % 62` is biased: 256 = 4*62 + 8, so the residues 0..7 are drawn from 5 source bytes and
+    // 8..61 from only 4 — over-representing the low characters by ~25%, a statistical fingerprint
+    // that distinguishes a synthesized id from a native (uniform) one. We therefore reject any byte
+    // >= 248 (the largest multiple of 62 that fits in a u8) and consume only the in-range bytes,
+    // mirroring `openai::synth_completion_id` and `proto::mod::synth_anthropic_request_id`. On an
+    // entropy failure we leave the remaining '0' fill rather than panic; there is no counter overlay.
+    const BASE62_REJECT_FLOOR: u8 = 248; // 4 * 62
     let mut token = [b'0'; SYNTH_ID_TOKEN_LEN];
-    for (slot, &byte) in token.iter_mut().zip(rand_bytes.iter()) {
-        *slot = BASE62_ALPHABET[(byte % 62) as usize];
+    let mut filled = 0usize;
+    'outer: while filled < SYNTH_ID_TOKEN_LEN {
+        let mut batch = [0u8; SYNTH_ID_TOKEN_LEN];
+        if getrandom::getrandom(&mut batch).is_err() {
+            // Near-impossible entropy failure: keep the remaining '0' fill rather than panic.
+            break 'outer;
+        }
+        for &byte in batch.iter() {
+            if byte >= BASE62_REJECT_FLOOR {
+                continue; // biased residue — discard to keep the distribution uniform
+            }
+            token[filled] = BASE62_ALPHABET[(byte % 62) as usize];
+            filled += 1;
+            if filled == SYNTH_ID_TOKEN_LEN {
+                break 'outer;
+            }
+        }
     }
 
     // `token` is ASCII base62 by construction, hence always valid UTF-8; the fallback only guards
@@ -267,13 +286,20 @@ impl ProtocolReader for AnthropicReader {
         }
 
         // Extract scalar fields and extra
+        // Checked `u32::try_from` rather than a raw `as u32`: a `max_tokens`/`top_k` larger than
+        // `u32::MAX` would silently TRUNCATE under `as` (e.g. 4294967297 → 1), forwarding a wildly
+        // wrong cap upstream. An out-of-range value drops to `None` here, matching the sibling
+        // readers; the upstream then applies its own default rather than receiving a corrupted limit.
         let max_tokens = obj
             .get("max_tokens")
             .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
+            .and_then(|v| u32::try_from(v).ok());
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
         let top_p = obj.get("top_p").and_then(|v| v.as_f64());
-        let top_k = obj.get("top_k").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let top_k = obj
+            .get("top_k")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
         // Anthropic's native `stop_sequences` is an array of strings.
         let stop = crate::ir::read_stop_sequences(obj.get("stop_sequences"));
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -733,6 +759,25 @@ fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrErr
                 retry_after: None,
             })?;
             if let Some(src_obj) = source.as_object() {
+                // Anthropic's Messages API has TWO native image source shapes:
+                //   - `{"type":"url","url":<url>}`           — a remote image reference
+                //   - `{"type":"base64","media_type":...,"data":<b64>}` — inline bytes
+                // The base64 path below extracts `media_type`/`data`, which are BOTH absent from a
+                // url source — so a url image would otherwise flatten to empty base64 (cross-protocol
+                // image data LOSS). Round-trip the url through the same `media_type:"image_url"`
+                // sentinel the writer recognizes (see `write_block`'s Image arm): the raw url lives in
+                // `data`, and `write_block` re-emits exactly `{"type":"url","url":<url>}` for it.
+                if src_obj.get("type").and_then(|v| v.as_str()) == Some("url") {
+                    let url = src_obj
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    return Ok(crate::ir::IrBlock::Image {
+                        media_type: "image_url".to_string(),
+                        data: url,
+                    });
+                }
                 let media_type = src_obj
                     .get("media_type")
                     .and_then(|v| v.as_str())
@@ -904,10 +949,39 @@ fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
         // content holds `tool_result` block(s). (Reachable when translating an OpenAI `tool` message.)
         crate::ir::IrRole::Tool => "user",
     };
-    let content_val: serde_json::Value = if msg.content.is_empty() {
+    // REQUEST-side filter (write_message feeds write_request only; write_response/_event call
+    // write_block directly, so response reasoning still surfaces). Anthropic's Messages API rejects
+    // an assistant `thinking` block that lacks a `signature` with a 400 — a signature is mandatory
+    // on the request path. A cross-protocol IR may carry a Thinking block whose signature is None
+    // (e.g. reasoning translated from a provider that emits no signature), so drop those blocks here
+    // rather than forward an egress that the upstream will 400. Other block types pass through.
+    let mut dropped_unsigned_thinking = 0usize;
+    let blocks: Vec<&crate::ir::IrBlock> = msg
+        .content
+        .iter()
+        .filter(|block| {
+            if let crate::ir::IrBlock::Thinking {
+                signature: None, ..
+            } = block
+            {
+                dropped_unsigned_thinking += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    if dropped_unsigned_thinking > 0 {
+        tracing::warn!(
+            dropped = dropped_unsigned_thinking,
+            "dropped assistant thinking block(s) with no signature from anthropic request egress \
+             (anthropic rejects unsigned thinking blocks with a 400)"
+        );
+    }
+    let content_val: serde_json::Value = if blocks.is_empty() {
         serde_json::Value::String("".to_string())
     } else {
-        serde_json::Value::Array(msg.content.iter().map(write_block).collect())
+        serde_json::Value::Array(blocks.into_iter().map(write_block).collect())
     };
     serde_json::json!({ "role": role_str, "content": content_val })
 }
@@ -2369,6 +2443,248 @@ mod anthropic_hardening_tests {
         assert_eq!(
             source.get("data").and_then(|d| d.as_str()),
             Some("iVBORw0KGgo=")
+        );
+    }
+
+    /// R19 #9/#11 (cross-protocol image data loss): an Anthropic URL-type image source
+    /// `{"type":"url","url":...}` must round-trip through the `image_url` sentinel rather than
+    /// silently flatten to empty base64 (the base64 path reads media_type/data, both absent from a
+    /// url source). Old code: `media_type`/`data` both `""`; fixed code: `media_type:"image_url"`,
+    /// `data:<url>`, and a re-write emits the native url source again.
+    #[test]
+    fn read_block_url_image_source_round_trips_via_sentinel() {
+        let block_json = serde_json::json!({
+            "type": "image",
+            "source": { "type": "url", "url": "https://example.com/cat.png" }
+        });
+        let ir = read_block(&block_json).expect("url image source parses");
+        match &ir {
+            crate::ir::IrBlock::Image { media_type, data } => {
+                assert_eq!(
+                    media_type, "image_url",
+                    "url source must map to the image_url sentinel, not empty base64 media_type"
+                );
+                assert_eq!(
+                    data, "https://example.com/cat.png",
+                    "the url must be preserved in `data`, not dropped to empty"
+                );
+            }
+            other => panic!("expected IrBlock::Image, got {other:?}"),
+        }
+        // Round-trip: writing the parsed block must re-emit Anthropic's native url source.
+        let out = write_block(&ir);
+        let source = out.get("source").expect("source present");
+        assert_eq!(source.get("type").and_then(|t| t.as_str()), Some("url"));
+        assert_eq!(
+            source.get("url").and_then(|u| u.as_str()),
+            Some("https://example.com/cat.png")
+        );
+        assert!(
+            source.get("data").is_none() && source.get("media_type").is_none(),
+            "no base64 leak after round-trip"
+        );
+    }
+
+    /// R19 #9/#11 (no regression): a genuine base64 image source must still parse to its real
+    /// `image/*` media_type and base64 data — the url branch must not intercept it.
+    #[test]
+    fn read_block_base64_image_source_unchanged() {
+        let block_json = serde_json::json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo=" }
+        });
+        let ir = read_block(&block_json).expect("base64 image source parses");
+        match ir {
+            crate::ir::IrBlock::Image { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, "iVBORw0KGgo=");
+            }
+            other => panic!("expected IrBlock::Image, got {other:?}"),
+        }
+    }
+
+    /// R19 #10/#26 (synth id uniformity): `synth_id_with_prefix` must draw each base62 character
+    /// uniformly via rejection sampling, NOT `byte % 62`. The old modulo over-represents characters
+    /// 0..7 by ~25% (256 = 4*62 + 8). Mint a large burst and assert (a) every id is unique, (b) the
+    /// per-character frequency of the low/biased band vs the high band is balanced within tolerance.
+    #[test]
+    fn synth_id_uniform_and_unique_under_burst() {
+        let n = 20_000usize;
+        let ids: Vec<String> = (0..n).map(|_| synth_request_id()).collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            n,
+            "burst of synthesized ids must be collision-free"
+        );
+
+        // Index each token character into the base62 alphabet and tally how many land in the
+        // over-represented band (alphabet positions 0..8, which a `% 62` bias inflates) vs the rest.
+        let mut low_band = 0u64; // alphabet indices 0..8
+        let mut other_band = 0u64; // alphabet indices 8..62
+        for id in &ids {
+            let token = id.strip_prefix("req_01").expect("req_01 prefix");
+            for &b in token.as_bytes() {
+                let idx = BASE62_ALPHABET
+                    .iter()
+                    .position(|&a| a == b)
+                    .expect("token char is in the base62 alphabet");
+                if idx < 8 {
+                    low_band += 1;
+                } else {
+                    other_band += 1;
+                }
+            }
+        }
+        // Under a uniform draw the expected per-character probability is 1/62; the 8-char low band
+        // should hold ~8/62 of all characters. The biased `% 62` would push the low band to ~10/62
+        // (each of 0..7 drawn from 5 source bytes instead of 4 → +25%). Assert the observed low-band
+        // share sits near 8/62 and well below the 9/62 a meaningful bias would reach.
+        let total = low_band + other_band;
+        let low_share = low_band as f64 / total as f64;
+        let expected = 8.0 / 62.0;
+        assert!(
+            (low_share - expected).abs() < 0.01,
+            "low-band share {low_share:.4} must be near uniform {expected:.4} (rejection sampling); \
+             a `% 62` bias would push it toward {:.4}",
+            9.0 / 62.0
+        );
+    }
+
+    /// R19 #10/#26 (synth id shape preserved): rejection sampling must not change the native length
+    /// or alphabet — `req_01` + 24 base62 chars = 30 total.
+    #[test]
+    fn synth_id_matches_native_length_and_alphabet() {
+        let id = synth_request_id();
+        assert_eq!(id.len(), 30, "native 30-char length");
+        let token = id.strip_prefix("req_01").expect("req_01 prefix");
+        assert_eq!(token.len(), 24, "24-char base62 token");
+        assert!(
+            token.bytes().all(|b| b.is_ascii_alphanumeric()),
+            "token is base62 alphanumeric, got {token}"
+        );
+    }
+
+    /// R19 #27 (unchecked cast truncation): `max_tokens`/`top_k` larger than `u32::MAX` must drop to
+    /// `None` via checked `try_from`, NOT silently truncate. Old code: `4_294_967_297 as u32` == 1,
+    /// forwarding a corrupted cap. Fixed code: out-of-range → None.
+    #[test]
+    fn read_request_oversized_max_tokens_and_top_k_drop_to_none() {
+        let body = serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 4_294_967_297u64,
+            "top_k": 8_589_934_592u64
+        });
+        let ir = AnthropicReader.read_request(&body).expect("request parses");
+        assert_eq!(
+            ir.max_tokens, None,
+            "an over-u32 max_tokens must drop to None, not truncate to a small value"
+        );
+        assert_eq!(
+            ir.top_k, None,
+            "an over-u32 top_k must drop to None, not truncate to a small value"
+        );
+        // In-range values still survive the checked cast.
+        let body2 = serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 1024u64,
+            "top_k": 40u64
+        });
+        let ir2 = AnthropicReader
+            .read_request(&body2)
+            .expect("request parses");
+        assert_eq!(ir2.max_tokens, Some(1024));
+        assert_eq!(ir2.top_k, Some(40));
+    }
+
+    /// R19 #28 (unsigned thinking 400): on the REQUEST side `write_message` must drop an assistant
+    /// Thinking block whose `signature` is None (Anthropic 400s an unsigned thinking block), while a
+    /// signed thinking block and surrounding text survive.
+    #[test]
+    fn write_message_drops_unsigned_thinking_block() {
+        let msg = crate::ir::IrMessage {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![
+                crate::ir::IrBlock::Thinking {
+                    text: "unsigned reasoning".to_string(),
+                    signature: None,
+                },
+                crate::ir::IrBlock::Thinking {
+                    text: "signed reasoning".to_string(),
+                    signature: Some("sig-abc".to_string()),
+                },
+                crate::ir::IrBlock::Text {
+                    text: "the answer".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                },
+            ],
+        };
+        let out = write_message(&msg);
+        let content = out
+            .get("content")
+            .and_then(|c| c.as_array())
+            .expect("content array");
+        assert_eq!(
+            content.len(),
+            2,
+            "the unsigned thinking block must be dropped, signed thinking + text kept"
+        );
+        // The surviving thinking block is the signed one; no block lacks a signature.
+        for block in content {
+            if block.get("type").and_then(|t| t.as_str()) == Some("thinking") {
+                assert!(
+                    block.get("signature").and_then(|s| s.as_str()).is_some(),
+                    "every emitted thinking block must carry a signature"
+                );
+            }
+        }
+        let texts: Vec<&str> = content
+            .iter()
+            .filter_map(|b| b.get("thinking").or_else(|| b.get("text")))
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(texts.contains(&"signed reasoning"));
+        assert!(texts.contains(&"the answer"));
+        assert!(!texts.contains(&"unsigned reasoning"));
+    }
+
+    /// R19 #28 (response reasoning untouched): the request-side filter must NOT affect the response
+    /// path — `write_response` still surfaces an unsigned thinking block as a `thinking` content
+    /// block (response reasoning has no signature requirement).
+    #[test]
+    fn write_response_keeps_unsigned_thinking_block() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Thinking {
+                text: "visible reasoning".to_string(),
+                signature: None,
+            }],
+            stop_reason: None,
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("claude-3-5-sonnet".to_string()),
+            id: Some("msg_123".to_string()),
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = AnthropicWriter.write_response(&resp);
+        let content = out
+            .get("content")
+            .and_then(|c| c.as_array())
+            .expect("content array");
+        assert!(
+            content
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking")),
+            "response reasoning must still surface even without a signature"
         );
     }
 

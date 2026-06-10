@@ -57,8 +57,12 @@ pub(crate) async fn healthz(State(app): State<Arc<App>>) -> Response {
     let t = now();
     // Side-effect-FREE readiness check: `/healthz` is unauthenticated and high-frequency (k8s
     // liveness, load balancers), so it must NOT transition expired-Open lanes to HalfOpen or steal
-    // the single-flight recovery probe from organic traffic — use `is_ready`, not `usable`.
-    if (0..app.lanes.len()).any(|i| app.store.is_ready(i, t)) {
+    // the single-flight recovery probe from organic traffic — use the non-mutating `is_ready_any_cell`,
+    // not the mutating `usable`. `is_ready_any_cell` (not the default-cell-only `is_ready`) checks the
+    // default cell AND every per-pool cell: production routes through NAMED pools whose per-pool cells
+    // trip independently, so reading only the default `""` cell would report 200 while every pool lane
+    // is circuit-broken (the default cell never moves for pool-routed traffic).
+    if (0..app.lanes.len()).any(|i| app.store.is_ready_any_cell(i, t)) {
         (StatusCode::OK, "ok").into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "no usable lanes").into_response()

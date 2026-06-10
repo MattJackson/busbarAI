@@ -322,7 +322,7 @@ async fn mock_handler(
                     .into_iter()
                     .map(|d| format!("data: {d}\n\n"))
                     .collect();
-                result.push("[DONE]\n\n".to_string());
+                result.push("data: [DONE]\n\n".to_string());
                 result
             };
 
@@ -2206,6 +2206,104 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// Regression: `MockResponse::Sse` must terminate a completed stream with the
+    /// SSE-compliant `data: [DONE]\n\n` frame (matching real OpenAI), NOT a bare
+    /// `[DONE]\n\n` that is missing the required `data: ` field prefix.
+    /// Fails against the old code which pushed `"[DONE]\n\n"`.
+    #[tokio::test]
+    async fn test_sse_done_terminator_has_data_prefix() {
+        let state = Arc::new(MockServerState::new());
+        let events: Vec<String> = vec!["chunk-0".to_string(), "chunk-1".to_string()];
+        state.push(MockResponse::Sse {
+            events,
+            abort_at_index: None,
+        });
+
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "test-model",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            ))
+            .pool("default", &[(0, 1)])
+            .build();
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+        let response = forward(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200);
+
+        use http_body_util::BodyExt as _;
+        let collected_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&collected_bytes);
+
+        assert!(
+            text.contains("data: [DONE]\n\n"),
+            "SSE terminator must carry the `data: ` prefix, got: {text}"
+        );
+        // The terminator must not appear in the bare, prefix-less form.
+        assert!(
+            !text.contains("\n\n[DONE]\n\n") && !text.starts_with("[DONE]"),
+            "SSE terminator must not be emitted as a bare `[DONE]` frame, got: {text}"
+        );
+        server.shutdown().await;
+    }
+
+    /// Regression: raw event payloads handed to `MockResponse::Sse` are prefixed with
+    /// exactly one `data: ` field. A double-prefixed `data: data: ...` frame must never
+    /// be produced. Fails against the old tests that pre-prefixed their event strings.
+    #[tokio::test]
+    async fn test_sse_events_single_data_prefix() {
+        let state = Arc::new(MockServerState::new());
+        let events: Vec<String> = vec!["event-0".to_string(), "event-1".to_string()];
+        state.push(MockResponse::Sse {
+            events,
+            abort_at_index: None,
+        });
+
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "test-model",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            ))
+            .pool("default", &[(0, 1)])
+            .build();
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+        let response = forward(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200);
+
+        use http_body_util::BodyExt as _;
+        let collected_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&collected_bytes);
+
+        assert!(
+            !text.contains("data: data:"),
+            "SSE frames must carry exactly one `data: ` prefix, got: {text}"
+        );
+        assert!(
+            text.contains("data: event-0\n\n") && text.contains("data: event-1\n\n"),
+            "each raw event must be wrapped in exactly one `data: ` frame, got: {text}"
+        );
+        server.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_permit_lifetime_during_stream() {
         let state = Arc::new(MockServerState::new());
@@ -2263,10 +2361,11 @@ mod tests {
         let state = Arc::new(MockServerState::new());
 
         // LIFO order: push success first (lane 1), then error (lane 0)
+        // Raw event payloads; MockResponse::Sse adds the `data: ` SSE prefix.
         let events = vec![
-            "data: event-0".to_string(),
-            "data: event-1".to_string(),
-            "data: event-2".to_string(),
+            "event-0".to_string(),
+            "event-1".to_string(),
+            "event-2".to_string(),
         ];
         state.push(MockResponse::Sse {
             events,
@@ -2324,19 +2423,21 @@ mod tests {
 
         // LIFO order: push lane 1 success first, then lane 0 mid-stream abort
         // Lane 1: would return success if used (should NOT be used)
-        let events_lane1 = vec!["data: lane1-ok".to_string()];
+        // Raw event payload; MockResponse::Sse adds the `data: ` SSE prefix.
+        let events_lane1 = vec!["lane1-ok".to_string()];
         state.push(MockResponse::Sse {
             events: events_lane1,
             abort_at_index: None,
         });
 
         // Lane 0: sends 1 event then abruptly ends (no [DONE]) to simulate mid-stream abort
+        // Raw event payloads; MockResponse::Sse adds the `data: ` SSE prefix.
         let events = vec![
-            "data: event-0".to_string(),
-            "data: event-1".to_string(),
-            "data: event-2".to_string(),
-            "data: event-3".to_string(),
-            "data: event-4".to_string(),
+            "event-0".to_string(),
+            "event-1".to_string(),
+            "event-2".to_string(),
+            "event-3".to_string(),
+            "event-4".to_string(),
         ];
         state.push(MockResponse::Sse {
             events,
@@ -2728,8 +2829,9 @@ mod tests {
     async fn test_failover_deadline() {
         let state = Arc::new(MockServerState::new());
 
-        // Push success response - should succeed within deadline
-        let events = vec!["data: success".to_string()];
+        // Push success response - should succeed within deadline.
+        // Raw event payload; MockResponse::Sse adds the `data: ` SSE prefix.
+        let events = vec!["success".to_string()];
         state.push(MockResponse::Sse {
             events,
             abort_at_index: None,
@@ -2863,12 +2965,12 @@ mod tests {
             r#"{"type":"message_stop"}"#.to_string(),
         ];
 
-        // MockResponse::Sse adds [DONE] at the end when abort_at_index is None
+        // MockResponse::Sse adds `data: [DONE]` at the end when abort_at_index is None
         let mut expected_text: String = usage_events
             .iter()
             .map(|e| format!("data: {}\n\n", e))
             .collect();
-        expected_text.push_str("[DONE]\n\n");
+        expected_text.push_str("data: [DONE]\n\n");
 
         // Push events in reverse order (LIFO means last pushed comes out first)
         state.push(MockResponse::Sse {
@@ -5339,8 +5441,9 @@ mod tests {
         let state = Arc::new(MockServerState::new());
 
         // LIFO: push success (lane 1) first, then context-length error (lane 0)
-        // Lane 1 should succeed with 200
-        let events = vec!["data: event-0".to_string()];
+        // Lane 1 should succeed with 200.
+        // Raw event payload; MockResponse::Sse adds the `data: ` SSE prefix.
+        let events = vec!["event-0".to_string()];
         state.push(MockResponse::Sse {
             events,
             abort_at_index: None,

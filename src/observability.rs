@@ -140,11 +140,18 @@ fn is_internal_v4(v4: &std::net::Ipv4Addr) -> bool {
 /// but the OS resolver (glibc `getaddrinfo`, used by reqwest's default resolver) still maps to an
 /// IPv4 address: a bare decimal integer (`2130706433` = 127.0.0.1), a `0x`/`0X` hex literal
 /// (`0x7f000001`), a leading-zero octal literal (`017700000001`), or a dotted form with FEWER than
-/// four octets (`127.1`, `10.0.1`). These bypass the canonical IP-literal checks while still
-/// resolving to loopback / link-local / private targets at connect time, so they must be treated as
-/// blocked. A canonical four-octet dotted-quad is NOT matched here (it is handled by the
-/// `parse::<IpAddr>()` path); a normal DNS hostname is not matched either. Mirrors
-/// `config_validate::is_alternate_ipv4_encoding`.
+/// four octets (`127.1`, `10.0.1`). On a raw, un-normalized host string these bypass the canonical
+/// IP-literal checks while still resolving to loopback / link-local / private targets at connect
+/// time, so they must be treated as blocked. A canonical four-octet dotted-quad is NOT matched here
+/// (it is handled by the `parse::<IpAddr>()` path); a normal DNS hostname is not matched either.
+///
+/// NOTE ON ITS ROLE IN THIS MODULE: in the webhook / OTLP SSRF guards this is a defense-in-depth
+/// parity mirror of `config_validate::is_alternate_ipv4_encoding`, NOT the primary guard. Those
+/// guards read the host from an already-`reqwest::Url::parse`d http(s) URL, and http(s) is a WHATWG
+/// "special scheme" whose host parser already canonicalizes every alternate encoding above to a
+/// dotted-quad — so the host reaches those callers as `127.0.0.1` (etc.) and the canonical
+/// `parse::<IpAddr>()` path does the real blocking. This function stays load-bearing in
+/// `config_validate`, which hand-parses a raw config string where no such normalization has run.
 fn is_alternate_ipv4_encoding(host: &str) -> bool {
     if host.is_empty() {
         return false;
@@ -233,9 +240,16 @@ fn host_is_internal(url: &reqwest::Url) -> bool {
                 return true;
             }
 
-            // Alternate IPv4 encodings that `parse::<IpAddr>()` rejects but the resolver expands to an
-            // internal address (decimal/hex/octal/short-dotted). Block BEFORE the parse() fallthrough,
-            // which would otherwise treat them as opaque (allowed) DNS names.
+            // Defense-in-depth parity mirror of `config_validate::is_alternate_ipv4_encoding`, NOT the
+            // primary guard. For an http(s) URL the PRIMARY protection is `reqwest::Url::parse`: http(s)
+            // is a WHATWG "special scheme", so its host parser already canonicalizes every alternate
+            // IPv4 encoding to a dotted-quad BEFORE we ever read `host_str()` — `2130706433` /
+            // `0x7f000001` / `017700000001` / `127.1` / `0177.0.0.1` all arrive here as `127.0.0.1`,
+            // which the canonical `parse::<IpAddr>()` arm below then blocks. So `host_str()` is already
+            // a dotted-quad and this branch does not meaningfully fire on the http(s) SSRF path. It is
+            // retained for structural parity with `config_validate` (which hand-parses a raw config
+            // string where Url::parse has NOT normalized the host, so the check IS load-bearing there)
+            // and as belt-and-suspenders should the host ever reach this guard pre-normalization.
             if is_alternate_ipv4_encoding(host) {
                 return true;
             }
@@ -516,15 +530,20 @@ fn otlp_host_is_blocked(url: &reqwest::Url) -> bool {
             if METADATA_HOSTS.iter().any(|m| host.eq_ignore_ascii_case(m)) {
                 return true;
             }
-            // Alternate IPv4 encodings that resolve to an internal target. A loopback alternate
-            // encoding (e.g. `2130706433` == 127.0.0.1) is the localhost-collector exception, so
-            // canonicalize and let the loopback carve-out below apply rather than blanket-blocking.
+            // Defense-in-depth parity mirror of `config_validate::is_alternate_ipv4_encoding`, NOT the
+            // primary guard. As in `host_is_internal`, for an http(s) URL `reqwest::Url::parse` has
+            // already canonicalized every alternate IPv4 encoding to a dotted-quad before `host_str()`
+            // is read (http(s) is a WHATWG special scheme): `2130706433` / `0x7f000001` /
+            // `017700000001` / `127.1` arrive here as `127.0.0.1`, so this branch does not meaningfully
+            // fire on the http(s) export path — the canonical `parse::<IpAddr>()` arm below applies the
+            // loopback-collector carve-out and the internal-v4 block. It is retained for structural
+            // parity with `config_validate` and as belt-and-suspenders for any pre-normalization host.
+            // Were it to fire, the loopback-vs-internal split below is preserved: a loopback alternate
+            // encoding (e.g. `2130706433` == 127.0.0.1) is the localhost-collector exception (allowed);
+            // every other alternate encoding is an internal target and is blocked. We can't run
+            // getaddrinfo in a pure validator, so be conservative — allow ONLY the canonical
+            // decimal/hex/octal/short-dotted spellings of 127.0.0.1, which are unambiguously loopback.
             if is_alternate_ipv4_encoding(host) {
-                // Best-effort canonicalization: if it parses to a loopback v4 after the resolver
-                // expansion we model here, allow it; otherwise it's an alternate-encoded internal
-                // target and must be blocked. We can't run getaddrinfo in a pure validator, so be
-                // conservative: block every alternate encoding EXCEPT the canonical decimal/hex/octal
-                // spellings of 127.0.0.1, which are unambiguously loopback.
                 return !is_alternate_loopback_v4(host);
             }
 
@@ -870,6 +889,46 @@ mod tests {
             assert!(
                 res.is_err(),
                 "alternate IPv4 encoding webhook URL '{bad}' must be rejected by the SSRF guard; got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_url_parse_canonicalizes_alternate_ipv4_encodings() {
+        // Documentation lock (finding #22): pins the corrected comments' truth that for an http(s)
+        // URL `reqwest::Url::parse` (WHATWG special-scheme host parsing) is the PRIMARY guard — it
+        // canonicalizes every alternate IPv4 encoding to a dotted-quad BEFORE `host_str()` is read,
+        // so `is_alternate_ipv4_encoding` is a defense-in-depth parity mirror, not the primary block.
+        // If a future url/reqwest bump ever stopped normalizing these, this test fails and the comment
+        // (and the reliance on the parity mirror as a fallback) must be revisited.
+        for (raw, want) in [
+            ("https://2130706433/log", "127.0.0.1"),        // decimal
+            ("https://0x7f000001/log", "127.0.0.1"),        // hex
+            ("https://0X7F000001/log", "127.0.0.1"),        // hex, upper prefix
+            ("https://017700000001/log", "127.0.0.1"),      // octal
+            ("https://127.1/log", "127.0.0.1"),             // short-dotted loopback
+            ("https://10.0.1/log", "10.0.0.1"),             // short-dotted RFC1918
+            ("https://2852039166/meta", "169.254.169.254"), // decimal IMDS
+            ("https://0x7f.0.0.1/log", "127.0.0.1"),        // per-octet hex
+            ("https://0177.0.0.1/log", "127.0.0.1"),        // per-octet octal
+        ] {
+            let parsed =
+                reqwest::Url::parse(raw).expect("special-scheme URL with numeric host must parse");
+            assert_eq!(
+                parsed.host_str(),
+                Some(want),
+                "Url::parse must canonicalize '{raw}' to the dotted-quad '{want}' before host_str()"
+            );
+            // is_alternate_ipv4_encoding therefore sees a canonical dotted-quad and does NOT fire;
+            // the real block on the SSRF path is the canonical IpAddr parse below it.
+            assert!(
+                !is_alternate_ipv4_encoding(want),
+                "canonical dotted-quad '{want}' must not be flagged as an alternate encoding"
+            );
+            // ...and the end-to-end guard still rejects/normalizes the target correctly.
+            assert!(
+                validate_webhook_url(Some(raw.to_string())).is_err(),
+                "post-normalization internal target '{raw}' must still be blocked by the SSRF guard"
             );
         }
     }

@@ -842,10 +842,14 @@ impl ProtocolReader for ResponsesReader {
                                         _ => Some(reason.to_string()),
                                     }
                                 } else {
-                                    Some("end_turn".to_string())
+                                    // No machine-readable reason: an `incomplete` status is NOT a
+                                    // successful end_turn. Mirror the non-streaming `read_response`
+                                    // and surface None rather than masking the truncation.
+                                    None
                                 }
                             } else {
-                                Some("end_turn".to_string())
+                                // `incomplete` with no `incomplete_details` at all — same as above.
+                                None
                             }
                         }
                         "" => Some("end_turn".to_string()),
@@ -1716,6 +1720,9 @@ impl ProtocolWriter for ResponsesWriter {
                                 content,
                                 is_error: _,
                             } => {
+                                // Concatenate adjacent text blocks WITHOUT a separator: a space
+                                // between fragments corrupts base64 / split JSON payloads.
+                                // Mirrors `openai.rs::write_request`'s tool_result concat fix.
                                 let output_text = content
                                     .iter()
                                     .filter_map(|b| match b {
@@ -1723,7 +1730,7 @@ impl ProtocolWriter for ResponsesWriter {
                                         _ => None,
                                     })
                                     .collect::<Vec<_>>()
-                                    .join(" ");
+                                    .concat();
 
                                 tool_items.push(serde_json::json!({
                                     "type": "function_call_output",
@@ -1758,6 +1765,9 @@ impl ProtocolWriter for ResponsesWriter {
                             is_error: _,
                         } = block
                         {
+                            // Concatenate adjacent text blocks WITHOUT a separator: a space
+                            // between fragments corrupts base64 / split JSON payloads.
+                            // Mirrors `openai.rs::write_request`'s tool_result concat fix.
                             let output_text = content
                                 .iter()
                                 .filter_map(|b| match b {
@@ -1765,7 +1775,7 @@ impl ProtocolWriter for ResponsesWriter {
                                     _ => None,
                                 })
                                 .collect::<Vec<_>>()
-                                .join(" ");
+                                .concat();
 
                             input_arr.push(serde_json::json!({
                                 "type": "function_call_output",
@@ -3572,6 +3582,147 @@ mod tests {
             other => panic!("expected MessageDelta, got {other:?}"),
         }
         assert!(matches!(events[1], crate::ir::IrStreamEvent::MessageStop));
+    }
+
+    /// Regression: a streaming `incomplete` status with NO `incomplete_details` must NOT decode to
+    /// `stop_reason = Some("end_turn")` — that masks the truncation as a clean completion. It must
+    /// be `None`, mirroring the non-streaming `read_response` path. Two fallback branches: missing
+    /// `incomplete_details` entirely, and present-but-without-a-`reason`.
+    #[test]
+    fn test_stream_incomplete_without_details_is_none() {
+        // Branch 1: no `incomplete_details` at all.
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = reader_read_response_events(
+            "response.incomplete",
+            &serde_json::json!({"response": {"status": "incomplete"}}),
+            &mut state,
+        );
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            crate::ir::IrStreamEvent::MessageDelta { stop_reason, .. } => {
+                assert_eq!(
+                    *stop_reason, None,
+                    "incomplete with no details must not claim end_turn"
+                );
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+        assert!(matches!(events[1], crate::ir::IrStreamEvent::MessageStop));
+
+        // Branch 2: `incomplete_details` present but carries no `reason`.
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = reader_read_response_events(
+            "response.incomplete",
+            &serde_json::json!({
+                "response": {"status": "incomplete", "incomplete_details": {}}
+            }),
+            &mut state,
+        );
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            crate::ir::IrStreamEvent::MessageDelta { stop_reason, .. } => {
+                assert_eq!(
+                    *stop_reason, None,
+                    "incomplete_details without a reason must not claim end_turn"
+                );
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+        assert!(matches!(events[1], crate::ir::IrStreamEvent::MessageStop));
+
+        // Sanity: a known reason still maps (max_output_tokens -> max_tokens).
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = reader_read_response_events(
+            "response.incomplete",
+            &serde_json::json!({
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"}
+                }
+            }),
+            &mut state,
+        );
+        match &events[0] {
+            crate::ir::IrStreamEvent::MessageDelta { stop_reason, .. } => {
+                assert_eq!(stop_reason.as_deref(), Some("max_tokens"));
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+    }
+
+    /// Regression (mirrors `openai.rs::write_request_tool_result_multi_text_concatenates_without_separator`):
+    /// a multi-block ToolResult must concatenate its text fragments with NO separator. A `.join(" ")`
+    /// injects a spurious space that corrupts base64 / split-JSON payloads. Covers BOTH the
+    /// Tool-role flat path AND the Assistant-role inline-tool_result path in `write_request`.
+    #[test]
+    fn write_request_tool_result_multi_text_concatenates_without_separator() {
+        fn text_block(s: &str) -> crate::ir::IrBlock {
+            crate::ir::IrBlock::Text {
+                text: s.to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }
+        }
+        let writer = ResponsesWriter;
+        let multi = || crate::ir::IrBlock::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            content: vec![text_block("AAA"), text_block("BBB")],
+            is_error: false,
+        };
+
+        // Tool-role path.
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Tool,
+                content: vec![multi()],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = writer.write_request(&req);
+        let item = out["input"]
+            .as_array()
+            .and_then(|a| a.iter().find(|m| m["type"] == "function_call_output"))
+            .expect("a function_call_output item (Tool role)");
+        assert_eq!(
+            item["output"], "AAABBB",
+            "Tool-role multi-text ToolResult must concatenate with NO separator, got {}",
+            item["output"]
+        );
+
+        // Assistant-role inline tool_result path.
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Assistant,
+                content: vec![multi()],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = writer.write_request(&req);
+        let item = out["input"]
+            .as_array()
+            .and_then(|a| a.iter().find(|m| m["type"] == "function_call_output"))
+            .expect("a function_call_output item (Assistant role)");
+        assert_eq!(
+            item["output"], "AAABBB",
+            "Assistant-role multi-text ToolResult must concatenate with NO separator, got {}",
+            item["output"]
+        );
     }
 
     /// Regression: the streaming error event nests the error inside the `response` object the

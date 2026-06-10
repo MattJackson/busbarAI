@@ -1263,11 +1263,36 @@ impl StreamTranslate {
         // transport-error path in forward.rs (`mid_stream_error_bytes`, also keyed off
         // `ingress_eventstream`). This is the only terminator on an aborted stream, so return early.
         if self.aborted {
+            // Single source of truth for the terminal detail across both ingress framings.
+            const ABORT_DETAIL: &str = "The response stream was interrupted.";
             if self.ingress_eventstream {
                 out.extend_from_slice(&crate::eventstream::encode_exception_frame(
                     "InternalServerException",
-                    "The response stream was interrupted.",
+                    ABORT_DETAIL,
                 ));
+                return out;
+            }
+            // SSE-INGRESS abort path (openai/anthropic/gemini/cohere/responses): the reassembly buffer
+            // overflowed `MAX_BUF` without a frame terminator, so the translator was abandoned and the
+            // happy-path terminal events (`message_stop`/finish chunk/…) were never produced. Returning
+            // a bare close here leaves the SSE client with a SILENTLY-TRUNCATED stream and NO terminal /
+            // error frame — indistinguishable from a successful short completion, so a native SDK
+            // believes it received the whole answer. Emit the ingress protocol's NATIVE streaming error
+            // frame so the truncation is signaled in-band, mirroring `forward::mid_stream_error_bytes`'s
+            // SSE branch (the same `write_response_event(&IrStreamEvent::Error(..))` path, framed by
+            // `emit_ir_event` exactly as every other event on this stream). `emit_ir_event` takes the
+            // non-eventstream branch here (`ingress_eventstream` is false), so this stays SSE text.
+            let err = IrError {
+                class: crate::breaker::StatusClass::ServerError,
+                provider_signal: Some(ABORT_DETAIL.to_string()),
+                retry_after: None,
+            };
+            let ev = crate::ir::IrStreamEvent::Error(err);
+            self.emit_ir_event(&ev, &mut out);
+            // OpenAI ingress still terminates with `data: [DONE]\n\n` after the error frame, matching a
+            // genuine OpenAI stream (the error event is an in-band `data:` chunk, not the terminator).
+            if self.emit_done {
+                out.extend_from_slice(b"data: [DONE]\n\n");
             }
             return out;
         }
@@ -5527,7 +5552,66 @@ mod stream_translate_tests {
         );
 
         // A NON-bedrock ingress (SSE client) aborted the same way must NOT get a binary exception
-        // frame (its wire is SSE; the abort yields an empty tail, as before).
+        // frame (its wire is SSE) — but it must STILL signal the truncation with the ingress
+        // protocol's NATIVE streaming error frame, not a silent bare close (see below).
+    }
+
+    /// LOW/completeness (#15): an SSE-INGRESS stream aborted by reassembly-buffer overflow must NOT
+    /// end with a silently-truncated body. Before this fix `finish()` returned an empty tail for SSE
+    /// ingress (only bedrock ingress emitted a terminal frame), so an SSE/native SDK client saw a
+    /// short stream indistinguishable from a successful completion. `finish()` must now emit the
+    /// ingress protocol's NATIVE streaming error frame (mirroring `forward::mid_stream_error_bytes`),
+    /// and OpenAI ingress must still append `data: [DONE]`.
+    #[test]
+    fn test_sse_ingress_overflow_abort_emits_native_error_frame() {
+        let chunk = vec![b'x'; 1024 * 1024]; // garbage, no `\n\n`
+
+        // Anthropic ingress: the native streaming error is `event: error` with a
+        // `{"type":"error","error":{...}}` payload — NOT a binary frame, NOT an empty tail.
+        let mut t = StreamTranslate::new("anthropic", "openai").expect("translator");
+        assert!(
+            !t.ingress_is_eventstream(),
+            "anthropic ingress must be SSE, not eventstream"
+        );
+        for _ in 0..18 {
+            let _ = t.feed(&chunk);
+            if t.aborted {
+                break;
+            }
+        }
+        assert!(
+            t.aborted,
+            "anthropic-ingress stream must abort after MAX_BUF"
+        );
+        let tail = String::from_utf8(t.finish()).expect("SSE error tail is UTF-8");
+        assert!(
+            !tail.is_empty(),
+            "aborted SSE-ingress finish must emit a native error frame, not a silent bare close"
+        );
+        assert!(
+            tail.starts_with("event: error\n"),
+            "anthropic-ingress abort must emit a native `event: error` frame; got {tail:?}"
+        );
+        // The `data:` payload must be the Anthropic stream error shape `{"type":"error",...}`.
+        let data_line = tail
+            .lines()
+            .find_map(|l| l.strip_prefix("data:"))
+            .map(|s| s.trim())
+            .expect("error frame carries a data: line");
+        let v: serde_json::Value =
+            serde_json::from_str(data_line).expect("error frame data: is JSON");
+        assert_eq!(
+            v.get("type").and_then(|x| x.as_str()),
+            Some("error"),
+            "anthropic stream error payload is `type:error`; got {v}"
+        );
+        assert!(
+            v.get("error").and_then(|e| e.get("message")).is_some(),
+            "anthropic stream error carries an error.message; got {v}"
+        );
+
+        // OpenAI ingress: the native streaming error is a BARE `data:` error envelope, and the stream
+        // must still terminate with `data: [DONE]\n\n` after it (a genuine OpenAI stream's terminator).
         let mut t2 = StreamTranslate::new("openai", "anthropic").expect("translator");
         for _ in 0..18 {
             let _ = t2.feed(&chunk);
@@ -5536,9 +5620,21 @@ mod stream_translate_tests {
             }
         }
         assert!(t2.aborted);
+        let tail2 = String::from_utf8(t2.finish()).expect("SSE error tail is UTF-8");
         assert!(
-            t2.finish().is_empty(),
-            "a non-bedrock-ingress aborted stream must not emit a binary exception frame"
+            tail2.contains("\"error\""),
+            "openai-ingress abort must emit a native bare `data:` error envelope; got {tail2:?}"
+        );
+        assert!(
+            tail2.trim_end().ends_with("data: [DONE]"),
+            "openai-ingress aborted stream must still terminate with `data: [DONE]`; got {tail2:?}"
+        );
+        // The error frame must precede the [DONE] terminator (in-band error, then terminator).
+        let err_pos = tail2.find("\"error\"").expect("error envelope present");
+        let done_pos = tail2.find("data: [DONE]").expect("[DONE] present");
+        assert!(
+            err_pos < done_pos,
+            "the error frame must precede [DONE]; got {tail2:?}"
         );
     }
 

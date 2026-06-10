@@ -962,24 +962,43 @@ impl UsageTap {
     ///     breaker for that lane (the `Poll::Ready(None)` arm only records when `terminal_error` is
     ///     set). This recognizes that shape so the per-lane breaker trip count is accurate for those
     ///     backends too.
+    ///   - OpenAI **Responses** streaming terminal failure: `{"type":"response.failed","response":{…,
+    ///     "error":{…}}}`. This frame carries a `type` (so the OpenAI bare-`error` branch above
+    ///     rejects it on the no-`type` gate) AND nests its error under `response.error` (so the
+    ///     Anthropic branch, which reads top-level `error`, never fires). Without this arm a streaming
+    ///     Responses FAILURE closed the stream cleanly and was recorded as breaker SUCCESS — the lane
+    ///     never tripped. Match on `type == "response.failed"` and pull the message from
+    ///     `response.error.message`.
     ///
     /// Sets `terminal_error` to the error message (or a generic marker).
     fn extract_terminal_error(&mut self, obj: &Value) {
-        let is_anthropic_error = obj.get("type").and_then(|t| t.as_str()) == Some("error");
+        let type_str = obj.get("type").and_then(|t| t.as_str());
+        let is_anthropic_error = type_str == Some("error");
         // OpenAI-style in-band error: a top-level `error` object with no `type` discriminant. Gate on
         // the ABSENCE of `type` so a normal typed OpenAI chunk that merely carries a nested `error:
         // null` (or any non-error event that happens to include an `error` key) does not false-trip;
         // a real terminal error frame is `{"error":{...}}` alone.
         let is_openai_error =
             obj.get("type").is_none() && obj.get("error").map(|e| !e.is_null()).unwrap_or(false);
-        if !is_anthropic_error && !is_openai_error {
+        // OpenAI Responses streaming terminal failure: a typed `response.failed` frame whose error is
+        // NESTED under `response.error` (neither branch above sees it).
+        let is_responses_failed = type_str == Some("response.failed");
+        if !is_anthropic_error && !is_openai_error && !is_responses_failed {
             return;
         }
-        let msg = obj
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("upstream stream error");
+        // Pull the human message from the shape that matched: `response.error.message` for the nested
+        // Responses failure frame, top-level `error.message` for the Anthropic/OpenAI shapes.
+        let msg = if is_responses_failed {
+            obj.get("response")
+                .and_then(|r| r.get("error"))
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+        } else {
+            obj.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+        }
+        .unwrap_or("upstream stream error");
         self.terminal_error = Some(msg.to_string());
     }
 
@@ -1283,13 +1302,18 @@ where
                     if had_first && this.is_sse {
                         // Mid-stream failure after first byte in SSE mode: record breaker failure then emit SSE error event
                         if let Some(ref app) = this.app {
-                            app.store.record_transient_in(
+                            let tripped = app.store.record_transient_in(
                                 &this.pool,
                                 this.lane_idx,
                                 "mid-stream",
                                 &this.breaker_cfg,
                                 None,
                             );
+                            // A mid-stream failure that drives a Closed→Open trip is a breaker trip
+                            // for this (pool, lane) — emit BREAKER_TRIPS_TOTAL once (#29).
+                            if tripped {
+                                emit_breaker_trip(app, &this.pool, this.lane_idx);
+                            }
                         }
                         // Mark the stream ended so the subsequent `Poll::Ready(None)` arm returns
                         // early instead of re-recording this same failure (the inner stream closes
@@ -1364,13 +1388,20 @@ where
                         if let (Some(app), Some(_err)) =
                             (this.app.as_ref(), this.tap.terminal_error.as_ref())
                         {
-                            app.store.record_transient_in(
+                            let tripped = app.store.record_transient_in(
                                 &this.pool,
                                 this.lane_idx,
                                 "stream-terminal-error",
                                 &this.breaker_cfg,
                                 None,
                             );
+                            // A terminal-error frame that drives a Closed→Open trip is a breaker trip
+                            // for this (pool, lane) — emit BREAKER_TRIPS_TOTAL once (#29). This is the
+                            // arm the `response.failed` recognition (#H2) now reaches for a streaming
+                            // Responses FAILURE that previously recorded as success.
+                            if tripped {
+                                emit_breaker_trip(app, &this.pool, this.lane_idx);
+                            }
                         }
                     }
                     // emit the ingress terminator before close. For a gemini JSON-array stream the
@@ -1847,6 +1878,20 @@ pub(crate) async fn forward(
     .await
 }
 
+/// Emit `BREAKER_TRIPS_TOTAL` once for a logical Closed→Open trip on a (pool, lane) cell. Called from
+/// the organic forward path's failure-record sites whenever `record_transient_in`/`record_rate_limit_in`
+/// reports a fresh trip, mirroring the HardDown arm so threshold-based trips are counted too (#29). The
+/// `pool` label is the bounded, operator-controlled canonical pool name (see metrics.rs taxonomy).
+fn emit_breaker_trip(app: &Arc<App>, pool_name: &str, i: usize) {
+    metrics::counter!(
+        crate::metrics::BREAKER_TRIPS_TOTAL,
+        "pool" => pool_name.to_string(),
+        "lane" => app.lanes[i].model.clone()
+    )
+    .increment(1);
+    tracing::warn!(pool = %pool_name, lane = %app.lanes[i].model, "lane breaker tripped (Closed→Open)");
+}
+
 /// Forward with pool name context for on_exhausted config lookup.
 // Plumbing function: each parameter is an independent request input (state, candidates, body,
 // caller token, pool name, affinity key, ingress protocol, usage sink) with no natural grouping.
@@ -2130,8 +2175,16 @@ pub(crate) async fn forward_with_pool(
             Err(e) => {
                 // Pre-response error: classify and potentially failover
                 let err_type = if e.is_timeout() { "timeout" } else { "connect" };
-                app.store
-                    .record_transient_in(pool_name, i, err_type, &breaker_cfg, None);
+                let tripped =
+                    app.store
+                        .record_transient_in(pool_name, i, err_type, &breaker_cfg, None);
+                // A threshold-based Closed→Open trip is a breaker trip for this (pool, lane) — emit
+                // BREAKER_TRIPS_TOTAL once, mirroring the HardDown arm (#29). `record_transient_in`
+                // returns `true` only on a logical trip (not a HalfOpen reopen or already-Open no-op),
+                // so the counter is not multi-counted per cell or per cooldown bump.
+                if tripped {
+                    emit_breaker_trip(&app, pool_name, i);
+                }
                 metrics::counter!(
                     crate::metrics::UPSTREAM_FAILURES_TOTAL,
                     "pool" => pool_name.to_string(),
@@ -2293,14 +2346,14 @@ pub(crate) async fn forward_with_pool(
                         Disposition::TransientUpstream => {
                             // Transient upstream failure → cooldown + err counter
                             // Record based on specific error type (exhaustive over remaining variants)
-                            if matches!(sig.class, StatusClass::RateLimit) {
+                            let tripped = if matches!(sig.class, StatusClass::RateLimit) {
                                 app.store.record_rate_limit_in(
                                     pool_name,
                                     i,
                                     now(),
                                     &breaker_cfg,
                                     sig.retry_after,
-                                );
+                                )
                             } else {
                                 let what = match sig.class {
                                     StatusClass::ServerError => "5xx",
@@ -2329,7 +2382,12 @@ pub(crate) async fn forward_with_pool(
                                     what,
                                     &breaker_cfg,
                                     sig.retry_after,
-                                );
+                                )
+                            };
+                            // A threshold-based Closed→Open trip is a breaker trip for this (pool,
+                            // lane) — emit BREAKER_TRIPS_TOTAL once, mirroring the HardDown arm (#29).
+                            if tripped {
+                                emit_breaker_trip(&app, pool_name, i);
                             }
                             metrics::counter!(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
@@ -2497,12 +2555,16 @@ pub(crate) async fn forward_with_pool(
                 // of its lifetime request budget (the `max_requests` cost cap; `usable()` stops
                 // admitting the lane once it reaches 0).
                 app.store.record_success_in(pool_name, i);
-                // Discard intentional: the post-success spend is the COST accounting, not the
-                // admission gate (that was `lane_admissible`/`usable` before dispatch). The CAS-based
-                // `spend_budget` can no longer over-spend; a `false` here only means this lane was
-                // already at 0, which the next admission check rejects. Explicit `let _ =` per
-                // `#[must_use]`.
-                let _ = app.store.spend_budget(i);
+                // BIND the spend result (#21): the post-success spend is COST accounting, not the
+                // admission gate (that was `lane_admissible`/`usable` before dispatch). It can no
+                // longer over-spend; `false` means this lane was already at 0 (the next admission
+                // check rejects it) OR that the spend was a no-op. The paired post-headers body
+                // TransportError below refunds the budget, but `refund_budget` UNCONDITIONALLY
+                // fetch_adds — so a refund of a no-op spend would push the budget ABOVE its cap. Guard
+                // the refund on this bool. `budget_spent` is `true` for an unlimited lane (the spend
+                // is a no-op success there) and `refund_budget` is likewise a no-op there, so an
+                // unlimited lane neither over-counts nor under-counts.
+                let budget_spent = app.store.spend_budget(i);
 
                 // stream the response body incrementally with first-byte boundary tracking
                 let ct = r.headers().get(CONTENT_TYPE).cloned();
@@ -2556,14 +2618,23 @@ pub(crate) async fn forward_with_pool(
                             "cross-protocol non-stream upstream body failed mid-transfer; \
                              not recording success/usage, refunding budget, returning ingress-native error"
                         );
-                        app.store.record_transient_in(
+                        let tripped = app.store.record_transient_in(
                             pool_name,
                             i,
                             "transport",
                             &breaker_cfg,
                             None,
                         );
-                        app.store.refund_budget(i);
+                        // A threshold-based Closed→Open trip here is a breaker trip too (#29).
+                        if tripped {
+                            emit_breaker_trip(&app, pool_name, i);
+                        }
+                        // Refund ONLY if the headers-spend actually decremented (#21): `refund_budget`
+                        // is an unconditional fetch_add, so refunding a no-op spend would raise the
+                        // budget above its cap.
+                        if budget_spent {
+                            app.store.refund_budget(i);
+                        }
                         return ingress_error(
                             ingress_protocol,
                             StatusCode::BAD_GATEWAY,
@@ -2982,6 +3053,12 @@ async fn forward_once(
     caller_token: Option<&str>,
     timeout_secs: u64,
     ingress_protocol: &str,
+    // The routing POOL cell this degraded attempt was selected against (fallback-pool member or
+    // least-bad member). ALL breaker recordings here (success/transient) must target THIS cell, not
+    // the default `""` cell: the degraded callers select via the POOL cell and (for fallback) CAS-win
+    // a single-flight HalfOpen probe on it, so recording on `""` left the pool cell wedged HalfOpen +
+    // `probe_in_flight` forever. An empty `pool` means the lane-default cell (direct/ad-hoc routes).
+    pool: &str,
     usage_sink: Option<UsageSink>,
 ) -> Result<Response, ()> {
     // Re-parse body for per-lane model rewriting.
@@ -3007,6 +3084,19 @@ async fn forward_once(
     // JSON-array reframing of its SSE stream.
     let gemini_json_array = ingress_protocol == "gemini" && wants_gemini_json_array(&v);
     let egress_name = app.lanes[i].protocol.name();
+
+    // Breaker config for THIS degraded attempt's routing pool cell — resolved the same way the main
+    // forward path resolves `breaker_cfg` (per-pool settings, ADR-0002 default fallback). All breaker
+    // recordings below target the `pool` cell with this cfg so the degraded path trips/cools the pool
+    // cell against its own thresholds, not a one-size default. Wrapped in an `Arc` so the streaming
+    // `FirstByteBody` guard can record mid-stream failures with the SAME thresholds the synchronous
+    // path used (mirrors `forward_with_pool`).
+    let forward_once_cfg: std::sync::Arc<crate::store::BreakerCfg> = std::sync::Arc::new(
+        app.pool_runtime
+            .get(pool)
+            .and_then(|r| r.breaker.clone())
+            .unwrap_or_default(),
+    );
 
     // Cross-protocol request shaping through the SINGLE shared seam (read→clear-extra→write, shim-key
     // strip, model rewrite, serialize) — the SAME function the hot `forward_with_pool` path uses, so
@@ -3147,15 +3237,18 @@ async fn forward_once(
             }
 
             // SUCCESS: the degraded path served a 2xx. Mirror the main forward loop
-            // (forward_with_pool) — record the lane success (feeds the breaker success window so a
-            // HalfOpen lane served via fallback/least-bad recovers to Closed) and consume one unit of
-            // its lifetime request budget. No pool context here, so use the bare-lane forms. Without
-            // these, a HalfOpen lane that ONLY ever serves traffic through the exhaustion paths never
-            // self-recovers and its `max_requests` budget never depletes.
-            app.store.record_success(i);
-            // Discard intentional (see the main path): post-success cost accounting, not admission;
-            // the CAS spend can't over-spend. Explicit `let _ =` per `#[must_use]`.
-            let _ = app.store.spend_budget(i);
+            // (forward_with_pool) — record the lane success against the ROUTING POOL cell (feeds the
+            // breaker success window so a HalfOpen lane served via fallback/least-bad recovers the
+            // POOL cell to Closed and clears its single-flight probe) and consume one unit of its
+            // lifetime request budget. The degraded callers select via the pool cell, so recording on
+            // the default `""` cell left the pool cell wedged HalfOpen + probe_in_flight forever.
+            app.store.record_success_in(pool, i);
+            // BIND the spend result (#21): a paired post-headers body TransportError below refunds the
+            // budget, but `refund_budget` UNCONDITIONALLY fetch_adds — so refunding a spend that was a
+            // no-op (budget already 0) would raise the budget ABOVE its cap. Only refund if this spend
+            // actually decremented. `budget_spent` is `true` for an unlimited lane (spend is a no-op
+            // success there), so an unlimited lane never refunds (refund_budget is also a no-op there).
+            let budget_spent = app.store.spend_budget(i);
 
             // SUCCESS: stream the response body incrementally (permit held for stream life).
             let is_sse = ct
@@ -3175,24 +3268,29 @@ async fn forward_once(
                 if read_end == ReadEnd::TransportError {
                     // Body failed mid-transfer after an optimistic success/budget recording on the
                     // 2xx headers (see the main forward path): don't charge tokens for a corrupt
-                    // fragment, record a compensating transient failure, refund the request budget
-                    // unit spent on the headers (no usable response was delivered, so a failed body
-                    // transfer must not permanently drain the lane's `max_requests` budget), and
-                    // return an ingress-native error. No pool context on the degraded path, so use the
-                    // bare-lane forms.
+                    // fragment, record a compensating transient failure against the ROUTING POOL cell
+                    // (so the pool cell — not the default `""` cell — sees the failed transfer), refund
+                    // the request budget unit spent on the headers (no usable response was delivered,
+                    // so a failed body transfer must not permanently drain the lane's `max_requests`
+                    // budget), and return an ingress-native error. Refund ONLY if the spend actually
+                    // decremented (#21) — `refund_budget` is an unconditional fetch_add, so refunding a
+                    // no-op spend would push the budget above its cap.
                     tracing::warn!(
                         ingress = %ingress_protocol,
                         egress = %egress_name,
                         "cross-protocol non-stream upstream body failed mid-transfer; \
                          not recording success/usage, refunding budget, returning ingress-native error"
                     );
-                    app.store.record_transient(
+                    let _tripped = app.store.record_transient_in(
+                        pool,
                         i,
                         "transport",
-                        &crate::store::BreakerCfg::default(),
+                        forward_once_cfg.as_ref(),
                         None,
                     );
-                    app.store.refund_budget(i);
+                    if budget_spent {
+                        app.store.refund_budget(i);
+                    }
                     return Ok(ingress_error(
                         ingress_protocol,
                         StatusCode::BAD_GATEWAY,
@@ -3324,7 +3422,10 @@ async fn forward_once(
 
             // Streaming (or same-protocol non-stream): stream with first-byte boundary tracking. On a
             // cross-protocol SSE response, translate egress frames → ingress frames, matching the main
-            // path. No pool context here → ADR-0002 default breaker config + lane-default cell.
+            // path. Mid-stream breaker failures must record against the ROUTING POOL cell with this
+            // pool's resolved breaker cfg (mirrors `forward_with_pool`) — NOT the default `""` cell —
+            // so a fallback/least-bad stream that fails mid-flight reopens the pool cell it was
+            // selected against, never the unrelated default cell.
             let translate = if is_sse && cross_protocol {
                 crate::proto::StreamTranslate::new(ingress_protocol, egress_name)
             } else {
@@ -3340,8 +3441,8 @@ async fn forward_once(
                 permit,
                 app.clone(),
                 i,
-                Arc::new(crate::store::BreakerCfg::default()),
-                "", // degraded path: lane-default breaker cell
+                forward_once_cfg.clone(),
+                pool, // degraded path: the routing pool's breaker cell
                 translate,
                 json_array,
                 usage_sink,
@@ -3386,11 +3487,18 @@ async fn forward_once(
                 .unwrap_or_else(|_| status.into_response()))
         }
         Err(e) => {
-            // Pre-response transport error: record transient, drop permit, signal "try next".
-            // Degraded path has no pool context — use default breaker thresholds.
+            // Pre-response transport error: record transient against the ROUTING POOL cell, drop the
+            // permit, signal "try next". The degraded callers selected via the pool cell (fallback CAS
+            // -wins a HalfOpen probe on it), so this transport failure must reopen the POOL cell — not
+            // the default `""` cell, which would leave the pool cell wedged HalfOpen forever. The
+            // returned trip bool is discarded here: the failover loop's UPSTREAM_FAILURES_TOTAL /
+            // FAILOVERS_TOTAL accounting lives on the main `forward_with_pool` path, and a logical-trip
+            // BREAKER_TRIPS_TOTAL on this last-resort degraded route is out of scope (#29 covers the
+            // organic path's record sites).
             let err_type = if e.is_timeout() { "timeout" } else { "connect" };
-            app.store
-                .record_transient(i, err_type, &crate::store::BreakerCfg::default(), None);
+            let _tripped =
+                app.store
+                    .record_transient_in(pool, i, err_type, forward_once_cfg.as_ref(), None);
             drop(permit);
             Err(())
         }
@@ -3475,6 +3583,10 @@ async fn handle_fallback_pool(
             caller_token,
             request_ctx.remaining(now()),
             ingress_protocol,
+            // The fallback pool's cell is the one `pick_among` selected this member against (and
+            // CAS-won the single-flight HalfOpen probe on) — record this attempt's breaker outcome
+            // against THAT cell, not the default `""` cell.
+            pool_name,
             // Clone per attempt: a transient transport failure retries the next member, so the sink
             // must survive into the next loop iteration; only a successful stream consumes it.
             usage_sink.clone(),
@@ -3529,6 +3641,9 @@ async fn handle_least_bad(
         caller_token,
         request_ctx.remaining(now),
         ingress_protocol,
+        // The least-bad member was selected via this pool's cell (`find_soonest_cooldown` /
+        // `cooldown_remaining_in(pool, …)`), so record its breaker outcome against the POOL cell.
+        pool,
         usage_sink,
     )
     .await
@@ -3691,6 +3806,35 @@ mod usage_tap_tests {
         let mut t = UsageTap::new();
         t.feed(&Bytes::from(r#"{"choices":[],"error":null}"#));
         assert_eq!(t.terminal_error, None);
+
+        // REGRESSION (H2): OpenAI Responses streaming terminal FAILURE frame —
+        // {"type":"response.failed","response":{...,"error":{...}}}. The error is NESTED under
+        // `response.error` and the frame carries a `type`, so BOTH the Anthropic branch (top-level
+        // `type:"error"`) and the OpenAI branch (no `type` + top-level `error`) reject it. Before the
+        // fix this closed the stream cleanly and recorded breaker SUCCESS — the lane never tripped.
+        // It must now set `terminal_error` (pulled from `response.error.message`) so the stream-end
+        // breaker arm records a failure.
+        let mut t = UsageTap::new();
+        t.feed(&Bytes::from(
+            r#"{"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"server_error","message":"responses stream failed"}}}"#,
+        ));
+        assert_eq!(
+            t.terminal_error.as_deref(),
+            Some("responses stream failed"),
+            "a response.failed frame must set terminal_error from response.error.message (H2)"
+        );
+
+        // A successful Responses completion frame (`response.completed`) must NOT false-trip: it
+        // carries a `type` but no `response.error`, so neither the failure arm nor the OpenAI/Anthropic
+        // arms fire.
+        let mut t = UsageTap::new();
+        t.feed(&Bytes::from(
+            r#"{"type":"response.completed","response":{"id":"resp_2","status":"completed"}}"#,
+        ));
+        assert_eq!(
+            t.terminal_error, None,
+            "a clean response.completed frame must not be flagged terminal"
+        );
     }
 
     /// MEDIUM (forward.rs same-protocol bedrock passthrough): a bedrock→bedrock streaming passthrough
@@ -6209,5 +6353,169 @@ data: {"type":"message_stop"}"#
                 "400 body must NOT leak serde_json Display internals ({needle:?}); got {text}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod forward_once_pool_cell_tests {
+    use super::forward_with_pool;
+    use crate::store::{now as store_now, BreakerState};
+    use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
+    use reqwest::StatusCode;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// REGRESSION (H1): on the degraded FallbackPool path, `forward_once` must record breaker outcomes
+    /// against the ROUTING POOL cell — NOT the default `""` cell. The fallback caller selects the
+    /// member via the pool cell and CAS-wins a single-flight HalfOpen probe on it; recording on `""`
+    /// left the pool cell wedged HalfOpen + `probe_in_flight` forever, benching the lane.
+    ///
+    /// Case A — a fallback 2xx must CLOSE the POOL cell. The fb pool cell starts expired-Open (→
+    /// HalfOpen on dispatch); a served 200 must drive it HalfOpen→Closed (and leave the default cell
+    /// untouched, proving the recording targeted the pool cell, not `""`).
+    #[tokio::test]
+    async fn test_forward_once_fallback_2xx_closes_pool_cell_not_default() {
+        // Fallback-pool member's upstream serves a clean 200.
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({ "content": [] }),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let t0 = store_now();
+        // Lane 0 = primary pool member, marked dead so the primary pool is EXHAUSTED → FallbackPool.
+        // Lane 1 = the fallback-pool member that actually serves.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "primary",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .dead("administratively down for test"),
+            )
+            .lane(LaneSpec::new(
+                "fbmember",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            ))
+            .pool("primary", &[(0, 1)])
+            .fallback_pool("fb", &[(1, 1)])
+            .on_exhausted(
+                "primary",
+                crate::config::OnExhausted::FallbackPool("fb".into()),
+            )
+            .build();
+
+        // Drive the "fb" pool cell for lane 1 into expired-Open (cooldown_until in the PAST), so the
+        // FallbackPool dispatch's `acquire_for_dispatch_in` transitions it Open→HalfOpen and CAS-wins
+        // the recovery probe — the precise state H1 wedges.
+        app.store.force_open_in("fb", 1, t0.saturating_sub(10));
+        assert!(
+            matches!(
+                app.store.breaker_state_in("fb", 1),
+                BreakerState::Open { .. }
+            ),
+            "precondition: fb pool cell is expired-Open"
+        );
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+        let response = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+            "primary",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "FallbackPool must serve the 2xx"
+        );
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+
+        // The POOL cell must now be CLOSED (HalfOpen probe succeeded). Before the fix the success was
+        // recorded on the "" cell, so the pool cell stayed HalfOpen forever.
+        assert!(
+            matches!(app.store.breaker_state_in("fb", 1), BreakerState::Closed),
+            "fb POOL cell must close on a 2xx served via forward_once (H1); got {:?}",
+            app.store.breaker_state_in("fb", 1)
+        );
+        // And the recording must NOT have touched the default "" cell (it was never tripped here).
+        assert!(
+            matches!(app.store.breaker_state_in("", 1), BreakerState::Closed),
+            "default cell must remain Closed (recording targeted the pool cell, not \"\")"
+        );
+        server.shutdown().await;
+    }
+
+    /// REGRESSION (H1) Case B — a fallback transport error must OPEN the POOL cell. The fb pool cell
+    /// starts expired-Open (→ HalfOpen on dispatch); a pre-response transport error (unreachable
+    /// member) must reopen the POOL cell (HalfOpen→Open), re-arming its cooldown — not the default
+    /// `""` cell. Before the fix the reopen hit `""`, leaving the pool cell wedged HalfOpen forever.
+    #[tokio::test]
+    async fn test_forward_once_fallback_transport_error_opens_pool_cell() {
+        let t0 = store_now();
+        // Lane 0 = dead primary (exhausts the primary pool). Lane 1 = fallback member pointed at an
+        // unreachable address so the upstream call fails pre-response (transport error).
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "primary",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1",
+                )
+                .dead("administratively down for test"),
+            )
+            .lane(LaneSpec::new(
+                "fbmember",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1", // connect-refused → forward_once Err(transport) arm
+            ))
+            .pool("primary", &[(0, 1)])
+            .fallback_pool("fb", &[(1, 1)])
+            .on_exhausted(
+                "primary",
+                crate::config::OnExhausted::FallbackPool("fb".into()),
+            )
+            .build();
+
+        app.store.force_open_in("fb", 1, t0.saturating_sub(10));
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+        let response = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+            "primary",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+        // The fb member is unreachable and the chain exhausts → a 5xx/503 to the client; the precise
+        // status is not the assertion — the breaker state of the POOL cell is.
+        let _ = response.status();
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+
+        // The POOL cell must be OPEN (the failed half-open probe reopened it with a fresh cooldown).
+        assert!(
+            matches!(
+                app.store.breaker_state_in("fb", 1),
+                BreakerState::Open { .. }
+            ),
+            "fb POOL cell must reopen on a transport error via forward_once (H1); got {:?}",
+            app.store.breaker_state_in("fb", 1)
+        );
+        // The default "" cell must be untouched (still Closed) — the recording targeted the pool cell.
+        assert!(
+            matches!(app.store.breaker_state_in("", 1), BreakerState::Closed),
+            "default cell must remain Closed (transport-error recording targeted the pool cell)"
+        );
     }
 }

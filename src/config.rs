@@ -714,10 +714,15 @@ models:
     /// (every referenced provider/model exists; the example stays a working starting point).
     #[test]
     fn test_shipped_example_config_resolves() {
-        // The example references these env-var placeholders (interpolation scans the whole file,
-        // including the commented governance block).
+        // The example references env-var placeholders via `${...}` interpolation, which scans the
+        // whole file — including commented blocks. ONLY the active (uncommented) `auth.client_tokens`
+        // entry uses the brace form, so only BUSBAR_CLIENT_TOKEN must be set. The commented
+        // governance `admin_token` deliberately uses the no-brace `$BUSBAR_ADMIN_TOKEN` form, which
+        // interpolate_env does NOT expand, so booting the default config must NOT require
+        // BUSBAR_ADMIN_TOKEN to be set (regression: the brace form forced a mandatory boot failure
+        // even with governance disabled). We intentionally do NOT set BUSBAR_ADMIN_TOKEN here.
         std::env::set_var("BUSBAR_CLIENT_TOKEN", "example-token");
-        std::env::set_var("BUSBAR_ADMIN_TOKEN", "example-admin");
+        std::env::remove_var("BUSBAR_ADMIN_TOKEN");
         let providers_raw =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/providers.yaml"))
                 .unwrap();
@@ -736,10 +741,43 @@ models:
         assert!(cfg.models.contains_key("claude-sonnet"));
 
         // Env vars are process-global and tests run in parallel; clean up so this test cannot
-        // leave BUSBAR_CLIENT_TOKEN/BUSBAR_ADMIN_TOKEN set for the rest of the run (which could
-        // mask an "unset variable" assertion in another test).
+        // leave BUSBAR_CLIENT_TOKEN set for the rest of the run (which could mask an "unset
+        // variable" assertion in another test).
         std::env::remove_var("BUSBAR_CLIENT_TOKEN");
+    }
+
+    /// Regression (#23): booting the shipped default config.yaml must NOT require BUSBAR_ADMIN_TOKEN
+    /// to be set. `interpolate_env` expands `${...}` anywhere in the raw text — including comments —
+    /// so a commented `admin_token: "${BUSBAR_ADMIN_TOKEN}"` example would make an unset
+    /// BUSBAR_ADMIN_TOKEN a MANDATORY boot failure even when governance is disabled. The commented
+    /// example uses the no-brace `$BUSBAR_ADMIN_TOKEN` form, which interpolate_env leaves verbatim.
+    /// This test interpolates the default config with BUSBAR_ADMIN_TOKEN guaranteed-unset and asserts
+    /// success; it fails against the old `${...}` comment (unset-variable boot error).
+    #[test]
+    fn test_default_config_boots_without_admin_token_env() {
+        std::env::set_var("BUSBAR_CLIENT_TOKEN", "example-token");
         std::env::remove_var("BUSBAR_ADMIN_TOKEN");
+
+        let config_raw =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.yaml")).unwrap();
+
+        // No active OR commented `${...}` token in the shipped config may reference an admin token:
+        // the only legitimate brace-form interpolation is the active client-tokens entry.
+        assert!(
+            !config_raw.contains("${BUSBAR_ADMIN_TOKEN}"),
+            "the commented admin_token example must use the no-brace $BUSBAR_ADMIN_TOKEN form so it \
+             does not force a mandatory boot failure on unset BUSBAR_ADMIN_TOKEN"
+        );
+
+        let expanded = interpolate_env(&config_raw)
+            .expect("default config.yaml must interpolate with BUSBAR_ADMIN_TOKEN unset");
+        // The no-brace form is passed through verbatim (interpolate_env only expands `${...}`).
+        assert!(
+            expanded.contains("$BUSBAR_ADMIN_TOKEN"),
+            "the no-brace admin_token example must survive interpolation untouched"
+        );
+
+        std::env::remove_var("BUSBAR_CLIENT_TOKEN");
     }
 
     /// The shipped providers.yaml catalog must parse, name only known protocols, and use HTTPS.
