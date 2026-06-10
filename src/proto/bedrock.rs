@@ -1747,6 +1747,7 @@ mod tests {
             canonical_uri: crate::sigv4::uri_encode_path("/model/anthropic.claude:0/converse"),
             body: br#"{"messages":[]}"#,
             timestamp_epoch: 1_440_938_160, // 20150830T123600Z
+            auth_mode: crate::auth::AuthMode::Token,
         };
         let headers = writer.sign_request("AKIDEXAMPLE:SECRETKEY", &ctx);
 
@@ -1779,6 +1780,7 @@ mod tests {
             canonical_uri: "/model/m/converse".to_string(),
             body: b"{}",
             timestamp_epoch: 1_440_938_160,
+            auth_mode: crate::auth::AuthMode::Token,
         };
         let headers = writer.sign_request("AKID:SECRET:SESSIONTOKEN", &ctx);
         let tok = headers
@@ -1805,6 +1807,7 @@ mod tests {
             canonical_uri: "/model/m/converse".to_string(),
             body: b"{}",
             timestamp_epoch: 1_440_938_160,
+            auth_mode: crate::auth::AuthMode::Token,
         };
         assert!(writer.sign_request("not-a-valid-key", &ctx).is_empty());
     }
@@ -2347,6 +2350,7 @@ mod tests {
             canonical_uri: "/model/m/converse".to_string(),
             body: b"{}",
             timestamp_epoch: 1_440_938_160,
+            auth_mode: crate::auth::AuthMode::Token,
         };
         // CR/LF embedded in the access key id → invalid Authorization header value
         // (HeaderValue::from_str rejects ASCII control chars, including CR/LF). This is the
@@ -3403,6 +3407,7 @@ mod tests {
             canonical_uri: "/model/m/converse".to_string(),
             body: b"{}",
             timestamp_epoch: 1_440_938_160,
+            auth_mode: crate::auth::AuthMode::Token,
         };
         // Session token with an embedded control char → un-encodable HeaderValue.
         let headers = writer.sign_request("AKID:SECRET:TOK\r\nEN", &ctx);
@@ -3989,6 +3994,7 @@ mod tests {
             canonical_uri: "/model/m/converse".to_string(),
             body: b"{}",
             timestamp_epoch: 1_440_938_160,
+            auth_mode: crate::auth::AuthMode::Token,
         };
         let headers = writer.sign_request("AKID:SECRET", &ctx);
         let auth = headers
@@ -4017,6 +4023,7 @@ mod tests {
             canonical_uri: "/model/m/converse".to_string(),
             body: b"{}",
             timestamp_epoch: 1_440_938_160,
+            auth_mode: crate::auth::AuthMode::Token,
         };
         let headers = writer.sign_request("AKID:SECRET", &ctx);
         let auth = headers

@@ -980,6 +980,82 @@ impl AnthropicWriter {
     }
 }
 
+/// Build Anthropic auth headers for `key`, resolving the credential scheme to native headers.
+///
+/// Anthropic accepts exactly ONE credential scheme per request, and a native client presents exactly
+/// one: an API-key client sends `x-api-key` and NO `authorization`; an OAuth client sends
+/// `authorization: Bearer <token>` and NO `x-api-key`. Emitting both (the same secret duplicated
+/// across two schemes) is a request shape no native client produces — a structural upstream-
+/// distinguishability tell — and, if upstream ever cross-validates the two headers, a latent 401
+/// source. So we classify the credential and emit a single scheme.
+///
+/// The credential family disambiguates the real cases: a static lane key (the configured
+/// `sk-ant-api…`) → `x-api-key`; a passthrough OAuth access token (`sk-ant-oat…`) →
+/// `authorization: Bearer`. A credential matching NEITHER family is `Ambiguous` — busbar cannot tell
+/// from the credential bytes alone whether it is a static key or a forwarded Bearer token. `mode`
+/// carries the front-door auth mode from the wire path (`SigningContext.auth_mode`) to break that
+/// tie WITHOUT a dual-header tell:
+///   * `Some(Passthrough)` → the caller's token, forwarded as `authorization: Bearer` only;
+///   * `Some(Token | None)` → a configured lane key, presented as `x-api-key` only;
+///   * `None` → the mode-blind primitive (`auth_headers`, no signing ctx): fall back to BOTH headers
+///     so neither path silently drops. Real Anthropic credentials always match ApiKey/OAuth, so the
+///     dual-header fallback never fires for genuine traffic; the wire path always passes `Some(_)`.
+///
+/// The `anthropic-version` header is common to all.
+///
+/// A key with bytes invalid in an HTTP header value (e.g. a stray newline) yields an empty header
+/// (one diagnostic warning, key bytes never logged) rather than panicking the worker — the upstream
+/// then returns a clean 401 the breaker classifies normally. Defense-in-depth; keys should be
+/// validated at config load.
+fn anthropic_auth_headers(
+    key: &str,
+    mode: Option<crate::auth::AuthMode>,
+) -> Vec<(HeaderName, HeaderValue)> {
+    let safe = |label: &'static str, raw: String| {
+        HeaderValue::from_str(&raw).unwrap_or_else(|_| {
+            tracing::warn!(
+                header = label,
+                "anthropic auth credential contains bytes invalid for an HTTP header value \
+                 (e.g. a trailing newline); sending an empty value, the upstream will return \
+                 401 — check the key configuration"
+            );
+            HeaderValue::from_static("")
+        })
+    };
+    let x_api_key = || {
+        (
+            HeaderName::from_static("x-api-key"),
+            safe("x-api-key", key.to_string()),
+        )
+    };
+    let authorization = || {
+        (
+            HeaderName::from_static("authorization"),
+            safe("authorization", format!("Bearer {key}")),
+        )
+    };
+    let version = (
+        HeaderName::from_static("anthropic-version"),
+        HeaderValue::from_static(ANTHROPIC_API_VERSION),
+    );
+    match AnthropicWriter::classify_credential(key) {
+        // Configured Anthropic API key: native API-key client shape — `x-api-key` only.
+        AnthropicCredScheme::ApiKey => vec![x_api_key(), version],
+        // OAuth access token / passthrough Bearer token: native OAuth client shape —
+        // `authorization: Bearer` only.
+        AnthropicCredScheme::OAuth => vec![authorization(), version],
+        // Unrecognized shape: the mode resolves it to a single native header on the wire path;
+        // the mode-blind primitive falls back to both so neither path silently drops.
+        AnthropicCredScheme::Ambiguous => match mode {
+            Some(crate::auth::AuthMode::Passthrough) => vec![authorization(), version],
+            Some(crate::auth::AuthMode::Token) | Some(crate::auth::AuthMode::None) => {
+                vec![x_api_key(), version]
+            }
+            None => vec![x_api_key(), authorization(), version],
+        },
+    }
+}
+
 impl ProtocolWriter for AnthropicWriter {
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
         Box::new(self.clone())
@@ -990,68 +1066,19 @@ impl ProtocolWriter for AnthropicWriter {
     }
 
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
-        // Anthropic accepts exactly ONE credential scheme per request, and a native client presents
-        // exactly one: an API-key client sends `x-api-key` and NO `authorization`; an OAuth client
-        // sends `authorization: Bearer <token>` and NO `x-api-key`. Emitting both (the same secret
-        // duplicated across two schemes) is a request shape no native client produces — a structural
-        // upstream-distinguishability tell — and, if upstream ever cross-validates the two headers,
-        // a latent 401 source. So we classify the credential and emit a single scheme.
-        //
-        // This one function serves two modes; the credential family disambiguates the real ones:
-        //   * static lane key -> the configured Anthropic API key (`sk-ant-api...`) -> `x-api-key`,
-        //   * passthrough      -> the *caller's* OAuth access token (`sk-ant-oat...`) ->
-        //                         `authorization: Bearer` (round-trips the caller's token upstream).
-        // `classify_credential` keys on those prefixes. A credential matching neither family is
-        // `Ambiguous`: busbar cannot tell from the credential alone whether it's a static key or a
-        // passthrough Bearer token (the mode lives in forward.rs, not in this trait signature), so
-        // it falls back to BOTH headers to keep the passthrough Bearer path working without
-        // silently dropping a non-canonical static key. Real Anthropic credentials always match
-        // ApiKey/OAuth, so the dual-header fallback never fires for genuine traffic — the path the
-        // distinguishability finding is about. The `anthropic-version` header is common to all.
-        //
-        // A key with bytes that aren't valid in an HTTP header value (e.g. a stray newline in the
-        // env var) yields an empty header rather than panicking the worker — the upstream then
-        // returns a clean 401 that the breaker classifies normally. This empty-value fallback is
-        // strictly defense-in-depth: keys should be validated at config load. We emit one warning
-        // so the misconfig (which would otherwise masquerade as an auth failure) is diagnosable.
-        // The key bytes themselves are never logged.
-        let safe = |label: &'static str, raw: String| {
-            HeaderValue::from_str(&raw).unwrap_or_else(|_| {
-                tracing::warn!(
-                    header = label,
-                    "anthropic auth credential contains bytes invalid for an HTTP header value \
-                     (e.g. a trailing newline); sending an empty value, the upstream will return \
-                     401 — check the key configuration"
-                );
-                HeaderValue::from_static("")
-            })
-        };
-        let x_api_key = || {
-            (
-                HeaderName::from_static("x-api-key"),
-                safe("x-api-key", key.to_string()),
-            )
-        };
-        let authorization = || {
-            (
-                HeaderName::from_static("authorization"),
-                safe("authorization", format!("Bearer {key}")),
-            )
-        };
-        let version = (
-            HeaderName::from_static("anthropic-version"),
-            HeaderValue::from_static(ANTHROPIC_API_VERSION),
-        );
-        match Self::classify_credential(key) {
-            // Configured Anthropic API key: native API-key client shape — `x-api-key` only.
-            AnthropicCredScheme::ApiKey => vec![x_api_key(), version],
-            // OAuth access token / passthrough Bearer token: native OAuth client shape —
-            // `authorization: Bearer` only.
-            AnthropicCredScheme::OAuth => vec![authorization(), version],
-            // Unrecognized shape: emit both so neither the static-key nor the passthrough path
-            // breaks (see the comment above on why this can't be disambiguated here).
-            AnthropicCredScheme::Ambiguous => vec![x_api_key(), authorization(), version],
-        }
+        // Mode-blind primitive (no signing context). An Ambiguous credential emits BOTH headers so
+        // neither the static-key nor the passthrough path silently drops. The live wire path uses
+        // `sign_request` below, which carries the auth mode and resolves Ambiguous to one header —
+        // so a real request never sends the dual-header upstream tell.
+        anthropic_auth_headers(key, None)
+    }
+
+    fn sign_request(&self, key: &str, ctx: &SigningContext) -> Vec<(HeaderName, HeaderValue)> {
+        // Wire path: the front-door auth mode (set by forward.rs into the SigningContext) resolves an
+        // Ambiguous Anthropic credential to the SINGLE native header that mode implies — Passthrough
+        // forwards the caller's token as `authorization: Bearer`; Token/None present the configured
+        // key as `x-api-key`. Clear ApiKey/OAuth credentials are unaffected (still single-header).
+        anthropic_auth_headers(key, Some(ctx.auth_mode))
     }
 
     fn rewrite_model(&self, body: &mut serde_json::Value, model: &str) {
@@ -1539,6 +1566,54 @@ mod anthropic_hardening_tests {
         assert_eq!(
             header_value(&headers, "anthropic-version").as_deref(),
             Some("2023-06-01")
+        );
+    }
+
+    /// Regression: the WIRE path (`sign_request`, which carries the front-door auth mode in the
+    /// SigningContext) resolves an Ambiguous credential to a SINGLE native header — never the
+    /// dual-header upstream-distinguishability tell the mode-blind `auth_headers` primitive emits.
+    /// Passthrough → caller's `authorization: Bearer` only; Token/None → configured `x-api-key` only.
+    #[test]
+    fn sign_request_resolves_ambiguous_credential_to_single_header_by_mode() {
+        let body = b"{}";
+        let ctx = |mode| crate::proto::SigningContext {
+            host: "api.anthropic.com".to_string(),
+            canonical_uri: "/v1/messages".to_string(),
+            body,
+            timestamp_epoch: 0,
+            auth_mode: mode,
+        };
+        let amb = "caller-specific-token-abc123";
+
+        // Passthrough: forward the caller's token as Bearer ONLY (no x-api-key tell).
+        let pt = AnthropicWriter.sign_request(amb, &ctx(crate::auth::AuthMode::Passthrough));
+        assert_eq!(
+            header_value(&pt, "authorization").as_deref(),
+            Some("Bearer caller-specific-token-abc123")
+        );
+        assert!(
+            header_value(&pt, "x-api-key").is_none(),
+            "passthrough wire path must NOT also emit x-api-key (dual-header tell)"
+        );
+
+        // Token mode (configured lane key): present the API-key shape ONLY (no Bearer tell).
+        for mode in [crate::auth::AuthMode::Token, crate::auth::AuthMode::None] {
+            let h = AnthropicWriter.sign_request(amb, &ctx(mode));
+            assert_eq!(
+                header_value(&h, "x-api-key").as_deref(),
+                Some("caller-specific-token-abc123")
+            );
+            assert!(
+                header_value(&h, "authorization").is_none(),
+                "token/none wire path must NOT also emit authorization (dual-header tell)"
+            );
+        }
+
+        // Clear API-key / OAuth credentials stay single-header on the wire path regardless of mode.
+        let api = AnthropicWriter.sign_request("sk-ant-api03-x", &ctx(crate::auth::AuthMode::None));
+        assert!(
+            header_value(&api, "x-api-key").is_some()
+                && header_value(&api, "authorization").is_none()
         );
     }
 
