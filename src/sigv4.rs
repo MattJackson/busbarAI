@@ -41,7 +41,8 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 /// Derive the SigV4 signing key: HMAC chain over date → region → service → "aws4_request".
-pub(crate) fn signing_key(secret: &str, datestamp: &str, region: &str, service: &str) -> Vec<u8> {
+/// File-private: the only caller is `sign_request` below.
+fn signing_key(secret: &str, datestamp: &str, region: &str, service: &str) -> Vec<u8> {
     let k_date = hmac(format!("AWS4{secret}").as_bytes(), datestamp.as_bytes());
     let k_region = hmac(&k_date, region.as_bytes());
     let k_service = hmac(&k_region, service.as_bytes());

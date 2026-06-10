@@ -507,14 +507,6 @@ impl ProtocolReader for CohereReader {
         })
     }
 
-    fn read_response_event(
-        &self,
-        _event_type: &str,
-        _data: &serde_json::Value,
-    ) -> Option<IrStreamEvent> {
-        None
-    }
-
     fn read_response_events(
         &self,
         _event_type: &str,

@@ -206,12 +206,29 @@ pub(crate) trait ProtocolReader: Send + Sync {
     /// Read an IR request from wire JSON.
     fn read_request(&self, body: &serde_json::Value) -> Result<crate::ir::IrRequest, IrError>;
 
-    /// Read a response/stream event from already-de-framed SSE data.
+    /// Read a single response/stream event from already-de-framed SSE data.
+    ///
+    /// Default: delegate to the canonical fan-out [`read_response_events`] over a fresh decode
+    /// state and surface its FIRST IR event. Every protocol whose live translation path is the
+    /// plural fan-out (OpenAI, Gemini, Cohere, Responses, Bedrock) inherits this default — the
+    /// singular form exists only to satisfy the trait and has no production caller on those
+    /// protocols. Delegating (rather than a dead `None` stub) guarantees that if the call-path
+    /// invariant is ever broken, an event degrades to 1:1 rather than being SILENTLY swallowed — a
+    /// silent drop is both a correctness failure and hard to diagnose. A chunk that maps to several
+    /// IR events loses the trailing ones through this 1:1 adapter (exactly why production uses the
+    /// plural path), but nothing is dropped wholesale. Never panics on the request path:
+    /// `StreamDecodeState::default()` is infallible and the fan-out is total. Anthropic overrides
+    /// this with its native 1:1 singular implementation (its plural form wraps the singular).
     fn read_response_event(
         &self,
         event_type: &str,
         data: &serde_json::Value,
-    ) -> Option<IrStreamEvent>;
+    ) -> Option<IrStreamEvent> {
+        let mut state = crate::ir::StreamDecodeState::default();
+        self.read_response_events(event_type, data, &mut state)
+            .into_iter()
+            .next()
+    }
 
     /// Fan-out variant: one wire event/chunk → 0..n IR stream events, threading
     /// per-request decode state. Anthropic is 1:1 (wraps the singular, ignores state); OpenAI's
@@ -6044,6 +6061,50 @@ mod gemini_tests {
         assert_eq!(
             out, j,
             "Gemini→Gemini minimal response roundtrip must remain byte-identical"
+        );
+    }
+
+    // Regression: the trait-default `read_response_event` (singular) must NOT be a dead `None`
+    // stub for protocols whose live path is the plural fan-out. Before this fix Gemini/Cohere/
+    // Responses/Bedrock each overrode the singular with `None`, silently swallowing any event a
+    // generic caller passed through it. The shared default now delegates to `read_response_events`
+    // over fresh state and surfaces the FIRST IR event. Pin that on Gemini as the class witness.
+    #[test]
+    fn test_singular_read_response_event_delegates_for_fanout_protocols() {
+        let reader = GeminiReader;
+        let chunk = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Hello"}]},
+                "finishReason": null
+            }]
+        });
+        // Singular path (trait default) must yield the same first event the fan-out produces,
+        // never a silent None.
+        let singular = reader.read_response_event("", &chunk);
+        let mut st = crate::ir::StreamDecodeState::default();
+        let plural_first = reader
+            .read_response_events("", &chunk, &mut st)
+            .into_iter()
+            .next();
+        assert!(
+            singular.is_some(),
+            "default singular read_response_event must not be a dead None stub"
+        );
+        assert_eq!(
+            singular, plural_first,
+            "default singular must equal the fan-out's first event"
+        );
+        // The default holds for any input (incl. an empty object): singular tracks the fan-out's
+        // first event exactly, and never panics.
+        let empty = serde_json::json!({});
+        let mut st2 = crate::ir::StreamDecodeState::default();
+        assert_eq!(
+            GeminiReader.read_response_event("", &empty),
+            GeminiReader
+                .read_response_events("", &empty, &mut st2)
+                .into_iter()
+                .next(),
+            "default singular must track the fan-out's first event on any input"
         );
     }
 

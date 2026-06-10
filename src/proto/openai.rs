@@ -485,28 +485,6 @@ impl ProtocolReader for OpenAiReader {
         })
     }
 
-    /// Singular-event entry point. OpenAI's wire stream is flat (one `chat.completion.chunk` may
-    /// carry role + content + finish at once), so the real translation lives in the fan-out
-    /// [`read_response_events`]; the production response-translation path always calls that plural
-    /// form on this reader. This singular method exists only because the `ProtocolReader` trait
-    /// requires it. Rather than a dead `None` stub that SILENTLY DROPS every event if the
-    /// call-path invariant is ever broken (a correctness failure that is both silent and hard to
-    /// diagnose), delegate to the canonical fan-out over fresh decode state and surface its FIRST
-    /// IR event. A single OpenAI chunk that maps to multiple IR events (e.g. role + content) loses
-    /// the trailing events through this 1:1 adapter — which is exactly why production uses the
-    /// plural path — but no event is silently swallowed wholesale. Never panics on the request
-    /// path: `StreamDecodeState::default()` is infallible and the fan-out is total.
-    fn read_response_event(
-        &self,
-        event_type: &str,
-        data: &serde_json::Value,
-    ) -> Option<IrStreamEvent> {
-        let mut state = crate::ir::StreamDecodeState::default();
-        self.read_response_events(event_type, data, &mut state)
-            .into_iter()
-            .next()
-    }
-
     /// OpenAI's flat stream → IR block-structured events. One chat.completion.chunk
     /// may carry role + content + finish at once → up to several IR events. State synthesizes the
     /// block boundaries OpenAI doesn't have.

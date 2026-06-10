@@ -442,15 +442,6 @@ impl ProtocolReader for GeminiReader {
         })
     }
 
-    fn read_response_event(
-        &self,
-        _event_type: &str,
-        _data: &serde_json::Value,
-    ) -> Option<IrStreamEvent> {
-        // Gemini streaming uses read_response_events (fan-out); this singular form is unused.
-        None
-    }
-
     fn read_response_events(
         &self,
         _event_type: &str,
