@@ -1423,6 +1423,35 @@ where
                             error = %e,
                             "pre-first-byte upstream transport error; terminating body stream generically"
                         );
+                        // Mid-BODY transport failure AFTER the first byte on a NON-SSE same-protocol
+                        // passthrough (e.g. OpenAI→OpenAI /chat/completions, content-type
+                        // application/json): the 2xx headers already recorded an optimistic breaker
+                        // SUCCESS (record_success_in, ~2705), but the body never arrived intact, so that
+                        // success is wrong — exactly the case the SSE if-branch above and BOTH buffered
+                        // `ReadEnd::TransportError` paths (forward.rs:2769, 3478) compensate. The SSE
+                        // branch couldn't fire here (this path is reached only when `!this.is_sse`), and
+                        // without this the optimistic success is NEVER reversed → repeated mid-body
+                        // failures accumulate as successes and the lane never trips. Record a compensating
+                        // transient. Gate on `had_first`: a PRE-first-byte failure (had_first == false) is
+                        // the original symmetric-with-#21 refund-only case (no streamed body content was
+                        // ever emitted to the client) and must NOT additionally record a transient — that
+                        // would be a sibling over-broad fix. Only a post-first-byte mid-body failure both
+                        // refunds budget AND records the failed transfer.
+                        if had_first {
+                            if let Some(ref app) = this.app {
+                                let tripped = app.store.record_transient_in(
+                                    &this.pool,
+                                    this.lane_idx,
+                                    "mid-body-transport",
+                                    &this.breaker_cfg,
+                                    None,
+                                );
+                                // A threshold-based Closed→Open trip here is a breaker trip (#29).
+                                if tripped {
+                                    emit_breaker_trip(app, &this.pool, this.lane_idx);
+                                }
+                            }
+                        }
                         // Symmetric with the buffered `ReadEnd::TransportError` path (#21): the 2xx
                         // headers already spent one `max_requests` budget unit on this lane, but a
                         // pre-first-byte body transport failure delivers NO usable response — so refund
@@ -6935,6 +6964,117 @@ data: {"type":"message_stop"}"#
         assert!(
             app.store.spend_budget(0),
             "streaming pre-first-byte transport failure must refund the spent budget unit (MED #3)"
+        );
+    }
+
+    /// REGRESSION (R25 MED #1, breaker symmetry): on a NON-SSE same-protocol passthrough (e.g.
+    /// OpenAI→OpenAI `/chat/completions`, content-type `application/json`) the 2xx headers recorded
+    /// an optimistic breaker SUCCESS, but a mid-BODY transport failure AFTER the first byte delivers
+    /// an incomplete response. `FirstByteBody`'s non-SSE `else` arm previously refunded budget but
+    /// NEVER recorded a compensating transient (the SSE if-branch and BOTH buffered
+    /// `ReadEnd::TransportError` paths do) — so repeated mid-body failures accumulated as successes
+    /// and the lane never tripped. The arm must now record a transient (gated on `had_first`),
+    /// mirroring the SSE/buffered paths. With a consecutive `n: 1` trip config, one mid-body failure
+    /// must drive the cell Closed→Open; before the fix it stays Closed (no transient recorded).
+    #[tokio::test]
+    async fn test_streaming_nonsse_mid_body_transport_error_records_transient() {
+        use super::FirstByteBody;
+        use crate::store::{BreakerCfg, BreakerState, TripConfig, TripMode};
+        use bytes::Bytes;
+        use futures::StreamExt as _;
+
+        // Lane 0: OpenAI, budget-limited with a single remaining unit (matches the 2xx-headers spend).
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("m", crate::proto::Protocol::openai(), "http://127.0.0.1:1")
+                    .budget(1),
+            )
+            .pool("p", &[(0, 1)])
+            .build();
+
+        // Spend the one unit exactly as the 2xx-headers path does before streaming.
+        let budget_spent = app.store.spend_budget(0);
+        assert!(budget_spent, "the headers-spend must decrement the unit");
+
+        // Trip config that opens the cell on a SINGLE consecutive failure, so one recorded transient
+        // is observable as a Closed→Open transition (and the absence of one leaves it Closed).
+        let breaker_cfg = std::sync::Arc::new(BreakerCfg {
+            trip: TripConfig {
+                mode: TripMode::Consecutive,
+                n: 1,
+                ..TripConfig::default()
+            },
+            ..BreakerCfg::default()
+        });
+
+        // The pool cell starts Closed.
+        assert!(
+            matches!(app.store.breaker_state_in("p", 0), BreakerState::Closed),
+            "pool cell must start Closed before any mid-body failure"
+        );
+
+        // A REAL `reqwest::Error`: connect-refused to a closed loopback port — the mid-body failure
+        // shape the body sees after the first byte already streamed.
+        let reqwest_err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/never")
+            .send()
+            .await
+            .expect_err("connect to a closed port must fail");
+
+        // Inner stream yields one GOOD chunk (sets `first_byte_sent`) THEN the transport error — this
+        // exercises the post-first-byte (`had_first == true`) NON-SSE `else` arm. `Box::pin` makes the
+        // stream `Unpin`, which `FirstByteBody`'s `Stream` impl requires of its inner.
+        let inner = Box::pin(futures::stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"{\"id\":\"x\",")),
+            Err::<Bytes, reqwest::Error>(reqwest_err),
+        ]));
+        let body = FirstByteBody::new(
+            inner,
+            false, // is_sse: NON-streaming same-protocol passthrough (application/json)
+            "openai",
+            (), // permit placeholder
+            app.clone(),
+            0,
+            breaker_cfg,
+            "p",
+            None,
+            None,
+            None,
+            budget_spent,
+        );
+        futures::pin_mut!(body);
+
+        // First poll: the good chunk passes through (and marks the first byte sent).
+        let first = body.next().await;
+        assert!(
+            matches!(first, Some(Ok(_))),
+            "the first chunk must stream through before the mid-body failure"
+        );
+
+        // Second poll: the mid-body transport failure terminates the body with a generic error item.
+        let second = body.next().await;
+        assert!(
+            matches!(second, Some(Err(_))),
+            "post-first-byte transport failure must terminate the body with an error item"
+        );
+
+        // The compensating transient must have driven the cell Closed→Open. Without the fix no
+        // transient is recorded and the cell stays Closed (the incomplete delivery is mis-counted as
+        // the optimistic 2xx-headers success).
+        assert!(
+            matches!(
+                app.store.breaker_state_in("p", 0),
+                BreakerState::Open { .. }
+            ),
+            "non-SSE mid-body transport failure must record a transient (cell trips Open), \
+             not stand as the optimistic success (R25 MED #1)"
+        );
+
+        // The budget-refund block is unchanged: the spent unit is still refunded on this failed
+        // delivery, so a fresh spend succeeds.
+        assert!(
+            app.store.spend_budget(0),
+            "non-SSE mid-body transport failure must still refund the spent budget unit"
         );
     }
 }

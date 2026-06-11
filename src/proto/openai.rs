@@ -180,19 +180,34 @@ impl ProtocolReader for OpenAiReader {
         // `This model's maximum context length is 8192 tokens, however you requested 9000 tokens...`.
         // Without a message scan that body would normalize to a generic client error and PENALIZE the
         // lane instead of triggering oversized-request failover. When no canonical code was parsed,
-        // scan the lowercased message for the context-length signal (a token/context reference paired
-        // with a too-long/exceeds/maximum phrasing) and synthesize the canonical code.
+        // scan the lowercased message for the context-length signal and synthesize the canonical code.
+        //
+        // MED #5: the scan must be PRECISE. A naive `(token|context) && (too long|exceeds|maximum)`
+        // OR-of-weak-tokens misclassifies unrelated errors — e.g. a quota body like
+        // `You have reached the maximum number of tokens allowed per day` (rate-limit, not oversized)
+        // pairs a stray `maximum` with a stray `token` and would falsely fail over with no penalty.
+        // Require a CO-LOCATED context-length phrase, mirroring the responses.rs / anthropic.rs
+        // siblings: either a self-contained canonical phrase, or `exceeds` paired specifically with
+        // `context`/`token limit` (not a bare `token`/`maximum`). Gate to the HTTP statuses OpenAI
+        // actually uses for an oversized request (400 invalid_request_error; 413 payload-too-large)
+        // so a 429/5xx that happens to mention tokens can never be reclassified as ContextLength.
         let provider_code = provider_code.or_else(|| {
+            let oversized_status =
+                status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE;
+            if !oversized_status {
+                return None;
+            }
             let message = error_obj
                 .and_then(|e_obj| e_obj.get("message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("")
                 .to_lowercase();
-            let names_budget = message.contains("token") || message.contains("context");
-            let signals_overflow = message.contains("too long")
-                || message.contains("exceeds")
-                || message.contains("maximum");
-            if names_budget && signals_overflow {
+            let is_context_length = message.contains("maximum context length")
+                || message.contains("context length exceeded")
+                || message.contains("reduce the length")
+                || (message.contains("exceeds")
+                    && (message.contains("context") || message.contains("token limit")));
+            if is_context_length {
                 Some("context_length_exceeded".to_string())
             } else {
                 None
@@ -2982,6 +2997,61 @@ mod tests {
         assert!(
             raw3.provider_code.is_none(),
             "a non-context-length 400 must not be tagged context_length_exceeded"
+        );
+    }
+
+    /// Regression (MED #5): the context-length message scan was OVER-BROAD — it ORed weak tokens
+    /// `(token|context) && (too long|exceeds|maximum)`, so unrelated errors that merely mention a
+    /// `maximum` and a `token` (or are `too long` over some non-context budget) misclassified as
+    /// ContextLength and triggered a no-penalty failover. The fix requires a CO-LOCATED
+    /// context-length phrase and gates to the oversized HTTP statuses (mirroring responses.rs /
+    /// anthropic.rs). These cases FAIL against the old OR-of-weak-tokens code.
+    #[test]
+    fn extract_error_context_length_scan_is_precise_no_false_positives() {
+        // FALSE-POSITIVE GUARD 1: a per-day token QUOTA / rate-limit message pairs `maximum` with
+        // `tokens` but is NOT a context overflow. Old code: matched. New code: must not.
+        let quota = br#"{"error":{"message":"You have reached the maximum number of tokens allowed per day for this organization.","type":"insufficient_quota","code":null}}"#;
+        let raw_quota = OpenAiReader.extract_error(StatusCode::TOO_MANY_REQUESTS, quota);
+        assert!(
+            raw_quota.provider_code.is_none(),
+            "a token-quota rate-limit message must NOT be tagged context_length_exceeded"
+        );
+
+        // FALSE-POSITIVE GUARD 2: a generic 400 that mentions `token` and `exceeds` but NOT a
+        // context phrase (`exceeds` co-located only with an unrelated noun). Old code matched on the
+        // bare `token` + `exceeds` pair; new code requires `exceeds` near `context`/`token limit`.
+        let generic = br#"{"error":{"message":"The provided JWT token exceeds the allowed audience set.","type":"invalid_request_error","code":null}}"#;
+        let raw_generic = OpenAiReader.extract_error(StatusCode::BAD_REQUEST, generic);
+        assert!(
+            raw_generic.provider_code.is_none(),
+            "an unrelated `token`+`exceeds` message must NOT be tagged context_length_exceeded"
+        );
+
+        // FALSE-POSITIVE GUARD 3: even an EXPLICIT context-length phrase on a non-oversized status
+        // (e.g. a 500 echoing a prior message) must not reclassify the failure as ContextLength.
+        let wrong_status = br#"{"error":{"message":"This model's maximum context length is 8192 tokens.","type":"server_error","code":null}}"#;
+        let raw_wrong = OpenAiReader.extract_error(StatusCode::INTERNAL_SERVER_ERROR, wrong_status);
+        assert!(
+            raw_wrong.provider_code.is_none(),
+            "a 5xx mentioning context length must NOT be reclassified as context_length_exceeded"
+        );
+
+        // TRUE POSITIVE 1: the canonical prose phrase on a 400 still synthesizes the code.
+        let real = br#"{"error":{"message":"This model's maximum context length is 8192 tokens, however you requested 9000 tokens.","type":"invalid_request_error","code":null}}"#;
+        let raw_real = OpenAiReader.extract_error(StatusCode::BAD_REQUEST, real);
+        assert_eq!(
+            raw_real.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "a real maximum-context-length 400 must still synthesize the canonical code"
+        );
+
+        // TRUE POSITIVE 2: a 413 payload-too-large carrying `exceeds`+`token limit` also synthesizes.
+        let real_413 = br#"{"error":{"message":"Request exceeds the token limit for this model.","type":"invalid_request_error","code":null}}"#;
+        let raw_413 = OpenAiReader.extract_error(StatusCode::PAYLOAD_TOO_LARGE, real_413);
+        assert_eq!(
+            raw_413.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "a 413 with `exceeds`+`token limit` must synthesize the canonical code"
         );
     }
 

@@ -46,6 +46,41 @@ impl Drop for InflightGuard {
     }
 }
 
+/// Return `url` with any URL userinfo (`scheme://user:pass@host/...`) masked, SAFE to put in a log
+/// line. An operator can embed credentials in a webhook / OTLP endpoint URL (RFC 3986 §3.2.1 allows
+/// `user:password@` in the authority), and logging the raw `&str` would leak that secret into the
+/// structured logs / stderr. We reparse the string and, if it carries a non-empty username or any
+/// password, replace the whole userinfo component with the fixed marker `***` (so it is visible that
+/// something was redacted) before reserializing. A URL with no userinfo, or a string that does not
+/// parse as a URL, is returned UNCHANGED (allocating a fresh owned `String` either way so callers
+/// have one uniform type) — masking must never alter or drop a URL that carried no secret. Pure, so
+/// it is unit-testable. Applied at EVERY URL-logging site in this module (the `endpoint` info log and
+/// the validation-error messages, which interpolate the raw URL).
+fn mask_userinfo(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        // Not a parseable URL (e.g. the empty string or `not-a-url`): no userinfo to leak, and we
+        // must not mangle the operator's original spelling in the diagnostic. Return as-is.
+        return url.to_string();
+    };
+    let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+    if !has_userinfo {
+        return url.to_string();
+    }
+    // `set_password(None)` then `set_username("***")` collapses the userinfo to the redaction
+    // marker. Both setters return `Err(())` for a "cannot-be-a-base" URL, but a URL that parsed
+    // WITH userinfo necessarily has an authority, so these succeed; on the unexpected error we fall
+    // back to a host-only reserialization rather than risk logging the secret.
+    if parsed.set_password(None).is_err() || parsed.set_username("***").is_err() {
+        // Defensive: strip to scheme + host (+ port) so no userinfo can survive into the log.
+        let host = parsed.host_str().unwrap_or("");
+        return match parsed.port() {
+            Some(p) => format!("{}://***@{host}:{p}", parsed.scheme()),
+            None => format!("{}://***@{host}", parsed.scheme()),
+        };
+    }
+    parsed.into()
+}
+
 /// True when `url`'s scheme equals `scheme` (an all-lowercase ASCII scheme word like `https`),
 /// compared CASE-INSENSITIVELY per RFC 3986 §3.1. Matches `<scheme>://...`; the `://` is required so
 /// `httpsx://` does not match `https`. Avoids the case-sensitivity bug in a raw
@@ -91,8 +126,11 @@ fn validate_webhook_url(url: Option<String>) -> Result<Option<String>, String> {
     // wrongly rejected by a literal `starts_with("https://")` on the raw string. Compare the scheme
     // (everything up to and including `://`) without allocating by lowercasing only that prefix.
     if !scheme_is(&u, "https") {
+        // Mask any embedded userinfo before it reaches the (logged) error message — the raw URL can
+        // carry `user:pass@` operator credentials (LOW #18).
         return Err(format!(
-            "observability.request_log_webhook_url must be an https:// URL (got '{u}')"
+            "observability.request_log_webhook_url must be an https:// URL (got '{}')",
+            mask_userinfo(&u)
         ));
     }
     let parsed = reqwest::Url::parse(&u)
@@ -100,7 +138,8 @@ fn validate_webhook_url(url: Option<String>) -> Result<Option<String>, String> {
     if host_is_internal(&parsed) {
         return Err(format!(
             "observability.request_log_webhook_url must not target a loopback/link-local/private/\
-             CGNAT/cloud-metadata host (SSRF guard); got '{u}'"
+             CGNAT/cloud-metadata host (SSRF guard); got '{}'",
+            mask_userinfo(&u)
         ));
     }
     Ok(Some(u))
@@ -450,6 +489,9 @@ pub(crate) fn init_logging(otlp_endpoint: Option<&str>) {
         let _ = TRACER_PROVIDER.set(provider);
     }
     if let Some(endpoint) = otlp_endpoint {
+        // Mask any embedded userinfo (`https://user:pass@host`) BEFORE logging — the raw endpoint
+        // can carry operator credentials that must not leak into structured logs (LOW #18).
+        let endpoint = mask_userinfo(endpoint);
         tracing::info!(endpoint, "OTLP tracing enabled");
     }
 }
@@ -493,8 +535,10 @@ fn validate_otlp_endpoint(endpoint: Option<&str>) -> Result<Option<String>, Stri
     // Case-INSENSITIVE scheme check (see `scheme_is`): `HTTP://localhost:4318` / `HTTPS://...` are
     // valid per RFC 3986 and would be wrongly rejected by a literal lowercase `starts_with`.
     if !(scheme_is(e, "https") || scheme_is(e, "http")) {
+        // Mask any embedded userinfo before it reaches the (logged) error message (LOW #18).
         return Err(format!(
-            "observability.otlp_endpoint must be an http:// or https:// URL (got '{e}')"
+            "observability.otlp_endpoint must be an http:// or https:// URL (got '{}')",
+            mask_userinfo(e)
         ));
     }
     let parsed = reqwest::Url::parse(e)
@@ -504,7 +548,8 @@ fn validate_otlp_endpoint(endpoint: Option<&str>) -> Result<Option<String>, Stri
     if otlp_host_is_blocked(&parsed) {
         return Err(format!(
             "observability.otlp_endpoint must not target a link-local/private/CGNAT/cloud-metadata \
-             host (SSRF guard; loopback/localhost collectors are allowed); got '{e}'"
+             host (SSRF guard; loopback/localhost collectors are allowed); got '{}'",
+            mask_userinfo(e)
         ));
     }
     // The `http://` carve-out is ONLY for the co-located loopback collector. A plaintext hop to a
@@ -516,7 +561,8 @@ fn validate_otlp_endpoint(endpoint: Option<&str>) -> Result<Option<String>, Stri
         return Err(format!(
             "observability.otlp_endpoint must use https:// for a non-loopback collector (plaintext \
              http:// is only permitted for a loopback/localhost collector; traces would otherwise be \
-             sent in cleartext); got '{e}'"
+             sent in cleartext); got '{}'",
+            mask_userinfo(e)
         ));
     }
     Ok(Some(e.to_string()))
@@ -711,6 +757,104 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mask_userinfo_strips_credentials() {
+        // Regression (LOW #18): a URL with embedded userinfo (`user:pass@host`) must have the secret
+        // stripped before it is logged. The masked form must NOT contain the username or password,
+        // must replace the userinfo with the `***` marker, and must preserve the host/port/path so
+        // the diagnostic is still useful.
+        let masked = mask_userinfo("https://alice:s3cr3t@collector.example.com:4318/v1/traces");
+        assert!(
+            !masked.contains("s3cr3t"),
+            "password must not survive masking: {masked}"
+        );
+        assert!(
+            !masked.contains("alice"),
+            "username must not survive masking: {masked}"
+        );
+        assert!(
+            masked.contains("***@"),
+            "userinfo marker expected: {masked}"
+        );
+        assert!(
+            masked.contains("collector.example.com"),
+            "host must be preserved: {masked}"
+        );
+        assert!(masked.contains("4318"), "port must be preserved: {masked}");
+        assert!(
+            masked.contains("/v1/traces"),
+            "path must be preserved: {masked}"
+        );
+
+        // Password-only userinfo (`:pass@`) and username-only userinfo (`user@`) are both masked.
+        assert!(!mask_userinfo("https://:topsecret@host/path").contains("topsecret"));
+        assert!(!mask_userinfo("https://tokenuser@host/path").contains("tokenuser"));
+    }
+
+    #[test]
+    fn test_mask_userinfo_passthrough_without_credentials() {
+        // A URL with no userinfo must be returned unchanged (modulo the trailing-slash normalization
+        // reqwest applies to a bare authority); masking must never drop or alter a credential-free URL.
+        assert_eq!(
+            mask_userinfo("https://collector.example.com:4318/v1/traces"),
+            "https://collector.example.com:4318/v1/traces"
+        );
+        // Non-URL strings (no userinfo to leak) are passed through verbatim for the diagnostic.
+        assert_eq!(mask_userinfo("not-a-url"), "not-a-url");
+        assert_eq!(mask_userinfo(""), "");
+    }
+
+    #[test]
+    fn test_validate_webhook_url_error_masks_userinfo() {
+        // Regression (LOW #18): the validation error message is logged (`configure_webhook` ->
+        // tracing::error!), so a rejected webhook URL bearing userinfo must not leak its credentials
+        // into that message. Use an internal host so it is rejected by the SSRF guard with the URL
+        // interpolated.
+        let err = validate_webhook_url(Some(
+            "https://user:hunter2@169.254.169.254/latest/meta-data/".to_string(),
+        ))
+        .expect_err("internal host must be rejected");
+        assert!(
+            !err.contains("hunter2") && !err.contains("user:"),
+            "webhook validation error must mask embedded userinfo; leaked: {err}"
+        );
+        // A plaintext (non-https) URL with userinfo is rejected by the scheme check, also masked.
+        let err = validate_webhook_url(Some("http://u:p4ss@hook.example.com/log".to_string()))
+            .expect_err("plaintext scheme must be rejected");
+        assert!(
+            !err.contains("p4ss"),
+            "scheme-rejection error must mask embedded userinfo; leaked: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_otlp_endpoint_error_masks_userinfo() {
+        // Regression (LOW #18): the OTLP validation error is printed to stderr (`init_logging`), so a
+        // rejected endpoint with userinfo must not leak credentials there either.
+        let err = validate_otlp_endpoint(Some("https://svc:topsecret@10.0.0.1/v1/traces"))
+            .expect_err("internal host must be rejected");
+        assert!(
+            !err.contains("topsecret"),
+            "OTLP SSRF-rejection error must mask embedded userinfo; leaked: {err}"
+        );
+        // Bad-scheme path also masks.
+        let err = validate_otlp_endpoint(Some("ftp://svc:s3cr3t@collector.example.com/x"))
+            .expect_err("bad scheme must be rejected");
+        assert!(
+            !err.contains("s3cr3t"),
+            "OTLP scheme-rejection error must mask embedded userinfo; leaked: {err}"
+        );
+        // Plaintext-to-remote path also masks.
+        let err = validate_otlp_endpoint(Some(
+            "http://svc:pw0rd@collector.example.com:4318/v1/traces",
+        ))
+        .expect_err("plaintext remote must be rejected");
+        assert!(
+            !err.contains("pw0rd"),
+            "OTLP plaintext-remote error must mask embedded userinfo; leaked: {err}"
+        );
+    }
 
     #[test]
     fn test_build_request_log_shape() {

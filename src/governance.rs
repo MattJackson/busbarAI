@@ -395,10 +395,22 @@ impl GovState {
     }
 
     /// Add tokens to the key's rate window for TPM accounting. Called post-response from
-    /// `record_tokens` (the token-fee path). Tokens are attributed to the window implied by `now` (the
-    /// moment the response completed): if the entry belongs to a stale (earlier) window, we
-    /// reinitialise it for `now`'s window and credit the tokens there. We never credit a stale window,
-    /// so a late response cannot inflate a window that has already closed.
+    /// `record_tokens`/`record_request` (the token-fee path). `now` is the request's pinned
+    /// `charged_at` (the header-arrival epoch), i.e. the window the request STARTED in — NOT a fresh
+    /// completion clock. This matters for a request that straddles a 60s boundary: it is admitted by
+    /// `check_rate` in its start window W0, but by the time its (streamed) response completes, a LATER
+    /// admission for the same key may have rolled the live entry forward to W1. The credit then
+    /// arrives carrying `charged_at` in W0 while the entry lives in W1.
+    ///
+    /// CREDIT THE ENTRY'S LIVE WINDOW (MED #6 fix, option b). A start-window OLDER-or-equal to the
+    /// entry's window is the straddle case above: the request's tokens belong to the same TPM budget
+    /// the key is currently spending, so we credit the entry's existing (live) window IN PLACE rather
+    /// than dropping the credit or rewinding the entry to the older start window. Previously a `<`
+    /// (older start window than entry) was either dropped or — worse — used to REINITIALISE the entry
+    /// back to W0, destroying the live W1 counter; either way a boundary-straddling request never
+    /// counted against TPM, letting a key sustain above its configured limit. Only a start-window
+    /// strictly NEWER than the entry (the entry is genuinely stale — an old window the sweep has not
+    /// yet evicted) reinitialises the entry to the new window before crediting.
     ///
     /// UPDATE-ONLY (the rate map must not grow for uncapped keys). This method credits an entry that
     /// ALREADY EXISTS but never materialises a missing one. `check_rate` only ever creates entries for
@@ -420,23 +432,24 @@ impl GovState {
             // key's entry is created by `check_rate` on admission, so the credit lands there.
             return;
         };
-        if st.window_start == window {
-            // Entry is for the window this response belongs to -> credit it.
+        if window <= st.window_start {
+            // Start-window older-or-equal to the entry's window. Either the same window (the normal
+            // case) or a boundary-straddling request whose live entry has rolled forward since
+            // admission. The tokens belong to the key's currently-live TPM budget, so credit the
+            // entry's existing window IN PLACE — do not rewind it to the older start window (which
+            // would wipe the live counter) and do not drop the credit (which would let a straddling
+            // request escape TPM). This is the MED #6 fix.
             st.tokens = st.tokens.saturating_add(tokens);
-        } else if st.window_start < window {
-            // Entry is for an OLDER window (it rolled forward as `check_rate` evicted/reset it) ->
-            // reinitialise for this response's window and credit there. Previously these tokens were
-            // silently dropped, so any response that completed in a different 60s window than it
-            // started (the common streaming case) never reached the TPM counter, letting a key sustain
-            // above its configured limit. This is the fix.
+        } else {
+            // Start-window strictly NEWER than the entry -> the entry is genuinely stale (an old
+            // window the amortized sweep has not yet evicted). Reinitialise it for this window and
+            // credit there, so a stale entry never carries old counts forward.
             *st = RateState {
                 window_start: window,
                 requests: 0,
                 tokens,
             };
         }
-        // else: entry is for a NEWER window than this (late) response -> its window has already
-        // closed; drop the credit rather than revive a stale window or inflate the current one.
     }
 
     /// Is this key already at/over its budget for the current window? (No cap → never.) Synchronous
@@ -619,7 +632,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 /// A virtual key issued by busbar (distinct from upstream provider keys). Maps a caller to the
 /// pools they may use plus their budget/rate-limit policy.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct VirtualKey {
     pub id: String,
     /// SHA-256 hex of the presented secret (the secret itself is never stored).
@@ -637,6 +650,37 @@ pub(crate) struct VirtualKey {
     pub tpm_limit: Option<u32>,
     pub enabled: bool,
     pub created_at: u64,
+}
+
+// MANUAL Debug that REDACTS `key_hash`. A derived `Debug` would print the SHA-256 of the key's
+// secret in PLAINTEXT — a latent credential leak any time a `VirtualKey` (or `GovCtx`, which embeds
+// one and whose derived Debug delegates here transitively) is debug-logged. The hash is the stored
+// authenticator (a presented secret is matched by hashing it and looking up this value), so it is
+// secret-equivalent and must never reach a log. Print presence only, never the value — mirroring
+// `config::GovernanceCfg`/`auth::AuthMiddleware`. All non-secret fields are shown verbatim so the
+// struct stays diagnosable.
+impl std::fmt::Debug for VirtualKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VirtualKey")
+            .field("id", &self.id)
+            .field(
+                "key_hash",
+                &if self.key_hash.is_empty() {
+                    "<absent>"
+                } else {
+                    "<redacted; present>"
+                },
+            )
+            .field("name", &self.name)
+            .field("allowed_pools", &self.allowed_pools)
+            .field("max_budget_cents", &self.max_budget_cents)
+            .field("budget_period", &self.budget_period)
+            .field("rpm_limit", &self.rpm_limit)
+            .field("tpm_limit", &self.tpm_limit)
+            .field("enabled", &self.enabled)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 /// Accumulated usage for a key within a budget window.
@@ -975,6 +1019,44 @@ mod tests {
         assert_eq!(s.get_key("k1").unwrap(), None);
     }
 
+    #[test]
+    fn test_virtualkey_debug_redacts_key_hash() {
+        // LOW #17 (SECURITY): VirtualKey's Debug must NOT print `key_hash` (the stored authenticator
+        // for the key's secret). A derived Debug leaked it in plaintext; the manual impl prints
+        // presence only. The hash value is deliberately distinctive so a substring check catches it.
+        let mut k = sample_key("vk_dbg", "SECRET-key-hash-value-zzz");
+        let dbg = format!("{k:?}");
+        assert!(
+            !dbg.contains("SECRET-key-hash-value-zzz"),
+            "VirtualKey Debug leaked key_hash: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted; present>"),
+            "VirtualKey Debug should mark key_hash present-but-redacted: {dbg}"
+        );
+        // Non-secret fields are still shown so the struct stays diagnosable.
+        assert!(dbg.contains("vk_dbg"), "id must still appear: {dbg}");
+        assert!(dbg.contains("test-key"), "name must still appear: {dbg}");
+
+        // Redaction holds TRANSITIVELY through GovCtx (its derived Debug delegates to VirtualKey's).
+        let ctx = GovCtx {
+            key: Some(k.clone()),
+        };
+        let ctx_dbg = format!("{ctx:?}");
+        assert!(
+            !ctx_dbg.contains("SECRET-key-hash-value-zzz"),
+            "GovCtx Debug leaked the embedded key_hash: {ctx_dbg}"
+        );
+
+        // An empty hash is marked absent (defensive; the request path never builds such a key).
+        k.key_hash = String::new();
+        let dbg_empty = format!("{k:?}");
+        assert!(
+            dbg_empty.contains("<absent>"),
+            "empty key_hash should read as absent: {dbg_empty}"
+        );
+    }
+
     /// A pool name CONTAINING a comma must survive a persist/read round-trip as ONE pool, not be
     /// split into fragments. The old comma-delimited CSV storage corrupted such names (a key for
     /// `"prod,special"` round-tripped as `["prod", "special"]`, an implicit privilege expansion that
@@ -1143,54 +1225,76 @@ mod tests {
     }
 
     #[test]
-    fn test_add_rate_tokens_credits_completion_window_not_dropped() {
-        // Regression: a streamed response that completes in a LATER 60s window than it started must
-        // still have its tokens counted (previously they were silently dropped because check_rate
-        // had evicted/rolled the entry).
+    fn test_add_rate_tokens_straddling_request_credits_live_window_not_dropped() {
+        // MED #6 regression. Production feeds `add_rate_tokens` the request's pinned `charged_at` (the
+        // window it STARTED in), not a fresh completion clock. A request that straddles a 60s boundary
+        // is admitted in its start window W0, but a LATER admission for the same key rolls the live
+        // entry forward to W1 before this request's (streamed) response completes. The credit then
+        // arrives carrying `charged_at` in W0 while the live entry is in W1.
+        //
+        // The old code took `window (W0) < st.window_start (W1)` and either DROPPED the credit or
+        // reinitialised the entry back to W0 — wiping the live W1 counter. Either way the straddling
+        // request escaped TPM. The fix credits the entry's LIVE (W1) window in place, so the tokens
+        // count against the key's currently-live TPM budget.
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let gov = GovState::new(store, 0, 0, None).unwrap();
         let mut k = sample_key("k1", "h1");
         k.rpm_limit = Some(10);
         k.tpm_limit = Some(500);
-        let start = 1_700_000_040; // window W0 starts at 1_700_000_040? compute: start/60*60
-        let w0 = start / 60 * 60;
-        let later = w0 + 65; // a request landing in the next window evicts the W0 entry
+        let w0 = 1_700_000_040 / 60 * 60; // a window boundary
+        let w1 = w0 + RATE_WINDOW_SECS; // the next window
 
-        // Admit a request in W0 (creates a W0 entry with requests=1).
-        assert!(gov.check_rate(&k, start).is_ok());
-        // A new request lands in the next window — check_rate's retain() evicts the W0 entry.
-        assert!(gov.check_rate(&k, later).is_ok());
-        // The first request's response completes (post-eviction) in its window `later`.
-        gov.record_tokens("k1", "total", later, 400);
-        // Those 400 tokens must be attributed to `later`'s window, not dropped: a follow-up that
-        // would push over the 500 TPM cap is rejected.
-        gov.record_tokens("k1", "total", later, 200); // now 600 >= 500 in this window
-        let retry = gov.check_rate(&k, later + 1).unwrap_err();
+        // The straddling request is admitted in W0 (creates a W0 entry).
+        assert!(gov.check_rate(&k, w0).is_ok());
+        // A later request for the same key lands in W1 and rolls the live entry forward to W1.
+        assert!(gov.check_rate(&k, w1).is_ok());
+        // The straddling request's response completes; its credit carries the pinned `charged_at` in
+        // W0 (older than the live W1 entry). It must land on the LIVE W1 window, not be dropped.
+        gov.record_tokens("k1", "total", w0, 400);
+        gov.record_tokens("k1", "total", w0, 200); // 600 >= 500 against the live W1 budget
+        let retry = gov.check_rate(&k, w1 + 1).unwrap_err();
         assert!(
             (1..=60).contains(&retry),
-            "accrued tokens enforce TPM in completion window"
+            "straddling request's tokens enforce TPM in the live window, not dropped"
         );
     }
 
     #[test]
-    fn test_add_rate_tokens_does_not_revive_stale_window() {
-        // Tokens credited with an OLD `now` must not inflate the current window's counter.
+    fn test_add_rate_tokens_reinitialises_a_genuinely_stale_entry() {
+        // The complement of the straddle case: when the credit's start-window is strictly NEWER than
+        // the entry's window, the entry is genuinely stale (an old window the amortized sweep has not
+        // yet evicted). It must be reinitialised to the new window before crediting, so a stale entry
+        // never carries its old counts forward.
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let gov = GovState::new(store, 0, 0, None).unwrap();
         let mut k = sample_key("k1", "h1");
         k.rpm_limit = Some(10);
         k.tpm_limit = Some(100);
-        let now = 1_700_000_040;
+        let w0 = 1_700_000_040 / 60 * 60;
+        let w1 = w0 + RATE_WINDOW_SECS;
 
-        // Establish the current window with a request.
-        assert!(gov.check_rate(&k, now).is_ok());
-        // A late credit for a PRIOR window (now - 120) must not touch the current window's tokens.
-        gov.record_tokens("k1", "total", now.saturating_sub(120), 1000);
-        // Current window still under TPM → admitted.
-        assert!(
-            gov.check_rate(&k, now + 1).is_ok(),
-            "stale-window credit must not affect current window"
+        // Seed a stale W0 entry directly (simulating an entry the sweep has not yet evicted), then
+        // credit with a NEWER start window W1.
+        {
+            let mut map = gov.rate.write().unwrap_or_else(|p| p.into_inner());
+            map.insert(
+                "k1".to_string(),
+                RateState {
+                    window_start: w0,
+                    requests: 5,
+                    tokens: 999,
+                },
+            );
+        }
+        gov.record_tokens("k1", "total", w1, 40);
+        let map = gov.rate.read().unwrap_or_else(|p| p.into_inner());
+        let st = map.get("k1").expect("entry exists");
+        assert_eq!(
+            st.window_start, w1,
+            "stale entry reinitialised to the new window"
         );
+        assert_eq!(st.requests, 0, "stale request count cleared");
+        assert_eq!(st.tokens, 40, "only the new window's tokens are credited");
     }
 
     #[test]

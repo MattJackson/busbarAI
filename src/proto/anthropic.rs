@@ -1183,6 +1183,21 @@ fn anthropic_auth_headers(
             safe("x-api-key", key.to_string()),
         )
     };
+    // ApiKey-scheme variant of `x-api-key` that strips LEADING whitespace from the configured key
+    // (R25 LOW #15). `classify_credential` matches on `key.trim_start()`, so `"  sk-ant-api…"`
+    // classifies as `ApiKey` — but the raw `x_api_key` closure above forwards the key VERBATIM,
+    // emitting `x-api-key: "  sk-ant-api…"` (a header value with a leading-space artifact the
+    // upstream rejects with a 401). Trim the leading whitespace so the emitted header matches the
+    // value that was classified. Scope is deliberately narrow: ONLY the canonical configured-key
+    // (`ApiKey`) scheme is trimmed here. The OAuth (`authorization: Bearer`) and the Ambiguous
+    // passthrough/static fallbacks keep the raw closures below, preserving their byte-for-byte
+    // round-trip contract — a forwarded caller token must reach the upstream exactly as presented.
+    let x_api_key_trimmed = || {
+        (
+            HeaderName::from_static("x-api-key"),
+            safe("x-api-key", key.trim_start().to_string()),
+        )
+    };
     let authorization = || {
         (
             HeaderName::from_static("authorization"),
@@ -1194,8 +1209,10 @@ fn anthropic_auth_headers(
         HeaderValue::from_static(ANTHROPIC_API_VERSION),
     );
     match AnthropicWriter::classify_credential(key) {
-        // Configured Anthropic API key: native API-key client shape — `x-api-key` only.
-        AnthropicCredScheme::ApiKey => vec![x_api_key(), version],
+        // Configured Anthropic API key: native API-key client shape — `x-api-key` only. Use the
+        // leading-whitespace-trimmed builder so a configured key with a stray leading space (the
+        // value `classify_credential` already matched on its trimmed form) is forwarded clean.
+        AnthropicCredScheme::ApiKey => vec![x_api_key_trimmed(), version],
         // OAuth access token / passthrough Bearer token: native OAuth client shape —
         // `authorization: Bearer` only.
         AnthropicCredScheme::OAuth => vec![authorization(), version],
@@ -1718,6 +1735,79 @@ mod anthropic_hardening_tests {
         assert_eq!(
             header_value(&headers, "anthropic-version").as_deref(),
             Some("2023-06-01")
+        );
+    }
+
+    /// R25 LOW #15 regression: a configured API key with LEADING WHITESPACE (a common config
+    /// artifact — a stray space or indentation in an env var / secrets file) classifies as `ApiKey`
+    /// (because `classify_credential` matches on the trimmed key) but, before the fix, was forwarded
+    /// VERBATIM — emitting `x-api-key: "  sk-ant-api…"`, a malformed header value the upstream rejects
+    /// with a 401. The configured-key (`ApiKey`) scheme must now emit the key with the leading
+    /// whitespace stripped, matching the value the classifier matched on.
+    #[test]
+    fn auth_headers_api_key_trims_leading_whitespace() {
+        // Wire path (sign_request, Token mode) and the mode-blind primitive both route a canonical
+        // `sk-ant-api…` key through the ApiKey arm — assert both emit the CLEAN header.
+        let raw = "   sk-ant-api03-secret-key";
+        let ctx = crate::proto::SigningContext {
+            host: "api.anthropic.com".to_string(),
+            canonical_uri: "/v1/messages".to_string(),
+            body: b"{}",
+            timestamp_epoch: 0,
+            auth_mode: crate::auth::AuthMode::Token,
+        };
+        for headers in [
+            AnthropicWriter.auth_headers(raw),
+            AnthropicWriter.sign_request(raw, &ctx),
+        ] {
+            assert_eq!(
+                header_value(&headers, "x-api-key").as_deref(),
+                Some("sk-ant-api03-secret-key"),
+                "the ApiKey scheme must forward the configured key with leading whitespace stripped"
+            );
+            // Still single-header (no Bearer tell) and the trim did not corrupt the value.
+            assert!(
+                header_value(&headers, "authorization").is_none(),
+                "an API key must NOT emit an authorization header"
+            );
+        }
+    }
+
+    /// Precision guard for R25 LOW #15: the leading-whitespace trim is scoped to the configured-key
+    /// (`ApiKey`) scheme ONLY. An OAuth (`sk-ant-oat…`) credential — and any Ambiguous passthrough
+    /// Bearer token — must round-trip BYTE-FOR-BYTE, leading whitespace included, so a forwarded
+    /// caller token reaches the upstream exactly as presented (the passthrough contract). Trimming
+    /// the Bearer value here would silently rewrite a caller's credential.
+    #[test]
+    fn auth_headers_oauth_and_passthrough_preserve_leading_whitespace() {
+        // OAuth (sk-ant-oat) keeps its raw Bearer value verbatim — note the leading space is kept
+        // inside the value after the `Bearer ` prefix.
+        let oat = "  sk-ant-oat01-caller-token";
+        let oauth_headers = AnthropicWriter.auth_headers(oat);
+        assert_eq!(
+            header_value(&oauth_headers, "authorization").as_deref(),
+            Some("Bearer   sk-ant-oat01-caller-token"),
+            "OAuth Bearer must round-trip the credential verbatim (no trim)"
+        );
+        assert!(
+            header_value(&oauth_headers, "x-api-key").is_none(),
+            "OAuth must not emit x-api-key"
+        );
+
+        // Ambiguous passthrough Bearer (wire path) likewise round-trips verbatim.
+        let amb = "  opaque-caller-token";
+        let ctx = crate::proto::SigningContext {
+            host: "api.anthropic.com".to_string(),
+            canonical_uri: "/v1/messages".to_string(),
+            body: b"{}",
+            timestamp_epoch: 0,
+            auth_mode: crate::auth::AuthMode::Passthrough,
+        };
+        let pt = AnthropicWriter.sign_request(amb, &ctx);
+        assert_eq!(
+            header_value(&pt, "authorization").as_deref(),
+            Some("Bearer   opaque-caller-token"),
+            "passthrough Bearer must round-trip the caller token verbatim (no trim)"
         );
     }
 

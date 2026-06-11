@@ -118,16 +118,25 @@ fn affinity_header_for<'a>(app: &'a Arc<App>, pool: &str) -> &'a str {
 }
 
 /// Reject before forwarding when the resolved virtual key is already over its budget for the
-/// current window. No-op when governance is off or the key has no budget cap.
+/// window the request was admitted in. No-op when governance is off or the key has no budget cap.
 /// Async: the budget read is a (blocking) SQLite query offloaded to the blocking pool inside
 /// `is_over_budget_async`, so the request path never stalls a Tokio worker thread.
+///
+/// The admission window is keyed off `charged_at` (the pinned header-arrival epoch), NOT a fresh
+/// `store::now()`. The later flat-fee (`finish` → `record_request`) and token-fee
+/// (`UsageSink::charged_at` → `record_tokens`) charges both bill into the `charged_at` window, so
+/// the over-budget GATE must read the SAME window or the admission decision and the charge can land
+/// in different windows when the request straddles a window boundary — a fresh clock here could
+/// admit against an empty new window while the charge falls into (and overshoots) the old one, or
+/// vice-versa (#29 sibling of the flat-fee/token-fee window pins).
 async fn budget_check(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
     proto: &str,
+    charged_at: u64,
 ) -> Option<Response> {
     if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
-        if g.is_over_budget_async(key, crate::store::now()).await {
+        if g.is_over_budget_async(key, charged_at).await {
             // `insufficient_quota` is the canonical OpenAI/Responses quota error type (the OpenAI
             // writer passes it through verbatim as a real type; the Responses writer maps it
             // explicitly). The older `billing_error` token was not in either vocabulary, so it
@@ -195,7 +204,7 @@ async fn governance_guard(
     if let Some(resp) = fallback_pools_authorized(app, gov, pool, proto) {
         return Some(finish(app, gov, proto, label, started, charged_at, resp));
     }
-    if let Some(resp) = budget_check(app, gov, proto).await {
+    if let Some(resp) = budget_check(app, gov, proto, charged_at).await {
         return Some(finish(app, gov, proto, label, started, charged_at, resp));
     }
     if let Some(resp) = rate_check(app, gov, proto) {
@@ -1500,6 +1509,88 @@ mod tests {
         assert_eq!(
             in_today, 0,
             "flat fee must NOT leak into the wall-clock 'now' window (#29)"
+        );
+    }
+
+    /// Regression for #29 (admission-gate side): `budget_check` must evaluate the over-budget
+    /// condition against the SAME window the request will be charged in — the pinned `charged_at`
+    /// (header-arrival) epoch — NOT a fresh `store::now()`. Otherwise the admission gate and the
+    /// charge can land in different windows when a request straddles a window boundary: the old
+    /// code (`is_over_budget_async(key, store::now())`) admitted against an empty current-day
+    /// window while the spend that exhausts the budget lives in the `charged_at` day.
+    ///
+    /// Setup: a `daily`-period key with a 30c cap whose spend (30c) was already charged into a PAST
+    /// day window. Probing that past window (`charged_at` on that day) must reject (spend ≥ cap);
+    /// probing today's empty window (`store::now()`) must admit. The pre-fix code used the latter
+    /// unconditionally and so would have admitted a request that the charge then overshot the cap.
+    #[tokio::test]
+    async fn test_budget_check_uses_charged_at_window_not_clock() {
+        use crate::governance::{GovState, NewKeySpec, SqliteStore, Store};
+        crate::metrics::init();
+
+        let past_day: u64 = 1_700_000_000; // a fixed past day
+        let past_window = past_day / 86_400 * 86_400;
+        assert_ne!(
+            past_window,
+            crate::store::now() / 86_400 * 86_400,
+            "test precondition: charged_at must be a different day than now"
+        );
+
+        // Seed 30c of spend directly into the PAST day window BEFORE wrapping the store in GovState,
+        // so the precondition is deterministic — `record_request` offloads its write to the blocking
+        // pool under a Tokio runtime (fire-and-forget, not awaited), which would race this test.
+        let store = std::sync::Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = std::sync::Arc::new(GovState::new(store.clone(), 30, 0, None).unwrap()); // 30c/req
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(30), // exhausted by a single 30c request
+                    budget_period: "daily".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .unwrap();
+        store
+            .add_usage(&key.id, past_window, 30, 0, true)
+            .expect("seed spend into the past day window");
+
+        let mut app = minimal_app();
+        Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov.clone());
+        let govctx = crate::governance::GovCtx {
+            key: Some(key.clone()),
+        };
+
+        assert_eq!(
+            gov.usage_for(&key.id, past_day)
+                .unwrap()
+                .map(|u| u.spend_cents)
+                .unwrap_or(0),
+            30,
+            "test precondition: the past day window is at the cap"
+        );
+
+        // Gate keyed off the (past) `charged_at` window sees spend ≥ cap → reject.
+        let rejected = budget_check(&app, &govctx, "openai", past_day).await;
+        assert!(
+            rejected.is_some(),
+            "budget_check must reject against the charged_at window where the spend lives (#29)"
+        );
+        assert_eq!(
+            rejected.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "over-budget on an OpenAI ingress maps to 429"
+        );
+
+        // Sanity: today's window is empty, so a gate keyed off the wall clock (the OLD behaviour)
+        // would have WRONGLY admitted. This proves the bug was real and the pin fixes it.
+        let admitted_today = budget_check(&app, &govctx, "openai", crate::store::now()).await;
+        assert!(
+            admitted_today.is_none(),
+            "today's window is empty; the old clock-based gate would have admitted here"
         );
     }
 
@@ -3873,7 +3964,7 @@ mod tests {
         let gov2 = crate::governance::GovCtx {
             key: Some(key2.clone()),
         };
-        let resp = budget_check(&app2, &gov2, "openai")
+        let resp = budget_check(&app2, &gov2, "openai", crate::store::now())
             .await
             .expect("zero-budget key ⇒ over-budget response");
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -3886,7 +3977,7 @@ mod tests {
         let gov2b = crate::governance::GovCtx {
             key: Some(key2b.clone()),
         };
-        let resp = budget_check(&app2b, &gov2b, "bedrock")
+        let resp = budget_check(&app2b, &gov2b, "bedrock", crate::store::now())
             .await
             .expect("zero-budget key ⇒ over-budget response (bedrock)");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);

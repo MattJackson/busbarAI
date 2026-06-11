@@ -143,14 +143,24 @@ impl ProtocolReader for GeminiReader {
             // The documented machine-readable reason wins on its own (it is unambiguous), regardless
             // of which status name accompanied it.
             let has_api_key_invalid_reason = lower.contains("api_key_invalid");
-            // A prose api-key-invalid message: an explicit "api key" reference paired with an
-            // invalid/expired/not-valid signal. Requiring BOTH tokens keeps a generic validation 400
-            // ("invalid value at 'contents[0].role'") from ever matching.
-            let mentions_api_key = lower.contains("api key") || lower.contains("api-key");
-            let signals_key_bad = lower.contains("not valid")
-                || lower.contains("invalid")
-                || lower.contains("expired");
-            let api_key_message = mentions_api_key && signals_key_bad;
+            // A prose api-key-invalid message: an explicit "api key" reference paired with a SPECIFIC
+            // bad-key signal. The earlier heuristic accepted a BARE "invalid" token, which fired on any
+            // INVALID_ARGUMENT field-validation 400 whose prose happened to also name an "api key"
+            // (e.g. a malformed `x-goog-api-key`-shaped field reference) — benching a HEALTHY lane on a
+            // pure client error. Pin to the documented Gemini bad-key phrasings instead: "API key not
+            // valid" / "API key … expired" (and the explicit "invalid api key" / "api key is invalid"
+            // orderings the API/SDK use). A generic validation 400 that merely contains the word
+            // "invalid" no longer matches and stays a lane-healthy ClientFault.
+            let api_key_message = lower.contains("api key not valid")
+                || lower.contains("api-key not valid")
+                || lower.contains("invalid api key")
+                || lower.contains("invalid api-key")
+                || lower.contains("api key is invalid")
+                || lower.contains("api-key is invalid")
+                || lower.contains("api key expired")
+                || lower.contains("api-key expired")
+                || lower.contains("api key has expired")
+                || lower.contains("api-key has expired");
             // Only consider the auth heuristic on the google.rpc.Code statuses Gemini actually uses
             // for an auth/permission failure, so an unrelated status carrying the words by accident
             // cannot trip it. The documented reason is authoritative on its own; the prose message is
@@ -1456,8 +1466,23 @@ impl ProtocolWriter for GeminiWriter {
                         // `{"output": <text>}` — the Gemini functionResponse convention for
                         // plain-text tool output — rather than silently discarding the content
                         // with an empty `{}` object.
-                        let response_val: serde_json::Value = serde_json::from_str(&response_text)
+                        //
+                        // Gemini's `functionResponse.response` is a protobuf Struct: it MUST be a JSON
+                        // OBJECT. A non-object parse result — a JSON `null` (e.g. upstream omitted the
+                        // response object and a literal "null" arrived), a bare scalar ("42", "true",
+                        // "\"text\""), or an array ("[1,2]") — would be emitted verbatim and rejected by
+                        // the backend (400). Coerce any non-object parsed value into a valid Struct:
+                        // `null` becomes `{}` (an empty-but-valid response), and any other non-object
+                        // scalar/array is wrapped under `{"output": <value>}` so its content survives.
+                        let parsed: serde_json::Value = serde_json::from_str(&response_text)
                             .unwrap_or_else(|_| serde_json::json!({ "output": response_text }));
+                        let response_val: serde_json::Value = if parsed.is_object() {
+                            parsed
+                        } else if parsed.is_null() {
+                            serde_json::json!({})
+                        } else {
+                            serde_json::json!({ "output": parsed })
+                        };
                         parts_arr.push(serde_json::json!({
                             "functionResponse": { "name": name, "response": response_val }
                         }))
@@ -1486,12 +1511,21 @@ impl ProtocolWriter for GeminiWriter {
                 }
             }
 
-            if !parts_arr.is_empty() {
-                let mut content_obj = serde_json::Map::new();
-                content_obj.insert("role".to_string(), serde_json::json!(role_str));
-                content_obj.insert("parts".to_string(), serde_json::Value::Array(parts_arr));
-                contents_arr.push(serde_json::Value::Object(content_obj));
+            // A turn whose IR blocks were ALL non-representable here (e.g. a thinking-only assistant
+            // turn, whose Thinking block is dropped by the `_ =>` arm above) leaves `parts_arr` empty.
+            // SKIPPING the whole contents entry drops the turn and can break Gemini's strict
+            // user/model alternation — two same-role turns then land adjacent and the API rejects the
+            // request with 400 INVALID_ARGUMENT. Mirror the Bedrock writer (bedrock.rs, empty
+            // `content_arr` → minimal placeholder): substitute an empty text part so the turn survives
+            // the seam and alternation is preserved. System-role messages never reach here (they
+            // `continue` during role mapping).
+            if parts_arr.is_empty() {
+                parts_arr.push(serde_json::json!({ "text": "" }));
             }
+            let mut content_obj = serde_json::Map::new();
+            content_obj.insert("role".to_string(), serde_json::json!(role_str));
+            content_obj.insert("parts".to_string(), serde_json::Value::Array(parts_arr));
+            contents_arr.push(serde_json::Value::Object(content_obj));
         }
 
         // Write contents to output after building all messages
@@ -3354,6 +3388,234 @@ mod tests {
         assert!(
             wire.get("stream").is_none(),
             "stream intent must not be serialised into the body: {wire}"
+        );
+    }
+
+    /// Regression (R25 LOW #10, REFINE the R24 bad-key heuristic): an `INVALID_ARGUMENT` 400 whose
+    /// prose contains the bare word "invalid" AND names an "api key" but is NOT a bad-key error
+    /// (a field-validation message that references an api-key-shaped field) must stay a lane-healthy
+    /// ClientFault. The earlier heuristic accepted a bare "invalid" token, so it would have benched a
+    /// HEALTHY lane on this. The refined heuristic requires a SPECIFIC bad-key phrase.
+    #[test]
+    fn test_extract_error_invalid_word_near_api_key_stays_client_fault() {
+        let reader = GeminiReader;
+        // A generic validation 400: "invalid" + "api key" both present, but no bad-key phrase.
+        let body = br#"{"error":{"code":400,"message":"Invalid value at 'request.api key field' (TYPE_STRING)","status":"INVALID_ARGUMENT"}}"#;
+        let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            raw.http_status, 400,
+            "a generic validation 400 that merely mentions 'invalid' near 'api key' must NOT re-shape to auth"
+        );
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("400"),
+            "the bare status code must be preserved, not synthesized to auth"
+        );
+        let empty_map = std::collections::HashMap::new();
+        let sig = crate::breaker::normalize_raw_error(&raw, &empty_map);
+        assert!(
+            matches!(sig.class, StatusClass::ClientError),
+            "must stay ClientError, got {:?}",
+            sig.class
+        );
+        assert!(
+            matches!(
+                crate::breaker::classify(&sig),
+                crate::breaker::Disposition::ClientFault
+            ),
+            "must stay a no-penalty ClientFault"
+        );
+    }
+
+    /// Companion to the refinement: an EXPIRED-key prose message ("API key expired") with no
+    /// machine-readable reason must STILL be detected as auth — the refined phrase set covers it.
+    #[test]
+    fn test_extract_error_expired_api_key_prose_is_auth() {
+        let reader = GeminiReader;
+        let body = br#"{"error":{"code":400,"message":"API key expired. Please renew the API key.","status":"INVALID_ARGUMENT"}}"#;
+        let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            raw.http_status, 401,
+            "an 'API key expired' prose message must re-shape to the auth status"
+        );
+        assert_eq!(raw.provider_code.as_deref(), Some("auth"));
+    }
+
+    /// Regression (R25 MED #2): a thinking-only assistant turn — whose sole IR block is a `Thinking`
+    /// block dropped by the writer — must NOT vanish from `contents`. Dropping it would collapse
+    /// user/model alternation (two user turns adjacent) and 400 the real Gemini API. The writer must
+    /// substitute a minimal placeholder text part so the model turn survives.
+    #[test]
+    fn test_write_request_thinking_only_turn_survives_with_placeholder() {
+        let writer = GeminiWriter;
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::User,
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "first".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                },
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::Assistant,
+                    content: vec![crate::ir::IrBlock::Thinking {
+                        text: "internal reasoning".to_string(),
+                        signature: None,
+                    }],
+                },
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::User,
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "second".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                },
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let wire = writer.write_request(&req);
+        let contents = wire
+            .get("contents")
+            .and_then(|v| v.as_array())
+            .expect("contents array must exist");
+        // All THREE turns must survive — the thinking-only model turn must not be dropped.
+        assert_eq!(
+            contents.len(),
+            3,
+            "thinking-only model turn must survive so user/model alternation is preserved: {wire}"
+        );
+        let model_turn = &contents[1];
+        assert_eq!(
+            model_turn.get("role").and_then(|v| v.as_str()),
+            Some("model"),
+            "the surviving turn must carry the model role: {model_turn}"
+        );
+        let parts = model_turn
+            .get("parts")
+            .and_then(|v| v.as_array())
+            .expect("the surviving turn must carry a parts array");
+        assert_eq!(
+            parts.len(),
+            1,
+            "placeholder turn carries exactly one part: {model_turn}"
+        );
+        assert_eq!(
+            parts[0].get("text").and_then(|v| v.as_str()),
+            Some(""),
+            "the placeholder part must be an empty text part: {model_turn}"
+        );
+    }
+
+    /// Regression (R25 LOW #11): a tool result that parses to JSON `null` (the upstream omitted the
+    /// response object) must NOT be emitted as `functionResponse.response: null`. Gemini's
+    /// `response` is a protobuf Struct and requires a JSON OBJECT; a null is rejected (400). The
+    /// writer must coerce a null parse result to an empty Struct `{}`.
+    #[test]
+    fn test_write_request_null_tool_result_coerced_to_struct() {
+        let writer = GeminiWriter;
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Tool,
+                content: vec![crate::ir::IrBlock::ToolResult {
+                    tool_use_id: "get_weather".to_string(),
+                    // A literal "null" payload — valid JSON that parses to Value::Null.
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "null".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                    is_error: false,
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let wire = writer.write_request(&req);
+        let response = wire
+            .get("contents")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|c| c.get("parts"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|p| p.get("functionResponse"))
+            .and_then(|fr| fr.get("response"))
+            .expect("functionResponse.response must exist");
+        assert!(
+            response.is_object(),
+            "a null tool-result payload must be coerced to a Struct (object), got: {response}"
+        );
+        assert!(
+            !response.is_null(),
+            "functionResponse.response must never be null: {wire}"
+        );
+    }
+
+    /// A bare-scalar tool result ("42") must likewise be coerced to a Struct — wrapped under
+    /// `{"output": <value>}` so the content survives — never emitted as a raw scalar.
+    #[test]
+    fn test_write_request_scalar_tool_result_coerced_to_struct() {
+        let writer = GeminiWriter;
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Tool,
+                content: vec![crate::ir::IrBlock::ToolResult {
+                    tool_use_id: "compute".to_string(),
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "42".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                    is_error: false,
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let wire = writer.write_request(&req);
+        let response = wire
+            .get("contents")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|c| c.get("parts"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|p| p.get("functionResponse"))
+            .and_then(|fr| fr.get("response"))
+            .expect("functionResponse.response must exist");
+        assert!(
+            response.is_object(),
+            "a scalar tool-result payload must be coerced to a Struct, got: {response}"
+        );
+        assert_eq!(
+            response.get("output").and_then(|v| v.as_i64()),
+            Some(42),
+            "the scalar value must survive under the `output` key: {response}"
         );
     }
 

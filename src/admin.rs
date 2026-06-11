@@ -34,6 +34,27 @@ where
 use crate::governance::{NewKeySpec, VirtualKey};
 use crate::state::App;
 
+/// Process-wide gate serializing the existence-sensitive critical sections of the key store.
+///
+/// `delete_key` is the only operation that flips a key from existing to absent, but its check-then-act
+/// (`usage_for` lookup → `delete_key`) and `update_key`'s check-then-act (the store's `get_key` →
+/// `put_key` UPSERT) BOTH read existence and then write, with no rows-affected signal from the store
+/// to make either atomic. Two hazards follow, and BOTH are closed by serializing every such section
+/// behind this one async mutex:
+///   - Two concurrent DELETEs of one id would otherwise both observe `Some` and both return 200 (the
+///     second SQL delete no-ops) — a misleading audit trail of two revocations of one row.
+///   - A PATCH interleaved with a DELETE would otherwise RESURRECT the revoked key: the PATCH reads
+///     the row (exists), the DELETE removes it, then the PATCH's `put_key` UPSERT re-inserts it. Under
+///     this gate the PATCH's lookup→put runs to completion before any DELETE (so the row is gone
+///     afterward), or after it (so the PATCH's `get_key` returns `None` → 404 and never re-puts).
+///
+/// The proper store-layer fix is an UPDATE-ONLY `put`/`update` (`UPDATE … WHERE id=?` that affects 0
+/// rows when absent, never an upsert) used by `update_key`, which would need no lock at all — but that
+/// method lives in `governance.rs`, outside this unit's owned files. This gate is the admin-side guard
+/// that closes the resurrection race with the surface we own. Both ops are admin-only and rare, so a
+/// single global lock has no meaningful cost.
+static EXISTENCE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Deserialize)]
 pub(crate) struct CreateKeyReq {
     name: String,
@@ -285,6 +306,14 @@ pub(crate) async fn update_key(
         req.tpm_limit,
         req.max_budget_cents,
     );
+    // RESURRECTION RACE: `update_key` is a check-then-act (`get_key` → `put_key`, and `put_key`
+    // UPSERTs on the PRIMARY KEY, so it INSERTs a missing row rather than no-opping). A PATCH that
+    // reads an extant key, then has a concurrent DELETE remove the row before its `put_key` runs,
+    // would re-create the just-revoked key. Hold the same existence gate `delete_key` uses across this
+    // whole lookup→put section so PATCH and DELETE cannot interleave: the PATCH either completes
+    // before the DELETE (row removed afterward) or sees `None` after it (404, no re-put). See
+    // `EXISTENCE_GATE`. The guard is released when this scope ends.
+    let _existence_guard = EXISTENCE_GATE.lock().await;
     let res =
         tokio::task::spawn_blocking(move || gov.update_key(&id, enabled, rpm, tpm, budget)).await;
     match res {
@@ -351,12 +380,11 @@ pub(crate) async fn delete_key(State(app): State<Arc<App>>, Path(id): Path<Strin
     // two concurrent DELETEs of the same id both observe `Some` and both return 200 (the second SQL
     // delete no-ops) — a misleading audit trail implying two revocations of one row. The store-layer
     // `changes()` fix is out of this unit's owned files, so we close the race here instead: serialize
-    // every delete's lookup→delete critical section behind a process-wide async mutex. `delete_key`
-    // is the only operation that flips a key from existing to absent, so serializing deletes against
-    // each other is sufficient — the loser of a race now observes `Ok(None)` and correctly returns
-    // 404. Deletes are admin-only and rare, so a single global lock has no meaningful cost.
-    static DELETE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _delete_guard = DELETE_GATE.lock().await;
+    // every delete's lookup→delete critical section behind the process-wide `EXISTENCE_GATE`. The same
+    // gate also serializes `update_key`'s lookup→put, so a PATCH cannot resurrect a key this DELETE
+    // removes (see `EXISTENCE_GATE`). The loser of a delete race observes `Ok(None)` and correctly
+    // returns 404. Deletes are admin-only and rare, so a single global lock has no meaningful cost.
+    let _existence_guard = EXISTENCE_GATE.lock().await;
     let now = crate::store::now();
     let gov = gov.clone();
     let id_for_task = id.clone();
@@ -1169,6 +1197,257 @@ mod tests {
         assert_eq!(
             not_found, 7,
             "every losing concurrent delete must report 404"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_patch_after_delete_404s_and_does_not_recreate_key() {
+        // Regression (MEDIUM #7, SECURITY): a PATCH must never RESURRECT a key a DELETE removed. The
+        // store's `update_key` is a check-then-act (`get_key` → `put_key`, where `put_key` UPSERTs and
+        // so re-INSERTs a missing row). Serializing `update_key`'s lookup→put behind the same gate as
+        // DELETE closes the window. This sequential case (DELETE fully precedes PATCH) proves the base
+        // contract: PATCH on a deleted key 404s and leaves it deleted (a later GET/usage stays 404).
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                0,
+            )
+            .unwrap();
+        let (addr, handle) = serve_with_gov(gov).await;
+        let client = reqwest::Client::new();
+        let key_url = format!("http://{addr}/admin/keys/{}", key.id);
+
+        // Revoke the key.
+        let del = client
+            .delete(&key_url)
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(del.status().as_u16(), 200, "the key is revoked");
+
+        // PATCH the now-deleted key → 404, and it must NOT recreate the row.
+        let patched = client
+            .patch(&key_url)
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"enabled": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            patched.status().as_u16(),
+            404,
+            "PATCH on a deleted key must 404, not resurrect it"
+        );
+
+        // The key must still be gone: usage 404s and the list is empty.
+        let usage = client
+            .get(format!("{key_url}/usage"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            usage.status().as_u16(),
+            404,
+            "the revoked key must remain absent after the PATCH"
+        );
+        let listed: serde_json::Value = client
+            .get(format!("http://{addr}/admin/keys"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            listed["keys"].as_array().unwrap().len(),
+            0,
+            "PATCH must not have re-inserted the deleted key: {listed}"
+        );
+        handle.abort();
+    }
+
+    /// A `Store` decorator that can pause inside `put_key` to force the exact PATCH/DELETE
+    /// interleaving the resurrection race needs — something a black-box HTTP burst cannot do
+    /// deterministically (the window between `update_key`'s `get_key` and `put_key` is microscopic).
+    /// All methods delegate to an inner `SqliteStore`; only `put_key` is instrumented, and only once
+    /// armed (so the create-time `put_key` during setup is unaffected).
+    ///
+    /// When armed, the FIRST subsequent `put_key` (the PATCH's) signals `entered` and then BLOCKS on
+    /// `release` until the test lets it proceed. This pins the PATCH between its existence check and
+    /// its write, so the test can run a DELETE in that gap and observe whether the gate prevents the
+    /// PATCH from re-inserting (resurrecting) the just-revoked row.
+    struct BarrierStore {
+        inner: SqliteStore,
+        armed: std::sync::atomic::AtomicBool,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl crate::governance::Store for BarrierStore {
+        fn put_key(
+            &self,
+            key: &crate::governance::VirtualKey,
+        ) -> crate::governance::StoreResult<()> {
+            // Disarm atomically so only the first put after arming pauses (and never the setup put).
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let _ = self.entered.send(());
+                // Block this blocking-pool thread until the test releases us, AFTER it has run a DELETE.
+                let _ = self.release.lock().unwrap().recv();
+            }
+            self.inner.put_key(key)
+        }
+        fn get_key(
+            &self,
+            id: &str,
+        ) -> crate::governance::StoreResult<Option<crate::governance::VirtualKey>> {
+            self.inner.get_key(id)
+        }
+        fn get_key_by_hash(
+            &self,
+            key_hash: &str,
+        ) -> crate::governance::StoreResult<Option<crate::governance::VirtualKey>> {
+            self.inner.get_key_by_hash(key_hash)
+        }
+        fn list_keys(&self) -> crate::governance::StoreResult<Vec<crate::governance::VirtualKey>> {
+            self.inner.list_keys()
+        }
+        fn delete_key(&self, id: &str) -> crate::governance::StoreResult<()> {
+            self.inner.delete_key(id)
+        }
+        fn add_usage(
+            &self,
+            key_id: &str,
+            window_start: u64,
+            spend_cents: i64,
+            tokens: u64,
+            count_request: bool,
+        ) -> crate::governance::StoreResult<()> {
+            self.inner
+                .add_usage(key_id, window_start, spend_cents, tokens, count_request)
+        }
+        fn get_usage(
+            &self,
+            key_id: &str,
+            window_start: u64,
+        ) -> crate::governance::StoreResult<crate::governance::Usage> {
+            self.inner.get_usage(key_id, window_start)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_patch_interleaved_with_delete_never_resurrects_key() {
+        // Regression (MEDIUM #7, SECURITY — the precise interleaving the gate exists to stop): a PATCH
+        // that has already read an extant key, then is overtaken by a DELETE that revokes it, must NOT
+        // have its `put_key` re-INSERT (resurrect) the row. We force the interleaving deterministically
+        // with `BarrierStore`: the PATCH's `put_key` pauses between the existence check and the write
+        // while the DELETE runs.
+        //
+        // Old code (PATCH not under the gate): the DELETE proceeds while the PATCH is paused, removes
+        // the row, returns 200; then the PATCH's UPSERT re-inserts it -> key PRESENT -> this test's
+        // final "key absent" assertion FAILS.
+        //
+        // Fixed code (PATCH holds the same `EXISTENCE_GATE` across lookup→put): the DELETE blocks on
+        // the gate until the PATCH releases it, so it runs strictly AFTER the PATCH's put -> the row is
+        // removed last -> key ABSENT -> this test PASSES.
+        crate::metrics::init();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store = Arc::new(BarrierStore {
+            inner: SqliteStore::open_in_memory().unwrap(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let gov =
+            Arc::new(GovState::new(store.clone(), 0, 0, Some("admintok".to_string())).unwrap());
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                0,
+            )
+            .unwrap();
+        let (addr, handle) = serve_with_gov(gov).await;
+        let key_url = format!("http://{addr}/admin/keys/{}", key.id);
+
+        // Arm the barrier so the PATCH's put_key (the next put) pauses mid-update.
+        store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // PATCH in the background — it will read the key, then block inside put_key.
+        let patch_url = key_url.clone();
+        let patch_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .patch(&patch_url)
+                .header("x-admin-token", "admintok")
+                .json(&serde_json::json!({"enabled": false}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+
+        // Wait until the PATCH is parked inside put_key (between its check and its write).
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .unwrap()
+            .expect("PATCH must reach the instrumented put_key");
+
+        // DELETE in the background. Old code: it completes now. Fixed code: it blocks on EXISTENCE_GATE.
+        let delete_url = key_url.clone();
+        let delete_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .delete(&delete_url)
+                .header("x-admin-token", "admintok")
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+
+        // Give the DELETE a moment to either complete (old) or wedge on the gate (fixed), then release
+        // the paused PATCH so both can finish.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        release_tx.send(()).unwrap();
+        let _ = patch_task.await.unwrap();
+        let _ = delete_task.await.unwrap();
+
+        // DECISIVE: regardless of the order the two requests reported, the revoked key must be GONE.
+        // A resurrecting PATCH (old code) leaves it PRESENT here.
+        let listed: serde_json::Value = reqwest::Client::new()
+            .get(format!("http://{addr}/admin/keys"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            listed["keys"].as_array().unwrap().len(),
+            0,
+            "a PATCH must never resurrect a key a concurrent DELETE revoked: {listed}"
         );
         handle.abort();
     }

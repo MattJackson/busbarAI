@@ -230,6 +230,28 @@ fn cohere_assign_tool_ir_index(
     Some(ir_index)
 }
 
+/// Resolve the IR block index the text content block claims for THIS stream, assigning it on first
+/// appearance and returning the same value verbatim thereafter. The index is claimed BY ORDER OF
+/// FIRST APPEARANCE — the count of tool blocks already tracked this stream — NOT a hardcoded 0, so a
+/// `tool-call-start` that arrives BEFORE the first `content-start`/`content-delta` (which claims IR
+/// index 0 via `cohere_assign_tool_ir_index` when no text has been seen) does not collide with the
+/// text block: the tool keeps 0 and the text block takes the next free slot. This mirrors the Gemini
+/// reader's `state.text_index` index-by-first-appearance scheme (gemini.rs), reusing the same shared
+/// `StreamDecodeState.text_index` field. Once `state.text_index` is `Some`, it is immutable for the
+/// stream's lifetime (so the matching `BlockStop` on `content-end` closes the index that was
+/// actually opened, even after later tools push the tracked count up). The persistent
+/// `TEXT_BLOCK_SEEN_SENTINEL` still gates the TOOL base offset (so a tool opened after the text block
+/// stays off the text index even after `content-end` clears the live flag — the HIGH finding); this
+/// helper governs only the TEXT block's own index (the LOW collision finding: tool-before-text).
+fn cohere_text_ir_index(state: &mut crate::ir::StreamDecodeState) -> usize {
+    let ti = state
+        .text_index
+        .unwrap_or_else(|| cohere_tracked_tool_count(state));
+    state.text_index = Some(ti);
+    state.open_tools.insert(TEXT_BLOCK_SEEN_SENTINEL);
+    ti
+}
+
 #[derive(Clone)]
 pub(crate) struct CohereReader;
 
@@ -676,36 +698,35 @@ impl ProtocolReader for CohereReader {
                 }
             }
             "content-start" => {
-                // The text content block ALWAYS occupies IR index 0 (matching gemini.rs and the
-                // `cohere_tool_ir_index` base-offset contract that keeps tool blocks off index 0).
-                // The raw upstream wire `index` is NOT forwarded into the IR stream: a backend that
-                // numbered its single text block other than 0 would emit a non-zero IR index that
-                // collides with a tool block (which assumes text lives at IR index 0), producing two
-                // BlockStart frames at the same IR index. Normalize to 0 on emit.
+                // The text content block claims a DYNAMIC IR index by order of first appearance
+                // (`cohere_text_ir_index`), NOT a hardcoded 0: a `tool-call-start` that arrived
+                // before any content frame already took 0, and forcing text to 0 here produced two
+                // BlockStart frames at the same IR index (the LOW tool/text collision finding).
+                // `cohere_text_ir_index` also records the persistent TEXT_BLOCK_SEEN_SENTINEL so a
+                // tool opened AFTER the text block stays off the text index even after content-end
+                // clears the live flag (the HIGH finding). The raw upstream wire `index` is still
+                // never forwarded into the IR stream.
                 if !state.text_block_open {
                     state.text_block_open = true;
-                    // Permanently record that a text block has occupied IR index 0 this stream so a
-                    // later tool block does not reuse index 0 after content-end clears the live
-                    // flag (see cohere_tool_ir_index / TEXT_BLOCK_SEEN_SENTINEL).
-                    state.open_tools.insert(TEXT_BLOCK_SEEN_SENTINEL);
+                    let ti = cohere_text_ir_index(state);
                     out.push(IrStreamEvent::BlockStart {
-                        index: 0,
+                        index: ti,
                         block: crate::ir::IrBlockMeta::Text,
                     });
                 }
             }
             "content-delta" => {
-                // The text content block ALWAYS occupies IR index 0 — see content-start. The raw
-                // upstream wire `index` is never forwarded into the IR stream; normalizing the text
-                // BlockStart/Delta to 0 keeps it off any tool block's IR index even when the backend
-                // numbers content frames with a non-zero index.
+                // The text content block claims a DYNAMIC IR index by order of first appearance
+                // (`cohere_text_ir_index`) — see content-start — NOT a hardcoded 0, so a tool that
+                // opened ahead of the first content frame (and took 0) does not collide with the
+                // text block (the LOW finding). The raw upstream wire `index` is never forwarded;
+                // every text BlockStart/Delta below uses the assigned `text_idx`. `cohere_text_ir_index`
+                // also records the persistent sentinel so a later tool stays off the text index.
+                let text_idx = cohere_text_ir_index(state);
                 if !state.text_block_open {
                     state.text_block_open = true;
-                    // See content-start: record the text block's claim on IR index 0 for the whole
-                    // stream so a subsequent tool block never collides with it.
-                    state.open_tools.insert(TEXT_BLOCK_SEEN_SENTINEL);
                     out.push(IrStreamEvent::BlockStart {
-                        index: 0,
+                        index: text_idx,
                         block: crate::ir::IrBlockMeta::Text,
                     });
                 }
@@ -717,7 +738,7 @@ impl ProtocolReader for CohereReader {
                         if let Some(text) = content_obj.as_str() {
                             if !text.is_empty() {
                                 out.push(IrStreamEvent::BlockDelta {
-                                    index: 0,
+                                    index: text_idx,
                                     delta: crate::ir::IrDelta::TextDelta(text.to_string()),
                                 });
                             }
@@ -732,7 +753,7 @@ impl ProtocolReader for CohereReader {
                                 if let Some(text) = block_obj.get("text").and_then(|t| t.as_str()) {
                                     if !text.is_empty() {
                                         out.push(IrStreamEvent::BlockDelta {
-                                            index: 0,
+                                            index: text_idx,
                                             delta: crate::ir::IrDelta::TextDelta(text.to_string()),
                                         });
                                     }
@@ -748,7 +769,7 @@ impl ProtocolReader for CohereReader {
                                             block_obj.get("text").and_then(|t| t.as_str())
                                         {
                                             out.push(IrStreamEvent::BlockDelta {
-                                                index: 0,
+                                                index: text_idx,
                                                 delta: crate::ir::IrDelta::TextDelta(
                                                     text.to_string(),
                                                 ),
@@ -762,15 +783,21 @@ impl ProtocolReader for CohereReader {
                 }
             }
             "content-end" => {
-                // content-end closes the text content block, which always lives at IR index 0 (see
-                // content-start/content-delta). Forwarding the raw wire `index` here would emit a
-                // BlockStop for an index the IR stream never opened (the matching BlockStart was
-                // normalized to 0), leaving the real text block unclosed and stopping a phantom one.
-                // Only emit the stop if a text block is actually open, so a stray content-end never
-                // produces an unbalanced BlockStop.
+                // content-end closes the text content block at the IR index it actually CLAIMED on
+                // first appearance (`state.text_index`), NOT a hardcoded 0 — a tool may have taken 0
+                // ahead of it (the LOW tool/text collision finding), so closing 0 here would leave
+                // the real text block open and stop a phantom one. The raw wire `index` is never
+                // forwarded. Only emit the stop if a text block is actually open, so a stray
+                // content-end never produces an unbalanced BlockStop. `state.text_index` is NOT
+                // cleared (mirroring how the tool entries stay recorded in `open_tools` for the
+                // stream's lifetime): keeping the claimed index immutable means a re-opened text
+                // block resolves to the SAME slot and a tool opened after content-end still derives
+                // its base off the persistent TEXT_BLOCK_SEEN_SENTINEL, so neither can collide with
+                // the text index (the HIGH finding).
                 if state.text_block_open {
                     state.text_block_open = false;
-                    out.push(IrStreamEvent::BlockStop { index: 0 });
+                    let ti = state.text_index.unwrap_or(0);
+                    out.push(IrStreamEvent::BlockStop { index: ti });
                 }
             }
             "message-end" => {
@@ -3126,6 +3153,148 @@ mod tests {
             Some(0),
             "the closed tool's assigned IR index is retained to keep later tool indices stable"
         );
+    }
+
+    /// Regression (LOW #12 + #13): a `tool-call-start` that arrives BEFORE any text content frame
+    /// must NOT collide with the text block on IR index 0. Before the fix the text block was
+    /// hardcoded to IR index 0, so a tool that opened first (and legitimately claimed 0 via
+    /// `cohere_assign_tool_ir_index` when no text had been seen) and the later text block BOTH
+    /// emitted a `BlockStart` at index 0 — two open frames at the same index, which a downstream
+    /// ingress writer mis-correlates. The text block now claims a DYNAMIC index by order of first
+    /// appearance (`state.text_index`, mirroring the Gemini reader): the tool keeps index 0 and the
+    /// text block takes index 1. Asserts the tool gets 0, text gets 1, the indices never overlap, and
+    /// the text block closes at the index it actually opened (1, not a hardcoded 0).
+    #[test]
+    fn test_stream_tool_before_text_no_index_collision() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = CohereReader;
+
+        // Tool opens FIRST — claims IR index 0 (no text seen yet).
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "tool-call-start",
+                "index": 0,
+                "delta": {"message": {"tool_calls": {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": ""}
+                }}}
+            }),
+            &mut state,
+        );
+        assert_eq!(evs.len(), 1, "tool-call-start emits one BlockStart");
+        match &evs[0] {
+            crate::ir::IrStreamEvent::BlockStart {
+                index,
+                block: crate::ir::IrBlockMeta::ToolUse { id, name },
+            } => {
+                assert_eq!(*index, 0, "the first-arriving tool claims IR index 0");
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "lookup");
+            }
+            other => panic!("expected tool BlockStart, got {other:?}"),
+        }
+
+        // Text content opens AFTER the tool — must take the NEXT free index (1), not collide on 0.
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "content-start", "index": 0}),
+            &mut state,
+        );
+        assert_eq!(evs.len(), 1, "content-start emits one text BlockStart");
+        let text_idx = match &evs[0] {
+            crate::ir::IrStreamEvent::BlockStart {
+                index,
+                block: crate::ir::IrBlockMeta::Text,
+            } => *index,
+            other => panic!("expected text BlockStart, got {other:?}"),
+        };
+        assert_eq!(
+            text_idx, 1,
+            "the text block must claim index 1 (off the tool-claimed 0), not collide on 0"
+        );
+        assert_ne!(
+            text_idx, 0,
+            "text must never reuse the tool-claimed IR index 0"
+        );
+
+        // A text delta rides the SAME dynamic index, not a hardcoded 0.
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "content-delta",
+                "index": 0,
+                "delta": {"message": {"content": {"type": "text", "text": "hi"}}}
+            }),
+            &mut state,
+        );
+        assert_eq!(evs.len(), 1, "content-delta emits one text delta");
+        match &evs[0] {
+            crate::ir::IrStreamEvent::BlockDelta {
+                index,
+                delta: crate::ir::IrDelta::TextDelta(t),
+            } => {
+                assert_eq!(*index, 1, "the text delta rides the assigned index 1");
+                assert_eq!(t, "hi");
+            }
+            other => panic!("expected text BlockDelta, got {other:?}"),
+        }
+
+        // content-end closes the text block at the index it actually opened (1), not 0.
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "content-end", "index": 0}),
+            &mut state,
+        );
+        assert_eq!(evs.len(), 1, "content-end emits one BlockStop");
+        assert!(
+            matches!(evs[0], crate::ir::IrStreamEvent::BlockStop { index: 1 }),
+            "the text block closes at its assigned index 1, not a hardcoded 0; got {:?}",
+            evs[0]
+        );
+
+        // The tool's index 0 is still independently resolvable — no overlap occurred.
+        assert_eq!(
+            cohere_lookup_tool_ir_index(&state, 0),
+            Some(0),
+            "the tool retains its distinct IR index 0"
+        );
+
+        // And the canonical text-before-tool ordering still keeps text at 0 / tool at 1 on a fresh
+        // stream (the fix must not regress the common case).
+        let mut state2 = crate::ir::StreamDecodeState::default();
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "content-start", "index": 0}),
+            &mut state2,
+        );
+        assert!(matches!(
+            evs[0],
+            crate::ir::IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::Text
+            }
+        ));
+        let evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "tool-call-start",
+                "index": 0,
+                "delta": {"message": {"tool_calls": {
+                    "id": "c2", "type": "function",
+                    "function": {"name": "f", "arguments": ""}
+                }}}
+            }),
+            &mut state2,
+        );
+        match &evs[0] {
+            crate::ir::IrStreamEvent::BlockStart { index, .. } => assert_eq!(
+                *index, 1,
+                "text-before-tool: text keeps 0, tool takes 1 (no regression)"
+            ),
+            other => panic!("expected tool BlockStart, got {other:?}"),
+        }
     }
 
     /// An unknown Cohere stream event type is a documented no-op (no events, no panic) — the named

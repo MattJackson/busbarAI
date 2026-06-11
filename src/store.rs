@@ -250,6 +250,12 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// `LaneState.err`; the per-pool cells bump their own separate `BreakerCell.err`). Here the
     /// per-cell `cell_record_success` touches no `ok`/`err` counter at all, so the single lane-global
     /// `ok` bump is applied explicitly, once.
+    ///
+    /// If a per-cell success push wins a HalfOpen→Closed CAS (possible when this push races a peer that
+    /// re-armed the cell after the caller's `recover_lane`), the implementation MUST reset that cell's
+    /// SWRR accumulator — `cell_record_success` zeroes `current_weight` under the transition lock and the
+    /// matching `reset_swrr_for` re-seeds it under the pool shard lock, holding `Σ current_weight == 0`.
+    /// Gating the reset on the recovered-bool mirrors `record_success_for`/`recover_lane` (LOW #19).
     fn record_probe_success_all_cells(&self, lane: usize);
     fn record_client_fault(&self, lane: usize);
     /// Record a transient upstream failure. `cfg` is the routing pool's resolved breaker config,
@@ -1764,19 +1770,32 @@ impl StateStore for InMemoryStore {
         }
         let now = Self::now_secs();
         // Default cell (direct/ad-hoc routes) — IS the `LaneState`. `cell_record_success` pushes the
-        // success outcome and runs the HalfOpen→Closed CAS (a no-op on an already-Closed cell, which
-        // is the steady state here since callers run `recover_lane` first on the 2xx path). It does
-        // NOT touch `ok`/`err`, so it never double-counts the lane-global stat. The recovered-bool is
-        // intentionally discarded: any SWRR reset is `record_success_for`'s job on the organic path,
-        // and no cell is HalfOpen here, so there is nothing to reset.
-        let _ = Self::cell_record_success(ls.as_ref(), now);
+        // success outcome and runs the HalfOpen→Closed CAS. It does NOT touch `ok`/`err`, so it never
+        // double-counts the lane-global stat. The CAS is *usually* a no-op here because the 2xx caller
+        // runs `recover_lane` first — but only when `lane_needs_probe` is true, and even then a peer
+        // (organic request, hard-down) can move a cell back to HalfOpen between that recovery and this
+        // push. If this push then wins the HalfOpen→Closed CAS, `cell_closed_locked` zeroed the cell's
+        // SWRR `current_weight` under the transition lock, so the matching `reset_swrr_for` MUST run to
+        // hold the pool's `Σ current_weight == 0` invariant — gate it on the recovered-bool exactly
+        // like `record_success_for` (~1584) and `recover_lane` (~1920) do. Dropping the bool here was
+        // the LOW #19 defect.
+        if Self::cell_record_success(ls.as_ref(), now) {
+            // Default cell belongs to the no-pool ("") set; reset runs after the transition lock is
+            // released (it is a leaf within `cell_record_success`), so the shard lock is un-nested.
+            self.reset_swrr_for("", ls.as_ref());
+        }
         // Every existing per-pool cell for this lane — the cells organic traffic is selected against,
         // so the probe success dilutes the SAME per-pool error-rate windows the failed-probe path
         // trips against. Mirrors `record_probe_failure_all_cells`'s `pool_cells` iteration exactly
         // (existing cells only — a cell not yet created inherits health lazily on first access).
         let cells = read_recover(&self.pool_cells);
-        for (_pool_name, cell) in cells.get(&lane).into_iter().flatten() {
-            let _ = Self::cell_record_success(cell.as_ref(), now);
+        for (pool_name, cell) in cells.get(&lane).into_iter().flatten() {
+            // Same SWRR gate per cell: a real HalfOpen→Closed close here re-admits the cell to
+            // selection with a zeroed accumulator, so reset it under THIS pool's shard lock (keyed by
+            // the pool name), serializing against that pool's selections — mirrors `recover_lane`.
+            if Self::cell_record_success(cell.as_ref(), now) {
+                self.reset_swrr_for(pool_name, cell.as_ref());
+            }
         }
         // Bump the lane-GLOBAL `ok` counter EXACTLY ONCE per probe (not once per cell). This is the
         // R24 fix: the prior per-cell `record_success_in` loop bumped `LaneState.ok` (N+1) times for a
@@ -2126,6 +2145,30 @@ impl InMemoryStore {
         self.cell(pool, lane)
             .cooldown_until()
             .load(Ordering::Acquire)
+    }
+
+    /// Park a named cell HalfOpen with the single-flight probe acquired and a STALE SWRR accumulator —
+    /// the precondition under which a recorded success drives a HalfOpen→Closed recovery whose reset
+    /// the caller is responsible for. Test-only setup for the LOW #19 regression.
+    pub(crate) fn arm_half_open_stale_swrr(
+        &self,
+        pool: &str,
+        lane: usize,
+        cooldown: u64,
+        stale_weight: i64,
+    ) {
+        let c = self.cell(pool, lane);
+        c.current_weight().store(stale_weight, Ordering::Relaxed);
+        c.cooldown_until().store(cooldown, Ordering::Relaxed);
+        c.breaker_state().store(ST_HALF_OPEN, Ordering::Relaxed);
+        c.probe_in_flight().store(true, Ordering::Relaxed);
+    }
+
+    /// Read a cell's raw SWRR `current_weight`, for the LOW #19 invariant assertion.
+    pub(crate) fn cell_current_weight(&self, pool: &str, lane: usize) -> i64 {
+        self.cell(pool, lane)
+            .current_weight()
+            .load(Ordering::Relaxed)
     }
 }
 
@@ -4775,6 +4818,59 @@ mod tests {
             store.breaker_state(0),
             BreakerState::Closed,
             "the half-open probe success must have recovered the cell to Closed"
+        );
+    }
+
+    /// LOW #19 (bug): `record_probe_success_all_cells` must gate the SWRR reset on the
+    /// `cell_record_success` recovered-bool — for the default cell AND every per-pool cell — exactly
+    /// like its siblings `record_success_for` and `recover_lane`. The probe-success caller normally
+    /// runs `recover_lane` first, but only when `lane_needs_probe` is true and not against a peer that
+    /// re-arms a cell HalfOpen in between; if THIS push then wins the HalfOpen→Closed CAS,
+    /// `cell_closed_locked` re-admits the cell to selection while leaving its STALE `current_weight`
+    /// untouched (the close never zeroes it — only `reset_swrr_for` does). Dropping the bool skipped
+    /// that reset, so the recovered cell rejoined selection carrying a stale accumulator and broke the
+    /// pool's `Σ current_weight == 0` invariant.
+    ///
+    /// Against the OLD code (bool discarded) the post-call `current_weight` stays at the seeded STALE
+    /// value and these assertions fail; against the fix the close drives the gated `reset_swrr_for` and
+    /// the accumulator reads 0.
+    #[test]
+    fn test_probe_success_all_cells_resets_swrr_on_half_open_close() {
+        const STALE_DEFAULT: i64 = 555;
+        const STALE_POOL: i64 = 999;
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(5000);
+
+        // Default ("") cell and a per-pool cell, both parked HalfOpen with the probe acquired and a
+        // stale SWRR accumulator. The expired cooldown (1000 < now=5000) makes them probe-recoverable.
+        store.arm_half_open_stale_swrr("", 0, 1000, STALE_DEFAULT);
+        store.arm_half_open_stale_swrr("pool-a", 0, 1000, STALE_POOL);
+
+        // Probe success across all cells. With the bug, each cell closes (HalfOpen→Closed) but its
+        // current_weight is never zeroed; with the fix, the gated reset zeroes both.
+        store.record_probe_success_all_cells(0);
+
+        assert_eq!(
+            store.breaker_state(0),
+            BreakerState::Closed,
+            "default cell must recover HalfOpen→Closed on the probe success"
+        );
+        assert_eq!(
+            store.breaker_state_in("pool-a", 0),
+            BreakerState::Closed,
+            "per-pool cell must recover HalfOpen→Closed on the probe success"
+        );
+        assert_eq!(
+            store.cell_current_weight("", 0),
+            0,
+            "default cell's stale SWRR accumulator must be reset to 0 on the HalfOpen→Closed close \
+             (LOW #19: the reset was skipped because the recovered-bool was discarded)"
+        );
+        assert_eq!(
+            store.cell_current_weight("pool-a", 0),
+            0,
+            "per-pool cell's stale SWRR accumulator must be reset to 0 on the HalfOpen→Closed close \
+             (LOW #19: the per-cell reset was skipped because the recovered-bool was discarded)"
         );
     }
 

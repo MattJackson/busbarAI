@@ -135,6 +135,98 @@ const JSON_BLOCK_SENTINEL: &str = "tool_result_json";
 /// never appears on the wire.
 const CACHE_POINTS_SENTINEL: &str = "__busbar_bedrock_cache_points";
 
+/// `extra` key under which the Bedrock reader stashes the positions of native Converse `guardContent`
+/// content blocks (the inline Guardrails markers, `{"guardContent": {"text": {"text": ...,
+/// "qualifiers": [...]}}}` or `{"guardContent": {"image": {...}}}`) that appear INSIDE the `system`
+/// array and inside each message's `content` array.
+///
+/// A `guardContent` block has NO IR `IrBlock` counterpart (the IR models only
+/// Text/Thinking/ToolUse/ToolResult/Image): the qualifiers (`grounding_source` / `query` /
+/// `guard_content`) that tell Bedrock Guardrails which spans to evaluate are not expressible as a
+/// plain Text block. Without this capture the reader silently DROPPED every `guardContent` on a
+/// same-protocol Bedrock passthrough — disabling the inline content-classification the caller
+/// explicitly requested (a guardrail the operator relies on for safety/compliance no longer sees the
+/// marked span), making the proxy behaviourally divergent from a direct AWS call. It is a
+/// Bedrock-NATIVE marker with no cross-protocol meaning, so stashing it in `extra` is exactly right:
+/// it survives a same-protocol round-trip and is correctly dropped on the cross-protocol seam (where
+/// `extra` is cleared) rather than leaking a Bedrock-only token onto a foreign wire.
+///
+/// The stash records each block's ORIGINAL absolute index in its native array (the same
+/// `{ "i": <usize>, "block": <value> }` / `{ "m": <usize>, "i": <usize>, "block": <value> }` shape as
+/// the `cachePoint` stash) so `write_request` can splice it back at the same position via the shared
+/// `splice_cache_points` helper. The leading `__busbar` prefix keeps it from colliding with any real
+/// Bedrock top-level key, and `write_request` consumes it (never re-emitting it via the trailing
+/// extra-merge), so the sentinel never appears on the wire.
+const GUARD_CONTENT_SENTINEL: &str = "__busbar_bedrock_guard_content";
+
+/// SENTINEL value placed in an IR `Thinking { signature }` to mark that the block is actually a
+/// Bedrock Converse `reasoningContent.redactedContent` block (encrypted/redacted reasoning bytes),
+/// NOT a plaintext `reasoningText`. The Converse `reasoningContent` union has two members:
+/// `reasoningText` (`{ "text", "signature" }`, which maps cleanly onto IR `Thinking { text,
+/// signature }`) and `redactedContent` (an opaque base64 blob with no `text`/`signature` of its own).
+/// The IR `Thinking` block has no field to distinguish the two, so a redacted block would either be
+/// dropped or mis-emitted as a plaintext `reasoningText`. The reader carries the redacted bytes in
+/// `Thinking.text` and sets `signature` to this sentinel; `write_request`/`write_response` re-emit a
+/// faithful `{"reasoningContent": {"redactedContent": <bytes>}}` block on same-protocol egress. A
+/// real `reasoningText` signature is a base64 SDK token and never equals this `__busbar`-prefixed
+/// marker, so the two can never collide; on the cross-protocol seam (where `extra`/sentinels carry no
+/// Bedrock meaning) the block degrades to a plain Thinking the target writer handles.
+const REASONING_REDACTED_SIG_SENTINEL: &str = "__busbar_bedrock_redacted_reasoning";
+
+/// Read a native Bedrock Converse `reasoningContent` content block into an IR `Thinking` block, or
+/// `None` when the block carries neither known member (forward-compatibility: a future
+/// `reasoningContent` union member is left undecoded rather than mis-mapped).
+///
+/// The Converse `reasoningContent` union has two members:
+///   - `reasoningText` (`{ "text", "signature" }`) → `Thinking { text, signature }` (the common case;
+///     `signature` is the model's opaque reasoning token, preserved verbatim for a faithful
+///     round-trip — Bedrock requires it echoed back on a follow-up turn).
+///   - `redactedContent` (opaque base64 bytes) → `Thinking { text: <bytes>, signature:
+///     REASONING_REDACTED_SIG_SENTINEL }` so the writer can re-emit `redactedContent` rather than
+///     leaking the bytes as a plaintext `reasoningText`.
+///
+/// Mirrors anthropic.rs `read_block`'s `"thinking"` arm (text + optional signature → `Thinking`).
+fn read_bedrock_reasoning_block(reasoning: &serde_json::Value) -> Option<crate::ir::IrBlock> {
+    if let Some(reasoning_text) = reasoning.get("reasoningText") {
+        let text = reasoning_text
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        let signature = reasoning_text
+            .get("signature")
+            .and_then(|s| s.as_str().map(String::from));
+        return Some(crate::ir::IrBlock::Thinking { text, signature });
+    }
+    if let Some(redacted) = reasoning.get("redactedContent").and_then(|r| r.as_str()) {
+        return Some(crate::ir::IrBlock::Thinking {
+            text: redacted.to_string(),
+            signature: Some(REASONING_REDACTED_SIG_SENTINEL.to_string()),
+        });
+    }
+    None
+}
+
+/// Build a native Bedrock Converse `reasoningContent` content block (`{"reasoningContent": ...}`) from
+/// an IR `Thinking { text, signature }` — the inverse of `read_bedrock_reasoning_block`.
+///
+/// A `Thinking` whose `signature` is the `REASONING_REDACTED_SIG_SENTINEL` re-emits the opaque
+/// `redactedContent` member (the bytes were carried in `text`); any other `Thinking` re-emits a
+/// `reasoningText` member, attaching `signature` only when present (Bedrock omits the field for an
+/// unsigned reasoning block rather than emitting `"signature": null`). Used by both `write_request`
+/// (assistant-turn passthrough) and `write_response` (model reasoning output).
+fn bedrock_reasoning_block(text: &str, signature: &Option<String>) -> serde_json::Value {
+    if signature.as_deref() == Some(REASONING_REDACTED_SIG_SENTINEL) {
+        return serde_json::json!({ "reasoningContent": { "redactedContent": text } });
+    }
+    let mut reasoning_text = serde_json::Map::new();
+    reasoning_text.insert("text".to_string(), serde_json::json!(text));
+    if let Some(sig) = signature {
+        reasoning_text.insert("signature".to_string(), serde_json::json!(sig));
+    }
+    serde_json::json!({ "reasoningContent": { "reasoningText": serde_json::Value::Object(reasoning_text) } })
+}
+
 /// Build a native Bedrock Converse `image` block body (`{ "format", "source": { "bytes" } }`) from
 /// an IR `Image (media_type, data)` pair, or `None` when the image cannot be represented natively.
 ///
@@ -255,6 +347,26 @@ fn splice_cache_points(arr: &mut Vec<serde_json::Value>, entries: &[serde_json::
         let pos = idx.min(arr.len());
         arr.insert(pos, block);
     }
+}
+
+/// Concatenate two optional `{ "i", "block" }` marker-entry slices (e.g. the captured `cachePoint`
+/// and `guardContent` stashes for one array) into a single owned `Vec` for a SINGLE `splice_cache_points`
+/// pass. Both classes recorded their indices against the SAME original array, so they MUST be spliced
+/// together (the helper sorts the combined batch by index): two separate passes would let the first
+/// pass's insertions shift the second pass's recorded indices, mis-placing the second class. Either
+/// or both inputs may be `None`/empty; the result preserves every entry verbatim.
+fn merge_marker_entries(
+    a: Option<&Vec<serde_json::Value>>,
+    b: Option<&Vec<serde_json::Value>>,
+) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    if let Some(entries) = a {
+        out.extend_from_slice(entries);
+    }
+    if let Some(entries) = b {
+        out.extend_from_slice(entries);
+    }
+    out
 }
 
 /// Derive the AWS region for SigV4 scope from a Bedrock endpoint host.
@@ -658,6 +770,10 @@ impl ProtocolReader for BedrockReader {
         // `CACHE_POINTS_SENTINEL`. Kept as `Value`s ready to nest under the sentinel object.
         let mut system_cache_points: Vec<serde_json::Value> = Vec::new();
         let mut message_cache_points: Vec<serde_json::Value> = Vec::new();
+        // Captured native `guardContent` (inline Guardrails) markers, same stash shape as the
+        // cachePoint capture; see `GUARD_CONTENT_SENTINEL`.
+        let mut system_guard_content: Vec<serde_json::Value> = Vec::new();
+        let mut message_guard_content: Vec<serde_json::Value> = Vec::new();
 
         let mut system_blocks: Vec<crate::ir::IrBlock> = Vec::new();
         if let Some(system_arr) = obj.get("system").and_then(|s| s.as_array()) {
@@ -675,6 +791,15 @@ impl ProtocolReader for BedrockReader {
                     system_cache_points.push(serde_json::json!({
                         "i": idx,
                         "block": { "cachePoint": cache_point.clone() },
+                    }));
+                } else if let Some(guard_content) = sys_val.get("guardContent") {
+                    // No IR counterpart for an inline Guardrails marker; stash it with its original
+                    // index so the writer re-emits it verbatim at the same position (a same-protocol
+                    // passthrough keeps the guardrail span the caller marked instead of silently
+                    // dropping it). See `GUARD_CONTENT_SENTINEL`.
+                    system_guard_content.push(serde_json::json!({
+                        "i": idx,
+                        "block": { "guardContent": guard_content.clone() },
                     }));
                 }
             }
@@ -812,6 +937,19 @@ impl ProtocolReader for BedrockReader {
                             if let Some(block) = read_bedrock_image_block(image) {
                                 msg_content.push(block);
                             }
+                        } else if let Some(reasoning) = content_val.get("reasoningContent") {
+                            // A native Converse `reasoningContent` (extended-thinking) block maps onto
+                            // IR `Thinking { text, signature }` (mirroring anthropic.rs `thinking`).
+                            // The old reader skipped every non-text/toolUse/toolResult/image/cachePoint
+                            // block, so an assistant turn carrying its prior reasoning had that
+                            // reasoning silently DROPPED on a same-protocol passthrough — and Bedrock
+                            // REQUIRES the signed reasoning echoed back on the follow-up turn, so the
+                            // loss made the proxy diverge from a direct AWS call. `redactedContent` is
+                            // carried via the redacted-signature sentinel so it re-emits faithfully.
+                            // A future union member yields `None` (left undecoded, not mis-mapped).
+                            if let Some(block) = read_bedrock_reasoning_block(reasoning) {
+                                msg_content.push(block);
+                            }
                         } else if let Some(cache_point) = content_val.get("cachePoint") {
                             // No IR counterpart for a prompt-cache marker; stash it with its
                             // (message, block) index so the writer re-emits it verbatim at the same
@@ -821,6 +959,17 @@ impl ProtocolReader for BedrockReader {
                                 "m": msg_idx,
                                 "i": block_idx,
                                 "block": { "cachePoint": cache_point.clone() },
+                            }));
+                        } else if let Some(guard_content) = content_val.get("guardContent") {
+                            // No IR counterpart for an inline Guardrails marker; stash it with its
+                            // (message, block) index so the writer re-emits it verbatim at the same
+                            // position on a same-protocol passthrough (the guardrail span the caller
+                            // marked stays present instead of being silently dropped). See
+                            // `GUARD_CONTENT_SENTINEL`.
+                            message_guard_content.push(serde_json::json!({
+                                "m": msg_idx,
+                                "i": block_idx,
+                                "block": { "guardContent": guard_content.clone() },
                             }));
                         }
                     }
@@ -919,6 +1068,30 @@ impl ProtocolReader for BedrockReader {
             extra.insert(
                 CACHE_POINTS_SENTINEL.to_string(),
                 serde_json::Value::Object(cache_points),
+            );
+        }
+
+        // Stash any captured `guardContent` markers (with their original positions) under the
+        // sentinel so `write_request` re-emits them at the same spots on a same-protocol passthrough.
+        // Only inserted when at least one was present, so a request that used no inline guardrails
+        // does not gain a stray key (preserving the byte-exact round-trip of a guard-free body).
+        if !system_guard_content.is_empty() || !message_guard_content.is_empty() {
+            let mut guard_content = serde_json::Map::new();
+            if !system_guard_content.is_empty() {
+                guard_content.insert(
+                    "system".to_string(),
+                    serde_json::Value::Array(system_guard_content),
+                );
+            }
+            if !message_guard_content.is_empty() {
+                guard_content.insert(
+                    "messages".to_string(),
+                    serde_json::Value::Array(message_guard_content),
+                );
+            }
+            extra.insert(
+                GUARD_CONTENT_SENTINEL.to_string(),
+                serde_json::Value::Object(guard_content),
             );
         }
 
@@ -1255,6 +1428,22 @@ impl ProtocolReader for BedrockReader {
                         name,
                         input,
                     });
+                } else if let Some(reasoning) = block_val.get("reasoningContent") {
+                    // A Converse response message can carry a `reasoningContent` (extended-thinking)
+                    // block — the model's reasoning output. Mirror the request-side reader: map it
+                    // onto IR `Thinking { text, signature }` via `read_bedrock_reasoning_block` (and
+                    // the redacted-signature sentinel for `redactedContent`). The old response loop
+                    // skipped it entirely, silently DROPPING the model's reasoning so a
+                    // bedrock->bedrock passthrough lost the thinking block (and a cross-protocol
+                    // egress could not surface it). A future union member yields `None` (undecoded).
+                    if let Some(block) = read_bedrock_reasoning_block(reasoning) {
+                        content.push(block);
+                    } else {
+                        tracing::warn!(
+                            "dropping Converse response reasoningContent block with no decodable \
+                             member (neither reasoningText nor redactedContent)"
+                        );
+                    }
                 } else if let Some(image) = block_val.get("image") {
                     // An assistant Converse response can carry an `image` content block (model
                     // image output / tool-rendered image). Mirror the request-side readers
@@ -1497,7 +1686,22 @@ impl ProtocolWriter for BedrockWriter {
             .and_then(|cp| cp.get("messages"))
             .and_then(|v| v.as_array());
 
-        if !req.system.is_empty() || system_cache_points.is_some() {
+        // The captured native `guardContent` markers (see `GUARD_CONTENT_SENTINEL`); same stash
+        // shape as the cachePoint markers and spliced back via the same shared helper. Consumed here
+        // and SKIPPED by the trailing extra-merge so the sentinel never reaches the wire.
+        let guard_content = req
+            .extra
+            .get(GUARD_CONTENT_SENTINEL)
+            .and_then(|v| v.as_object());
+        let system_guard_content = guard_content
+            .and_then(|gc| gc.get("system"))
+            .and_then(|v| v.as_array());
+        let message_guard_content = guard_content
+            .and_then(|gc| gc.get("messages"))
+            .and_then(|v| v.as_array());
+
+        if !req.system.is_empty() || system_cache_points.is_some() || system_guard_content.is_some()
+        {
             let mut text_arr: Vec<serde_json::Value> = req
                 .system
                 .iter()
@@ -1509,11 +1713,15 @@ impl ProtocolWriter for BedrockWriter {
                 })
                 .collect();
 
-            // Re-emit any captured `cachePoint` markers at their original positions so prompt
-            // caching survives a same-protocol round-trip instead of being silently dropped.
-            if let Some(entries) = system_cache_points {
-                splice_cache_points(&mut text_arr, entries);
-            }
+            // Re-emit any captured `cachePoint` / `guardContent` markers at their original
+            // positions so prompt caching and inline guardrails survive a same-protocol round-trip
+            // instead of being silently dropped. BOTH marker classes recorded indices against the
+            // SAME original array, so they must be spliced as ONE sorted batch (the helper sorts by
+            // index): splicing them in two passes would let the first pass's insertions shift the
+            // second pass's recorded indices off by one. `merge_marker_entries` concatenates the two
+            // `{ "i", "block" }` lists for a single ascending splice.
+            let merged = merge_marker_entries(system_cache_points, system_guard_content);
+            splice_cache_points(&mut text_arr, &merged);
 
             if !text_arr.is_empty() {
                 out.insert("system".to_string(), serde_json::Value::Array(text_arr));
@@ -1627,22 +1835,35 @@ impl ProtocolWriter for BedrockWriter {
                             content_arr.push(serde_json::json!({ "image": image_block }));
                         }
                     }
-                    crate::ir::IrBlock::Thinking { .. } => {}
+                    crate::ir::IrBlock::Thinking { text, signature } => {
+                        // Re-emit the assistant turn's reasoning as a native Converse
+                        // `reasoningContent` block (the inverse of `read_request`'s reasoningContent
+                        // decode). The old writer dropped every Thinking block here, so a
+                        // bedrock->bedrock passthrough lost the signed reasoning Bedrock requires
+                        // echoed back on a follow-up turn. The redacted-signature sentinel re-emits
+                        // `redactedContent`; any other Thinking re-emits `reasoningText`.
+                        content_arr.push(bedrock_reasoning_block(text, signature));
+                    }
                 }
             }
 
-            // Re-emit any captured `cachePoint` markers for THIS message at their original
-            // positions so prompt caching survives a same-protocol round-trip. Spliced BEFORE the
-            // empty-content placeholder below so a message whose only block was a `cachePoint`
-            // re-emits the marker rather than a bare `""` placeholder. `msg_idx` matches the
-            // reader's recorded message index on the Bedrock passthrough path (the Bedrock reader
-            // only emits User/Assistant turns, so no System-role `continue` desyncs the count).
-            if let Some(entries) = message_cache_points {
-                let for_this_msg: Vec<serde_json::Value> = entries
-                    .iter()
-                    .filter(|e| e.get("m").and_then(|v| v.as_u64()) == Some(msg_idx as u64))
-                    .cloned()
-                    .collect();
+            // Re-emit any captured `cachePoint` / `guardContent` markers for THIS message at their
+            // original positions so prompt caching and inline guardrails survive a same-protocol
+            // round-trip. Spliced BEFORE the empty-content placeholder below so a message whose only
+            // block was a `cachePoint`/`guardContent` re-emits the marker rather than a bare `""`
+            // placeholder. `msg_idx` matches the reader's recorded message index on the Bedrock
+            // passthrough path (the Bedrock reader only emits User/Assistant turns, so no System-role
+            // `continue` desyncs the count). BOTH classes are collected for this message and spliced
+            // as ONE sorted batch (see `merge_marker_entries`) so cachePoint insertions cannot shift
+            // guardContent's recorded indices.
+            let for_this_msg: Vec<serde_json::Value> = message_cache_points
+                .into_iter()
+                .chain(message_guard_content)
+                .flatten()
+                .filter(|e| e.get("m").and_then(|v| v.as_u64()) == Some(msg_idx as u64))
+                .cloned()
+                .collect();
+            if !for_this_msg.is_empty() {
                 splice_cache_points(&mut content_arr, &for_this_msg);
             }
 
@@ -1772,6 +1993,11 @@ impl ProtocolWriter for BedrockWriter {
             // it verbatim would leak the sentinel object onto the wire (an invalid body and a proxy
             // tell), so skip it here. Mirrors the inferenceConfig/toolConfig consume-don't-re-emit.
             if key == CACHE_POINTS_SENTINEL {
+                continue;
+            }
+            // The guardContent stash is likewise a busbar-internal sentinel, already consumed above
+            // (spliced back into `system`/`messages`). Skip it so it never leaks onto the wire.
+            if key == GUARD_CONTENT_SENTINEL {
                 continue;
             }
             out.insert(key.clone(), value.clone());
@@ -1957,7 +2183,15 @@ impl ProtocolWriter for BedrockWriter {
                     }
                 }
 
-                crate::ir::IrBlock::Thinking { .. } => {}
+                crate::ir::IrBlock::Thinking { text, signature } => {
+                    // Re-emit the model's reasoning as a native Converse `reasoningContent` block
+                    // (the inverse of `read_response`'s reasoningContent decode), instead of silently
+                    // dropping it. A same-protocol passthrough reproduces the thinking block, and a
+                    // cross-protocol egress that carried reasoning into the IR can surface it. The
+                    // redacted-signature sentinel re-emits `redactedContent`; any other Thinking
+                    // re-emits `reasoningText`.
+                    content_arr.push(bedrock_reasoning_block(text, signature));
+                }
 
                 // A `toolResult` is a USER-turn content block in Bedrock Converse; it has no place
                 // in an ASSISTANT response message, so it is the only genuine no-op here. Handled
@@ -3964,25 +4198,23 @@ mod tests {
 
     /// Regression (R24 LOW#8 — writer, non-stream `write_response`): a response whose blocks are ALL
     /// non-representable in an assistant Converse message (here a lone `ToolResult`, which belongs to
-    /// a user turn, plus a `Thinking` block) must NOT emit an empty `content: []` array — Bedrock
-    /// rejects that with a ValidationException. `write_request` already guards every turn; this
-    /// mirrors that guard with a minimal placeholder text block.
+    /// a user turn) must NOT emit an empty `content: []` array — Bedrock rejects that with a
+    /// ValidationException. `write_request` already guards every turn; this mirrors that guard with a
+    /// minimal placeholder text block.
+    ///
+    /// NOTE: a `Thinking` block is NO LONGER non-representable in a response (R25 MED #3 re-emits it
+    /// as a native `reasoningContent` block), so it cannot be part of an "all non-representable" case;
+    /// the lone `ToolResult` (genuinely a user-turn block) is the only remaining no-op here.
     #[test]
     fn test_write_response_empty_content_emits_placeholder() {
         let writer = BedrockWriter;
         let resp = crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
-            content: vec![
-                crate::ir::IrBlock::Thinking {
-                    text: String::new(),
-                    signature: None,
-                },
-                crate::ir::IrBlock::ToolResult {
-                    tool_use_id: "tu_1".to_string(),
-                    content: Vec::new(),
-                    is_error: false,
-                },
-            ],
+            content: vec![crate::ir::IrBlock::ToolResult {
+                tool_use_id: "tu_1".to_string(),
+                content: Vec::new(),
+                is_error: false,
+            }],
             stop_reason: Some("end_turn".to_string()),
             usage: IrUsage {
                 input_tokens: 1,
@@ -4336,11 +4568,15 @@ mod tests {
     }
 
     /// Regression (R19 #16): a user/assistant turn whose blocks are ALL non-representable on the
-    /// Bedrock wire (here a thinking-only assistant message, and a user message holding only a
-    /// URL-sentinel image) must NOT be silently dropped. Dropping it loses turn structure and can
-    /// break the strict user/assistant alternation Bedrock Converse enforces. The writer now mirrors
-    /// the Anthropic writer by emitting a minimal placeholder `{"text":""}` block so the turn (and
-    /// its role) survives.
+    /// Bedrock wire (here a user message holding only a URL-sentinel image) must NOT be silently
+    /// dropped. Dropping it loses turn structure and can break the strict user/assistant alternation
+    /// Bedrock Converse enforces. The writer mirrors the Anthropic writer by emitting a minimal
+    /// placeholder `{"text":""}` block so the turn (and its role) survives.
+    ///
+    /// NOTE: a Thinking block is NO LONGER non-representable on Bedrock (R25 MED #3 re-emits it as a
+    /// native `reasoningContent` block), so the thinking-only assistant turn here now carries that
+    /// reasoningContent block — NOT a placeholder. The remaining turn (a URL-sentinel image) is still
+    /// non-representable and exercises the placeholder path.
     #[test]
     fn test_write_request_all_nonrepresentable_turn_kept_with_placeholder() {
         let writer = BedrockWriter;
@@ -4355,7 +4591,7 @@ mod tests {
                         citations: Vec::new(),
                     }],
                 },
-                // Assistant turn carrying ONLY a thinking block (non-representable on Bedrock).
+                // Assistant turn carrying ONLY a thinking block (now re-emitted as reasoningContent).
                 crate::ir::IrMessage {
                     role: crate::ir::IrRole::Assistant,
                     content: vec![crate::ir::IrBlock::Thinking {
@@ -4404,11 +4640,15 @@ mod tests {
             Some("user")
         );
 
-        // The two emptied turns each carry a single placeholder text block.
+        // The assistant thinking-only turn now re-emits a native `reasoningContent` block (R25 MED
+        // #3) — NOT a placeholder — so the turn survives carrying its reasoning rather than an empty
+        // text stub.
         assert_eq!(
-            msgs[1].pointer("/content/0/text").and_then(|v| v.as_str()),
-            Some(""),
-            "thinking-only assistant turn must carry a placeholder text block"
+            msgs[1]
+                .pointer("/content/0/reasoningContent/reasoningText/text")
+                .and_then(|v| v.as_str()),
+            Some("internal reasoning"),
+            "thinking-only assistant turn must carry its reasoningContent block"
         );
         assert_eq!(
             msgs[1]
@@ -4417,6 +4657,8 @@ mod tests {
                 .map(|a| a.len()),
             Some(1)
         );
+        // The image-only (URL-sentinel) user turn IS still non-representable, so it keeps the
+        // placeholder text block.
         assert_eq!(
             msgs[2].pointer("/content/0/text").and_then(|v| v.as_str()),
             Some(""),
@@ -5671,6 +5913,237 @@ mod tests {
             "an s3Location response image must be carried into IR under the image_s3 sentinel; \
              got {:?}",
             ir_s3.content
+        );
+    }
+
+    /// Regression (R25 MED #3): a native Converse `reasoningContent` (extended-thinking) block in a
+    /// REQUEST message's `content[]` was SILENTLY DROPPED by `read_request` (no arm matched it), so a
+    /// same-protocol Bedrock->Bedrock passthrough lost the signed reasoning Bedrock requires echoed
+    /// back on a follow-up turn. It must now round-trip: reader carries it into IR `Thinking`, writer
+    /// re-emits `reasoningContent`. FAILS against the old code (the block vanishes) and passes after.
+    #[test]
+    fn test_request_reasoning_content_round_trips() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let body = serde_json::json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"reasoningContent": {"reasoningText": {"text": "let me think", "signature": "sig-abc"}}},
+                        {"text": "the answer is 42"}
+                    ]
+                }
+            ]
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        // Reader carried reasoningContent into an IR Thinking block with the signature preserved.
+        let thinking = ir.messages[0].content.iter().find_map(|b| match b {
+            crate::ir::IrBlock::Thinking { text, signature } => Some((text, signature)),
+            _ => None,
+        });
+        assert_eq!(
+            thinking,
+            Some((&"let me think".to_string(), &Some("sig-abc".to_string()))),
+            "reasoningContent must be carried into IR as a Thinking block; got {:?}",
+            ir.messages[0].content
+        );
+        let out = writer.write_request(&ir);
+        // Writer re-emits the reasoningContent block at the head of the content array.
+        assert_eq!(
+            out.pointer("/messages/0/content/0/reasoningContent/reasoningText/text")
+                .and_then(|v| v.as_str()),
+            Some("let me think"),
+            "reasoningContent text must survive the round-trip; got {out}"
+        );
+        assert_eq!(
+            out.pointer("/messages/0/content/0/reasoningContent/reasoningText/signature")
+                .and_then(|v| v.as_str()),
+            Some("sig-abc"),
+            "reasoningContent signature must survive the round-trip; got {out}"
+        );
+        assert_eq!(
+            out, body,
+            "a reasoningContent-bearing request must round-trip byte-identically; got {out}"
+        );
+    }
+
+    /// Regression (R25 MED #3): a `reasoningContent` block in a RESPONSE message's `content[]` was
+    /// silently dropped by `read_response`. It must now round-trip through read->write. Also covers
+    /// the `redactedContent` member (carried via the redacted-signature sentinel) so a redacted
+    /// reasoning block re-emits as `redactedContent`, not a plaintext `reasoningText`.
+    #[test]
+    fn test_response_reasoning_content_round_trips() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let body = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"reasoningContent": {"reasoningText": {"text": "reasoning", "signature": "rs-1"}}},
+                        {"text": "final"}
+                    ]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 3, "outputTokens": 4, "totalTokens": 7}
+        });
+        let ir = reader.read_response(&body).expect("read_response");
+        assert!(
+            ir.content.iter().any(|b| matches!(
+                b,
+                crate::ir::IrBlock::Thinking { text, signature }
+                    if text == "reasoning" && signature.as_deref() == Some("rs-1")
+            )),
+            "response reasoningContent must be carried into IR as a Thinking block; got {:?}",
+            ir.content
+        );
+        let out = writer.write_response(&ir);
+        assert_eq!(
+            out, body,
+            "a reasoningContent-bearing response must round-trip byte-identically; got {out}"
+        );
+
+        // redactedContent: carried via the sentinel signature, re-emitted as redactedContent.
+        let redacted_body = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"reasoningContent": {"redactedContent": "RVhBTVBMRQ=="}},
+                        {"text": "ok"}
+                    ]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}
+        });
+        let ir_r = reader.read_response(&redacted_body).expect("read redacted");
+        assert!(
+            ir_r.content.iter().any(|b| matches!(
+                b,
+                crate::ir::IrBlock::Thinking { text, signature }
+                    if text == "RVhBTVBMRQ=="
+                        && signature.as_deref() == Some(REASONING_REDACTED_SIG_SENTINEL)
+            )),
+            "redactedContent must be carried under the redacted-signature sentinel; got {:?}",
+            ir_r.content
+        );
+        let out_r = writer.write_response(&ir_r);
+        assert_eq!(
+            out_r.pointer("/output/message/content/0/reasoningContent/redactedContent")
+                .and_then(|v| v.as_str()),
+            Some("RVhBTVBMRQ=="),
+            "a redacted reasoning block must re-emit as redactedContent, not reasoningText; got {out_r}"
+        );
+        assert!(
+            out_r
+                .pointer("/output/message/content/0/reasoningContent/reasoningText")
+                .is_none(),
+            "a redacted reasoning block must NOT leak as a plaintext reasoningText; got {out_r}"
+        );
+    }
+
+    /// Regression (R25 MED #4): native Converse `guardContent` (inline Guardrails) blocks that appear
+    /// inside the `system` array and inside a message's `content` array were SILENTLY DROPPED by
+    /// `read_request` (no IR `IrBlock` counterpart), so a same-protocol Bedrock->Bedrock passthrough
+    /// re-emitted a body with the guardrail spans the caller marked stripped — disabling the inline
+    /// content-classification the operator relies on. They must now survive the read->write round-trip
+    /// at their ORIGINAL positions via the `GUARD_CONTENT_SENTINEL` stash. FAILS against the old code
+    /// (the guardContent blocks vanish) and passes after.
+    #[test]
+    fn test_guard_content_round_trips() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let body = serde_json::json!({
+            "system": [
+                {"text": "be safe"},
+                {"guardContent": {"text": {"text": "ground truth", "qualifiers": ["grounding_source"]}}}
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"guardContent": {"text": {"text": "user query", "qualifiers": ["query"]}}},
+                        {"text": "hello"}
+                    ]
+                }
+            ]
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        assert!(
+            ir.extra.contains_key(GUARD_CONTENT_SENTINEL),
+            "guardContent markers must be captured into extra; got {:?}",
+            ir.extra
+        );
+        let out = writer.write_request(&ir);
+        assert!(
+            out.get(GUARD_CONTENT_SENTINEL).is_none(),
+            "the guardContent sentinel must not appear on the wire; got {out}"
+        );
+        assert_eq!(
+            out, body,
+            "guardContent markers must survive the round-trip at their original positions; got {out}"
+        );
+    }
+
+    /// Regression (R25 MED #4): when BOTH `cachePoint` and `guardContent` markers occupy DISTINCT
+    /// positions in the SAME content array, they must be re-spliced together so neither shifts the
+    /// other off its recorded index. This guards the single-batch merge (`merge_marker_entries`)
+    /// against the naive two-pass splice that would mis-order them.
+    #[test]
+    fn test_guard_content_and_cache_point_interleave_preserved() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let body = serde_json::json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"guardContent": {"text": {"text": "q", "qualifiers": ["query"]}}},
+                        {"text": "a"},
+                        {"cachePoint": {"type": "default"}},
+                        {"text": "b"}
+                    ]
+                }
+            ]
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out, body,
+            "interleaved guardContent + cachePoint markers must round-trip at their original \
+             positions; got {out}"
+        );
+    }
+
+    /// A `reasoningContent` block carrying neither known member (a hypothetical future union member)
+    /// must degrade gracefully — `read_bedrock_reasoning_block` returns `None` and the block is left
+    /// undecoded rather than panicking or being mis-mapped to a Thinking with empty text.
+    #[test]
+    fn test_unknown_reasoning_member_does_not_panic() {
+        let reader = BedrockReader;
+        let body = serde_json::json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"reasoningContent": {"futureMember": {"foo": "bar"}}},
+                        {"text": "ok"}
+                    ]
+                }
+            ]
+        });
+        let ir = reader.read_request(&body).expect("read_request");
+        // No Thinking block synthesized from the unknown member.
+        assert!(
+            !ir.messages[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, crate::ir::IrBlock::Thinking { .. })),
+            "an unknown reasoningContent member must not be mis-mapped to a Thinking block; got {:?}",
+            ir.messages[0].content
         );
     }
 }

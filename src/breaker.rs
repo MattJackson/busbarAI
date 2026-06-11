@@ -117,9 +117,15 @@ pub(crate) fn normalize_raw_error(
             }
         }
         // built-in recognition of the canonical context-length code (the operator
-        // error_map above overrides; this is the default when unmapped). The lane is healthy —
-        // ContextLength → fail over without penalty.
-        if code == "context_length_exceeded" {
+        // error_map above overrides — it is checked first and returns early; this is the default
+        // when unmapped). The lane is healthy — ContextLength → fail over without penalty.
+        //
+        // Gate on a non-5xx status: a 5xx is an upstream server failure, never a context-length
+        // error, so a 5xx body that happens to carry a `context_length_exceeded`-ish code must NOT
+        // be reclassified as ContextLength (that would mask a transient outage and skip the breaker
+        // penalty). Let such cases fall through to the HTTP-status classification below, where the
+        // operator error_map can still countermand via the structured-type signal (Step 1b).
+        if code == "context_length_exceeded" && !(500..600).contains(&raw.http_status) {
             return CanonicalSignal {
                 class: StatusClass::ContextLength,
                 provider_signal: Some(code.clone()),
@@ -224,6 +230,54 @@ mod tests {
         let map = err_map(&[("1302", "rate_limit"), ("server_error", "server_error")]);
         let sig = normalize_raw_error(&raw, &map);
         assert_eq!(sig.class, StatusClass::RateLimit);
+    }
+
+    #[test]
+    fn test_builtin_context_length_on_real_400_classifies_context_length() {
+        // A genuine 400 carrying the canonical context-length code is ContextLength: the lane is
+        // healthy, fail over without penalizing the breaker.
+        let raw = RawUpstreamError {
+            http_status: 400,
+            provider_code: Some("context_length_exceeded".to_string()),
+            structured_type: None,
+            retry_after_secs: None,
+        };
+        let sig = normalize_raw_error(&raw, &HashMap::new());
+        assert_eq!(sig.class, StatusClass::ContextLength);
+        assert_eq!(
+            sig.provider_signal.as_deref(),
+            Some("context_length_exceeded")
+        );
+    }
+
+    #[test]
+    fn test_builtin_context_length_not_recognized_on_5xx() {
+        // A 5xx is a real upstream server failure, never a context-length error. Even if the body
+        // happens to carry a `context_length_exceeded` code, it must classify as ServerError (→
+        // TransientUpstream) so the breaker is penalized — NOT ContextLength.
+        let raw = RawUpstreamError {
+            http_status: 503,
+            provider_code: Some("context_length_exceeded".to_string()),
+            structured_type: None,
+            retry_after_secs: None,
+        };
+        let sig = normalize_raw_error(&raw, &HashMap::new());
+        assert_eq!(sig.class, StatusClass::ServerError);
+    }
+
+    #[test]
+    fn test_operator_error_map_overrides_builtin_context_length() {
+        // The operator error_map is checked first and returns early, so it countermands the
+        // built-in context-length recognition even for the canonical code on a 400.
+        let raw = RawUpstreamError {
+            http_status: 400,
+            provider_code: Some("context_length_exceeded".to_string()),
+            structured_type: None,
+            retry_after_secs: None,
+        };
+        let map = err_map(&[("context_length_exceeded", "client_error")]);
+        let sig = normalize_raw_error(&raw, &map);
+        assert_eq!(sig.class, StatusClass::ClientError);
     }
 
     #[test]

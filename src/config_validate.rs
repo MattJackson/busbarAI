@@ -394,6 +394,19 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                         "pool '{}' on_exhausted references unknown fallback pool '{}'",
                         pool_name, target
                     ));
+                } else if target == *pool_name {
+                    // Self-referential fallback (pool A -> fallback A): the runtime loop guard
+                    // (forward.rs `RequestCtx::visited_pools`) silently terminates the chain on the
+                    // re-entry, so the configured degraded-routing policy never actually engages — A
+                    // exhausts, "falls back" to itself, is recognised as already-visited, and 503s.
+                    // A fallback pointing at its own owner is never meaningful; reject it at boot
+                    // rather than ship a self-cancelling policy with no diagnostic. (This is the
+                    // length-1 case the general cycle walk below would also catch, called out
+                    // explicitly for a precise diagnostic.)
+                    errors.push(format!(
+                        "pool '{}' on_exhausted references itself as its fallback pool ('{}'); a self-referential fallback never engages — the runtime loop guard terminates it on re-entry — so it 503s exactly as having no fallback would. Point it at a different pool or remove on_exhausted",
+                        pool_name, target
+                    ));
                 }
             }
         }
@@ -410,6 +423,58 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     pool_name, affinity.mode
                 ));
             }
+        }
+    }
+
+    // Rule 7b: Multi-hop fallback cycle (A -> B -> A, or any longer ring). The per-pool self-ref
+    // check above (Rule 7) only catches the length-1 case; a chain that exits the originating pool
+    // and loops back through one or more intermediaries is just as defeated at runtime — forward.rs's
+    // `RequestCtx::visited_pools` guard terminates the walk the moment it re-enters an already-visited
+    // pool, so the configured degraded-routing policy still collapses into a 503 with no boot
+    // diagnostic. Detect it at startup by following each pool's resolved fallback edge until the chain
+    // either ends (no on_exhausted / non-fallback action), hits a dangling target (already reported
+    // by Rule 7), or revisits a pool. To report each distinct cycle EXACTLY ONCE (a 2-ring would
+    // otherwise be reported from both members), emit only when the originating `pool_name` is the
+    // lexicographically smallest member of the cycle it sits on.
+    for pool_name in cfg.pools.keys() {
+        // Walk the fallback chain from this pool, recording the ordered path. Stop at the first
+        // repeat (the visited check is the terminator; the chain can be at most `pools.len()` long
+        // before it must repeat). Names are owned because the resolved target lives inside the parsed
+        // `OnExhausted::FallbackPool(String)`, which does not outlive the parse call.
+        let mut path: Vec<String> = Vec::new();
+        let mut cursor: String = pool_name.clone();
+        loop {
+            if path.contains(&cursor) {
+                // `cursor` closes a cycle. Identify the cycle's members (from the first occurrence
+                // of `cursor` in `path` to the end) and report only if this originating pool is the
+                // smallest-named member, so each ring is reported once.
+                let start = path.iter().position(|p| *p == cursor).unwrap_or(0);
+                let ring = &path[start..];
+                let min_member = ring
+                    .iter()
+                    .min()
+                    .map(String::as_str)
+                    .unwrap_or(cursor.as_str());
+                if pool_name.as_str() == min_member && ring.len() > 1 {
+                    let mut display: Vec<&str> = ring.iter().map(String::as_str).collect();
+                    display.push(cursor.as_str()); // close the ring visually (A -> B -> A)
+                    errors.push(format!(
+                        "fallback_pool cycle detected: {}; on_exhausted fallback chains must not loop — the runtime loop guard terminates a cycle on re-entry, so every pool in the ring 503s instead of degrading. Break the cycle (point one pool at a non-looping pool or remove its on_exhausted)",
+                        display.join(" -> ")
+                    ));
+                }
+                break;
+            }
+            // Resolve this pool's fallback edge, if any, before pushing so we can stop cleanly.
+            let Some(next) = resolve_fallback_target(cfg, &cursor) else {
+                break; // chain ends here (no fallback or non-fallback action)
+            };
+            path.push(cursor);
+            // A dangling target was already reported by Rule 7; do not chase it (it is not a pool).
+            if !cfg.pools.contains_key(&next) {
+                break;
+            }
+            cursor = next;
         }
     }
 
@@ -565,6 +630,19 @@ pub(crate) fn validate_governance(
 /// an `admin/` first segment, so reject that family too.
 fn reserved_admin_name(name: &str) -> bool {
     name == "admin" || name.starts_with("admin/") || name.split('/').next() == Some("admin")
+}
+
+/// Resolve the single `on_exhausted: fallback_pool:<name>` edge out of `pool_name`, if it has one.
+/// Returns `Some(target)` only for a well-formed FallbackPool action; `None` for a pool with no
+/// `on_exhausted`, a non-fallback action (reject/least_bad), or an unparseable action (already
+/// rejected elsewhere at parse time). The returned name is owned because it lives inside the parsed
+/// `OnExhausted` value, which does not outlive this call. Used by the Rule 7b fallback-cycle walk.
+fn resolve_fallback_target(cfg: &RootCfg, pool_name: &str) -> Option<String> {
+    let on_exhausted = cfg.pools.get(pool_name)?.on_exhausted.as_ref()?;
+    match crate::config::OnExhausted::parse(&on_exhausted.action) {
+        Ok(crate::config::OnExhausted::FallbackPool(target)) => Some(target),
+        Ok(_) | Err(_) => None,
+    }
 }
 
 /// True when an `AuthCfg` would resolve to an empty client-token allowlist after `normalize()`.
@@ -2508,6 +2586,148 @@ mod tests {
         assert!(
             validate(&cfg).is_ok(),
             "on_exhausted referencing an existing pool must validate"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_self_referential_fallback_pool() {
+        // A pool whose on_exhausted fallback points at ITSELF (A -> A) never engages at runtime
+        // (the loop guard terminates on re-entry) — reject it at boot.
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut pool = make_pool(vec![make_member("mymodel")]);
+        pool.on_exhausted = Some(config::OnExhaustedCfg {
+            action: "fallback_pool:mypool".to_string(), // points at its own name
+        });
+        pools.insert("mypool".to_string(), pool);
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs =
+            validate(&cfg).expect_err("a self-referential fallback pool must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("references itself as its fallback pool")
+                    && e.contains("mypool")),
+            "expected a self-referential fallback-pool error; got: {errs:?}"
+        );
+        // It must NOT be misreported as a dangling/unknown fallback pool (the pool exists).
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.contains("references unknown fallback pool")),
+            "a self-reference must not be reported as an unknown fallback pool; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_two_pool_fallback_cycle() {
+        // A <-> B: pool A falls back to B and B falls back to A. The runtime loop guard collapses
+        // the ring into a 503, so startup must reject it. The cycle must be reported EXACTLY ONCE
+        // (not once per ring member).
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut a = make_pool(vec![make_member("mymodel")]);
+        a.on_exhausted = Some(config::OnExhaustedCfg {
+            action: "fallback_pool:pool_b".to_string(),
+        });
+        let mut b = make_pool(vec![make_member("mymodel")]);
+        b.on_exhausted = Some(config::OnExhaustedCfg {
+            action: "fallback_pool:pool_a".to_string(),
+        });
+        pools.insert("pool_a".to_string(), a);
+        pools.insert("pool_b".to_string(), b);
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg).expect_err("an A<->B fallback cycle must fail validation");
+        let cycle_errs: Vec<&String> = errs
+            .iter()
+            .filter(|e| e.contains("fallback_pool cycle detected"))
+            .collect();
+        assert_eq!(
+            cycle_errs.len(),
+            1,
+            "an A<->B cycle must be reported exactly once; got: {errs:?}"
+        );
+        assert!(
+            cycle_errs[0].contains("pool_a") && cycle_errs[0].contains("pool_b"),
+            "the cycle diagnostic must name both ring members; got: {}",
+            cycle_errs[0]
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_three_pool_fallback_cycle() {
+        // A -> B -> C -> A: a longer ring must also be rejected, and reported exactly once.
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        for (name, next) in [("p1", "p2"), ("p2", "p3"), ("p3", "p1")] {
+            let mut p = make_pool(vec![make_member("mymodel")]);
+            p.on_exhausted = Some(config::OnExhaustedCfg {
+                action: format!("fallback_pool:{next}"),
+            });
+            pools.insert(name.to_string(), p);
+        }
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg).expect_err("a 3-pool fallback cycle must fail validation");
+        let cycle_errs: Vec<&String> = errs
+            .iter()
+            .filter(|e| e.contains("fallback_pool cycle detected"))
+            .collect();
+        assert_eq!(
+            cycle_errs.len(),
+            1,
+            "a 3-pool cycle must be reported exactly once; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_acyclic_fallback_chain() {
+        // A -> B -> C (no loop back) is a legitimate degraded-routing chain and must NOT be flagged
+        // as a cycle (guard against an over-broad cycle detector). C has no fallback.
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut a = make_pool(vec![make_member("mymodel")]);
+        a.on_exhausted = Some(config::OnExhaustedCfg {
+            action: "fallback_pool:chain_b".to_string(),
+        });
+        let mut b = make_pool(vec![make_member("mymodel")]);
+        b.on_exhausted = Some(config::OnExhaustedCfg {
+            action: "fallback_pool:chain_c".to_string(),
+        });
+        let c = make_pool(vec![make_member("mymodel")]);
+        pools.insert("chain_a".to_string(), a);
+        pools.insert("chain_b".to_string(), b);
+        pools.insert("chain_c".to_string(), c);
+        let cfg = make_root_cfg(providers, models, pools);
+        assert!(
+            validate(&cfg).is_ok(),
+            "an acyclic A->B->C fallback chain must validate; got: {:?}",
+            validate(&cfg)
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_diamond_fallback_no_cycle() {
+        // A->C and B->C (two pools share a downstream fallback) is NOT a cycle: C is visited from
+        // two distinct walks but neither walk loops. Guards the min-member dedup logic against a
+        // false positive on a converging (non-looping) graph.
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut a = make_pool(vec![make_member("mymodel")]);
+        a.on_exhausted = Some(config::OnExhaustedCfg {
+            action: "fallback_pool:dia_c".to_string(),
+        });
+        let mut b = make_pool(vec![make_member("mymodel")]);
+        b.on_exhausted = Some(config::OnExhaustedCfg {
+            action: "fallback_pool:dia_c".to_string(),
+        });
+        let c = make_pool(vec![make_member("mymodel")]);
+        pools.insert("dia_a".to_string(), a);
+        pools.insert("dia_b".to_string(), b);
+        pools.insert("dia_c".to_string(), c);
+        let cfg = make_root_cfg(providers, models, pools);
+        assert!(
+            validate(&cfg).is_ok(),
+            "a converging (diamond) fallback graph must validate; got: {:?}",
+            validate(&cfg)
         );
     }
 
