@@ -916,7 +916,7 @@ impl InMemoryStore {
         c.probe_in_flight().store(false, Ordering::Release);
     }
 
-    /// Transition the cell to Closed (full recovery): reset streak/err/window, clear the cooldown
+    /// Transition the cell to Closed (full recovery): reset streak/window, clear the cooldown
     /// and release the single-flight probe. Acquires the per-cell transition lock so the Closed state
     /// and cleared cooldown move as a consistent pair against any racing transition (see
     /// `cell_closed_locked`).
@@ -978,7 +978,12 @@ impl InMemoryStore {
     /// caller's job (it must hold the per-pool shard lock).
     fn cell_closed_locked(c: &dyn BreakerCellAccess) {
         c.streak().store(0, Ordering::Release);
-        c.err().store(0, Ordering::Release);
+        // Do NOT zero `c.err()` here. For the default cell `c.err()` IS the PUBLIC `/stats`
+        // lifetime `LaneState.err` counter, which must stay monotonic (like `LaneState.ok`).
+        // The breaker FSM never reads `err()` — `should_trip` keys off `outcome_window` + `streak`
+        // — so this zeroing was dead for recovery health yet corrupted the stats counter, making
+        // `LaneState.err` non-monotonic on every default-cell recovery (LOW #12). Recovery health
+        // is fully reset by the `streak`/`outcome_window`/`cooldown`/`state` stores below.
         lock_recover(c.outcome_window()).clear();
         c.cooldown_until().store(0, Ordering::Release);
         c.breaker_state().store(ST_CLOSED, Ordering::Release);
@@ -3493,6 +3498,52 @@ mod tests {
             store.snapshot(0, 1000).err,
             3,
             "default-cell failures must count err exactly once each (was 2x before the fix)"
+        );
+    }
+
+    /// LOW #12 (store.rs:cell_closed_locked): a default-cell recovery must NOT zero the lane-global
+    /// `err` counter the `/stats` snapshot reports. `c.err()` for the default cell IS `LaneState.err`,
+    /// a PUBLIC lifetime counter that must stay monotonic (like `LaneState.ok`). The breaker FSM never
+    /// reads `err()` (`should_trip` keys off `outcome_window` + `streak`), so the old
+    /// `c.err().store(0)` in `cell_closed_locked` was dead for the FSM yet reset the stats counter on
+    /// every recovery, making `LaneState.err` non-monotonic. Trip the default cell with N failures (so
+    /// `err == N`), recover the lane, and assert `err` is STILL N — the recovery clears health
+    /// (streak/window/cooldown/state) but leaves the observability counter intact.
+    #[test]
+    fn test_default_cell_recovery_does_not_zero_lane_err() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        set_now_for_test(1000);
+        let cfg = BreakerCfg::default();
+
+        // Trip the default cell (bare pool=="" path) with enough failures to open the breaker. Each
+        // failure bumps the lane-global err counter.
+        let failures = 50u64;
+        for _ in 0..failures {
+            store.record_transient(0, "5xx", &cfg, None);
+        }
+        assert_eq!(
+            store.snapshot(0, 1000).err,
+            failures,
+            "each default-cell failure bumps the lane-global err counter"
+        );
+
+        // Advance past the cooldown so the lane is recovery-eligible, then recover it. recover_lane
+        // closes the default cell via cell_closed_if_recoverable → cell_closed_locked — the exact path
+        // that previously zeroed err.
+        let cooled = 1000 + store.cooldown_remaining(0, 1000) + 1;
+        set_now_for_test(cooled);
+        store.recover_lane(0);
+
+        // The breaker FSM health is reset (the lane is usable again)…
+        assert!(
+            !store.lane_needs_probe(0, cooled),
+            "recover_lane must clear the tripped default cell"
+        );
+        // …but the PUBLIC lifetime err counter must remain monotonic — NOT zeroed by recovery (LOW #12).
+        assert_eq!(
+            store.snapshot(0, cooled).err,
+            failures,
+            "default-cell recovery must NOT zero the lane-global err counter (must stay monotonic)"
         );
     }
 

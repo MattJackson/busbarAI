@@ -53,7 +53,20 @@ use crate::state::App;
 /// method lives in `governance.rs`, outside this unit's owned files. This gate is the admin-side guard
 /// that closes the resurrection race with the surface we own. Both ops are admin-only and rare, so a
 /// single global lock has no meaningful cost.
-static EXISTENCE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+///
+/// CANCELLATION SAFETY (R26): this is a `std::sync::Mutex`, NOT a `tokio::sync::Mutex`, and the guard
+/// is acquired INSIDE each operation's `spawn_blocking` closure — bound to the SYNCHRONOUS store
+/// mutation, not to the async handler future. An earlier design held an async guard across the
+/// cancellable outer `.await`; if the client dropped the request, the guard was dropped while the
+/// already-scheduled (and thus uncancellable) `spawn_blocking` closure kept running its lookup→write,
+/// re-opening the very resurrection / double-revoke races this gate closes. Acquiring the lock inside
+/// the blocking closure means the gate is held for the entire lookup→write regardless of any
+/// outer-future drop: `spawn_blocking`, once scheduled, runs to completion. A `std::sync::Mutex` is
+/// used precisely because the lock is taken on a blocking thread with no async runtime in scope.
+/// A poisoned lock (a panic in another holder while the gate was held) is recovered with
+/// `into_inner()` — the guarded data is `()`, so there is no inconsistent state to fear, and refusing
+/// to serialize would be worse than proceeding.
+static EXISTENCE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Deserialize)]
 pub(crate) struct CreateKeyReq {
@@ -312,10 +325,18 @@ pub(crate) async fn update_key(
     // would re-create the just-revoked key. Hold the same existence gate `delete_key` uses across this
     // whole lookup→put section so PATCH and DELETE cannot interleave: the PATCH either completes
     // before the DELETE (row removed afterward) or sees `None` after it (404, no re-put). See
-    // `EXISTENCE_GATE`. The guard is released when this scope ends.
-    let _existence_guard = EXISTENCE_GATE.lock().await;
-    let res =
-        tokio::task::spawn_blocking(move || gov.update_key(&id, enabled, rpm, tpm, budget)).await;
+    // `EXISTENCE_GATE`.
+    //
+    // CANCELLATION SAFETY (R26): the gate is locked INSIDE the `spawn_blocking` closure so its
+    // lifetime is bound to the synchronous `gov.update_key` mutation, not to this cancellable async
+    // handler. If the client drops the request, the already-scheduled closure still runs to completion
+    // holding the gate — so a dropped outer future can never release the gate while the lookup→write
+    // is still in flight (which would re-open the resurrection / double-revoke races).
+    let res = tokio::task::spawn_blocking(move || {
+        let _existence_guard = EXISTENCE_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        gov.update_key(&id, enabled, rpm, tpm, budget)
+    })
+    .await;
     match res {
         Ok(Ok(Some(key))) => json_response(StatusCode::OK, key_meta(&key)),
         Ok(Ok(None)) => json_response(StatusCode::NOT_FOUND, json!({"error": "key not found"})),
@@ -384,14 +405,21 @@ pub(crate) async fn delete_key(State(app): State<Arc<App>>, Path(id): Path<Strin
     // gate also serializes `update_key`'s lookup→put, so a PATCH cannot resurrect a key this DELETE
     // removes (see `EXISTENCE_GATE`). The loser of a delete race observes `Ok(None)` and correctly
     // returns 404. Deletes are admin-only and rare, so a single global lock has no meaningful cost.
-    let _existence_guard = EXISTENCE_GATE.lock().await;
+    //
+    // CANCELLATION SAFETY (R26): the gate is locked INSIDE the `spawn_blocking` closure, so the whole
+    // lookup→delete runs under the lock on the blocking thread. `spawn_blocking` is uncancellable once
+    // scheduled, so even if the client drops this request the critical section completes while still
+    // holding the gate — the gate can never be released mid-sequence by an outer-future drop.
     let now = crate::store::now();
     let gov = gov.clone();
     let id_for_task = id.clone();
-    let res = tokio::task::spawn_blocking(move || match gov.usage_for(&id_for_task, now) {
-        Ok(None) => Ok(None),
-        Ok(Some(_)) => gov.delete_key(&id_for_task).map(Some),
-        Err(e) => Err(e),
+    let res = tokio::task::spawn_blocking(move || {
+        let _existence_guard = EXISTENCE_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        match gov.usage_for(&id_for_task, now) {
+            Ok(None) => Ok(None),
+            Ok(Some(_)) => gov.delete_key(&id_for_task).map(Some),
+            Err(e) => Err(e),
+        }
     })
     .await;
     match res {
@@ -1448,6 +1476,132 @@ mod tests {
             listed["keys"].as_array().unwrap().len(),
             0,
             "a PATCH must never resurrect a key a concurrent DELETE revoked: {listed}"
+        );
+        handle.abort();
+    }
+
+    #[test]
+    fn test_existence_gate_is_std_sync_mutex_lockable_without_runtime() {
+        // Regression (MEDIUM #6, R26 — CONTINUES the R25 existence-race fix): the gate MUST be a
+        // `std::sync::Mutex<()>`, not a `tokio::sync::Mutex<()>`. The fix binds the gate's lifetime to
+        // the SYNCHRONOUS store mutation by locking it INSIDE the `spawn_blocking` closure (which has no
+        // async runtime in scope); a `tokio::sync::Mutex` cannot be locked there — its `.lock()` returns
+        // a future. This test locks the gate from a PLAIN (non-async) thread with no Tokio runtime
+        // present: that only compiles/runs for a `std::sync::Mutex`. Against the old `tokio::sync::Mutex`
+        // this call would not typecheck as a blocking lock (and `into_inner` on poison is std-only), so
+        // the gate-type regression is pinned. We assert the guarded unit value round-trips.
+        let guard = super::EXISTENCE_GATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The guarded data is the unit type; dereferencing proves we hold a std MutexGuard<()>.
+        let () = *guard;
+        drop(guard);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_cancelled_patch_keeps_gate_held_for_full_store_mutation() {
+        // Regression (MEDIUM #6, R26 — request-cancellation voids the existence gate): the R25 fix held
+        // the gate across the cancellable outer `.await`. If the client dropped the request, the async
+        // guard dropped — but the already-scheduled (uncancellable) `spawn_blocking` closure kept
+        // running its lookup→write with the gate NO LONGER held, re-opening the resurrection /
+        // double-revoke races. The R26 fix locks the gate INSIDE the blocking closure, so the gate is
+        // held for the entire lookup→write regardless of any outer-future drop.
+        //
+        // We force the exact condition with `BarrierStore`: a PATCH parks inside `put_key` (between its
+        // existence check and its write). We then DROP (cancel) the PATCH's driving future while it is
+        // parked, and fire a DELETE. The DELETE must NOT be able to complete while the PATCH's blocking
+        // mutation is still in flight:
+        //   - Old code (async guard owned by the dropped PATCH future): cancelling releases the gate, so
+        //     the DELETE acquires it and COMPLETES within the window -> this test's "DELETE still
+        //     pending" assertion FAILS.
+        //   - Fixed code (gate locked inside the still-running blocking closure): the DELETE blocks on
+        //     the gate until the PATCH's `put_key` finishes -> the DELETE is STILL PENDING in the
+        //     window -> this test PASSES. Releasing the barrier then lets both drain.
+        crate::metrics::init();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store = Arc::new(BarrierStore {
+            inner: SqliteStore::open_in_memory().unwrap(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let gov =
+            Arc::new(GovState::new(store.clone(), 0, 0, Some("admintok".to_string())).unwrap());
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                0,
+            )
+            .unwrap();
+        let (addr, handle) = serve_with_gov(gov).await;
+        let key_url = format!("http://{addr}/admin/keys/{}", key.id);
+
+        // Arm the barrier so the PATCH's put_key (the next put) pauses mid-update.
+        store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // PATCH in the background — it will read the key, acquire the gate inside the blocking closure,
+        // then block inside put_key. We keep the JoinHandle so we can ABORT (cancel) it.
+        let patch_url = key_url.clone();
+        let patch_task = tokio::spawn(async move {
+            let _ = reqwest::Client::new()
+                .patch(&patch_url)
+                .header("x-admin-token", "admintok")
+                .json(&serde_json::json!({"enabled": false}))
+                .send()
+                .await;
+        });
+
+        // Wait until the PATCH is parked inside put_key (gate held by the blocking closure).
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .unwrap()
+            .expect("PATCH must reach the instrumented put_key");
+
+        // CANCEL the PATCH: abort its driving future. The Tokio JoinHandle abort drops the async task;
+        // in the old design this dropped the async existence guard. The blocking closure keeps running.
+        patch_task.abort();
+        let _ = patch_task.await; // joins the cancellation
+
+        // Fire a DELETE. Old code: gate is free -> DELETE completes quickly. Fixed code: gate is still
+        // held by the parked blocking closure -> DELETE blocks.
+        let delete_url = key_url.clone();
+        let delete_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .delete(&delete_url)
+                .header("x-admin-token", "admintok")
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+
+        // Give the DELETE time to either complete (old) or wedge on the gate (fixed).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !delete_task.is_finished(),
+            "a cancelled PATCH must keep the EXISTENCE_GATE held for its full blocking mutation; the \
+             DELETE must remain blocked on the gate (old async-guard code releases it on cancel)"
+        );
+
+        // Release the parked PATCH put_key so the gate frees and the DELETE can finish — proves no
+        // deadlock and lets the task drain cleanly.
+        release_tx.send(()).unwrap();
+        let del_status = delete_task.await.unwrap();
+        // The PATCH's put_key resurrected/updated the row (it ran to completion despite cancellation),
+        // so the DELETE that follows under the gate observes it and revokes it: 200. (The point of this
+        // test is the BLOCKING, not the final status — but it must be a coherent 200, not a 404.)
+        assert_eq!(
+            del_status, 200,
+            "the DELETE runs after the gate frees and revokes the (now-present) key"
         );
         handle.abort();
     }

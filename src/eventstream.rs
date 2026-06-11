@@ -144,7 +144,18 @@ fn event_type_for_frame(headers: &[u8]) -> String {
             // exception name before lowercasing — mirroring `extract_error`'s
             // `rsplit(['#', '/'])` in proto/bedrock.rs — so the normalized token matches the
             // `read_response_events` exception arms rather than being a no-op long namespaced string.
-            let bare = exc.rsplit(['#', '/']).next().unwrap_or(&exc);
+            //
+            // Use the last NON-EMPTY token, not `.next()`: a value that ENDS with a delimiter
+            // (e.g. `ThrottlingException#` or `aws.bedrock/`) makes `rsplit` yield an empty leading
+            // token, which `.next()` would return verbatim — dropping the classification to `""`
+            // and re-sinking the mid-stream error into the no-op arm. `.find(|s| !s.is_empty())`
+            // skips that trailing-delimiter empty and recovers the bare name. The `unwrap_or(&exc)`
+            // guards the all-delimiter case (e.g. `"#"`/`"/"`), where every token is empty: fall
+            // back to the raw value rather than panicking or yielding `""`.
+            let bare = exc
+                .rsplit(['#', '/'])
+                .find(|s| !s.is_empty())
+                .unwrap_or(&exc);
             return lowercase_first(bare);
         }
     }
@@ -635,6 +646,51 @@ mod tests {
             "ModelStreamErrorException",
         ));
         assert_eq!(event_type_for_frame(&h3), "modelStreamErrorException");
+    }
+
+    /// REGRESSION (LOW #14, eventstream.rs `event_type_for_frame`): an `:exception-type` value
+    /// that ENDS with a Smithy/ARN delimiter (`ThrottlingException#`, `aws.bedrock/`) made
+    /// `rsplit(['#', '/']).next()` return the empty LEADING token, dropping the classification to
+    /// `""` — re-sinking the mid-stream error into the no-op arm the namespace fix was meant to
+    /// prevent. Taking the last NON-EMPTY token (`.find(|s| !s.is_empty())`) strips the trailing
+    /// delimiter and recovers the bare name. The normal namespaced case is unaffected.
+    #[test]
+    fn test_event_type_exception_trailing_delimiter_recovers_name() {
+        // Trailing `#` — the empty leading token must be skipped, not returned.
+        let mut h = string_header(":message-type", "exception");
+        h.extend_from_slice(&string_header(":exception-type", "ThrottlingException#"));
+        assert_eq!(
+            event_type_for_frame(&h),
+            "throttlingException",
+            "a trailing `#` must not drop the exception classification to empty"
+        );
+
+        // Trailing `/` — same recovery.
+        let mut h2 = string_header(":message-type", "exception");
+        h2.extend_from_slice(&string_header(":exception-type", "ThrottlingException/"));
+        assert_eq!(
+            event_type_for_frame(&h2),
+            "throttlingException",
+            "a trailing `/` must not drop the exception classification to empty"
+        );
+
+        // The normal namespaced value still resolves to the same bare token (no regression).
+        let mut h3 = string_header(":message-type", "exception");
+        h3.extend_from_slice(&string_header(
+            ":exception-type",
+            "com.amazon.coral.service#ThrottlingException",
+        ));
+        assert_eq!(event_type_for_frame(&h3), "throttlingException");
+
+        // All-delimiter pathological value: every token is empty → `unwrap_or(&exc)` falls back to
+        // the raw value (lowercased first char), never panics and never yields `""`.
+        let mut h4 = string_header(":message-type", "exception");
+        h4.extend_from_slice(&string_header(":exception-type", "#"));
+        assert_eq!(
+            event_type_for_frame(&h4),
+            "#",
+            "an all-delimiter value falls back to the raw value, not empty/panic"
+        );
     }
 
     /// REGRESSION (MEDIUM/test-coverage, eventstream.rs:104-109): an exception-typed frame

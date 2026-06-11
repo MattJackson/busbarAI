@@ -767,12 +767,26 @@ impl ProtocolReader for GeminiReader {
             // 3. finishReason → close blocks + MessageDelta + MessageStop
             if let Some(finish_reason_val) = candidate.get("finishReason").and_then(|r| r.as_str())
             {
-                let stop_reason = match finish_reason_val {
+                let mut stop_reason = match finish_reason_val {
                     "STOP" => "end_turn".to_string(),
                     "MAX_TOKENS" => "max_tokens".to_string(),
                     "SAFETY" => "safety".to_string(),
                     other => other.to_lowercase(),
                 };
+
+                // Gemini's `FinishReason` enum has NO TOOL_USE member: a tool-call turn ends with
+                // STOP, mapped to `end_turn` above. But this turn emitted `functionCall` parts (tracked
+                // in `state.open_tools`, still populated here — it is drained just below), and every
+                // other protocol reader emits the canonical `tool_use` stop reason for a tool-call
+                // turn. Promote `end_turn` → `tool_use` so the streamed terminal reason matches the
+                // tool blocks; cross-protocol egress (Anthropic relays `tool_use`; OpenAI maps it to
+                // `"tool_calls"`) then carries the right value. The Gemini writer maps
+                // `Some("tool_use")` back to STOP, keeping same-protocol streaming lossless. Only a
+                // bare `end_turn` is promoted; a tool-call truncated/blocked mid-flight keeps its
+                // stronger `max_tokens`/`safety` reason.
+                if stop_reason == "end_turn" && !state.open_tools.is_empty() {
+                    stop_reason = "tool_use".to_string();
+                }
 
                 // Close text block first if open, at the index it actually claimed (not a hardcoded
                 // 0 — a tool may have taken 0 ahead of it).
@@ -929,6 +943,27 @@ impl ProtocolReader for GeminiReader {
                     other => other.to_lowercase(),
                 });
 
+        // Gemini's `FinishReason` enum has NO TOOL_USE member: a tool-call turn ends with STOP, which
+        // maps to `end_turn` above. But the IR carries `ToolUse` blocks in `content`, and every other
+        // protocol reader emits the canonical `tool_use` stop reason for a tool-call turn. Promote
+        // `end_turn` → `tool_use` whenever a `ToolUse` block is present so the canonical IR is correct
+        // and cross-protocol egress (Anthropic relays `tool_use`; OpenAI maps it to `"tool_calls"`)
+        // matches the content. The Gemini writer maps `Some("tool_use")` back to STOP, so the
+        // same-protocol Gemini→Gemini round-trip stays lossless. Only a bare `end_turn` is promoted;
+        // `max_tokens`/`safety`/etc. (a tool-call truncated/blocked mid-flight) keep their stronger
+        // terminal reason.
+        let stop_reason = match stop_reason {
+            Some(sr)
+                if sr == "end_turn"
+                    && content
+                        .iter()
+                        .any(|b| matches!(b, crate::ir::IrBlock::ToolUse { .. })) =>
+            {
+                Some("tool_use".to_string())
+            }
+            other => other,
+        };
+
         // Parse usageMetadata: promptTokenCount→input_tokens, candidatesTokenCount→output_tokens
         let usage = gemini_usage(body);
 
@@ -1080,6 +1115,33 @@ fn empty_object_if_absent(args: Option<&serde_json::Value>) -> serde_json::Value
     match args {
         Some(v) => v.clone(),
         None => serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
+/// Coerce an `IrBlock::ToolUse.input` into a valid Gemini `functionCall.args` value.
+///
+/// Gemini's `functionCall.args` is a protobuf Struct: it MUST be a JSON OBJECT. A cross-protocol
+/// reader (Anthropic/OpenAI/Bedrock/Cohere) can hand us a `ToolUse.input` that is NOT an object — a
+/// JSON array (`[1,2]`), a bare scalar (`42`/`true`/`"text"`), a `null`, or an unparseable raw string
+/// — and emitting any of those verbatim under `args` produces a request the backend rejects (400).
+/// This mirrors the `ToolResult.response` coercion below: an object passes through byte-identical (so
+/// the same-protocol Gemini→Gemini round-trip stays lossless), a `null` becomes an empty-but-valid
+/// `{}`, and any other non-object (array/scalar) is wrapped under `{"args": <value>}` so its content
+/// survives. A raw JSON string is parsed first, then the SAME coercion is applied to the parse result;
+/// an unparseable string is treated as a scalar and wrapped.
+fn coerce_tool_args(input: &serde_json::Value) -> serde_json::Value {
+    // Resolve the candidate value: a string is a serialized payload — parse it, falling back to the
+    // string itself (a scalar) when it does not parse as JSON. Any non-string value is used as-is.
+    let candidate: serde_json::Value = match input.as_str() {
+        Some(s) => serde_json::from_str(s).unwrap_or_else(|_| input.clone()),
+        None => input.clone(),
+    };
+    if candidate.is_object() {
+        candidate
+    } else if candidate.is_null() {
+        serde_json::json!({})
+    } else {
+        serde_json::json!({ "args": candidate })
     }
 }
 
@@ -1426,14 +1488,10 @@ impl ProtocolWriter for GeminiWriter {
                         parts_arr.push(serde_json::json!({ "text": text }))
                     }
                     crate::ir::IrBlock::ToolUse { id: _, name, input } => {
-                        // ToolUse → functionCall{name, args}
-                        let args_val = if input.is_object() || input.is_array() {
-                            input.clone()
-                        } else {
-                            // If it's a string, parse or wrap as object
-                            serde_json::from_str(input.as_str().unwrap_or("{}"))
-                                .unwrap_or_else(|_| input.clone())
-                        };
+                        // ToolUse → functionCall{name, args}. `args` MUST be a JSON OBJECT (Gemini
+                        // Struct); coerce any non-object input (array/scalar/null/unparseable string)
+                        // the same way `functionResponse.response` is coerced below.
+                        let args_val = coerce_tool_args(input);
                         parts_arr.push(serde_json::json!({
                             "functionCall": { "name": name, "args": args_val }
                         }))
@@ -2000,14 +2058,11 @@ impl ProtocolWriter for GeminiWriter {
                     }
                 }
 
-                // ToolUse → functionCall{name, args}
+                // ToolUse → functionCall{name, args}. `args` MUST be a JSON OBJECT (Gemini Struct);
+                // coerce any non-object input (array/scalar/null/unparseable string) the same way
+                // `write_request` does.
                 crate::ir::IrBlock::ToolUse { id: _, name, input } => {
-                    let args_val = if input.is_object() || input.is_array() {
-                        input.clone()
-                    } else {
-                        serde_json::from_str(input.as_str().unwrap_or("{}"))
-                            .unwrap_or_else(|_| input.clone())
-                    };
+                    let args_val = coerce_tool_args(input);
                     parts_arr.push(serde_json::json!({
                         "functionCall": {"name": name, "args": args_val}
                     }));
@@ -5600,6 +5655,217 @@ mod tests {
         assert!(
             reader.read_response(&body).is_err(),
             "an empty candidates[] body with no block reason must still error"
+        );
+    }
+
+    /// Regression (MED #2): Gemini has no TOOL_USE finishReason — a tool-call turn ends with STOP.
+    /// `read_response` mapped STOP → `end_turn` unconditionally, so the IR carried `end_turn` next to
+    /// a `ToolUse` block, which leaked on cross-protocol egress (Anthropic relays `end_turn`; OpenAI
+    /// maps it to `"stop"`). When a `ToolUse` block is present, the buffered reader MUST promote
+    /// `end_turn` → `tool_use`. Fails against the old unconditional mapping.
+    #[test]
+    fn test_read_response_stop_with_function_call_is_tool_use() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "SF"}}}]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let ir = reader
+            .read_response(&body)
+            .expect("tool-call STOP body must decode");
+        assert!(
+            ir.content
+                .iter()
+                .any(|b| matches!(b, crate::ir::IrBlock::ToolUse { .. })),
+            "the response must carry a ToolUse block: {:?}",
+            ir.content
+        );
+        assert_eq!(
+            ir.stop_reason.as_deref(),
+            Some("tool_use"),
+            "STOP + functionCall must read back as `tool_use`, not `end_turn`"
+        );
+    }
+
+    /// Companion guard (MED #2): a plain STOP with NO tool block must stay `end_turn`. The promotion
+    /// must be gated on a ToolUse block being present, not applied to every STOP.
+    #[test]
+    fn test_read_response_plain_stop_stays_end_turn() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hello"}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let ir = reader.read_response(&body).expect("plain STOP must decode");
+        assert_eq!(
+            ir.stop_reason.as_deref(),
+            Some("end_turn"),
+            "a plain STOP with no tool block must stay `end_turn`"
+        );
+    }
+
+    /// Regression (MED #2, streaming sibling): the streaming reader mapped STOP → `end_turn` on the
+    /// terminal MessageDelta unconditionally, leaking `end_turn` for a tool-call turn on the streamed
+    /// cross-protocol path. When tool blocks were opened this run (`state.open_tools` non-empty at the
+    /// finishReason handler), the terminal stop_reason MUST be `tool_use`. Fails against old code.
+    #[test]
+    fn test_stream_stop_with_function_call_terminal_is_tool_use() {
+        let events = collect_stream(&[serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "SF"}}}]
+                },
+                "finishReason": "STOP"
+            }]
+        })]);
+        let stop = events.iter().find_map(|e| match e {
+            IrStreamEvent::MessageDelta { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            stop.flatten().as_deref(),
+            Some("tool_use"),
+            "streamed STOP + functionCall must terminate with `tool_use`: {events:?}"
+        );
+    }
+
+    /// Companion guard (MED #2, streaming): a plain STOP stream with no tool block must terminate
+    /// with `end_turn` (no spurious promotion when `state.open_tools` is empty).
+    #[test]
+    fn test_stream_plain_stop_terminal_stays_end_turn() {
+        let events = collect_stream(&[serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hello"}]},
+                "finishReason": "STOP"
+            }]
+        })]);
+        let stop = events.iter().find_map(|e| match e {
+            IrStreamEvent::MessageDelta { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            stop.flatten().as_deref(),
+            Some("end_turn"),
+            "a plain STOP stream must terminate with `end_turn`: {events:?}"
+        );
+    }
+
+    /// Regression (LOW #10): a `ToolUse.input` that is a JSON ARRAY must be coerced to a valid Gemini
+    /// `functionCall.args` OBJECT (Gemini `args` is a protobuf Struct). The old code passed an array
+    /// through verbatim (`input.is_array()` branch), producing a backend-rejected request. After the
+    /// fix the array is wrapped under `{"args": <value>}`. Asserts BOTH writers (request + response).
+    #[test]
+    fn test_tool_use_array_input_coerced_to_object_args() {
+        let block = crate::ir::IrBlock::ToolUse {
+            id: "call_1".to_string(),
+            name: "do_thing".to_string(),
+            input: serde_json::json!([1, 2, 3]),
+        };
+
+        // write_request path
+        let writer = GeminiWriter;
+        let req = crate::ir::IrRequest {
+            system: Vec::new(),
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Assistant,
+                content: vec![block.clone()],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let wire = writer.write_request(&req);
+        let args = wire
+            .pointer("/contents/0/parts/0/functionCall/args")
+            .expect("functionCall.args must be present");
+        assert!(
+            args.is_object(),
+            "request functionCall.args MUST be an object (Gemini Struct), got: {args}"
+        );
+        assert_eq!(
+            args.pointer("/args"),
+            Some(&serde_json::json!([1, 2, 3])),
+            "array input must be wrapped under `args`: {args}"
+        );
+
+        // write_response path
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![block],
+            stop_reason: Some("tool_use".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let rwire = writer.write_response(&resp);
+        let rargs = rwire
+            .pointer("/candidates/0/content/parts/0/functionCall/args")
+            .expect("response functionCall.args must be present");
+        assert!(
+            rargs.is_object(),
+            "response functionCall.args MUST be an object, got: {rargs}"
+        );
+        assert_eq!(
+            rargs.pointer("/args"),
+            Some(&serde_json::json!([1, 2, 3])),
+            "array input must be wrapped under `args` in the response too: {rargs}"
+        );
+    }
+
+    /// Companion guard (LOW #10): an OBJECT `ToolUse.input` must pass through byte-identical so the
+    /// same-protocol Gemini→Gemini round-trip stays lossless (no `{"args": ...}` wrapping).
+    #[test]
+    fn test_tool_use_object_input_passes_through_unchanged() {
+        let writer = GeminiWriter;
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "do_thing".to_string(),
+                input: serde_json::json!({"city": "SF", "unit": "C"}),
+            }],
+            stop_reason: Some("tool_use".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let rwire = writer.write_response(&resp);
+        let rargs = rwire
+            .pointer("/candidates/0/content/parts/0/functionCall/args")
+            .expect("functionCall.args must be present");
+        assert_eq!(
+            rargs,
+            &serde_json::json!({"city": "SF", "unit": "C"}),
+            "object input must pass through unchanged (no `args` wrapper): {rargs}"
         );
     }
 }

@@ -1300,14 +1300,24 @@ impl ProtocolWriter for CohereWriter {
                     }
                 }
                 // Degenerate Tool turn with text but no ToolResult: emit the text as a tool message
-                // rather than dropping it entirely.
-                if !emitted_tool_result {
-                    if let Some(content_val) = content_val {
-                        let mut tool_obj = serde_json::Map::new();
-                        tool_obj.insert("role".to_string(), serde_json::json!("tool"));
-                        tool_obj.insert("content".to_string(), content_val);
-                        messages_arr.push(serde_json::Value::Object(tool_obj));
-                    }
+                // rather than dropping it entirely. Cohere tool message `content` must be a string,
+                // so we stringify the text blocks (join with " ") exactly like the ToolResult path —
+                // forwarding `content_val` here would emit a JSON array for multi-block turns,
+                // producing an invalid Cohere request.
+                if !emitted_tool_result && !text_blocks.is_empty() {
+                    let mut tool_obj = serde_json::Map::new();
+                    tool_obj.insert("role".to_string(), serde_json::json!("tool"));
+                    tool_obj.insert(
+                        "content".to_string(),
+                        serde_json::Value::String(
+                            text_blocks
+                                .iter()
+                                .map(|t| t.as_str())
+                                .collect::<Vec<&str>>()
+                                .join(" "),
+                        ),
+                    );
+                    messages_arr.push(serde_json::Value::Object(tool_obj));
                 }
                 continue;
             }
@@ -3698,6 +3708,54 @@ mod tests {
         assert_eq!(
             msgs[0].get("content").and_then(|c| c.as_str()),
             Some("orphan tool text")
+        );
+    }
+
+    /// Regression (LOW #11/correctness): a degenerate Tool-role message with MULTIPLE text blocks
+    /// but NO ToolResult must emit `content` as a joined STRING, not a JSON text-part array. The old
+    /// code forwarded `content_val` (a JSON array for >1 text block), producing an invalid Cohere
+    /// tool message; the fix stringifies the blocks like the ToolResult path.
+    #[test]
+    fn test_tool_role_multi_text_without_result_is_string() {
+        let ir = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::Tool,
+                content: vec![
+                    crate::ir::IrBlock::Text {
+                        text: "a".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    },
+                    crate::ir::IrBlock::Text {
+                        text: "b".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let writer = CohereWriter;
+        let out = writer.write_request(&ir);
+        let msgs = out.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(
+            msgs.len(),
+            1,
+            "a Tool turn with multiple text blocks but no ToolResult must emit one message"
+        );
+        assert_eq!(msgs[0].get("role").and_then(|r| r.as_str()), Some("tool"));
+        assert_eq!(
+            msgs[0].get("content").and_then(|c| c.as_str()),
+            Some("a b"),
+            "multi-block degenerate Tool content must be a joined string, not a JSON array"
         );
     }
 

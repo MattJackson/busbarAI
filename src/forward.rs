@@ -1484,21 +1484,56 @@ where
                     // (`{"type":"error", ...}`) mid-stream. Previously this arm recorded a failure on
                     // EVERY completed SSE stream, so healthy streaming lanes tripped after a handful
                     // of successful requests.
-                    if this.is_sse && this.first_byte_sent.load(Ordering::Relaxed) {
-                        if let (Some(app), Some(_err)) =
-                            (this.app.as_ref(), this.tap.terminal_error.as_ref())
-                        {
+                    //
+                    // Hoist the TRANSLATE-side abort flag ONCE, at the top of this arm, BEFORE
+                    // `finish()` consumes the translate below. A cross-protocol `StreamTranslate`
+                    // that overflowed `MAX_BUF` (>16MiB without a frame terminator) or hit a
+                    // malformed egress prelude calls `abort()` and stops feeding the body — but it
+                    // leaves `tap.terminal_error` clear (no in-band `{"type":"error"}` frame was ever
+                    // scanned). That is the SIBLING condition to the R25 mid-body terminal-error fix:
+                    // both deliver a partial/aborted response the caller cannot use, so BOTH must be
+                    // treated as a failed stream by ALL THREE downstream gates (breaker, token
+                    // billing, json-array byte-shaping). The json-array close path below previously
+                    // read `aborted()` locally for its own byte-shaping; that single read is hoisted
+                    // here and reused so the three gates can never diverge.
+                    let translate_aborted = this
+                        .translate
+                        .as_ref()
+                        .map(|t| t.aborted())
+                        .unwrap_or(false);
+                    // A stream is FAILED for breaker purposes when EITHER an in-band terminal error
+                    // frame was tapped (as of this point in the arm) OR the cross-protocol translate
+                    // aborted mid-flight. The breaker gate has always evaluated `terminal_error` HERE
+                    // at the top of the arm (before the deferred bedrock `finish()` tap-feed below),
+                    // so keep that ordering; the billing gate re-evaluates the same predicate AFTER
+                    // the tap-feed (see below) since a bedrock deferred `metadata` frame can surface a
+                    // terminal error only at finish.
+                    let breaker_failed = this.tap.terminal_error.is_some() || translate_aborted;
+                    if this.is_sse && this.first_byte_sent.load(Ordering::Relaxed) && breaker_failed
+                    {
+                        if let Some(app) = this.app.as_ref() {
+                            // Distinguish the two failure lineages in the recorded reason so the
+                            // R25 terminal-error path and this R26 translate-abort sibling remain
+                            // separable in breaker telemetry.
+                            let reason = if this.tap.terminal_error.is_some() {
+                                "stream-terminal-error"
+                            } else {
+                                // translate_aborted must hold here (breaker_failed && no
+                                // terminal_error) — name the sibling lineage explicitly.
+                                "stream-translate-abort"
+                            };
                             let tripped = app.store.record_transient_in(
                                 &this.pool,
                                 this.lane_idx,
-                                "stream-terminal-error",
+                                reason,
                                 &this.breaker_cfg,
                                 None,
                             );
-                            // A terminal-error frame that drives a Closed→Open trip is a breaker trip
-                            // for this (pool, lane) — emit BREAKER_TRIPS_TOTAL once (#29). This is the
-                            // arm the `response.failed` recognition (#H2) now reaches for a streaming
-                            // Responses FAILURE that previously recorded as success.
+                            // A terminal-error frame OR translate abort that drives a Closed→Open
+                            // trip is a breaker trip for this (pool, lane) — emit BREAKER_TRIPS_TOTAL
+                            // once (#29). This is the arm the `response.failed` recognition (#H2) now
+                            // reaches for a streaming Responses FAILURE that previously recorded as
+                            // success.
                             if tripped {
                                 emit_breaker_trip(app, &this.pool, this.lane_idx);
                             }
@@ -1510,20 +1545,17 @@ where
                     // body — drain the translate buffer (so its decode side-effects run) but discard
                     // its SSE terminator bytes, then append the framer close.
                     let done = if let Some(framer) = this.json_array.as_mut() {
-                        // Capture the TRANSLATE-side abort flag BEFORE draining its terminator: a
-                        // cross-protocol StreamTranslate that overflowed `MAX_BUF` (or hit a malformed
-                        // egress prelude) stopped feeding this framer, and its SSE terminal-error frame
-                        // cannot ride inside a JSON-array body, so the framer's own `aborted` flag stays
-                        // clear. Route the close through `finish_for_translate(translate.aborted())` so
-                        // an aborted gemini-json-array stream surfaces a NATIVE error element + `]`
-                        // instead of a bare `]` (a silent truncation indistinguishable from a short
-                        // success). Drain the translate's SSE terminator for its decode side-effects but
-                        // discard those bytes — the JSON-array terminator is the framer close.
-                        let translate_aborted = this
-                            .translate
-                            .as_ref()
-                            .map(|t| t.aborted())
-                            .unwrap_or(false);
+                        // The TRANSLATE-side abort flag was hoisted at the top of this arm (BEFORE any
+                        // `finish()` drains the translate): a cross-protocol StreamTranslate that
+                        // overflowed `MAX_BUF` (or hit a malformed egress prelude) stopped feeding this
+                        // framer, and its SSE terminal-error frame cannot ride inside a JSON-array body,
+                        // so the framer's own `aborted` flag stays clear. Route the close through
+                        // `finish_for_translate(translate_aborted)` so an aborted gemini-json-array
+                        // stream surfaces a NATIVE error element + `]` instead of a bare `]` (a silent
+                        // truncation indistinguishable from a short success). Drain the translate's SSE
+                        // terminator for its decode side-effects but discard those bytes — the
+                        // JSON-array terminator is the framer close. Reuse the single hoisted read so
+                        // the breaker, billing, and byte-shaping gates can never diverge.
                         let _ = this.translate.as_mut().map(|t| t.finish());
                         framer.finish_for_translate(translate_aborted)
                     } else {
@@ -1548,12 +1580,22 @@ where
                     this.ended = true;
                     // Charge this request's token usage to the virtual key's budget (once) — but ONLY
                     // for a cleanly-terminated stream. A stream that emitted a mid-stream terminal
-                    // ERROR frame (`tap.terminal_error` set) delivered a partial/aborted response the
-                    // caller cannot use, and billing it contradicts the flat-fee-only-on-success
+                    // ERROR frame (`tap.terminal_error` set) OR whose cross-protocol translate
+                    // aborted mid-flight (`translate_aborted`) delivered a partial/aborted response
+                    // the caller cannot use, and billing it contradicts the flat-fee-only-on-success
                     // policy (`route::finish` charges the per-request fee only on 2xx). Mirror that
-                    // here: a failed stream is not token-billed.
+                    // here with the SAME `failed` predicate the breaker gate above uses: a failed
+                    // stream is not token-billed, covering BOTH the SSE-ingress and json-array close
+                    // paths (the json-array path previously fell through and billed an aborted
+                    // stream's partial tokens).
                     if let Some(sink) = this.usage_sink.take() {
-                        if this.tap.terminal_error.is_none() {
+                        // Re-evaluate the failed predicate AFTER the deferred bedrock `finish()`
+                        // tap-feed above (which can surface a terminal error only at stream end), OR'd
+                        // with the hoisted translate-abort flag — keeping the SAME failed semantics
+                        // the breaker gate used. An aborted translate's `feed` is a no-op, so the
+                        // `translate_aborted` snapshot taken at the top of the arm is still authoritative.
+                        let billing_failed = this.tap.terminal_error.is_some() || translate_aborted;
+                        if !billing_failed {
                             // `saturating_add`: both operands are UPSTREAM-CONTROLLED token counts
                             // (parsed from the provider's usage block), so an unchecked `+` could panic
                             // on overflow in debug / silently wrap in release (#18). Saturate to
@@ -7075,6 +7117,151 @@ data: {"type":"message_stop"}"#
         assert!(
             app.store.spend_budget(0),
             "non-SSE mid-body transport failure must still refund the spent budget unit"
+        );
+    }
+
+    /// REGRESSION (R26 MED #1 + LOW #7, CLASS-COMPLETION of the R25 forward fix): a CROSS-PROTOCOL
+    /// stream whose `StreamTranslate` ABORTS after the first byte — its reassembly buffer overran
+    /// `MAX_BUF` (>16MiB without a frame terminator) or it hit a malformed egress prelude — sets NO
+    /// `tap.terminal_error` (no in-band `{"type":"error"}` frame was ever scanned). R25 made the
+    /// `Poll::Ready(None)` arm reverse the optimistic 2xx breaker success ONLY on `terminal_error`;
+    /// it missed the translate-abort SIBLING. Before this fix the arm therefore (a) recorded the
+    /// optimistic success un-reversed (cell stays Closed) AND (b) billed the partial captured tokens
+    /// via `record_tokens`. After the fix BOTH gates treat `terminal_error.is_some() ||
+    /// translate.aborted()` as failed: the cell trips Closed→Open AND no token fee is charged.
+    #[tokio::test]
+    async fn test_streaming_translate_abort_trips_breaker_and_skips_billing() {
+        use super::FirstByteBody;
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        use crate::store::{BreakerCfg, BreakerState, TripConfig, TripMode};
+        use bytes::Bytes;
+        use futures::StreamExt as _;
+
+        // Lane 0: OpenAI EGRESS. The cross-protocol seam is anthropic INGRESS ← openai EGRESS, so a
+        // `StreamTranslate::new("anthropic", "openai")` is constructed (ingress != egress → Some).
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m",
+                crate::proto::Protocol::openai(),
+                "http://127.0.0.1:1",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+
+        // Trip config: open the cell on a SINGLE consecutive failure, so the one compensating
+        // transient this arm must record is observable as a Closed→Open transition (and its absence
+        // leaves the cell Closed — the un-reversed optimistic success the bug records).
+        let breaker_cfg = Arc::new(BreakerCfg {
+            trip: TripConfig {
+                mode: TripMode::Consecutive,
+                n: 1,
+                ..TripConfig::default()
+            },
+            ..BreakerCfg::default()
+        });
+
+        // The pool cell starts Closed (the synchronous 2xx-headers success was already recorded
+        // before streaming; this arm must REVERSE it on the translate abort).
+        assert!(
+            matches!(app.store.breaker_state_in("p", 0), BreakerState::Closed),
+            "pool cell must start Closed before the translate abort"
+        );
+
+        // A usage sink over a real GovState priced at 100c per 1k tokens, so any `record_tokens`
+        // call with nonzero tokens leaves an observable spend in the key's window.
+        let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+        let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov"));
+        let charged_at: u64 = 1_700_000_000;
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(1_000_000),
+                    budget_period: "daily".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                charged_at,
+            )
+            .expect("create key");
+        let sink = Some(UsageSink {
+            gov: gov.clone(),
+            key_id: key.id.clone(),
+            period: key.budget_period.clone(),
+            charged_at,
+        });
+
+        // Cross-protocol translator: openai EGRESS SSE → anthropic INGRESS SSE. The tap scans the
+        // translated anthropic output for usage.
+        let translate = crate::proto::StreamTranslate::new("anthropic", "openai")
+            .expect("anthropic<-openai translate must construct");
+
+        // Inner upstream stream:
+        //   chunk 1: an OpenAI trailing usage-only chunk (`include_usage` convention) carrying
+        //            prompt_tokens — translated to an anthropic `message_delta` whose usage the tap
+        //            reads, giving a NONZERO captured input_tokens (the partial tokens the bug bills).
+        //            This also marks `first_byte_sent`.
+        //   chunk 2: a >MAX_BUF run of bytes with NO SSE frame terminator → the translate's
+        //            reassembly buffer overflows and `abort()` fires (aborted == true), with NO
+        //            terminal-error frame ever scanned (tap.terminal_error stays None).
+        // Then the inner stream ends with `None`, driving the `Poll::Ready(None)` arm under test.
+        let usage_chunk =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":600,\"completion_tokens\":400}}\n\n"
+                .to_vec();
+        let overflow = vec![b'x'; crate::eventstream::MAX_FRAME_BYTES + 16];
+        let inner = Box::pin(futures::stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::from(usage_chunk)),
+            Ok::<Bytes, reqwest::Error>(Bytes::from(overflow)),
+        ]));
+
+        let body = FirstByteBody::new(
+            inner,
+            true, // is_sse: streaming cross-protocol path
+            "anthropic",
+            (),
+            app.clone(),
+            0,
+            breaker_cfg,
+            "p",
+            Some(translate),
+            None,
+            sink,
+            false, // budget_spent: irrelevant to this arm
+        );
+        futures::pin_mut!(body);
+
+        // Drain the body to completion (the abort produces no client error item — it is a silent
+        // truncation on the wire; the observable effects are breaker + billing).
+        while let Some(item) = body.next().await {
+            // Translated/terminator bytes may flow; none of them is an Err for this arm.
+            let _ = item;
+        }
+
+        // (1) BREAKER: the translate abort must have recorded a compensating transient that drove the
+        // cell Closed→Open. Before the fix no transient is recorded (only `terminal_error` was
+        // checked) and the optimistic 2xx success stands → the cell stays Closed.
+        assert!(
+            matches!(
+                app.store.breaker_state_in("p", 0),
+                BreakerState::Open { .. }
+            ),
+            "a StreamTranslate abort after first byte must record a breaker transient \
+             (cell Closed→Open), not stand as the optimistic 2xx success (R26 MED #1)"
+        );
+
+        // (2) BILLING: a captured-nonzero-token aborted stream must NOT be token-billed. With the
+        // 100c/1k price, the old code's `record_tokens(.., 1000)` would have left 100c of spend in
+        // the key's window; the fix skips the call entirely, so the window stays at 0.
+        let spent = gov
+            .usage_for(&key.id, charged_at)
+            .expect("usage read")
+            .map(|u| u.spend_cents)
+            .unwrap_or(0);
+        assert_eq!(
+            spent, 0,
+            "an aborted cross-protocol stream must NOT charge a token fee \
+             (record_tokens must not be called) — R26 LOW #7"
         );
     }
 }

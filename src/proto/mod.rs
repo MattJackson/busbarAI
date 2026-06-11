@@ -1042,9 +1042,12 @@ impl StreamTranslate {
             // the whole `out_data` Value (which can be kilobytes for a metadata/tool-result frame) just
             // to insert one key. `payload` is the serialization of `out_data`; when `out_data` is a JSON
             // object it begins with `{`, so `{"type":<enc>,` + payload[1..] yields the same object with
-            // `type` prepended — zero Value clone, one small format alloc. Guard on the object shape (a
-            // non-object out_data would not serialize to a leading `{`); fall back to the explicit
-            // build only in that (unexpected) case so the tap is never fed malformed JSON.
+            // `type` prepended — zero Value clone, one small format alloc. Every returning arm of the
+            // Bedrock `write_response_event` (the only writer that reaches this eventstream branch)
+            // yields a `serde_json::json!({...})` object, so `out_data` is ALWAYS an object here and this
+            // `is_object()` guard always fires. The guard is a defensive shape-check, not a real branch:
+            // a hypothetical non-object `out_data` (currently unreachable) is simply skipped — the tap
+            // just records no entry for it rather than being fed a malformed (non-`{`-leading) payload.
             if out_data.is_object() {
                 if let Ok(enc_et) = serde_json::to_string(&out_et) {
                     // payload is `{...}`; replace the leading `{` with `{"type":<enc_et>,` (or
@@ -1654,6 +1657,23 @@ pub(crate) use gemini::{GeminiReader, GeminiWriter};
 pub(crate) use openai::{OpenAiReader, OpenAiWriter};
 pub(crate) use responses::{ResponsesReader, ResponsesWriter};
 
+/// Every protocol name busbar ships a built-in `Protocol` for. SINGLE SOURCE OF TRUTH shared by
+/// `ProtocolRegistry::with_builtins` (which builds its map from these names) and the config validator
+/// (`config_validate.rs`, which rejects a provider whose `protocol` is not in this set so an unknown
+/// protocol is COLLECTED with every other config error rather than escaping to a lone `die()` at lane
+/// construction in `main.rs`). Keeping the list here, co-located with `with_builtins` and
+/// `debug_assert`-checked against the registry it builds, guarantees the registry and validator cannot
+/// drift: adding a protocol to `with_builtins` without listing it here (or vice versa) trips the
+/// assertion in any debug/test build.
+pub(crate) const KNOWN_PROTOCOLS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "gemini",
+    "bedrock",
+    "responses",
+    "cohere",
+];
+
 /// String-keyed registry mapping a provider's protocol name to its `Protocol`.
 /// `with_builtins` registers every protocol busbar ships with.
 #[derive(Default)]
@@ -1665,12 +1685,39 @@ impl ProtocolRegistry {
     /// Create a new registry with built-in protocols.
     pub(crate) fn with_builtins() -> Self {
         let mut map = std::collections::HashMap::new();
-        map.insert("anthropic".to_string(), Arc::new(Protocol::anthropic()));
-        map.insert("openai".to_string(), Arc::new(Protocol::openai()));
-        map.insert("gemini".to_string(), Arc::new(Protocol::gemini()));
-        map.insert("bedrock".to_string(), Arc::new(Protocol::bedrock()));
-        map.insert("responses".to_string(), Arc::new(Protocol::responses()));
-        map.insert("cohere".to_string(), Arc::new(Protocol::cohere()));
+        for &name in KNOWN_PROTOCOLS {
+            // Build the registry from the single-source-of-truth name list so the registry and the
+            // config validator (which validates against `KNOWN_PROTOCOLS`) cannot drift.
+            let protocol = match name {
+                "anthropic" => Protocol::anthropic(),
+                "openai" => Protocol::openai(),
+                "gemini" => Protocol::gemini(),
+                "bedrock" => Protocol::bedrock(),
+                "responses" => Protocol::responses(),
+                "cohere" => Protocol::cohere(),
+                // Startup-only construction: if a name is added to `KNOWN_PROTOCOLS` without a
+                // matching constructor arm here, fail loud in debug/test builds. In release this
+                // skips the unmapped name (it simply will not be registered), and the lane-build
+                // `die()` in main.rs remains the defensive backstop.
+                other => {
+                    debug_assert!(
+                        false,
+                        "KNOWN_PROTOCOLS lists '{other}' but with_builtins has no constructor for it"
+                    );
+                    continue;
+                }
+            };
+            map.insert(name.to_string(), Arc::new(protocol));
+        }
+        // Belt-and-suspenders: the registry must contain exactly the KNOWN_PROTOCOLS set, so a
+        // constructor arm added WITHOUT listing the name in KNOWN_PROTOCOLS (or vice versa) is caught.
+        debug_assert_eq!(
+            map.len(),
+            KNOWN_PROTOCOLS.len(),
+            "ProtocolRegistry built {} protocols but KNOWN_PROTOCOLS lists {}",
+            map.len(),
+            KNOWN_PROTOCOLS.len()
+        );
         Self { map }
     }
 
@@ -4095,22 +4142,24 @@ mod stream_fanout_tests {
                     created: None,
                     model: None
                 },
+                // R26 (MED #5): tool-only stream (no text) is 0-based — text reserves index 0 ONLY
+                // when text actually appears. Previously asserted the buggy 1-based index.
                 IrStreamEvent::BlockStart {
-                    index: 1,
+                    index: 0,
                     block: IrBlockMeta::ToolUse {
                         id: "call_1".to_string(),
                         name: "get_weather".to_string()
                     }
                 },
                 IrStreamEvent::BlockDelta {
-                    index: 1,
+                    index: 0,
                     delta: IrDelta::InputJsonDelta(String::new())
                 },
                 IrStreamEvent::BlockDelta {
-                    index: 1,
+                    index: 0,
                     delta: IrDelta::InputJsonDelta("{\"loc\":\"SF\"}".to_string())
                 },
-                IrStreamEvent::BlockStop { index: 1 },
+                IrStreamEvent::BlockStop { index: 0 },
                 IrStreamEvent::MessageDelta {
                     stop_reason: Some("tool_use".to_string()),
                     stop_sequence: None,
@@ -6623,8 +6672,12 @@ mod gemini_tests {
             panic!("expected ToolUse block");
         }
 
-        // Assert stop_reason: "STOP" → "end_turn"
-        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
+        // Assert stop_reason: Gemini has no TOOL_USE finishReason — a tool-call turn ends with STOP.
+        // Because this response carries a ToolUse block, the reader promotes the mapped `end_turn` →
+        // the canonical `tool_use` (matching every other protocol's reader and keeping cross-protocol
+        // egress correct). The Gemini writer maps `tool_use` back to STOP, so same-protocol stays
+        // lossless.
+        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
 
         // Assert usage: promptTokenCount→input_tokens, candidatesTokenCount→output_tokens
         assert_eq!(resp.usage.input_tokens, 15);

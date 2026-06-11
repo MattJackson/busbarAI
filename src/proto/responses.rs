@@ -258,6 +258,37 @@ fn responses_error_code(error_type: &str) -> serde_json::Value {
     }
 }
 
+/// Map a terminal `response.failed` provider signal (the captured `error.code`/`error.type`) to the
+/// breaker `StatusClass` that drives disposition and failover.
+///
+/// A streamed `response.failed` carries the SAME OpenAI error envelope as the non-streaming HTTP
+/// error body, so the mid-stream failure class must be derived from that signal rather than
+/// hardcoded to `ServerError`. Hardcoding `ServerError` misclassifies an auth/rate-limit/
+/// context-length failure that arrives mid-stream: the breaker would treat a dead key (Auth →
+/// HardDown) or an oversized request (ContextLength → fail-over-no-penalty) as a transient 5xx,
+/// giving the wrong breaker disposition and the wrong failover decision.
+///
+/// The mapping mirrors the non-stream HTTP classifier's buckets (`classify`/`normalize_raw_error`):
+/// auth codes → Auth, quota/rate codes → RateLimit, context-window codes → ContextLength, and the
+/// 5xx/overloaded family → ServerError. The final arm explicitly binds the unrecognized signal and
+/// defaults to `ServerError` (the safe transient bucket — a retry/cooldown rather than a permanent
+/// HardDown) per the no-`_`-catch-all rule.
+fn class_for_response_failed(signal: &str) -> StatusClass {
+    match signal {
+        "invalid_api_key" | "authentication_error" => StatusClass::Auth,
+        "rate_limit_exceeded" | "insufficient_quota" => StatusClass::RateLimit,
+        "context_length_exceeded" | "string_above_max_length" => StatusClass::ContextLength,
+        "server_error" | "overloaded_error" => StatusClass::ServerError,
+        other => {
+            // Unrecognized provider signal: default to the transient ServerError bucket so the lane
+            // recovers via cooldown rather than being permanently penalized. Named binding (not `_`)
+            // keeps the arm explicit per the no-catch-all rule.
+            let _ = other;
+            StatusClass::ServerError
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ResponsesReader;
 
@@ -946,8 +977,17 @@ impl ProtocolReader for ResponsesReader {
                             })
                             .map(String::from)
                             .or_else(|| Some("response_failed".to_string()));
+                        // Derive the breaker class from the captured provider signal rather than
+                        // hardcoding ServerError: an auth/rate-limit/context-length failure that
+                        // arrives mid-stream must classify the same way it would on the non-stream
+                        // HTTP path, or the breaker takes the wrong disposition/failover. The
+                        // fallback "response_failed" (no error code/type present) maps to the
+                        // default ServerError bucket.
+                        let class = class_for_response_failed(
+                            provider_signal.as_deref().unwrap_or("response_failed"),
+                        );
                         out.push(IrStreamEvent::Error(IrError {
-                            class: StatusClass::ServerError,
+                            class,
                             provider_signal,
                             retry_after: None,
                         }));
@@ -1047,9 +1087,14 @@ impl ProtocolReader for ResponsesReader {
                     // would mask the upstream failure from downstream clients AND deny the breaker
                     // the failure signal, so we mirror the body-present failure arm above: emit an
                     // explicit Error followed by MessageStop.
+                    // No nested response object → no error code/type to inspect. The only signal is
+                    // the wire event_type; classify via the shared helper (which defaults the
+                    // unrecognized "response_failed" sentinel to ServerError) so both response.failed
+                    // arms derive their class through the same mapping.
+                    let provider_signal = "response_failed";
                     out.push(IrStreamEvent::Error(IrError {
-                        class: StatusClass::ServerError,
-                        provider_signal: Some("response_failed".to_string()),
+                        class: class_for_response_failed(provider_signal),
+                        provider_signal: Some(provider_signal.to_string()),
                         retry_after: None,
                     }));
                     close_open_blocks(&mut out, state);
@@ -1112,9 +1157,9 @@ impl ProtocolReader for ResponsesReader {
         // empty `output:[]` would iterate zero items, fail the usage check, and mask the real error
         // as an internal `ir_parse` (ClientFault, no-retry) — the wrong breaker transition. Handle
         // failed bodies uniformly here whether `output` is `[]`, null, or absent. Surface the
-        // upstream signal as a ServerError so the real error reaches the client and the breaker sees
-        // a retryable server failure. Mirror the streaming `response.failed` arm: prefer the
-        // `error.code` enum, fall back to `error.type`, then a generic `response_failed`.
+        // upstream signal so the real error reaches the client and the breaker sees the correct
+        // class via `class_for_response_failed`. Mirror the streaming `response.failed` arm: prefer
+        // the `error.code` enum, fall back to `error.type`, then a generic `response_failed`.
         if status == "failed" {
             let provider_signal = obj
                 .get("error")
@@ -1127,8 +1172,13 @@ impl ProtocolReader for ResponsesReader {
                 })
                 .map(String::from)
                 .or_else(|| Some("response_failed".to_string()));
+            // Same class as the streaming `response.failed` arms: derive the breaker class from the
+            // captured provider signal rather than hardcoding ServerError, so an auth/rate-limit/
+            // context-length failed body classifies correctly (right breaker disposition/failover).
+            let class =
+                class_for_response_failed(provider_signal.as_deref().unwrap_or("response_failed"));
             return Err(IrError {
-                class: StatusClass::ServerError,
+                class,
                 provider_signal,
                 retry_after: None,
             });
@@ -4160,6 +4210,113 @@ mod tests {
         );
     }
 
+    /// Regression (LOW #8): a streamed `response.failed` must classify the IrError by the captured
+    /// provider signal, not a hardcoded ServerError. An `invalid_api_key` mid-stream failure is an
+    /// Auth failure (HardDown breaker disposition), NOT a transient ServerError — hardcoding
+    /// ServerError gave the wrong breaker disposition / failover. The provider_signal is preserved
+    /// verbatim. Against the old code (class: ServerError) this asserts Auth and fails.
+    #[test]
+    fn test_stream_failed_invalid_api_key_classifies_as_auth() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = reader_read_response_events(
+            "response.failed",
+            &serde_json::json!({
+                "response": {
+                    "status": "failed",
+                    "error": {"code": "invalid_api_key", "type": "authentication_error"}
+                }
+            }),
+            &mut state,
+        );
+        match &events[0] {
+            crate::ir::IrStreamEvent::Error(err) => {
+                assert_eq!(
+                    err.class,
+                    StatusClass::Auth,
+                    "invalid_api_key mid-stream must classify as Auth, not ServerError"
+                );
+                // provider_signal is kept as-is (the captured error.code).
+                assert_eq!(err.provider_signal.as_deref(), Some("invalid_api_key"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // The full mapping mirrors the non-stream HTTP classifier buckets.
+        assert_eq!(
+            class_for_response_failed("invalid_api_key"),
+            StatusClass::Auth
+        );
+        assert_eq!(
+            class_for_response_failed("authentication_error"),
+            StatusClass::Auth
+        );
+        assert_eq!(
+            class_for_response_failed("rate_limit_exceeded"),
+            StatusClass::RateLimit
+        );
+        assert_eq!(
+            class_for_response_failed("insufficient_quota"),
+            StatusClass::RateLimit
+        );
+        assert_eq!(
+            class_for_response_failed("context_length_exceeded"),
+            StatusClass::ContextLength
+        );
+        assert_eq!(
+            class_for_response_failed("string_above_max_length"),
+            StatusClass::ContextLength
+        );
+        assert_eq!(
+            class_for_response_failed("server_error"),
+            StatusClass::ServerError
+        );
+        assert_eq!(
+            class_for_response_failed("overloaded_error"),
+            StatusClass::ServerError
+        );
+        // Unrecognized signal defaults to the transient ServerError bucket.
+        assert_eq!(
+            class_for_response_failed("response_failed"),
+            StatusClass::ServerError
+        );
+    }
+
+    /// Regression (LOW #8 sibling): the NON-streaming `read_response` `status:"failed"` path must
+    /// also classify by the captured provider signal rather than hardcoding ServerError. A failed
+    /// body carrying `code:"context_length_exceeded"` is a ContextLength failure (fail over without
+    /// penalizing the lane), NOT a transient ServerError. Against the old code this asserts
+    /// ContextLength and fails.
+    #[test]
+    fn test_read_response_failed_body_classifies_by_signal() {
+        let reader = ResponsesReader;
+        let err = reader
+            .read_response(&serde_json::json!({
+                "status": "failed",
+                "output": [],
+                "error": {"code": "context_length_exceeded", "type": "invalid_request_error"}
+            }))
+            .expect_err("failed body must surface an IrError");
+        assert_eq!(
+            err.class,
+            StatusClass::ContextLength,
+            "context_length_exceeded failed body must classify as ContextLength, not ServerError"
+        );
+        assert_eq!(
+            err.provider_signal.as_deref(),
+            Some("context_length_exceeded")
+        );
+
+        // An auth-failed body classifies as Auth.
+        let err_auth = reader
+            .read_response(&serde_json::json!({
+                "status": "failed",
+                "output": [],
+                "error": {"code": "invalid_api_key", "type": "authentication_error"}
+            }))
+            .expect_err("failed body must surface an IrError");
+        assert_eq!(err_auth.class, StatusClass::Auth);
+    }
+
     /// Regression: an unknown terminal status must not be decoded as a successful end_turn; its
     /// stop_reason is None (terminal, but no success claim).
     #[test]
@@ -6918,15 +7075,19 @@ mod tests {
         );
     }
 
-    /// Regression (MEDIUM/correctness, Round 15): a non-streaming Responses body with
-    /// `status:"failed"` and `output:null` is an upstream provider failure, NOT a parse error. The
-    /// reader must surface it as a ServerError IrError carrying the upstream `error.code`, never
-    /// misclassify it as an internal `ir_parse` ClientError.
+    /// Regression (MEDIUM/correctness, Round 15; class-corrected R26/LOW #8): a non-streaming
+    /// Responses body with `status:"failed"` and `output:null` is an upstream provider failure, NOT
+    /// a parse error. The reader must surface it as an IrError carrying the upstream `error.code`,
+    /// never misclassify it as an internal `ir_parse` ClientError. As of R26 the IrError `class` is
+    /// derived from the captured signal via `class_for_response_failed` (mirroring the streaming
+    /// `response.failed` arms and the HTTP classifier) rather than hardcoded ServerError: a
+    /// `rate_limit_exceeded` failed body must classify as RateLimit, not a generic ServerError.
     #[test]
     fn test_read_response_failed_surfaces_upstream_error() {
         let reader = ResponsesReader;
 
-        // status:"failed" with output:null and a populated error.code.
+        // status:"failed" with output:null and a populated error.code. The rate-limit signal must
+        // classify as RateLimit (not the old hardcoded ServerError).
         let body = serde_json::json!({
             "id": "resp_fail",
             "object": "response",
@@ -6941,8 +7102,8 @@ mod tests {
             .expect_err("failed status must surface as an error");
         assert_eq!(
             err.class,
-            StatusClass::ServerError,
-            "an upstream failure is a ServerError, not a ClientError ir_parse"
+            StatusClass::RateLimit,
+            "a rate_limit_exceeded failed body is a RateLimit, not a generic ServerError"
         );
         assert_eq!(
             err.provider_signal.as_deref(),
@@ -6950,7 +7111,8 @@ mod tests {
             "the upstream error.code must be surfaced as the provider signal"
         );
 
-        // error.type fallback when code is absent.
+        // error.type fallback when code is absent. `content_filter` is not one of the mapped
+        // signals, so it falls to the default transient ServerError bucket.
         let body_type = serde_json::json!({
             "status": "failed",
             "error": { "type": "content_filter", "message": "blocked" },
@@ -6962,7 +7124,7 @@ mod tests {
         assert_eq!(err_type.class, StatusClass::ServerError);
         assert_eq!(err_type.provider_signal.as_deref(), Some("content_filter"));
 
-        // failed with no usable error object → generic response_failed signal, still ServerError.
+        // failed with no usable error object → generic response_failed signal, default ServerError.
         let body_bare = serde_json::json!({ "status": "failed" });
         let err_bare = reader
             .read_response(&body_bare)

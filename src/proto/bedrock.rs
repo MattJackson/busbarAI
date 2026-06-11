@@ -1171,6 +1171,22 @@ impl ProtocolReader for BedrockReader {
                                 block: crate::ir::IrBlockMeta::ToolUse { id: tu_id, name },
                             });
                         }
+                    } else if start_obj.contains_key("reasoningContent")
+                        && state.started
+                        && !state.thinking_block_open
+                    {
+                        // Some Bedrock-compatible backends prefix a streamed reasoning block with an
+                        // explicit `contentBlockStart` carrying an (empty) `reasoningContent` start
+                        // object, rather than implying the block on the first delta. Open the Thinking
+                        // block here so the following `reasoningContent` deltas attach to it; the
+                        // delta arm's lazy-open then sees the flag already set and does not re-open it.
+                        // (The native AWS `ContentBlockStart` union only models `toolUse`, so a real
+                        // AWS stream never takes this branch — it lazily opens on the first delta.)
+                        state.thinking_block_open = true;
+                        out.push(IrStreamEvent::BlockStart {
+                            index: idx,
+                            block: crate::ir::IrBlockMeta::Thinking,
+                        });
                     } else if start_obj.is_empty() && state.started && !state.text_block_open {
                         // The native Bedrock ConverseStream wire sends `contentBlockStart` with an
                         // empty `start: {}` for a text block. Only that empty-object shape opens a
@@ -1218,6 +1234,67 @@ impl ProtocolReader for BedrockReader {
                                 delta: crate::ir::IrDelta::InputJsonDelta(input_str.to_string()),
                             });
                         }
+                    } else if let Some(reasoning) = delta_obj
+                        .get("reasoningContent")
+                        .and_then(|r| r.as_object())
+                    {
+                        // Native Bedrock ConverseStream streams the model's extended-thinking as a
+                        // `reasoningContent` member on `contentBlockDelta`. The buffered reader
+                        // (`read_bedrock_reasoning_block`) already preserves this in the non-streaming
+                        // path; the streaming path used to silently DROP it — no Thinking BlockStart
+                        // and no ThinkingDelta/SignatureDelta were ever emitted. Mirror the buffered
+                        // logic here: lazily open the Thinking block on the FIRST reasoningContent
+                        // delta (the wire sends NO dedicated `contentBlockStart` for a reasoning
+                        // block — it is implied by the first delta), then emit the matching delta.
+                        //
+                        // The `ReasoningContentBlockDelta` union has three members:
+                        //   - `text`            → ThinkingDelta(text)            (plaintext reasoning)
+                        //   - `signature`       → SignatureDelta(signature)      (the opaque token)
+                        //   - `redactedContent` → a SINGLE SignatureDelta carrying the
+                        //                         REASONING_REDACTED_SIG_SENTINEL prefix immediately
+                        //                         followed by the opaque bytes. The sentinel is the
+                        //                         SAME marker the buffered reader uses to distinguish
+                        //                         redacted reasoning from a plaintext `reasoningText`;
+                        //                         carrying the bytes IN the sentinel-prefixed delta
+                        //                         (rather than a separate ThinkingDelta) keeps the
+                        //                         redacted block to ONE IR delta → ONE Bedrock frame,
+                        //                         so the writer can re-emit `redactedContent: <bytes>`
+                        //                         faithfully without a plaintext `text` leak.
+                        if state.started && !state.thinking_block_open {
+                            state.thinking_block_open = true;
+                            out.push(IrStreamEvent::BlockStart {
+                                index: idx,
+                                block: crate::ir::IrBlockMeta::Thinking,
+                            });
+                        }
+                        if state.thinking_block_open {
+                            if let Some(text) = reasoning.get("text").and_then(|t| t.as_str()) {
+                                out.push(IrStreamEvent::BlockDelta {
+                                    index: idx,
+                                    delta: crate::ir::IrDelta::ThinkingDelta(text.to_string()),
+                                });
+                            } else if let Some(sig) =
+                                reasoning.get("signature").and_then(|s| s.as_str())
+                            {
+                                out.push(IrStreamEvent::BlockDelta {
+                                    index: idx,
+                                    delta: crate::ir::IrDelta::SignatureDelta(sig.to_string()),
+                                });
+                            } else if let Some(redacted) =
+                                reasoning.get("redactedContent").and_then(|r| r.as_str())
+                            {
+                                out.push(IrStreamEvent::BlockDelta {
+                                    index: idx,
+                                    delta: crate::ir::IrDelta::SignatureDelta(format!(
+                                        "{REASONING_REDACTED_SIG_SENTINEL}{redacted}"
+                                    )),
+                                });
+                            }
+                            // A future `reasoningContent` delta member with none of the three known
+                            // keys carries no representable IR delta; the block stays open and the
+                            // unknown member is skipped (forward-compat), mirroring the buffered
+                            // reader's `None` arm.
+                        }
                     }
                 }
             }
@@ -1236,6 +1313,14 @@ impl ProtocolReader for BedrockReader {
                 // to the block whose stop we are processing; tool-use stops never set the flag.
                 if state.text_block_open {
                     state.text_block_open = false;
+                }
+
+                // Clear the reasoning-block open flag on its stop too, so a subsequent reasoning
+                // block (or a reasoning-then-text sequence) opens cleanly. At most one block of a
+                // given kind is open at a time on this wire, so the stop unambiguously closes the
+                // open thinking block; a text/tool stop with no thinking block open is a no-op here.
+                if state.thinking_block_open {
+                    state.thinking_block_open = false;
                 }
 
                 out.push(IrStreamEvent::BlockStop { index: idx });
@@ -2032,7 +2117,20 @@ impl ProtocolWriter for BedrockWriter {
                         "start": { "toolUse": { "toolUseId": id, "name": name } }
                     }),
                 )),
-                crate::ir::IrBlockMeta::Thinking | crate::ir::IrBlockMeta::Image => None,
+                // A reasoning (extended-thinking) block opens with a `contentBlockStart` whose
+                // `start` carries an (empty) `reasoningContent` object — the inverse of the reader's
+                // lazy-open. Without this the streamed reasoning deltas were orphaned and the block
+                // dropped on Bedrock egress; mirror the buffered `write_response` reasoningContent
+                // re-emit on the streaming path. (Image has no streaming-start projection on Bedrock
+                // — image blocks are not streamed as `contentBlock*` frames — so it stays None.)
+                crate::ir::IrBlockMeta::Thinking => Some((
+                    "contentBlockStart".to_string(),
+                    serde_json::json!({
+                        "contentBlockIndex": index,
+                        "start": { "reasoningContent": {} }
+                    }),
+                )),
+                crate::ir::IrBlockMeta::Image => None,
             },
 
             IrStreamEvent::BlockDelta { index, delta } => match delta {
@@ -2052,8 +2150,44 @@ impl ProtocolWriter for BedrockWriter {
                     }),
                 )),
 
-                crate::ir::IrDelta::ThinkingDelta(_) | crate::ir::IrDelta::SignatureDelta(_) => {
-                    None
+                // Streamed extended-thinking. The Bedrock `ReasoningContentBlockDelta` union carries
+                // EITHER a `text` (plaintext reasoning) OR a `signature` (the opaque reasoning token)
+                // OR a `redactedContent` (opaque encrypted bytes) per frame — each IR delta maps to
+                // exactly ONE ConverseStream frame, so the single-frame-per-event constraint holds.
+                // This is the streaming inverse of `bedrock_reasoning_block`'s buffered logic.
+                crate::ir::IrDelta::ThinkingDelta(text) => Some((
+                    "contentBlockDelta".to_string(),
+                    serde_json::json!({
+                        "contentBlockIndex": index,
+                        "delta": { "reasoningContent": { "text": text } }
+                    }),
+                )),
+
+                // A SignatureDelta whose value begins with the redacted-reasoning sentinel is NOT a
+                // real `signature` token: the reader collapsed a streamed `redactedContent` delta
+                // into a single sentinel-PREFIXED SignatureDelta (sentinel immediately followed by
+                // the opaque bytes) so the redacted block stayed one IR delta. Strip the sentinel and
+                // re-emit the bytes under `redactedContent` — never as a plaintext `signature` —
+                // mirroring `bedrock_reasoning_block`. Any other SignatureDelta is a genuine reasoning
+                // token (an opaque base64 SDK string that never collides with the `__busbar` prefix)
+                // and re-emits as `signature`.
+                crate::ir::IrDelta::SignatureDelta(sig) => {
+                    match sig.strip_prefix(REASONING_REDACTED_SIG_SENTINEL) {
+                        Some(redacted) => Some((
+                            "contentBlockDelta".to_string(),
+                            serde_json::json!({
+                                "contentBlockIndex": index,
+                                "delta": { "reasoningContent": { "redactedContent": redacted } }
+                            }),
+                        )),
+                        None => Some((
+                            "contentBlockDelta".to_string(),
+                            serde_json::json!({
+                                "contentBlockIndex": index,
+                                "delta": { "reasoningContent": { "signature": sig } }
+                            }),
+                        )),
+                    }
                 }
             },
 
@@ -6042,6 +6176,246 @@ mod tests {
                 .pointer("/output/message/content/0/reasoningContent/reasoningText")
                 .is_none(),
             "a redacted reasoning block must NOT leak as a plaintext reasoningText; got {out_r}"
+        );
+    }
+
+    /// Regression (R26 MED #3/#4): STREAMING extended-thinking (`reasoningContent` deltas on the
+    /// ConverseStream wire) was SILENTLY DROPPED — `read_response_events` had no reasoning arm and
+    /// `write_response_event` returned `None` for ThinkingDelta/SignatureDelta — even though the
+    /// BUFFERED path (R25) preserved it. The streaming path must now mirror the buffered logic: the
+    /// reader lazily opens a Thinking block on the first `reasoningContent` delta and emits
+    /// ThinkingDelta/SignatureDelta; the writer re-emits them as `reasoningContent` frames. This test
+    /// drives a full plaintext-reasoning ConverseStream through read->IR->write and asserts each IR
+    /// reasoning event round-trips to its native frame. FAILS against the old code (no BlockStart for
+    /// the reasoning block; ThinkingDelta/SignatureDelta produce no frame) and passes after.
+    #[test]
+    fn test_stream_reasoning_content_round_trips() {
+        use crate::ir::{IrBlockMeta, IrDelta, IrStreamEvent};
+
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        // A native ConverseStream that streams a reasoning block (text deltas then a signature) and
+        // then a normal text answer. The reasoning block is implied by its first `reasoningContent`
+        // delta (no dedicated `contentBlockStart` on the wire), exactly as AWS streams it.
+        let frames = vec![
+            serde_json::json!({"type": "messageStart", "role": "assistant"}),
+            serde_json::json!({
+                "type": "contentBlockDelta",
+                "contentBlockIndex": 0,
+                "delta": {"reasoningContent": {"text": "let me "}}
+            }),
+            serde_json::json!({
+                "type": "contentBlockDelta",
+                "contentBlockIndex": 0,
+                "delta": {"reasoningContent": {"text": "think"}}
+            }),
+            serde_json::json!({
+                "type": "contentBlockDelta",
+                "contentBlockIndex": 0,
+                "delta": {"reasoningContent": {"signature": "sig-xyz"}}
+            }),
+            serde_json::json!({"type": "contentBlockStop", "contentBlockIndex": 0}),
+            serde_json::json!({"type": "contentBlockStart", "contentBlockIndex": 1, "start": {}}),
+            serde_json::json!({
+                "type": "contentBlockDelta",
+                "contentBlockIndex": 1,
+                "delta": {"text": "the answer"}
+            }),
+            serde_json::json!({"type": "contentBlockStop", "contentBlockIndex": 1}),
+        ];
+
+        let events: Vec<IrStreamEvent> = frames
+            .into_iter()
+            .flat_map(|f| reader.read_response_events("", &f, &mut state))
+            .collect();
+
+        // The reader opened a Thinking block lazily on the first reasoningContent delta and emitted
+        // the two ThinkingDeltas + the SignatureDelta.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStart { index: 0, block: IrBlockMeta::Thinking }
+            )),
+            "a Thinking BlockStart must be lazily opened on the first reasoningContent delta; got {events:?}"
+        );
+        let thinking_text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                IrStreamEvent::BlockDelta {
+                    delta: IrDelta::ThinkingDelta(t),
+                    ..
+                } => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking_text, "let me think",
+            "the streamed reasoning text must be carried as ThinkingDeltas; got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockDelta { delta: IrDelta::SignatureDelta(s), .. } if s == "sig-xyz"
+            )),
+            "the reasoning signature must be carried as a SignatureDelta; got {events:?}"
+        );
+
+        // Round-trip every reasoning IR event back through the writer and confirm the native frames.
+        let block_start = writer
+            .write_response_event(&IrStreamEvent::BlockStart {
+                index: 0,
+                block: IrBlockMeta::Thinking,
+            })
+            .expect("Thinking BlockStart must produce a frame");
+        assert_eq!(block_start.0, "contentBlockStart");
+        assert!(
+            block_start.1.pointer("/start/reasoningContent").is_some(),
+            "a Thinking BlockStart must emit a reasoningContent start; got {}",
+            block_start.1
+        );
+
+        let text_delta = writer
+            .write_response_event(&IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::ThinkingDelta("hello".to_string()),
+            })
+            .expect("ThinkingDelta must produce a frame");
+        assert_eq!(text_delta.0, "contentBlockDelta");
+        assert_eq!(
+            text_delta
+                .1
+                .pointer("/delta/reasoningContent/text")
+                .and_then(|v| v.as_str()),
+            Some("hello"),
+            "a ThinkingDelta must re-emit as reasoningContent.text; got {}",
+            text_delta.1
+        );
+
+        let sig_delta = writer
+            .write_response_event(&IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::SignatureDelta("sig-xyz".to_string()),
+            })
+            .expect("SignatureDelta must produce a frame");
+        assert_eq!(sig_delta.0, "contentBlockDelta");
+        assert_eq!(
+            sig_delta
+                .1
+                .pointer("/delta/reasoningContent/signature")
+                .and_then(|v| v.as_str()),
+            Some("sig-xyz"),
+            "a SignatureDelta must re-emit as reasoningContent.signature; got {}",
+            sig_delta.1
+        );
+        // A genuine signature must NOT leak as redactedContent.
+        assert!(
+            sig_delta
+                .1
+                .pointer("/delta/reasoningContent/redactedContent")
+                .is_none(),
+            "a real signature must not re-emit as redactedContent; got {}",
+            sig_delta.1
+        );
+    }
+
+    /// Regression (R26 MED #3/#4): the STREAMING redacted-reasoning case. A `reasoningContent`
+    /// delta carrying `redactedContent` (opaque encrypted bytes) must survive read->IR->write on the
+    /// streaming path, re-emitting as `redactedContent` — never leaking as a plaintext `text` or a
+    /// `signature`. The reader collapses it into a single SignatureDelta carrying the
+    /// REASONING_REDACTED_SIG_SENTINEL prefix + bytes (one IR delta → one frame); the writer strips
+    /// the sentinel and re-emits the bytes under `redactedContent`. FAILS against the old code (the
+    /// redacted delta was dropped entirely) and passes after.
+    #[test]
+    fn test_stream_reasoning_redacted_round_trips() {
+        use crate::ir::{IrBlockMeta, IrDelta, IrStreamEvent};
+
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        let frames = vec![
+            serde_json::json!({"type": "messageStart", "role": "assistant"}),
+            serde_json::json!({
+                "type": "contentBlockDelta",
+                "contentBlockIndex": 0,
+                "delta": {"reasoningContent": {"redactedContent": "RVhBTVBMRQ=="}}
+            }),
+            serde_json::json!({"type": "contentBlockStop", "contentBlockIndex": 0}),
+        ];
+
+        let events: Vec<IrStreamEvent> = frames
+            .into_iter()
+            .flat_map(|f| reader.read_response_events("", &f, &mut state))
+            .collect();
+
+        // A Thinking block is opened and the redacted bytes ride on a sentinel-prefixed SignatureDelta.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::Thinking
+                }
+            )),
+            "a Thinking BlockStart must open for a streamed redactedContent delta; got {events:?}"
+        );
+        let sentinel_delta = events.iter().find_map(|e| match e {
+            IrStreamEvent::BlockDelta {
+                delta: IrDelta::SignatureDelta(s),
+                ..
+            } => Some(s.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            sentinel_delta.as_deref(),
+            Some(
+                format!("{REASONING_REDACTED_SIG_SENTINEL}RVhBTVBMRQ==").as_str()
+            ),
+            "redacted reasoning bytes must ride on a sentinel-prefixed SignatureDelta; got {events:?}"
+        );
+        // No plaintext ThinkingDelta must be emitted for a redacted block (no leak of the bytes as text).
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockDelta {
+                    delta: IrDelta::ThinkingDelta(_),
+                    ..
+                }
+            )),
+            "a redacted reasoning block must NOT emit a plaintext ThinkingDelta; got {events:?}"
+        );
+
+        // Writer re-emits the bytes under redactedContent, stripping the sentinel.
+        let frame = writer
+            .write_response_event(&IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::SignatureDelta(sentinel_delta.expect("sentinel delta present")),
+            })
+            .expect("sentinel SignatureDelta must produce a frame");
+        assert_eq!(frame.0, "contentBlockDelta");
+        assert_eq!(
+            frame
+                .1
+                .pointer("/delta/reasoningContent/redactedContent")
+                .and_then(|v| v.as_str()),
+            Some("RVhBTVBMRQ=="),
+            "a sentinel SignatureDelta must re-emit the bytes as redactedContent; got {}",
+            frame.1
+        );
+        assert!(
+            frame
+                .1
+                .pointer("/delta/reasoningContent/signature")
+                .is_none(),
+            "a redacted reasoning delta must NOT leak as a plaintext signature; got {}",
+            frame.1
+        );
+        assert!(
+            frame.1.pointer("/delta/reasoningContent/text").is_none(),
+            "a redacted reasoning delta must NOT leak as a plaintext text; got {}",
+            frame.1
         );
     }
 

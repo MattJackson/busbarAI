@@ -126,6 +126,22 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
     // circuit breaker), exactly like the shipped `anthropic` catalog entry. Only the entries that
     // ARE present must name a known StatusClass.
     for (provider_name, provider_cfg) in &cfg.providers {
+        // The provider's `protocol` selects a built-in `Protocol` from the registry at lane
+        // construction. An unknown protocol used to escape this multi-error collection entirely and
+        // surface as a lone `die()` deep in `main.rs` (lane build) — so an operator with several
+        // config mistakes saw only the first one. Validate it HERE against the single source of truth
+        // (`proto::KNOWN_PROTOCOLS`, the same list `ProtocolRegistry::with_builtins` builds from) so a
+        // bad protocol is collected alongside every other error. `main.rs`'s `die()` remains a
+        // defensive (now unreachable) backstop.
+        if !crate::proto::KNOWN_PROTOCOLS.contains(&provider_cfg.protocol.as_str()) {
+            errors.push(format!(
+                "provider '{}' has unknown protocol '{}': must be one of: {}",
+                provider_name,
+                provider_cfg.protocol,
+                crate::proto::KNOWN_PROTOCOLS.join(", ")
+            ));
+        }
+
         for (code, mapped_class) in &provider_cfg.error_map {
             if crate::config::status_class_from_str(mapped_class).is_none() {
                 errors.push(format!(
@@ -990,6 +1006,45 @@ mod tests {
         assert!(
             !errs.iter().any(|e| e.contains("invalid auth 'api-key'")),
             "'api-key' is a valid auth style and must not error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_protocol() {
+        // An unknown `protocol` must be COLLECTED by validate() (alongside any other config error),
+        // not escape to a lone `die()` at lane construction in main.rs. Mirrors
+        // test_validate_rejects_bad_auth_style.
+        let mut providers = HashMap::new();
+        let bad = make_provider("nope", "https://api.example.com", "API_KEY");
+        providers.insert("bad".to_string(), bad);
+        // A provider on a real protocol must NOT trigger this error.
+        let ok = make_provider("anthropic", "https://api.anthropic.com", "ANTHROPIC_KEY");
+        providers.insert("good".to_string(), ok);
+
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        let errs = validate(&cfg).expect_err("unknown protocol must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("unknown protocol 'nope'") && e.contains("'bad'")),
+            "expected an unknown-protocol error naming provider 'bad' and 'nope'; got: {errs:?}"
+        );
+        // The error must enumerate the allowed set so the operator can self-correct.
+        let msg = errs
+            .iter()
+            .find(|e| e.contains("unknown protocol 'nope'"))
+            .unwrap_or_else(|| panic!("expected unknown-protocol error; got: {errs:?}"));
+        for proto in crate::proto::KNOWN_PROTOCOLS {
+            assert!(
+                msg.contains(proto),
+                "allowed-set list must include '{proto}'; got: {msg}"
+            );
+        }
+        // A real protocol ('anthropic') must not be flagged as unknown.
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.contains("unknown protocol 'anthropic'")),
+            "'anthropic' is a valid protocol and must not error; got: {errs:?}"
         );
     }
 

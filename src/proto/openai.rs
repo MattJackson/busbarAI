@@ -645,6 +645,11 @@ impl ProtocolReader for OpenAiReader {
             }
             if !state.text_block_open {
                 state.text_block_open = true;
+                // Persist that a text block now occupies `text_index` (the slot just past any
+                // thinking block). Tool-call indices key off `state.text_index.is_some()` so they
+                // reserve a slot for text ONLY when text actually appears — see the `text_base`
+                // derivation below.
+                state.text_index = Some(text_index);
                 out.push(IrStreamEvent::BlockStart {
                     index: text_index,
                     block: crate::ir::IrBlockMeta::Text,
@@ -656,12 +661,20 @@ impl ProtocolReader for OpenAiReader {
             });
         }
 
-        // 4. Tool calls → IR block index = oai_idx + 1 + offset (text owns `offset`). BlockStart on
-        //    first sight (id+name present), InputJsonDelta for streamed arguments.
+        // 4. Tool calls → IR block index = oai_idx + text_base + offset. `offset` (0/1) is the
+        //    thinking slot; `text_base` (0/1) reserves index for the text block ONLY when text has
+        //    actually appeared. Mirrors the Gemini reader: a tool-only stream (no text) yields
+        //    0-based tool indices instead of the prior unconditional +1, which left tool indices
+        //    1-based and broke cross-protocol tool-call ordering (Anthropic/OpenAI writers key on
+        //    index). BlockStart on first sight (id+name present), InputJsonDelta for streamed
+        //    arguments.
         if let Some(tcs) = delta
             .and_then(|d| d.get("tool_calls"))
             .and_then(|t| t.as_array())
         {
+            // 0 when no text block has opened, 1 once one has (then the text block owns the slot
+            // just below the tools). Lineage: R25 cohere dynamic-text-index fix.
+            let text_base = usize::from(state.text_index.is_some());
             // A tool call means the answer phase has begun; close any still-open thinking block.
             if state.thinking_block_open {
                 state.thinking_block_open = false;
@@ -670,7 +683,7 @@ impl ProtocolReader for OpenAiReader {
             for tc in tcs {
                 // Bound the upstream-supplied tool-call index before it touches our index
                 // arithmetic. A crafted/proxied chunk can carry `"index": u64::MAX`; casting that
-                // raw to `usize` and computing `oai_idx + 1 + offset` overflows — panicking on the
+                // raw to `usize` and computing `oai_idx + text_base + offset` overflows — panicking on the
                 // request path in debug builds and silently wrapping to a near-zero index in release
                 // (corrupting the IR block sequence delivered downstream). OpenAI documents at most
                 // 128 parallel tool calls, so any larger index is malformed; clamp to MAX_TOOL_INDEX
@@ -680,7 +693,10 @@ impl ProtocolReader for OpenAiReader {
                     .get("index")
                     .and_then(|i| i.as_u64())
                     .map_or(0, |v| v.min(MAX_TOOL_INDEX) as usize);
-                let ir_idx = match oai_idx.checked_add(1).and_then(|n| n.checked_add(offset)) {
+                let ir_idx = match oai_idx
+                    .checked_add(text_base)
+                    .and_then(|n| n.checked_add(offset))
+                {
                     Some(idx) => idx,
                     None => continue,
                 };
@@ -770,12 +786,16 @@ impl ProtocolReader for OpenAiReader {
                 state.text_block_open = false;
                 out.push(IrStreamEvent::BlockStop { index: text_index });
             }
+            // Same text-presence base used when the tool BlockStarts were emitted, so each
+            // BlockStop pairs with its BlockStart's IR index. `state.text_index` is set iff a text
+            // block opened during this stream; tool-only streams keep a 0 base.
+            let text_base = usize::from(state.text_index.is_some());
             for oai_idx in std::mem::take(&mut state.open_tools) {
                 // `oai_idx` was clamped to <= MAX_TOOL_INDEX before it entered `open_tools`, so this
                 // cannot overflow; use saturating arithmetic anyway so the close index can never wrap
                 // and the BlockStop always pairs with the BlockStart's IR index.
                 out.push(IrStreamEvent::BlockStop {
-                    index: oai_idx.saturating_add(1).saturating_add(offset),
+                    index: oai_idx.saturating_add(text_base).saturating_add(offset),
                 });
             }
             let stop_reason = Some(match fr {
@@ -3576,7 +3596,7 @@ mod tests {
     fn stream_tool_call_index_u64_max_does_not_panic_or_wrap() {
         // A crafted/proxied chunk with `"index": u64::MAX` must not panic (debug) or wrap to a
         // near-zero IR index (release). The index is clamped to MAX_TOOL_INDEX before the
-        // `oai_idx + 1 + offset` arithmetic, so the emitted BlockStart index stays bounded.
+        // `oai_idx + text_base + offset` arithmetic, so the emitted BlockStart index stays bounded.
         let reader = OpenAiReader;
         let mut st = crate::ir::StreamDecodeState::default();
         let evs = reader.read_response_events(
@@ -3597,8 +3617,8 @@ mod tests {
             }),
             &mut st,
         );
-        // A BlockStart is emitted with a bounded index (clamped 127 + 1, no thinking offset = 128),
-        // never wrapping to a tiny value.
+        // A BlockStart is emitted with a bounded index (clamped 127, no text block so text_base=0,
+        // no thinking offset), never wrapping to a tiny value.
         let start_idx = evs
             .iter()
             .find_map(|e| match e {
@@ -3606,7 +3626,7 @@ mod tests {
                 _ => None,
             })
             .expect("clamped tool-call still opens a block");
-        assert_eq!(start_idx, (MAX_TOOL_INDEX as usize) + 1);
+        assert_eq!(start_idx, MAX_TOOL_INDEX as usize);
         // The matching argument delta routes to the same bounded index.
         let delta_idx = evs.iter().find_map(|e| match e {
             IrStreamEvent::BlockDelta {
@@ -3620,8 +3640,8 @@ mod tests {
 
     #[test]
     fn stream_tool_call_index_close_does_not_overflow_on_finish() {
-        // The finish-path close loop computes the same `oai_idx + 1 + offset`; with a clamped index
-        // it must close at the matching bounded IR index without panicking/wrapping.
+        // The finish-path close loop computes the same `oai_idx + text_base + offset`; with a
+        // clamped index it must close at the matching bounded IR index without panicking/wrapping.
         let reader = OpenAiReader;
         let mut st = crate::ir::StreamDecodeState::default();
         let _ = reader.read_response_events(
@@ -3659,7 +3679,166 @@ mod tests {
                 _ => None,
             })
             .expect("open tool block is closed on finish");
-        assert_eq!(stop_idx, (MAX_TOOL_INDEX as usize) + 1);
+        assert_eq!(stop_idx, MAX_TOOL_INDEX as usize);
+    }
+
+    // --- Round 26 fix (MED #5): tool-call IR indices reserve a text slot ONLY when text appears
+    //     (cross-protocol sibling of the R25 cohere dynamic-text-index fix). Under the old
+    //     unconditional `+1` text base, a tool-only stream emitted 1-based tool indices, breaking
+    //     cross-protocol tool-call ordering for writers that key on the IR block index.
+
+    #[test]
+    fn stream_tool_only_yields_zero_based_tool_indices() {
+        // No text block ever opens, so the first tool call must claim IR index 0 (text_base = 0),
+        // NOT index 1. Fails against the old `oai_idx + 1 + offset` arithmetic.
+        let reader = OpenAiReader;
+        let mut st = crate::ir::StreamDecodeState::default();
+        let start_evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-to",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": [{
+                        "index": 0,
+                        "id": "call_a",
+                        "function": { "name": "f", "arguments": "{\"x\":1}" }
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+            &mut st,
+        );
+        let start_idx = start_evs
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::BlockStart {
+                    index,
+                    block: IrBlockMeta::ToolUse { .. },
+                } => Some(*index),
+                _ => None,
+            })
+            .expect("tool-only stream opens a tool block");
+        assert_eq!(
+            start_idx, 0,
+            "tool-only stream must be 0-based, not 1-based"
+        );
+        // Argument delta routes to the same 0 index.
+        let delta_idx = start_evs.iter().find_map(|e| match e {
+            IrStreamEvent::BlockDelta {
+                index,
+                delta: IrDelta::InputJsonDelta(_),
+            } => Some(*index),
+            _ => None,
+        });
+        assert_eq!(delta_idx, Some(0));
+        // ...and the finish-path BlockStop closes at the SAME 0 index.
+        let finish_evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-to",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+            }),
+            &mut st,
+        );
+        let stop_idx = finish_evs
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::BlockStop { index } => Some(*index),
+                _ => None,
+            })
+            .expect("tool block is closed on finish");
+        assert_eq!(
+            stop_idx, 0,
+            "tool BlockStop must pair with its 0-based start"
+        );
+    }
+
+    #[test]
+    fn stream_text_then_tool_keeps_text_at_zero_tool_after() {
+        // A text+tool stream keeps text at index 0 and places the tool at index 1 (text_base = 1).
+        let reader = OpenAiReader;
+        let mut st = crate::ir::StreamDecodeState::default();
+        // Text first → opens at index 0.
+        let text_evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-tt",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "hello" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut st,
+        );
+        let text_idx = text_evs
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::BlockStart {
+                    index,
+                    block: IrBlockMeta::Text,
+                } => Some(*index),
+                _ => None,
+            })
+            .expect("text block opens");
+        assert_eq!(text_idx, 0, "text owns index 0");
+        // Then a tool call → must open at index 1 (just past the text block).
+        let tool_evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-tt",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": [{
+                        "index": 0,
+                        "id": "call_b",
+                        "function": { "name": "g", "arguments": "{}" }
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+            &mut st,
+        );
+        let tool_idx = tool_evs
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::BlockStart {
+                    index,
+                    block: IrBlockMeta::ToolUse { .. },
+                } => Some(*index),
+                _ => None,
+            })
+            .expect("tool block opens after text");
+        assert_eq!(tool_idx, 1, "tool follows the text block at index 1");
+        // Finish closes text at 0 and the tool at 1.
+        let finish_evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-tt",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+            }),
+            &mut st,
+        );
+        let stops: Vec<usize> = finish_evs
+            .iter()
+            .filter_map(|e| match e {
+                IrStreamEvent::BlockStop { index } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert!(stops.contains(&0), "text BlockStop at 0: {stops:?}");
+        assert!(stops.contains(&1), "tool BlockStop at 1: {stops:?}");
     }
 
     // --- Round 6 fix 2 (MEDIUM/security): open_tools cardinality is capped per stream ---
