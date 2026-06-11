@@ -1020,11 +1020,15 @@ fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
              (anthropic rejects unsigned thinking blocks with a 400)"
         );
     }
-    let content_val: serde_json::Value = if blocks.is_empty() {
-        serde_json::Value::String("".to_string())
-    } else {
-        serde_json::Value::Array(blocks.into_iter().map(write_block).collect())
-    };
+    // When no blocks survive (e.g. an all-thinking assistant message whose unsigned thinking blocks
+    // were all dropped above), emit an EMPTY ARRAY `[]`, not an empty STRING `""`. Anthropic's
+    // Messages API rejects a message whose top-level `content` is the empty string with a 400
+    // ("text content blocks must be non-empty" / "content: field required"), whereas an empty array
+    // is a well-formed message with zero content blocks that the API accepts. This matches the
+    // empty-array skeleton `write_response_event` already emits for `message_start.message.content`
+    // (a message with no blocks yet). The non-empty branch is unchanged: a populated array of blocks.
+    let content_val: serde_json::Value =
+        serde_json::Value::Array(blocks.into_iter().map(write_block).collect());
     serde_json::json!({ "role": role_str, "content": content_val })
 }
 
@@ -2863,6 +2867,63 @@ mod anthropic_hardening_tests {
         assert!(texts.contains(&"signed reasoning"));
         assert!(texts.contains(&"the answer"));
         assert!(!texts.contains(&"unsigned reasoning"));
+    }
+
+    /// R22 LOW #15 (empty-content class): when every content block is filtered out — e.g. an
+    /// all-thinking assistant message whose unsigned thinking blocks are all dropped on the request
+    /// path — `write_message` must emit `content: []` (an empty array, a valid zero-block message),
+    /// NOT `content: ""` (an empty string, which Anthropic's Messages API rejects with a 400). The
+    /// old code emitted the bare empty string; this guards the regression.
+    #[test]
+    fn write_message_emits_empty_array_when_all_blocks_dropped() {
+        let msg = crate::ir::IrMessage {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![
+                crate::ir::IrBlock::Thinking {
+                    text: "unsigned reasoning A".to_string(),
+                    signature: None,
+                },
+                crate::ir::IrBlock::Thinking {
+                    text: "unsigned reasoning B".to_string(),
+                    signature: None,
+                },
+            ],
+        };
+        let out = write_message(&msg);
+        let content = out.get("content").expect("content key present");
+        assert!(
+            !content.is_string(),
+            "content must not be a bare empty string (anthropic 400s an empty content string): {content:?}"
+        );
+        let arr = content
+            .as_array()
+            .expect("content must be an array when no blocks survive");
+        assert!(
+            arr.is_empty(),
+            "every block was dropped, so the content array must be empty: {arr:?}"
+        );
+    }
+
+    /// R22 LOW #15 (companion): a message with a single surviving block still emits a populated
+    /// content ARRAY (never the empty-string fallback) — confirms the non-empty branch is intact
+    /// after collapsing the old `if blocks.is_empty()` split.
+    #[test]
+    fn write_message_emits_array_for_surviving_block() {
+        let msg = crate::ir::IrMessage {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "kept".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+        };
+        let out = write_message(&msg);
+        let arr = out
+            .get("content")
+            .and_then(|c| c.as_array())
+            .expect("content must be an array");
+        assert_eq!(arr.len(), 1, "the single text block must survive: {arr:?}");
+        assert_eq!(arr[0].get("text").and_then(|t| t.as_str()), Some("kept"));
     }
 
     /// R19 #28 (response reasoning untouched): the request-side filter must NOT affect the response

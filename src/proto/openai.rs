@@ -298,7 +298,11 @@ impl ProtocolReader for OpenAiReader {
                 let content_val = msg_val.get("content");
 
                 let role = match role_str {
-                    "system" => crate::ir::IrRole::System,
+                    // OpenAI's o1/o3 reasoning models replace "system" with "developer" (the
+                    // Responses API reader already treats them as equivalent). Map both to the IR
+                    // System role so a developer-role turn flows through the existing
+                    // System-promotion path below rather than being 400ed by the catch-all.
+                    "developer" | "system" => crate::ir::IrRole::System,
                     "user" => crate::ir::IrRole::User,
                     "assistant" => crate::ir::IrRole::Assistant,
                     "tool" => crate::ir::IrRole::Tool,
@@ -1137,11 +1141,19 @@ impl ProtocolWriter for OpenAiWriter {
     }
 
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
-        vec![(
-            HeaderName::from_static("authorization"),
-            HeaderValue::from_str(&format!("Bearer {key}"))
-                .unwrap_or_else(|_| HeaderValue::from_static("")),
-        )]
+        let value = HeaderValue::from_str(&format!("Bearer {key}")).unwrap_or_else(|_| {
+            // Mirror the Anthropic writer: surface the misconfiguration instead of silently
+            // emitting an empty Bearer (which yields an opaque upstream 401). Never log key
+            // bytes — only the fact that they were invalid for an HTTP header value.
+            tracing::warn!(
+                header = "authorization",
+                "openai auth credential contains bytes invalid for an HTTP header value \
+                 (e.g. a trailing newline); sending an empty value, the upstream will return \
+                 401 — check the key configuration"
+            );
+            HeaderValue::from_static("")
+        });
+        vec![(HeaderName::from_static("authorization"), value)]
     }
 
     fn rewrite_model(&self, body: &mut serde_json::Value, model: &str) {
@@ -1967,6 +1979,28 @@ mod tests {
         });
         let ir = OpenAiReader.read_request(&body).expect("parses");
         assert_eq!(ir.system, vec![text_block("")]);
+    }
+
+    // --- read_request: the "developer" role (OpenAI o1/o3 system-equivalent) is accepted and
+    //     promoted to the top-level system field, not 400ed by the role catch-all (R22 HIGH #2).
+
+    #[test]
+    fn read_request_developer_role_feeds_system_not_rejected() {
+        let body = serde_json::json!({
+            "model": "o3",
+            "messages": [
+                { "role": "developer", "content": "be precise" },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+        // Old code returned Err(400) on the unknown "developer" role; it must now parse.
+        let ir = OpenAiReader
+            .read_request(&body)
+            .expect("developer role must not 400");
+        // The developer turn carries the system prompt and lands in the top-level system field...
+        assert_eq!(ir.system, vec![text_block("be precise")]);
+        // ...and is never surfaced as a System-role IrMessage inside the messages array.
+        assert!(ir.messages.iter().all(|m| m.role != IrRole::System));
     }
 
     // --- read_request: `max_completion_tokens` is a modeled output-token cap (R15 finding)
@@ -4288,5 +4322,35 @@ mod tests {
         });
         let ir3 = reader.read_request(&body3).expect("request parses");
         assert_eq!(ir3.max_tokens, Some(1024));
+    }
+
+    // --- auth_headers: invalid credential bytes fall back to an empty value without panic, and a
+    //     valid key produces the expected single `authorization: Bearer` header (R22 LOW #14).
+
+    fn header_value(headers: &[(HeaderName, HeaderValue)], name: &str) -> Option<String> {
+        headers
+            .iter()
+            .find(|(n, _)| n.as_str() == name)
+            .map(|(_, v)| v.to_str().unwrap_or_default().to_string())
+    }
+
+    #[test]
+    fn auth_headers_valid_key_emits_bearer_authorization() {
+        let headers = OpenAiWriter.auth_headers("sk-openai-good-key");
+        assert_eq!(
+            header_value(&headers, "authorization").as_deref(),
+            Some("Bearer sk-openai-good-key")
+        );
+        assert_eq!(headers.len(), 1, "openai auth emits a single header");
+    }
+
+    #[test]
+    fn auth_headers_invalid_key_falls_back_to_empty_no_panic() {
+        // A key whose bytes are invalid for an HTTP header value (an embedded newline). The writer
+        // must not panic; it falls back to an empty `authorization` value (and warns — not asserted
+        // here, but the empty fallback is what previously happened SILENTLY).
+        let headers = OpenAiWriter.auth_headers("sk-openai-bad\nkey");
+        assert_eq!(header_value(&headers, "authorization").as_deref(), Some(""));
+        assert_eq!(headers.len(), 1);
     }
 }

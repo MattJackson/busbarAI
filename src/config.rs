@@ -644,6 +644,16 @@ pub(crate) fn resolve(
 mod tests {
     use super::*;
 
+    /// Serializes tests that touch the *shared* `BUSBAR_CLIENT_TOKEN` env var. Env vars are
+    /// process-global, and `cargo test` runs tests in parallel by default, so two tests that
+    /// `set_var`/`remove_var` the same name race: one can wipe the value mid-flight of the other,
+    /// causing a spurious "unset variable" interpolation failure. Renaming is not viable because the
+    /// shipped `config.yaml` hard-references `${BUSBAR_CLIENT_TOKEN}`; instead, every test that
+    /// drives that var must hold this lock for the whole set/interpolate/remove sequence.
+    ///
+    /// Per-test vars use unique `BUSBAR_T_*` names and so do not need this guard.
+    static CLIENT_TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A `tracing::Layer` that records the messages of WARN-level events it sees, so a test can
     /// assert a particular `tracing::warn!` fired.
     #[derive(Clone, Default)]
@@ -814,6 +824,12 @@ models:
     /// (every referenced provider/model exists; the example stays a working starting point).
     #[test]
     fn test_shipped_example_config_resolves() {
+        // Hold the shared-env lock across the whole set/interpolate/remove sequence so a sibling test
+        // that also drives BUSBAR_CLIENT_TOKEN cannot wipe it mid-flight (recover on poison: a panic
+        // in another holder must not block this test).
+        let _env_guard = CLIENT_TOKEN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // The example references env-var placeholders via `${...}` interpolation, which scans the
         // whole file — including commented blocks. ONLY the active (uncommented) `auth.client_tokens`
         // entry uses the brace form, so only BUSBAR_CLIENT_TOKEN must be set. The commented
@@ -855,6 +871,10 @@ models:
     /// success; it fails against the old `${...}` comment (unset-variable boot error).
     #[test]
     fn test_default_config_boots_without_admin_token_env() {
+        // Serialize with the sibling that shares BUSBAR_CLIENT_TOKEN (see CLIENT_TOKEN_ENV_LOCK).
+        let _env_guard = CLIENT_TOKEN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::set_var("BUSBAR_CLIENT_TOKEN", "example-token");
         std::env::remove_var("BUSBAR_ADMIN_TOKEN");
 
@@ -878,6 +898,47 @@ models:
         );
 
         std::env::remove_var("BUSBAR_CLIENT_TOKEN");
+    }
+
+    /// Regression (#20): the two integration tests above share the process-global
+    /// `BUSBAR_CLIENT_TOKEN` env var with a set → interpolate → remove sequence. Under the default
+    /// parallel test runner, an unguarded sibling could `remove_var` between this test's `set_var`
+    /// and `interpolate_env`, making interpolation fail with an "unset variable" error. This test
+    /// reproduces that race deterministically by hammering the exact sequence from many threads, and
+    /// asserts that holding `CLIENT_TOKEN_ENV_LOCK` across the whole sequence keeps every
+    /// interpolation succeeding. Run against the old (unguarded) sequence it flakes/fails; with the
+    /// guard it is stable.
+    #[test]
+    fn test_client_token_env_lock_serializes_set_interpolate_remove() {
+        const THREADS: usize = 8;
+        const ITERS: usize = 200;
+        let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let failures = std::sync::Arc::clone(&failures);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ITERS {
+                    // The guard makes set/interpolate/remove atomic w.r.t. other lock holders.
+                    let _g = CLIENT_TOKEN_ENV_LOCK
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    std::env::set_var("BUSBAR_CLIENT_TOKEN", "race-token");
+                    let r = interpolate_env("tok: \"${BUSBAR_CLIENT_TOKEN}\"");
+                    if r.as_deref() != Ok("tok: \"race-token\"") {
+                        failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    std::env::remove_var("BUSBAR_CLIENT_TOKEN");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("interpolation thread must not panic");
+        }
+        assert_eq!(
+            failures.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "guarded set/interpolate/remove of BUSBAR_CLIENT_TOKEN must never observe an unset var"
+        );
     }
 
     /// The shipped providers.yaml catalog must parse, name only known protocols, and use HTTPS.

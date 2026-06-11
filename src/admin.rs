@@ -11,8 +11,25 @@ use std::sync::Arc;
 use axum::extract::{Json, Path, State};
 use axum::http::{header::CONTENT_TYPE, StatusCode};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
+
+/// Deserialize a field as a "double option" so the three JSON intents stay distinguishable:
+///   - field ABSENT: the `#[serde(default)]` on the field supplies the OUTER `None`.
+///   - field present `null`: this fn is invoked and yields `Some(None)` (an explicit clear).
+///   - field present value: this fn is invoked and yields `Some(Some(v))` (an explicit set).
+///
+/// Serde calls a field's deserializer ONLY when the key is present, so the absent case never reaches
+/// here (it is covered by the field default). This is the standard `double_option` pattern; it lets
+/// PATCH express "clear this cap back to unlimited" (`null`) distinctly from "leave it unchanged"
+/// (omit), which a single `Option<T>` cannot represent.
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
 
 use crate::governance::{NewKeySpec, VirtualKey};
 use crate::state::App;
@@ -181,16 +198,24 @@ pub(crate) async fn create_key(
 
 /// Partial update to an existing key. Every field is optional; only the present ones change. The
 /// secret, name, allowed-pools, and budget period are immutable here (rotate/recreate for those).
+///
+/// The three cap fields are THREE-STATE via serde double-option (`Option<Option<T>>`):
+///   - absent (`#[serde(default)]` -> outer `None`): leave the stored cap unchanged.
+///   - JSON `null` (`Some(None)`): CLEAR the cap back to unlimited.
+///   - a value (`Some(Some(v))`): SET the cap to that value.
+///
+/// A single `Option<T>` could not tell absent from present-null, so a cap could never be cleared
+/// once set. `enabled` is a plain `Option<bool>` (a bool has no "unlimited"/clear state).
 #[derive(Deserialize)]
 pub(crate) struct UpdateKeyReq {
     #[serde(default)]
     enabled: Option<bool>,
-    #[serde(default)]
-    rpm_limit: Option<u32>,
-    #[serde(default)]
-    tpm_limit: Option<u32>,
-    #[serde(default)]
-    max_budget_cents: Option<i64>,
+    #[serde(default, deserialize_with = "double_option")]
+    rpm_limit: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    tpm_limit: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    max_budget_cents: Option<Option<i64>>,
 }
 
 /// PATCH /admin/keys/:id — enable/disable a key or adjust its rate/budget caps. The `enabled` field
@@ -209,24 +234,29 @@ pub(crate) async fn update_key(
     // Create-parity validation (see create_key for the rationale on each): a negative budget is a
     // silent over-budget DoS; a zero rate cap is a permanently-unusable key. Reject both here so PATCH
     // cannot install a value create() forbids.
-    if let Some(budget) = req.max_budget_cents {
+    //
+    // THREE-STATE: validation applies ONLY to a present *value* (`Some(Some(v))` = set). A present
+    // `null` (`Some(Some(_))` vs `Some(None)`) means "clear to unlimited" and is always allowed — it
+    // can never produce a dead/over-budget key, so it must NOT be rejected by the create-parity
+    // guards. Absent (`None`) leaves the field unchanged and likewise needs no check.
+    if let Some(Some(budget)) = req.max_budget_cents {
         if budget < 0 {
             return json_response(
                 StatusCode::BAD_REQUEST,
-                json!({"error": "max_budget_cents must be >= 0"}),
+                json!({"error": "max_budget_cents must be >= 0 (use null to clear to unlimited)"}),
             );
         }
     }
-    if req.rpm_limit == Some(0) {
+    if req.rpm_limit == Some(Some(0)) {
         return json_response(
             StatusCode::BAD_REQUEST,
-            json!({"error": "rpm_limit must be >= 1 (omit the field to leave unchanged)"}),
+            json!({"error": "rpm_limit must be >= 1 (omit to leave unchanged, null to clear to unlimited)"}),
         );
     }
-    if req.tpm_limit == Some(0) {
+    if req.tpm_limit == Some(Some(0)) {
         return json_response(
             StatusCode::BAD_REQUEST,
-            json!({"error": "tpm_limit must be >= 1 (omit the field to leave unchanged)"}),
+            json!({"error": "tpm_limit must be >= 1 (omit to leave unchanged, null to clear to unlimited)"}),
         );
     }
     let gov = gov.clone();
@@ -696,6 +726,121 @@ mod tests {
         assert!(
             body["rpm_limit"].is_null() && body["tpm_limit"].is_null(),
             "omitted limits are unlimited (null): {body}"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_patch_key_clears_caps_to_unlimited_via_null() {
+        // LOW #16/#19 (three-state): PATCH must distinguish absent (leave unchanged), JSON null
+        // (clear to unlimited), and a value (set). A single Option<T> conflated absent with null, so a
+        // cap could never be cleared once set. Verify the full matrix end-to-end through the handler.
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (addr, handle) = serve_with_gov(gov).await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}/admin/keys");
+
+        // Create a key that HAS all three caps set.
+        let created: serde_json::Value = client
+            .post(&base)
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({
+                "name": "k",
+                "rpm_limit": 10,
+                "tpm_limit": 2000,
+                "max_budget_cents": 5000
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["rpm_limit"], 10);
+        assert_eq!(created["tpm_limit"], 2000);
+        assert_eq!(created["max_budget_cents"], 5000);
+        let key_url = format!("{base}/{id}");
+
+        // Present null CLEARS each cap to unlimited (null in the response).
+        let cleared: serde_json::Value = client
+            .patch(&key_url)
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({
+                "rpm_limit": null,
+                "tpm_limit": null,
+                "max_budget_cents": null
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            cleared["rpm_limit"].is_null(),
+            "rpm cleared to unlimited: {cleared}"
+        );
+        assert!(cleared["tpm_limit"].is_null(), "tpm cleared to unlimited");
+        assert!(
+            cleared["max_budget_cents"].is_null(),
+            "budget cleared to unlimited"
+        );
+
+        // Re-set them with values.
+        let reset: serde_json::Value = client
+            .patch(&key_url)
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({
+                "rpm_limit": 7,
+                "tpm_limit": 99,
+                "max_budget_cents": 123
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(reset["rpm_limit"], 7);
+        assert_eq!(reset["tpm_limit"], 99);
+        assert_eq!(reset["max_budget_cents"], 123);
+
+        // Absent fields LEAVE the caps unchanged (only `enabled` present here).
+        let unchanged: serde_json::Value = client
+            .patch(&key_url)
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"enabled": false}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(unchanged["enabled"], false);
+        assert_eq!(unchanged["rpm_limit"], 7, "absent leaves rpm unchanged");
+        assert_eq!(unchanged["tpm_limit"], 99, "absent leaves tpm unchanged");
+        assert_eq!(
+            unchanged["max_budget_cents"], 123,
+            "absent leaves budget unchanged"
+        );
+
+        // Clearing to unlimited (null) must NOT trip the create-parity guards (those reject a present
+        // 0/negative VALUE, not a clear). null on rpm/tpm/budget all return 200.
+        let cleared2 = client
+            .patch(&key_url)
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"rpm_limit": null, "max_budget_cents": null}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            cleared2.status().as_u16(),
+            200,
+            "null (clear) must not be rejected by the create-parity guards"
         );
 
         handle.abort();

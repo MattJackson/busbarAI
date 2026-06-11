@@ -801,6 +801,7 @@ impl UsageTap {
     /// uncapped brace-scan over the whole slice so a trailing usage frame is still found.
     pub(crate) fn feed_whole(&mut self, body: &[u8]) {
         if let Ok(obj) = serde_json::from_slice::<Value>(body) {
+            self.extract_usage_from_message_start(&obj);
             self.extract_usage_from_delta(&obj);
             self.extract_usage_from_stop(&obj);
             self.extract_usage_any(&obj);
@@ -823,6 +824,7 @@ impl UsageTap {
                 if let Some(end) = find_matching_brace(&chunk[start..]) {
                     let json_bytes = &chunk[start..start + end];
                     if let Ok(obj) = serde_json::from_slice::<Value>(json_bytes) {
+                        self.extract_usage_from_message_start(&obj);
                         self.extract_usage_from_delta(&obj);
                         self.extract_usage_from_stop(&obj);
                         self.extract_usage_any(&obj);
@@ -930,6 +932,39 @@ impl UsageTap {
             }
             if let Some(v) = u.get("output_tokens").and_then(|v| v.as_u64()) {
                 self.output_tokens = Some(v);
+            }
+        }
+    }
+
+    /// Extract usage fields from a `message_start` event object (Anthropic SSE).
+    ///
+    /// Completeness fix (MED #3): Anthropic emits `input_tokens` ONLY on the opening
+    /// `message_start` frame — `{"type":"message_start","message":{"usage":{"input_tokens":N,…}}}`
+    /// — and then sends `output_tokens` (and any usage corrections) on the trailing
+    /// `message_delta`/`message_stop` frames, whose `usage` block omits `input_tokens`. The
+    /// cross-protocol path backfills the prompt count when translating egress→IR via
+    /// `StreamTranslate`, but the SAME-protocol Anthropic→Anthropic stream has no translate seam,
+    /// so without reading `message_start` here the tap reports `input_tokens = 0` for every native
+    /// Anthropic streamed completion and UNDERCOUNTS prompt tokens (TPM/spend undercharged).
+    ///
+    /// The usage is NESTED under `message.usage` (unlike the top-level `usage` on delta/stop), so
+    /// it is read from there. Fields are filled ONLY when still unset, so an authoritative later
+    /// frame (`message_delta`'s corrected `output_tokens`, or a backend that repeats `input_tokens`
+    /// on `message_delta`) always overrides this opening snapshot rather than the reverse.
+    fn extract_usage_from_message_start(&mut self, obj: &Value) {
+        if obj.get("type").and_then(|t| t.as_str()) != Some("message_start") {
+            return;
+        }
+        if let Some(u) = obj.get("message").and_then(|m| m.get("usage")) {
+            if self.input_tokens.is_none() {
+                if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
+                    self.input_tokens = Some(v);
+                }
+            }
+            if self.output_tokens.is_none() {
+                if let Some(v) = u.get("output_tokens").and_then(|v| v.as_u64()) {
+                    self.output_tokens = Some(v);
+                }
             }
         }
     }
@@ -1937,14 +1972,34 @@ pub(crate) async fn forward(
     .await
 }
 
+/// The bounded `pool` LABEL for an UPSTREAM/breaker metric (LOW #25).
+///
+/// The breaker-CELL key (`pool_name`) is `""` for the lane-default cell shared by every
+/// direct/ad-hoc (single-model) route — that empty string is the correct CELL key and must NOT be
+/// repointed (the cell identity drives breaker state, /stats, /healthz). But emitting it verbatim
+/// as the `pool` metric LABEL mislabels all model-routed upstream traffic under an empty-string
+/// series, whereas `REQUESTS_TOTAL` (via `route::pool_label`) labels the SAME request stream with
+/// the MODEL name. That split makes upstream metrics impossible to correlate with the request
+/// counter for non-pool traffic. Resolve the metric label to the routed lane's model name when the
+/// cell key is empty, leaving named-pool traffic labeled by its pool name. This decouples the metric
+/// label from the cell key WITHOUT touching the cell key itself.
+fn metric_pool_label(app: &Arc<App>, pool_name: &str, i: usize) -> String {
+    if pool_name.is_empty() {
+        app.lanes[i].model.clone()
+    } else {
+        pool_name.to_string()
+    }
+}
+
 /// Emit `BREAKER_TRIPS_TOTAL` once for a logical Closed→Open trip on a (pool, lane) cell. Called from
 /// the organic forward path's failure-record sites whenever `record_transient_in`/`record_rate_limit_in`
 /// reports a fresh trip, mirroring the HardDown arm so threshold-based trips are counted too (#29). The
-/// `pool` label is the bounded, operator-controlled canonical pool name (see metrics.rs taxonomy).
+/// `pool` label is the bounded, operator-controlled canonical pool name, or the routed model name for
+/// the default (`""`) cell (LOW #25; see `metric_pool_label`) so it correlates with REQUESTS_TOTAL.
 fn emit_breaker_trip(app: &Arc<App>, pool_name: &str, i: usize) {
     metrics::counter!(
         crate::metrics::BREAKER_TRIPS_TOTAL,
-        "pool" => pool_name.to_string(),
+        "pool" => metric_pool_label(app, pool_name, i),
         "lane" => app.lanes[i].model.clone()
     )
     .increment(1);
@@ -2112,10 +2167,16 @@ pub(crate) async fn forward_with_pool(
         // Mark this lane as excluded for future attempts in this request
         request_ctx.exclude(i);
 
+        // The bounded `pool` LABEL for THIS hop's upstream/failover/breaker metrics (LOW #25).
+        // Resolves to the routed lane's model name on the default (`""`) cell so these series
+        // correlate with REQUESTS_TOTAL (which labels model-routed traffic by model, not `""`);
+        // the breaker-cell key below stays `pool_name` (`""`) — only the metric LABEL is decoupled.
+        let metric_pool = metric_pool_label(&app, pool_name, i);
+
         // count this upstream attempt (re-entrant across failover hops — each is a real attempt).
         metrics::counter!(
             crate::metrics::UPSTREAM_ATTEMPTS_TOTAL,
-            "pool" => pool_name.to_string(),
+            "pool" => metric_pool.clone(),
             "lane" => app.lanes[i].model.clone()
         )
         .increment(1);
@@ -2246,14 +2307,14 @@ pub(crate) async fn forward_with_pool(
                 }
                 metrics::counter!(
                     crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                    "pool" => pool_name.to_string(),
+                    "pool" => metric_pool.clone(),
                     "lane" => app.lanes[i].model.clone(),
                     "disposition" => "transient_upstream"
                 )
                 .increment(1);
                 metrics::counter!(
                     crate::metrics::FAILOVERS_TOTAL,
-                    "pool" => pool_name.to_string(),
+                    "pool" => metric_pool.clone(),
                     "reason" => err_type.to_string()
                 )
                 .increment(1);
@@ -2450,14 +2511,14 @@ pub(crate) async fn forward_with_pool(
                             }
                             metrics::counter!(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                                "pool" => pool_name.to_string(),
+                                "pool" => metric_pool.clone(),
                                 "lane" => app.lanes[i].model.clone(),
                                 "disposition" => "transient_upstream"
                             )
                             .increment(1);
                             metrics::counter!(
                                 crate::metrics::FAILOVERS_TOTAL,
-                                "pool" => pool_name.to_string(),
+                                "pool" => metric_pool.clone(),
                                 "reason" => "transient_upstream"
                             )
                             .increment(1);
@@ -2500,14 +2561,14 @@ pub(crate) async fn forward_with_pool(
                             // a hard-down is a breaker trip for this lane.
                             metrics::counter!(
                                 crate::metrics::BREAKER_TRIPS_TOTAL,
-                                "pool" => pool_name.to_string(),
+                                "pool" => metric_pool.clone(),
                                 "lane" => app.lanes[i].model.clone()
                             )
                             .increment(1);
                             tracing::warn!(pool = %pool_name, lane = %app.lanes[i].model, reason = %reason, "lane hard-down (breaker trip)");
                             metrics::counter!(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                                "pool" => pool_name.to_string(),
+                                "pool" => metric_pool.clone(),
                                 "lane" => app.lanes[i].model.clone(),
                                 "disposition" => "hard_down"
                             )
@@ -2555,7 +2616,7 @@ pub(crate) async fn forward_with_pool(
                             // For billing hard downs: continue to next lane (failover)
                             metrics::counter!(
                                 crate::metrics::FAILOVERS_TOTAL,
-                                "pool" => pool_name.to_string(),
+                                "pool" => metric_pool.clone(),
                                 "reason" => "hard_down"
                             )
                             .increment(1);
@@ -2585,14 +2646,14 @@ pub(crate) async fn forward_with_pool(
 
                             metrics::counter!(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                                "pool" => pool_name.to_string(),
+                                "pool" => metric_pool.clone(),
                                 "lane" => app.lanes[i].model.clone(),
                                 "disposition" => "context_length"
                             )
                             .increment(1);
                             metrics::counter!(
                                 crate::metrics::FAILOVERS_TOTAL,
-                                "pool" => pool_name.to_string(),
+                                "pool" => metric_pool.clone(),
                                 "reason" => "context_length"
                             )
                             .increment(1);
@@ -3023,6 +3084,16 @@ async fn handle_exhaustion_for_pool(
     ingress_protocol: &str,
     usage_sink: Option<UsageSink>,
 ) -> Response {
+    // Cycle-guard fix (LOW #22): mark the ORIGINATING pool visited here, BEFORE the mode lookup —
+    // this is the single point every pool's exhaustion handling flows through. The loop guard in
+    // `handle_fallback_pool` only checks/marks the FALLBACK pool name, so an A->B->A chain was not
+    // caught on the second hop: when A exhausted it jumped straight to `handle_fallback_pool(B)`
+    // (marking only B), and when B then fell back to A, the guard saw A as unvisited and recursed
+    // into A's members again before terminating. Marking A here means a later hop back to A is
+    // recognized as a cycle and terminates via the guard. Idempotent (set insert); harmless on the
+    // non-cyclic single-hop case where A is never revisited.
+    request_ctx.mark_pool_visited(pool_name);
+
     // Look up pool-specific on_exhausted config, default to Status503 for unknown pools.
     let mode = app
         .on_exhausted_cfgs
@@ -3128,6 +3199,13 @@ async fn forward_once(
             // See the main forward path: log the parser cause for operators, never leak the
             // serde_json Display detail into the client 400 body (an internal tell + body echo).
             tracing::debug!(error = %e, "request body JSON parse failed");
+            // Probe-leak guard (HIGH #1): a fallback-pool caller CAS-won a single-flight HalfOpen
+            // probe on the POOL cell in `pick_among` before entering here, and the contract is that
+            // EVERY early return out of `forward_once` releases it. This is a pre-dispatch bail (no
+            // breaker outcome recorded), so without an explicit release the cell stays HalfOpen +
+            // `probe_in_flight`, benching the lane forever. `release_probe_in` is idempotent and a
+            // no-op on the default `""` cell / a non-HalfOpen cell, so it is safe on every path.
+            app.store.release_probe_in(pool, i);
             return Ok(ingress_error(
                 ingress_protocol,
                 StatusCode::BAD_REQUEST,
@@ -3166,7 +3244,13 @@ async fn forward_once(
     // so neither path can be missing it.
     let payload = match translate_request_cross_protocol(app, i, ingress_protocol, v) {
         Ok(p) => p,
-        Err(resp) => return Ok(*resp),
+        Err(resp) => {
+            // Probe-leak guard (HIGH #1): release the POOL-cell single-flight probe this
+            // fallback attempt CAS-won before bailing on a translation failure (a pre-dispatch
+            // early return — no breaker outcome recorded). Idempotent; no-op off a HalfOpen cell.
+            app.store.release_probe_in(pool, i);
+            return Ok(*resp);
+        }
     };
     let base = &app.lanes[i].base_url;
 
@@ -3262,6 +3346,12 @@ async fn forward_once(
                     // this degraded route can no longer drift (the bug it fixes: a 401/403 on the
                     // degraded path was labeled `invalid_request_error`, the wrong typed-exception
                     // discriminant for an Anthropic SDK and a proxy tell).
+                    // Probe-leak guard (HIGH #1): a non-2xx response carries no breaker recording
+                    // on this degraded relay path (it relays verbatim, no disposition), so the
+                    // single-flight HalfOpen probe this fallback attempt CAS-won on the POOL cell
+                    // is still in flight. Release it before returning or the cell stays HalfOpen +
+                    // `probe_in_flight` forever. Idempotent; no-op off a HalfOpen / default cell.
+                    app.store.release_probe_in(pool, i);
                     return Ok(shape_cross_protocol_error(ingress_protocol, status, &bytes));
                 }
                 // Same-protocol degraded path: relay the upstream error verbatim (no classification).
@@ -3291,6 +3381,12 @@ async fn forward_once(
                         rb = rb.header("x-amzn-errortype", et);
                     }
                 }
+                // Probe-leak guard (HIGH #1): same as the cross-protocol non-2xx branch above —
+                // a verbatim same-protocol error relay records no breaker outcome, so release the
+                // POOL-cell single-flight probe this fallback attempt CAS-won before returning, or
+                // the cell stays HalfOpen + `probe_in_flight` forever. Idempotent; no-op off a
+                // HalfOpen / default cell.
+                app.store.release_probe_in(pool, i);
                 return Ok(rb
                     .body(Body::from(bytes))
                     .unwrap_or_else(|_| status.into_response()));
@@ -3857,6 +3953,62 @@ mod usage_tap_tests {
         ));
         assert_eq!(t.input_tokens, Some(11));
         assert_eq!(t.output_tokens, Some(9));
+    }
+
+    /// REGRESSION (MED #3): a SAME-protocol Anthropic stream must count `input_tokens` from the
+    /// opening `message_start` frame. Anthropic emits `input_tokens` ONLY on `message_start`
+    /// (nested under `message.usage`) and then `output_tokens` on the trailing `message_delta`,
+    /// whose `usage` block OMITS `input_tokens`. The cross-protocol path backfills the prompt count
+    /// via `StreamTranslate`, but the same-protocol Anthropic→Anthropic stream has no translate, so
+    /// before the `message_start` extractor the tap reported `input_tokens = 0` for every native
+    /// Anthropic streamed completion — undercounting prompt tokens (TPM/spend undercharged).
+    #[test]
+    fn test_tap_counts_input_tokens_from_message_start() {
+        // Feed the frames in real wire order: message_start carries input_tokens (+ an initial
+        // output_tokens), message_delta carries the FINAL output_tokens but NO input_tokens.
+        let mut t = UsageTap::new();
+        t.feed(&Bytes::from(
+            r#"{"type":"message_start","message":{"id":"msg_x","role":"assistant","usage":{"input_tokens":57,"output_tokens":1}}}"#,
+        ));
+        // After message_start alone, the prompt count must already be captured (the bug: 0/None).
+        assert_eq!(
+            t.input_tokens,
+            Some(57),
+            "input_tokens must come from message_start (Anthropic puts it only there)"
+        );
+
+        // The trailing message_delta corrects output_tokens and carries NO input_tokens; the
+        // earlier input count must SURVIVE (delta does not clobber it back to zero/None).
+        t.feed(&Bytes::from(
+            r#"{"type":"message_delta","usage":{"output_tokens":42}}"#,
+        ));
+        assert_eq!(
+            t.input_tokens,
+            Some(57),
+            "input_tokens from message_start must persist through the message_delta frame"
+        );
+        assert_eq!(
+            t.output_tokens,
+            Some(42),
+            "the authoritative message_delta output_tokens must override the message_start initial"
+        );
+
+        // Independence: a backend that DOES repeat input_tokens on a later authoritative frame must
+        // override the message_start snapshot (the extractor only FILLS unset fields, so a real
+        // delta value wins).
+        let mut t2 = UsageTap::new();
+        t2.feed(&Bytes::from(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":10}}}"#,
+        ));
+        t2.feed(&Bytes::from(
+            r#"{"type":"message_delta","usage":{"input_tokens":99,"output_tokens":3}}"#,
+        ));
+        assert_eq!(
+            t2.input_tokens,
+            Some(99),
+            "an authoritative later input_tokens must override the message_start snapshot"
+        );
+        assert_eq!(t2.output_tokens, Some(3));
     }
 
     /// HIGH (forward.rs `record_nonstream_usage` / `UsageTap` MAX_SCAN_BYTES guard): a buffered
@@ -6761,6 +6913,222 @@ mod forward_once_pool_cell_tests {
         assert!(
             matches!(app.store.breaker_state_in("", 1), BreakerState::Closed),
             "default cell must remain Closed (transport-error recording targeted the pool cell)"
+        );
+    }
+
+    /// REGRESSION (HIGH #1 — the probe-LEAK class). A fallback-pool member that returns a NON-2xx
+    /// must leave its POOL cell USABLE, not wedged HalfOpen. `forward_once`'s same-protocol non-2xx
+    /// branch relays the error verbatim and records NO breaker outcome, so the single-flight
+    /// HalfOpen probe the fallback dispatch CAS-won on the pool cell is still in flight at the early
+    /// return. Without an explicit `release_probe_in` the cell stays HalfOpen + `probe_in_flight`
+    /// forever — every later request finds the probe "taken" and the lane is benched until the slow
+    /// out-of-band prober rescues it. The fix releases the probe (HalfOpen→Open, flag cleared,
+    /// expired cooldown intact) so the cell is immediately probe-eligible again.
+    ///
+    /// Discriminator: after the non-2xx, the pool cell must be back to `Open` (NOT `HalfOpen`) AND
+    /// a fresh dispatch acquisition must be able to re-win the probe. Against the old code the cell
+    /// is wedged `HalfOpen` and the re-acquire returns false.
+    #[tokio::test]
+    async fn test_forward_once_fallback_non2xx_leaves_pool_cell_usable() {
+        // The fallback member's upstream serves a 4xx (a non-2xx the degraded path relays verbatim,
+        // recording no breaker outcome — the path that leaked the probe).
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::ServerError {
+            status: StatusCode::BAD_REQUEST,
+            body: json!({ "type": "error", "error": { "type": "invalid_request_error", "message": "bad" } }),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let t0 = store_now();
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "primary",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .dead("administratively down for test"),
+            )
+            .lane(LaneSpec::new(
+                "fbmember",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            ))
+            .pool("primary", &[(0, 1)])
+            .fallback_pool("fb", &[(1, 1)])
+            .on_exhausted(
+                "primary",
+                crate::config::OnExhausted::FallbackPool("fb".into()),
+            )
+            .build();
+
+        // Drive the "fb" pool cell into expired-Open so the FallbackPool dispatch CAS-wins the
+        // single-flight HalfOpen recovery probe — the precise state the leak wedges.
+        app.store.force_open_in("fb", 1, t0.saturating_sub(10));
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+        let response = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+            "primary",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+        // The verbatim non-2xx is relayed to the client (the status is not the point — the cell is).
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "FallbackPool must relay the upstream non-2xx verbatim"
+        );
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+
+        // The probe must have been RELEASED: the pool cell is Open again (not wedged HalfOpen).
+        assert!(
+            !matches!(app.store.breaker_state_in("fb", 1), BreakerState::HalfOpen),
+            "fb POOL cell must NOT be wedged HalfOpen after a non-2xx (HIGH #1 probe leak); got {:?}",
+            app.store.breaker_state_in("fb", 1)
+        );
+        // And the slot is reusable: a fresh dispatch acquisition can re-win the probe (the cooldown
+        // is still expired, so an Open cell re-admits exactly one probe). Against the old code the
+        // cell was HalfOpen with `probe_in_flight == true`, so this would return false.
+        assert!(
+            app.store.acquire_for_dispatch_in("fb", 1, store_now()),
+            "fb POOL cell must be re-acquirable after a non-2xx relay (probe was leaked otherwise)"
+        );
+        // The default "" cell is never touched by the degraded path's recordings.
+        assert!(
+            matches!(app.store.breaker_state_in("", 1), BreakerState::Closed),
+            "default cell must remain Closed (degraded path targets the pool cell only)"
+        );
+        server.shutdown().await;
+    }
+
+    /// REGRESSION (LOW #22): an A<->B FallbackPool cycle must terminate via the visited-pool guard,
+    /// NOT recurse back into the originating pool. The guard in `handle_fallback_pool` only
+    /// checks/marks the FALLBACK pool name, so an A->B->A chain was not caught on the second hop:
+    /// when B fell back to A, the guard saw A as unvisited and RE-ENTERED A's members. The fix marks
+    /// the ORIGINATING pool at the top of `handle_exhaustion_for_pool`, so the hop back to A is
+    /// recognized as a cycle and terminates with 503.
+    ///
+    /// Discriminator topology: pool A's ORIGINATING member (lane 0) is dead and pool B's member
+    /// (lane 1) is dead, so both pools exhaust and the chain is A->B->A. Pool A is ALSO reachable as
+    /// a FALLBACK target whose member (lane 2) is a LIVE upstream serving 200. With the fix the
+    /// second hop to A is caught by the guard and the request 503s WITHOUT ever dispatching lane 2.
+    /// Against the old code the un-guarded re-entry into A dispatches lane 2 and returns 200 — so a
+    /// 200 here is the regression signature.
+    #[tokio::test]
+    async fn test_fallback_pool_a_b_a_cycle_terminates_via_guard() {
+        // Lane 2 (pool A's FALLBACK member) is a live upstream that would serve 200 if the cycle
+        // erroneously re-entered pool A. The guard must prevent that dispatch entirely.
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({ "content": [] }),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        let app = TestApp::new()
+            // Lane 0: pool A's ORIGINATING member — dead, so pool A exhausts on entry.
+            .lane(
+                LaneSpec::new(
+                    "a-origin",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .dead("administratively down for test"),
+            )
+            // Lane 1: pool B's member — dead, so pool B exhausts and falls back to A.
+            .lane(
+                LaneSpec::new(
+                    "b-member",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .dead("administratively down for test"),
+            )
+            // Lane 2: pool A's FALLBACK member — LIVE. Only reached if the cycle re-enters A (bug).
+            .lane(LaneSpec::new(
+                "a-fallback",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            ))
+            .pool("A", &[(0, 1)])
+            // A reachable as a fallback target routes to the live lane 2; B routes to the dead lane 1.
+            .fallback_pool("A", &[(2, 1)])
+            .fallback_pool("B", &[(1, 1)])
+            // A -> B -> A cycle.
+            .on_exhausted("A", crate::config::OnExhausted::FallbackPool("B".into()))
+            .on_exhausted("B", crate::config::OnExhausted::FallbackPool("A".into()))
+            .build();
+
+        let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
+        let response = forward_with_pool(
+            app.clone(),
+            // Originating candidate set for pool A = its dead member (lane 0) → A exhausts.
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            req_body.into(),
+            None,
+            "A",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+        let status = response.status().as_u16();
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+
+        // The A<->B cycle must terminate at the guard with 503 — NOT recurse back into A and serve
+        // the live lane-2 200. A 200 here means the second-hop guard missed the cycle (the bug).
+        assert_eq!(
+            status, 503,
+            "an A<->B fallback cycle must terminate via the visited-pool guard (503), not \
+             re-enter pool A and serve its live member (200); got {status}"
+        );
+        server.shutdown().await;
+    }
+
+    /// REGRESSION (LOW #25): the upstream/breaker METRIC pool label must resolve to the ROUTED
+    /// MODEL name for the default (`""`) breaker cell — the cell shared by every direct/ad-hoc
+    /// (single-model) route via `forward()` — so those series correlate with `REQUESTS_TOTAL`
+    /// (which labels model-routed traffic by model, never `""`). For a NAMED pool the label is the
+    /// pool name verbatim. The breaker-CELL key is NOT repointed by this helper (that stays `""`);
+    /// only the metric LABEL is decoupled, which is exactly what `metric_pool_label` computes.
+    #[test]
+    fn test_metric_pool_label_resolves_model_for_default_cell() {
+        use super::metric_pool_label;
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "claude-sonnet",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1",
+            ))
+            .lane(LaneSpec::new(
+                "gpt-4o",
+                crate::proto::Protocol::openai(),
+                "http://127.0.0.1:1",
+            ))
+            .build();
+
+        // Default ("") cell → the routed lane's MODEL name (so upstream metrics align with
+        // REQUESTS_TOTAL's model label instead of an empty-string series).
+        assert_eq!(
+            metric_pool_label(&app, "", 0),
+            "claude-sonnet",
+            "default-cell traffic must be labeled by the routed model, not the empty cell key"
+        );
+        assert_eq!(
+            metric_pool_label(&app, "", 1),
+            "gpt-4o",
+            "the label tracks the specific routed lane's model"
+        );
+        // A NAMED pool keeps its pool name verbatim (bounded, operator-controlled label).
+        assert_eq!(
+            metric_pool_label(&app, "prod-pool", 0),
+            "prod-pool",
+            "named-pool traffic stays labeled by its pool name"
         );
     }
 }

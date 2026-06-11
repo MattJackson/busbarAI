@@ -91,8 +91,17 @@ pub(crate) fn spawn_probers(app: Arc<App>) {
 /// response through the SAME two-stage disposition pipeline organic traffic uses
 /// (`proto.extract_error` → `normalize_raw_error` → `breaker::classify`) rather than forcing every
 /// failure to a transient cooldown:
-///   - 2xx → recover the lane if it was tripped (→ Closed). A healthy lane is left untouched (no
-///     synthetic success is counted, so probes don't pollute the `ok` stats).
+///   - 2xx → recover the lane if it was tripped (→ Closed), THEN push a success outcome into every
+///     cell's sliding error-rate window (`record_probe_success_all_cells`). Recording the success is
+///     what makes probe-outcome accounting SYMMETRIC: failures already feed the window via
+///     `record_probe_failure_all_cells`, so without a matching success record a lane that fails some
+///     probes and succeeds others would show a 100%-error window (every cell holds only failures) and
+///     the error-rate breaker would trip a perfectly recoverable lane (LOW #23). The success is
+///     recorded AFTER recovery so no cell is HalfOpen at that point — the success push therefore never
+///     *forces* a HalfOpen→Closed transition (recovery, when warranted, already happened via
+///     `recover_lane`); on an already-healthy lane the cells are Closed and the push only feeds the
+///     window. The success counts toward the lane's `ok` stat, exactly mirroring how a failed probe
+///     feeds the breaker — probe accounting is now fully two-sided rather than failure-only.
 ///   - `HardDown` (Auth/Billing — e.g. an invalid credential or exhausted balance) → record a
 ///     hard-down trip on every cell the lane routes against, matching organic semantics. Previously
 ///     these were mis-recorded as transient, so an auth-dead lane oscillated between cooldown and
@@ -168,10 +177,19 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
         Ok(r) if r.status().is_success() => {
             if app.store.lane_needs_probe(i, now()) {
                 // Probe tests the shared upstream → recover the lane in every cell (all pools +
-                // default), clearing both Open trips and soft cooldowns.
+                // default), clearing both Open trips and soft cooldowns. This runs FIRST so that by
+                // the time we record the success outcome below, every cell is Closed and the success
+                // push can never force a HalfOpen→Closed transition (recovery already happened here).
                 app.store.recover_lane(i);
                 tracing::info!(lane = %lane.model, "lane recovered via health probe");
             }
+            // Record the 2xx as a SUCCESS in every cell's sliding error-rate window — the symmetric
+            // counterpart to the failed-probe `record_probe_failure_all_cells` below. Without this,
+            // probes only ever fed FAILURES into the window, so a lane that intermittently fails
+            // probes presented a 100%-error window to the error-rate breaker and tripped spuriously
+            // (LOW #23). This does NOT force any breaker transition — recovery, when warranted,
+            // already happened above; here we only push the outcome.
+            record_probe_success_all_cells(app, i);
             return;
         }
         Ok(r) => {
@@ -242,6 +260,37 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
                 lane = %lane.model,
                 "health probe got a client-fault/context-length response; lane not penalized"
             );
+        }
+    }
+}
+
+/// Push a SUCCESS outcome into the sliding error-rate window of every cell lane `i` routes against —
+/// the default/direct-route cell (`""`) AND every per-pool cell the lane is a member of — mirroring
+/// the all-cells reach of the failed-probe `record_probe_failure_all_cells` and the successful-probe
+/// `recover_lane`. This is the success half of symmetric probe accounting (LOW #23): the failed-probe
+/// path feeds failures into each cell's window, so without a matching success record a lane whose
+/// probes sometimes fail and sometimes succeed would present a window containing ONLY failures, and
+/// the error-rate breaker (errors / total over the window) would read 100% error and trip a lane that
+/// is in fact mostly healthy.
+///
+/// It does NOT force a HalfOpen→Closed transition: callers invoke this only on the 2xx path AFTER
+/// `recover_lane` has already closed any suppressed cell, so no cell is HalfOpen here and the
+/// underlying `record_success_in` only pushes the outcome (its HalfOpen→Closed CAS is a no-op on an
+/// already-Closed cell). The recover-on-2xx semantics are therefore left fully intact — this only
+/// adds the previously-missing success sample.
+///
+/// The cell set is derived from `app.pools` (config pool membership keyed by lane index) plus the
+/// always-present default cell. Recording into a per-pool cell lazily materializes it Closed if it
+/// did not yet exist, which is harmless (a Closed cell is the lane default) and keeps the success and
+/// failure paths trained on the same cells real traffic is selected against.
+fn record_probe_success_all_cells(app: &Arc<App>, i: usize) {
+    // Default/direct-route cell — the `""` (no-pool) cell `named`/`adhoc` routes read.
+    app.store.record_success_in("", i);
+    // Every pool this lane is a member of, so the success dilutes the SAME per-pool error-rate
+    // windows the failed-probe path trips against (organic traffic routes on the per-pool cells).
+    for (pool_name, members) in &app.pools {
+        if members.iter().any(|m| m.idx == i) {
+            app.store.record_success_in(pool_name, i);
         }
     }
 }
@@ -423,6 +472,110 @@ mod tests {
             .build();
         probe_lane(&app, 0, Duration::from_secs(1)).await;
         assert!(matches!(app.store.breaker_state(0), BreakerState::Closed));
+    }
+
+    /// REGRESSION (R22 LOW #23, symmetric probe accounting): a 2xx probe must record a SUCCESS into
+    /// every cell's sliding error-rate window, not just a failed probe recording a FAILURE. With the
+    /// old failure-only accounting, a lane whose probes intermittently fail presented a window holding
+    /// ONLY failures, so the error-rate breaker (errors / total) read ~100% and tripped a recoverable
+    /// lane. Here we drive 7 successful probes then 5 failing (503) probes against a default error-rate
+    /// breaker (min_requests=5, threshold=0.5): the failures alone would breach (5/5 = 1.0 >= 0.5 →
+    /// Open), but the recorded successes dilute the window to 5/12 ≈ 0.42 < 0.5, so BOTH the default
+    /// cell and the per-pool cell stay Closed. Against the pre-fix code (no success recorded) the 5th
+    /// failure trips the default cell Open — this test fails there and passes after.
+    #[tokio::test]
+    async fn test_probe_success_recorded_so_intermittent_failures_dont_trip() {
+        let state = Arc::new(MockServerState::new());
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("claude", Protocol::anthropic(), &server.base_url())
+                    .api_key("sk-test")
+                    .health(health_active()),
+            )
+            .pool("p", &[(0, 1)])
+            .build();
+
+        // 7 successful probes: each must push a SUCCESS into both the default and the per-pool cell's
+        // window (the per-pool cell is lazily created Closed on the first success record).
+        for _ in 0..7 {
+            state.push(MockResponse::Ok {
+                status: StatusCode::OK,
+                body: serde_json::json!({ "ok": true }),
+            });
+            probe_lane(&app, 0, Duration::from_secs(5)).await;
+        }
+        // 5 failing (503 transient) probes. The failure path records into the SAME cells. Even at the
+        // 5th failure the windows hold 7 successes + 5 errors → 5/12 < 0.5 → no trip.
+        for _ in 0..5 {
+            state.push(MockResponse::ServerError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: serde_json::json!({ "error": "upstream down" }),
+            });
+            probe_lane(&app, 0, Duration::from_secs(5)).await;
+        }
+
+        assert!(
+            matches!(app.store.breaker_state(0), BreakerState::Closed),
+            "recorded probe successes must dilute the error-rate window so 5 of 12 outcomes stays \
+             below the 0.5 trip threshold; default cell should remain Closed, got {:?}",
+            app.store.breaker_state(0)
+        );
+        assert!(
+            matches!(app.store.breaker_state_in("p", 0), BreakerState::Closed),
+            "the per-pool cell organic traffic routes against must likewise stay Closed once probe \
+             successes are recorded into its window, got {:?}",
+            app.store.breaker_state_in("p", 0)
+        );
+        server.shutdown().await;
+    }
+
+    /// REGRESSION (R22 LOW #23): a 2xx probe on an already-Closed, never-tripped lane must still push
+    /// a success outcome into the lane's window (the success half of symmetric accounting) — it is NOT
+    /// silently dropped just because the lane needed no recovery. We assert observably: after one
+    /// success probe followed by 4 failing probes, the default cell holds 1 success + 4 errors = 5
+    /// outcomes at 4/5 = 0.8 >= 0.5 and trips Open; if the success had NOT been recorded the window
+    /// would hold only 4 errors (4 < min_requests=5) and stay Closed. So an Open default cell here
+    /// proves the healthy-lane success was recorded.
+    #[tokio::test]
+    async fn test_probe_success_recorded_even_on_healthy_lane() {
+        let state = Arc::new(MockServerState::new());
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("claude", Protocol::anthropic(), &server.base_url())
+                    .api_key("sk-test")
+                    .health(health_active()),
+            )
+            .pool("p", &[(0, 1)])
+            .build();
+
+        // One success on a healthy (Closed, untripped) lane — recovery is a no-op, but the success
+        // must still be recorded into the window.
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: serde_json::json!({ "ok": true }),
+        });
+        probe_lane(&app, 0, Duration::from_secs(5)).await;
+        // 4 failing probes. With the success recorded the window is 1 success + 4 errors = 5 outcomes
+        // (>= min_requests) at 4/5 = 0.8 >= 0.5 → trips Open. Without the success it would be 4 errors
+        // only (< min_requests) → stays Closed.
+        for _ in 0..4 {
+            state.push(MockResponse::ServerError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: serde_json::json!({ "error": "upstream down" }),
+            });
+            probe_lane(&app, 0, Duration::from_secs(5)).await;
+        }
+
+        assert!(
+            matches!(app.store.breaker_state(0), BreakerState::Open { .. }),
+            "the healthy-lane probe success must be recorded so the window reaches min_requests (1 \
+             success + 4 errors = 5 at 0.8 error rate) and trips Open; a Closed cell here would mean \
+             the success was dropped, got {:?}",
+            app.store.breaker_state(0)
+        );
+        server.shutdown().await;
     }
 
     /// REGRESSION (R16 HIGH, SigV4 signed==sent): the active probe MUST sign the canonical URI from

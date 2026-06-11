@@ -181,7 +181,15 @@ impl CohereReader {
     fn body_signals_context_length(body: &[u8]) -> bool {
         let lower = String::from_utf8_lossy(body).to_lowercase();
         lower.contains("too many tokens")
-            || lower.contains("too long")
+            // `too long` is co-constrained to a token/context/input qualifier so it only fires on a
+            // genuine oversized-request error. A bare `contains("too long")` over-matched ANY
+            // upstream message containing "too long" (e.g. "request URL too long", "value too long
+            // for column"), mis-synthesizing the canonical `context_length_exceeded` code and
+            // triggering a no-penalty ContextLength failover for an unrelated client error.
+            || (lower.contains("too long")
+                && (lower.contains("token")
+                    || lower.contains("context")
+                    || lower.contains("input")))
             || lower.contains("token limit")
             || (lower.contains("exceeds") && lower.contains("context"))
             || (lower.contains("maximum") && lower.contains("token"))
@@ -2376,14 +2384,27 @@ mod tests {
         );
     }
 
-    /// Two successive synthesized ids within the same process must be distinct. Entropy comes from
-    /// the CSPRNG; the monotonic counter fold is a backstop guaranteeing distinctness even if the
-    /// RNG returned identical bytes.
+    /// Synthesized ids are unique across a burst by virtue of CSPRNG entropy alone — `synthesize_
+    /// cohere_id` is a PURE RFC-4122 UUIDv4 (122 random bits, ~5.3e36 values) with NO monotonic
+    /// counter overlay (a counter folded into any fixed region would be a low-entropy structural
+    /// tell a native random v4 never carries — see the fn doc-comment). This test therefore asserts
+    /// what the code actually guarantees: a burst of ids are all distinct AND every one is a
+    /// well-formed UUIDv4. It does NOT assert a counter backstop, because none exists by design.
     #[test]
     fn test_synthesized_ids_are_unique() {
-        let a = synthesize_cohere_id();
-        let b = synthesize_cohere_id();
-        assert_ne!(a, b, "the atomic counter must make synthesized ids unique");
+        const N: usize = 4096;
+        let mut seen = std::collections::HashSet::with_capacity(N);
+        for _ in 0..N {
+            let id = synthesize_cohere_id();
+            assert!(
+                is_uuid_v4(&id),
+                "each synthesized id must be a well-formed UUIDv4, got {id}"
+            );
+            assert!(
+                seen.insert(id.clone()),
+                "CSPRNG-seeded synthesized ids must be unique across a burst; collision on {id}"
+            );
+        }
     }
 
     /// A well-formed credential produces a single `Authorization: Bearer <key>` header.
@@ -3142,6 +3163,66 @@ mod tests {
             crate::breaker::StatusClass::ContextLength,
             "a non-context-length error must not be classified as ContextLength"
         );
+    }
+
+    /// Regression (MED #8): the `too long` arm of `body_signals_context_length` must be
+    /// co-constrained to a token/context/input qualifier. A bare `contains("too long")` over-matched
+    /// ANY message containing "too long" (e.g. "request URL too long", "value too long for column")
+    /// and mis-synthesized the canonical `context_length_exceeded` code — triggering a no-penalty
+    /// ContextLength failover for an unrelated client error. This asserts the generic "too long"
+    /// bodies are NOT classified ContextLength, while genuine oversized-context "too long" bodies
+    /// still are.
+    #[test]
+    fn test_too_long_only_classifies_context_length_when_qualified() {
+        let reader = CohereReader;
+        let empty = std::collections::HashMap::new();
+
+        // Generic "too long" errors with NO token/context/input qualifier: must NOT be ContextLength.
+        let non_context: &[&[u8]] = &[
+            br#"{"message": "the requested URL is too long", "error_type": "invalid_request_error"}"#,
+            br#"{"message": "value too long for column name", "error_type": "invalid_request_error"}"#,
+            br#"{"message": "the password you provided is too long"}"#,
+        ];
+        for body in non_context {
+            let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+            assert_ne!(
+                raw.provider_code.as_deref(),
+                Some("context_length_exceeded"),
+                "a generic 'too long' message must not synthesize the context-length code: {}",
+                String::from_utf8_lossy(body)
+            );
+            let signal = crate::breaker::normalize_raw_error(&raw, &empty);
+            assert_ne!(
+                signal.class,
+                crate::breaker::StatusClass::ContextLength,
+                "a generic 'too long' message must not classify as ContextLength: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+
+        // Genuine oversized-context "too long" errors (qualified by token/context/input): still
+        // classified ContextLength so the no-penalty failover still fires.
+        let context: &[&[u8]] = &[
+            br#"{"message": "the input is too long for the requested model"}"#,
+            br#"{"message": "your prompt is too long: it exceeds the model context window"}"#,
+            br#"{"message": "message too long, too many tokens"}"#,
+        ];
+        for body in context {
+            let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+            assert_eq!(
+                raw.provider_code.as_deref(),
+                Some("context_length_exceeded"),
+                "a qualified 'too long' (context) message must synthesize the context-length code: {}",
+                String::from_utf8_lossy(body)
+            );
+            let signal = crate::breaker::normalize_raw_error(&raw, &empty);
+            assert_eq!(
+                signal.class,
+                crate::breaker::StatusClass::ContextLength,
+                "a qualified 'too long' (context) message must classify as ContextLength: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     /// Regression (MEDIUM/conformance): a non-streaming request must OMIT the `stream` key entirely

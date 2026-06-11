@@ -2740,14 +2740,22 @@ mod tests {
         // Should return 503 after exhausting lanes up to max_failover cap (default=3)
         assert_eq!(response.status().as_u16(), 503);
 
-        // Verify: total errors across all lanes should be capped (not unbounded)
+        // Verify the EXACT attempt count, not a loose upper bound. The failover loop runs
+        // `0..=max_cap` (max_cap=3, so up to 4 hops), but each picked lane is excluded for
+        // subsequent hops (`request_ctx.exclude(i)`), so with only 2 distinct lanes the loop
+        // can dispatch at most 2 real upstream attempts: hop 0 picks one lane, hop 1 picks the
+        // other, hop 2 finds the candidate set exhausted → exhaustion handler → 503. Each
+        // dispatched attempt records exactly one `err` (transient 500). The cap (4) never binds
+        // here because the candidate pool drains first; the binding invariant is "no lane is
+        // retried within a request", which yields EXACTLY one error per lane.
+        //
+        // A regression that reused/re-picked an already-tried lane (broken exclusion), or that
+        // ran the loop past the cap, would push this above 2 and fail the assertion.
         let t = now();
         let total_errs: u64 = (0..2).map(|i| app.store.snapshot(i, t).err).sum();
-
-        // With max_failover=3 and 2 lanes, we should have bounded attempts
-        assert!(
-            total_errs <= 10,
-            "Total errors {} should be capped (not unbounded)",
+        assert_eq!(
+            total_errs, 2,
+            "expected exactly 2 upstream attempts (one per distinct lane, no retry), got {}",
             total_errs
         );
 
@@ -2809,14 +2817,20 @@ mod tests {
         // Should return 503 after exhausting all lanes up to max_failover cap (default=3)
         assert_eq!(response.status().as_u16(), 503);
 
-        // Verify: total errors across all lanes should be capped (not unbounded)
+        // Verify the EXACT attempt count, not a loose upper bound. With 3 distinct lanes and
+        // max_cap=3, the failover loop dispatches exactly 3 real upstream attempts: hops 0,1,2
+        // each pick a fresh lane (each is excluded after pick via `request_ctx.exclude(i)`), and
+        // the final loop turn finds the candidate set exhausted → exhaustion handler → 503. Each
+        // dispatched attempt records exactly one `err` (transient 500). This is the boundary case
+        // where lane count == cap, so BOTH invariants (cap and no-retry) pin the count to 3.
+        //
+        // A regression that ran the loop past `max_cap`, or that re-picked an already-tried lane,
+        // would push this above 3 and fail the assertion.
         let t = now();
         let total_errs: u64 = (0..3).map(|i| app.store.snapshot(i, t).err).sum();
-
-        // With max_failover=3 and 3 lanes, we should have bounded attempts (not unbounded retry)
-        assert!(
-            total_errs <= 10,
-            "Total errors {} should be capped (not unbounded)",
+        assert_eq!(
+            total_errs, 3,
+            "expected exactly 3 upstream attempts (one per distinct lane, capped at max_cap=3), got {}",
             total_errs
         );
 

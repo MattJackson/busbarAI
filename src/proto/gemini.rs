@@ -255,10 +255,10 @@ impl ProtocolReader for GeminiReader {
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            let args = func_call
-                                .get("args")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
+                            // Zero-arg functionCall → empty JSON OBJECT, not `null` (the tool-call
+                            // input is an argument map; a no-arg call is `{}`). Keeps the request
+                            // reader consistent with the response readers' args handling.
+                            let args = empty_object_if_absent(func_call.get("args"));
                             // Gemini carries no tool-call id; synthesize a stable, non-empty one
                             // keyed by (index, name). The Gemini writer ignores the ToolUse `id`
                             // (it round-trips `name`), so this is safe for same-protocol passthrough
@@ -514,6 +514,50 @@ impl ProtocolReader for GeminiReader {
             return out;
         }
 
+        // 0b. Prompt-blocked envelope. A native Gemini `generateContent`/`streamGenerateContent`
+        // can reject the PROMPT itself (not the candidate) — the chunk carries a top-level
+        // `promptFeedback.blockReason` (e.g. SAFETY/BLOCKLIST/PROHIBITED_CONTENT/OTHER), NO
+        // `candidates`, and NO `error` envelope. Without this arm the reader would emit only a bare
+        // `MessageStart` (from the block below) and then EOF — no `finishReason`, so no closing
+        // `MessageDelta`/`MessageStop` — leaving the downstream client on a hung, non-terminated
+        // stream with an empty response and the breaker/observability never seeing the block.
+        // Surface it as a proper terminal sequence (MessageStart once, then a `safety`
+        // MessageDelta + MessageStop) so the stream terminates cleanly with a content-policy stop.
+        // Guarded on candidates-ABSENT so a normal chunk that happens to also carry promptFeedback
+        // alongside candidates is still processed by the candidate path below. Handled before the
+        // MessageStart/candidates block.
+        if candidates_absent(data) {
+            if let Some(block_reason) = prompt_block_reason(data) {
+                if !state.started {
+                    state.started = true;
+                    let id = data
+                        .get("responseId")
+                        .and_then(|i| i.as_str())
+                        .map(String::from);
+                    let model = data
+                        .get("modelVersion")
+                        .or_else(|| data.get("model"))
+                        .and_then(|m| m.as_str())
+                        .map(String::from);
+                    out.push(IrStreamEvent::MessageStart {
+                        role: crate::ir::IrRole::Assistant,
+                        usage: None,
+                        id,
+                        created: None,
+                        model,
+                    });
+                }
+                let usage = gemini_usage(data);
+                out.push(IrStreamEvent::MessageDelta {
+                    stop_reason: Some(prompt_block_stop_reason(block_reason)),
+                    stop_sequence: None,
+                    usage,
+                });
+                out.push(IrStreamEvent::MessageStop);
+                return out;
+            }
+        }
+
         // 1. MessageStart exactly once on first chunk. Capture the stream identity from the first
         // chunk so same-protocol passthrough preserves it: streamed Gemini chunks carry the same
         // `responseId`/`modelVersion` as the whole-response body. Gemini streams carry no `created`
@@ -622,10 +666,15 @@ impl ProtocolReader for GeminiReader {
                                     let ir_idx = text_base + state.open_tools.len();
                                     state.open_tools.insert(ir_idx);
 
-                                    let args = func_call
-                                        .get("args")
-                                        .cloned()
-                                        .unwrap_or(serde_json::Value::Null);
+                                    // A zero-arg Gemini `functionCall` either omits `args` or sends
+                                    // `{}`. Default the MISSING case to an empty JSON OBJECT, not
+                                    // `null`: the args field models a tool-call argument map, so a
+                                    // no-arg call is the empty object `{}`. Serializing `null` instead
+                                    // produced `"input": null` / `"arguments": "null"` on cross-protocol
+                                    // Anthropic/OpenAI egress — an invalid tool-call input shape a strict
+                                    // SDK rejects (it expects an object). `empty_object_if_absent` keeps
+                                    // an explicitly-present `args` (even an explicit `null`) verbatim.
+                                    let args = empty_object_if_absent(func_call.get("args"));
 
                                     // Gemini streams carry no tool-call id; synthesize a stable,
                                     // non-empty one keyed by (tool-position, name) so the
@@ -679,26 +728,7 @@ impl ProtocolReader for GeminiReader {
                 }
 
                 // Parse usageMetadata if present
-                let usage = data
-                    .get("usageMetadata")
-                    .map(|u| crate::ir::IrUsage {
-                        input_tokens: u
-                            .get("promptTokenCount")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0),
-                        output_tokens: u
-                            .get("candidatesTokenCount")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0),
-                        cache_creation_input_tokens: None,
-                        cache_read_input_tokens: None,
-                    })
-                    .unwrap_or(crate::ir::IrUsage {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cache_creation_input_tokens: None,
-                        cache_read_input_tokens: None,
-                    });
+                let usage = gemini_usage(data);
 
                 out.push(IrStreamEvent::MessageDelta {
                     stop_reason: Some(stop_reason.to_string()),
@@ -719,6 +749,41 @@ impl ProtocolReader for GeminiReader {
             provider_signal: Some("ir_parse".to_string()),
             retry_after: None,
         })?;
+
+        // Prompt-blocked envelope. A native Gemini `generateContent` can reject the PROMPT itself
+        // (not a candidate): the body carries a top-level `promptFeedback.blockReason` (e.g.
+        // SAFETY/BLOCKLIST/PROHIBITED_CONTENT/OTHER), NO `candidates`, and NO `error` envelope.
+        // Hard-failing the absent-candidates path below turned this legitimate content-policy block
+        // into a spurious `ir_parse` ClientError (→ a confusing 4xx with no surfaced reason) instead
+        // of a clean empty response carrying a `safety` stop. Detect it here — candidates ABSENT plus
+        // a `promptFeedback.blockReason` — and return an empty-content response with the mapped stop
+        // reason, mirroring the streaming reader's prompt-block terminal sequence and the
+        // SAFETY-filtered-candidate tolerance below. Usage is still surfaced when present.
+        if candidates_absent(body) {
+            if let Some(block_reason) = prompt_block_reason(body) {
+                let usage = gemini_usage(body);
+                let model = obj
+                    .get("modelVersion")
+                    .or_else(|| obj.get("model"))
+                    .and_then(|m| m.as_str())
+                    .map(String::from);
+                let id = obj
+                    .get("responseId")
+                    .and_then(|i| i.as_str())
+                    .map(String::from);
+                return Ok(crate::ir::IrResponse {
+                    role: crate::ir::IrRole::Assistant,
+                    content: Vec::new(),
+                    stop_reason: Some(prompt_block_stop_reason(block_reason)),
+                    usage,
+                    model,
+                    id,
+                    created: None,
+                    system_fingerprint: None,
+                    stop_sequence: None,
+                });
+            }
+        }
 
         // Parse candidates array - must have at least one
         let candidates_val = obj.get("candidates").ok_or(IrError {
@@ -777,10 +842,9 @@ impl ProtocolReader for GeminiReader {
                         .and_then(|n| n.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let args = func_call
-                        .get("args")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
+                    // Zero-arg functionCall → empty JSON OBJECT, not `null` (see the streaming
+                    // reader's note): the tool-call input is an argument map, so a no-arg call is `{}`.
+                    let args = empty_object_if_absent(func_call.get("args"));
 
                     let id = synth_tool_call_id(tool_call_index, &name_val);
                     tool_call_index += 1;
@@ -806,28 +870,7 @@ impl ProtocolReader for GeminiReader {
                 });
 
         // Parse usageMetadata: promptTokenCount→input_tokens, candidatesTokenCount→output_tokens
-        let usage_val = obj.get("usageMetadata");
-        let usage = if let Some(u) = usage_val {
-            crate::ir::IrUsage {
-                input_tokens: u
-                    .get("promptTokenCount")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                output_tokens: u
-                    .get("candidatesTokenCount")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
-            }
-        } else {
-            crate::ir::IrUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
-            }
-        };
+        let usage = gemini_usage(body);
 
         // Gemini reports the serving model as `modelVersion` (fall back to `model`).
         let model = obj
@@ -963,6 +1006,71 @@ fn synth_tool_call_id(call_index: usize, function_name: &str) -> String {
     call_index.hash(&mut hasher);
     function_name.hash(&mut hasher);
     format!("call_{:016x}", hasher.finish())
+}
+
+/// Default a possibly-absent Gemini `functionCall.args` to an empty JSON OBJECT (`{}`), not `null`.
+///
+/// A zero-argument Gemini `functionCall` either OMITS the `args` field or sends an empty object.
+/// The args field models a tool-call argument MAP, so the correct empty value is `{}` — serializing
+/// `null` instead leaked `"input": null` / `"arguments": "null"` onto cross-protocol Anthropic /
+/// OpenAI egress, an invalid tool-input shape strict SDKs reject (they require an object). An
+/// EXPLICITLY-present value (including an explicit `null`, which a native client could send) is kept
+/// verbatim — we only synthesize the empty object for the truly-absent case.
+fn empty_object_if_absent(args: Option<&serde_json::Value>) -> serde_json::Value {
+    match args {
+        Some(v) => v.clone(),
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
+/// True when a Gemini response/stream chunk carries NO `candidates` array (absent or non-array).
+/// Used to distinguish a prompt-block / error-only envelope from a normal candidate-bearing chunk.
+fn candidates_absent(data: &serde_json::Value) -> bool {
+    !data
+        .get("candidates")
+        .map(|c| c.is_array())
+        .unwrap_or(false)
+}
+
+/// Extract a top-level `promptFeedback.blockReason` (the PROMPT-level content block signal) if the
+/// envelope carries one, e.g. `{"promptFeedback":{"blockReason":"SAFETY"}}`. Returns the raw reason
+/// string (SAFETY / BLOCKLIST / PROHIBITED_CONTENT / OTHER / …) so the caller can map it to a
+/// canonical stop reason. `None` when absent or not a non-empty string.
+fn prompt_block_reason(data: &serde_json::Value) -> Option<&str> {
+    data.get("promptFeedback")
+        .and_then(|pf| pf.get("blockReason"))
+        .and_then(|r| r.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+/// Map a Gemini `promptFeedback.blockReason` to a canonical IR stop reason. A prompt block is a
+/// content-policy refusal of the input, so it surfaces as `safety` (matching the candidate-level
+/// `finishReason: SAFETY` → `safety` mapping) for the well-known content-policy reasons; any other
+/// reason is lowercased so a novel block reason is still surfaced rather than dropped.
+fn prompt_block_stop_reason(block_reason: &str) -> String {
+    match block_reason {
+        "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" => "safety".to_string(),
+        other => other.to_lowercase(),
+    }
+}
+
+/// Parse a Gemini `usageMetadata` block into `IrUsage`, defaulting every counter to 0 when the
+/// field (or an individual counter) is absent. Shared by the streaming and prompt-block paths so
+/// usage accounting stays identical regardless of how a response terminates.
+fn gemini_usage(data: &serde_json::Value) -> crate::ir::IrUsage {
+    let u = data.get("usageMetadata");
+    crate::ir::IrUsage {
+        input_tokens: u
+            .and_then(|u| u.get("promptTokenCount"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        output_tokens: u
+            .and_then(|u| u.get("candidatesTokenCount"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+    }
 }
 
 /// Map a canonical `StatusClass` onto the `(HTTP code, google.rpc.Code name)` pair Gemini uses in
@@ -3482,6 +3590,140 @@ mod tests {
         assert!(
             ir.stop_reason.is_some(),
             "the SAFETY finishReason must still map to a stop_reason"
+        );
+    }
+
+    /// Regression (MED, completeness): a PROMPT-blocked Gemini stream chunk carries a top-level
+    /// `promptFeedback.blockReason`, NO `candidates`, and NO `error`. The reader must surface it as a
+    /// PROPER TERMINAL SEQUENCE — MessageStart, then a `safety` MessageDelta + MessageStop — not a
+    /// bare MessageStart followed by EOF (which left the downstream client on a hung, non-terminated
+    /// stream with an empty response). Old code emitted only MessageStart and never terminated.
+    #[test]
+    fn test_stream_prompt_block_emits_terminal_sequence() {
+        let events = collect_stream(&[serde_json::json!({
+            "promptFeedback": {"blockReason": "SAFETY"},
+            "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 0}
+        })]);
+
+        // Exactly one MessageStart, one MessageDelta, one MessageStop — a complete terminal stream.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, IrStreamEvent::MessageStart { .. }))
+                .count(),
+            1,
+            "prompt-block stream must emit exactly one MessageStart: {events:?}"
+        );
+        let stop_reason = events.iter().find_map(|e| match e {
+            IrStreamEvent::MessageDelta { stop_reason, .. } => stop_reason.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            stop_reason.as_deref(),
+            Some("safety"),
+            "prompt-block must surface a `safety` stop_reason: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(IrStreamEvent::MessageStop)),
+            "the stream must terminate with MessageStop: {events:?}"
+        );
+        // No stray content blocks for a blocked prompt.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, IrStreamEvent::BlockStart { .. })),
+            "a blocked prompt must not open any content block: {events:?}"
+        );
+    }
+
+    /// Regression (MED, completeness): a PROMPT-blocked NON-STREAMING Gemini body (top-level
+    /// `promptFeedback.blockReason`, NO `candidates`, NO `error`) must decode to an empty-content
+    /// response with a `safety` stop reason, NOT hard-fail with `ir_parse` (which the old
+    /// absent-candidates arm did → a spurious client error with no surfaced reason).
+    #[test]
+    fn test_read_response_prompt_block_is_safety_stop_not_error() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "promptFeedback": {
+                "blockReason": "PROHIBITED_CONTENT",
+                "safetyRatings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}]
+            },
+            "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 0}
+        });
+        let ir = reader
+            .read_response(&body)
+            .expect("prompt-blocked body must decode, not error");
+        assert!(
+            ir.content.is_empty(),
+            "a blocked prompt has no content blocks, got {:?}",
+            ir.content
+        );
+        assert_eq!(
+            ir.stop_reason.as_deref(),
+            Some("safety"),
+            "a blocked prompt must surface a `safety` stop_reason"
+        );
+        assert_eq!(ir.usage.input_tokens, 9, "usage must still be surfaced");
+    }
+
+    /// Regression: a candidates-absent body with NEITHER an error NOR a promptFeedback.blockReason is
+    /// still a malformed envelope and MUST hard-fail — the prompt-block arm must not swallow it.
+    #[test]
+    fn test_read_response_candidates_absent_without_block_still_errors() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({"usageMetadata": {"promptTokenCount": 1}});
+        assert!(
+            reader.read_response(&body).is_err(),
+            "a candidates-absent body with no block reason must still error"
+        );
+    }
+
+    /// Regression (LOW, bug): a STREAMING zero-arg `functionCall` (no `args` field) must emit an
+    /// empty JSON OBJECT `{}` as its InputJsonDelta, NOT `null`. Serializing `null` produced an
+    /// invalid tool-input shape on cross-protocol egress.
+    #[test]
+    fn test_stream_zero_arg_function_call_emits_empty_object_not_null() {
+        let events = collect_stream(&[serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"functionCall": {"name": "ping"}}]},
+                "finishReason": "STOP"
+            }]
+        })]);
+        let args_json = events.iter().find_map(|e| match e {
+            IrStreamEvent::BlockDelta {
+                delta: IrDelta::InputJsonDelta(s),
+                ..
+            } => Some(s.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            args_json.as_deref(),
+            Some("{}"),
+            "zero-arg streamed functionCall must serialize to `{{}}`, not `null`: {events:?}"
+        );
+    }
+
+    /// Regression (LOW, bug): a NON-STREAMING zero-arg `functionCall` (no `args` field) must decode
+    /// to an empty-object `input` (`{}`), NOT `null`.
+    #[test]
+    fn test_read_response_zero_arg_function_call_input_is_empty_object_not_null() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"functionCall": {"name": "ping"}}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let ir = reader.read_response(&body).expect("read_response");
+        let input = ir.content.iter().find_map(|b| match b {
+            crate::ir::IrBlock::ToolUse { input, .. } => Some(input.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            input,
+            Some(serde_json::Value::Object(serde_json::Map::new())),
+            "zero-arg functionCall input must be `{{}}`, not null: {:?}",
+            ir.content
         );
     }
 

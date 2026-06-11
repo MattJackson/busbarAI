@@ -128,7 +128,11 @@ impl GovState {
         self.offload_store_write("token usage record failed", key_id, move |store| {
             store.add_usage(&key_owned, window, spend, tokens, false)
         });
-        self.add_rate_tokens(key_id, now, tokens);
+        // Feed the TPM counter UPDATE-only: this path has just the key id, not the key's caps, so it
+        // cannot prove the key is capped. It credits an existing entry (created by `check_rate` for a
+        // capped key) but never materialises one — an uncapped key has no entry and must not gain one
+        // here, otherwise the rate map grows unboundedly for caps-free deployments.
+        self.add_rate_tokens(key_id, now, tokens, false);
     }
 
     /// Acquire the `rate` map for writing, recovering from a poisoned lock rather than panicking.
@@ -228,17 +232,27 @@ impl GovState {
     }
 
     /// Apply a partial update to an existing key: enable/disable it, or adjust its rate/budget caps.
-    /// Only the `Some(_)` fields change; `key_hash`/`name`/`allowed_pools`/`budget_period`/`created_at`
-    /// are preserved (the secret is never re-minted). Returns `Ok(None)` when the key does not exist
-    /// (so the caller can 404), `Ok(Some(updated_metadata))` otherwise. Validation (non-negative
-    /// budget, non-zero rate caps) is the caller's responsibility, mirroring `create_key`'s ingress.
+    /// `key_hash`/`name`/`allowed_pools`/`budget_period`/`created_at` are preserved (the secret is
+    /// never re-minted). Returns `Ok(None)` when the key does not exist (so the caller can 404),
+    /// `Ok(Some(updated_metadata))` otherwise. Validation (non-negative budget, non-zero rate caps on
+    /// a *present* value) is the caller's responsibility, mirroring `create_key`'s ingress.
+    ///
+    /// THREE-STATE caps. The three cap fields (`rpm_limit`/`tpm_limit`/`max_budget_cents`) are
+    /// `Option<Option<T>>` so the API can distinguish all three intents the JSON allows:
+    ///   - `None`: field absent from the request body -> leave the stored value unchanged.
+    ///   - `Some(None)`: field present as JSON `null` -> CLEAR the cap to unlimited (None).
+    ///   - `Some(Some)`: field present with a value -> SET the cap to that value.
+    ///
+    /// The old single-`Option` shape conflated absent and present-null, so a cap could never be
+    /// cleared back to unlimited once set — only widened/narrowed. `enabled` stays a plain `Option`
+    /// (a bool has no "unlimited"/clear state; absent vs present is its only distinction).
     pub(crate) fn update_key(
         &self,
         id: &str,
         enabled: Option<bool>,
-        rpm_limit: Option<u32>,
-        tpm_limit: Option<u32>,
-        max_budget_cents: Option<i64>,
+        rpm_limit: Option<Option<u32>>,
+        tpm_limit: Option<Option<u32>>,
+        max_budget_cents: Option<Option<i64>>,
     ) -> StoreResult<Option<VirtualKey>> {
         let Some(mut key) = self.store.get_key(id)? else {
             return Ok(None);
@@ -246,14 +260,17 @@ impl GovState {
         if let Some(e) = enabled {
             key.enabled = e;
         }
+        // Outer `Some` = the field was present in the request. The inner option is then assigned
+        // verbatim: inner `Some(v)` sets the cap, inner `None` (JSON null) clears it to unlimited.
+        // Outer `None` (field absent) falls through and leaves the stored value untouched.
         if let Some(r) = rpm_limit {
-            key.rpm_limit = Some(r);
+            key.rpm_limit = r;
         }
         if let Some(t) = tpm_limit {
-            key.tpm_limit = Some(t);
+            key.tpm_limit = t;
         }
         if let Some(b) = max_budget_cents {
-            key.max_budget_cents = Some(b);
+            key.max_budget_cents = b;
         }
         // `put_key` UPSERTs on the PRIMARY KEY `id` with identical `key_hash`, so this is an in-place
         // update of the existing row (no secret rotation). Refresh the in-memory cache so the change
@@ -379,14 +396,26 @@ impl GovState {
 
     /// Add tokens to the key's rate window for TPM accounting. Called post-response from
     /// `record_request`/`record_tokens`. Tokens are attributed to the window implied by `now` (the
-    /// moment the response completed): if no entry exists, or it belongs to a stale (earlier)
-    /// window, we (re)initialise the entry for `now`'s window and credit the tokens there. The prior
-    /// behaviour silently dropped tokens whenever the entry had been evicted or rolled by a later
-    /// `check_rate` call (i.e. whenever a response completed in a different 60s window than it
-    /// started — the common case for streaming), causing TPM to under-count and a key to sustain
-    /// above its configured limit. We never credit a stale window, so a late response cannot inflate
-    /// a window that has already closed.
-    fn add_rate_tokens(&self, key_id: &str, now: u64, tokens: u64) {
+    /// moment the response completed): if the entry is missing or belongs to a stale (earlier)
+    /// window, we (re)initialise it for `now`'s window and credit the tokens there. We never credit a
+    /// stale window, so a late response cannot inflate a window that has already closed.
+    ///
+    /// MEMORY BOUND (the rate map must not grow for uncapped keys). `create_if_absent` gates whether a
+    /// MISSING entry is materialised. `check_rate` only ever creates entries for keys that carry an
+    /// RPM/TPM cap (it early-returns for uncapped keys before touching the map), so an uncapped key
+    /// has no entry here. Materialising one unconditionally — as the prior code did on EVERY response,
+    /// for EVERY key — leaked one entry per uncapped key forever, since the sweep only evicts entries
+    /// whose window is stale and a busy uncapped key keeps refreshing its own. So:
+    ///   - callers that KNOW the key has a cap (`record_request`, which holds the `VirtualKey`) pass
+    ///     `create_if_absent = true`, preserving the swept-capped-key recovery: a capped key whose
+    ///     entry the sweep evicted between admission and completion still gets its tokens credited.
+    ///   - callers WITHOUT the cap (`record_tokens`, which only has the key id) pass `false`: an entry
+    ///     is updated if present (the normal case — `check_rate` created it for a capped key) but is
+    ///     never created from scratch, so an uncapped key cannot grow the map through this path.
+    ///
+    /// Updating an entry that already exists is always safe regardless of the flag: only a capped key
+    /// could have produced that entry in the first place.
+    fn add_rate_tokens(&self, key_id: &str, now: u64, tokens: u64, create_if_absent: bool) {
         if tokens == 0 {
             return;
         }
@@ -410,8 +439,10 @@ impl GovState {
             }
             // else: entry is for a NEWER window than this (late) response -> its window has already
             // closed; drop the credit rather than revive a stale window or inflate the current one.
-        } else {
-            // No entry yet -> create one for this response's window and credit it.
+        } else if create_if_absent {
+            // No entry yet, but the caller vouches the key is capped -> create one for this
+            // response's window and credit it (recovers a capped key whose entry the sweep evicted
+            // between admission and completion). An uncapped key never reaches here.
             map.insert(
                 key_id.to_string(),
                 RateState {
@@ -421,6 +452,16 @@ impl GovState {
                 },
             );
         }
+        // else: no entry and the caller can't prove the key is capped -> do NOT materialise one. An
+        // uncapped key has no entry (check_rate never made one), so this prevents the unbounded
+        // growth of the rate map for deployments whose keys have no RPM/TPM cap.
+    }
+
+    /// Whether a key carries any in-window rate cap (RPM or TPM). Only such keys may have an entry in
+    /// the ephemeral `rate` map; uncapped keys are early-returned by `check_rate` and never fed it,
+    /// which keeps the map bounded (see `add_rate_tokens`).
+    fn key_has_rate_cap(key: &VirtualKey) -> bool {
+        key.rpm_limit.is_some() || key.tpm_limit.is_some()
     }
 
     /// Is this key already at/over its budget for the current window? (No cap → never.) Synchronous
@@ -490,8 +531,15 @@ impl GovState {
         self.offload_store_write("usage record failed", &key.id, move |store| {
             store.add_usage(&key_id, window, fee, tokens, true)
         });
-        // also feed the rate window's TPM counter.
-        self.add_rate_tokens(&key.id, now, tokens);
+        // Feed the rate window's TPM counter ONLY for keys that carry an RPM/TPM cap. An uncapped key
+        // is never rate-limited (`check_rate` early-returns and never creates an entry for it), so
+        // feeding the rate map for it would leak one entry per uncapped key forever — the unbounded
+        // growth this guards against. We hold the full `VirtualKey` here, so we can prove the cap and
+        // pass `create_if_absent = true`, which preserves crediting a capped key whose entry the
+        // sweep evicted between admission and completion.
+        if Self::key_has_rate_cap(key) {
+            self.add_rate_tokens(&key.id, now, tokens, true);
+        }
     }
 
     fn load(store: &dyn Store) -> StoreResult<HashMap<String, VirtualKey>> {
@@ -1466,7 +1514,7 @@ mod tests {
         assert!(key.enabled, "new key starts enabled");
         let hash = key.key_hash.clone();
 
-        // Disable it; leave the limits untouched (None).
+        // Disable it; leave the limits untouched (outer None = field absent).
         let updated = gov
             .update_key(&key.id, Some(false), None, None, None)
             .unwrap()
@@ -1478,9 +1526,9 @@ mod tests {
         let looked = gov.lookup(&secret).unwrap();
         assert!(!looked.enabled, "lookup reflects the disabled key");
 
-        // Re-enable and bump the rate cap in one call.
+        // Re-enable and bump the rate cap in one call (Some(Some(50)) = set).
         let re = gov
-            .update_key(&key.id, Some(true), Some(50), None, None)
+            .update_key(&key.id, Some(true), Some(Some(50)), None, None)
             .unwrap()
             .expect("key exists");
         assert!(re.enabled);
@@ -1491,6 +1539,123 @@ mod tests {
             .update_key("vk_does_not_exist", Some(false), None, None, None)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn test_update_key_clears_caps_to_unlimited_with_inner_none() {
+        // THREE-STATE caps (LOW #16/#19): `Some(None)` CLEARS a cap back to unlimited; `None` (outer)
+        // leaves it unchanged; `Some(Some(v))` sets it. The old single-Option shape could only set or
+        // leave-unchanged, never clear. Verify all three transitions on every cap field.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store.clone(), 1, 0, None).unwrap();
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(5000),
+                    budget_period: "total".to_string(),
+                    rpm_limit: Some(10),
+                    tpm_limit: Some(2000),
+                },
+                1_700_000_000,
+            )
+            .unwrap();
+        assert_eq!(key.rpm_limit, Some(10));
+        assert_eq!(key.tpm_limit, Some(2000));
+        assert_eq!(key.max_budget_cents, Some(5000));
+
+        // Clear ALL three caps to unlimited with inner None.
+        let cleared = gov
+            .update_key(&key.id, None, Some(None), Some(None), Some(None))
+            .unwrap()
+            .expect("key exists");
+        assert_eq!(cleared.rpm_limit, None, "rpm cleared to unlimited");
+        assert_eq!(cleared.tpm_limit, None, "tpm cleared to unlimited");
+        assert_eq!(
+            cleared.max_budget_cents, None,
+            "budget cleared to unlimited"
+        );
+        // The clear persisted through the store, not just the returned struct.
+        let persisted = store.get_key(&key.id).unwrap().unwrap();
+        assert_eq!(persisted.rpm_limit, None);
+        assert_eq!(persisted.tpm_limit, None);
+        assert_eq!(persisted.max_budget_cents, None);
+
+        // Now SET them again from the cleared state.
+        let reset = gov
+            .update_key(
+                &key.id,
+                None,
+                Some(Some(7)),
+                Some(Some(99)),
+                Some(Some(123)),
+            )
+            .unwrap()
+            .expect("key exists");
+        assert_eq!(reset.rpm_limit, Some(7));
+        assert_eq!(reset.tpm_limit, Some(99));
+        assert_eq!(reset.max_budget_cents, Some(123));
+
+        // And absence (outer None) leaves them UNCHANGED.
+        let unchanged = gov
+            .update_key(&key.id, Some(false), None, None, None)
+            .unwrap()
+            .expect("key exists");
+        assert!(!unchanged.enabled, "enabled toggled");
+        assert_eq!(unchanged.rpm_limit, Some(7), "absent leaves rpm unchanged");
+        assert_eq!(unchanged.tpm_limit, Some(99), "absent leaves tpm unchanged");
+        assert_eq!(
+            unchanged.max_budget_cents,
+            Some(123),
+            "absent leaves budget unchanged"
+        );
+    }
+
+    #[test]
+    fn test_unlimited_key_does_not_grow_rate_map() {
+        // LOW #17 (memory): a key with NO RPM/TPM cap must never grow the ephemeral `rate` map. Both
+        // the rate-limit gate (`check_rate`) and the post-response accounting (`record_request` /
+        // `record_tokens`) must skip the map for an uncapped key — otherwise every request leaks one
+        // entry per uncapped key forever. Drive many requests for an uncapped key and assert the map
+        // stays empty; then a capped key DOES get an entry (the feed still works where it should).
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 5, 7, None).unwrap();
+
+        let mut uncapped = sample_key("uncapped", "h_unl");
+        uncapped.rpm_limit = None;
+        uncapped.tpm_limit = None;
+        let now = 1_700_000_040;
+        for _ in 0..50 {
+            assert!(gov.check_rate(&uncapped, now).is_ok());
+            gov.record_request(&uncapped, now, 1234); // non-zero tokens — would feed the map pre-fix
+        }
+        // record_tokens carries only the key id (no caps), so it must also not materialise an entry.
+        gov.record_tokens("uncapped", "total", now, 9999);
+        assert!(
+            gov.rate
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("uncapped")
+                .is_none(),
+            "an uncapped key must never gain a rate-map entry"
+        );
+
+        // A capped key still gets fed: check_rate creates its entry and record_request credits TPM.
+        let mut capped = sample_key("capped", "h_cap");
+        capped.rpm_limit = Some(100);
+        capped.tpm_limit = Some(100_000);
+        assert!(gov.check_rate(&capped, now).is_ok());
+        gov.record_request(&capped, now, 500);
+        let map = gov.rate.read().unwrap_or_else(|p| p.into_inner());
+        let st = map
+            .get("capped")
+            .expect("a capped key must have a rate-map entry");
+        assert_eq!(st.tokens, 500, "capped key's TPM counter was fed");
+        assert!(
+            map.get("uncapped").is_none(),
+            "uncapped key still absent after a capped key was added"
+        );
     }
 
     #[test]

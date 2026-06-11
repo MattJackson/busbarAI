@@ -193,6 +193,28 @@ fn push_system_content(
     }
 }
 
+/// Extract the IR content blocks for a user/assistant conversation turn from a Responses
+/// `message`-item `content` field. The Responses surface allows `content` to be EITHER an array of
+/// typed content blocks (`[{"type":"input_text",...}, ...]`) OR a bare JSON string shorthand
+/// (`"content": "hello"`). The array-only path used previously silently DROPPED the entire turn
+/// when `content` was a bare string (`as_array()` -> None -> message never pushed), losing a
+/// user/assistant turn on a cross-protocol hop. This helper handles both shapes so neither arm
+/// loses a turn. A bare string becomes a single `Text` block (empty string -> empty content, but
+/// the message is still emitted so the turn survives).
+fn message_content_blocks(content: Option<&serde_json::Value>) -> Option<Vec<crate::ir::IrBlock>> {
+    match content {
+        Some(serde_json::Value::String(s)) => Some(vec![crate::ir::IrBlock::Text {
+            text: s.clone(),
+            cache_control: None,
+            citations: Vec::new(),
+        }]),
+        Some(serde_json::Value::Array(arr)) => {
+            Some(arr.iter().filter_map(|b| responses_block(b).ok()).collect())
+        }
+        _ => None,
+    }
+}
+
 /// Reconstruct a Responses `image_url` string from the IR `Image` (media_type, data) pair — the
 /// inverse of [`parse_image_url`]. A URL-sentinel image is emitted verbatim; a base64 image is
 /// re-wrapped into a `data:<mime>;base64,<payload>` URI.
@@ -525,13 +547,12 @@ impl ProtocolReader for ResponsesReader {
                                 _ => None,
                             };
                             if let Some(role) = role {
-                                if let Some(content_arr) =
-                                    item.get("content").and_then(|c| c.as_array())
+                                // `content` may be an array of typed blocks OR a bare string
+                                // shorthand; `message_content_blocks` handles both so a
+                                // string-content turn is not silently dropped.
+                                if let Some(msg_content) =
+                                    message_content_blocks(item.get("content"))
                                 {
-                                    let msg_content: Vec<crate::ir::IrBlock> = content_arr
-                                        .iter()
-                                        .filter_map(|b| responses_block(b).ok())
-                                        .collect();
                                     messages.push(crate::ir::IrMessage {
                                         role,
                                         content: msg_content,
@@ -565,12 +586,10 @@ impl ProtocolReader for ResponsesReader {
                             _ => continue,
                         };
 
-                        if let Some(content_arr) = content_val.and_then(|c| c.as_array()) {
-                            let msg_content: Vec<crate::ir::IrBlock> = content_arr
-                                .iter()
-                                .filter_map(|b| responses_block(b).ok())
-                                .collect();
-
+                        // As in the typed `message` arm, `content` may be an array of typed
+                        // blocks OR a bare string shorthand; handle both via
+                        // `message_content_blocks` so a string-content untyped turn survives.
+                        if let Some(msg_content) = message_content_blocks(content_val) {
                             messages.push(crate::ir::IrMessage {
                                 role,
                                 content: msg_content,
@@ -2780,6 +2799,61 @@ mod tests {
         assert_eq!(ir.tools.len(), 1);
         let tool = &ir.tools[0];
         assert_eq!(tool.name, "get_weather");
+    }
+
+    // Regression (MED #4/#5): a `message`-item `content` that is a BARE JSON STRING (the
+    // Responses shorthand) must survive. The old array-only path returned `None` from
+    // `as_array()` and silently dropped the whole turn, losing a user/assistant message on a
+    // cross-protocol hop. Covers BOTH the typed `"type":"message"` arm and the untyped
+    // role-keyed fallback.
+    #[test]
+    fn test_read_request_bare_string_content_survives() {
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [
+                // typed message arm, bare-string content
+                {"type": "message", "role": "user", "content": "hello from typed"},
+                // typed message arm, assistant bare-string content
+                {"type": "message", "role": "assistant", "content": "typed assistant reply"},
+                // untyped role-keyed fallback, bare-string content
+                {"role": "user", "content": "hello from untyped"},
+                {"role": "assistant", "content": "untyped assistant reply"}
+            ]
+        });
+
+        let reader = ResponsesReader;
+        let ir = reader
+            .read_request(&json)
+            .expect("read_request should succeed");
+
+        // All four turns must survive (old code dropped every one).
+        assert_eq!(ir.messages.len(), 4, "no turn may be dropped");
+
+        let expect_text = |msg: &crate::ir::IrMessage, role: crate::ir::IrRole, text: &str| {
+            assert_eq!(msg.role, role);
+            assert_eq!(msg.content.len(), 1);
+            match &msg.content[0] {
+                crate::ir::IrBlock::Text { text: t, .. } => assert_eq!(t, text),
+                other => panic!("expected Text block, got {other:?}"),
+            }
+        };
+
+        expect_text(&ir.messages[0], crate::ir::IrRole::User, "hello from typed");
+        expect_text(
+            &ir.messages[1],
+            crate::ir::IrRole::Assistant,
+            "typed assistant reply",
+        );
+        expect_text(
+            &ir.messages[2],
+            crate::ir::IrRole::User,
+            "hello from untyped",
+        );
+        expect_text(
+            &ir.messages[3],
+            crate::ir::IrRole::Assistant,
+            "untyped assistant reply",
+        );
     }
 
     #[test]

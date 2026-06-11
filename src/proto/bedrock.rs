@@ -438,6 +438,28 @@ fn write_cache_usage(
     }
 }
 
+/// Upper bound applied to the upstream-controlled Bedrock ConverseStream `contentBlockIndex` at
+/// every stream read site (`contentBlockStart` / `contentBlockDelta` / `contentBlockStop`). The
+/// wire value is attacker-controllable: a hostile/buggy backend can send an arbitrarily huge index
+/// (up to `u64::MAX`), which the old code cast straight to `usize` and forwarded into IR
+/// `BlockStart`/`BlockDelta`/`BlockStop` indices. A downstream ingress writer keying per-index
+/// state off that value would then allocate/track against a pathological index. A real Converse
+/// stream emits small sequential block indices (0, 1, 2, …); any larger value is malformed, so we
+/// clamp to this bounded cap before it enters the IR. Mirrors the OpenAI reader's `MAX_TOOL_INDEX`
+/// and the Cohere reader's `MAX_TOOL_FRAME_INDEX` clamps.
+const MAX_CONTENT_BLOCK_INDEX: u64 = 1023;
+
+/// Read the upstream-controlled `contentBlockIndex` off a Bedrock ConverseStream frame, defaulting
+/// to 0 when absent/non-numeric, and clamp it to `MAX_CONTENT_BLOCK_INDEX` so a crafted huge index
+/// can never be forwarded into an IR block index. Shared by all three stream read sites so the
+/// clamp stays uniform.
+fn clamp_content_block_index(data: &serde_json::Value) -> usize {
+    data.get("contentBlockIndex")
+        .and_then(|i| i.as_u64())
+        .unwrap_or(0)
+        .min(MAX_CONTENT_BLOCK_INDEX) as usize
+}
+
 #[derive(Clone)]
 pub(crate) struct BedrockReader;
 
@@ -502,8 +524,14 @@ impl ProtocolReader for BedrockReader {
         let text = String::from_utf8_lossy(body);
         let lower = text.to_lowercase();
 
+        // Keep this set of context-length phrasings in LOCKSTEP with the production
+        // `extract_error` above (R21 #17 added the third `exceeds the maximum` pattern there but
+        // not here, drifting the two). All three must match identically so the test-only classifier
+        // mirrors what the breaker actually sees.
         if lower.contains("input is longer than the maximum number of tokens")
             || (lower.contains("maximum-tokens") && lower.contains("requested"))
+            || (lower.contains("exceeds the maximum")
+                && (lower.contains("token") || lower.contains("context")))
         {
             return CanonicalSignal {
                 class: StatusClass::ContextLength,
@@ -928,10 +956,7 @@ impl ProtocolReader for BedrockReader {
             }
 
             Some("contentBlockStart") => {
-                let idx = data
-                    .get("contentBlockIndex")
-                    .and_then(|i| i.as_u64())
-                    .unwrap_or(0) as usize;
+                let idx = clamp_content_block_index(data);
 
                 if let Some(start_obj) = data.get("start").and_then(|s| s.as_object()) {
                     if let Some(tool_use) = start_obj.get("toolUse").and_then(|t| t.as_object()) {
@@ -981,10 +1006,7 @@ impl ProtocolReader for BedrockReader {
             }
 
             Some("contentBlockDelta") => {
-                let idx = data
-                    .get("contentBlockIndex")
-                    .and_then(|i| i.as_u64())
-                    .unwrap_or(0) as usize;
+                let idx = clamp_content_block_index(data);
 
                 if let Some(delta_obj) = data.get("delta").and_then(|d| d.as_object()) {
                     if delta_obj.contains_key("text") {
@@ -1012,10 +1034,7 @@ impl ProtocolReader for BedrockReader {
             }
 
             Some("contentBlockStop") => {
-                let idx = data
-                    .get("contentBlockIndex")
-                    .and_then(|i| i.as_u64())
-                    .unwrap_or(0) as usize;
+                let idx = clamp_content_block_index(data);
 
                 // Clear `text_block_open` on ANY contentBlockStop while a text block is open, not
                 // only at index 0. Bedrock indexes text blocks that follow a tool-use block at
@@ -5251,6 +5270,131 @@ mod tests {
         assert!(
             bedrock_image_block(JSON_BLOCK_SENTINEL, r#"{"a":1}"#).is_none(),
             "the json sentinel must never emit an image block"
+        );
+    }
+
+    /// Regression (R22 LOW #24, index clamp): the upstream-controlled `contentBlockIndex` is
+    /// attacker-controllable and was forwarded UNCLAMPED into IR block indices at all three stream
+    /// read sites (`contentBlockStart` / `contentBlockDelta` / `contentBlockStop`). A malicious huge
+    /// index must now be clamped to `MAX_CONTENT_BLOCK_INDEX` before it reaches the IR, so a
+    /// downstream ingress writer can never be driven to track/allocate against a pathological index.
+    #[test]
+    fn test_stream_huge_content_block_index_is_clamped() {
+        use crate::ir::IrStreamEvent;
+        let mut state = crate::ir::StreamDecodeState::default();
+        let reader = BedrockReader;
+
+        // Open the stream so the BlockStart `state.started` guard passes.
+        let _ = reader.read_response_events(
+            "",
+            &serde_json::json!({"type": "messageStart", "role": "assistant"}),
+            &mut state,
+        );
+
+        let huge = u64::MAX;
+        let expected = MAX_CONTENT_BLOCK_INDEX as usize;
+
+        // contentBlockStart (text shape: empty `start` object).
+        let start = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "contentBlockStart",
+                "contentBlockIndex": huge,
+                "start": {}
+            }),
+            &mut state,
+        );
+        let start_idx = start.iter().find_map(|e| match e {
+            IrStreamEvent::BlockStart { index, .. } => Some(*index),
+            _ => None,
+        });
+        assert_eq!(
+            start_idx,
+            Some(expected),
+            "a huge contentBlockIndex on contentBlockStart must be clamped to \
+             MAX_CONTENT_BLOCK_INDEX; got {start:?}"
+        );
+
+        // contentBlockDelta.
+        let delta = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "contentBlockDelta",
+                "contentBlockIndex": huge,
+                "delta": {"text": "hi"}
+            }),
+            &mut state,
+        );
+        let delta_idx = delta.iter().find_map(|e| match e {
+            IrStreamEvent::BlockDelta { index, .. } => Some(*index),
+            _ => None,
+        });
+        assert_eq!(
+            delta_idx,
+            Some(expected),
+            "a huge contentBlockIndex on contentBlockDelta must be clamped; got {delta:?}"
+        );
+
+        // contentBlockStop.
+        let stop = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "type": "contentBlockStop",
+                "contentBlockIndex": huge
+            }),
+            &mut state,
+        );
+        let stop_idx = stop.iter().find_map(|e| match e {
+            IrStreamEvent::BlockStop { index } => Some(*index),
+            _ => None,
+        });
+        assert_eq!(
+            stop_idx,
+            Some(expected),
+            "a huge contentBlockIndex on contentBlockStop must be clamped; got {stop:?}"
+        );
+    }
+
+    /// Regression (R22 LOW #12, classify/extract_error lockstep): the `#[cfg(test)]` `classify`
+    /// helper must recognize EVERY context-length phrasing the production `extract_error` does. R21
+    /// #17 added a third pattern (`exceeds the maximum` + token/context) to `extract_error` but not
+    /// to `classify`, so the two drifted. The classifier must now map that third phrasing to
+    /// `StatusClass::ContextLength`, identically to `extract_error`.
+    #[test]
+    fn test_classify_third_context_length_pattern_matches_extract_error() {
+        let reader = BedrockReader;
+        // The third phrasing (R21 #17): "exceeds the maximum" + token/context.
+        let body = br#"{"__type":"ValidationException","message":"The request exceeds the maximum context length for this model."}"#;
+
+        // Production extract_error surfaces the canonical code...
+        let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "extract_error must recognize the `exceeds the maximum` phrasing; got {raw:?}"
+        );
+
+        // ...and the test-only classify must agree (lockstep).
+        let signal = reader.classify(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            signal.class,
+            StatusClass::ContextLength,
+            "classify must map the `exceeds the maximum` phrasing to ContextLength, in lockstep \
+             with extract_error; got {signal:?}"
+        );
+        assert_eq!(
+            signal.provider_signal.as_deref(),
+            Some("context_length_exceeded"),
+            "classify must surface the canonical context_length_exceeded signal; got {signal:?}"
+        );
+
+        // The "token" branch variant also matches.
+        let body_tok = br#"{"__type":"ValidationException","message":"Prompt exceeds the maximum number of input tokens."}"#;
+        let signal_tok = reader.classify(StatusCode::BAD_REQUEST, body_tok);
+        assert_eq!(
+            signal_tok.class,
+            StatusClass::ContextLength,
+            "classify must match the token variant of the third pattern; got {signal_tok:?}"
         );
     }
 }

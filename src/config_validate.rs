@@ -244,6 +244,26 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         // produce a breaker that either never protects the backend or trips it open on the first
         // hiccup, defeating the failure-handling guarantee. Reject them at startup (fail-loud).
         if let Some(breaker) = &pool_cfg.breaker {
+            // A `base_cooldown_secs: 0` or `max_cooldown_secs: 0` parses fine but yields a degenerate
+            // breaker with NO cooldown: when the breaker trips open it would re-admit the failing
+            // backend immediately (the cooldown window is zero seconds), defeating the back-off the
+            // breaker exists to provide. This is the cooldown-axis twin of the trip.* zero-floor
+            // guards below (min_requests/window_s/n >= 1) — reject a zero floor on EITHER cooldown
+            // field at boot rather than ship a breaker that never actually pauses the backend. (The
+            // inversion check below additionally requires max >= base; the two together pin both
+            // fields to >= 1 with max >= base.)
+            if breaker.base_cooldown_secs == 0 {
+                errors.push(format!(
+                    "pool '{}' breaker base_cooldown_secs must be >= 1 (got 0); a zero cooldown re-admits a tripped backend immediately, defeating the breaker's back-off",
+                    pool_name
+                ));
+            }
+            if breaker.max_cooldown_secs == 0 {
+                errors.push(format!(
+                    "pool '{}' breaker max_cooldown_secs must be >= 1 (got 0); a zero cooldown re-admits a tripped backend immediately, defeating the breaker's back-off",
+                    pool_name
+                ));
+            }
             // The escalating cooldown clamps at max_cooldown_secs, so a max below the base would
             // pin every cooldown below the configured base — reject the inversion.
             if breaker.max_cooldown_secs < breaker.base_cooldown_secs {
@@ -387,8 +407,41 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     );
                 }
             }
-            // Passthrough carries no token-allowlist requirement.
-            Some(crate::auth::AuthMode::Passthrough) => {}
+            // Passthrough carries no token-allowlist requirement, but it has a credential-LEAK
+            // foot-gun: forward.rs selects the upstream key as `caller_token.unwrap_or(lane.api_key)`,
+            // so an UNAUTHENTICATED caller (no token) in passthrough mode gets busbar's OWN configured
+            // lane key (resolved from the provider's `api_key_env`) substituted upstream. A passthrough
+            // deployment is meant to forward the CALLER's credential, never a configured one — so a
+            // provider whose `api_key_env` resolves to a NON-EMPTY value is the leak signal.
+            //
+            // We WARN (not hard-reject): a legit Bedrock-ingress passthrough provider authenticates
+            // per-request with SigV4 from the AWS credential chain, so its `api_key_env` normally
+            // resolves EMPTY and never trips this — but an operator may also have a deliberate
+            // static-key fallback provider, and rejecting would break that. Mirror main.rs's
+            // single env read (`std::env::var(api_key_env)`) so the guard sees the SAME value the
+            // lane will, and surface a prominent boot warning naming each offending provider. The
+            // resolved `_legacy_api_key` is always None (config::resolve discards+warns on it), so
+            // `api_key_env` is the only key source to check.
+            Some(crate::auth::AuthMode::Passthrough) => {
+                for (provider_name, provider_cfg) in &cfg.providers {
+                    let resolved_key = std::env::var(&provider_cfg.api_key_env).unwrap_or_default();
+                    if !resolved_key.trim().is_empty() {
+                        tracing::warn!(
+                            provider = %provider_name,
+                            api_key_env = %provider_cfg.api_key_env,
+                            "auth.mode=passthrough with a NON-EMPTY configured api_key for this \
+                             provider is a credential-leak risk: in passthrough mode an \
+                             UNAUTHENTICATED caller (no token) has busbar's OWN configured lane key \
+                             substituted upstream (caller_token.unwrap_or(lane.api_key)), forwarding \
+                             your secret on the caller's behalf. A passthrough deployment should \
+                             forward the CALLER credential, never a configured one. Unset the \
+                             environment variable named by api_key_env (Bedrock-ingress passthrough \
+                             signs per-request via SigV4 and needs no static key), or switch to \
+                             auth.mode=token to gate callers."
+                        );
+                    }
+                }
+            }
             Some(crate::auth::AuthMode::None) => {
                 // mode=none is an open relay: `validate_token` admits every request unconditionally,
                 // so a configured `client_tokens` allowlist has ZERO enforcement effect. An operator
@@ -443,7 +496,12 @@ pub(crate) fn validate_governance(
         && governance
             .admin_token
             .as_deref()
-            .is_none_or(|t| t.is_empty())
+            // A WHITESPACE-ONLY admin_token (e.g. " " or "\t") passes a bare `is_empty()` guard but is
+            // functionally unusable: it is a degenerate secret an operator cannot reasonably present,
+            // and `${BUSBAR_ADMIN_TOKEN}` expanding to an all-blanks value would silently lock the
+            // /admin API exactly as an unset token does. Reject blank-only here too (trim then test)
+            // so the boot diagnostic fires for the whitespace case, not just the truly-empty one.
+            .is_none_or(|t| t.trim().is_empty())
     {
         errors.push(
             "governance.enabled is true but no governance.admin_token is configured; the /admin management API is unreachable (every admin call returns 401). Set governance.admin_token (e.g. admin_token: ${BUSBAR_ADMIN_TOKEN})".to_string(),
@@ -1536,6 +1594,27 @@ mod tests {
                 ),
                 "max_cooldown_secs",
             ),
+            (
+                // Regression (MED #9): a zero base cooldown yields a degenerate breaker that re-admits
+                // a tripped backend immediately — must fail loud, mirroring the trip.* zero-floor guards.
+                "base_cooldown 0",
+                make_breaker(
+                    0,
+                    120,
+                    Some(make_trip(config::BreakerTripMode::ErrorRate, 30, 0.5, 5, 3)),
+                ),
+                "base_cooldown_secs must be >= 1",
+            ),
+            (
+                // Regression (MED #9): the max-cooldown twin of the above.
+                "max_cooldown 0",
+                make_breaker(
+                    0,
+                    0,
+                    Some(make_trip(config::BreakerTripMode::ErrorRate, 30, 0.5, 5, 3)),
+                ),
+                "max_cooldown_secs must be >= 1",
+            ),
         ];
 
         for (desc, breaker, expected) in cases {
@@ -1575,6 +1654,48 @@ mod tests {
         assert!(
             validate(&cfg).is_ok(),
             "a well-formed breaker config must validate"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_cooldown_breaker() {
+        // Regression (MED #9): a breaker with base_cooldown_secs == 0 or max_cooldown_secs == 0
+        // passes the inversion check (0 <= 0) yet is degenerate — when it trips open it re-admits the
+        // failing backend immediately because the cooldown window is zero seconds, defeating the
+        // back-off the breaker exists to provide. This is the cooldown-axis twin of the trip.* zero-
+        // floor guards and must fail loud at boot. The breaker has NO `trip` block here, proving the
+        // cooldown floor is enforced independently of trip validation.
+        for (base, max, expected) in [
+            (0u64, 120u64, "base_cooldown_secs must be >= 1"),
+            (15, 0, "max_cooldown_secs must be >= 1"),
+            (0, 0, "base_cooldown_secs must be >= 1"),
+        ] {
+            let (providers, models, _) = valid_maps();
+            let mut pools = HashMap::new();
+            let mut pool = make_pool(vec![make_member("mymodel")]);
+            pool.breaker = Some(make_breaker(base, max, None));
+            pools.insert("mypool".to_string(), pool);
+            let cfg = make_root_cfg(providers, models, pools);
+            let errs = validate(&cfg).unwrap_err_or_default(format!(
+                "breaker base={base} max={max} must fail validation"
+            ));
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains(expected) && e.contains("mypool")),
+                "base={base} max={max}: expected error containing '{expected}'; got: {errs:?}"
+            );
+        }
+
+        // The boundary (both fields == 1) is the minimum well-formed breaker and must validate.
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut pool = make_pool(vec![make_member("mymodel")]);
+        pool.breaker = Some(make_breaker(1, 1, None));
+        pools.insert("mypool".to_string(), pool);
+        let cfg = make_root_cfg(providers, models, pools);
+        assert!(
+            validate(&cfg).is_ok(),
+            "a breaker with base==max==1 is the minimum well-formed config and must validate"
         );
     }
 
@@ -1693,6 +1814,47 @@ mod tests {
                 "expected an admin-token lockout error for {missing:?}; got: {errs:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_validate_governance_rejects_whitespace_only_admin_token() {
+        // Regression (LOW #21): a WHITESPACE-ONLY admin_token (" ", "\t", "\n") passes a bare
+        // is_empty() guard but is a degenerate, functionally-unusable secret — `${BUSBAR_ADMIN_TOKEN}`
+        // expanding to all blanks silently locks the /admin API exactly as an unset token does. The
+        // boot diagnostic must fire for the whitespace case too, not just truly-empty. Against the
+        // old `t.is_empty()` guard these would PASS validation (bug); the `t.trim().is_empty()` fix
+        // rejects them.
+        for blank in [" ", "   ", "\t", "\n", " \t\n "] {
+            let gov = config::GovernanceCfg {
+                enabled: true,
+                db_path: "busbar-governance.db".to_string(),
+                price_per_request_cents: 1,
+                price_per_1k_tokens_cents: 0,
+                admin_token: Some(blank.to_string()),
+            };
+            let errs = validate_governance(&gov, None).unwrap_err_or_default(format!(
+                "a whitespace-only admin_token {blank:?} must fail validation"
+            ));
+            assert!(
+                errs.iter().any(|e| e.contains("governance.admin_token")
+                    && e.contains("/admin management API is unreachable")),
+                "expected an admin-token lockout error for blank token {blank:?}; got: {errs:?}"
+            );
+        }
+
+        // A token with surrounding whitespace but a real non-blank core is usable and must NOT error
+        // (we only reject ALL-blank, not trim the stored secret).
+        let gov = config::GovernanceCfg {
+            enabled: true,
+            db_path: "busbar-governance.db".to_string(),
+            price_per_request_cents: 1,
+            price_per_1k_tokens_cents: 0,
+            admin_token: Some("  real-secret  ".to_string()),
+        };
+        assert!(
+            validate_governance(&gov, None).is_ok(),
+            "an admin_token with a non-blank core must validate (we do not reject surrounding space)"
+        );
     }
 
     #[test]
@@ -1824,6 +1986,136 @@ mod tests {
                 "token mode with at least one token must validate"
             );
         }
+    }
+
+    /// A `tracing::Layer` that records the messages of WARN-level events it sees, so a test can
+    /// assert a particular `tracing::warn!` fired (mirrors the helper in `config.rs`). The structured
+    /// fields (`provider`, `api_key_env`) are recorded into the message-or-field buffer.
+    #[derive(Clone, Default)]
+    struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct Vis(String);
+            impl tracing::field::Visit for Vis {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    // Append every field's debug rendering so both the `message` and the structured
+                    // `provider`/`api_key_env` fields are searchable by the assertion.
+                    self.0.push_str(&format!(" {}={value:?}", field.name()));
+                }
+            }
+            let mut vis = Vis(String::new());
+            event.record(&mut vis);
+            if let Ok(mut msgs) = self.0.lock() {
+                msgs.push(vis.0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_passthrough_warns_on_nonempty_configured_key() {
+        // Regression (LOW #10): in passthrough mode forward.rs selects the upstream key as
+        // `caller_token.unwrap_or(lane.api_key)`, so an UNAUTHENTICATED caller (no token) gets
+        // busbar's OWN configured lane key (resolved from `api_key_env`) substituted upstream — a
+        // credential leak. A passthrough deployment should forward the CALLER credential, never a
+        // configured one. validate() must emit a prominent boot WARNING for any provider whose
+        // `api_key_env` resolves to a NON-EMPTY value while auth.mode=passthrough. A legit Bedrock-
+        // ingress passthrough provider authenticates per-request via SigV4 and resolves an EMPTY key,
+        // so it must NOT warn — that is the second half of this test.
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        // Unique env-var names so parallel tests cannot clobber the values we set/read here.
+        let leak_env = "BUSBAR_T_R22_PASSTHROUGH_LEAK_KEY";
+        let bedrock_env = "BUSBAR_T_R22_PASSTHROUGH_BEDROCK_KEY";
+        std::env::set_var(leak_env, "sk-busbar-secret-should-not-leak");
+        std::env::remove_var(bedrock_env); // Bedrock passthrough: no static key (SigV4 per-request)
+
+        // Provider WITH a non-empty resolved key (the leak case) + Bedrock-style provider whose key
+        // env is unset (the legit case). Both providers need a model so validate() has full context.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "leaky".to_string(),
+            make_provider("anthropic", "https://api.example.com", leak_env),
+        );
+        providers.insert(
+            "bedrock".to_string(),
+            make_provider("bedrock", "https://bedrock.example.com", bedrock_env),
+        );
+        let mut models = HashMap::new();
+        models.insert("leakymodel".to_string(), make_model("leaky", 10));
+        models.insert("bedrockmodel".to_string(), make_model("bedrock", 10));
+        let mut cfg = make_root_cfg(providers, models, HashMap::new());
+        cfg.auth = Some(make_auth("passthrough", vec![], None));
+
+        let cap = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        let result = tracing::subscriber::with_default(subscriber, || validate(&cfg));
+
+        std::env::remove_var(leak_env);
+
+        // The combo is a WARN, not a hard error: passthrough has no token-allowlist requirement, so
+        // validation still succeeds (the warning is the diagnostic, so a deliberate static-key
+        // fallback is not broken).
+        assert!(
+            result.is_ok(),
+            "passthrough + non-empty key is a warning, not a hard error; got: {result:?}"
+        );
+
+        let msgs = cap.0.lock().unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("credential-leak") && m.contains("leaky")),
+            "expected a passthrough credential-leak warning naming the 'leaky' provider; got: {msgs:?}"
+        );
+        // The Bedrock-style provider with an EMPTY resolved key must NOT trip the warning — otherwise
+        // a legit SigV4 passthrough deployment is spammed with a false-positive credential-leak alert.
+        assert!(
+            !msgs.iter().any(|m| m.contains("bedrock")),
+            "a provider whose api_key_env resolves empty must NOT warn (legit SigV4 passthrough); got: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_passthrough_no_warn_when_all_keys_empty() {
+        // Counter-case: with auth.mode=passthrough and EVERY provider's api_key_env unset, no
+        // credential-leak warning fires — the guard keys off the RESOLVED value, not merely the
+        // presence of the passthrough mode. This pins the false-positive boundary.
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let empty_env = "BUSBAR_T_R22_PASSTHROUGH_EMPTY_KEY";
+        std::env::remove_var(empty_env);
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            make_provider("anthropic", "https://api.example.com", empty_env),
+        );
+        let mut models = HashMap::new();
+        models.insert("m".to_string(), make_model("p", 10));
+        let mut cfg = make_root_cfg(providers, models, HashMap::new());
+        cfg.auth = Some(make_auth("passthrough", vec![], None));
+
+        let cap = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        let result = tracing::subscriber::with_default(subscriber, || validate(&cfg));
+
+        assert!(result.is_ok(), "passthrough with empty keys must validate");
+        let msgs = cap.0.lock().unwrap();
+        assert!(
+            !msgs.iter().any(|m| m.contains("credential-leak")),
+            "no credential-leak warning must fire when every api_key_env resolves empty; got: {msgs:?}"
+        );
     }
 
     #[test]

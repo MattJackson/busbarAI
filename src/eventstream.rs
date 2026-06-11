@@ -42,11 +42,34 @@
 /// and `StreamTranslate::MAX_BUF` in sync.
 pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
-/// Drain every COMPLETE frame from `buf`, returning `(event_type, payload_bytes)` per frame and
-/// leaving any trailing partial frame buffered. A malformed prelude clears the buffer (the stream
-/// is unrecoverable) rather than looping.
-pub(crate) fn drain_frames(buf: &mut Vec<u8>) -> Vec<(String, Vec<u8>)> {
+/// Outcome of a [`drain_frames_checked`] pass: WHY the decoder stopped pulling frames from the
+/// buffer. This is the DISTINCT abandonment signal the egress reassembler (`StreamTranslate::feed`)
+/// must key off — previously it inferred a malformed-prelude abort by observing that `drain_frames`
+/// had emptied the buffer, which is fragile: a normal pass that happens to consume every buffered
+/// byte ALSO leaves an empty buffer, so length alone cannot tell a clean full-drain apart from an
+/// unrecoverable abort. Making the abort an explicit variant removes that ambiguity entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainStatus {
+    /// The decoder consumed every COMPLETE frame and stopped cleanly: either the buffer is now empty
+    /// or it holds only a trailing PARTIAL frame awaiting more bytes. The buffer is intact and the
+    /// stream is healthy — feed more bytes and call again.
+    Ok,
+    /// A malformed prelude (out-of-range `total_len`, or `headers_len` larger than the frame can
+    /// hold) was encountered. The stream is UNRECOVERABLE: the buffer has been cleared and the caller
+    /// must abandon the stream rather than continue feeding it. This is the propagated abort signal
+    /// (no longer length-inferred).
+    MalformedPrelude,
+}
+
+/// Drain every COMPLETE frame from `buf`, returning the `(event_type, payload_bytes)` pairs AND a
+/// [`DrainStatus`] saying why the pass stopped. [`DrainStatus::MalformedPrelude`] is the EXPLICIT,
+/// propagated abort signal: on a malformed prelude the buffer is cleared (the stream is
+/// unrecoverable) and the status reflects it, so the caller no longer has to infer abandonment from
+/// the (ambiguous) post-pass buffer length. A clean pass — buffer emptied or a trailing partial
+/// frame left buffered — returns [`DrainStatus::Ok`].
+pub(crate) fn drain_frames_checked(buf: &mut Vec<u8>) -> (Vec<(String, Vec<u8>)>, DrainStatus) {
     let mut out = Vec::new();
+    let mut status = DrainStatus::Ok;
     loop {
         if buf.len() < 12 {
             break; // need the full prelude
@@ -60,6 +83,7 @@ pub(crate) fn drain_frames(buf: &mut Vec<u8>) -> Vec<(String, Vec<u8>)> {
         // length is treated like any other malformed prelude: abandon the (unrecoverable) stream.
         if !(16..=MAX_FRAME_BYTES).contains(&total_len) || headers_len > total_len - 16 {
             buf.clear(); // malformed — abandon the stream rather than spin
+            status = DrainStatus::MalformedPrelude; // distinct propagated signal, not length-inferred
             break;
         }
         if buf.len() < total_len {
@@ -74,7 +98,19 @@ pub(crate) fn drain_frames(buf: &mut Vec<u8>) -> Vec<(String, Vec<u8>)> {
         out.push((event_type, payload));
         buf.drain(..total_len);
     }
-    out
+    (out, status)
+}
+
+/// Drain every COMPLETE frame from `buf`, returning `(event_type, payload_bytes)` per frame and
+/// leaving any trailing partial frame buffered. A malformed prelude clears the buffer (the stream
+/// is unrecoverable) rather than looping.
+///
+/// Thin wrapper over [`drain_frames_checked`] that DISCARDS the [`DrainStatus`], preserved for the
+/// many callers that only need the frames (the usage tap, the route tests). A caller that must
+/// distinguish a malformed-prelude abort from a clean full-drain (e.g. the egress reassembler) calls
+/// [`drain_frames_checked`] for the explicit signal instead of inferring it from buffer length.
+pub(crate) fn drain_frames(buf: &mut Vec<u8>) -> Vec<(String, Vec<u8>)> {
+    drain_frames_checked(buf).0
 }
 
 /// The framing headers `drain_frames` cares about: the normal `:event-type`, plus the
@@ -936,6 +972,76 @@ mod tests {
             msgs.iter().any(|m| m.contains(":exception-type")),
             "dropping an oversized :exception-type frame must emit an observable warn!, got: {msgs:?}"
         );
+    }
+
+    /// REGRESSION (LOW #18, eventstream.rs `drain_frames_checked`): a malformed prelude must abandon
+    /// the stream via a DISTINCT propagated status (`DrainStatus::MalformedPrelude`), not be inferred
+    /// from the buffer being emptied. The key discriminator this test pins: a NORMAL full drain that
+    /// also leaves the buffer empty returns `DrainStatus::Ok`, so the abort signal is unambiguous —
+    /// length alone could not tell the two apart, which was the fragile behavior being fixed.
+    #[test]
+    fn test_drain_frames_checked_signals_malformed_prelude_distinctly() {
+        // (a) Malformed prelude: oversized total_len. Buffer cleared AND status is MalformedPrelude.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&u32::MAX.to_be_bytes()); // total_len ~4 GiB, above MAX_FRAME_BYTES
+        bad.extend_from_slice(&0u32.to_be_bytes()); // headers_len = 0
+        bad.extend_from_slice(&[0, 0, 0, 0]); // prelude CRC
+        bad.extend_from_slice(b"trailing junk");
+        let (frames, status) = drain_frames_checked(&mut bad);
+        assert!(
+            frames.is_empty(),
+            "no frame emitted for a malformed prelude"
+        );
+        assert!(bad.is_empty(), "malformed prelude clears the buffer");
+        assert_eq!(
+            status,
+            DrainStatus::MalformedPrelude,
+            "malformed prelude must propagate the DISTINCT abort signal, not be length-inferred"
+        );
+
+        // (b) headers_len overflow is the OTHER malformed-prelude shape — same distinct signal.
+        let mut bad2 = Vec::new();
+        bad2.extend_from_slice(&20u32.to_be_bytes()); // total_len = 20 (>= 16, <= cap)
+        bad2.extend_from_slice(&5u32.to_be_bytes()); // headers_len = 5 (> 20 - 16 = 4)
+        bad2.extend_from_slice(&[0, 0, 0, 0]); // prelude CRC
+        bad2.extend_from_slice(b"junk extra bytes");
+        let (frames2, status2) = drain_frames_checked(&mut bad2);
+        assert!(frames2.is_empty());
+        assert!(bad2.is_empty());
+        assert_eq!(status2, DrainStatus::MalformedPrelude);
+
+        // (c) The AMBIGUITY case the old length-inference got wrong: a CLEAN full drain that consumes
+        // every buffered byte also leaves an EMPTY buffer — but it is NOT an abort. Status is Ok.
+        let mut good = encode_frame("contentBlockDelta", br#"{"delta":{"text":"hi"}}"#);
+        let (frames3, status3) = drain_frames_checked(&mut good);
+        assert_eq!(frames3.len(), 1);
+        assert!(
+            good.is_empty(),
+            "a clean full drain also empties the buffer"
+        );
+        assert_eq!(
+            status3,
+            DrainStatus::Ok,
+            "an empty buffer after a clean full drain must NOT be read as an abort"
+        );
+
+        // (d) A trailing PARTIAL frame is healthy too (buffer non-empty): status Ok, await more bytes.
+        let full = encode_frame("messageStop", br#"{"stopReason":"end_turn"}"#);
+        let mut partial = full[..full.len() - 4].to_vec();
+        let (frames4, status4) = drain_frames_checked(&mut partial);
+        assert!(frames4.is_empty(), "no complete frame yet");
+        assert!(!partial.is_empty(), "partial frame stays buffered");
+        assert_eq!(
+            status4,
+            DrainStatus::Ok,
+            "a buffered partial is not an abort"
+        );
+
+        // (e) The thin `drain_frames` wrapper still returns just the frames (existing callers).
+        let mut buf = encode_frame("messageStart", br#"{"role":"assistant"}"#);
+        let only_frames = drain_frames(&mut buf);
+        assert_eq!(only_frames.len(), 1);
+        assert_eq!(only_frames[0].0, "messageStart");
     }
 
     /// REGRESSION (MEDIUM/test-coverage, eventstream.rs:48): the smallest frame with a NON-empty

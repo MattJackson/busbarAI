@@ -1245,6 +1245,27 @@ impl StreamTranslate {
         self.ingress_eventstream
     }
 
+    /// True once this translator abandoned its stream — the reassembly buffer grew past
+    /// [`Self::MAX_BUF`] without a frame terminator (`abort_overflow`), so the happy-path terminal
+    /// events were never produced and every subsequent `feed` is a no-op.
+    ///
+    /// On the SSE-ingress path `finish()` already surfaces this abort as the ingress protocol's
+    /// native in-band error frame. But on the GEMINI JSON-ARRAY ingress path the caller discards the
+    /// translate's SSE `finish()` bytes (an SSE error frame cannot ride inside a JSON-array body) and
+    /// closes the array with [`GeminiJsonArrayFramer::finish`] instead — whose OWN `aborted` flag is
+    /// not set when the UPSTREAM translate aborted (the translate simply stopped feeding it bytes), so
+    /// the array would close with a bare `]` and the truncation would be silently swallowed. This
+    /// accessor lets that close path observe the translate-side abort and emit the framer error-close
+    /// instead, mirroring the SSE-ingress terminal-error behavior in `finish()`.
+    ///
+    /// Production wiring lives in `forward.rs` (the JSON-array close arm must call
+    /// `framer.finish_for_translate(translate.aborted())`); until that one-line caller change lands
+    /// this accessor is exercised only by the in-file regression test, hence `allow(dead_code)`.
+    #[allow(dead_code)]
+    pub(crate) fn aborted(&self) -> bool {
+        self.aborted
+    }
+
     /// Abandon a stream whose reassembly buffer grew past [`Self::MAX_BUF`] without a frame
     /// terminator. The buffer is released and all subsequent `feed()` calls become no-ops.
     fn abort_overflow(&mut self) {
@@ -1540,6 +1561,41 @@ impl GeminiJsonArrayFramer {
         } else {
             b"[]".to_vec()
         }
+    }
+
+    /// Close the array at end-of-stream when this framer sits DOWNSTREAM of a cross-protocol
+    /// [`StreamTranslate`] (gemini ingress, non-gemini egress). Identical to [`finish`] except it ALSO
+    /// surfaces an abort that happened on the TRANSLATE side: when the translate's reassembly buffer
+    /// overflowed `MAX_BUF` it stopped feeding this framer and its SSE terminal-error frame is
+    /// discarded by the caller (an SSE error cannot ride inside a JSON-array body), so this framer's
+    /// own `aborted` flag stays clear and a plain [`finish`] would emit a bare `]` — a SILENT
+    /// truncation indistinguishable from a successful short completion. Pass
+    /// `translate_aborted = StreamTranslate::aborted()`; when EITHER side aborted, emit the
+    /// Gemini-shaped error element + `]` (mirroring the SSE-ingress terminal-error path in
+    /// `StreamTranslate::finish`) instead of the bare close. Idempotent via the shared `finished` flag.
+    ///
+    /// [`finish`]: Self::finish
+    ///
+    /// Production wiring lives in `forward.rs` (the `Poll::Ready(None)` JSON-array close arm must call
+    /// this with `translate.aborted()` instead of discarding `translate.finish()` then calling plain
+    /// `framer.finish()`); until that caller change lands this is exercised only by the in-file
+    /// regression test, hence `allow(dead_code)`.
+    #[allow(dead_code)]
+    pub(crate) fn finish_for_translate(&mut self, translate_aborted: bool) -> Vec<u8> {
+        if self.finished {
+            return Vec::new();
+        }
+        if translate_aborted || self.aborted {
+            return self.finish_with_error(
+                500,
+                "INTERNAL",
+                // Same client-facing wire body as the framer-side abort in `finish`: a native
+                // Gemini 500 `google.rpc.Status.message`, carrying no busbar-internal vocabulary
+                // (the protocol-indistinguishability promise).
+                "Internal error encountered.",
+            );
+        }
+        self.finish()
     }
 
     /// Terminate the array with a trailing Gemini-shaped error element, then the closing `]`. Used on
@@ -4360,6 +4416,64 @@ mod stream_translate_tests {
         assert!(
             arr.iter().any(|el| el.get("error").is_some()),
             "aborted stream must surface an error element, not a silent bare close; got {parsed}"
+        );
+    }
+
+    /// MED #6 regression: on the GEMINI JSON-ARRAY ingress path the buffer-overflow abort of the
+    /// UPSTREAM `StreamTranslate` must surface as a trailing error element, NOT a silently truncated
+    /// bare `]`. The framer's OWN `aborted` flag stays clear (the translate simply stops feeding it),
+    /// and the caller discards the translate's SSE `finish()` bytes (an SSE error can't ride inside a
+    /// JSON-array body), so `finish_for_translate(translate.aborted())` must observe the translate-side
+    /// abort and emit the gemini error-close — mirroring the SSE-ingress terminal-error path. Against
+    /// the old code (no `aborted()` accessor, plain `framer.finish()`) the array closed with a bare
+    /// `]` and the truncation was swallowed.
+    #[test]
+    fn test_gemini_json_array_surfaces_upstream_translate_abort() {
+        // openai egress → gemini ingress: the cross-protocol pairing that engages BOTH a
+        // StreamTranslate (openai→gemini SSE) and the JSON-array framer downstream of it.
+        let mut st = StreamTranslate::new("gemini", "openai").expect("translator");
+        // Drive a real chunk through translate→framer so the array opens with one element.
+        let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"index\":0}]}\n\n";
+        let mut framer = GeminiJsonArrayFramer::new();
+        let translated = st.feed(chunk);
+        let mut out = framer.feed(&translated);
+        // Now overflow the TRANSLATE reassembly buffer with a never-terminated frame → it aborts.
+        let huge = vec![b'x'; StreamTranslate::MAX_BUF + 16];
+        let mut never_terminated =
+            Vec::from(&b"data: {\"choices\":[{\"delta\":{\"content\":\""[..]);
+        never_terminated.extend_from_slice(&huge);
+        let _ = st.feed(&never_terminated);
+        assert!(
+            st.aborted(),
+            "the translate must have aborted on the MAX_BUF overflow"
+        );
+        // The framer itself did NOT abort — only the upstream translate did.
+        // Close the array via the translate-aware path, surfacing the upstream abort.
+        out.extend_from_slice(&framer.finish_for_translate(st.aborted()));
+        let parsed: serde_json::Value = serde_json::from_slice(&out)
+            .expect("aborted-translate finish must still parse as a JSON array");
+        let arr = parsed.as_array().expect("array");
+        assert!(
+            arr.iter().any(|el| el.get("error").is_some()),
+            "an aborted upstream translate must surface an error element, not a silent bare close; got {parsed}"
+        );
+
+        // Control: with NO upstream abort, `finish_for_translate(false)` closes cleanly (no error
+        // element) — the accessor must not spuriously inject an error on a healthy stream.
+        let mut clean_st = StreamTranslate::new("gemini", "openai").expect("translator");
+        let mut clean_framer = GeminiJsonArrayFramer::new();
+        let mut clean_out = clean_framer.feed(&clean_st.feed(chunk));
+        let _ = clean_st.finish();
+        clean_out.extend_from_slice(&clean_framer.finish_for_translate(clean_st.aborted()));
+        let clean: serde_json::Value =
+            serde_json::from_slice(&clean_out).expect("clean finish parses");
+        assert!(
+            clean
+                .as_array()
+                .expect("array")
+                .iter()
+                .all(|el| el.get("error").is_none()),
+            "a non-aborted stream must close cleanly with no error element; got {clean}"
         );
     }
 
