@@ -987,6 +987,27 @@ impl ProtocolReader for ResponsesReader {
                         _ => None,
                     };
 
+                    // Tool-use override, mirroring the non-streaming `read_response` (which flips a
+                    // `completed` end_turn to `tool_use` when the output carries a function_call).
+                    // Without this, a STREAMED Responses tool call terminated stop_reason=end_turn
+                    // while the non-stream path said tool_use — so a cross-protocol client (OpenAI/
+                    // Anthropic ingress) never saw the tool-call finish signal on the streaming path.
+                    // The `response.completed` event carries the fully-assembled `output`, so detect a
+                    // function_call item there and override only the successful end_turn cases.
+                    let stop_reason = if matches!(stop_reason.as_deref(), Some("end_turn"))
+                        && response_obj
+                            .get("output")
+                            .and_then(|o| o.as_array())
+                            .is_some_and(|items| {
+                                items.iter().any(|it| {
+                                    it.get("type").and_then(|t| t.as_str()) == Some("function_call")
+                                })
+                            }) {
+                        Some("tool_use".to_string())
+                    } else {
+                        stop_reason
+                    };
+
                     let usage = response_obj
                         .get("usage")
                         .map(|u| crate::ir::IrUsage {
@@ -3604,6 +3625,71 @@ mod tests {
             *completed_reason,
             Some("end_turn".to_string()),
             "bodyless completed must map to end_turn"
+        );
+    }
+
+    #[test]
+    fn test_stream_completed_with_function_call_is_tool_use_not_end_turn() {
+        // A STREAMED Responses tool call must terminate with stop_reason=tool_use, matching the
+        // non-streaming read_response (which flips a completed end_turn to tool_use when the output
+        // carries a function_call). Before the fix the stream said end_turn, so a cross-protocol
+        // client never saw the tool-call finish signal on the streaming path.
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = reader_read_response_events(
+            "response.completed",
+            &serde_json::json!({
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        { "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                          "name": "get_weather", "arguments": "{}" }
+                    ]
+                }
+            }),
+            &mut state,
+        );
+        let stop = events
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::IrStreamEvent::MessageDelta { stop_reason, .. } => Some(stop_reason),
+                _ => None,
+            })
+            .expect("terminal MessageDelta");
+        assert_eq!(
+            *stop,
+            Some("tool_use".to_string()),
+            "a streamed completed response containing a function_call must be tool_use, not end_turn"
+        );
+    }
+
+    #[test]
+    fn test_stream_completed_without_function_call_stays_end_turn() {
+        // No function_call in the output → still a plain end_turn (the override must not over-fire).
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = reader_read_response_events(
+            "response.completed",
+            &serde_json::json!({
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        { "type": "message", "role": "assistant",
+                          "content": [{ "type": "output_text", "text": "hi", "annotations": [] }] }
+                    ]
+                }
+            }),
+            &mut state,
+        );
+        let stop = events
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::IrStreamEvent::MessageDelta { stop_reason, .. } => Some(stop_reason),
+                _ => None,
+            })
+            .expect("terminal MessageDelta");
+        assert_eq!(
+            *stop,
+            Some("end_turn".to_string()),
+            "text-only completed stays end_turn"
         );
     }
 
