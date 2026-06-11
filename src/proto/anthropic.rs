@@ -85,6 +85,31 @@ fn synth_id_with_prefix(prefix: &str) -> String {
     format!("{prefix}01{token}")
 }
 
+/// Upper bound on an upstream-supplied streaming content-block index. Anthropic's Messages API
+/// numbers blocks densely from 0; a real response has a small handful, never a sparse pathological
+/// index. An upstream-controlled `index` flows into the IR (`BlockStart`/`BlockDelta`/`BlockStop`)
+/// and then into a downstream WRITER that allocates/serializes against it (e.g. `GeminiWriter`'s
+/// `open_tools` set, the Bedrock `contentBlockIndex` field), so a hostile/buggy backend sending a
+/// huge `index` (up to `u64::MAX`) could drive a pathological allocation/serialization. CLAMP every
+/// read site to this bound before the value enters the IR, mirroring the Bedrock reader's
+/// `MAX_CONTENT_BLOCK_INDEX` (same 1023 cap), the OpenAI reader's `MAX_TOOL_INDEX`, and the Cohere
+/// reader's `MAX_TOOL_FRAME_INDEX`. 1023 is far above any legitimate block count yet bounds the
+/// downstream allocation. (R27 #7, cross-protocol sibling of those clamps.)
+const MAX_ANTHROPIC_BLOCK_INDEX: u64 = 1023;
+
+/// Read a streaming event's `index`, requiring it to be present and numeric (returns `None` to drop
+/// the event otherwise, matching the prior `.as_u64()?` semantics), and CLAMP it to
+/// `MAX_ANTHROPIC_BLOCK_INDEX` before narrowing to `usize`. Shared by the three `content_block_*`
+/// read sites so the bound can never drift between them. Mirrors `bedrock::clamp_content_block_index`
+/// (that reader defaults a missing index to 0; the Anthropic stream instead drops an event with no
+/// index, preserving this protocol's stricter `?`-on-missing behavior — the clamp is the additive
+/// hardening, the presence requirement is unchanged).
+fn read_clamped_block_index(data: &serde_json::Value) -> Option<usize> {
+    data.get("index")
+        .and_then(|i| i.as_u64())
+        .map(|v| v.min(MAX_ANTHROPIC_BLOCK_INDEX) as usize)
+}
+
 #[derive(Clone)]
 pub(crate) struct AnthropicReader;
 
@@ -112,7 +137,22 @@ impl ProtocolReader for AnthropicReader {
 
         // Anthropic signals context-length via the error MESSAGE (no distinct code).
         // Surface the canonical code so the breaker pipeline (normalize_raw_error) → ContextLength.
+        //
+        // GATE the message-scan override on a request-SIZE status (400 Bad Request / 413 Payload Too
+        // Large) — the only statuses under which an oversized-prompt body is the authoritative signal
+        // (R27 #11, cross-protocol sibling of the Cohere `body_signals_context_length` gate). Without
+        // the gate, ANY non-2xx whose body merely mentions a token/length phrase was reclassified to
+        // context_length: a 401/403 ("...invalid token...") or a 429 ("...rate limit on tokens...")
+        // would be turned into a non-penalizing ContextLength fail-over, so the breaker never recorded
+        // the auth/rate-limit fault and the lane stayed "healthy" while hard-down or throttled. By
+        // confining the override to 400/413, a 401/403/429 that happens to mention tokens keeps its
+        // auth/rate-limit disposition and is penalized by the breaker as it should be.
+        let status_code = status.as_u16();
+        let is_request_size_status = status_code == 400 || status_code == 413;
         let provider_code = provider_code.or_else(|| {
+            if !is_request_size_status {
+                return None;
+            }
             let lower = String::from_utf8_lossy(body).to_lowercase();
             if lower.contains("prompt is too long")
                 || (lower.contains("exceeds the maximum")
@@ -409,10 +449,7 @@ impl ProtocolReader for AnthropicReader {
                 })
             }
             "content_block_start" => {
-                let index = data
-                    .get("index")
-                    .and_then(|i| i.as_u64())
-                    .map(|v| v as usize)?;
+                let index = read_clamped_block_index(data)?;
                 let block = data.get("content_block")?;
                 let block_type = block.get("type").and_then(|t| t.as_str())?;
                 let meta = match block_type {
@@ -432,10 +469,7 @@ impl ProtocolReader for AnthropicReader {
                 Some(IrStreamEvent::BlockStart { index, block: meta })
             }
             "content_block_delta" => {
-                let index = data
-                    .get("index")
-                    .and_then(|i| i.as_u64())
-                    .map(|v| v as usize)?;
+                let index = read_clamped_block_index(data)?;
                 let delta_val = data.get("delta")?;
                 let delta_type = delta_val.get("type").and_then(|t| t.as_str())?;
                 let delta = match delta_type {
@@ -473,10 +507,7 @@ impl ProtocolReader for AnthropicReader {
                 Some(IrStreamEvent::BlockDelta { index, delta })
             }
             "content_block_stop" => {
-                let index = data
-                    .get("index")
-                    .and_then(|i| i.as_u64())
-                    .map(|v| v as usize)?;
+                let index = read_clamped_block_index(data)?;
                 Some(IrStreamEvent::BlockStop { index })
             }
             "message_delta" => {
@@ -2011,6 +2042,114 @@ mod anthropic_hardening_tests {
             raw.structured_type.as_deref(),
             Some("invalid_request_error")
         );
+    }
+
+    /// R27 #7 regression (block-index clamp): a streaming `content_block_start` whose `index` is an
+    /// upstream-controlled pathological value (`u64::MAX`) must be CLAMPED to
+    /// `MAX_ANTHROPIC_BLOCK_INDEX` before it enters the IR, so a downstream writer (GeminiWriter
+    /// `open_tools`, Bedrock `contentBlockIndex`) never allocates/serializes against the raw value.
+    /// Mirrors the Bedrock reader's `MAX_CONTENT_BLOCK_INDEX` clamp test. Against the OLD code
+    /// (`.map(|v| v as usize)`) this index would be `u64::MAX as usize` and the assertion fails.
+    #[test]
+    fn content_block_start_clamps_pathological_index() {
+        let data = serde_json::json!({
+            "type": "content_block_start",
+            "index": u64::MAX,
+            "content_block": { "type": "text" }
+        });
+        let ev = AnthropicReader
+            .read_response_event("content_block_start", &data)
+            .expect("content_block_start parses");
+        match ev {
+            IrStreamEvent::BlockStart { index, .. } => {
+                assert_eq!(
+                    index, MAX_ANTHROPIC_BLOCK_INDEX as usize,
+                    "a u64::MAX block index must be clamped to MAX_ANTHROPIC_BLOCK_INDEX"
+                );
+            }
+            other => panic!("expected BlockStart, got {other:?}"),
+        }
+    }
+
+    /// R27 #7 regression (block-index clamp, delta + stop sites): the same clamp must apply to
+    /// `content_block_delta` and `content_block_stop`, not just `content_block_start` — all three
+    /// share `read_clamped_block_index`. Guards that the class is fixed at every read site.
+    #[test]
+    fn content_block_delta_and_stop_clamp_pathological_index() {
+        let delta = serde_json::json!({
+            "type": "content_block_delta",
+            "index": u64::MAX,
+            "delta": { "type": "text_delta", "text": "x" }
+        });
+        match AnthropicReader
+            .read_response_event("content_block_delta", &delta)
+            .expect("content_block_delta parses")
+        {
+            IrStreamEvent::BlockDelta { index, .. } => {
+                assert_eq!(index, MAX_ANTHROPIC_BLOCK_INDEX as usize);
+            }
+            other => panic!("expected BlockDelta, got {other:?}"),
+        }
+
+        let stop = serde_json::json!({
+            "type": "content_block_stop",
+            "index": u64::MAX
+        });
+        match AnthropicReader
+            .read_response_event("content_block_stop", &stop)
+            .expect("content_block_stop parses")
+        {
+            IrStreamEvent::BlockStop { index } => {
+                assert_eq!(index, MAX_ANTHROPIC_BLOCK_INDEX as usize);
+            }
+            other => panic!("expected BlockStop, got {other:?}"),
+        }
+    }
+
+    /// R27 #11 regression (cross-protocol sibling of the Cohere context-length gate): a 429 whose
+    /// body merely MENTIONS tokens/length must NOT be reclassified to context_length. The
+    /// message-scan override is now gated on a request-size status (400/413), so a 429 keeps its
+    /// rate-limit disposition: `extract_error` leaves `provider_code` empty of the context-length
+    /// code, and the breaker's `normalize_raw_error` normalizes the 429 to `RateLimit` (penalizing
+    /// the lane). Against the OLD un-gated code, `provider_code` would become
+    /// `context_length_exceeded` and `normalize_raw_error` would classify it as `ContextLength`
+    /// (a non-penalizing fail-over) — so this asserts `RateLimit`, failing the old behavior.
+    #[test]
+    fn extract_error_429_with_token_body_not_reclassified_to_context_length() {
+        // A 429 rate-limit body that happens to mention tokens (e.g. a per-token rate limit).
+        let body = br#"{"error":{"type":"rate_limit_error","message":"rate limit exceeds the maximum tokens per minute"}}"#;
+        let raw = AnthropicReader.extract_error(StatusCode::TOO_MANY_REQUESTS, body);
+        assert_eq!(raw.http_status, 429);
+        assert_ne!(
+            raw.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "a 429 body mentioning tokens must NOT be overridden to the context-length code"
+        );
+        // End-to-end: the breaker normalizes it to RateLimit, not ContextLength.
+        let empty_map = std::collections::HashMap::new();
+        let signal = crate::breaker::normalize_raw_error(&raw, &empty_map);
+        assert_eq!(
+            signal.class,
+            StatusClass::RateLimit,
+            "a 429 with a token-mentioning body must normalize to RateLimit, not ContextLength"
+        );
+    }
+
+    /// R27 #11 regression (positive case preserved): a genuine 400 oversized-prompt body STILL
+    /// synthesizes the canonical context-length code under the new 400/413 gate, so legitimate
+    /// context-length fail-over is unaffected by the gating change.
+    #[test]
+    fn extract_error_400_context_length_still_synthesized_under_gate() {
+        let body = br#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens"}}"#;
+        let raw = AnthropicReader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "a genuine 400 oversized-prompt body must still synthesize the context-length code"
+        );
+        let empty_map = std::collections::HashMap::new();
+        let signal = crate::breaker::normalize_raw_error(&raw, &empty_map);
+        assert_eq!(signal.class, StatusClass::ContextLength);
     }
 
     /// write_error must produce the NATIVE Anthropic envelope

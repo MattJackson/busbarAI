@@ -109,11 +109,19 @@ pub(crate) fn normalize_raw_error(
     let provider_signal = if let Some(ref code) = raw.provider_code {
         if let Some(mapped_class) = error_map.get(code) {
             if let Some(class) = status_class_from_str(mapped_class) {
-                return CanonicalSignal {
-                    class,
-                    provider_signal: Some(code.clone()),
-                    retry_after: raw.retry_after_secs,
-                };
+                // CLASS guard (R27 #8/#3): context_length must NEVER mask a 5xx upstream
+                // outage. An operator error_map mapping a code to `context_length` on a 5xx
+                // status would otherwise reclassify a transient outage as no-penalty
+                // ContextLength and skip the breaker penalty. Suppress the early return in
+                // that one case and fall through to HTTP-status classification so the lane is
+                // penalized; every other mapped class returns as before.
+                if !(class == StatusClass::ContextLength && (500..600).contains(&raw.http_status)) {
+                    return CanonicalSignal {
+                        class,
+                        provider_signal: Some(code.clone()),
+                        retry_after: raw.retry_after_secs,
+                    };
+                }
             }
         }
         // built-in recognition of the canonical context-length code (the operator
@@ -125,7 +133,12 @@ pub(crate) fn normalize_raw_error(
         // be reclassified as ContextLength (that would mask a transient outage and skip the breaker
         // penalty). Let such cases fall through to the HTTP-status classification below, where the
         // operator error_map can still countermand via the structured-type signal (Step 1b).
-        if code == "context_length_exceeded" && !(500..600).contains(&raw.http_status) {
+        // TIGHTEN (R27 #3, breaker-layer half): the built-in context_length code only ever
+        // applies to oversized-request statuses (400 Bad Request / 413 Payload Too Large).
+        // The previous `!(500..600)` guard let any non-5xx (e.g. a 200/3xx/auth) carrying a
+        // `context_length_exceeded` code masquerade as ContextLength; restrict to the precise
+        // request-size set so it can never mask a non-request-size status.
+        if code == "context_length_exceeded" && (raw.http_status == 400 || raw.http_status == 413) {
             return CanonicalSignal {
                 class: StatusClass::ContextLength,
                 provider_signal: Some(code.clone()),
@@ -143,11 +156,16 @@ pub(crate) fn normalize_raw_error(
     // typed `error.type`). The explicit code (above) wins; this refines when the code didn't match.
     if let Some(ref ty) = raw.structured_type {
         if let Some(class) = error_map.get(ty).and_then(|m| status_class_from_str(m)) {
-            return CanonicalSignal {
-                class,
-                provider_signal: provider_signal.or_else(|| Some(ty.clone())),
-                retry_after: raw.retry_after_secs,
-            };
+            // Same CLASS guard as the code path above: a structured-type signal mapped to
+            // `context_length` on a 5xx must not mask the upstream outage — fall through to
+            // HTTP-status classification so the lane is penalized.
+            if !(class == StatusClass::ContextLength && (500..600).contains(&raw.http_status)) {
+                return CanonicalSignal {
+                    class,
+                    provider_signal: provider_signal.or_else(|| Some(ty.clone())),
+                    retry_after: raw.retry_after_secs,
+                };
+            }
         }
     }
 
@@ -278,6 +296,88 @@ mod tests {
         let map = err_map(&[("context_length_exceeded", "client_error")]);
         let sig = normalize_raw_error(&raw, &map);
         assert_eq!(sig.class, StatusClass::ClientError);
+    }
+
+    #[test]
+    fn test_operator_map_context_length_on_5xx_is_penalized() {
+        // R27 #8/#3 regression: an operator error_map mapping a provider code to
+        // `context_length` on a 503 must NOT mask the upstream outage. The early return is
+        // suppressed and we fall through to HTTP-status classification → ServerError
+        // (TransientUpstream), so the breaker is penalized. (Fails against pre-R27 code, which
+        // returned ContextLength.)
+        let raw = RawUpstreamError {
+            http_status: 503,
+            provider_code: Some("1234".to_string()),
+            structured_type: None,
+            retry_after_secs: None,
+        };
+        let map = err_map(&[("1234", "context_length")]);
+        let sig = normalize_raw_error(&raw, &map);
+        assert_eq!(sig.class, StatusClass::ServerError);
+        assert_eq!(classify(&sig), Disposition::TransientUpstream);
+    }
+
+    #[test]
+    fn test_operator_map_context_length_on_400_still_classifies_context_length() {
+        // Companion to the 5xx case: a genuine request-size 400 mapped to `context_length`
+        // still resolves to ContextLength (fail over without penalty). The guard only fires
+        // on 5xx.
+        let raw = RawUpstreamError {
+            http_status: 400,
+            provider_code: Some("1234".to_string()),
+            structured_type: None,
+            retry_after_secs: None,
+        };
+        let map = err_map(&[("1234", "context_length")]);
+        let sig = normalize_raw_error(&raw, &map);
+        assert_eq!(sig.class, StatusClass::ContextLength);
+    }
+
+    #[test]
+    fn test_structured_type_context_length_on_5xx_is_penalized() {
+        // Same CLASS guard on the structured-type path: a typed signal mapped to
+        // `context_length` on a 502 must fall through to ServerError, not mask the outage.
+        // (Fails against pre-R27 code, which returned ContextLength.)
+        let raw = RawUpstreamError {
+            http_status: 502,
+            provider_code: None,
+            structured_type: Some("ctx_overflow".to_string()),
+            retry_after_secs: None,
+        };
+        let map = err_map(&[("ctx_overflow", "context_length")]);
+        let sig = normalize_raw_error(&raw, &map);
+        assert_eq!(sig.class, StatusClass::ServerError);
+        assert_eq!(classify(&sig), Disposition::TransientUpstream);
+    }
+
+    #[test]
+    fn test_builtin_context_length_not_recognized_on_non_request_size_4xx() {
+        // R27 #3 tighten regression: the built-in context_length code only applies to the
+        // oversized-request statuses (400/413). A 403 carrying the canonical code must NOT be
+        // reclassified as ContextLength; it falls through to HTTP classification (Auth here).
+        // (Fails against pre-R27 code, whose `!(500..600)` guard accepted any non-5xx.)
+        let raw = RawUpstreamError {
+            http_status: 403,
+            provider_code: Some("context_length_exceeded".to_string()),
+            structured_type: None,
+            retry_after_secs: None,
+        };
+        let sig = normalize_raw_error(&raw, &HashMap::new());
+        assert_eq!(sig.class, StatusClass::Auth);
+    }
+
+    #[test]
+    fn test_builtin_context_length_recognized_on_413() {
+        // 413 Payload Too Large is the other oversized-request status the tightened guard
+        // accepts for the built-in context_length code.
+        let raw = RawUpstreamError {
+            http_status: 413,
+            provider_code: Some("context_length_exceeded".to_string()),
+            structured_type: None,
+            retry_after_secs: None,
+        };
+        let sig = normalize_raw_error(&raw, &HashMap::new());
+        assert_eq!(sig.class, StatusClass::ContextLength);
     }
 
     #[test]

@@ -1160,15 +1160,25 @@ impl InMemoryStore {
     ) -> bool {
         lock_recover(c.outcome_window()).push(now_time, true); // error outcome
         c.err().fetch_add(1, Ordering::Relaxed);
-        c.streak().fetch_add(1, Ordering::Relaxed);
 
         // The state-dependent transition reads BOTH state and cooldown and writes the (state,
         // cooldown) pair, so serialize it under the transition lock (re-reading the state under the
-        // lock) — a concurrent close/trip must not interleave its pair with this one. The counter
-        // bumps above are independent atomics and need no lock. `should_trip` (which also locks the
-        // outcome_window) and the inner `cell_open_locked` run UNDER this lock; we call the `_locked`
-        // open variant so we never re-take this std Mutex (which would deadlock).
+        // lock) — a concurrent close/trip must not interleave its pair with this one. The order-
+        // insensitive `err()` bump and outcome_window push above are independent of the streak and
+        // need no lock. `should_trip` (which also locks the outcome_window) and the inner
+        // `cell_open_locked` run UNDER this lock; we call the `_locked` open variant so we never
+        // re-take this std Mutex (which would deadlock).
         let _tx = lock_recover(c.transition_lock());
+        // Bump the consecutive-failure streak UNDER the transition lock (was previously an
+        // unconditional fetch_add outside it). `should_trip` (Consecutive mode) and
+        // `compute_cooldown_with_retry_after` both read the streak under THIS lock; bumping it
+        // outside let concurrent failures over-count the streak before the trip/cooldown read,
+        // inflating the first-trip escalation/cooldown level. Serializing the bump with the
+        // should_trip/compute_cooldown read makes the escalation level reflect the serialized
+        // consecutive-failure count. (The ST_OPEN branch is still a no-op for the transition but
+        // the streak bump remains — a failure while Open still advances the consecutive count,
+        // preserving the prior ST_OPEN no-op-branch streak-bump semantics.)
+        c.streak().fetch_add(1, Ordering::Relaxed);
         match c.breaker_state().load(Ordering::Acquire) {
             ST_CLOSED => {
                 if Self::should_trip(c, now_time, cfg) {
@@ -2281,6 +2291,113 @@ mod tests {
             "a HalfOpen→Open reopen (failed probe) must NOT report a fresh trip"
         );
         assert!(matches!(store.breaker_state(0), BreakerState::Open { .. }));
+    }
+
+    /// REGRESSION (R27 LOW #12): the consecutive-failure streak bump in `cell_record_failure` must
+    /// happen UNDER the per-cell `transition_lock`, serialized with the should_trip/compute_cooldown
+    /// read — NOT as an unconditional `fetch_add` BEFORE the lock. The old pre-lock bump let
+    /// concurrent failures over-count the streak before the first trip read the value, inflating the
+    /// first-trip escalation/cooldown level.
+    ///
+    /// Deterministic exposure: hold the default cell's `transition_lock`, then drive a failure from
+    /// another thread. With the bump RELOCATED under the lock, the spawned failure blocks at the lock
+    /// and the streak CANNOT advance while we hold it (stays 0). The OLD code bumped the streak before
+    /// taking the lock, so the streak would advance to 1 even while the lock is held — this assertion
+    /// fails against the old code and passes after the fix.
+    #[test]
+    fn test_streak_bump_is_serialized_under_transition_lock() {
+        set_now_for_test(1000);
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        // Consecutive mode, n=2: the streak alone drives both the trip decision and the cooldown
+        // shift, so an over-counted streak is directly observable.
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 10,
+            max_cooldown_secs: 1000,
+            honor_retry_after: false,
+            trip: TripConfig {
+                mode: TripMode::Consecutive,
+                window_s: 30,
+                threshold: 0.5,
+                min_requests: 5,
+                n: 2,
+            },
+        };
+
+        // The default ("") cell IS the LaneState, which implements BreakerCellAccess — grab its
+        // transition lock the same way the record path does.
+        let lane = store.get_lane(0).clone();
+        assert_eq!(
+            lane.streak().load(Ordering::Relaxed),
+            0,
+            "fresh lane starts with streak 0"
+        );
+
+        let guard = lock_recover(lane.transition_lock());
+
+        // Spawn a failure that must block on the transition lock we hold. The barrier gives a
+        // deterministic handshake: the spawned thread rendezvous, then immediately calls
+        // `record_transient`. After the rendezvous releases, the spawned thread runs the lock-free
+        // prologue of `cell_record_failure` (outcome_window push + err bump + — in the OLD code — the
+        // pre-lock `streak().fetch_add(1)`) and then blocks on the transition lock we still hold.
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let store_t = Arc::clone(&store);
+        let cfg_t = cfg.clone();
+        let barrier_t = Arc::clone(&barrier);
+        let handle = std::thread::spawn(move || {
+            // Mirror the recording thread's clock (the test clock is thread-local).
+            set_now_for_test(1000);
+            barrier_t.wait();
+            store_t.record_transient(0, "5xx", &cfg_t, None)
+        });
+
+        barrier.wait();
+        // After the rendezvous, give the spawned thread a real, generous window to execute its
+        // lock-free prologue and PARK on the held transition lock. Under the OLD (buggy) placement the
+        // streak `fetch_add` ran BEFORE the lock, so it has already advanced to 1 by now; under the FIX
+        // the bump is AFTER the lock, so the parked thread leaves the streak untouched at 0.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert_eq!(
+            lane.streak().load(Ordering::Relaxed),
+            0,
+            "while the transition_lock is held, a concurrent failure must NOT advance the streak — \
+             the bump is serialized UNDER the lock (old code bumped it before the lock, over-counting)"
+        );
+
+        // Release the lock; the parked failure now completes, bumping the streak to exactly 1 (no
+        // trip yet: 1 < n=2).
+        drop(guard);
+        let tripped_first = handle.join().expect("record thread panicked");
+        assert!(
+            !tripped_first,
+            "the first failure (streak 1 < n=2) must NOT trip"
+        );
+        assert_eq!(
+            lane.streak().load(Ordering::Relaxed),
+            1,
+            "after the lock releases, the serialized bump lands → streak exactly 1"
+        );
+
+        // A second serialized failure reaches streak exactly 2 == n → trips, and the cooldown uses
+        // shift=2 (base 10 << 2 = 40, ±10% jitter, no retry-after floor), NOT an inflated level.
+        let tripped_second = store.record_transient(0, "5xx", &cfg, None);
+        assert!(
+            tripped_second,
+            "the second failure (streak 2 == n) must trip Closed→Open"
+        );
+        assert_eq!(
+            lane.streak().load(Ordering::Relaxed),
+            2,
+            "two serialized failures reach streak exactly 2 at the trip, not an inflated count"
+        );
+        let now = crate::store::now_for_test();
+        let remaining = store.cooldown_remaining(0, now);
+        // shift=2 → 40s ±10% (jitter band [36,44], lower clamp duration/2=20 inert here). An inflated
+        // streak (shift>=3 → >=80s) would land WELL outside this window.
+        assert!(
+            (36..=44).contains(&remaining),
+            "first-trip cooldown must reflect shift=2 (~40s ±10%), not an inflated escalation \
+             level; got {remaining}s"
+        );
     }
 
     /// REGRESSION (#21): the spend/refund contract the forward path's over-refund guard relies on.

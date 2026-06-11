@@ -314,7 +314,15 @@ impl ProtocolReader for CohereReader {
         // Anthropic reader's `or_else` (its `provider_code` is `None` when context-length triggers),
         // Cohere always populates `provider_code` from `message`, so the canonical code must REPLACE
         // it rather than only fill an empty slot.
-        let provider_code = if Self::body_signals_context_length(body) {
+        // Gate the body-scan override on a request-SIZE status. A 401/403/429 whose free-text body
+        // happens to mention token counts must NOT be reclassified as the no-penalty ContextLength
+        // class — that would let an auth/rate-limit failure escape the breaker (no cooldown, no
+        // failover penalty). Cohere signals an oversized request with HTTP 400 (and, for some
+        // gateways, 413); only on those statuses does the phrasing carry context-length meaning.
+        let provider_code = if (status == StatusCode::BAD_REQUEST
+            || status == StatusCode::PAYLOAD_TOO_LARGE)
+            && Self::body_signals_context_length(body)
+        {
             Some("context_length_exceeded".to_string())
         } else {
             provider_code
@@ -333,16 +341,10 @@ impl ProtocolReader for CohereReader {
         let text = String::from_utf8_lossy(body);
         let lower = text.to_lowercase();
 
-        if lower.contains("too many tokens")
-            || (lower.contains("maximum") && lower.contains("tokens"))
-        {
-            return CanonicalSignal {
-                class: StatusClass::ContextLength,
-                provider_signal: Some("context_length_exceeded".to_string()),
-                retry_after: None,
-            };
-        }
-
+        // Mirror the production `extract_error` gate: rate-limit / auth / server statuses are
+        // classified by status FIRST, so a free-text body that mentions token counts on a 429/401/403
+        // can never be reclassified as the no-penalty ContextLength class. The context-length phrasing
+        // is honored ONLY on a request-size status (400 / 413).
         if status == StatusCode::TOO_MANY_REQUESTS {
             return CanonicalSignal {
                 class: StatusClass::RateLimit,
@@ -363,6 +365,17 @@ impl ProtocolReader for CohereReader {
             return CanonicalSignal {
                 class: StatusClass::ServerError,
                 provider_signal: Some("5xx".to_string()),
+                retry_after: None,
+            };
+        }
+
+        if (status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE)
+            && (lower.contains("too many tokens")
+                || (lower.contains("maximum") && lower.contains("tokens")))
+        {
+            return CanonicalSignal {
+                class: StatusClass::ContextLength,
+                provider_signal: Some("context_length_exceeded".to_string()),
                 retry_after: None,
             };
         }
@@ -1107,6 +1120,14 @@ pub(crate) struct CohereWriter {
     /// `Relaxed`-equivalent access is fine. Lock poisoning degrades to a no-op / `false` rather than
     /// panicking on the request path.
     open_tool_indices: std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    /// Per-stream set of text-block indices that emitted a `content-start` frame, so the matching
+    /// `BlockStop` emits `content-end` ONLY for a block that actually opened. Cross-protocol blocks
+    /// that carry no opening frame (Thinking / Image — see the `BlockStart` arm, which maps them to
+    /// `None`) are never recorded here, so their `BlockStop` emits NOTHING rather than an orphan
+    /// `content-end` with no matching `content-start`. Mirrors the Gemini writer's
+    /// no-frame-for-untracked-index behavior. Same `Mutex` / poison-degrades-to-no-op discipline as
+    /// `open_tool_indices`.
+    open_text_indices: std::sync::Mutex<std::collections::BTreeSet<usize>>,
 }
 
 /// Value-namespace constructor for [`CohereWriter`]. A `const` and a struct may share a name (they
@@ -1125,6 +1146,7 @@ pub(crate) struct CohereWriter {
 #[allow(clippy::declare_interior_mutable_const)]
 pub(crate) const CohereWriter: CohereWriter = CohereWriter {
     open_tool_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+    open_text_indices: std::sync::Mutex::new(std::collections::BTreeSet::new()),
 };
 
 impl Clone for CohereWriter {
@@ -1135,6 +1157,12 @@ impl Clone for CohereWriter {
         CohereWriter {
             open_tool_indices: std::sync::Mutex::new(
                 self.open_tool_indices
+                    .lock()
+                    .map(|set| set.clone())
+                    .unwrap_or_default(),
+            ),
+            open_text_indices: std::sync::Mutex::new(
+                self.open_text_indices
                     .lock()
                     .map(|set| set.clone())
                     .unwrap_or_default(),
@@ -1159,6 +1187,27 @@ impl CohereWriter {
     /// panicking on the request path.
     fn take_tool_open(&self, index: usize) -> bool {
         self.open_tool_indices
+            .lock()
+            .map(|mut set| set.remove(&index))
+            .unwrap_or(false)
+    }
+
+    /// Record that a `content-start` frame was emitted for text block `index`, so the matching
+    /// `BlockStop` emits `content-end` for it. Cross-protocol blocks that emit no opening frame
+    /// (Thinking / Image) are never recorded, so their `BlockStop` stays silent. Lock poisoning
+    /// degrades to a no-op rather than panicking on the request path.
+    fn mark_text_open(&self, index: usize) {
+        if let Ok(mut set) = self.open_text_indices.lock() {
+            set.insert(index);
+        }
+    }
+
+    /// Return true and forget `index` if a `content-start` was emitted for that text block; false if
+    /// no text block opened at `index` (e.g. a Thinking block that carried no opening frame, whose
+    /// `BlockStop` must emit nothing). Lock poisoning degrades to `false` (emit nothing) rather than
+    /// panicking on the request path.
+    fn take_text_open(&self, index: usize) -> bool {
+        self.open_text_indices
             .lock()
             .map(|mut set| set.remove(&index))
             .unwrap_or(false)
@@ -1432,18 +1481,25 @@ impl ProtocolWriter for CohereWriter {
             }
 
             IrStreamEvent::BlockStart { index, block } => match block {
-                crate::ir::IrBlockMeta::Text => Some((
-                    "".to_string(),
-                    serde_json::json!({
-                        "type": "content-start",
-                        "index": index,
-                        "delta": {
-                            "message": {
-                                "content": { "type": "text", "text": "" }
+                crate::ir::IrBlockMeta::Text => {
+                    // Record the open text index so its matching `BlockStop` emits `content-end`. A
+                    // cross-protocol block that carries NO opening frame (Thinking / Image, below)
+                    // is never recorded, so its `BlockStop` stays silent rather than emitting an
+                    // orphan `content-end` — see `open_text_indices`.
+                    self.mark_text_open(*index);
+                    Some((
+                        "".to_string(),
+                        serde_json::json!({
+                            "type": "content-start",
+                            "index": index,
+                            "delta": {
+                                "message": {
+                                    "content": { "type": "text", "text": "" }
+                                }
                             }
-                        }
-                    }),
-                )),
+                        }),
+                    ))
+                }
                 // Cross-protocol streaming tool use (e.g. Anthropic/Gemini → Cohere-ingress) must
                 // surface a native `tool-call-start` frame mirroring the shape this file's own
                 // reader consumes (delta.message.tool_calls.{id,type,function.{name,arguments}}).
@@ -1522,15 +1578,26 @@ impl ProtocolWriter for CohereWriter {
                 // per-stream open-tool set: a tool-call index (recorded by its `tool-call-start`)
                 // closes with `tool-call-end`, consuming the marker; any other index (a text block)
                 // closes with `content-end`.
-                let close_type = if self.take_tool_open(*index) {
-                    "tool-call-end"
+                // A tool-call index (recorded by its `tool-call-start`) closes with `tool-call-end`,
+                // consuming its marker. A text index (recorded by its `content-start`) closes with
+                // `content-end`, consuming its marker. An UNTRACKED index — a cross-protocol block
+                // that emitted no opening frame (Thinking / Image, whose `BlockStart` maps to `None`)
+                // — emits NOTHING: previously it fell through to an unconditional `content-end`,
+                // producing an orphan close with no matching `content-start` (the MED finding). This
+                // mirrors the Gemini writer's no-frame-for-untracked-index behavior.
+                if self.take_tool_open(*index) {
+                    Some((
+                        "".to_string(),
+                        serde_json::json!({ "type": "tool-call-end", "index": index }),
+                    ))
+                } else if self.take_text_open(*index) {
+                    Some((
+                        "".to_string(),
+                        serde_json::json!({ "type": "content-end", "index": index }),
+                    ))
                 } else {
-                    "content-end"
-                };
-                Some((
-                    "".to_string(),
-                    serde_json::json!({ "type": close_type, "index": index }),
-                ))
+                    None
+                }
             }
 
             IrStreamEvent::MessageDelta {
@@ -4756,8 +4823,9 @@ mod tests {
     }
 
     /// A tool index is consumed on close: a second `BlockStop` at the same index (an over-eager or
-    /// duplicate close) falls back to `content-end` rather than mis-reporting `tool-call-end` for a
-    /// block that is no longer tracked as a tool.
+    /// duplicate close) must NOT re-report `tool-call-end`. After the open-text-tracking fix (MED #4)
+    /// an index that is tracked by NEITHER the open-tool set NOR the open-text set emits no frame at
+    /// all, rather than falling through to an orphan `content-end` with no matching `content-start`.
     #[test]
     fn test_block_stop_tool_index_consumed_on_close() {
         let writer = CohereWriter;
@@ -4777,13 +4845,12 @@ mod tests {
             first.get("type").and_then(|t| t.as_str()),
             Some("tool-call-end")
         );
-        let (_, second) = writer
-            .write_response_event(&IrStreamEvent::BlockStop { index: 3 })
-            .expect("second stop");
-        assert_eq!(
-            second.get("type").and_then(|t| t.as_str()),
-            Some("content-end"),
-            "a tool index consumed on first close must not re-report tool-call-end"
+        // The tool marker was consumed and no text block was ever opened at index 3, so a second
+        // close is an untracked index → no frame (no orphan content-end).
+        let second = writer.write_response_event(&IrStreamEvent::BlockStop { index: 3 });
+        assert!(
+            second.is_none(),
+            "a tool index consumed on first close must emit no frame on a duplicate close, got {second:?}"
         );
     }
 
@@ -5091,6 +5158,111 @@ mod tests {
             count_block_starts_at(&ts, 2),
             0,
             "the tool block must NOT reuse the text block's non-zero wire index"
+        );
+    }
+
+    /// Regression (MED #3 / LOW #11): a non-request-size status (e.g. 429) whose free-text body
+    /// mentions token counts must NOT be reclassified as the no-penalty `ContextLength` class. The
+    /// body-scan override in `extract_error` is now gated on a request-size status (400 / 413), so a
+    /// rate-limit failure keeps its `RateLimit` disposition and stays subject to the breaker. Against
+    /// the old (ungated) code this stream reclassified to ContextLength and escaped the breaker.
+    #[test]
+    fn test_rate_limit_body_mentioning_tokens_is_not_context_length() {
+        let reader = CohereReader;
+        // A 429 whose message free-text mentions a maximum token count (the exact phrasing the
+        // context-length scan keys on) must stay a rate-limit failure.
+        let body = br#"{"message":"You have exceeded the maximum number of tokens per minute for your trial key"}"#;
+        let raw = reader.extract_error(StatusCode::TOO_MANY_REQUESTS, body);
+
+        // The override must NOT fire: provider_code keeps the raw message, not the canonical
+        // context-length code.
+        assert_ne!(
+            raw.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "a 429 body mentioning tokens must not be reclassified as context_length_exceeded"
+        );
+
+        // End-to-end through the breaker: the canonical class is RateLimit, not ContextLength.
+        let sig = crate::breaker::normalize_raw_error(&raw, &std::collections::HashMap::new());
+        assert_eq!(
+            sig.class,
+            StatusClass::RateLimit,
+            "a 429 body mentioning tokens must normalize to RateLimit so the breaker penalizes the lane"
+        );
+
+        // The `#[cfg(test)] classify()` helper must agree (status checked before the phrasing).
+        let signal = reader.classify(StatusCode::TOO_MANY_REQUESTS, body);
+        assert_eq!(signal.class, StatusClass::RateLimit);
+    }
+
+    /// A genuine oversized-request failure (HTTP 400 with context-length phrasing) must still
+    /// override to the canonical `context_length_exceeded` code and normalize to `ContextLength`.
+    /// Guards that the status gate did not break the real context-length path.
+    #[test]
+    fn test_bad_request_body_mentioning_tokens_is_context_length() {
+        let reader = CohereReader;
+        let body =
+            br#"{"message":"too many tokens: the request exceeds the maximum context length"}"#;
+        let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "a 400 oversized-request body must still override to the canonical code"
+        );
+        let sig = crate::breaker::normalize_raw_error(&raw, &std::collections::HashMap::new());
+        assert_eq!(sig.class, StatusClass::ContextLength);
+
+        let signal = reader.classify(StatusCode::BAD_REQUEST, body);
+        assert_eq!(signal.class, StatusClass::ContextLength);
+    }
+
+    /// Regression (MED #4): a cross-protocol `Thinking` block carries NO opening frame on the Cohere
+    /// stream (its `BlockStart` maps to `None`), so its `BlockStop` must emit NOTHING — not an orphan
+    /// `content-end` with no matching `content-start`. Against the old code the `BlockStop` fell
+    /// through to an unconditional `content-end`.
+    #[test]
+    fn test_thinking_blockstop_emits_no_orphan_content_end() {
+        let writer = CohereWriter;
+
+        // Thinking BlockStart → no frame.
+        let start = writer.write_response_event(&IrStreamEvent::BlockStart {
+            index: 0,
+            block: crate::ir::IrBlockMeta::Thinking,
+        });
+        assert!(
+            start.is_none(),
+            "a Thinking BlockStart must not emit an opening frame"
+        );
+
+        // Thinking BlockStop → no frame (the orphan-content-end defect).
+        let stop = writer.write_response_event(&IrStreamEvent::BlockStop { index: 0 });
+        assert!(
+            stop.is_none(),
+            "a Thinking BlockStop must emit no frame (no orphan content-end)"
+        );
+    }
+
+    /// A normal Text block still emits a balanced `content-start` / `content-end` pair — the
+    /// open-text tracking must not suppress legitimate text closes.
+    #[test]
+    fn test_text_block_emits_balanced_content_start_and_end() {
+        let writer = CohereWriter;
+
+        let start = writer.write_response_event(&IrStreamEvent::BlockStart {
+            index: 0,
+            block: crate::ir::IrBlockMeta::Text,
+        });
+        let (_, start_data) = start.expect("Text BlockStart must emit a content-start frame");
+        assert_eq!(
+            start_data.get("type").and_then(|t| t.as_str()),
+            Some("content-start")
+        );
+
+        let stop = writer.write_response_event(&IrStreamEvent::BlockStop { index: 0 });
+        let (_, stop_data) = stop.expect("Text BlockStop must emit a content-end frame");
+        assert_eq!(
+            stop_data.get("type").and_then(|t| t.as_str()),
+            Some("content-end")
         );
     }
 }

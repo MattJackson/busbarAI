@@ -62,7 +62,14 @@ const RESPONSE_ID_TOKEN_LEN: usize = 48;
 /// suffixes here are wide (>= 48 chars ≈ 285 bits of base62 entropy), so pure CSPRNG output is
 /// collision-free in practice for a per-process id stream and needs no monotonic-counter backstop.
 /// On entropy failure the buffer stays zeroed (all '0'), so this never panics on the request path.
-/// Returns an owned `String` of exactly `N` base62 characters.
+/// Returns an owned `String` of exactly `N` base62 characters, each drawn from a UNIFORM base62
+/// distribution: a raw `byte % 62` reduction is biased (256 is not a multiple of 62, so bytes
+/// 248..=255 wrap to base62 digits 0..=7, making those eight chars ~1.56x more likely than 8..=61
+/// and leaving a faint statistical fingerprint a native uniform-random id never carries). We instead
+/// use REJECTION SAMPLING: any byte >= 248 (= 62 * 4, the largest multiple of 62 that fits in a u8)
+/// is rejected and a fresh CSPRNG byte is drawn for that slot, so every base62 character is
+/// equiprobable. Rejection keeps the function infallible/panic-free — on a getrandom failure a slot
+/// simply keeps its all-zero fallback rather than retrying.
 ///
 /// `N` MUST be >= 11. A token narrower than that carries too little base62 entropy to stay
 /// collision-free across a per-process id stream and falls below the opaque-suffix width a native
@@ -83,11 +90,29 @@ fn synth_token<const N: usize>() -> String {
     }
     let () = MinWidth::<N>::OK;
 
-    let mut rand_bytes = [0u8; N];
-    let _ = getrandom::getrandom(&mut rand_bytes);
+    // Largest multiple of 62 that fits in a u8 (62 * 4). A byte in `0..REJECT_THRESHOLD` maps to a
+    // base62 digit with NO modular bias; a byte >= this threshold (248..=255) is rejected so every
+    // base62 character stays equiprobable. See the docstring for the bias rationale.
+    const REJECT_THRESHOLD: u8 = 248;
+
     let mut token = [b'0'; N];
-    for (slot, &byte) in token.iter_mut().zip(rand_bytes.iter()) {
-        *slot = BASE62[(byte % 62) as usize];
+    for slot in token.iter_mut() {
+        // Draw fresh bytes until one falls in the unbiased range. A small scratch buffer is refilled
+        // from the CSPRNG as needed; on a getrandom failure the draw yields zeros, which are < the
+        // threshold and accepted, so the slot stays at base62 '0' (the existing all-zero fallback)
+        // and the loop still terminates — keeping the function infallible and panic-free.
+        let mut buf = [0u8; 1];
+        loop {
+            if getrandom::getrandom(&mut buf).is_err() {
+                // Entropy failure: leave this slot at its existing '0' fallback and move on.
+                break;
+            }
+            if buf[0] < REJECT_THRESHOLD {
+                *slot = BASE62[(buf[0] % 62) as usize];
+                break;
+            }
+            // buf[0] >= REJECT_THRESHOLD: biased region, reject and redraw.
+        }
     }
 
     // `token` is ASCII base62 by construction, hence always valid UTF-8; the fallback only guards an
@@ -800,7 +825,17 @@ impl ProtocolReader for ResponsesReader {
                             // `content_block_start`), a deterministic proxy tell that corrupts a
                             // downstream writer's tool-call state. Beyond the cap a NEW index is
                             // silently skipped (no BlockStart), matching openai.rs.
-                            let already_open = state.open_tools.contains(&idx);
+                            // An index must not open as BOTH a tool and a text block: a text delta
+                            // at this same `output_index` stores its open marker under
+                            // `idx + TEXT_INDEX_KEY_OFFSET`, and if such a text block is already open
+                            // here, opening a tool block at the raw `idx` too would leave two open
+                            // markers (`idx` and `idx + offset`) for one wire index — both BlockStarts
+                            // collapse onto IR index `idx`, yielding a duplicate
+                            // `content_block_start` and (at the terminal frame) a duplicate
+                            // BlockStop. Require the symmetric text key to be CLEAR before opening a
+                            // tool block, so a single output_index is exactly one block kind.
+                            let already_open = state.open_tools.contains(&idx)
+                                || state.open_tools.contains(&(idx + TEXT_INDEX_KEY_OFFSET));
                             if !already_open && state.open_tools.len() < MAX_OPEN_TOOLS {
                                 state.open_tools.insert(idx);
                                 out.push(IrStreamEvent::BlockStart {
@@ -839,7 +874,22 @@ impl ProtocolReader for ResponsesReader {
                     // so a backend emitting a unique index per delta cannot grow the set without
                     // bound. Beyond the cap a new index streams no BlockStart/BlockDelta (matching
                     // the tool arm's suppression), never an orphan delta.
+                    // Symmetric to the tool arm: an index already open as a TOOL block (raw `idx` in
+                    // `open_tools`) must not also open a TEXT block under `idx +
+                    // TEXT_INDEX_KEY_OFFSET`. If a function-call item already holds this
+                    // `output_index`, a stray text delta at the same index must NOT open a second
+                    // block (two BlockStarts collapsing onto one IR index — a duplicate
+                    // `content_block_start` and an eventual duplicate BlockStop). Treat the index as
+                    // already open and route no text BlockStart/BlockDelta to it.
                     let text_key = idx + TEXT_INDEX_KEY_OFFSET;
+                    if state.open_tools.contains(&idx) {
+                        // This `output_index` is already held by an OPEN TOOL block. A text delta
+                        // here must NOT open a second block (a duplicate `content_block_start`/
+                        // `_stop` once both keys collapse onto IR index `idx`) AND must NOT push a
+                        // TextDelta into a tool block (a malformed text fragment inside an open
+                        // tool-use block a strict SDK rejects). Drop the stray text delta entirely.
+                        return out;
+                    }
                     let already_open = state.open_tools.contains(&text_key);
                     if !already_open {
                         if state.open_tools.len() >= MAX_OPEN_TOOLS {
@@ -947,7 +997,16 @@ impl ProtocolReader for ResponsesReader {
                             })
                             .collect();
                         state.open_tools.clear();
+                        // Dedup AFTER sorting: a tool key (`N`) and a text key (`N +
+                        // TEXT_INDEX_KEY_OFFSET`) both map back to the SAME IR index `N`, so without
+                        // dedup a single output_index that was (erroneously, pre-fix) opened as both
+                        // kinds would emit TWO BlockStop{N} — a duplicate `content_block_stop` the
+                        // downstream Anthropic writer relays for an already-closed index. One
+                        // BlockStop per distinct IR index, regardless of how many keys collapsed onto
+                        // it. (The output_item.added / output_text.delta guards below also prevent the
+                        // double-open in the first place; this dedup is the second, defensive layer.)
                         indices.sort_unstable();
+                        indices.dedup();
                         for index in indices {
                             out.push(IrStreamEvent::BlockStop { index });
                         }
@@ -7457,6 +7516,196 @@ mod tests {
         assert!(
             output.is_empty(),
             "no blocks streamed -> empty output array"
+        );
+    }
+
+    /// Regression (MED #2): a function_call and a text part arriving at the SAME `output_index`
+    /// must NOT both open a block, and a terminal event must close that index EXACTLY once.
+    ///
+    /// Before the fix, `output_item.added` tracked the tool under raw key `N` while
+    /// `output_text.delta` tracked text under `N + TEXT_INDEX_KEY_OFFSET`, so a tool AND a text
+    /// block could both open at the same wire index. `close_open_blocks` then mapped both keys back
+    /// to IR index `N` and (with no dedup) emitted TWO `BlockStop{N}` — a duplicate
+    /// `content_block_stop` the Anthropic writer relays for an already-closed index.
+    #[test]
+    fn test_same_output_index_tool_and_text_single_open_single_close() {
+        let mut state = crate::ir::StreamDecodeState::default();
+
+        // Open a tool block at output_index 0.
+        let added = reader_read_response_events(
+            "response.output_item.added",
+            &serde_json::json!({
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_x", "name": "f"}
+            }),
+            &mut state,
+        );
+        let starts_after_tool = added
+            .iter()
+            .filter(|e| matches!(e, crate::ir::IrStreamEvent::BlockStart { .. }))
+            .count();
+        assert_eq!(
+            starts_after_tool, 1,
+            "tool open emits exactly one BlockStart"
+        );
+
+        // A text delta arrives at the SAME output_index 0. It must NOT open a second block, and
+        // must NOT route a TextDelta into the open tool block.
+        let text = reader_read_response_events(
+            "response.output_text.delta",
+            &serde_json::json!({"output_index": 0, "delta": "hi"}),
+            &mut state,
+        );
+        assert!(
+            text.is_empty(),
+            "text delta at an index already held by a tool block must emit nothing, got {text:?}"
+        );
+        assert!(
+            !state.open_tools.contains(&TEXT_INDEX_KEY_OFFSET),
+            "no text key must be opened at an index already held by a tool"
+        );
+
+        // Exactly one key is open for index 0 (the raw tool key).
+        assert_eq!(
+            state.open_tools.len(),
+            1,
+            "exactly one open marker for the shared index"
+        );
+
+        // A terminal event must close index 0 exactly ONCE.
+        let completed = reader_read_response_events(
+            "response.completed",
+            &serde_json::json!({"response": {"status": "completed"}}),
+            &mut state,
+        );
+        let stops_at_0 = completed
+            .iter()
+            .filter(|e| matches!(e, crate::ir::IrStreamEvent::BlockStop { index: 0 }))
+            .count();
+        assert_eq!(
+            stops_at_0, 1,
+            "terminal must emit EXACTLY ONE BlockStop for the shared index, got {completed:?}"
+        );
+    }
+
+    /// Regression (MED #2, dedup layer): even if two open keys for the same IR index somehow
+    /// coexist in `open_tools` (raw `N` and `N + TEXT_INDEX_KEY_OFFSET`), the terminal drain must
+    /// collapse them to a SINGLE `BlockStop{N}`. This pins the `sort`+`dedup` in `close_open_blocks`
+    /// directly: before the dedup fix this drain produced two `BlockStop{N}`.
+    #[test]
+    fn test_terminal_drain_dedups_colliding_keys() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        // Directly seed both keys for IR index 3 to exercise the drain's dedup in isolation.
+        state.open_tools.insert(3);
+        state.open_tools.insert(3 + TEXT_INDEX_KEY_OFFSET);
+
+        let events = reader_read_response_events(
+            "response.completed",
+            &serde_json::json!({"response": {"status": "completed"}}),
+            &mut state,
+        );
+        let stops_at_3 = events
+            .iter()
+            .filter(|e| matches!(e, crate::ir::IrStreamEvent::BlockStop { index: 3 }))
+            .count();
+        assert_eq!(
+            stops_at_3, 1,
+            "colliding tool+text keys for one IR index must drain to exactly one BlockStop, got {events:?}"
+        );
+        assert!(
+            state.open_tools.is_empty(),
+            "terminal drain must clear all open keys"
+        );
+    }
+
+    /// Regression (MED #2, symmetric guard): a tool item must not open at an `output_index` already
+    /// held by an OPEN TEXT block. Before the fix, `output_item.added` only checked the raw key, so
+    /// a text block open under `N + TEXT_INDEX_KEY_OFFSET` did not block a tool open at raw `N`.
+    #[test]
+    fn test_tool_open_suppressed_when_text_block_open_at_index() {
+        let mut state = crate::ir::StreamDecodeState::default();
+        // Open a TEXT block at index 0.
+        let text = reader_read_response_events(
+            "response.output_text.delta",
+            &serde_json::json!({"output_index": 0, "delta": "a"}),
+            &mut state,
+        );
+        assert!(state.open_tools.contains(&TEXT_INDEX_KEY_OFFSET));
+        assert_eq!(text.len(), 2);
+
+        // A function_call item arrives at the same index 0 -> must NOT open a tool block.
+        let added = reader_read_response_events(
+            "response.output_item.added",
+            &serde_json::json!({
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_y", "name": "g"}
+            }),
+            &mut state,
+        );
+        assert!(
+            !added
+                .iter()
+                .any(|e| matches!(e, crate::ir::IrStreamEvent::BlockStart { .. })),
+            "tool open at an index already held by a text block must emit no BlockStart, got {added:?}"
+        );
+        assert!(
+            !state.open_tools.contains(&0),
+            "no raw tool key may be opened at an index already held by a text block"
+        );
+    }
+
+    /// Regression (LOW #9): `synth_token` must emit ONLY base62 characters, drawn uniformly via
+    /// rejection sampling (no biased `byte % 62`). We assert the character class strictly, and run
+    /// a targeted check of the EXACT bias `byte % 62` introduces: 256 = 4*62 + 8, so under the old
+    /// reduction bytes wrap such that base62 digits at indices 0..=7 get FIVE source bytes each
+    /// (`d, d+62, d+124, d+186, d+248`) while indices 8..=61 get only FOUR — a 5/4 = 1.25x
+    /// over-representation of the first 8 alphabet positions. Rejection sampling drops bytes >= 248,
+    /// so every index gets exactly four source bytes and the two groups have EQUAL expected
+    /// frequency. We compare the mean count of the biased group (indices 0..=7) against the
+    /// unbiased group (indices 8..=61) over a large sample: under the fix the ratio is ≈1.0; under
+    /// the old code it is ≈1.25, far outside the tolerance band.
+    #[test]
+    fn test_synth_token_uniform_base62_only() {
+        let alphabet: std::collections::HashSet<char> = BASE62.iter().map(|&b| b as char).collect();
+        // Per-alphabet-INDEX counts (index into BASE62), so we can isolate the exact biased group.
+        let mut counts = [0usize; 62];
+        let char_to_index: std::collections::HashMap<char, usize> = BASE62
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| (b as char, i))
+            .collect();
+
+        // 20_000 tokens * 48 chars = 960_000 samples. With ~15.5k expected per digit, the standard
+        // deviation per digit is ~124 (<1%), so a 25% group-mean gap is overwhelmingly significant.
+        for _ in 0..20_000 {
+            let tok = synth_token::<48>();
+            assert_eq!(tok.len(), 48, "token width must be exactly N");
+            for c in tok.chars() {
+                assert!(
+                    alphabet.contains(&c),
+                    "synth_token produced a non-base62 char: {c:?}"
+                );
+                counts[char_to_index[&c]] += 1;
+            }
+        }
+
+        // Every base62 digit must have appeared at least once.
+        assert!(
+            counts.iter().all(|&n| n > 0),
+            "all 62 base62 digits should appear in a large uniform sample, counts={counts:?}"
+        );
+
+        // Mean frequency of the would-be-biased group (alphabet indices 0..=7) vs the rest.
+        let biased_group: f64 = counts[0..8].iter().sum::<usize>() as f64 / 8.0;
+        let rest_group: f64 = counts[8..62].iter().sum::<usize>() as f64 / 54.0;
+        let ratio = biased_group / rest_group;
+        // Fixed code: ratio ≈ 1.0. Old `byte % 62`: ratio ≈ 1.25. A 5% band cleanly separates them
+        // while absorbing ordinary CSPRNG variance (the per-group means concentrate far tighter than
+        // 5% at this sample size).
+        assert!(
+            (0.95..=1.05).contains(&ratio),
+            "first-8 base62 digits must not be over-represented (group ratio={ratio:.4}; \
+             ~1.25 indicates the biased `byte % 62` reduction). counts={counts:?}"
         );
     }
 }

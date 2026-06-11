@@ -631,7 +631,15 @@ impl ProtocolReader for OpenAiReader {
 
         // Index offset: a thinking block (when present) owns index 0, so text/tools shift up by one.
         let offset = usize::from(state.reasoning_seen);
-        let text_index = offset;
+        // Where text lands. Two arrival orders must both stay collision-free and stable:
+        //   - text-FIRST (no tools open yet): `offset + 0` == `offset` — index 0 (or 1 behind a
+        //     thinking block), exactly as before, so existing text-first tests are unchanged.
+        //   - tool-FIRST (tools already open): text cannot reuse a slot a tool already claimed, so it
+        //     lands just PAST the open tools (`offset + open_tools.len()`).
+        // Once the text block has actually opened, `state.text_index` is `Some` and pins the slot for
+        // the rest of the stream (via `unwrap_or`), so the finish-path `BlockStop{index: text_index}`
+        // still pairs with the open-time `BlockStart` even though more tools may open afterward.
+        let text_index = state.text_index.unwrap_or(offset + state.open_tools.len());
 
         // 3. Text content → close any open thinking block first, then open the text block + a
         //    TextDelta. Text owns index `offset` (0 normally, 1 when a thinking block precedes it).
@@ -717,6 +725,12 @@ impl ProtocolReader for OpenAiReader {
                             .unwrap_or("")
                             .to_string();
                         state.open_tools.insert(oai_idx);
+                        // Record the IR index this tool's BlockStart was emitted with so the
+                        // finish-path BlockStop replays it VERBATIM. `text_base` is derived from
+                        // `state.text_index.is_some()` at open time and can change once text arrives
+                        // after this tool; recomputing the base at close would diverge. Persisting the
+                        // exact emitted index keeps every BlockStop paired with its BlockStart.
+                        state.tool_ir_index.insert(oai_idx, ir_idx);
                         out.push(IrStreamEvent::BlockStart {
                             index: ir_idx,
                             block: crate::ir::IrBlockMeta::ToolUse {
@@ -786,17 +800,21 @@ impl ProtocolReader for OpenAiReader {
                 state.text_block_open = false;
                 out.push(IrStreamEvent::BlockStop { index: text_index });
             }
-            // Same text-presence base used when the tool BlockStarts were emitted, so each
-            // BlockStop pairs with its BlockStart's IR index. `state.text_index` is set iff a text
-            // block opened during this stream; tool-only streams keep a 0 base.
-            let text_base = usize::from(state.text_index.is_some());
+            // Replay each tool's BlockStop at the EXACT IR index its BlockStart was emitted with,
+            // read back from `tool_ir_index`. Recomputing the index here (as the prior code did, from
+            // a `text_index.is_some()` base) diverged whenever text arrived AFTER a tool opened: the
+            // tool's BlockStart used the base captured at open time (text absent → 0), but the close
+            // base would then read 1 (text now present), so BlockStop pointed at the wrong index.
+            // The recorded map is keyed by `oai_idx` exactly like `open_tools`; fall back to the
+            // open-time arithmetic only for the impossible case of an open tool with no recorded
+            // index (keeps the path total without a catch-all panic).
+            let tool_ir_index = std::mem::take(&mut state.tool_ir_index);
             for oai_idx in std::mem::take(&mut state.open_tools) {
-                // `oai_idx` was clamped to <= MAX_TOOL_INDEX before it entered `open_tools`, so this
-                // cannot overflow; use saturating arithmetic anyway so the close index can never wrap
-                // and the BlockStop always pairs with the BlockStart's IR index.
-                out.push(IrStreamEvent::BlockStop {
-                    index: oai_idx.saturating_add(text_base).saturating_add(offset),
+                let index = tool_ir_index.get(&oai_idx).copied().unwrap_or_else(|| {
+                    let text_base = usize::from(state.text_index.is_some());
+                    oai_idx.saturating_add(text_base).saturating_add(offset)
                 });
+                out.push(IrStreamEvent::BlockStop { index });
             }
             let stop_reason = Some(match fr {
                 "stop" => "end_turn".to_string(),
@@ -3839,6 +3857,140 @@ mod tests {
             .collect();
         assert!(stops.contains(&0), "text BlockStop at 0: {stops:?}");
         assert!(stops.contains(&1), "tool BlockStop at 1: {stops:?}");
+    }
+
+    // --- R27 MED #5 + MED #6: tool_call FIRST, then text, then finish. Text must not collide with
+    //     the already-open tool's index, and every BlockStart must pair with a BlockStop at the
+    //     SAME index (the finish-path close must not recompute a divergent base). ---
+
+    #[test]
+    fn stream_tool_then_text_no_index_collision_and_stops_pair() {
+        let reader = OpenAiReader;
+        let mut st = crate::ir::StreamDecodeState::default();
+
+        // Tool call FIRST (oai index 0) → opens at IR index 0 (no text seen yet, so text_base = 0).
+        let tool_evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-tf",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": [{
+                        "index": 0,
+                        "id": "call_a",
+                        "function": { "name": "f", "arguments": "{}" }
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+            &mut st,
+        );
+        let tool_idx = tool_evs
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::BlockStart {
+                    index,
+                    block: IrBlockMeta::ToolUse { .. },
+                } => Some(*index),
+                _ => None,
+            })
+            .expect("tool block opens first");
+        assert_eq!(tool_idx, 0, "tool-first claims index 0");
+
+        // Text arrives AFTER the tool. It must NOT reuse index 0 (the tool holds it); it lands just
+        // past the open tools at index 1.
+        let text_evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-tf",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "hello" },
+                    "finish_reason": null
+                }]
+            }),
+            &mut st,
+        );
+        let text_idx = text_evs
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::BlockStart {
+                    index,
+                    block: IrBlockMeta::Text,
+                } => Some(*index),
+                _ => None,
+            })
+            .expect("text block opens after tool");
+        assert_eq!(
+            text_idx, 1,
+            "text lands past the open tool, not colliding at 0"
+        );
+        assert_ne!(text_idx, tool_idx, "text and tool must not share an index");
+
+        // A second tool (oai index 1) arrives after text → text_base is now 1, so it lands at
+        // index 1 + 1 = 2 (no collision with text at 1 or tool0 at 0).
+        let tool2_evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-tf",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": [{
+                        "index": 1,
+                        "id": "call_b",
+                        "function": { "name": "g", "arguments": "{}" }
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+            &mut st,
+        );
+        let tool2_idx = tool2_evs
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::BlockStart {
+                    index,
+                    block: IrBlockMeta::ToolUse { .. },
+                } => Some(*index),
+                _ => None,
+            })
+            .expect("second tool opens");
+        assert_eq!(tool2_idx, 2, "second tool lands past text");
+
+        // Finish: every BlockStart index emitted above must be matched by a BlockStop at the SAME
+        // index. The old finish-path recomputed text_base (now 1, since text is present) and applied
+        // it to the FIRST tool — pushing its BlockStop to index 1 (tool0 opened at 0) and clobbering
+        // text's stop, so the multiset of stops diverged from the starts.
+        let finish_evs = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "id": "chatcmpl-tf",
+                "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+            }),
+            &mut st,
+        );
+        let mut stops: Vec<usize> = finish_evs
+            .iter()
+            .filter_map(|e| match e {
+                IrStreamEvent::BlockStop { index } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        stops.sort_unstable();
+        // tool0 → 0, text → 1, tool1 → 2: each opened block closed exactly once at its open index.
+        assert_eq!(
+            stops,
+            vec![0, 1, 2],
+            "every BlockStart pairs with a BlockStop at the same index: {stops:?}"
+        );
     }
 
     // --- Round 6 fix 2 (MEDIUM/security): open_tools cardinality is capped per stream ---

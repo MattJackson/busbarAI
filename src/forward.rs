@@ -1218,6 +1218,17 @@ struct FirstByteBody<S, P> {
     /// Set once the stream has fully ended (after any translation terminator), so a later poll
     /// returns None instead of re-polling a finished inner stream.
     ended: bool,
+    /// Bounded reassembly buffer for a SAME-PROTOCOL NON-STREAM (`!is_sse`, `translate == None`,
+    /// non-bedrock) `application/json` body that reqwest delivers across multiple transport frames.
+    /// The per-poll `tap.feed` scanner keeps NO cross-chunk state — it only parses complete JSON
+    /// objects within a single chunk — so a multi-chunk same-protocol non-stream body that splits the
+    /// top-level object before its trailing `usage` parses NO usage, leaving input/output tokens
+    /// `None` and undercounting the key's TPM/spend (MED #1). On that one path we therefore retain the
+    /// raw bytes here (capped at `MAX_TRANSLATED_BODY_BYTES`, dropping past the cap with a warn like
+    /// the buffered guards) and run `tap.feed_whole` ONCE over the reassembled body at stream end,
+    /// instead of feeding per-chunk. Bytes still stream to the client incrementally; only a bounded
+    /// copy is retained for usage parsing. The SSE / translation / bedrock paths never touch this.
+    nonstream_buf: Vec<u8>,
 }
 
 impl<S, P> FirstByteBody<S, P>
@@ -1256,6 +1267,7 @@ where
             usage_sink,
             budget_spent,
             ended: false,
+            nonstream_buf: Vec::new(),
         }
     }
 }
@@ -1334,6 +1346,31 @@ where
                         // bedrock→bedrock streaming is token-accounted AND in-band errors trip the
                         // breaker — neither of which the JSON `feed` scanner can do over binary frames.
                         this.tap.feed_eventstream(&chunk);
+                    } else if !this.is_sse {
+                        // SAME-PROTOCOL NON-STREAM `application/json` passthrough (MED #1): the per-poll
+                        // `tap.feed` scanner keeps no cross-chunk state, so a body that reqwest splits
+                        // across transport frames before its trailing `usage` would parse NO usage and
+                        // undercount the key's TPM/spend. Retain the raw bytes (bounded) and run
+                        // `feed_whole` ONCE over the reassembled body in the `Poll::Ready(None)` arm
+                        // instead of feeding per-chunk. The SSE path keeps feeding per-chunk (it must
+                        // stay non-buffering). Cap at `MAX_TRANSLATED_BODY_BYTES`; past the cap, drop
+                        // the overflow with a warn (matching the buffered `read_capped` guards) — the
+                        // tail `usage` may then be missed, but the gap is observable, not a memory leak.
+                        if this.nonstream_buf.len() < MAX_TRANSLATED_BODY_BYTES {
+                            let remaining = MAX_TRANSLATED_BODY_BYTES - this.nonstream_buf.len();
+                            if chunk.len() <= remaining {
+                                this.nonstream_buf.extend_from_slice(&chunk);
+                            } else {
+                                this.nonstream_buf.extend_from_slice(&chunk[..remaining]);
+                                tracing::warn!(
+                                    buffered = this.nonstream_buf.len(),
+                                    cap = MAX_TRANSLATED_BODY_BYTES,
+                                    "same-protocol non-stream body exceeded the usage-tap reassembly \
+                                     cap; if the tail usage frame fell past the cap, this request's \
+                                     tokens are undercounted (TPM/spend may be undercharged)"
+                                );
+                            }
+                        }
                     } else {
                         this.tap.feed(&chunk);
                     }
@@ -1578,6 +1615,17 @@ where
                     }
                     drop(this.permit.take());
                     this.ended = true;
+                    // SAME-PROTOCOL NON-STREAM (`!is_sse`) reassembly (MED #1): the body was buffered
+                    // across transport frames above instead of fed per-chunk (the per-poll scanner
+                    // keeps no cross-chunk state). Parse the usage ONCE over the reassembled body so a
+                    // multi-chunk body whose top-level object split before its trailing `usage` is
+                    // still token-counted. `feed_whole` runs the uncapped whole-document/brace-scan
+                    // (the buffer is already bounded by `MAX_TRANSLATED_BODY_BYTES`). The SSE path's
+                    // `nonstream_buf` is always empty, so this is a no-op there.
+                    if !this.is_sse && !this.nonstream_buf.is_empty() {
+                        let buf = std::mem::take(&mut this.nonstream_buf);
+                        this.tap.feed_whole(&buf);
+                    }
                     // Charge this request's token usage to the virtual key's budget (once) — but ONLY
                     // for a cleanly-terminated stream. A stream that emitted a mid-stream terminal
                     // ERROR frame (`tap.terminal_error` set) OR whose cross-protocol translate
@@ -2325,7 +2373,15 @@ pub(crate) async fn forward_with_pool(
 
         // Mode-aware key selection: passthrough uses caller token, others use lane's api_key
         let key = match app.auth_mode() {
-            crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(&app.lanes[i].api_key),
+            // Passthrough forwards the CALLER's credential upstream. When the caller presents NO
+            // credential, fall back to an EMPTY credential — NOT the lane operator's `api_key`
+            // (LOW #15 SECURITY): borrowing the operator key would let an unauthenticated caller
+            // silently spend on the operator's upstream account. An empty credential makes the
+            // provider return its own 401/403, attributed to the caller (a client-auth fault, no
+            // lane penalty), matching the documented passthrough contract. No-op in canonical
+            // keyless passthrough (lane.api_key already empty); only changes the misconfigured
+            // passthrough+configured-key case.
+            crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(""),
             crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
         };
 
@@ -3365,7 +3421,15 @@ async fn forward_once(
 
     // Mode-aware key selection: passthrough uses caller token, others use lane's api_key.
     let key = match app.auth_mode() {
-        crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(&app.lanes[i].api_key),
+        // Passthrough forwards the CALLER's credential upstream. When the caller presents NO
+        // credential, fall back to an EMPTY credential — NOT the lane operator's `api_key`
+        // (LOW #15 SECURITY): borrowing the operator key would let an unauthenticated caller
+        // silently spend on the operator's upstream account. An empty credential makes the
+        // provider return its own 401/403, attributed to the caller (a client-auth fault, no
+        // lane penalty), matching the documented passthrough contract. No-op in canonical
+        // keyless passthrough (lane.api_key already empty); only changes the misconfigured
+        // passthrough+configured-key case.
+        crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(""),
         crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
     };
 
@@ -5813,6 +5877,225 @@ mod ingress_indistinguishability_tests {
             spend, 0,
             "an undelivered (untranslatable) completion must NOT charge the token budget"
         );
+        server.shutdown().await;
+    }
+
+    /// REGRESSION (MED #1, forward.rs `FirstByteBody`): a SAME-PROTOCOL NON-STREAM 2xx
+    /// `application/json` body whose top-level object splits across transport frames BEFORE its
+    /// trailing `usage` must STILL be token-counted. The streaming per-poll `tap.feed` scanner keeps
+    /// no cross-chunk state — it only parses complete JSON objects within a single chunk — so the old
+    /// code parsed NO usage on a multi-chunk same-protocol non-stream body, leaving input/output
+    /// tokens `None`, charging 0 tokens, and undercounting the key's TPM/spend on a mainstream config
+    /// (OpenAI→OpenAI). The fix buffers the non-SSE body (bounded) and runs `feed_whole` ONCE over the
+    /// reassembled body at stream end. Drives `FirstByteBody` directly (the harness cannot force a
+    /// transport-frame split end-to-end) with a body deliberately split before `usage`, then asserts
+    /// the gov recorded the tokens (the old code would record 0 → spend 0).
+    #[tokio::test]
+    async fn test_same_protocol_nonstream_multichunk_counts_usage() {
+        use super::FirstByteBody;
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        use bytes::Bytes;
+        use http_body_util::BodyExt as _;
+        crate::metrics::init();
+
+        // Gov + virtual key: 0c/request, 100c/1k tokens → a 1000-token response costs 100c. A nonzero
+        // post-drain spend proves the reassembled body's `usage` was counted.
+        let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+        let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov"));
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(1_000_000),
+                    budget_period: "daily".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .expect("create key");
+        let charged_at: u64 = 1_700_000_000;
+        let sink = Some(UsageSink {
+            gov: gov.clone(),
+            key_id: key.id.clone(),
+            period: key.budget_period.clone(),
+            charged_at,
+        });
+
+        // An OpenAI chat.completion 2xx with 600 input + 400 output = 1000 tokens, with `usage` at the
+        // TAIL (real wire order). Split the wire bytes into two chunks at a point BEFORE `"usage"`, so
+        // neither chunk contains a complete top-level object — the exact cross-frame split the old
+        // per-chunk scanner could not reassemble.
+        let body = r#"{"id":"chatcmpl-split","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":600,"completion_tokens":400}}"#;
+        let split = body.find(r#""usage""#).expect("usage marker present");
+        assert!(split > 0 && split < body.len(), "split must be interior");
+        let chunk1 = Bytes::from(body[..split].to_string());
+        let chunk2 = Bytes::from(body[split..].to_string());
+        // Sanity: neither chunk is a parseable complete object, so the per-chunk scanner finds nothing.
+        let mut probe = super::UsageTap::new();
+        probe.feed(&chunk1);
+        probe.feed(&chunk2);
+        assert_eq!(
+            probe.input_tokens, None,
+            "precondition: the per-chunk scanner must NOT parse usage from the split body, or the bug is masked"
+        );
+
+        // Minimal App for the lane/store the FirstByteBody refunds/breaker arms reference (unused on
+        // this clean non-SSE drain, but required by the constructor).
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "glm-4.5",
+                crate::proto::Protocol::openai(),
+                "http://127.0.0.1:1",
+            ))
+            .pool("pa", &[(0, 1)])
+            .build();
+
+        // Same-protocol non-stream: is_sse=false, translate=None, ingress non-bedrock ("openai").
+        let inner = futures::stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(chunk1),
+            Ok::<Bytes, reqwest::Error>(chunk2),
+        ]);
+        let fbb = FirstByteBody::new(
+            inner,
+            false, // is_sse: same-protocol NON-STREAM application/json
+            "openai",
+            (),
+            app.clone(),
+            0,
+            Arc::new(crate::store::BreakerCfg::default()),
+            "pa",
+            None, // translate: same-protocol → no translation
+            None, // json_array
+            sink,
+            false, // budget_spent
+        );
+
+        // Drain the body fully (drives poll_next to Poll::Ready(None), firing feed_whole + record).
+        let collected = fbb
+            .into_body()
+            .collect()
+            .await
+            .expect("drain body")
+            .to_bytes();
+        // The client still receives the full body incrementally (bytes are unchanged).
+        assert_eq!(
+            collected.as_ref(),
+            body.as_bytes(),
+            "the client must still receive the complete body verbatim"
+        );
+
+        // The reassembled body's 1000 tokens → 100c must have been charged (old code: 0). Inside a
+        // Tokio runtime `record_tokens` offloads the SQLite write to the blocking pool, so drain it
+        // by polling until the usage row appears (bounded retries) before asserting.
+        let mut spend = 0;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            spend = gov
+                .usage_for(&key.id, charged_at)
+                .expect("usage read")
+                .map(|u| u.spend_cents)
+                .unwrap_or(0);
+            if spend == 100 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            spend, 100,
+            "a multi-chunk same-protocol non-stream body's tail usage MUST be counted (1000 tokens → 100c)"
+        );
+    }
+
+    /// REGRESSION (LOW #15 SECURITY, forward.rs key selection): in `Passthrough` mode, a caller that
+    /// presents NO credential must fall back to an EMPTY credential, NOT the lane operator's
+    /// `api_key`. Borrowing the operator key would let an unauthenticated caller silently spend on the
+    /// operator's upstream account. With the empty-credential fallback the upstream returns its own
+    /// 401/403 (a client-auth fault attributed to the caller, no lane penalty). Drives the full
+    /// `forward_with_pool` passthrough path with `caller_token = None` against a misconfigured lane
+    /// that DOES carry a non-empty operator key, then asserts the UPSTREAM saw an empty Bearer
+    /// credential — NOT `Bearer sk-operator-secret` (the old borrow-the-operator-key behavior).
+    #[tokio::test]
+    async fn test_passthrough_no_caller_token_selects_empty_not_lane_key() {
+        use crate::auth::AuthMiddleware;
+        use crate::config::AuthCfg;
+        crate::metrics::init();
+
+        // Upstream answers 200 so we can inspect the Authorization header it received.
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: json!({
+                "id": "chatcmpl-x",
+                "object": "chat.completion",
+                "created": 1234567890,
+                "model": "glm-4.5",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }),
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        // Passthrough mode + a MISCONFIGURED lane that DOES carry an operator key. Lane speaks OpenAI
+        // (Bearer auth), ingress same-protocol openai.
+        let passthrough = AuthCfg {
+            mode: "passthrough".to_string(),
+            ..AuthCfg::default_none()
+        };
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "glm-4.5",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .api_key("sk-operator-secret"),
+            )
+            .pool("pa", &[(0, 1)])
+            .auth(Arc::new(AuthMiddleware::new(&passthrough)))
+            .build();
+
+        let body = serde_json::to_vec(
+            &json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50}),
+        )
+        .unwrap();
+        // Caller presents NO credential.
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            body.into(),
+            None,
+            "pa",
+            None,
+            "openai",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 200);
+
+        // The upstream must NOT have received the operator key. With the fix the forwarded credential
+        // is empty → `Authorization: Bearer ` (empty token); the OLD code forwarded
+        // `Authorization: Bearer sk-operator-secret`, silently borrowing the operator key.
+        let recorded_auth = state
+            .get_last_auth_header()
+            .expect("mock recorded an Authorization header");
+        assert_ne!(
+            recorded_auth, "Bearer sk-operator-secret",
+            "passthrough with no caller credential must NOT borrow the operator's lane api_key (LOW #15)"
+        );
+        assert!(
+            !recorded_auth.contains("sk-operator-secret"),
+            "operator key must never leak upstream for an unauthenticated passthrough caller; got {recorded_auth:?}"
+        );
+        // The forwarded credential is empty → a bare `Bearer` token (HTTP strips the trailing space of
+        // the empty value on the wire), NOT `Bearer <operator-key>`.
+        assert_eq!(
+            recorded_auth.trim(),
+            "Bearer",
+            "passthrough with no caller credential must forward an EMPTY Bearer credential upstream"
+        );
+
         server.shutdown().await;
     }
 

@@ -607,6 +607,19 @@ impl ProtocolReader for GeminiReader {
                         model,
                     });
                 }
+                // Close any blocks opened by earlier chunks in this stream before the terminal
+                // MessageDelta — a mid-stream prompt-block can land after a normal text/tool chunk
+                // already pushed BlockStart(s). Mirror the finishReason path (~793-802) exactly so
+                // the IR stream stays balanced; without this the open BlockStart events never get a
+                // matching BlockStop, producing an unbalanced stream downstream.
+                if state.text_block_open {
+                    state.text_block_open = false;
+                    let ti = state.text_index.take().unwrap_or(0);
+                    out.push(IrStreamEvent::BlockStop { index: ti });
+                }
+                for oai_idx in std::mem::take(&mut state.open_tools) {
+                    out.push(IrStreamEvent::BlockStop { index: oai_idx });
+                }
                 let usage = gemini_usage(data);
                 out.push(IrStreamEvent::MessageDelta {
                     stop_reason: Some(prompt_block_stop_reason(block_reason)),
@@ -4152,6 +4165,75 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, IrStreamEvent::BlockStart { .. })),
             "a blocked prompt must not open any content block: {events:?}"
+        );
+    }
+
+    /// Regression (LOW #10, bug): a MID-STREAM prompt-block arm must close any blocks opened by
+    /// earlier chunks before emitting its terminal MessageDelta/MessageStop. A normal text chunk
+    /// opens a content block (BlockStart{0}); a following `promptFeedback.blockReason` SAFETY chunk
+    /// (NO candidates) previously emitted the terminal MessageDelta/MessageStop WITHOUT closing that
+    /// open block, leaving an unbalanced IR stream (orphaned BlockStart). The fixed arm mirrors the
+    /// finishReason path: the second chunk must emit exactly [BlockStop{0}, MessageDelta{safety},
+    /// MessageStop].
+    #[test]
+    fn test_stream_mid_stream_prompt_block_closes_open_text_block() {
+        let reader = GeminiReader;
+        let mut state = StreamDecodeState::default();
+
+        // Chunk 1: a normal text chunk opens a content block.
+        let first = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": "hello"}], "role": "model"}
+                }]
+            }),
+            &mut state,
+        );
+        assert!(
+            first
+                .iter()
+                .any(|e| matches!(e, IrStreamEvent::BlockStart { index: 0, .. })),
+            "first chunk must open block 0: {first:?}"
+        );
+        assert!(
+            state.text_block_open,
+            "text block must remain open after the first chunk: {first:?}"
+        );
+
+        // Chunk 2: a mid-stream prompt-block (NO candidates) must close block 0, then terminate.
+        let second = reader.read_response_events(
+            "",
+            &serde_json::json!({
+                "promptFeedback": {"blockReason": "SAFETY"},
+                "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 0}
+            }),
+            &mut state,
+        );
+
+        let stop_reason = second.iter().find_map(|e| match e {
+            IrStreamEvent::MessageDelta { stop_reason, .. } => stop_reason.clone(),
+            _ => None,
+        });
+        assert!(
+            matches!(
+                second.as_slice(),
+                [
+                    IrStreamEvent::BlockStop { index: 0 },
+                    IrStreamEvent::MessageDelta { .. },
+                    IrStreamEvent::MessageStop,
+                ]
+            ),
+            "mid-stream prompt-block must emit [BlockStop{{0}}, MessageDelta, MessageStop]: {second:?}"
+        );
+        assert_eq!(
+            stop_reason.as_deref(),
+            Some("safety"),
+            "the terminal MessageDelta must carry a `safety` stop_reason: {second:?}"
+        );
+        assert!(
+            !state.text_block_open,
+            "the open text block flag must be cleared after the prompt-block close: {second:?}"
         );
     }
 

@@ -510,6 +510,27 @@ pub(crate) async fn auth_middleware(
                 );
             });
         }
+        // Same class of silent override for `auth.mode=token` WITH a non-empty static client_tokens
+        // allowlist: the governance branch resolves every request against the virtual-key store, so
+        // the static allowlist is NEVER consulted — its configured entries have ZERO enforcement
+        // effect (governance supersedes them, exactly as it supersedes passthrough/none above). An
+        // operator who set `auth.mode=token` + `client_tokens: [...]` AND enabled governance in the
+        // belief the static list still gates access is running a config that reads as doubly-secured
+        // but whose static tokens are inert. `validate_governance` accepts the pairing (governance
+        // simply wins), so there is no boot-time error; mirror the passthrough/none advisories with a
+        // parallel one-shot warning at the first request that exercises it, rather than leaving the
+        // inert allowlist undiagnosed.
+        if app.auth_mode() == AuthMode::Token && !app.auth.client_tokens.is_empty() {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    "auth.mode=token with governance enabled: governance supersedes the static \
+                     client_tokens allowlist — every request is resolved against the virtual-key \
+                     store and the configured client_tokens entries have NO enforcement effect. \
+                     Remove them, or disable governance, to avoid a misleading config."
+                );
+            });
+        }
         // Reject a missing / empty token BEFORE the governance lookup, mirroring the
         // `validate_token` guard that the static-token path applies. Without this, an
         // unauthenticated request would call `gov.lookup(sha256(""))` — admitting the caller if any
@@ -2044,6 +2065,177 @@ mod tests {
 
         handle.abort();
         server.shutdown().await;
+    }
+
+    /// A `tracing::Layer` that records the messages of WARN-level events it sees, so a test can
+    /// assert a particular `tracing::warn!` fired. Mirrors the helper used in eventstream/config
+    /// tests; kept local to the auth test module.
+    #[derive(Clone, Default)]
+    struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct Vis(String);
+            impl tracing::field::Visit for Vis {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut vis = Vis(String::new());
+            event.record(&mut vis);
+            if let Ok(mut msgs) = self.0.lock() {
+                msgs.push(vis.0);
+            }
+        }
+    }
+
+    /// Regression (LOW #13, completeness): `auth.mode=token` WITH a non-empty static `client_tokens`
+    /// allowlist AND governance enabled is a silently inert configuration — governance supersedes the
+    /// static allowlist, so the configured tokens have ZERO enforcement effect. The OLD code emitted
+    /// NO diagnostic for this pairing (only the passthrough/none overrides warned), so an operator who
+    /// believed the static list still gated access had no signal that it was dead. The fix adds a
+    /// parallel one-shot `WARN_ONCE` inside the governance branch, gated on
+    /// `auth_mode()==Token && !client_tokens.is_empty()`.
+    ///
+    /// This pins the WARNING itself (not just behaviour): the inert-allowlist behaviour is unchanged
+    /// by the fix, so a behaviour-only assertion would pass against the old code too. We drive the
+    /// real router + `auth_middleware` on a CURRENT-THREAD runtime so the synchronous `tracing::warn!`
+    /// fires on the same thread as the thread-local subscriber (`with_default`) and is captured — the
+    /// multi-thread end-to-end siblings (none/passthrough) deliberately could NOT assert their warn
+    /// line for exactly this thread-affinity reason. Against the old code the message assertion FAILS
+    /// (no such warning); it passes once the diagnostic is emitted. The static `WARN_ONCE` is
+    /// process-global, but this is the ONLY test that exercises the token+governance+non-empty pairing,
+    /// so it observes the first (and only) firing.
+    #[test]
+    fn test_token_mode_with_governance_and_client_tokens_warns_inert_allowlist() {
+        use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+        use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
+        use serde_json::json;
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        crate::metrics::init();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime must build");
+
+        let cap = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+
+        let admitted = tracing::subscriber::with_default(subscriber, || {
+            rt.block_on(async {
+                let state = Arc::new(MockServerState::new());
+                state.push(MockResponse::Ok {
+                    status: axum::http::StatusCode::OK,
+                    body: json!({
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "test-model",
+                        "content": [{"type": "text", "text": "hi"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }),
+                });
+                let server = MockServer::new(state).await;
+
+                // The virtual key the request actually authenticates with under governance.
+                let vk_secret = "sk-vk-token-gov";
+                let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+                store
+                    .put_key(&VirtualKey {
+                        id: "k".to_string(),
+                        key_hash: crate::sigv4::sha256_hex(vk_secret.as_bytes()),
+                        name: "k".to_string(),
+                        allowed_pools: vec!["pa".to_string()],
+                        max_budget_cents: None,
+                        budget_period: "total".to_string(),
+                        rpm_limit: None,
+                        tpm_limit: None,
+                        enabled: true,
+                        created_at: 0,
+                    })
+                    .unwrap();
+                let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+
+                // auth.mode=token WITH a non-empty static allowlist — the inert combination. The
+                // listed static token is NOT the governance virtual key.
+                let auth_cfg = crate::config::AuthCfg {
+                    mode: AuthMode::Token.as_config_str().to_string(),
+                    client_tokens: vec!["static-allowlisted-but-inert".to_string()],
+                    _legacy_token: None,
+                };
+
+                let app = TestApp::new()
+                    .lane(
+                        LaneSpec::new(
+                            "test-model",
+                            crate::proto::Protocol::anthropic(),
+                            &server.base_url(),
+                        )
+                        .api_key("busbar-upstream-key"),
+                    )
+                    .pool("pa", &[(0, 1)])
+                    .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+                    .governance(gov)
+                    .build();
+
+                let router = crate::build_router(app);
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                // Spawn on the SAME current-thread runtime so the server-side middleware (and its
+                // synchronous warn!) runs on this thread, under the installed subscriber.
+                tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+                let client = reqwest::Client::new();
+                let url = format!("http://{addr}/pa/v1/messages");
+                let body = json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+                    .to_string();
+
+                // Authenticate with the VIRTUAL KEY (governance is what is honoured), exercising the
+                // governance branch where the new warning lives.
+                let resp = client
+                    .post(&url)
+                    .bearer_auth(vk_secret)
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                resp.status().as_u16()
+            })
+        });
+
+        assert_ne!(
+            admitted, 401,
+            "the valid enabled virtual key must pass governance auth (got {admitted})"
+        );
+
+        let msgs = cap.0.lock().expect("warn capture mutex");
+        assert!(
+            msgs.iter().any(|m| {
+                let lc = m.to_ascii_lowercase();
+                lc.contains("auth.mode=token")
+                    && lc.contains("governance")
+                    && lc.contains("client_tokens")
+            }),
+            "token+governance with a non-empty client_tokens allowlist must WARN that governance \
+             supersedes the static allowlist; captured warnings: {msgs:?}"
+        );
     }
 
     #[test]

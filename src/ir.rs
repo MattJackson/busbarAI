@@ -266,6 +266,16 @@ pub(crate) struct StreamDecodeState {
     /// reader stashes the `messageStop` stop_reason here and pairs it with the usage when `metadata`
     /// arrives. Used by the Bedrock reader only; other protocols leave it `None`.
     pub pending_stop_reason: Option<String>,
+    /// OpenAI-only: maps each opened OpenAI tool_call `index` (the `oai_idx`) to the IR block index
+    /// its `BlockStart` was emitted with. The OpenAI flat stream lets text arrive AFTER tool calls,
+    /// and the text block's presence shifts the tool index base — so the IR index a tool's BlockStart
+    /// claimed at OPEN time can diverge from a value RECOMPUTED at finish/close time (where text is
+    /// now `Some`). Recording the emitted IR index here and replaying it verbatim at close guarantees
+    /// every tool `BlockStop` pairs with the SAME index as its `BlockStart`, regardless of later text
+    /// arrival. Empty for every other reader (which assign IR indices 1:1 or via `open_tools`/
+    /// `text_index` directly and never recompute a divergent base). Keyed by `oai_idx` so it tracks
+    /// `open_tools` one-for-one.
+    pub tool_ir_index: std::collections::BTreeMap<usize, usize>,
 }
 
 #[cfg(test)]
@@ -300,6 +310,7 @@ mod tests {
         assert!(!st.reasoning_seen);
         assert!(!st.thinking_block_open);
         assert!(st.pending_stop_reason.is_none());
+        assert!(st.tool_ir_index.is_empty());
     }
 
     #[test]

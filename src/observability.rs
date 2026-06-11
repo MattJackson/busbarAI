@@ -81,6 +81,108 @@ fn mask_userinfo(url: &str) -> String {
     parsed.into()
 }
 
+/// Standard base64 (RFC 4648 §4, with `=` padding) of arbitrary bytes. Used only to build the
+/// `Authorization: Basic <base64(user:pass)>` header value for OTLP export (see
+/// `split_otlp_credentials`); we hand-roll it rather than pull a `base64` crate into the direct
+/// dependency set (the encoder is a dozen lines and runs once, at startup, off the request path).
+/// Pure, so it is unit-testable.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        // Pack up to three input bytes into a 24-bit big-endian buffer; absent bytes are 0.
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        // The 3rd/4th sextets become `=` padding when the input chunk was short.
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Split any embedded userinfo (`scheme://user:pass@host/...`) OUT of a validated OTLP endpoint,
+/// returning `(clean_endpoint, authorization)`:
+///   * `clean_endpoint` is the endpoint with the userinfo component removed entirely, so the URI the
+///     OTLP SDK stores and may echo into its own error/debug messages NEVER carries the secret.
+///   * `authorization`, when the endpoint carried a non-empty username or any password, is
+///     `Some(Authorization: Basic base64(user:pass))` — the credential is moved off the URL and into
+///     a request header (passed as the `HyperClient::new` 3rd argument), which the SDK does not log.
+///
+/// This is the credential-OUT-of-the-URL fix for LOW #14 (continuation of the R25 OTLP-masking work):
+/// masking only sanitized busbar's OWN log lines, but the raw URL was still handed to
+/// `with_endpoint()`, so SDK-internal diagnostics could expose the secret in the request URI.
+///
+/// A URL with no userinfo, or a string that does not parse as a URL, yields `(endpoint unchanged,
+/// None)` — we must not mangle a credential-free endpoint, and validation already accepted it. Pure,
+/// so it is unit-testable without process-wide state.
+fn split_otlp_credentials(endpoint: &str) -> (String, Option<reqwest::header::HeaderValue>) {
+    let Ok(mut parsed) = reqwest::Url::parse(endpoint) else {
+        return (endpoint.to_string(), None);
+    };
+    let username = parsed.username().to_string();
+    let password = parsed.password().map(str::to_string);
+    if username.is_empty() && password.is_none() {
+        return (endpoint.to_string(), None);
+    }
+    // Per RFC 7617 the Basic credential is `base64(user-id ":" password)`, with an empty password
+    // when none was supplied. The userinfo arrives percent-encoded in the URL; decode it so the wire
+    // credential matches what the operator configured.
+    let user = percent_decode(&username);
+    let pass = percent_decode(password.as_deref().unwrap_or(""));
+    let token = base64_encode(format!("{user}:{pass}").as_bytes());
+    // Strip the userinfo from the URL so the endpoint handed to the SDK is credential-free. Both
+    // setters return `Err(())` only for a cannot-be-a-base URL, which a URL that parsed WITH userinfo
+    // is not; on the unexpected error we still must not leak, so fall back to a host-only rebuild.
+    let clean = if parsed.set_username("").is_err() || parsed.set_password(None).is_err() {
+        let host = parsed.host_str().unwrap_or("");
+        match parsed.port() {
+            Some(p) => format!("{}://{host}:{p}", parsed.scheme()),
+            None => format!("{}://{host}", parsed.scheme()),
+        }
+    } else {
+        parsed.into()
+    };
+    // `HeaderValue::from_str` only fails on bytes a header value cannot carry; a base64 token is pure
+    // ASCII from `[A-Za-z0-9+/=]`, so this never fails. If it somehow did, drop the credential rather
+    // than panic on the startup path — the export simply goes out unauthenticated.
+    let auth = reqwest::header::HeaderValue::from_str(&format!("Basic {token}")).ok();
+    (clean, auth)
+}
+
+/// Percent-decode a URL component to its raw UTF-8 string, leaving any byte that is not a valid
+/// `%XX` escape (or invalid UTF-8) untouched so a credential is never silently corrupted.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// True when `url`'s scheme equals `scheme` (an all-lowercase ASCII scheme word like `https`),
 /// compared CASE-INSENSITIVELY per RFC 3986 §3.1. Matches `<scheme>://...`; the `://` is required so
 /// `httpsx://` does not match `https`. Avoids the case-sensitivity bug in a raw
@@ -728,16 +830,22 @@ where
         .https_or_http()
         .enable_http1()
         .build();
+    // Move any embedded userinfo (`https://user:pass@host`) OUT of the URL and into an
+    // `Authorization: Basic ...` header (LOW #14): the endpoint string passed to `with_endpoint`
+    // below — which the OTLP SDK may echo into its own error/debug messages as the request URI —
+    // must never carry the operator's secret. The credential travels as the `HyperClient::new` 3rd
+    // argument (`authorization`), which the SDK injects per-request and does not log.
+    let (clean_endpoint, authorization) = split_otlp_credentials(endpoint);
     let http_client = opentelemetry_http::hyper::HyperClient::new(
         https,
         std::time::Duration::from_secs(10),
-        None,
+        authorization,
     );
 
     let exporter = match opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_http_client(http_client)
-        .with_endpoint(endpoint)
+        .with_endpoint(&clean_endpoint)
         .build()
     {
         Ok(e) => e,
@@ -853,6 +961,99 @@ mod tests {
         assert!(
             !err.contains("pw0rd"),
             "OTLP plaintext-remote error must mask embedded userinfo; leaked: {err}"
+        );
+    }
+
+    #[test]
+    fn test_base64_encode_rfc4648_vectors() {
+        // Standard RFC 4648 test vectors, including the padding edge cases the OTLP Basic-auth token
+        // exercises (input lengths not a multiple of 3).
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // The exact token the credential path produces for `alice:s3cr3t`.
+        assert_eq!(base64_encode(b"alice:s3cr3t"), "YWxpY2U6czNjcjN0");
+    }
+
+    #[test]
+    fn test_split_otlp_credentials_moves_secret_off_url() {
+        // Regression (LOW #14): an endpoint with embedded userinfo must yield (a) a credential-FREE
+        // endpoint for `with_endpoint` (so the URI the SDK may log never carries the secret) and (b)
+        // an `Authorization: Basic base64(user:pass)` header carrying the credential out of band.
+        let (clean, auth) =
+            split_otlp_credentials("https://alice:s3cr3t@collector.example.com:4318/v1/traces");
+        // The clean endpoint must NOT contain the username or password in any form...
+        assert!(
+            !clean.contains("alice") && !clean.contains("s3cr3t") && !clean.contains('@'),
+            "endpoint passed to the SDK must be credential-free: {clean}"
+        );
+        // ...while still pointing at the same collector (host/port/path preserved).
+        assert_eq!(clean, "https://collector.example.com:4318/v1/traces");
+        // The credential rides in a Basic auth header, base64 of `alice:s3cr3t`.
+        let auth = auth.expect("userinfo must produce an Authorization header");
+        let auth = auth.to_str().expect("header value is ascii");
+        assert_eq!(auth, "Basic YWxpY2U6czNjcjN0");
+        // Belt-and-braces: the raw secret must not appear verbatim in the header either.
+        assert!(
+            !auth.contains("s3cr3t") && !auth.contains("alice"),
+            "credential must be base64-encoded, not plaintext: {auth}"
+        );
+    }
+
+    #[test]
+    fn test_split_otlp_credentials_password_only_and_user_only() {
+        // Password-only (`:pass@`) and username-only (`user@`) userinfo are both moved off the URL.
+        let (clean, auth) = split_otlp_credentials("https://:topsecret@host:4318/v1/traces");
+        assert!(
+            !clean.contains("topsecret") && !clean.contains('@'),
+            "password-only secret must leave the URL: {clean}"
+        );
+        let auth = auth.expect("password-only userinfo still authenticates");
+        assert_eq!(
+            auth.to_str().unwrap(),
+            format!("Basic {}", base64_encode(b":topsecret"))
+        );
+
+        let (clean, auth) = split_otlp_credentials("https://tokenuser@host:4318/v1/traces");
+        assert!(
+            !clean.contains("tokenuser") && !clean.contains('@'),
+            "username-only secret must leave the URL: {clean}"
+        );
+        let auth = auth.expect("username-only userinfo still authenticates");
+        assert_eq!(
+            auth.to_str().unwrap(),
+            format!("Basic {}", base64_encode(b"tokenuser:"))
+        );
+    }
+
+    #[test]
+    fn test_split_otlp_credentials_passthrough_without_userinfo() {
+        // A credential-free endpoint must be returned unchanged with NO Authorization header, so
+        // unauthenticated collectors keep working exactly as before.
+        let (clean, auth) = split_otlp_credentials("https://collector.example.com:4318/v1/traces");
+        assert_eq!(clean, "https://collector.example.com:4318/v1/traces");
+        assert!(auth.is_none(), "no userinfo must mean no auth header");
+        // Loopback http collector, also credential-free.
+        let (clean, auth) = split_otlp_credentials("http://localhost:4318");
+        assert!(auth.is_none());
+        assert!(clean.starts_with("http://localhost:4318"));
+    }
+
+    #[test]
+    fn test_split_otlp_credentials_percent_decodes() {
+        // Percent-encoded userinfo (e.g. a password containing `@` or `:`) must be decoded so the
+        // wire credential matches what the operator configured. `%40` is `@`, `%3A` is `:`.
+        let (clean, auth) = split_otlp_credentials("https://u:p%40ss%3Aword@host/v1/traces");
+        assert!(!clean.contains('@'), "userinfo stripped: {clean}");
+        let auth = auth.expect("auth header present");
+        // Decoded credential is `u:p@ss:word`.
+        assert_eq!(
+            auth.to_str().unwrap(),
+            format!("Basic {}", base64_encode(b"u:p@ss:word"))
         );
     }
 
