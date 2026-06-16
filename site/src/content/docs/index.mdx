@@ -1,0 +1,89 @@
+---
+title: Busbar
+description: The reliability layer for LLM traffic — one endpoint speaks every major SDK, with fault-aware circuit breaking and in-flight failover.
+template: splash
+hero:
+  tagline: One endpoint speaks every major SDK. Fault-aware circuit breaking and in-flight failover keep your app serving when your providers aren't.
+  actions:
+    - text: Get started
+      link: /getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: Why Busbar
+      link: /why-busbar/
+      icon: open-book
+    - text: GitHub
+      link: https://github.com/MattJackson/busbarAI
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+Busbar sits between your application and your LLM providers. Point any SDK — OpenAI,
+Anthropic, Gemini, Bedrock, Cohere — at one URL, and it routes, translates, and
+**keeps serving through provider failures**. It's a different class of tool than a
+proxy with a long model list.
+
+:::tip[The core idea]
+**You define a model name and its backends. Busbar accepts *any* input protocol — OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses — and routes and translates accordingly.** One model name, reachable by every client; you choose what runs behind it.
+:::
+
+<CardGrid>
+  <Card title="Speaks every protocol — losslessly" icon="random">
+    Six wire protocols, native on **both** sides, translated through one internal format
+    rich enough to hold every protocol's features — so nothing gets dropped. Busbar does
+    **not** flatten everything to OpenAI shape, so Anthropic thinking blocks, Gemini safety
+    settings, and Bedrock tool use survive the hop.
+
+    *Enables:* use whatever SDK your code already speaks — and reach every model through it;
+    move a workload between providers with a config edit, not a code migration; adopt a new
+    model the day it ships.
+  </Card>
+  <Card title="Fails over inside the request" icon="rocket">
+    Before your client sees a byte — even mid-stream. A provider 429 or 5xx becomes a
+    silent reroute across your pool, including **across protocol families**.
+
+    *Enables:* reliability your app gets for free, instead of a pile of per-provider retry
+    code. Not a 500 your user feels, not a 3am page.
+  </Card>
+  <Card title="Knows whose fault a failure is" icon="warning">
+    A circuit breaker on every provider connection classifies each error — provider outage,
+    your bad request, context-length, hard auth/billing failure — and treats each
+    differently instead of retrying into a wall.
+
+    *Enables:* a flaky provider is pulled and probed back gently; a malformed 400 never
+    poisons a healthy lane; an overly long prompt fails *over* to a bigger-context model.
+  </Card>
+  <Card title="Runs anywhere — your infrastructure" icon="approve-check">
+    A single static Rust binary — no Python sidecar, no interpreter, no GC in the request
+    path. Ships for **Linux, macOS, and Windows** (Intel and ARM). Your keys, your network,
+    your data path. Deploy it like nginx.
+
+    *Enables:* keys and prompts never transit a third party; rotating an upstream key is a
+    restart, not a deployment sweep.
+  </Card>
+</CardGrid>
+
+## The one-line change
+
+Your code already speaks OpenAI (or Anthropic, or Gemini). Swap the base URL:
+
+```diff
+- client = OpenAI(api_key=OPENAI_KEY)
++ client = OpenAI(api_key=BUSBAR_TOKEN, base_url="http://busbar:8080")
+
+  # the rest of your code is untouched — `model` now names a single model
+  # OR a pool you define in config (e.g. "fast" = 80% Claude / 20% GPT-4o, Gemini on failover)
+  client.chat.completions.create(
+      model="fast",
+      messages=[{"role": "user", "content": "Hello!"}],
+  )
+```
+
+That request left as OpenAI, may have been served by Anthropic, and came back as OpenAI —
+translated losslessly both ways. If Anthropic returned a 429 mid-flight, Busbar rerouted to
+the next pool member before your client saw a single byte. **The model name is a config
+value, not a code dependency.**
+
+[Read the case for Busbar →](/why-busbar/) · [Get started in 60 seconds →](/getting-started/)
