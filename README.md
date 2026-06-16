@@ -42,18 +42,17 @@ That request left as OpenAI, may have been served by Anthropic, and came back as
 
 ---
 
-## A different class of product
+## What's inside
 
-| | Busbar | Self-hosted proxy | Hosted router |
-|---|---|---|---|
-| **Cross-protocol translation** | Native, lossless both ways | Normalized to OpenAI shape | OpenAI shape only |
-| **Circuit breaking** | Per provider connection, fault-attributed | Basic retry / cooldown | Not exposed |
-| **Failover** | Mid-request, streaming-safe, across protocols | Exception-level retry | None |
-| **Governance** | Virtual keys, budgets, ACLs | Add-on | Dashboard |
-| **Keys & prompts** | Stay in your network | Stay in your network | Transit a third party |
-| **Runtime** | Single static binary | Python + dependencies | n/a (hosted) |
+- **Six wire protocols**, lossless both ways — any client protocol reaches any pool → [Protocols](https://ai-bus.bar/protocols/)
+- **Fault-attributed circuit breaking** + **streaming-safe in-flight failover** → [Reliability](https://ai-bus.bar/reliability/)
+- **Weighted pools** — smooth weighted round-robin, session affinity, per-lane concurrency → [Reliability](https://ai-bus.bar/reliability/)
+- **Governance** — virtual keys, budgets, RPM/TPM limits, spend tracking → [Governance](https://ai-bus.bar/guides/governance/)
+- **Vetted provider catalog** — plus any provider on the six protocols in a few lines of YAML → [Providers](https://ai-bus.bar/providers/)
+- **Security-hardened** — SSRF guards, constant-time auth, SHA-256 key storage, secrets never logged → [SECURITY.md](SECURITY.md)
+- **Observability** — Prometheus `/metrics`, OTLP traces, per-request webhook → [Configuration](https://ai-bus.bar/configuration/)
 
-Same arena as **LiteLLM** / **OpenRouter** — the difference is that Busbar is built reliability-first, and self-hosted is how it ships. → **[Why Busbar](https://ai-bus.bar/why-busbar/)**
+Same arena as **LiteLLM** / **OpenRouter** — the difference is that Busbar is built reliability-first. → **[Why Busbar](https://ai-bus.bar/why-busbar/)**
 
 ---
 
@@ -82,18 +81,6 @@ curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' \
 ```
 
 Full walkthrough → **[Getting Started](https://ai-bus.bar/getting-started/)**
-
----
-
-## What's inside
-
-- **Six wire protocols**, lossless both ways — any client protocol reaches any pool → [Protocols](https://ai-bus.bar/protocols/)
-- **Fault-attributed circuit breaking** + **streaming-safe in-flight failover** → [Reliability](https://ai-bus.bar/reliability/)
-- **Weighted pools** — smooth weighted round-robin, session affinity, per-lane concurrency → [Reliability](https://ai-bus.bar/reliability/)
-- **Governance** — virtual keys, budgets, RPM/TPM limits, spend tracking → [Governance](https://ai-bus.bar/guides/governance/)
-- **Vetted provider catalog** — plus any provider on the six protocols in a few lines of YAML → [Providers](https://ai-bus.bar/providers/)
-- **Security-hardened** — SSRF guards, constant-time auth, SHA-256 key storage, secrets never logged → [SECURITY.md](SECURITY.md)
-- **Observability** — Prometheus `/metrics`, OTLP traces, per-request webhook → [Configuration](https://ai-bus.bar/configuration/)
 
 ---
 
