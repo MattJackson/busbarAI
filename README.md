@@ -52,7 +52,7 @@ If you're already weighing the options:
 
 **Thesis: protocols, not providers.** Implement a handful of wire protocols losslessly, and every vendor that speaks one is just a catalog entry — a name, a `base_url`, and the env var holding its key. Six protocols are implemented; 42 vetted providers ship as catalog entries, and any OpenAI-compatible endpoint (including your own) is three lines of YAML.
 
-> **Status: 1.0.0-rc.3 — feature-complete and API-stable, hardened across a multi-round security/correctness audit. Release-candidate validation continuing ahead of 1.0.0.** AGPL-3.0.
+> **Status: 1.0.0-rc.4 — feature-complete and API-stable, hardened across a multi-round security/correctness audit. Release-candidate validation continuing ahead of 1.0.0.** AGPL-3.0.
 
 ## Quick start
 

@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.4] — 2026-06-16
+
+A continuation of the rc.3 hardening campaign: nine further rounds (R19→R27) of
+multi-round, dual-model (Sonnet + Opus) security/correctness auditing over the
+rc.3 tree, with adversarial triage and class-level fixes. No API changes vs rc.3.
+
+The severity gate — **0 critical / 0 high / 0 medium-security / 0 medium-correctness**
+— is met and has held flat for the final four rounds; remaining findings are
+documented low/medium-completeness items at the asymptote of the audit loop. The
+test suite grew from 267 (rc.2) to **1334** passing; `fmt`, `build`, `clippy
+-D warnings`, and `test` all green.
+
+### Fixed
+- **Circuit-breaker / streaming / FSM cluster** — clean SSE stream-end no longer
+  records a spurious breaker failure; breaker success is recorded synchronously
+  before streaming; mid-stream error paths no longer double-record. Readiness
+  checks (`cell_ready_breaker`/`is_ready`) are split from the probe-acquiring
+  transition (`cell_acquire_breaker`) so candidate enumeration no longer steals
+  probes or transitions lanes; a failed half-open probe releases its permit
+  instead of benching a lane permanently.
+- **Upstream `Retry-After`** is extracted on the forward path and propagated
+  through error normalization so the breaker cooldown floor is honored.
+- **SSRF hardening** — backslash-bypass and OTLP-redirect vectors closed; the
+  OTLP exporter uses a no-redirect client. Removed a duplicate `reqwest` major
+  as a side effect.
+- **Same-protocol non-stream large-body token undercount** — `FirstByteBody`
+  now buffers and feeds the whole body once, so usage is no longer dropped past
+  the per-chunk scan cap.
+- A long tail of medium/low conformance, governance, admin-validation, and
+  protocol-translation findings across all six wire protocols (see the private
+  audit residuals for the per-finding ledger).
+
 ## [1.0.0-rc.3] — 2026-06-10
 
 This is a hardening release: a multi-round security/correctness audit campaign over the rc.2 code,
