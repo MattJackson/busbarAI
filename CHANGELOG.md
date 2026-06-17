@@ -7,11 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.0-rc.5] — Unreleased
+## [1.0.0-rc.5] — 2026-06-17
 
 Three independent features land together: pluggable routing policies, deeper Prometheus
 observability, and native inbound TLS/mTLS. The request path, wire protocols, breaker FSM,
-and governance contract are unchanged.
+and governance contract are unchanged. This release also folds in a multi-round security
+and correctness audit and an internal provider-containment refactor.
 
 ### Added
 
@@ -101,6 +102,27 @@ and governance contract are unchanged.
 - **Startup fail-fast for TLS config errors.** PEM cert, key, or CA load/parse failures
   abort startup with a message naming the offending file; key material is never logged. A
   single-connection handshake failure is logged at debug level only.
+
+### Fixed
+
+- **Weight-zero drain bypass on the session-affinity path.** A pool member set to
+  `weight: 0` (an operator draining a lane) could still receive requests that carried an
+  existing session-affinity stickiness, sidestepping the drain. Affinity resolution now
+  applies the same weight-zero exclusion as fresh routing; regression test added.
+- **Anthropic outbound `User-Agent`.** Corrected the User-Agent header shape emitted on the
+  Anthropic upstream hop.
+- **SSRF guard covers the Oracle Cloud metadata address.** The trusted-upstream net guard
+  now blocks `192.0.0.192` alongside the other link-local / cloud-metadata ranges.
+- Additional cross-cutting correctness fixes from a deep audit pass (streaming-translation
+  vtable flag propagation, request-id header constant) and the multi-round security and
+  correctness review (rounds R3–R12).
+
+### Changed
+
+- **Provider containment (internal).** All provider-name branches were removed from the
+  protocol-agnostic core and relocated behind the `ProtocolReader`/`ProtocolWriter` vtable,
+  so provider-specific behavior lives entirely in `src/proto/*` (safe defaults plus
+  per-provider overrides). No user-visible behavior change — architecture only.
 
 ## [1.0.0-rc.4] — 2026-06-16
 

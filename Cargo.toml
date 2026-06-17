@@ -1,6 +1,6 @@
 [package]
 name = "busbar"
-version = "1.0.0-rc.4"
+version = "1.0.0-rc.5"
 edition = "2021"
 # Effective MSRV: governance.rs uses `u32::is_multiple_of` (stabilized in Rust 1.87), and clippy's
 # `manual_is_multiple_of` lint rewrites `% N == 0` back to it, so 1.87 is the genuine minimum. Declare
