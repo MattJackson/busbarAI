@@ -4,24 +4,15 @@
 //   …/releases/latest/download/busbar-<target>.tar.gz   (.zip for Windows)
 // so they always resolve to the newest release with no JavaScript or API calls.
 // The asset names are kept version-less by .github/workflows/release.yml (archive: busbar-$target).
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import glyphPrimary from '../assets/busbar-primary.svg';
+// Crate version, synced from the repo Cargo.toml into src/release.json by sync-docs.mjs
+// (runs before every dev/build). Importing keeps the read inside site/ — robust in astro build.
+import release from '../release.json';
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
 const REL = `${GITHUB}/releases/latest/download`;
 const YEAR = new Date().getFullYear();
-
-// Read the current version from the repo Cargo.toml at build time, so this page tracks releases.
-let version = '';
-try {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const cargo = readFileSync(join(here, '..', '..', '..', 'Cargo.toml'), 'utf8');
-  version = (cargo.match(/^\s*version\s*=\s*"([^"]+)"/m) || [])[1] || '';
-} catch (_) {
-  version = '';
-}
+const version = release.version || '';
 
 // Each archive contains the single `busbar` binary. Targets mirror release.yml's matrix.
 const groups = [

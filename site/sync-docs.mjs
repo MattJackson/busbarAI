@@ -90,3 +90,13 @@ console.log('published providers.yaml -> public/providers.yaml');
   writeFileSync(join(outDir, 'changelog.md'), frontmatter + body.trimStart());
   console.log('synced CHANGELOG.md -> src/content/docs/changelog.md');
 }
+
+// Expose the crate version (from the repo Cargo.toml) to the site as src/release.json,
+// so pages (e.g. /download) can show the current version without reading outside site/ at
+// astro-build time. Single source of truth = Cargo.toml [package] version.
+{
+  const cargo = readFileSync(join(here, '..', 'Cargo.toml'), 'utf8');
+  const version = (cargo.match(/^\s*version\s*=\s*"([^"]+)"/m) || [])[1] || '';
+  writeFileSync(join(here, 'src', 'release.json'), JSON.stringify({ version }, null, 2) + '\n');
+  console.log(`wrote release version ${version || '(unknown)'} -> src/release.json`);
+}
