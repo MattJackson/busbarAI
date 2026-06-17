@@ -36,7 +36,7 @@ tag="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
 [ -n "$tag" ] || err "could not determine the latest release tag"
 say "latest is $tag for $target"
 
-asset="busbar-${tag}-${target}.tar.gz"
+asset="busbar-${target}.tar.gz"
 url="https://github.com/$REPO/releases/download/$tag/$asset"
 
 # --- download + extract the binary ---------------------------------------------------

@@ -24,9 +24,9 @@ const features = [
     enables: 'A flaky provider is pulled and probed back gently; a rate-limit storm on one lane never starves the healthy ones.',
   },
   {
-    title: 'Routing as a pluggable policy',
-    body: 'Pick a built-in policy — weighted, cheapest, fastest, or least-busy — or write your own as a webhook (any language) or a sandboxed script. Your policy sees per-member cost, per-lane latency, live concurrency, budget remaining, and rate headroom, then returns who to prefer.',
-    enables: 'Steer by cost or speed without redeploying — and a slow or broken policy falls back, never blocks.',
+    title: 'A programmable request path',
+    body: 'Routing is the first hook: a policy — built-in (<strong>weighted, cheapest, fastest, least-busy, usage</strong>), a webhook in any language, or a sandboxed Rhai script — inspects each request and decides who serves it, from per-member cost, latency, live concurrency, budget, and rate headroom. A slow or broken hook falls back, never blocks a request.',
+    enables: 'The same fail-safe machinery is built to carry <strong>PII-steering, audit, caching, and guardrails</strong> — your own logic on the request path, in any language.',
   },
   {
     title: 'Governance & hard budget caps',
@@ -46,7 +46,6 @@ const features = [
 ];
 
 const trust = [
-  { k: 'AGPL-3.0', v: 'Open source' },
   { k: 'One binary', v: 'No Python runtime' },
   { k: 'Hardened', v: 'SSRF guards · constant-time auth' },
   { k: 'Cross-platform', v: 'Linux · macOS · Windows · ARM' },
@@ -76,6 +75,8 @@ models:
   claude-sonnet:
     provider: anthropic
     max_concurrent: 10`;
+const qsRun = `export ANTHROPIC_KEY=sk-ant-...
+BUSBAR_CONFIG=./config.yaml busbar   <span class="cm"># serving on :8080</span>`;
 const qsRequest = `curl localhost:8080/v1/chat/completions \\
   -d '{"model":"claude-sonnet",
        "messages":[{"role":"user","content":"hi"}]}'`;
@@ -115,6 +116,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         <nav class="nav-links">
           <a href={DOCS}>Docs</a>
           <a href="/benchmark/">Benchmark</a>
+          <a href="/download/">Download</a>
           <a href={GITHUB} class="ghost">GitHub</a>
         </nav>
       </div>
@@ -133,7 +135,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           </p>
           <div class="cta-row">
             <a href="/getting-started/" class="btn">Get started</a>
-            <a href={GITHUB} class="btn btn-ghost">View on GitHub</a>
+            <a href="/download/" class="btn btn-ghost">Download</a>
             <a href={DOCS} class="btn btn-text">Read the docs →</a>
           </div>
           <div class="proto-row" aria-label="Supported protocols">
@@ -176,17 +178,18 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       <h2 class="section-title">How it works</h2>
       <div class="diagram">
         <div class="col col-clients">
-          <div class="col-label">Your apps · any SDK</div>
-          <div class="node">OpenAI SDK</div>
-          <div class="node">Anthropic SDK</div>
-          <div class="node">Gemini SDK</div>
+          <div class="col-label">Any client · 6 protocols</div>
+          <div class="node">OpenAI · Anthropic</div>
+          <div class="node">Gemini · Bedrock</div>
+          <div class="node">Cohere · Responses</div>
         </div>
 
-        <div class="link-zone" aria-hidden="true">
-          <svg viewBox="0 0 120 220" preserveAspectRatio="none">
-            <path d="M0 40 C 70 40, 50 110, 120 110" />
+        <div class="link-zone">
+          <span class="hop-tls">TLS · mTLS</span>
+          <svg viewBox="0 0 120 220" preserveAspectRatio="none" aria-hidden="true">
+            <path d="M0 30 C 70 30, 50 110, 120 110" />
             <path d="M0 110 H 120" />
-            <path d="M0 180 C 70 180, 50 110, 120 110" />
+            <path d="M0 190 C 70 190, 50 110, 120 110" />
           </svg>
         </div>
 
@@ -198,13 +201,15 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
             </div>
             <div class="bb-sub">one endpoint · :8080</div>
           </div>
+          <svg class="hook-line" viewBox="0 0 2 34" preserveAspectRatio="none" aria-hidden="true"><line x1="1" y1="0" x2="1" y2="34" /></svg>
+          <div class="hook-out">Hooks · your policy on the path</div>
         </div>
 
         <div class="link-zone" aria-hidden="true">
           <svg viewBox="0 0 120 220" preserveAspectRatio="none">
-            <path d="M0 110 C 70 110, 50 40, 120 40" />
+            <path d="M0 110 C 70 110, 50 30, 120 30" />
             <path d="M0 110 H 120" />
-            <path d="M0 110 C 70 110, 50 180, 120 180" />
+            <path d="M0 110 C 70 110, 50 190, 120 190" />
           </svg>
         </div>
 
@@ -224,8 +229,8 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         {features.map((f) => (
           <article class="feature">
             <h3>{f.title}</h3>
-            <p>{f.body}</p>
-            <p class="enables"><span>Enables</span> {f.enables}</p>
+            <p set:html={f.body}></p>
+            <p class="enables"><span>Enables</span> <span set:html={f.enables}></span></p>
           </article>
         ))}
       </div>
@@ -250,6 +255,10 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           <div class="qs-block">
             <span class="qs-tag">config.yaml</span>
             <pre><code set:html={qsConfig}></code></pre>
+          </div>
+          <div class="qs-block">
+            <span class="qs-tag">run</span>
+            <pre><code set:html={qsRun}></code></pre>
           </div>
           <div class="qs-block">
             <span class="qs-tag">request</span>
@@ -299,10 +308,11 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           </div>
           <div>
             <h4>Project</h4>
+            <a href="/download/">Download</a>
+            <a href="/changelog/">Changelog</a>
             <a href={GITHUB}>GitHub</a>
             <a href={`${GITHUB}/blob/main/LICENSE`}>License (AGPL-3.0)</a>
             <a href="/llms.txt">llms.txt</a>
-            <a href="/changelog/">Changelog</a>
           </div>
           <div>
             <h4>Legal</h4>
@@ -438,16 +448,16 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       .flow { padding: 18px 28px 92px; }
       .diagram {
         display: grid; grid-template-columns: 1fr 0.6fr 1.3fr 0.6fr 1fr; align-items: center; gap: 0;
-        background: var(--bg-soft); border: 1px solid var(--line); border-radius: 18px; padding: 38px 26px;
+        background: var(--bg-soft); border: 1px solid var(--line); border-radius: 18px; padding: 38px 26px 76px;
       }
-      .col { display: flex; flex-direction: column; gap: 10px; }
-      .col-label { font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 4px; }
+      .col { display: flex; flex-direction: column; gap: 10px; position: relative; }
+      .col-label { position: absolute; bottom: calc(100% + 9px); left: 0; right: 0; font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
       .node {
         background: #fff; border: 1px solid var(--line); border-radius: 9px;
         padding: 11px 14px; font-size: 13.5px; font-weight: 600; color: var(--charcoal);
         box-shadow: 0 1px 2px rgba(15,23,42,0.04);
       }
-      .link-zone svg { width: 100%; height: 200px; }
+      .link-zone svg { width: 100%; height: 150px; }
       .link-zone path { fill: none; stroke: #cbd5e1; stroke-width: 1.6; stroke-dasharray: 5 5; }
       .busbar-box {
         background: var(--slate); border-radius: 14px; padding: 22px 20px; text-align: center;
@@ -457,18 +467,28 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       .bb-tags { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin: 16px 0 12px; }
       .bb-tags span { font-size: 11.5px; font-weight: 600; color: var(--slate); background: var(--lime); border-radius: 6px; padding: 4px 9px; }
       .bb-sub { color: var(--muted-d); font-size: 12px; font-family: ui-monospace, monospace; }
+      .link-zone { position: relative; }
+      .hop-tls {
+        position: absolute; top: 2px; left: 50%; transform: translateX(-50%);
+        font-size: 10px; font-weight: 700; letter-spacing: 0.02em; color: var(--muted-d);
+        background: var(--bg-soft); padding: 1px 7px; border-radius: 5px; white-space: nowrap; z-index: 2;
+      }
+      .hook-line { position: absolute; top: calc(100% + 14px); left: 50%; transform: translateX(-50%); width: 2px; height: 34px; overflow: visible; }
+      .hook-line line { stroke: #cbd5e1; stroke-width: 2; stroke-dasharray: 5 5; }
+      .hook-out { position: absolute; top: 100%; left: 0; right: 0; margin-top: 54px; text-align: center; font-size: 11px; font-weight: 600; color: var(--muted); }
 
       /* FEATURES */
       .features { padding: 18px 28px 96px; }
-      .feature-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; }
+      .feature-grid { display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(2, auto 1fr auto); gap: 22px; }
       .feature {
         background: #fff; border: 1px solid var(--line); border-radius: 14px; padding: 26px 24px;
+        display: grid; grid-template-rows: subgrid; grid-row: span 3; row-gap: 0;
         transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
       }
       .feature:hover { border-color: #cbd5e1; box-shadow: 0 12px 30px -14px rgba(15,23,42,0.16); transform: translateY(-2px); }
       .feature h3 { font-size: 17.5px; font-weight: 700; margin-bottom: 12px; }
       .feature p { font-size: 14.5px; color: #475569; margin: 0; }
-      .feature .enables { font-size: 13.5px; color: var(--charcoal); margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+      .feature .enables { font-size: 13.5px; color: var(--charcoal); margin-top: 0; padding-top: 14px; border-top: 1px solid var(--line); }
       .feature .enables span {
         display: inline-block; font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em;
         text-transform: uppercase; color: #4d7c0f; margin-right: 6px;
@@ -492,7 +512,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
 
       /* TRUST */
       .trust { background: var(--bg-soft); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 44px 0; }
-      .trust-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; }
+      .trust-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
       .trust-item { text-align: center; }
       .trust-k { font-size: 18px; font-weight: 800; color: var(--slate); letter-spacing: -0.01em; }
       .trust-v { font-size: 13px; color: var(--muted); margin-top: 4px; }
@@ -512,7 +532,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       /* RESPONSIVE */
       @media (max-width: 900px) {
         .hero-grid, .qs-grid { grid-template-columns: 1fr; gap: 40px; }
-        .feature-grid { grid-template-columns: repeat(2, 1fr); }
+        .feature-grid { grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(3, auto 1fr auto); }
         .diagram { grid-template-columns: 1fr; gap: 18px; }
         .link-zone { display: none; }
         .footer-inner { grid-template-columns: 1fr; gap: 32px; }
@@ -522,6 +542,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         .nav-links { gap: 14px; }
         .nav-links a.ghost, .nav-links a[href='/why-busbar/'], .nav-links a[href='/benchmark/'] { display: none; }
         .feature-grid, .trust-grid, .footer-cols { grid-template-columns: 1fr; }
+        .feature-grid { grid-template-rows: repeat(6, auto 1fr auto); }
         .trust-grid { grid-template-columns: repeat(2, 1fr); }
         .hero-grid { padding: 56px 22px 50px; }
       }

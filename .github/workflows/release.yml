@@ -55,5 +55,5 @@ jobs:
         with:
           bin: busbar
           target: ${{ matrix.target }}
-          archive: busbar-$tag-$target
+          archive: busbar-$target
           token: ${{ secrets.GITHUB_TOKEN }}
