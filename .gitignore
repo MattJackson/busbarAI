@@ -32,3 +32,7 @@ Thumbs.db
 # Stray debug/scratch artifacts (never commit)
 /rust_out
 /scratch_syms.txt
+
+# Python bytecode (bench harness)
+__pycache__/
+*.pyc

@@ -126,15 +126,30 @@ def worker(args, body_bytes, n, headers, results, errors, lock, ttft):
 
 
 def run(args):
-    body = dict(PAYLOAD)
-    body["model"] = args.model
+    if args.api == "anthropic":
+        # Anthropic Messages API shape (max_tokens is required). Same single-token "ping" prompt as
+        # the OpenAI path so both paths elicit equivalent upstream work and the delta is clean.
+        body = {
+            "model": args.model,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "ping"}],
+        }
+    else:
+        body = dict(PAYLOAD)
+        body["model"] = args.model
     if args.mode == "ttft":
         body["stream"] = True
     body_bytes = json.dumps(body).encode("utf-8")
 
     headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
+    if args.api == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
     if args.token:
         headers["Authorization"] = f"Bearer {args.token}"
+    # Arbitrary extra headers (e.g. `x-api-key: ...` for the direct-to-Anthropic baseline path).
+    for h in args.header:
+        k, _, v = h.partition(":")
+        headers[k.strip()] = v.strip()
 
     ttft = args.mode == "ttft"
 
@@ -194,6 +209,10 @@ def main():
     ap.add_argument("--concurrency", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=2000)
     ap.add_argument("--token", default="")
+    ap.add_argument("--api", choices=["openai", "anthropic"], default="openai",
+                    help="request shape: openai (/v1/chat/completions) or anthropic (/v1/messages)")
+    ap.add_argument("--header", action="append", default=[],
+                    help="extra request header 'Key: Value' (repeatable; e.g. 'x-api-key: ...')")
     ap.add_argument("--model", default="mock-model")
     ap.add_argument("--label", default="")
     args = ap.parse_args()

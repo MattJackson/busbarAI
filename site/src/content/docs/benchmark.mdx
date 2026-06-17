@@ -12,30 +12,35 @@ shape on your hardware.
 
 <Tabs>
   <TabItem label="Result">
-    We measure a **difference**: drive identical load against the same fixed-latency upstream over two
-    paths and subtract. The mock contributes the same fixed time on both paths, so `busbar − direct`
-    is Busbar's own cost and nothing else. Reported as **p50 / p99 / p99.9** for non-streaming
-    full-response latency and for streaming **TTFT** (time to first byte).
+    We measure a **difference**, on a **fixed, named machine** so the run is exactly reproducible:
+    drive identical load against the **same Anthropic model** over two paths and subtract. Anthropic's
+    own latency is present in *both* paths and cancels in the subtraction, so `busbar − direct` is
+    Busbar's added cost — measured against real provider jitter. Reported as **p50 / p99 / p99.9** for
+    non-streaming full-response latency and for streaming **TTFT** (time to first byte).
 
-    {/* RESULTS TABLE — fill from `bench/latency/run.sh`. Do NOT hand-enter estimated numbers. */}
+    **Test rig (the reproduction anchor):** AWS **c7g.xlarge** (4 vCPU Graviton3, Amazon Linux 2023
+    arm64) in **us-east-1**, running the released **`v1.0.0-rc.5`** `aarch64` binary against
+    `claude-haiku-4-5` on `api.anthropic.com`. The load generator, Busbar, and the direct baseline all
+    run on that one box — same machine, same egress on both paths.
 
-    | Path | Upstream delay | p50 added | p99 added | p99.9 added |
-    |------|---------------|-----------|-----------|-------------|
-    | Busbar added (full response) | 0 ms | _run to fill_ | _run to fill_ | _run to fill_ |
-    | Busbar added (streaming TTFT) | 0 ms | _run to fill_ | _run to fill_ | _run to fill_ |
-    | Busbar added (full response) | 200 ms | _run to fill_ | _run to fill_ | _run to fill_ |
-    | Busbar added (streaming TTFT) | 200 ms | _run to fill_ | _run to fill_ | _run to fill_ |
+    {/* RESULTS TABLE — fill from `bench/latency/run-anthropic.sh` on the rig above. Measured only. */}
 
-    :::note[Status: placeholder pending a measured run]
-    The harness is complete and runs. The mock-upstream path needs a Busbar build that trusts the
-    local mock's TLS cert — the release binary trusts only public webpki roots upstream (see the
-    harness README). Run `bench/latency/run.sh` in an environment that satisfies that precondition, or
-    point it at a real provider with your own key, to fill these cells with **measured** numbers. We
-    publish only measured figures — never estimates.
+    | Busbar added overhead | p50 | p99 | p99.9 |
+    |-----------------------|-----|-----|-------|
+    | Full response (non-streaming) | _run to fill_ | _run to fill_ | _run to fill_ |
+    | Streaming TTFT | _run to fill_ | _run to fill_ | _run to fill_ |
+
+    :::note[Status: placeholder pending the measured run on the rig above]
+    The harness is complete and runs against real Anthropic with no TLS gymnastics — the release binary
+    already trusts `api.anthropic.com`. These cells are filled from a run on the exact rig above and
+    committed one commit after the release tag. We publish only **measured** figures — never estimates.
     :::
 
-    **The takeaway.** Once filled, the one-line read is: *Busbar adds single-digit-to-tens-of-microseconds
-    at p50, and its p99 stays close to its p50.* That tight p50→p99 spread is the whole story.
+    **The takeaway.** Against a real provider the absolute call time is Anthropic's (hundreds of ms);
+    the *delta* is Busbar. The one-line read once filled: *Busbar's added p50 is a tiny fraction of the
+    provider call, and it grows no tail of its own* — the delta's p99/p99.9 track its p50 rather than
+    ballooning. Where the delta widens, that is provider jitter leaking into the subtraction, not a
+    Busbar pause.
 
     **Why the tail stays tight — no garbage collector.** Busbar is a single Rust binary with **no GC**.
     Nothing in the request path pauses to sweep memory, so the latency it adds is near-constant
@@ -56,60 +61,56 @@ shape on your hardware.
   </TabItem>
 
   <TabItem label="Reproduce">
-    The harness lives in `bench/latency/` and is self-contained — Python stdlib plus the release
-    binary. It builds Busbar if needed, starts the mock upstream and Busbar pointed at it, drives both
-    paths, and prints the per-percentile deltas.
+    The figures come from one fixed machine and a published, copy-paste sequence — so anyone can re-run
+    **exactly** what we ran. The harness (`bench/latency/`) is Python stdlib plus the released binary;
+    no special build.
+
+    **1. Launch the rig** — an AWS `c7g.xlarge` (Graviton3, 4 vCPU) on Amazon Linux 2023 (arm64) in
+    `us-east-1`. The AMI is resolved from the SSM public parameter, so the image is pinned to the same
+    family for every reproducer:
 
     ```bash
-    # from the repo root
-    bench/latency/run.sh
+    AMI=$(aws ssm get-parameter --region us-east-1 \
+      --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
+      --query 'Parameter.Value' --output text)
 
-    # scale the load
-    REQS=50000 CONC=100 bench/latency/run.sh
-
-    # just the pure-overhead pass (no 200ms-delay pass)
-    DELAYS="0" bench/latency/run.sh
+    aws ec2 run-instances --region us-east-1 \
+      --image-id "$AMI" --instance-type c7g.xlarge \
+      --key-name YOUR_KEYPAIR --security-group-ids YOUR_SG_ALLOWING_SSH \
+      --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=busbar-bench}]'
+    # then: aws ec2 describe-instances ... for the public IP, and `ssh ec2-user@<ip>`
     ```
 
-    Run a single step by hand:
+    **2. On the box** — install the released binary, fetch the harness at the tag, point it at
+    Anthropic, and run:
 
     ```bash
-    # 1. fixed-latency mock upstream (instant variant)
-    python3 bench/latency/mock_upstream.py --port 9001 --delay-ms 0 &
+    curl -fsSL https://getbusbar.com/install.sh | sh          # released aarch64 busbar
+    git clone --branch v1.0.0-rc.5 --depth 1 \
+      https://github.com/MattJackson/busbarAI && cd busbarAI
 
-    # 2. busbar pointed at it
-    BUSBAR_PROVIDERS=bench/latency/providers.mock.yaml \
-    BUSBAR_CONFIG=bench/latency/config.mock.yaml \
-    BENCH_MOCK_KEY=x \
-      target/release/busbar &
-
-    # 3. baseline vs busbar — subtract the percentiles to get the added overhead
-    python3 bench/latency/loadgen.py --url http://127.0.0.1:9001 \
-      --mode full --requests 20000 --concurrency 50 --model bench-model --label direct/full/0ms
-    python3 bench/latency/loadgen.py --url http://127.0.0.1:8080 \
-      --mode full --requests 20000 --concurrency 50 \
-      --token bench-token --model bench-pool --label busbar/full/0ms
-
-    # streaming TTFT through busbar
-    python3 bench/latency/loadgen.py --url http://127.0.0.1:8080 \
-      --mode ttft --requests 20000 --concurrency 50 \
-      --token bench-token --model bench-pool --label busbar/ttft/0ms
+    export ANTHROPIC_API_KEY=sk-ant-...                       # your key; spends real tokens
+    BUSBAR_BIN=$HOME/busbar bench/latency/run-anthropic.sh    # prints p50/p99/p99.9 deltas
     ```
 
-    :::caution[Precondition: upstream TLS trust]
-    Busbar's release binary requires every provider `base_url` to be `https://` and trusts **only
-    public (webpki) CA roots** for upstream TLS — no OS trust store, no `SSL_CERT_FILE`, no insecure
-    flag (a deliberate SSRF/credential-leak stance). A plain `http://127.0.0.1` mock works as the
-    *direct baseline* target but Busbar will not connect to it; a self-signed mock isn't trusted
-    either. To put the mock on the **busbar** path, serve it over HTTPS with a **publicly-trusted**
-    cert for a loopback-resolving hostname like `localtest.me` (which the SSRF guard allows), or run
-    the busbar path against a **real provider** with your own key. Full details — including the
-    `--tls-cert/--tls-key` mock option and the real-provider setup — are in `bench/latency/README.md`.
+    It drives both paths against the **same** Anthropic model — direct (`x-api-key` straight to
+    `api.anthropic.com`) and through Busbar (Anthropic ingress → same upstream) — and prints the
+    per-percentile `busbar − direct` table. That delta is the number in the Result tab. Load is modest
+    by default (`REQS=300 CONC=4`, `max_tokens=16`) because it spends real tokens; scale with
+    `REQS=1000 CONC=8 bench/latency/run-anthropic.sh`. Terminate the instance when done
+    (`aws ec2 terminate-instances --instance-ids <id>`).
+
+    :::note[Why a fixed cloud box, not a laptop]
+    Absolute latency depends on the machine and its path to the provider, so pinning the instance type,
+    region, OS image, and released binary is what makes the run reproducible by anyone — "I used my
+    MacBook" is not a citable number. The one-shot AWS wrapper we run lives in our private ops repo; the
+    canonical, like-for-like method is exactly the sequence above.
     :::
 
-    For non-streaming throughput you can swap `loadgen.py` for a native generator (`oha`, `hey`,
-    `bombardier`, `wrk`) and subtract its reported percentiles between the two paths; `loadgen.py`
-    remains the reference because it is the only one that also measures streaming **TTFT** and reports
-    **p99.9**. Numbers are machine-specific — report the *shape* (tight tail), not absolute µs.
+    **Isolating *pure* overhead (optional).** The real-provider delta is dominated by Anthropic's
+    jitter. To see Busbar's overhead with zero provider noise, the harness also has a local
+    **mock-upstream mode** (`bench/latency/run.sh`) — see `bench/latency/README.md`. It needs a
+    publicly-trusted cert for a loopback domain, because the release binary trusts only public CA roots
+    for upstream TLS.
   </TabItem>
 </Tabs>
