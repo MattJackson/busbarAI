@@ -314,16 +314,17 @@ fn vendor_auth_failure_message(proto: &str) -> &'static str {
 ///   - anthropic / cohere / unknown → HTTP 401 + "authentication_error": the standard
 ///     bad-credential shape for those vendors.
 ///
-/// Not a disposition/breaker match, so a named fallback arm (treating an unknown future proto like
-/// the Anthropic-family 401 authentication_error) is fine and keeps the request path panic-free.
+/// Not a disposition/breaker match, so an unknown future proto falls back to the Anthropic-family
+/// 401 authentication_error, keeping the request path panic-free.
+///
+/// Thin wrapper: dispatches through `ProtocolWriter::auth_failure_status_and_kind` so the
+/// per-protocol decision lives in the writer vtable, not in this agnostic function. `BedrockWriter`
+/// overrides to (403, "auth"); `GeminiWriter` to (400, "invalid_request_error"); all others use the
+/// default (401, "authentication_error"). An unknown future proto falls back to the default.
 pub(crate) fn auth_failure_status_and_kind(proto: &str) -> (StatusCode, &'static str) {
-    match proto {
-        "bedrock" => (StatusCode::FORBIDDEN, "auth"),
-        "gemini" => (StatusCode::BAD_REQUEST, "invalid_request_error"),
-        "openai" | "responses" => (StatusCode::UNAUTHORIZED, "authentication_error"),
-        "anthropic" | "cohere" => (StatusCode::UNAUTHORIZED, "authentication_error"),
-        _ => (StatusCode::UNAUTHORIZED, "authentication_error"),
-    }
+    crate::proto::protocol_for(proto)
+        .map(|p| p.writer().auth_failure_status_and_kind())
+        .unwrap_or((StatusCode::UNAUTHORIZED, "authentication_error"))
 }
 
 /// Build an auth-failure response carrying the inferred ingress protocol's NATIVE error envelope
@@ -570,11 +571,17 @@ pub(crate) async fn auth_middleware(
         // access-key-id + secret access key busbar issued (tied to a virtual key). When the request
         // targets the Bedrock ingress protocol AND carries an `AWS4-HMAC-SHA256` Authorization header,
         // VERIFY that signature and, on success, attach the SAME `GovCtx` a bearer auth would — so
-        // budgets / RPM / TPM / allowed_pools all apply. This runs ONLY for the bedrock+SigV4 shape;
-        // every other request (bearer / x-api-key / x-goog-api-key, or a non-bedrock path) falls
-        // straight through to the unchanged token path below. On a verification failure we return the
-        // native-vendor (Bedrock 403 AccessDenied) auth error — never a bearer-style 401.
-        if proto_for_path(&path) == "bedrock" && has_sigv4_authorization(&req) {
+        // budgets / RPM / TPM / allowed_pools all apply. This runs ONLY for a protocol that
+        // authenticates ingress with SigV4 (Bedrock today) AND a request that actually carries the
+        // `AWS4-HMAC-SHA256` header; every other request (bearer / x-api-key / x-goog-api-key, or a
+        // non-SigV4 protocol) falls straight through to the unchanged token path below. On a
+        // verification failure we return the native-vendor (Bedrock 403 AccessDenied) auth error —
+        // never a bearer-style 401. The "which protocol uses SigV4" decision is a `ProtocolReader`
+        // vtable predicate, NOT a `proto == "bedrock"` name-branch.
+        let ingress_uses_sigv4 = crate::proto::protocol_for(proto_for_path(&path))
+            .map(|p| p.reader().uses_sigv4_ingress_auth())
+            .unwrap_or(false);
+        if ingress_uses_sigv4 && has_sigv4_authorization(&req) {
             // BODY INTEGRITY: a SigV4 signature only binds the payload if we re-hash the actual bytes
             // and confirm they match the signed `x-amz-content-sha256` (which the signature covers).
             // Verifying the signature alone leaves a MitM free to tamper the body in transit while the

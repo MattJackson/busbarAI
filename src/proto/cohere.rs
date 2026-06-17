@@ -1849,6 +1849,11 @@ impl ProtocolWriter for CohereWriter {
         })
     }
 
+    fn egress_user_agent(&self) -> &'static str {
+        // Cohere Python SDK UA shape — pinned, see `EGRESS_UA_COHERE` audit note in forward.rs.
+        crate::forward::EGRESS_UA_COHERE
+    }
+
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
         Box::new(self.clone())
     }

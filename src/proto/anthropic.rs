@@ -56,8 +56,9 @@ fn synth_id_with_prefix(prefix: &str) -> String {
     // 8..61 from only 4 — over-representing the low characters by ~25%, a statistical fingerprint
     // that distinguishes a synthesized id from a native (uniform) one. We therefore reject any byte
     // >= 248 (the largest multiple of 62 that fits in a u8) and consume only the in-range bytes,
-    // mirroring `openai::synth_completion_id` and `proto::mod::synth_anthropic_request_id`. On an
-    // entropy failure we leave the remaining '0' fill rather than panic; there is no counter overlay.
+    // mirroring `openai::synth_completion_id` (the other rejection-sampling base62 synth;
+    // `proto::mod::synth_anthropic_request_id` reaches a uniform distribution differently, via u128
+    // division). On an entropy failure we leave the remaining '0' fill rather than panic; no counter.
     // Same ordering-independent reduction cutoff as every other base62 synth (4 * 62 = 248); only
     // this module's ALPHABET *ordering* (uppercase-first) is intentionally local.
     const BASE62_REJECT_FLOOR: u8 = crate::proto::BASE62_REJECT_THRESHOLD;
@@ -1435,6 +1436,36 @@ impl ProtocolWriter for AnthropicWriter {
             other => other,
         };
         Self::error_envelope(anthropic_type, message)
+    }
+
+    fn attach_error_response_headers(
+        &self,
+        headers: &mut axum::http::HeaderMap,
+        _kind: &str,
+        envelope: &serde_json::Value,
+    ) {
+        // A real Anthropic response ALWAYS carries the request id in the `request-id` RESPONSE HEADER
+        // (the official SDK reads `request-id` into `APIError.request_id` / `Message._request_id`, NOT
+        // the body). The writer already mints a top-level body `request_id`; mirror it into the header
+        // so body and header AGREE and the SDK populates `request_id` — omitting it was a deterministic
+        // proxy tell on every error response.
+        if let Some(rid) = envelope.get("request_id").and_then(|v| v.as_str()) {
+            if let Ok(hv) = axum::http::HeaderValue::from_str(rid) {
+                headers.insert("request-id", hv);
+            }
+        }
+    }
+
+    fn ingress_relays_request_id_header(&self) -> bool {
+        // A real Anthropic endpoint ALWAYS sends `request-id`; the official SDK reads it into
+        // `APIError.request_id` / `Message._request_id` (NOT the body `request_id`). Omitting it
+        // was a deterministic proxy tell and left the SDK's `request_id == None` on every response.
+        true
+    }
+
+    fn egress_user_agent(&self) -> &'static str {
+        // Anthropic Python SDK UA shape — pinned, see `EGRESS_UA_ANTHROPIC` audit note in forward.rs.
+        crate::forward::EGRESS_UA_ANTHROPIC
     }
 
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {

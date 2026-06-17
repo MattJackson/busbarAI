@@ -254,8 +254,10 @@ pub(crate) const STREAM_ABORT_DETAIL: &str = "The response stream was interrupte
 /// non-stream (the AWS SDK exposes it via `*Output::request_id()`; an absent header makes that return
 /// `None`, which is impossible with a real endpoint and a deterministic proxy tell). Uses the OS
 /// CSPRNG; returns `None` (so the caller simply OMITS the header) if entropy is unavailable — this is
-/// on the request path and must never panic. Shared by the success paths (`forward.rs`) and the error
-/// paths (`route.rs`/`auth.rs` keep wire-identical private copies pending a wider refactor).
+/// on the request path and must never panic. Single source of truth: every path — success
+/// (`forward.rs` via `wrap_buffered_as_stream` / `maybe_attach_bedrock_amzn_id`) and error
+/// (`forward::ingress_error` and the `main.rs` fallback, both via `attach_bedrock_error_headers`) —
+/// reaches this through the writer vtable, so there are no private copies.
 pub(crate) fn synth_amzn_request_id() -> Option<String> {
     let mut buf = [0u8; 16];
     getrandom::getrandom(&mut buf).ok()?;
@@ -373,8 +375,8 @@ pub(crate) fn proto_for_path(path: &str) -> &'static str {
 /// top-level `message` for cohere, the `message` beside `__type` for bedrock). It MUST read like the
 /// copy the REAL vendor returns for a bad/missing credential and carry NO busbar-internal vocabulary
 /// ("lane", "virtual key", "passthrough", …): any such word is a deterministic protocol tell that
-/// also discloses busbar's auth model. Canonical source of truth; `auth.rs` keeps a wire-identical
-/// private copy pending migration. Strings sampled from real 401/403 bodies:
+/// also discloses busbar's auth model. Canonical source of truth; `auth.rs::vendor_auth_failure_message`
+/// is a thin delegation wrapper to this, not a copy. Strings sampled from real 401/403 bodies:
 ///   anthropic → "invalid x-api-key"; openai/responses → "Incorrect API key provided.";
 ///   gemini → "API key not valid. Please pass a valid API key."; cohere → "invalid api token";
 ///   bedrock → "" (AWS conveys AccessDenied via __type / x-amzn-errortype, not message prose).
@@ -463,6 +465,17 @@ pub(crate) trait ProtocolReader: Send + Sync {
 
     /// Read a whole (non-streaming) response from wire JSON.
     fn read_response(&self, body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError>;
+
+    /// True when THIS protocol authenticates INBOUND requests with AWS SigV4 (an access-key-id +
+    /// secret signature) rather than a bearer / api-key token — the Bedrock ingress shape. The
+    /// front-door auth middleware consults this through the reader vtable to decide whether to run
+    /// the SigV4 verification path for a request, instead of branching on the protocol NAME. The
+    /// SigV4 verification itself stays in the auth layer (it needs the governance key lookup and the
+    /// shared signing helpers, exactly like the bearer path) — only the "which protocol uses SigV4"
+    /// metadata lives here. Default `false` (bearer / api-key protocols); BedrockReader overrides.
+    fn uses_sigv4_ingress_auth(&self) -> bool {
+        false
+    }
 
     /// Clone this reader as a trait object.
     fn clone_box(&self) -> Box<dyn ProtocolReader>;
@@ -593,6 +606,226 @@ pub(crate) trait ProtocolWriter: Send + Sync {
                 "type": kind,
             }
         })
+    }
+
+    /// Native HTTP status a quota/budget-exhaustion rejection maps to for THIS protocol. Most vendors
+    /// surface over-quota as `429 Too Many Requests` (the default); Bedrock's
+    /// `ServiceQuotaExceededException` is a `400`-class error. The agnostic governance guard calls
+    /// this through the writer vtable instead of branching on the protocol name, so a 7th protocol
+    /// gets the default until it overrides. The wrong status here is a vendor-indistinguishability
+    /// tell on an over-budget rejection.
+    fn quota_exceeded_status(&self) -> StatusCode {
+        StatusCode::TOO_MANY_REQUESTS
+    }
+
+    /// Attach any protocol-specific RESPONSE HEADERS a native endpoint always carries on an error
+    /// response, given the already-built error `envelope` and canonical `kind`. Default no-op (most
+    /// protocols carry the error entirely in the body). Bedrock attaches `x-amzn-RequestId` +
+    /// `x-amzn-errortype`; Anthropic mirrors the body `request_id` into the `request-id` header. The
+    /// agnostic error path (`forward::ingress_error`) calls this through the writer vtable instead of
+    /// branching on the protocol name, so the main/degraded/auth/route error paths cannot drift.
+    fn attach_error_response_headers(
+        &self,
+        _headers: &mut axum::http::HeaderMap,
+        _kind: &str,
+        _envelope: &serde_json::Value,
+    ) {
+    }
+
+    /// True when this protocol's INGRESS client decodes a binary `application/vnd.amazon.eventstream`
+    /// body (a native AWS SDK Bedrock client). A mid-stream error must then be a BINARY exception
+    /// frame, not an SSE `event: error` text frame — writing SSE text into a binary eventstream body
+    /// yields an undecodable prelude/CRC for the SDK's decoder. The agnostic `FirstByteBody`
+    /// constructor calls this through the writer vtable instead of `ingress_protocol == "bedrock"`,
+    /// so the eventstream path is gated by the protocol itself, not by its name.
+    ///
+    /// Default: `false` (every SSE-framed protocol). Only `BedrockWriter` overrides to `true`.
+    fn ingress_is_eventstream(&self) -> bool {
+        false
+    }
+
+    /// The streaming `Content-Type` this protocol's INGRESS client expects when receiving a
+    /// cross-protocol reframed stream. On a cross-protocol reframe the streamed body is re-encoded
+    /// into the client's framing, so the response header must describe the CLIENT's wire format —
+    /// copying the upstream CT verbatim would mislabel the body (e.g. a Bedrock-egress
+    /// `application/vnd.amazon.eventstream` reaching an SSE client, or vice versa).
+    ///
+    /// Default: `"text/event-stream"` (openai/anthropic/gemini/cohere/responses). `BedrockWriter`
+    /// overrides to `"application/vnd.amazon.eventstream"`. The agnostic forward path calls this
+    /// through the writer vtable so `ingress_stream_content_type` carries no `"bedrock"` branch.
+    fn streaming_content_type(&self) -> &'static str {
+        "text/event-stream"
+    }
+
+    /// Plausible native-SDK `User-Agent` for THIS EGRESS protocol. reqwest sends NO default
+    /// User-Agent unless one is set, so without this every proxied upstream request reaches the
+    /// backend with no UA at all — a trivial backend-side fingerprint distinguishing busbar-proxied
+    /// traffic from a native vendor SDK (which always sends a recognizable UA). Each writer returns
+    /// the string its real first-party SDK emits. The agnostic forward path calls this through the
+    /// writer vtable instead of the name-match in `egress_user_agent`, so adding a 7th protocol
+    /// only requires an override here, not a new branch in the core.
+    ///
+    /// Default: `EGRESS_UA_DEFAULT` from forward.rs — a generic-but-present UA for unknown egress
+    /// (better than none). Each registered writer overrides with its own pinned SDK UA string (see
+    /// `EGRESS_UA_*` in forward.rs for the release-time audit obligation).
+    fn egress_user_agent(&self) -> &'static str {
+        crate::forward::EGRESS_UA_DEFAULT
+    }
+
+    /// Native-SDK `Accept` header for THIS EGRESS protocol, given the caller's stream intent.
+    /// A native SDK always sends one; omitting it is a backend-side proxy fingerprint, especially on
+    /// the Bedrock egress where botocore sends `application/vnd.amazon.eventstream` on a
+    /// ConverseStream call. The agnostic forward path calls this through the writer vtable instead of
+    /// the name-match in `egress_accept`, so the core never branches on `"bedrock"`.
+    ///
+    /// Default: `text/event-stream` when streaming, `application/json` otherwise (the shape shared
+    /// by anthropic/openai/responses/gemini/cohere). `BedrockWriter` overrides: eventstream when
+    /// streaming, `application/json` otherwise.
+    fn egress_accept(&self, wants_stream: bool) -> &'static str {
+        if wants_stream {
+            "text/event-stream"
+        } else {
+            crate::forward::APPLICATION_JSON
+        }
+    }
+
+    /// True when this protocol carries the model identifier IN THE URL PATH rather than in the
+    /// request body. Gemini encodes it as `/v1beta/models/{model}:generateContent` and Bedrock as
+    /// `/model/{id}/converse`; for both, the body `model` field must be STRIPPED on the same-protocol
+    /// passthrough path (the native backend rejects an unexpected body field and the model is already
+    /// encoded in the signed/constructed URL). Body-model protocols (anthropic/openai/responses/cohere)
+    /// return `false` (the default) and keep the field untouched. The agnostic
+    /// `strip_same_protocol_model_shim` calls this through the writer vtable instead of
+    /// `matches!(ingress_protocol, "gemini" | "bedrock")`, so a 7th url-model protocol only needs an
+    /// override here, not a new arm in the core.
+    ///
+    /// Default: `false` (body-model protocols). Only `GeminiWriter` and `BedrockWriter` override to
+    /// `true`.
+    fn has_model_in_url(&self) -> bool {
+        false
+    }
+
+    /// The HTTP status and protocol-agnostic error `kind` a bad/missing credential yields for THIS
+    /// protocol. The pair is chosen to match what the genuine vendor returns for a bad API key,
+    /// because the status code and the writer-mapped `error.type`/`error.status` are both deterministic
+    /// protocol tells a native SDK keys its typed exception off:
+    ///   - bedrock → HTTP 403 + "auth": a real SigV4 rejection is 403 AccessDenied (NOT 401).
+    ///   - gemini  → HTTP 400 + "invalid_request_error": the Generative Language API does NOT return
+    ///     401/UNAUTHENTICATED for a bad API key; it returns HTTP 400 with `error.status:
+    ///     "INVALID_ARGUMENT"` (google.rpc.Code; the gemini writer maps `invalid_request_error` →
+    ///     INVALID_ARGUMENT and echoes `code: 400`). A 401/UNAUTHENTICATED body would be a tell.
+    ///   - openai / responses → HTTP 401 + "authentication_error": the genuine OpenAI/Responses
+    ///     bad-key 401 body carries `error.code: "invalid_api_key"`. We pass `authentication_error`
+    ///     so the wire body carries the real `code: "invalid_api_key"` pairing.
+    ///   - anthropic / cohere / unknown → HTTP 401 + "authentication_error": the standard
+    ///     bad-credential shape for those vendors.
+    ///
+    /// `BedrockWriter` and `GeminiWriter` override; all other writers use the default. The agnostic
+    /// `auth::auth_failure_status_and_kind` dispatches through this vtable instead of a match on the
+    /// protocol name, so the core never branches on `"bedrock"` or `"gemini"` for auth-failure shaping.
+    ///
+    /// Default: `(StatusCode::UNAUTHORIZED, "authentication_error")` (openai/responses/anthropic/
+    /// cohere/unknown).
+    fn auth_failure_status_and_kind(&self) -> (StatusCode, &'static str) {
+        (StatusCode::UNAUTHORIZED, "authentication_error")
+    }
+
+    /// When a Bedrock-ingress client requested a STREAMING response (`wants_stream`) but the upstream
+    /// answered with a BUFFERED (non-SSE) 2xx body, the single translated `IrResponse` must be
+    /// re-emitted as native binary eventstream frames rather than `application/json` — a Bedrock SDK's
+    /// `ConverseStream` decoder expects binary-framed events and cannot parse a bare JSON body (hard
+    /// SDK decode failure and a deterministic proxy tell).
+    ///
+    /// Returns `Some(bytes)` when this writer needs the buffered-to-stream synthesis path, `None` when
+    /// the plain translated JSON body is correct (all non-Bedrock ingress protocols). The returned bytes
+    /// are the complete binary eventstream payload; the caller emits them under
+    /// `writer.streaming_content_type()` so the Content-Type header matches the framing.
+    ///
+    /// Default: `None` (every SSE-framed protocol — a plain JSON body is acceptable).
+    /// `BedrockWriter` overrides: returns `Some(bedrock_response_to_eventstream(ir, elapsed_ms))`.
+    fn wrap_buffered_as_stream(
+        &self,
+        _ir: &crate::ir::IrResponse,
+        _elapsed_ms: Option<u64>,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Inject any protocol-required per-response metrics into a translated buffered response body
+    /// (a `serde_json::Value` produced by `write_response`), if timing is available.
+    ///
+    /// Bedrock's non-stream `Converse` response ALWAYS carries `metrics.latencyMs` (the AWS SDK
+    /// surfaces it via `ConverseOutput::metrics().latency_ms()`). The bedrock writer's `write_response`
+    /// deliberately omits it (the writer is unaware of wall-clock time); the agnostic forward path
+    /// injects it here — matching the live streaming path which injects it into the `metadata` frame.
+    /// OMIT rather than fabricate a tell-tale `0` when timing is unavailable.
+    ///
+    /// Default: no-op (all non-Bedrock protocols carry no timing field in the response body).
+    /// `BedrockWriter` overrides: inserts `metrics: { latencyMs: ms }` when both `elapsed_ms` is
+    /// `Some` AND `value` is a JSON object (same double-`Some` guard the original inline branches use).
+    fn inject_response_metrics(&self, _value: &mut serde_json::Value, _elapsed_ms: Option<u64>) {}
+
+    /// True when this protocol's INGRESS client expects `x-amzn-RequestId` (and, on error paths,
+    /// `x-amzn-errortype`) on every response — 2xx, stream, and error. A real AWS Bedrock endpoint
+    /// always sends these headers; their absence is a detectable proxy tell and leaves the AWS SDK's
+    /// `request_id()` returning `None`.
+    ///
+    /// Used as the predicate at the four category-3 sites in `forward.rs` (header capture before body
+    /// consumption, 2xx buffered attach, streaming 2xx attach, degraded error attach). The header-attach
+    /// bodies remain inline; only the name-branch `if ingress_protocol == "bedrock"` is replaced with
+    /// `if writer.ingress_relays_amzn_headers()`, removing the provider-name string from the
+    /// agnostic core while keeping the intricate `Builder`-move header flow untouched.
+    ///
+    /// Default: `false` (all non-Bedrock protocols never emit `x-amzn-*` headers).
+    /// `BedrockWriter` overrides: `true`.
+    fn ingress_relays_amzn_headers(&self) -> bool {
+        false
+    }
+
+    /// True when this protocol's INGRESS client expects a `request-id` RESPONSE HEADER on every
+    /// response (2xx SUCCESS paths and relay paths). A real Anthropic endpoint always sends
+    /// `request-id`; the official Anthropic SDK reads it into `APIError.request_id` /
+    /// `Message._request_id` (NOT the body `request_id`), so omitting it leaves the SDK's
+    /// `request_id == None` on every busbar response — a deterministic proxy tell.
+    ///
+    /// Used as the predicate in `maybe_attach_anthropic_request_id` in `forward.rs` (the SUCCESS /
+    /// 2xx analog of `attach_error_response_headers`'s Anthropic branch). The header-attach body
+    /// remains inline; only the name-branch `if ingress_protocol != "anthropic"` is replaced with
+    /// a vtable dispatch so the agnostic core carries no Anthropic name string.
+    ///
+    /// Default: `false` (no other protocol emits `request-id`).
+    /// `AnthropicWriter` overrides: `true`.
+    fn ingress_relays_request_id_header(&self) -> bool {
+        false
+    }
+
+    /// True when this protocol's INGRESS client expects a STREAMING response body in the JSON-array
+    /// streaming format (NOT SSE). Gemini clients that send a `:streamGenerateContent` request
+    /// WITHOUT `?alt=sse` expect an array-framed JSON stream; the route layer signals this via the
+    /// `GEMINI_JSON_ARRAY_SHIM_KEY` in the request body, and the forward path gates on this predicate
+    /// (AND the shim key) to enable `GeminiJsonArrayFramer`. Gating on the vtable — not the name
+    /// string — prevents a body-model client from smuggling the shim key to force JSON-array reframing
+    /// of its own SSE stream (that would be undecodable and a router behaviour no native backend
+    /// exhibits).
+    ///
+    /// Default: `false` (openai/anthropic/bedrock/cohere/responses all use SSE or binary framing).
+    /// `GeminiWriter` overrides: `true`.
+    fn uses_array_stream_shim(&self) -> bool {
+        false
+    }
+
+    /// True when this protocol has a NATIVE path-not-found error envelope with a protocol-specific
+    /// message format, as opposed to the canonical `not_found_error` OpenAI-shape used by all other
+    /// protocols. Gemini native NOT_FOUND responses carry a structured message naming the resource
+    /// path and API version; for all other protocols the generic envelope is correct.
+    ///
+    /// Used at two sites in `route.rs` (no-colon path and unsupported-action path) to gate the
+    /// Gemini-native NOT_FOUND envelope without branching on the name string `"gemini"`.
+    ///
+    /// Default: `false` (all non-Gemini protocols use the canonical OpenAI-shape NOT_FOUND).
+    /// `GeminiWriter` overrides: `true`.
+    fn has_native_path_not_found(&self) -> bool {
+        false
     }
 
     /// Build a minimal, protocol-correct request body for an active health probe of `model`.
@@ -1874,7 +2107,7 @@ impl GeminiJsonArrayFramer {
 
 /// Anthropic reader implementation.
 mod anthropic;
-mod bedrock;
+pub(crate) mod bedrock;
 mod cohere;
 mod gemini;
 mod openai;

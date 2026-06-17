@@ -712,7 +712,8 @@ fn fallback_error_response(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let proto = proto_for_path(path);
-    let body = match proto::protocol_for(proto) {
+    let protocol = proto::protocol_for(proto);
+    let body = match &protocol {
         Some(p) => p.writer().write_error(status.as_u16(), kind, message),
         // proto_for_path only ever returns a registered protocol literal, so this is unreachable in
         // practice; shape a generic OpenAI-style envelope rather than panic on the request path.
@@ -727,23 +728,13 @@ fn fallback_error_response(
         body.to_string(),
     )
         .into_response();
-    if proto == "bedrock" {
-        let headers = resp.headers_mut();
-        if let Some(id) = proto::synth_amzn_request_id() {
-            if let Ok(hv) = axum::http::HeaderValue::from_str(&id) {
-                headers.insert(
-                    axum::http::HeaderName::from_static(proto::HDR_AMZN_REQUEST_ID),
-                    hv,
-                );
-            }
-        }
-        let errortype = proto::error_kind_to_bedrock_type(kind);
-        if let Ok(hv) = axum::http::HeaderValue::from_str(errortype) {
-            headers.insert(
-                axum::http::HeaderName::from_static(proto::HDR_AMZN_ERROR_TYPE),
-                hv,
-            );
-        }
+    // Provider-specific error RESPONSE HEADERS (Bedrock `x-amzn-RequestId`/`x-amzn-errortype`;
+    // Anthropic `request-id` mirrored from the body) — dispatched via the writer vtable so this
+    // fallback handler matches the shape produced by `forward::ingress_error` on the hot path,
+    // with no provider name-branch here.
+    if let Some(p) = &protocol {
+        p.writer()
+            .attach_error_response_headers(resp.headers_mut(), kind, &body);
     }
     resp
 }

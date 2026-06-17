@@ -1638,6 +1638,11 @@ impl ProtocolWriter for OpenAiWriter {
         }
     }
 
+    fn egress_user_agent(&self) -> &'static str {
+        // OpenAI Python SDK UA shape — pinned, see `EGRESS_UA_OPENAI` audit note in forward.rs.
+        crate::forward::EGRESS_UA_OPENAI
+    }
+
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
         Box::new(self.clone())
     }

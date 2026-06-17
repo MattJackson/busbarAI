@@ -2313,6 +2313,41 @@ impl ProtocolWriter for GeminiWriter {
         out
     }
 
+    fn egress_user_agent(&self) -> &'static str {
+        // Google GenAI SDK UA shape — pinned, see `EGRESS_UA_GEMINI` audit note in forward.rs.
+        crate::forward::EGRESS_UA_GEMINI
+    }
+
+    fn has_model_in_url(&self) -> bool {
+        // Gemini encodes the model in the URL path (`/v1beta/models/{model}:generateContent`),
+        // NOT the body. The body `model` field must be stripped on the same-protocol passthrough
+        // path so the native generateContent backend does not see an unexpected field.
+        true
+    }
+
+    fn auth_failure_status_and_kind(&self) -> (axum::http::StatusCode, &'static str) {
+        // The Generative Language API does NOT return 401/UNAUTHENTICATED for a bad API key;
+        // it returns HTTP 400 with `error.status: "INVALID_ARGUMENT"`. The gemini writer maps
+        // `invalid_request_error` → INVALID_ARGUMENT and echoes `code: 400`, so a 401 body
+        // would be a tell the google-genai SDK never sees from real Google on the bad-key path.
+        (axum::http::StatusCode::BAD_REQUEST, "invalid_request_error")
+    }
+
+    fn uses_array_stream_shim(&self) -> bool {
+        // Gemini clients that send `:streamGenerateContent` WITHOUT `?alt=sse` expect a JSON-array
+        // streamed body, not SSE. The route layer signals this via the GEMINI_JSON_ARRAY_SHIM_KEY;
+        // this predicate gates the shim so only genuine Gemini ingress enables it — preventing a
+        // body-model client from smuggling the key to force JSON-array reframing of its SSE stream.
+        true
+    }
+
+    fn has_native_path_not_found(&self) -> bool {
+        // Gemini native NOT_FOUND responses carry a structured message naming the resource path
+        // and API version (e.g. "Invalid resource path: models/{rest} is not found for API
+        // version {api_version}."). All other protocols use the canonical OpenAI-shape NOT_FOUND.
+        true
+    }
+
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
         Box::new(self.clone())
     }

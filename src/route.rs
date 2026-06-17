@@ -155,17 +155,13 @@ async fn budget_check(
                 // The client-facing message carries only vendor-plausible quota copy — never the
                 // internal key id or governance vocabulary. The key id is recorded server-side.
                 tracing::info!(key_id = %key.id, "governance: key over budget");
-                // Native quota status differs by vendor: OpenAI/Responses/Gemini/Anthropic/Cohere all
-                // surface an over-quota condition as 429 (Gemini's RESOURCE_EXHAUSTED bucket), whereas
-                // Bedrock's `ServiceQuotaExceededException` is a 400-class error. No real provider
-                // returns 402 here, so the previous blanket 402 was a vendor-agnostic tell. Pick the
-                // status that makes each ingress writer map to its native quota shape; the body `kind`
-                // (`insufficient_quota`) already drives the per-protocol error vocabulary.
-                let status = if proto == "bedrock" {
-                    StatusCode::BAD_REQUEST
-                } else {
-                    StatusCode::TOO_MANY_REQUESTS
-                };
+                // Native quota status differs by vendor (Bedrock's `ServiceQuotaExceededException` is
+                // 400; every other vendor surfaces over-quota as 429). The writer owns that mapping via
+                // `quota_exceeded_status()`, so this agnostic guard never branches on the protocol
+                // name. The body `kind` (`insufficient_quota`) drives the per-protocol error vocabulary.
+                let status = crate::proto::protocol_for(proto)
+                    .map(|p| p.writer().quota_exceeded_status())
+                    .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
                 return Some(ingress_error(
                     proto,
                     status,
@@ -185,11 +181,9 @@ async fn budget_check(
                     }
                     crate::config::BudgetOnStoreError::Deny => {
                         tracing::warn!(key_id = %key.id, error = %e, "budget charge store error; failing closed (deny)");
-                        let status = if proto == "bedrock" {
-                            StatusCode::BAD_REQUEST
-                        } else {
-                            StatusCode::TOO_MANY_REQUESTS
-                        };
+                        let status = crate::proto::protocol_for(proto)
+                            .map(|p| p.writer().quota_exceeded_status())
+                            .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
                         return Some(ingress_error(
                             proto,
                             status,
@@ -885,16 +879,19 @@ pub(crate) async fn gemini_ingress(
             // bounded `"unresolved"` sentinel. Routing through `finish_rejected` keeps this malformed-path
             // rejection observable in metrics + the webhook instead of a silent early-return.
             let envelope_proto = crate::proto::proto_for_path(uri.path());
-            if envelope_proto == "gemini" {
+            if crate::proto::protocol_for(envelope_proto)
+                .map(|p| p.writer().has_native_path_not_found())
+                .unwrap_or(false)
+            {
                 return finish_rejected(
                     &app,
                     &gov,
-                    "gemini",
+                    envelope_proto,
                     "unresolved",
                     started,
                     charged_at,
                     ingress_error(
-                        "gemini",
+                        envelope_proto,
                         StatusCode::NOT_FOUND,
                         "NOT_FOUND",
                         &format!(
@@ -947,16 +944,19 @@ pub(crate) async fn gemini_ingress(
             // `finish_rejected` with the bounded `proto_for_path` literal as both envelope + metric protocol
             // and the bounded `"unresolved"` pool label, keeping it observable in metrics + webhook.
             let envelope_proto = crate::proto::proto_for_path(uri.path());
-            if envelope_proto == "gemini" {
+            if crate::proto::protocol_for(envelope_proto)
+                .map(|p| p.writer().has_native_path_not_found())
+                .unwrap_or(false)
+            {
                 return finish_rejected(
                     &app,
                     &gov,
-                    "gemini",
+                    envelope_proto,
                     "unresolved",
                     started,
                     charged_at,
                     ingress_error(
-                        "gemini",
+                        envelope_proto,
                         StatusCode::NOT_FOUND,
                         "NOT_FOUND",
                         &format!(

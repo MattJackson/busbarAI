@@ -616,6 +616,13 @@ fn clamp_content_block_index(data: &serde_json::Value) -> usize {
 pub(crate) struct BedrockReader;
 
 impl ProtocolReader for BedrockReader {
+    fn uses_sigv4_ingress_auth(&self) -> bool {
+        // A Bedrock-SDK client signs inbound requests with AWS SigV4 (access-key-id + secret tied to
+        // a busbar virtual key), not a bearer token — so the auth middleware runs the SigV4 verify
+        // path for bedrock ingress. Every other protocol uses the default (bearer / api-key).
+        true
+    }
+
     fn extract_error(&self, status: StatusCode, body: &[u8]) -> crate::breaker::RawUpstreamError {
         // Parse the body once. Bedrock error responses carry the human-readable
         // text in `message` and the machine-readable error type in `__type`
@@ -2470,9 +2477,266 @@ impl ProtocolWriter for BedrockWriter {
         })
     }
 
+    fn quota_exceeded_status(&self) -> StatusCode {
+        // AWS Bedrock surfaces an over-quota condition as `ServiceQuotaExceededException`, a
+        // 400-class error — NOT the 429 every other vendor uses.
+        StatusCode::BAD_REQUEST
+    }
+
+    fn attach_error_response_headers(
+        &self,
+        headers: &mut axum::http::HeaderMap,
+        kind: &str,
+        _envelope: &serde_json::Value,
+    ) {
+        // A real AWS Bedrock runtime response ALWAYS carries `x-amzn-RequestId` (the only request-id
+        // surface the AWS SDK exposes via `*Output::request_id()`) and `x-amzn-errortype` == the body
+        // `__type`. Omitting them was distinguishable from native Bedrock and left the SDK request id
+        // empty on the most-exercised failover error surface.
+        crate::proto::attach_bedrock_error_headers(headers, kind);
+    }
+
+    fn ingress_is_eventstream(&self) -> bool {
+        // A native AWS SDK Bedrock client decodes a BINARY `application/vnd.amazon.eventstream`
+        // body, not SSE text. Mid-stream errors must be binary exception frames (not SSE `event:`
+        // text) — writing SSE text into a binary eventstream body yields an undecodable prelude/CRC.
+        true
+    }
+
+    fn streaming_content_type(&self) -> &'static str {
+        // Bedrock ingress expects a BINARY `application/vnd.amazon.eventstream` body; the encoder
+        // is implemented and wired (`StreamTranslate` packs each event into a CRC-valid frame).
+        // Returns this instead of the default `text/event-stream` so the response CT matches the
+        // body framing the client actually receives — mislabeling it as SSE would break the SDK.
+        "application/vnd.amazon.eventstream"
+    }
+
+    fn egress_user_agent(&self) -> &'static str {
+        // AWS Bedrock is reached via boto3/botocore; the SDK's UA is the backend-facing fingerprint
+        // guard. Pinned — see the `EGRESS_UA_BEDROCK` audit obligation in forward.rs.
+        crate::forward::EGRESS_UA_BEDROCK
+    }
+
+    fn egress_accept(&self, wants_stream: bool) -> &'static str {
+        // botocore/boto3 sends `application/vnd.amazon.eventstream` on a ConverseStream call and
+        // `application/json` on a non-stream Converse call — the headline Bedrock egress surface.
+        if wants_stream {
+            "application/vnd.amazon.eventstream"
+        } else {
+            crate::forward::APPLICATION_JSON
+        }
+    }
+
+    fn has_model_in_url(&self) -> bool {
+        // Bedrock encodes the model in the URL path (`/model/{id}/converse`), NOT the body.
+        // The body `model` field must be stripped on the same-protocol passthrough path so the
+        // native Converse backend does not see an unexpected field.
+        true
+    }
+
+    fn auth_failure_status_and_kind(&self) -> (axum::http::StatusCode, &'static str) {
+        // A real AWS SigV4 rejection returns HTTP 403 AccessDenied (NOT 401). The AWS SDK keys
+        // its typed `AccessDeniedException` off the 403 status, so returning 401 here would be
+        // a deterministic proxy tell and a mismatched typed-exception class on the SDK side.
+        (axum::http::StatusCode::FORBIDDEN, "auth")
+    }
+
+    fn wrap_buffered_as_stream(
+        &self,
+        ir: &crate::ir::IrResponse,
+        elapsed_ms: Option<u64>,
+    ) -> Option<Vec<u8>> {
+        // A Bedrock-ingress client that requested ConverseStream but received a buffered (non-SSE)
+        // 2xx response from the upstream must get a native binary eventstream frame sequence, not a
+        // bare `application/json` Converse body that the SDK's eventstream decoder cannot parse
+        // (hard decode failure and a deterministic proxy tell). Delegate to the module-local free fn
+        // which synthesizes the full frame sequence through this same writer — the call sites now
+        // dispatch through the vtable instead of branching on `ingress_protocol == "bedrock"`.
+        Some(bedrock_response_to_eventstream(ir, elapsed_ms))
+    }
+
+    fn inject_response_metrics(
+        &self,
+        value: &mut serde_json::Value,
+        elapsed_ms: Option<u64>,
+    ) {
+        // A native AWS Bedrock Converse (non-stream) response ALWAYS populates `metrics.latencyMs`
+        // (the SDK surfaces it via `ConverseOutput::metrics().latency_ms()`). The bedrock writer's
+        // `write_response` deliberately omits it (timing is unknown at that layer); inject the real
+        // request elapsed wall-clock here, and OMIT rather than fabricate a tell-tale `0` if timing
+        // is unavailable — the same policy the streaming path applies on the `metadata` frame.
+        if let (Some(ms), Some(obj)) = (elapsed_ms, value.as_object_mut()) {
+            obj.insert(
+                "metrics".to_string(),
+                serde_json::json!({ "latencyMs": ms }),
+            );
+        }
+    }
+
+    fn ingress_relays_amzn_headers(&self) -> bool {
+        // A real AWS Bedrock endpoint ALWAYS carries `x-amzn-RequestId` (the only request-id surface
+        // the AWS SDK exposes via `*Output::request_id()`) and `x-amzn-errortype` on every response.
+        // Their absence is a detectable proxy tell and leaves the SDK's `request_id()` returning None.
+        true
+    }
+
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
         Box::new(self.clone())
     }
+}
+
+/// Wrap a SINGLE non-stream `IrResponse` into a Bedrock ConverseStream binary `eventstream` byte
+/// sequence (`application/vnd.amazon.eventstream`), for the case where a bedrock-ingress client
+/// requested `ConverseStream` (`wants_stream`) but the cross-protocol upstream answered with a
+/// BUFFERED (non-SSE) 2xx. Returning that single response as `application/json` + a non-stream
+/// Converse body is undecodable by the AWS SDK's eventstream decoder (it expects framed
+/// `messageStart`/`contentBlockDelta`/…/`messageStop`/`metadata` events) — a hard functional failure
+/// and a deterministic proxy tell on the headline bedrock-ingress surface. This synthesizes the
+/// native frame sequence a real ConverseStream emits for the same completion: one `messageStart`,
+/// then per content block a `contentBlockStart` + its `contentBlockDelta`(s) + `contentBlockStop`,
+/// then `messageStop` (carrying the stop reason) and a trailing `metadata` frame (carrying token
+/// usage) — matching the two-frame stop/usage split the Bedrock writer's `MessageDelta` arm expects.
+/// Each event is rendered through the SAME `bedrock` writer used on the live streaming path and
+/// encoded via `eventstream::encode_frame`, so the bytes are byte-for-byte what a native stream sends.
+/// Never panics on the request path: a frame whose payload fails to serialize is skipped.
+pub(crate) fn bedrock_response_to_eventstream(ir: &crate::ir::IrResponse, elapsed_ms: Option<u64>) -> Vec<u8> {
+    use crate::ir::{IrBlock, IrBlockMeta, IrDelta, IrStreamEvent, IrUsage};
+    let writer = crate::proto::Protocol::bedrock();
+    let writer = writer.writer();
+    let mut out: Vec<u8> = Vec::new();
+    // Render one IR stream event through the bedrock writer and append the encoded frame (if the
+    // writer maps it to a native frame; some IR events have no Bedrock analog and yield None).
+    let push = |ev: &IrStreamEvent, out: &mut Vec<u8>| {
+        if let Some((event_type, mut payload)) = writer.write_response_event(ev) {
+            // A native ConverseStream `metadata` frame ALWAYS carries a `metrics.latencyMs` (the SDK
+            // surfaces it via `ConverseStreamMetadataEvent::metrics()`); the bedrock writer's
+            // `MessageDelta` arm deliberately omits `metrics`, and the LIVE StreamTranslate path injects
+            // it there (`proto::mod.rs`). On this BUFFERED synthesis path StreamTranslate is bypassed,
+            // so inject it HERE too — otherwise `metrics == None`, which a real endpoint never returns
+            // (a deterministic proxy tell). Use the request's elapsed wall-clock, consistent with the
+            // live path; if timing is unavailable OMIT `metrics` rather than emit a tell-tale `0`.
+            if event_type == "metadata" {
+                if let (Some(ms), Some(obj)) = (elapsed_ms, payload.as_object_mut()) {
+                    obj.insert(
+                        "metrics".to_string(),
+                        serde_json::json!({ "latencyMs": ms }),
+                    );
+                }
+            }
+            if let Ok(bytes) = serde_json::to_vec(&payload) {
+                out.extend_from_slice(&crate::eventstream::encode_frame(&event_type, &bytes));
+            }
+        }
+    };
+
+    // messageStart
+    push(
+        &IrStreamEvent::MessageStart {
+            role: ir.role,
+            usage: None,
+            id: None,
+            created: None,
+            model: ir.model.clone(),
+        },
+        &mut out,
+    );
+
+    // Per content block: contentBlockStart → contentBlockDelta(s) → contentBlockStop. Mirror the
+    // live streaming fan-out (`read_response_events`) so the SDK sees the same per-block framing.
+    for (index, block) in ir.content.iter().enumerate() {
+        match block {
+            IrBlock::Text { text, .. } => {
+                push(
+                    &IrStreamEvent::BlockStart {
+                        index,
+                        block: IrBlockMeta::Text,
+                    },
+                    &mut out,
+                );
+                push(
+                    &IrStreamEvent::BlockDelta {
+                        index,
+                        delta: IrDelta::TextDelta(text.clone()),
+                    },
+                    &mut out,
+                );
+                push(&IrStreamEvent::BlockStop { index }, &mut out);
+            }
+            IrBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                push(
+                    &IrStreamEvent::BlockStart {
+                        index,
+                        block: IrBlockMeta::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                        },
+                    },
+                    &mut out,
+                );
+                push(
+                    &IrStreamEvent::BlockDelta {
+                        index,
+                        delta: IrDelta::InputJsonDelta(input.to_string()),
+                    },
+                    &mut out,
+                );
+                push(&IrStreamEvent::BlockStop { index }, &mut out);
+            }
+            // Thinking/ToolResult/Image blocks have no native ConverseStream content-delta frame on
+            // this synthesized path (the Bedrock writer maps their start/delta to None); skip them
+            // rather than emit an orphaned/empty frame. These are enumerated EXPLICITLY (no `_`
+            // catch-all) so that adding a future `IrBlock` variant (e.g. a document or
+            // redacted-thinking block) is a COMPILE error here rather than silent data loss in the
+            // synthesized ConverseStream output — this is the newest, least-tested encoder path.
+            IrBlock::Thinking { .. } | IrBlock::ToolResult { .. } | IrBlock::Image { .. } => {}
+        }
+    }
+
+    // messageStop (stop reason) then metadata (usage) — the writer's `MessageDelta` arm maps a
+    // stop_reason-bearing delta to `messageStop` and a usage-only delta to `metadata`, exactly the
+    // two native frames a real ConverseStream ends with.
+    // Default the synthesized stop reason from the IR CONTENT, not unconditionally `end_turn`. A
+    // native Bedrock Converse reports `tool_use` for a turn that emitted a tool call; if the buffered
+    // IR carried a ToolUse block but no explicit stop_reason (a cross-protocol 2xx whose upstream
+    // omitted it), default to the canonical `tool_use` so `stop_reason_reverse` yields `tool_use` and
+    // an AWS SDK consumer keying agentic control flow off stopReason re-invokes the tool. Only fall
+    // back to `end_turn` when the completion carried no tool call.
+    let default_stop_reason = if ir
+        .content
+        .iter()
+        .any(|b| matches!(b, IrBlock::ToolUse { .. }))
+    {
+        "tool_use"
+    } else {
+        "end_turn"
+    };
+    push(
+        &IrStreamEvent::MessageDelta {
+            stop_reason: ir
+                .stop_reason
+                .clone()
+                .or_else(|| Some(default_stop_reason.to_string())),
+            usage: IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            stop_sequence: None,
+        },
+        &mut out,
+    );
+    push(
+        &IrStreamEvent::MessageDelta {
+            stop_reason: None,
+            usage: ir.usage.clone(),
+            stop_sequence: None,
+        },
+        &mut out,
+    );
+    out
 }
 
 #[cfg(test)]

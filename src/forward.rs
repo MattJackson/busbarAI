@@ -60,7 +60,7 @@ fn maybe_attach_bedrock_amzn_id(
     rb: axum::http::response::Builder,
     ingress_protocol: &str,
 ) -> axum::http::response::Builder {
-    if ingress_protocol != "bedrock" {
+    if !ingress_relays_amzn_headers(ingress_protocol) {
         return rb;
     }
     match crate::proto::synth_amzn_request_id() {
@@ -83,7 +83,10 @@ fn maybe_attach_anthropic_request_id(
     ingress_protocol: &str,
     upstream_request_id: Option<&str>,
 ) -> axum::http::response::Builder {
-    if ingress_protocol != "anthropic" {
+    if !crate::proto::protocol_for(ingress_protocol)
+        .map(|p| p.writer().ingress_relays_request_id_header())
+        .unwrap_or(false)
+    {
         return rb;
     }
     match upstream_request_id
@@ -93,6 +96,17 @@ fn maybe_attach_anthropic_request_id(
         Some(id) => rb.header("request-id", id),
         None => rb,
     }
+}
+
+/// True when `ingress_protocol`'s writer signals that EVERY response — 2xx, streaming, and error —
+/// must carry `x-amzn-RequestId` (and, on error paths, `x-amzn-errortype`). Dispatches through the
+/// `ProtocolWriter::ingress_relays_amzn_headers()` vtable instead of branching on the provider name
+/// `"bedrock"`, so the agnostic forward path never contains a hard-coded protocol string for this
+/// decision. Unknown protocols fall back to `false` (no `x-amzn-*` headers emitted).
+fn ingress_relays_amzn_headers(ingress_protocol: &str) -> bool {
+    crate::proto::protocol_for(ingress_protocol)
+        .map(|p| p.writer().ingress_relays_amzn_headers())
+        .unwrap_or(false)
 }
 
 /// TRANSPARENCY: stamp which routing POLICY chose which TARGET onto a successful response, mirroring
@@ -128,16 +142,17 @@ fn maybe_attach_route_policy(
 /// `pub(crate)` and the single source of truth for native error shaping: it attaches the
 /// protocol-appropriate headers (Bedrock `x-amzn-RequestId` / `x-amzn-errortype` via the shared
 /// `proto::attach_bedrock_error_headers`; Gemini code/status ride the body envelope the writer
-/// builds). `route.rs::ingress_error` and `auth.rs::unauthorized_response` keep wire-identical
-/// private copies pending their migration to this function next round — once they call it, the
-/// degraded path, the main path, and the auth/route paths cannot diverge on error shape or headers.
+/// builds). `route.rs::ingress_error` and `auth.rs::unauthorized_response` now both DELEGATE to THIS
+/// function (the migration is complete — they hold no private copies), so the degraded path, the main
+/// path, and the auth/route paths cannot diverge on error shape or headers.
 pub(crate) fn ingress_error(ingress: &str, status: StatusCode, kind: &str, msg: &str) -> Response {
-    let envelope = match crate::proto::protocol_for(ingress) {
-        Some(p) => p.writer().write_error(status.as_u16(), kind, msg),
-        None => crate::proto::Protocol::openai()
-            .writer()
-            .write_error(status.as_u16(), kind, msg),
-    };
+    // Resolve the ingress protocol's vtable ONCE (fall back to OpenAI's generic envelope for an
+    // unknown name — unreachable for the 6 validated ingress protocols). All provider-specific error
+    // shape (the body envelope AND any response headers) flows through trait methods on this writer,
+    // so the agnostic error path carries no `if ingress == "<name>"` branch.
+    let protocol =
+        crate::proto::protocol_for(ingress).unwrap_or_else(crate::proto::Protocol::openai);
+    let envelope = protocol.writer().write_error(status.as_u16(), kind, msg);
     let body = serde_json::to_string(&envelope).unwrap_or_else(|_| {
         // Envelope is built from serde_json::json! values and always serializes; this fallback only
         // exists to avoid an unwrap on the request path. Build it with `json!` (correct JSON string
@@ -150,28 +165,12 @@ pub(crate) fn ingress_error(ingress: &str, status: StatusCode, kind: &str, msg: 
         .header(CONTENT_TYPE, APPLICATION_JSON)
         .body(Body::from(body))
         .unwrap_or_else(|_| status.into_response());
-    // Bedrock ingress: a real AWS Bedrock runtime response ALWAYS carries `x-amzn-RequestId` (the
-    // only request-id surface the AWS SDK exposes via `*Output::request_id()`) and an
-    // `x-amzn-errortype` header equal to the body `__type`. A forward-layer error that omitted both
-    // was distinguishable from native Bedrock and left the SDK's request id empty — the most-
-    // exercised error surface under failover. Attach them via the shared helper so this path cannot
-    // drift from `route.rs`/`auth.rs`.
-    if ingress == "bedrock" {
-        crate::proto::attach_bedrock_error_headers(resp.headers_mut(), kind);
-    }
-    // Anthropic ingress: a real Anthropic response ALWAYS carries the request id in the `request-id`
-    // RESPONSE HEADER (the official SDK reads `request-id` into `APIError.request_id` /
-    // `Message._request_id`, NOT the body), so an anthropic error that omitted the header left
-    // `err.request_id == None` on every response — impossible against the real API and a deterministic
-    // tell. The writer already mints a top-level body `request_id`; mirror it into the header so body
-    // and header AGREE and the SDK populates `request_id`.
-    if ingress == "anthropic" {
-        if let Some(rid) = envelope.get("request_id").and_then(|v| v.as_str()) {
-            if let Ok(hv) = axum::http::HeaderValue::from_str(rid) {
-                resp.headers_mut().insert("request-id", hv);
-            }
-        }
-    }
+    // Provider-specific error RESPONSE HEADERS (Bedrock `x-amzn-RequestId`/`x-amzn-errortype`;
+    // Anthropic `request-id` mirrored from the body) — dispatched via the writer vtable so the main,
+    // degraded, auth, and route error paths cannot drift on header shape.
+    protocol
+        .writer()
+        .attach_error_response_headers(resp.headers_mut(), kind, &envelope);
     resp
 }
 
@@ -251,10 +250,14 @@ fn strip_router_shim_keys(v: &mut Value, egress_protocol: &str) {
         // The gemini JSON-array key is never native to ANY protocol → strip unconditionally (also
         // closes the leak where a body-model client smuggles the key in its own controlled body).
         obj.remove(GEMINI_JSON_ARRAY_SHIM_KEY);
-        // `stream` is a path-model shim for the EGRESS protocols gemini/bedrock (stream intent rides
-        // the URL there); for body-model egress it is the writer-authored field the backend needs to
-        // start streaming, so it must be PRESERVED. Gate on egress, never ingress.
-        if matches!(egress_protocol, "gemini" | "bedrock") {
+        // `stream` is a path-model shim for the EGRESS protocols gemini/bedrock (stream intent and
+        // model both ride the URL there; `has_model_in_url()` covers both). For body-model egress
+        // `stream` is the writer-authored field the backend needs to start streaming, so it must be
+        // PRESERVED. Gate on egress, never ingress.
+        if crate::proto::protocol_for(egress_protocol)
+            .map(|p| p.writer().has_model_in_url())
+            .unwrap_or(false)
+        {
             obj.remove("stream");
         }
     }
@@ -266,8 +269,15 @@ fn strip_router_shim_keys(v: &mut Value, egress_protocol: &str) {
 /// `rewrite_model` re-inserts one, so this strip must run AFTER it to remove both the route layer's
 /// shim and the re-inserted copy. NEVER call this on the cross-protocol branch: there the body-model
 /// egress requires the `model` that `rewrite_model` installed. No-op for body-model ingress.
+///
+/// Thin wrapper: dispatches through `ProtocolWriter::has_model_in_url` so the per-protocol decision
+/// (gemini/bedrock → strip; all others → keep) lives in the writer vtable, not in this agnostic
+/// function. An unknown future url-model protocol only needs an override in its writer.
 fn strip_same_protocol_model_shim(v: &mut Value, ingress_protocol: &str) {
-    if matches!(ingress_protocol, "gemini" | "bedrock") {
+    let model_in_url = crate::proto::protocol_for(ingress_protocol)
+        .map(|p| p.writer().has_model_in_url())
+        .unwrap_or(false);
+    if model_in_url {
         if let Some(obj) = v.as_object_mut() {
             obj.remove("model");
         }
@@ -630,160 +640,6 @@ fn mid_stream_error_bytes(
             format!("data: {data}\n\n").into_bytes()
         }
     }
-}
-
-/// Wrap a SINGLE non-stream `IrResponse` into a Bedrock ConverseStream binary `eventstream` byte
-/// sequence (`application/vnd.amazon.eventstream`), for the case where a bedrock-ingress client
-/// requested `ConverseStream` (`wants_stream`) but the cross-protocol upstream answered with a
-/// BUFFERED (non-SSE) 2xx. Returning that single response as `application/json` + a non-stream
-/// Converse body is undecodable by the AWS SDK's eventstream decoder (it expects framed
-/// `messageStart`/`contentBlockDelta`/…/`messageStop`/`metadata` events) — a hard functional failure
-/// and a deterministic proxy tell on the headline bedrock-ingress surface. This synthesizes the
-/// native frame sequence a real ConverseStream emits for the same completion: one `messageStart`,
-/// then per content block a `contentBlockStart` + its `contentBlockDelta`(s) + `contentBlockStop`,
-/// then `messageStop` (carrying the stop reason) and a trailing `metadata` frame (carrying token
-/// usage) — matching the two-frame stop/usage split the Bedrock writer's `MessageDelta` arm expects.
-/// Each event is rendered through the SAME `bedrock` writer used on the live streaming path and
-/// encoded via `eventstream::encode_frame`, so the bytes are byte-for-byte what a native stream sends.
-/// Never panics on the request path: a frame whose payload fails to serialize is skipped.
-fn bedrock_response_to_eventstream(ir: &crate::ir::IrResponse, elapsed_ms: Option<u64>) -> Vec<u8> {
-    use crate::ir::{IrBlock, IrBlockMeta, IrDelta, IrStreamEvent, IrUsage};
-    let writer = crate::proto::Protocol::bedrock();
-    let writer = writer.writer();
-    let mut out: Vec<u8> = Vec::new();
-    // Render one IR stream event through the bedrock writer and append the encoded frame (if the
-    // writer maps it to a native frame; some IR events have no Bedrock analog and yield None).
-    let push = |ev: &IrStreamEvent, out: &mut Vec<u8>| {
-        if let Some((event_type, mut payload)) = writer.write_response_event(ev) {
-            // A native ConverseStream `metadata` frame ALWAYS carries a `metrics.latencyMs` (the SDK
-            // surfaces it via `ConverseStreamMetadataEvent::metrics()`); the bedrock writer's
-            // `MessageDelta` arm deliberately omits `metrics`, and the LIVE StreamTranslate path injects
-            // it there (`proto::mod.rs`). On this BUFFERED synthesis path StreamTranslate is bypassed,
-            // so inject it HERE too — otherwise `metrics == None`, which a real endpoint never returns
-            // (a deterministic proxy tell). Use the request's elapsed wall-clock, consistent with the
-            // live path; if timing is unavailable OMIT `metrics` rather than emit a tell-tale `0`.
-            if event_type == "metadata" {
-                if let (Some(ms), Some(obj)) = (elapsed_ms, payload.as_object_mut()) {
-                    obj.insert(
-                        "metrics".to_string(),
-                        serde_json::json!({ "latencyMs": ms }),
-                    );
-                }
-            }
-            if let Ok(bytes) = serde_json::to_vec(&payload) {
-                out.extend_from_slice(&crate::eventstream::encode_frame(&event_type, &bytes));
-            }
-        }
-    };
-
-    // messageStart
-    push(
-        &IrStreamEvent::MessageStart {
-            role: ir.role,
-            usage: None,
-            id: None,
-            created: None,
-            model: ir.model.clone(),
-        },
-        &mut out,
-    );
-
-    // Per content block: contentBlockStart → contentBlockDelta(s) → contentBlockStop. Mirror the
-    // live streaming fan-out (`read_response_events`) so the SDK sees the same per-block framing.
-    for (index, block) in ir.content.iter().enumerate() {
-        match block {
-            IrBlock::Text { text, .. } => {
-                push(
-                    &IrStreamEvent::BlockStart {
-                        index,
-                        block: IrBlockMeta::Text,
-                    },
-                    &mut out,
-                );
-                push(
-                    &IrStreamEvent::BlockDelta {
-                        index,
-                        delta: IrDelta::TextDelta(text.clone()),
-                    },
-                    &mut out,
-                );
-                push(&IrStreamEvent::BlockStop { index }, &mut out);
-            }
-            IrBlock::ToolUse {
-                id, name, input, ..
-            } => {
-                push(
-                    &IrStreamEvent::BlockStart {
-                        index,
-                        block: IrBlockMeta::ToolUse {
-                            id: id.clone(),
-                            name: name.clone(),
-                        },
-                    },
-                    &mut out,
-                );
-                push(
-                    &IrStreamEvent::BlockDelta {
-                        index,
-                        delta: IrDelta::InputJsonDelta(input.to_string()),
-                    },
-                    &mut out,
-                );
-                push(&IrStreamEvent::BlockStop { index }, &mut out);
-            }
-            // Thinking/ToolResult/Image blocks have no native ConverseStream content-delta frame on
-            // this synthesized path (the Bedrock writer maps their start/delta to None); skip them
-            // rather than emit an orphaned/empty frame. These are enumerated EXPLICITLY (no `_`
-            // catch-all) so that adding a future `IrBlock` variant (e.g. a document or
-            // redacted-thinking block) is a COMPILE error here rather than silent data loss in the
-            // synthesized ConverseStream output — this is the newest, least-tested encoder path.
-            IrBlock::Thinking { .. } | IrBlock::ToolResult { .. } | IrBlock::Image { .. } => {}
-        }
-    }
-
-    // messageStop (stop reason) then metadata (usage) — the writer's `MessageDelta` arm maps a
-    // stop_reason-bearing delta to `messageStop` and a usage-only delta to `metadata`, exactly the
-    // two native frames a real ConverseStream ends with.
-    // Default the synthesized stop reason from the IR CONTENT, not unconditionally `end_turn`. A
-    // native Bedrock Converse reports `tool_use` for a turn that emitted a tool call; if the buffered
-    // IR carried a ToolUse block but no explicit stop_reason (a cross-protocol 2xx whose upstream
-    // omitted it), default to the canonical `tool_use` so `stop_reason_reverse` yields `tool_use` and
-    // an AWS SDK consumer keying agentic control flow off stopReason re-invokes the tool. Only fall
-    // back to `end_turn` when the completion carried no tool call.
-    let default_stop_reason = if ir
-        .content
-        .iter()
-        .any(|b| matches!(b, IrBlock::ToolUse { .. }))
-    {
-        "tool_use"
-    } else {
-        "end_turn"
-    };
-    push(
-        &IrStreamEvent::MessageDelta {
-            stop_reason: ir
-                .stop_reason
-                .clone()
-                .or_else(|| Some(default_stop_reason.to_string())),
-            usage: IrUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
-            },
-            stop_sequence: None,
-        },
-        &mut out,
-    );
-    push(
-        &IrStreamEvent::MessageDelta {
-            stop_reason: None,
-            usage: ir.usage.clone(),
-            stop_sequence: None,
-        },
-        &mut out,
-    );
-    out
 }
 
 /// Non-buffering stream inspection tap for usage parsing.
@@ -1272,7 +1128,13 @@ where
             inner,
             first_byte_sent: Arc::new(AtomicBool::new(false)),
             is_sse,
-            ingress_eventstream: ingress_protocol == "bedrock",
+            // Resolve the ingress protocol's writer ONCE to determine whether the client expects a
+            // binary event-stream body (Bedrock) rather than SSE text. Dispatches through the
+            // `ingress_is_eventstream` vtable method so this constructor carries no `== "bedrock"`
+            // branch — a future protocol with a binary framing just overrides the method.
+            ingress_eventstream: crate::proto::protocol_for(ingress_protocol)
+                .map(|p| p.writer().ingress_is_eventstream())
+                .unwrap_or(false),
             ingress_protocol: Box::from(ingress_protocol),
             permit: Some(permit),
             app: Some(app),
@@ -1984,17 +1846,14 @@ fn is_streaming_content_type(ct: &str) -> bool {
 /// reframe the streamed body is re-encoded into the client's framing, so the response header must
 /// describe the CLIENT's wire format — copying the upstream CT verbatim would mislabel the body
 /// (e.g. a Bedrock-egress `application/vnd.amazon.eventstream` reaching an SSE client, or vice
-/// versa). SSE protocols (openai/anthropic/gemini/cohere/responses) get `text/event-stream`; bedrock
-/// ingress gets `application/vnd.amazon.eventstream` — and this CT now describes a fully reframed
-/// BINARY body: the encoder is implemented and wired (`StreamTranslate` sets `ingress_eventstream`
-/// and packs each event into a CRC-valid frame via `eventstream::encode_frame`). Returns `None` for
-/// an unrecognized literal so the caller keeps the upstream CT rather than guessing.
+/// versa). Returns `None` for an unrecognized protocol name so the caller keeps the upstream CT
+/// rather than guessing.
+///
+/// Dispatches through `ProtocolWriter::streaming_content_type` (SSE protocols → `text/event-stream`;
+/// Bedrock → `application/vnd.amazon.eventstream`) so this function carries no `"bedrock"` branch —
+/// the CT is a property of the writer vtable, not the name string.
 fn ingress_stream_content_type(ingress: &str) -> Option<&'static str> {
-    match ingress {
-        "openai" | "anthropic" | "gemini" | "cohere" | "responses" => Some("text/event-stream"),
-        "bedrock" => Some("application/vnd.amazon.eventstream"),
-        _ => None,
-    }
+    crate::proto::protocol_for(ingress).map(|p| p.writer().streaming_content_type())
 }
 
 /// extract the host (no scheme, no trailing slash, no userinfo) from a base URL, for SigV4's signed
@@ -2107,74 +1966,53 @@ pub(crate) fn lane_auth_headers(
 // guard ensures this block can never change unnoticed.
 //
 // Anthropic Python SDK UA shape (api.anthropic.com).
-const EGRESS_UA_ANTHROPIC: &str = "anthropic-sdk-python/0.39.0";
+pub(crate) const EGRESS_UA_ANTHROPIC: &str = "anthropic-sdk-python/0.39.0";
 // OpenAI Python SDK shape; the Responses API is served by the same SDK/UA.
-const EGRESS_UA_OPENAI: &str = "OpenAI/Python 1.54.0";
+pub(crate) const EGRESS_UA_OPENAI: &str = "OpenAI/Python 1.54.0";
 // Google GenAI SDK shape (generativelanguage.googleapis.com).
-const EGRESS_UA_GEMINI: &str = "google-genai-sdk/0.8.0 gl-python/3.11";
+pub(crate) const EGRESS_UA_GEMINI: &str = "google-genai-sdk/0.8.0 gl-python/3.11";
 // AWS Bedrock is reached via boto3/botocore.
-const EGRESS_UA_BEDROCK: &str = "Boto3/1.35.0 md/Botocore#1.35.0";
+pub(crate) const EGRESS_UA_BEDROCK: &str = "Boto3/1.35.0 md/Botocore#1.35.0";
 // Cohere Python SDK shape (api.cohere.com).
-const EGRESS_UA_COHERE: &str = "cohere-python/5.11.0";
+pub(crate) const EGRESS_UA_COHERE: &str = "cohere-python/5.11.0";
 // Unknown/foreign egress protocol: a generic-but-present UA still beats sending none.
-const EGRESS_UA_DEFAULT: &str = "okhttp/4.12.0";
+pub(crate) const EGRESS_UA_DEFAULT: &str = "okhttp/4.12.0";
 
 /// Plausible native-SDK `User-Agent` for the chosen EGRESS protocol. reqwest sends NO default
 /// User-Agent unless one is set, so without this every proxied upstream request reaches the backend
 /// with no UA at all — a trivial backend-side fingerprint distinguishing busbar-proxied traffic from
-/// a native vendor SDK (which always sends a recognizable UA). Returned strings mirror the shape a
-/// real first-party SDK emits for that provider's API. (Backend-facing only; does not affect client
-/// indistinguishability.) The version numbers are PINNED and drift over time — see the
+/// a native vendor SDK (which always sends a recognizable UA). (Backend-facing only; does not affect
+/// client indistinguishability.) The version numbers are PINNED and drift over time — see the
 /// `EGRESS_UA_*` constant block above for the release-time audit obligation that keeps them current.
+///
+/// Thin wrapper: dispatches through `ProtocolWriter::egress_user_agent` so the name-match lives in
+/// the per-protocol writer, not in this agnostic function. Call sites that already hold a resolved
+/// writer (`writer.egress_user_agent()`) bypass this wrapper; it exists for test-code paths that
+/// look up by name.
 pub(crate) fn egress_user_agent(egress_protocol: &str) -> &'static str {
-    match egress_protocol {
-        "anthropic" => EGRESS_UA_ANTHROPIC,
-        "openai" | "responses" => EGRESS_UA_OPENAI,
-        "gemini" => EGRESS_UA_GEMINI,
-        "bedrock" => EGRESS_UA_BEDROCK,
-        "cohere" => EGRESS_UA_COHERE,
-        // Enumerated default, not a wildcard on a disposition match — this is a UA-string lookup,
-        // not a breaker/disposition decision.
-        _ => EGRESS_UA_DEFAULT,
-    }
+    crate::proto::protocol_for(egress_protocol)
+        .map(|p| p.writer().egress_user_agent())
+        .unwrap_or(EGRESS_UA_DEFAULT)
 }
 
 /// The `Accept` header a native SDK for `egress_protocol` sends, given the caller's stream intent.
 /// `accept` is NOT part of SigV4 SignedHeaders, so adding it never affects a Bedrock signature — but
 /// a native SDK ALWAYS sends one, so omitting it is a deterministic backend-side proxy fingerprint
-/// (a busbar-proxied request carries none where a native one does). Mirrors the per-protocol
-/// `egress_user_agent` lookup: set to what the real SDK emits so the backend cannot separate busbar
-/// traffic from native traffic on this header. Enumerated (no disposition wildcard) — a header-string
-/// lookup, not a breaker/disposition decision.
+/// (a busbar-proxied request carries none where a native one does). Set to what the real SDK emits so
+/// the backend cannot separate busbar traffic from native traffic on this header.
+///
+/// Thin wrapper: dispatches through `ProtocolWriter::egress_accept` so the per-protocol logic (Bedrock
+/// → eventstream/json; all others → text/event-stream/json) lives in the writer vtable, not in this
+/// agnostic function. Call sites that already hold a resolved writer (`writer.egress_accept(stream)`)
+/// bypass this wrapper; it exists for test-code paths that look up by name.
 pub(crate) fn egress_accept(egress_protocol: &str, wants_stream: bool) -> &'static str {
-    match egress_protocol {
-        // botocore/boto3 sends `application/vnd.amazon.eventstream` on a ConverseStream call and
-        // `application/json` on a non-stream Converse call — the headline Bedrock egress surface.
-        "bedrock" => {
-            if wants_stream {
-                "application/vnd.amazon.eventstream"
-            } else {
-                APPLICATION_JSON
-            }
-        }
-        // Anthropic, OpenAI/Responses, Gemini, and Cohere SDKs all negotiate JSON for the unary call
-        // and `text/event-stream` for an SSE stream — the same shape across these REST/SSE backends.
-        "anthropic" | "openai" | "responses" | "gemini" | "cohere" => {
-            if wants_stream {
-                "text/event-stream"
-            } else {
-                APPLICATION_JSON
-            }
-        }
-        // Unknown/foreign egress: a present, plausible Accept still beats sending none.
-        _ => {
-            if wants_stream {
-                "text/event-stream"
-            } else {
-                APPLICATION_JSON
-            }
-        }
-    }
+    crate::proto::protocol_for(egress_protocol)
+        .map(|p| p.writer().egress_accept(wants_stream))
+        .unwrap_or(if wants_stream {
+            "text/event-stream"
+        } else {
+            APPLICATION_JSON
+        })
 }
 
 /// Charge a non-streaming response's token usage to the virtual key's budget. The streaming path
@@ -2205,6 +2043,10 @@ fn record_nonstream_usage(upstream_body: &[u8], usage_sink: &Option<UsageSink>) 
     }
 }
 
+/// Anthropic-ingress convenience entry point. Binds `ingress_protocol = "anthropic"` and delegates
+/// to `forward_with_pool`; its only callers are `route::named` and `route::adhoc`, both Anthropic
+/// `/v1/messages` routes. The literal `"anthropic"` here is NOT a name-branch — it is the
+/// route→protocol binding for this specific ingress entry point.
 pub(crate) async fn forward(
     app: Arc<App>,
     cands: Vec<WeightedLane>,
@@ -2523,13 +2365,16 @@ pub(crate) async fn forward_with_pool(
 
     // Gemini ingress streaming WITHOUT `?alt=sse`: the native client expects a JSON-array streamed
     // body, not SSE. The route layer signals this via a router shim key (read here; stripped from the
-    // body unconditionally before forwarding). GATED on `ingress_protocol == "gemini"`: only a
-    // genuine Gemini client can want JSON-array response framing. Without the gate a body-model client
-    // (openai/cohere/responses) that sent `{"__busbar_gemini_json_array":true}` in its own
-    // fully-controlled body would have its SSE stream silently reframed as a JSON array under
-    // `Content-Type: application/json` — undecodable by the official SDK and a router behavior no
-    // native backend exhibits. False for every other protocol and for the `?alt=sse` gemini variant.
-    let gemini_json_array = ingress_protocol == "gemini" && wants_gemini_json_array(&v);
+    // body unconditionally before forwarding). GATED on `uses_array_stream_shim()` (true only for
+    // GeminiWriter): only a genuine Gemini client can want JSON-array response framing. Without the
+    // gate a body-model client (openai/cohere/responses) that sent `{"__busbar_gemini_json_array":true}`
+    // in its own fully-controlled body would have its SSE stream silently reframed as a JSON array
+    // under `Content-Type: application/json` — undecodable by the official SDK and a router behavior
+    // no native backend exhibits. False for every other protocol and for the `?alt=sse` gemini variant.
+    let gemini_json_array = crate::proto::protocol_for(ingress_protocol)
+        .map(|p| p.writer().uses_array_stream_shim())
+        .unwrap_or(false)
+        && wants_gemini_json_array(&v);
 
     // Derive affinity key early (before any mutations to v)
     let affinity_key_str: Option<String> = if let Some(k) = affinity_key {
@@ -2808,14 +2653,14 @@ pub(crate) async fn forward_with_pool(
             .headers(convert_headers(auth))
             .header(CONTENT_TYPE, APPLICATION_JSON)
             // Native-SDK User-Agent for the egress protocol. The shared client sets none, so without
-            // this the backend sees a UA-less request — a proxy fingerprint (see egress_user_agent).
-            .header(USER_AGENT, egress_user_agent(egress_name))
+            // this the backend sees a UA-less request — a proxy fingerprint. Dispatched through the
+            // writer vtable (`ProtocolWriter::egress_user_agent`) — `writer` is already resolved above.
+            .header(USER_AGENT, writer.egress_user_agent())
             // Native-SDK Accept for the egress protocol (eventstream/json/SSE by stream intent). A
-            // native SDK always sends one; omitting it is a backend-side proxy fingerprint, especially
-            // on the bedrock egress where botocore sends `application/vnd.amazon.eventstream` on a
-            // ConverseStream call (see egress_accept). Not part of SigV4 SignedHeaders, so no signature
-            // impact.
-            .header(ACCEPT, egress_accept(egress_name, wants_stream))
+            // native SDK always sends one; omitting it is a backend-side proxy fingerprint. Dispatched
+            // through the writer vtable (`ProtocolWriter::egress_accept`) so no `"bedrock"` branch
+            // lives here. Not part of SigV4 SignedHeaders, so no signature impact.
+            .header(ACCEPT, writer.egress_accept(wants_stream))
             .body(payload);
         // reqwest's per-request `.timeout()` bounds the ENTIRE request lifecycle, INCLUDING reading
         // the response body. For a STREAMING response that body is a long-lived generation stream
@@ -2897,7 +2742,7 @@ pub(crate) async fn forward_with_pool(
                     let upstream_amzn_headers: Vec<(
                         axum::http::HeaderName,
                         axum::http::HeaderValue,
-                    )> = if ingress_protocol == "bedrock" {
+                    )> = if ingress_relays_amzn_headers(ingress_protocol) {
                         [
                             crate::proto::HDR_AMZN_REQUEST_ID,
                             crate::proto::HDR_AMZN_ERROR_TYPE,
@@ -3436,22 +3281,30 @@ pub(crate) async fn forward_with_pool(
                                 // protocol streams SSE, which the FirstByteBody path handles when the
                                 // upstream is SSE — a non-SSE upstream to an SSE-stream request still
                                 // returns the translated JSON body, which their SDKs accept.)
-                                if ingress_protocol == "bedrock" && wants_stream {
+                                if wants_stream {
                                     let elapsed_ms =
                                         u64::try_from(upstream_started.elapsed().as_millis()).ok();
-                                    let frames = bedrock_response_to_eventstream(&ir, elapsed_ms);
-                                    let rb = Response::builder()
-                                        .status(status)
-                                        .header(CONTENT_TYPE, "application/vnd.amazon.eventstream");
-                                    let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
-                                    let rb = maybe_attach_route_policy(
-                                        rb,
-                                        chosen_policy_name,
-                                        &app.lanes[i].model,
-                                    );
-                                    return rb
-                                        .body(Body::from(frames))
-                                        .unwrap_or_else(|_| status.into_response());
+                                    if let Some(frames) = ingress_proto
+                                        .writer()
+                                        .wrap_buffered_as_stream(&ir, elapsed_ms)
+                                    {
+                                        let rb = Response::builder()
+                                            .status(status)
+                                            .header(
+                                                CONTENT_TYPE,
+                                                ingress_proto.writer().streaming_content_type(),
+                                            );
+                                        let rb =
+                                            maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
+                                        let rb = maybe_attach_route_policy(
+                                            rb,
+                                            chosen_policy_name,
+                                            &app.lanes[i].model,
+                                        );
+                                        return rb
+                                            .body(Body::from(frames))
+                                            .unwrap_or_else(|_| status.into_response());
+                                    }
                                 }
                                 let mut translated = ingress_proto.writer().write_response(&ir);
                                 // A native AWS Bedrock Converse (non-stream) response ALWAYS populates
@@ -3463,17 +3316,10 @@ pub(crate) async fn forward_with_pool(
                                 // streaming policy: inject the real request elapsed wall-clock here, and
                                 // OMIT `metrics` rather than fabricate a tell-tale `0` if timing is
                                 // unavailable.
-                                if ingress_protocol == "bedrock" {
-                                    if let (Some(ms), Some(obj)) = (
-                                        u64::try_from(upstream_started.elapsed().as_millis()).ok(),
-                                        translated.as_object_mut(),
-                                    ) {
-                                        obj.insert(
-                                            "metrics".to_string(),
-                                            serde_json::json!({ "latencyMs": ms }),
-                                        );
-                                    }
-                                }
+                                ingress_proto.writer().inject_response_metrics(
+                                    &mut translated,
+                                    u64::try_from(upstream_started.elapsed().as_millis()).ok(),
+                                );
                                 // Gemini JSON-array streaming (`:streamGenerateContent` WITHOUT
                                 // `?alt=sse`, so `gemini_json_array`) answered by a BUFFERED non-SSE 2xx:
                                 // the native non-`alt=sse` endpoint returns a JSON ARRAY of chunk objects
@@ -3601,7 +3447,7 @@ pub(crate) async fn forward_with_pool(
                 // Bedrock-ingress streaming 2xx must carry `x-amzn-RequestId` (a real ConverseStream
                 // always does). Prefer the upstream's real id when this is a same-protocol bedrock
                 // passthrough (it captured one); otherwise synthesize. Non-bedrock ingress: omit.
-                if ingress_protocol == "bedrock" {
+                if ingress_relays_amzn_headers(ingress_protocol) {
                     if let Some(id) = upstream_amzn_id.or_else(crate::proto::synth_amzn_request_id)
                     {
                         rb = rb.header(crate::proto::HDR_AMZN_REQUEST_ID, id);
@@ -3806,9 +3652,12 @@ async fn forward_once(
     // stream intent for the stream-aware upstream path (Gemini).
     let wants_stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     // Gemini ingress streaming WITHOUT `?alt=sse` → JSON-array streamed body (see main path). GATED
-    // on `ingress_protocol == "gemini"` so a body-model client cannot smuggle the shim key to force
-    // JSON-array reframing of its SSE stream.
-    let gemini_json_array = ingress_protocol == "gemini" && wants_gemini_json_array(&v);
+    // on `uses_array_stream_shim()` (true only for GeminiWriter) so a body-model client cannot
+    // smuggle the shim key to force JSON-array reframing of its SSE stream.
+    let gemini_json_array = crate::proto::protocol_for(ingress_protocol)
+        .map(|p| p.writer().uses_array_stream_shim())
+        .unwrap_or(false)
+        && wants_gemini_json_array(&v);
     let egress_name = app.lanes[i].protocol.name();
 
     // Breaker config for THIS degraded attempt's routing pool cell — resolved the same way the main
@@ -3882,10 +3731,12 @@ async fn forward_once(
         .post(format!("{base}{wire_path}"))
         .headers(convert_headers(auth))
         .header(CONTENT_TYPE, APPLICATION_JSON)
-        // Native-SDK User-Agent for the egress protocol (mirrors the main forward path).
-        .header(USER_AGENT, egress_user_agent(egress_name))
-        // Native-SDK Accept for the egress protocol (mirrors the main forward path; see egress_accept).
-        .header(ACCEPT, egress_accept(egress_name, wants_stream))
+        // Native-SDK User-Agent for the egress protocol (mirrors the main forward path). Dispatched
+        // through the writer vtable (`ProtocolWriter::egress_user_agent`) — writer resolved above.
+        .header(USER_AGENT, writer.egress_user_agent())
+        // Native-SDK Accept for the egress protocol (mirrors the main forward path). Dispatched
+        // through the writer vtable (`ProtocolWriter::egress_accept`) — no `"bedrock"` branch here.
+        .header(ACCEPT, writer.egress_accept(wants_stream))
         .body(payload);
     // See the main forward path: reqwest's `.timeout()` bounds the whole body read, so applying the
     // failover deadline to a STREAMING request truncates a healthy long generation at that wall-clock
@@ -3969,7 +3820,7 @@ async fn forward_once(
                 // falls back from header-first to body `__type` — both detectable tells. (The main
                 // path forwards these on its same-protocol error branches; this degraded route
                 // previously captured the id but never attached it, and dropped the errortype.)
-                if ingress_protocol == "bedrock" {
+                if ingress_relays_amzn_headers(ingress_protocol) {
                     if let Some(id) = upstream_amzn_id.as_deref() {
                         rb = rb.header(crate::proto::HDR_AMZN_REQUEST_ID, id);
                     }
@@ -4112,35 +3963,35 @@ async fn forward_once(
                             // Bedrock ConverseStream request answered by a buffered (non-SSE) 2xx:
                             // emit the native binary eventstream frame sequence, not an
                             // `application/json` Converse body the SDK's stream decoder cannot parse
-                            // (mirrors the main forward path; see `bedrock_response_to_eventstream`).
-                            if ingress_protocol == "bedrock" && wants_stream {
+                            // (mirrors the main forward path; dispatches through writer vtable).
+                            if wants_stream {
                                 let elapsed_ms =
                                     u64::try_from(upstream_started.elapsed().as_millis()).ok();
-                                let frames = bedrock_response_to_eventstream(&ir, elapsed_ms);
-                                let rb = Response::builder()
-                                    .status(status)
-                                    .header(CONTENT_TYPE, "application/vnd.amazon.eventstream");
-                                let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
-                                return Ok(rb
-                                    .body(Body::from(frames))
-                                    .unwrap_or_else(|_| status.into_response()));
+                                if let Some(frames) = ingress_proto
+                                    .writer()
+                                    .wrap_buffered_as_stream(&ir, elapsed_ms)
+                                {
+                                    let rb = Response::builder()
+                                        .status(status)
+                                        .header(
+                                            CONTENT_TYPE,
+                                            ingress_proto.writer().streaming_content_type(),
+                                        );
+                                    let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
+                                    return Ok(rb
+                                        .body(Body::from(frames))
+                                        .unwrap_or_else(|_| status.into_response()));
+                                }
                             }
                             let mut translated = ingress_proto.writer().write_response(&ir);
                             // Inject `metrics.latencyMs` for a bedrock-ingress non-stream Converse — a
                             // native AWS Converse always populates it, so its absence is a proxy tell
                             // (mirrors the streaming path and the buffered cross-protocol path above).
                             // OMIT rather than fabricate `0` if timing is unavailable.
-                            if ingress_protocol == "bedrock" {
-                                if let (Some(ms), Some(obj)) = (
-                                    u64::try_from(upstream_started.elapsed().as_millis()).ok(),
-                                    translated.as_object_mut(),
-                                ) {
-                                    obj.insert(
-                                        "metrics".to_string(),
-                                        serde_json::json!({ "latencyMs": ms }),
-                                    );
-                                }
-                            }
+                            ingress_proto.writer().inject_response_metrics(
+                                &mut translated,
+                                u64::try_from(upstream_started.elapsed().as_millis()).ok(),
+                            );
                             // Gemini JSON-array streaming answered by a buffered non-SSE 2xx: wrap the
                             // single translated object in a one-element JSON array, matching the native
                             // non-`alt=sse` `streamGenerateContent` array framing (see the main path).
@@ -4233,7 +4084,7 @@ async fn forward_once(
             }
             // Bedrock-ingress streaming 2xx carries `x-amzn-RequestId`: forward the upstream's real
             // id on same-protocol passthrough, else synthesize. Non-bedrock ingress: omit.
-            if ingress_protocol == "bedrock" {
+            if ingress_relays_amzn_headers(ingress_protocol) {
                 if let Some(id) = upstream_amzn_id.or_else(crate::proto::synth_amzn_request_id) {
                     rb = rb.header(crate::proto::HDR_AMZN_REQUEST_ID, id);
                 }
@@ -4895,8 +4746,8 @@ mod cross_protocol_extra_tests {
 
 #[cfg(test)]
 mod bedrock_eventstream_tests {
-    use super::bedrock_response_to_eventstream;
     use crate::ir::{IrBlock, IrResponse, IrRole, IrUsage};
+    use crate::proto::bedrock::bedrock_response_to_eventstream;
 
     /// A bedrock-ingress ConverseStream request answered by a BUFFERED (non-SSE) 2xx is rewrapped
     /// into the native binary eventstream frame sequence — not an `application/json` Converse body
