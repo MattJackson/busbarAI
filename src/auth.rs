@@ -768,12 +768,16 @@ fn verify_bedrock_sigv4(
     // the wire cannot tell "body tampered" from "bad signature".
     const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
     if payload_hash.eq_ignore_ascii_case(UNSIGNED_PAYLOAD) {
-        tracing::debug!("inbound SigV4 rejected: UNSIGNED-PAYLOAD not permitted for governed ingress");
+        tracing::debug!(
+            "inbound SigV4 rejected: UNSIGNED-PAYLOAD not permitted for governed ingress"
+        );
         return Err(());
     }
     let actual_body_hash = crate::sigv4::sha256_hex(body);
     if !AuthMiddleware::constant_time_eq(&actual_body_hash, &payload_hash.to_ascii_lowercase()) {
-        tracing::debug!("inbound SigV4 rejected: request body does not match signed x-amz-content-sha256");
+        tracing::debug!(
+            "inbound SigV4 rejected: request body does not match signed x-amz-content-sha256"
+        );
         return Err(());
     };
     let Some(amzdate) = headers
@@ -3127,7 +3131,8 @@ mod tests {
         let (auth, headers) =
             sign_bedrock_request(&secret, &akid, "us-east-1", "bedrock", path, b"", &amzdate);
         let req = bedrock_request(path, &auth, &headers);
-        let key = verify_bedrock_sigv4(&gov, &req, b"").expect("a correctly-signed request must verify");
+        let key =
+            verify_bedrock_sigv4(&gov, &req, b"").expect("a correctly-signed request must verify");
         // Behavioral: the function resolved the SPECIFIC owning key (not just "some enabled key").
         // Tying to the key's identity (name) is a stronger statement than `key.enabled`, which merely
         // restates an input property. The owning key here is the one `gov_with_aws_key` created.
@@ -3288,8 +3293,15 @@ mod tests {
         let signed_body = br#"{"max_tokens":16}"#;
         let tampered_body = br#"{"max_tokens":999999}"#;
         // Sign over the ORIGINAL body (so Authorization + x-amz-content-sha256 are valid for it)...
-        let (auth, headers) =
-            sign_bedrock_request(&secret, &akid, "us-east-1", "bedrock", path, signed_body, &a);
+        let (auth, headers) = sign_bedrock_request(
+            &secret,
+            &akid,
+            "us-east-1",
+            "bedrock",
+            path,
+            signed_body,
+            &a,
+        );
         let req = bedrock_request(path, &auth, &headers);
         // ...but feed the verifier the TAMPERED bytes (what the middleware would have buffered).
         assert_eq!(

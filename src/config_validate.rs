@@ -2700,9 +2700,9 @@ mod tests {
             // M2: assert the ACTUAL returned host is a non-empty string (so a bug returning
             // Some("") / Some("garbage") cannot pass). The returned host is the normalized authority.
             let got = ssrf_blocked_host(blocked, &[], false, &[]);
-            let host = got
-                .as_deref()
-                .unwrap_or_else(|| panic!("expected '{blocked}' to be flagged as a metadata SSRF target"));
+            let host = got.as_deref().unwrap_or_else(|| {
+                panic!("expected '{blocked}' to be flagged as a metadata SSRF target")
+            });
             assert!(
                 !host.is_empty(),
                 "blocked '{blocked}' returned an EMPTY host string"
@@ -2719,7 +2719,8 @@ mod tests {
             Some("169.254.169.254")
         );
         assert_eq!(
-            ssrf_blocked_host("https://user:pass@169.254.169.254:8443/x", &[], false, &[]).as_deref(),
+            ssrf_blocked_host("https://user:pass@169.254.169.254:8443/x", &[], false, &[])
+                .as_deref(),
             Some("169.254.169.254"),
             "userinfo and port must be stripped from the returned host"
         );
@@ -2738,9 +2739,21 @@ mod tests {
         // H5: DIRECT unit tests for the inet_aton canonicalizer. The 1-, 2-, and 3-part obfuscated
         // forms of the IMDS address all canonicalize to 169.254.169.254. (0xA9FEA9FE = 2852039166.)
         let imds: std::net::Ipv4Addr = "169.254.169.254".parse().unwrap();
-        assert_eq!(expand_alternate_ipv4("2852039166"), Some(imds), "1-part decimal");
-        assert_eq!(expand_alternate_ipv4("169.16689662"), Some(imds), "2-part inet_aton");
-        assert_eq!(expand_alternate_ipv4("169.254.43518"), Some(imds), "3-part inet_aton");
+        assert_eq!(
+            expand_alternate_ipv4("2852039166"),
+            Some(imds),
+            "1-part decimal"
+        );
+        assert_eq!(
+            expand_alternate_ipv4("169.16689662"),
+            Some(imds),
+            "2-part inet_aton"
+        );
+        assert_eq!(
+            expand_alternate_ipv4("169.254.43518"),
+            Some(imds),
+            "3-part inet_aton"
+        );
         // Don't-double-process invariant: an already-canonical dotted quad returns None (left to the
         // IpAddr parse path), so the expander never re-canonicalizes a normal address.
         assert_eq!(
@@ -2820,11 +2833,13 @@ mod tests {
             make_provider("openai", "https://api.openai.com", "API_KEY"),
         );
         let cfg = make_root_cfg_with_blocked(providers, vec!["169.254.0.0/16".to_string()]);
-        let errs = validate(&cfg).expect_err("a CIDR blocked_metadata_hosts entry must fail validation");
+        let errs =
+            validate(&cfg).expect_err("a CIDR blocked_metadata_hosts entry must fail validation");
         assert!(
-            errs.iter().any(|e| e.contains("security.blocked_metadata_hosts")
-                && e.contains("169.254.0.0/16")
-                && e.contains("CIDR")),
+            errs.iter()
+                .any(|e| e.contains("security.blocked_metadata_hosts")
+                    && e.contains("169.254.0.0/16")
+                    && e.contains("CIDR")),
             "expected a CIDR rejection naming the key+value; got: {errs:?}"
         );
 
@@ -2836,10 +2851,11 @@ mod tests {
         );
         let mut cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
         cfg.allow_metadata_hosts = vec!["10.0.0.0/8".to_string()];
-        let errs = validate(&cfg).expect_err("a CIDR allow_metadata_hosts entry must fail validation");
+        let errs =
+            validate(&cfg).expect_err("a CIDR allow_metadata_hosts entry must fail validation");
         assert!(
-            errs.iter().any(|e| e.contains("security.allow_metadata_hosts")
-                && e.contains("10.0.0.0/8")),
+            errs.iter()
+                .any(|e| e.contains("security.allow_metadata_hosts") && e.contains("10.0.0.0/8")),
             "expected a CIDR rejection naming security.allow_metadata_hosts; got: {errs:?}"
         );
 
@@ -2853,8 +2869,9 @@ mod tests {
         let errs = validate(&cfg)
             .expect_err("a CIDR per-provider allow_metadata_hosts entry must fail validation");
         assert!(
-            errs.iter().any(|e| e.contains("provider 'prov' allow_metadata_hosts")
-                && e.contains("169.254.169.254/32")),
+            errs.iter()
+                .any(|e| e.contains("provider 'prov' allow_metadata_hosts")
+                    && e.contains("169.254.169.254/32")),
             "expected a CIDR rejection naming the provider's allow_metadata_hosts; got: {errs:?}"
         );
 

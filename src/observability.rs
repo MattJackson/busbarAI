@@ -452,7 +452,10 @@ pub(crate) fn fire_request_log(payload: Value) {
         let body = payload.to_string();
         let _ = client
             .post(url.as_str())
-            .header(reqwest::header::CONTENT_TYPE, crate::forward::APPLICATION_JSON)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                crate::forward::APPLICATION_JSON,
+            )
             .body(body)
             .timeout(WEBHOOK_DELIVERY_TIMEOUT)
             .send()
@@ -741,9 +744,7 @@ fn otlp_host_is_blocked(url: &reqwest::Url) -> bool {
                     if let Some(v4) = v6.to_ipv4() {
                         return !v4.is_loopback() && is_internal_v4(&v4);
                     }
-                    v6.is_unspecified()
-                        || is_unique_local_v6(&v6)
-                        || is_link_local_v6(&v6)
+                    v6.is_unspecified() || is_unique_local_v6(&v6) || is_link_local_v6(&v6)
                 }
                 // DNS name: block the cloud-metadata names (handled above) but ALLOW `localhost`
                 // (and `*.localhost`) — the loopback carve-out — and any external collector hostname.

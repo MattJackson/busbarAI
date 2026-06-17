@@ -368,7 +368,11 @@ mod tests {
     fn native_registry_names_round_trip() {
         for name in ["weighted", "cheapest", "fastest", "least_busy", "usage"] {
             let p = native_policy(name).expect("known name must resolve");
-            assert_eq!(p.name(), name, "resolved native policy name must round-trip");
+            assert_eq!(
+                p.name(),
+                name,
+                "resolved native policy name must round-trip"
+            );
         }
     }
 

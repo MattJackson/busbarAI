@@ -966,8 +966,13 @@ mod tests {
         // timing, only the response contract.)
         let amzdate = "20150830T123600Z";
         let now = parse_amz_date(amzdate).unwrap();
-        let (parsed, headers, ph) =
-            signed_fixture("a-real-tenant-secret", "us-east-1", "bedrock", amzdate, "20150830");
+        let (parsed, headers, ph) = signed_fixture(
+            "a-real-tenant-secret",
+            "us-east-1",
+            "bedrock",
+            amzdate,
+            "20150830",
+        );
         let req = inbound(&headers, &ph, amzdate);
         assert_eq!(
             verify_inbound_sigv4(&parsed, &req, DUMMY_SECRET, now),
@@ -983,12 +988,14 @@ mod tests {
         // the three mandatory sections are present and well-formed.
         let v = "AWS4-HMAC-SHA256 Credential=AKID/20150830/us-east-1/bedrock/aws4_request, \
                  SignedHeaders=host;x-amz-date, Signature=abc123, X-Future-Extension=whatever";
-        let p = parse_authorization_header(v).expect("unknown section must be skipped, not rejected");
+        let p =
+            parse_authorization_header(v).expect("unknown section must be skipped, not rejected");
         assert_eq!(p.access_key_id, "AKID");
         assert_eq!(p.signed_headers, "host;x-amz-date");
         assert_eq!(p.signature, "abc123");
         // But a MISSING mandatory section (Signature) with an unknown one present still fails.
-        let missing_sig = "AWS4-HMAC-SHA256 Credential=AKID/20150830/us-east-1/bedrock/aws4_request, \
+        let missing_sig =
+            "AWS4-HMAC-SHA256 Credential=AKID/20150830/us-east-1/bedrock/aws4_request, \
                            SignedHeaders=host, X-Extra=1";
         assert_eq!(
             parse_authorization_header(missing_sig),

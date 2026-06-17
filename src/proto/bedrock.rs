@@ -2555,11 +2555,7 @@ impl ProtocolWriter for BedrockWriter {
         Some(bedrock_response_to_eventstream(ir, elapsed_ms))
     }
 
-    fn inject_response_metrics(
-        &self,
-        value: &mut serde_json::Value,
-        elapsed_ms: Option<u64>,
-    ) {
+    fn inject_response_metrics(&self, value: &mut serde_json::Value, elapsed_ms: Option<u64>) {
         // A native AWS Bedrock Converse (non-stream) response ALWAYS populates `metrics.latencyMs`
         // (the SDK surfaces it via `ConverseOutput::metrics().latency_ms()`). The bedrock writer's
         // `write_response` deliberately omits it (timing is unknown at that layer); inject the real
@@ -2599,7 +2595,10 @@ impl ProtocolWriter for BedrockWriter {
 /// Each event is rendered through the SAME `bedrock` writer used on the live streaming path and
 /// encoded via `eventstream::encode_frame`, so the bytes are byte-for-byte what a native stream sends.
 /// Never panics on the request path: a frame whose payload fails to serialize is skipped.
-pub(crate) fn bedrock_response_to_eventstream(ir: &crate::ir::IrResponse, elapsed_ms: Option<u64>) -> Vec<u8> {
+pub(crate) fn bedrock_response_to_eventstream(
+    ir: &crate::ir::IrResponse,
+    elapsed_ms: Option<u64>,
+) -> Vec<u8> {
     use crate::ir::{IrBlock, IrBlockMeta, IrDelta, IrStreamEvent, IrUsage};
     let writer = crate::proto::Protocol::bedrock();
     let writer = writer.writer();

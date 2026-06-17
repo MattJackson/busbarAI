@@ -448,9 +448,7 @@ mod tests {
         assert_ne!(IrToolChoice::None, IrToolChoice::Required);
         assert_ne!(
             IrToolChoice::Required,
-            IrToolChoice::Tool {
-                name: "f".into()
-            }
+            IrToolChoice::Tool { name: "f".into() }
         );
         // A targeted tool is keyed on its name.
         assert_eq!(
@@ -466,9 +464,7 @@ mod tests {
             IrToolChoice::Tool { name: "b".into() }
         );
         // Clone is a faithful round-trip of the variant.
-        let tc = IrToolChoice::Tool {
-            name: "x".into(),
-        };
+        let tc = IrToolChoice::Tool { name: "x".into() };
         assert_eq!(tc.clone(), tc);
     }
 }

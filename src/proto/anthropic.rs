@@ -1338,11 +1338,12 @@ fn anthropic_auth_headers(
     );
     // Assemble the credential header(s) (each an `Option`, omitted on bad bytes) followed by the
     // always-present `anthropic-version`.
-    let assemble = |creds: Vec<Option<(HeaderName, HeaderValue)>>| -> Vec<(HeaderName, HeaderValue)> {
-        let mut out: Vec<(HeaderName, HeaderValue)> = creds.into_iter().flatten().collect();
-        out.push(version.clone());
-        out
-    };
+    let assemble =
+        |creds: Vec<Option<(HeaderName, HeaderValue)>>| -> Vec<(HeaderName, HeaderValue)> {
+            let mut out: Vec<(HeaderName, HeaderValue)> = creds.into_iter().flatten().collect();
+            out.push(version.clone());
+            out
+        };
     match AnthropicWriter::classify_credential(key) {
         // Configured Anthropic API key: native API-key client shape — `x-api-key` only. Use the
         // leading-whitespace-trimmed builder so a configured key with a stray leading space (the
@@ -2136,7 +2137,11 @@ mod anthropic_hardening_tests {
             header_value(&headers, "anthropic-version").as_deref(),
             Some("2023-06-01")
         );
-        assert_eq!(headers.len(), 1, "only anthropic-version remains on a bad key");
+        assert_eq!(
+            headers.len(),
+            1,
+            "only anthropic-version remains on a bad key"
+        );
     }
 
     /// The same warn+OMIT guarantee on the OAuth path: an invalid OAuth token OMITS the
@@ -2156,7 +2161,11 @@ mod anthropic_hardening_tests {
             header_value(&headers, "anthropic-version").as_deref(),
             Some("2023-06-01")
         );
-        assert_eq!(headers.len(), 1, "only anthropic-version remains on a bad token");
+        assert_eq!(
+            headers.len(),
+            1,
+            "only anthropic-version remains on a bad token"
+        );
     }
 
     /// extract_error parses the body once and surfaces both provider_code and structured_type.
@@ -4439,6 +4448,9 @@ mod anthropic_hardening_tests {
         let (_event2, data2) = AnthropicWriter
             .write_response_event(&ev2)
             .expect("MessageDelta must emit a message_delta event");
-        assert_eq!(data2["delta"]["stop_reason"], serde_json::json!("max_tokens"));
+        assert_eq!(
+            data2["delta"]["stop_reason"],
+            serde_json::json!("max_tokens")
+        );
     }
 }

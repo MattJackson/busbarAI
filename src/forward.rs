@@ -3300,14 +3300,11 @@ pub(crate) async fn forward_with_pool(
                                         .writer()
                                         .wrap_buffered_as_stream(&ir, elapsed_ms)
                                     {
-                                        let rb = Response::builder()
-                                            .status(status)
-                                            .header(
-                                                CONTENT_TYPE,
-                                                ingress_proto.writer().streaming_content_type(),
-                                            );
-                                        let rb =
-                                            maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
+                                        let rb = Response::builder().status(status).header(
+                                            CONTENT_TYPE,
+                                            ingress_proto.writer().streaming_content_type(),
+                                        );
+                                        let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
                                         let rb = maybe_attach_route_policy(
                                             rb,
                                             chosen_policy_name,
@@ -3983,12 +3980,10 @@ async fn forward_once(
                                     .writer()
                                     .wrap_buffered_as_stream(&ir, elapsed_ms)
                                 {
-                                    let rb = Response::builder()
-                                        .status(status)
-                                        .header(
-                                            CONTENT_TYPE,
-                                            ingress_proto.writer().streaming_content_type(),
-                                        );
+                                    let rb = Response::builder().status(status).header(
+                                        CONTENT_TYPE,
+                                        ingress_proto.writer().streaming_content_type(),
+                                    );
                                     let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
                                     return Ok(rb
                                         .body(Body::from(frames))

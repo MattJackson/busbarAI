@@ -157,8 +157,7 @@ pub(crate) fn openai_classify(status: StatusCode, body: &[u8]) -> CanonicalSigna
     // gate a 401/429/5xx whose prose happens to contain "maximum context length" would reclassify as
     // ContextLength — letting a genuine auth/rate-limit/server failure escape fault attribution. The
     // structured `code: "context_length_exceeded"` path is NOT gated (it is unambiguous).
-    let oversized =
-        status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE;
+    let oversized = status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE;
     let body_lower = String::from_utf8_lossy(body).to_lowercase();
     if code_is_context || (oversized && body_lower.contains("maximum context length")) {
         return CanonicalSignal {

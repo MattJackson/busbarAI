@@ -373,7 +373,9 @@ mod tests {
             .decide(&req(), &cands, &ctx(), Duration::from_millis(50))
             .await;
         let msg = res
-            .expect_err("a runtime error (undefined variable) must surface as Err → on_error fallback")
+            .expect_err(
+                "a runtime error (undefined variable) must surface as Err → on_error fallback",
+            )
             .to_string();
         assert!(
             msg.contains("eval error"),

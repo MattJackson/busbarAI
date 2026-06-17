@@ -492,7 +492,10 @@ mod tests {
             v["context"]["budget_remaining"], 500,
             "context.budget_remaining must be serialized with the RoutingContext value"
         );
-        assert_eq!(v["context"]["pool"], "p", "context.pool must carry the pool name");
+        assert_eq!(
+            v["context"]["pool"], "p",
+            "context.pool must carry the pool name"
+        );
 
         // The request projection must reflect the live RoutingRequest (req()).
         assert_eq!(v["request"]["pool"], "p");
@@ -504,7 +507,9 @@ mod tests {
         assert_eq!(v["request"]["stream"], true);
 
         // Each candidate carries its own budget_remaining + idx (cand() sets 1000).
-        let arr = v["candidates"].as_array().expect("candidates must be an array");
+        let arr = v["candidates"]
+            .as_array()
+            .expect("candidates must be an array");
         assert_eq!(arr.len(), 2, "both candidates must be projected");
         assert_eq!(arr[0]["idx"], 0);
         assert_eq!(arr[0]["budget_remaining"], 1000);

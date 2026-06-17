@@ -1753,9 +1753,7 @@ impl Store for SqliteStore {
 /// store error. A NON-panic join failure (the blocking pool was shut down mid-flight, e.g. on
 /// runtime teardown) is mapped to the crate's `StoreError` convention so the caller's fail-open /
 /// fail-closed knob applies, exactly as the old `GovState` offload did.
-async fn join_offload<T>(
-    handle: tokio::task::JoinHandle<StoreResult<T>>,
-) -> StoreResult<T> {
+async fn join_offload<T>(handle: tokio::task::JoinHandle<StoreResult<T>>) -> StoreResult<T> {
     match handle.await {
         Ok(res) => res,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
@@ -1942,7 +1940,9 @@ mod tests {
             let gov = gov.clone();
             let key = key.clone();
             handles.push(tokio::spawn(async move {
-                gov.try_charge_request_within_budget(&key, at).await.unwrap()
+                gov.try_charge_request_within_budget(&key, at)
+                    .await
+                    .unwrap()
             }));
         }
         let mut admitted = 0u32;
@@ -2559,9 +2559,16 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        let u = usage.expect("token charge must land after draining the offloaded spawn_blocking write");
-        assert_eq!(u.spend_cents, 100, "2000 tokens at 50c/1k must spend exactly 100c");
-        assert_eq!(u.tokens, 2000, "raw token count must be recorded for TPM accounting");
+        let u = usage
+            .expect("token charge must land after draining the offloaded spawn_blocking write");
+        assert_eq!(
+            u.spend_cents, 100,
+            "2000 tokens at 50c/1k must spend exactly 100c"
+        );
+        assert_eq!(
+            u.tokens, 2000,
+            "raw token count must be recorded for TPM accounting"
+        );
     }
 
     #[test]
