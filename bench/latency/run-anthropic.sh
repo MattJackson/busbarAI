@@ -91,7 +91,7 @@ probe=$(curl -s -o /dev/null -w '%{http_code}' -m 30 \
   -H "Authorization: Bearer $BENCH_TOKEN" -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -d "{\"model\":\"bench-pool\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
-  "http://127.0.0.1:$BUSBAR_PORT/v1/messages" || echo "000")
+  "http://127.0.0.1:$BUSBAR_PORT/bench-pool/v1/messages" || echo "000")
 if [[ "$probe" != "200" ]]; then
   echo "!! busbar->Anthropic probe returned HTTP $probe (expected 200)." >&2
   echo "!! Check ANTHROPIC_API_KEY and that the model id is valid. busbar log:" >&2
@@ -107,7 +107,9 @@ for mode in full ttft; do
     --mode "$mode" --requests "$REQS" --concurrency "$CONC" --warmup "$WARMUP" \
     --header "x-api-key: $ANTHROPIC_API_KEY" --model "$MODEL" --label "direct/${mode}/real" | tee -a "$RESULTS"
   # busbar: loadgen -> busbar -> api.anthropic.com
-  "$PY" "$HERE/loadgen.py" --url "http://127.0.0.1:$BUSBAR_PORT" --path /v1/messages --api anthropic \
+  # Busbar's Anthropic ingress carries the pool name in the PATH (/<pool>/v1/messages); the body
+  # model is ignored and rewritten to the lane's upstream id.
+  "$PY" "$HERE/loadgen.py" --url "http://127.0.0.1:$BUSBAR_PORT" --path /bench-pool/v1/messages --api anthropic \
     --mode "$mode" --requests "$REQS" --concurrency "$CONC" --warmup "$WARMUP" \
     --token "$BENCH_TOKEN" --model bench-pool --label "busbar/${mode}/real" | tee -a "$RESULTS"
 done
