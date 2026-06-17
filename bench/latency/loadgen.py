@@ -26,6 +26,7 @@
 import argparse
 import http.client
 import json
+import os
 import sys
 import threading
 import time
@@ -147,9 +148,13 @@ def run(args):
     if args.token:
         headers["Authorization"] = f"Bearer {args.token}"
     # Arbitrary extra headers (e.g. `x-api-key: ...` for the direct-to-Anthropic baseline path).
+    # A value of `env:NAME` is read from the environment, so secrets never appear in argv/ps.
     for h in args.header:
         k, _, v = h.partition(":")
-        headers[k.strip()] = v.strip()
+        v = v.strip()
+        if v.startswith("env:"):
+            v = os.environ.get(v[4:], "")
+        headers[k.strip()] = v
 
     ttft = args.mode == "ttft"
 

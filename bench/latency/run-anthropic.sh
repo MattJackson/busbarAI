@@ -105,7 +105,7 @@ for mode in full ttft; do
   # direct: loadgen -> api.anthropic.com  (x-api-key baseline)
   "$PY" "$HERE/loadgen.py" --url "https://api.anthropic.com" --path /v1/messages --api anthropic \
     --mode "$mode" --requests "$REQS" --concurrency "$CONC" --warmup "$WARMUP" \
-    --header "x-api-key: $ANTHROPIC_API_KEY" --model "$MODEL" --label "direct/${mode}/real" | tee -a "$RESULTS"
+    --header "x-api-key: env:ANTHROPIC_API_KEY" --model "$MODEL" --label "direct/${mode}/real" | tee -a "$RESULTS"
   # busbar: loadgen -> busbar -> api.anthropic.com
   # Busbar's Anthropic ingress carries the pool name in the PATH (/<pool>/v1/messages); the body
   # model is ignored and rewritten to the lane's upstream id.
