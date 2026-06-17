@@ -14,21 +14,42 @@ shape on your hardware.
   <TabItem label="Result">
     We measure a **difference**, on a **fixed, named machine** so the run is exactly reproducible:
     drive identical load against the **same Anthropic model** over two paths and subtract. Anthropic's
-    own latency is present in *both* paths and cancels in the subtraction, so `busbar − direct` is
-    Busbar's added cost — measured against real provider jitter. Reported as **p50 / p99 / p99.9** for
-    non-streaming full-response latency and for streaming **TTFT** (time to first byte).
+    own latency is present in *both* paths and cancels in the subtraction, so `with − without` is
+    Busbar's added cost — measured against real provider jitter. We publish **both** absolute paths —
+    *without* Busbar and *with* Busbar — at **p50 / p99 / p99.9**, and the per-percentile difference, for
+    non-streaming full-response latency and for streaming **TTFT** (time to first byte). Nothing is
+    hidden: you see each path's real numbers and can check the subtraction yourself.
 
     **Test rig (the reproduction anchor):** AWS **c7g.xlarge** (4 vCPU Graviton3, Amazon Linux 2023
     arm64) in **us-east-1**, running the released **`v1.0.0-rc.5`** `aarch64` binary against
     `claude-haiku-4-5` on `api.anthropic.com`. The load generator, Busbar, and the direct baseline all
     run on that one box — same machine, same egress on both paths.
 
-    {/* RESULTS TABLE — fill from `bench/latency/run-anthropic.sh` on the rig above. Measured only. */}
+    {/* RESULTS TABLES — fill from `bench/latency/run-anthropic.sh` on the rig above. Measured only. */}
 
-    | Busbar added overhead | p50 | p99 | p99.9 |
-    |-----------------------|-----|-----|-------|
-    | Full response (non-streaming) | _run to fill_ | _run to fill_ | _run to fill_ |
-    | Streaming TTFT | _run to fill_ | _run to fill_ | _run to fill_ |
+    **Full response (non-streaming)** — latency, ms
+
+    | Path | p50 | p99 | p99.9 |
+    |------|-----|-----|-------|
+    | Without Busbar — client → Anthropic | _run to fill_ | _run to fill_ | _run to fill_ |
+    | With Busbar — client → Busbar → Anthropic | _run to fill_ | _run to fill_ | _run to fill_ |
+    | **Busbar adds (with − without)** | _run to fill_ | _run to fill_ | _run to fill_ |
+
+    **Streaming TTFT** — latency, ms
+
+    | Path | p50 | p99 | p99.9 |
+    |------|-----|-----|-------|
+    | Without Busbar — client → Anthropic | _run to fill_ | _run to fill_ | _run to fill_ |
+    | With Busbar — client → Busbar → Anthropic | _run to fill_ | _run to fill_ | _run to fill_ |
+    | **Busbar adds (with − without)** | _run to fill_ | _run to fill_ | _run to fill_ |
+
+    **On the tail and provider jitter.** The absolute p99/p99.9 in the *Without* and *With* rows include
+    Anthropic's own network jitter — a slow upstream response inflates the tail on **both** paths
+    equally. That is exactly why the headline figure is the **delta**: the same provider variance sits in
+    both measurements and subtracts out, leaving Busbar's own added cost. We show the absolute rows too,
+    so the provider tail is visible rather than hidden — read the jitter and the Busbar delta side by
+    side, and check the subtraction yourself. (Sample size: each cell is N requests at fixed concurrency;
+    the exact counts are printed by the harness and recorded with the run.)
 
     :::note[Status: placeholder pending the measured run on the rig above]
     The harness is complete and runs against real Anthropic with no TLS gymnastics — the release binary
@@ -85,12 +106,14 @@ shape on your hardware.
     Anthropic, and run:
 
     ```bash
-    curl -fsSL https://getbusbar.com/install.sh | sh          # released aarch64 busbar
-    git clone --branch v1.0.0-rc.5 --depth 1 \
-      https://github.com/MattJackson/busbarAI && cd busbarAI
+    curl -fsSL https://getbusbar.com/install.sh | sh          # released aarch64 busbar (rc.5)
+    # the binary under test is the release above; the harness landed one commit after the
+    # tag, so clone the default branch for it:
+    git clone --depth 1 https://github.com/MattJackson/busbarAI && cd busbarAI
 
     export ANTHROPIC_API_KEY=sk-ant-...                       # your key; spends real tokens
-    BUSBAR_BIN=$HOME/busbar bench/latency/run-anthropic.sh    # prints p50/p99/p99.9 deltas
+    REQS=10000 CONC=12 BUSBAR_BIN=$HOME/busbar \
+      bench/latency/run-anthropic.sh                         # prints p50/p99/p99.9, both paths + delta
     ```
 
     It drives both paths against the **same** Anthropic model — direct (`x-api-key` straight to
