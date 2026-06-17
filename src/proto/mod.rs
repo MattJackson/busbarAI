@@ -222,6 +222,12 @@ pub(crate) const DEFAULT_MAX_TOKENS: u32 = 4096;
 pub(crate) const HDR_AMZN_REQUEST_ID: &str = "x-amzn-requestid";
 pub(crate) const HDR_AMZN_ERROR_TYPE: &str = "x-amzn-errortype";
 
+/// The response-header name a native Anthropic endpoint always carries (the SDK reads it into
+/// `APIError.request_id` / `Message._request_id`). Hoisted to a const — like the `HDR_AMZN_*`
+/// siblings — so the sites that attach it (forward.rs success path) and capture it from upstream
+/// cannot drift on spelling.
+pub(crate) const HDR_REQUEST_ID: &str = "request-id";
+
 /// Mixed-case base62 alphabet (digits + lowercase + uppercase, no `-`/`_`) and the rejection-sampling
 /// threshold used when synthesizing opaque ids for protocols whose native ids are flat random tokens
 /// (Gemini `responseId`, Responses `msg_`/`fc_`/`resp_` suffixes). Hoisted here as the single source
@@ -641,6 +647,16 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     ///
     /// Default: `false` (every SSE-framed protocol). Only `BedrockWriter` overrides to `true`.
     fn ingress_is_eventstream(&self) -> bool {
+        false
+    }
+
+    /// True when THIS protocol's streamed (SSE) response ends with the literal `data: [DONE]`
+    /// terminator — the OpenAI Chat Completions convention. busbar reproduces it when emitting an
+    /// openai-format stream back to an openai-ingress client on a cross-protocol hop. Default `false`
+    /// (Responses uses typed terminal events; Anthropic/Gemini/Cohere have their own framing; Bedrock
+    /// is binary eventstream); OpenAiWriter overrides → true. Consulted via the vtable by
+    /// `StreamTranslate::new` so that constructor carries no `ingress == "openai"` name-branch.
+    fn emits_sse_done_terminator(&self) -> bool {
         false
     }
 
@@ -1271,16 +1287,26 @@ impl StreamTranslate {
         if ingress == egress {
             return None;
         }
+        let ingress_proto = protocol_for(ingress)?;
+        let egress_proto = protocol_for(egress)?;
+        // Derive the framing flags from the protocol vtable rather than re-comparing the name
+        // strings: `ingress_eventstream`/`egress_eventstream` reuse the SAME `ingress_is_eventstream()`
+        // method `FirstByteBody` already dispatches through (so the two can never drift from it), and
+        // `emit_done` reads `emits_sse_done_terminator()`. This constructor carries no provider-name
+        // branch; a 7th protocol gets the safe `false` defaults.
+        let emit_done = ingress_proto.writer().emits_sse_done_terminator();
+        let ingress_eventstream = ingress_proto.writer().ingress_is_eventstream();
+        let egress_eventstream = egress_proto.writer().ingress_is_eventstream();
         Some(Self {
-            ingress: protocol_for(ingress)?,
-            egress: protocol_for(egress)?,
+            ingress: ingress_proto,
+            egress: egress_proto,
             decode: crate::ir::StreamDecodeState::default(),
             buf: Vec::new(),
             scanned: 0,
             aborted: false,
-            emit_done: ingress == "openai",
-            egress_eventstream: egress == "bedrock",
-            ingress_eventstream: ingress == "bedrock",
+            emit_done,
+            egress_eventstream,
+            ingress_eventstream,
             started_at: None,
             openai_chunk_identity: None,
             bedrock_metadata_emitted: false,

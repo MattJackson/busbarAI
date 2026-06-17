@@ -1074,14 +1074,19 @@ fn ssrf_blocked_host(
     // The hardcoded metadata IP literals.
     //  * link-local `169.254.0.0/16` (IMDS `169.254.169.254`, ECS `169.254.170.2`, Tencent
     //    `169.254.0.23`, …);
-    //  * Alibaba `100.100.100.200`; Azure `168.63.129.16`; EC2 IMDSv6 `fd00:ec2::254`.
+    //  * Alibaba `100.100.100.200`; Azure `168.63.129.16`; Oracle Cloud (OCI) `192.0.0.192`;
+    //    EC2 IMDSv6 `fd00:ec2::254`.
     let imds_v6 = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x254);
     let alibaba_v4 = Ipv4Addr::new(100, 100, 100, 200);
     let azure_v4 = Ipv4Addr::new(168, 63, 129, 16);
-    // Predicate: is this PARSED v4 address a hardcoded metadata target? (link-local /16 + the two
+    // OCI's IMDS lives at the globally-routable-shaped `192.0.0.192` — NOT caught by link-local /
+    // private / CGNAT / unspecified, so it needs an explicit literal like Alibaba/Azure.
+    let oci_v4 = Ipv4Addr::new(192, 0, 0, 192);
+    // Predicate: is this PARSED v4 address a hardcoded metadata target? (link-local /16 + the
     // non-link-local literals.)
-    let is_metadata_v4 =
-        |v4: &Ipv4Addr| -> bool { v4.is_link_local() || *v4 == alibaba_v4 || *v4 == azure_v4 };
+    let is_metadata_v4 = |v4: &Ipv4Addr| -> bool {
+        v4.is_link_local() || *v4 == alibaba_v4 || *v4 == azure_v4 || *v4 == oci_v4
+    };
 
     // Alternate / non-canonical IPv4 encodings (decimal int `2852039166` = 169.254.169.254, hex,
     // octal, short dotted) that `IpAddr::from_str` rejects but the OS resolver still maps to an IPv4
@@ -1123,6 +1128,7 @@ pub(crate) fn metadata_denylist_entries() -> Vec<String> {
         "169.254.0.0/16",
         "100.100.100.200", // Alibaba Cloud ECS
         "168.63.129.16",   // Azure WireServer / platform
+        "192.0.0.192",     // Oracle Cloud (OCI) IMDS
         "fd00:ec2::254",   // AWS EC2 IMDSv6
         "metadata.google.internal",
         "metadata.internal",

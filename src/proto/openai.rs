@@ -1643,6 +1643,12 @@ impl ProtocolWriter for OpenAiWriter {
         crate::forward::EGRESS_UA_OPENAI
     }
 
+    fn emits_sse_done_terminator(&self) -> bool {
+        // OpenAI Chat Completions SSE ends with a literal `data: [DONE]` frame; busbar reproduces it
+        // when emitting an openai-format stream to an openai-ingress client.
+        true
+    }
+
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
         Box::new(self.clone())
     }

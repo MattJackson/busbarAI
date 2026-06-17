@@ -93,7 +93,7 @@ fn maybe_attach_anthropic_request_id(
         .map(|s| s.to_string())
         .or_else(crate::proto::synth_anthropic_request_id)
     {
-        Some(id) => rb.header("request-id", id),
+        Some(id) => rb.header(crate::proto::HDR_REQUEST_ID, id),
         None => rb,
     }
 }
@@ -1652,7 +1652,15 @@ async fn pick_among(
             let pos = (stable_hash(k) as usize) % cands.len();
             let sticky = cands[pos].idx;
 
-            if !request_ctx.excluded.contains(&sticky) && app.store.usable_in(pool_name, sticky, t)
+            // DRAIN (`weight: 0`): an operator weights a member to 0 to bleed it off before
+            // decommission. SWRR (`select_weighted_for`) and the routing-policy preferred walk both
+            // already exclude a 0-weight candidate; this sticky fast-path must too, else a session
+            // whose hash lands on a drained-but-breaker-healthy member keeps pinning to it on the
+            // NORMAL path — silently defeating drain. `usable_in`/`lane_admissible` only consult
+            // dead/budget/breaker, never weight, so gate on the candidate's weight here.
+            if cands[pos].weight != 0
+                && !request_ctx.excluded.contains(&sticky)
+                && app.store.usable_in(pool_name, sticky, t)
             {
                 // CLASS GUARD (single-flight recovery probe), sticky fast path: `usable_in` →
                 // `cell_acquire_breaker` transitions an expired-Open lane to HalfOpen and CAS-wins
@@ -1965,8 +1973,12 @@ pub(crate) fn lane_auth_headers(
 // against the latest published SDK release (PyPI / Crates.io / etc.) and bump as needed; the test
 // guard ensures this block can never change unnoticed.
 //
-// Anthropic Python SDK UA shape (api.anthropic.com).
-pub(crate) const EGRESS_UA_ANTHROPIC: &str = "anthropic-sdk-python/0.39.0";
+// Anthropic Python SDK UA shape (api.anthropic.com). The official SDK is Stainless-generated and
+// emits `<Title>/Python <ver>` — `Anthropic/Python <ver>` — the SAME grammar as the OpenAI SDK below,
+// NOT a `anthropic-sdk-python/<ver>` shape (which no released Anthropic SDK has ever sent). Emitting
+// the wrong shape was a wire tell that distinguished busbar-proxied traffic from a native client on
+// the User-Agent alone — the egress-UA tests now also assert the shared `<Title>/Python <ver>` grammar.
+pub(crate) const EGRESS_UA_ANTHROPIC: &str = "Anthropic/Python 0.39.0";
 // OpenAI Python SDK shape; the Responses API is served by the same SDK/UA.
 pub(crate) const EGRESS_UA_OPENAI: &str = "OpenAI/Python 1.54.0";
 // Google GenAI SDK shape (generativelanguage.googleapis.com).
@@ -3107,7 +3119,7 @@ pub(crate) async fn forward_with_pool(
                 // forwards it verbatim; cross-protocol/synthetic cases mint one in the attach helper.
                 let upstream_request_id = r
                     .headers()
-                    .get("request-id")
+                    .get(crate::proto::HDR_REQUEST_ID)
                     .and_then(|h| h.to_str().ok())
                     .map(|s| s.to_string());
                 let is_sse = ct
@@ -3775,7 +3787,7 @@ async fn forward_once(
             // cross-protocol synthesizes). See `maybe_attach_anthropic_request_id`.
             let upstream_request_id = r
                 .headers()
-                .get("request-id")
+                .get(crate::proto::HDR_REQUEST_ID)
                 .and_then(|h| h.to_str().ok())
                 .map(|s| s.to_string());
             let cross_protocol = ingress_protocol != egress_name;
@@ -5754,6 +5766,21 @@ mod ingress_indistinguishability_tests {
             assert!(
                 ua.chars().any(|c| c.is_ascii_digit()),
                 "{p} egress UA must carry a version number: {ua}"
+            );
+        }
+        // D-FIND-1: the Stainless-generated Python SDKs (OpenAI + Anthropic) emit the SAME
+        // `<Title>/Python <ver>` grammar. Emitting a different shape for one (the old
+        // `anthropic-sdk-python/<ver>`) was a wire tell distinguishing proxied from native traffic.
+        // Assert BOTH match the shared grammar so the anthropic UA can never silently drift back.
+        for ua in [super::EGRESS_UA_ANTHROPIC, super::EGRESS_UA_OPENAI] {
+            let (title, rest) = ua.split_once('/').expect("Python-SDK UA contains a '/'");
+            assert!(
+                title.chars().next().is_some_and(|c| c.is_ascii_uppercase()),
+                "Stainless Python SDK UA must start with a capitalized Title: {ua}"
+            );
+            assert!(
+                rest.starts_with("Python "),
+                "Stainless Python SDK UA must be `<Title>/Python <ver>`: {ua}"
             );
         }
     }
@@ -8255,6 +8282,49 @@ mod ordered_walk_tests {
             WeightedLane { idx: 1, weight: 1 },
             WeightedLane { idx: 2, weight: 1 },
         ]
+    }
+
+    /// DRAIN (D-FIND-2): a `weight: 0` member must NOT be selected via the session-affinity sticky
+    /// fast-path — mirroring SWRR (`select_weighted_for`) and the routing-policy walk, which both
+    /// already exclude weight 0. Before the fix the sticky path consulted only dead/budget/breaker
+    /// (never weight), so a session whose hash landed on a drained-but-breaker-healthy member kept
+    /// pinning to it on the NORMAL path, silently defeating the operator's drain. Found by the
+    /// Phase-D Opus adversarial pass; missed by single-dimension audits because no test paired a
+    /// non-None affinity key with a weight-0 candidate.
+    #[tokio::test]
+    async fn sticky_affinity_never_selects_zero_weight_drained_member() {
+        let app = three_lane_app();
+        // Single candidate, weight 0 (fully drained). The affinity key hashes to pos 0 (the only
+        // candidate), so the sticky path is exercised ON the drained lane. With the drain gate it is
+        // skipped, and SWRR (which also excludes weight 0) finds nothing → None. WITHOUT the gate this
+        // returned `Some((0, _))` — the bug. (Deterministic: 1 candidate ⇒ pos is always 0.)
+        let drained_only = vec![WeightedLane { idx: 0, weight: 0 }];
+        let mut rc = RequestCtx::new(60);
+        let picked = pick_among(&app, &drained_only, &mut rc, Some("session-abc"), "p", None).await;
+        assert!(
+            picked.is_none(),
+            "a drained (weight 0) member must never be stickily selected; got {:?}",
+            picked.map(|(i, _)| i)
+        );
+
+        // Realistic drain: lane 0 drained, lane 1 healthy. For EVERY affinity key the result is lane 1
+        // — whatever the hash position, the drained lane 0 is never returned (skipped on the sticky
+        // path, excluded by SWRR), and selection falls through to the healthy lane.
+        let drained_and_healthy = vec![
+            WeightedLane { idx: 0, weight: 0 },
+            WeightedLane { idx: 1, weight: 1 },
+        ];
+        for key in ["s1", "s2", "session-xyz", "abc", "00000", "user-42"] {
+            let mut rc = RequestCtx::new(60);
+            let (idx, _permit) =
+                pick_among(&app, &drained_and_healthy, &mut rc, Some(key), "p", None)
+                    .await
+                    .expect("the healthy lane is selectable");
+            assert_eq!(
+                idx, 1,
+                "key {key:?} must route to the healthy lane, never the drained (weight 0) one"
+            );
+        }
     }
 
     /// The walk dispatches to the FIRST ranked lane that is healthy: order [2,0,1] all-healthy ⇒ 2.
