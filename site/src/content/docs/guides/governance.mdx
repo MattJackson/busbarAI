@@ -1,0 +1,109 @@
+---
+title: Governance
+description: Budgets, rate limits, spend tracking, and pool access — what they do and how to turn them on.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Governance gives you a control plane over **who** can use **which** models and **how much**.
+It's off by default; turn it on when you need budgets, rate limits, spend visibility, or access
+control. Each capability below has two views — read **What it does** for the why, flip to
+**Configure it** for the exact YAML and commands.
+
+## Virtual keys, budgets & spend
+
+<Tabs>
+  <TabItem label="What it does">
+    Busbar issues **virtual keys** — scoped bearer tokens your applications present instead of a raw
+    client token. Each key carries its own **budget** (a spend cap over a `total`, `daily`, or
+    `monthly` window) and its own **spend tracking** (running spend, tokens, and requests).
+
+    Spend is computed from a price you set: a flat charge per request, plus a per-1,000-token charge
+    accrued from each response's usage. Budgets are a **soft guard** — usage is reconciled after the
+    response, so concurrent in-flight requests can overshoot a cap by a bounded amount; Busbar fails
+    *open* on a store error rather than dropping your traffic.
+
+    **Why it matters:** you get per-key cost attribution and caps without trusting every developer
+    and deployment to self-police. A staging key can be capped at a monthly budget; a production key
+    runs uncapped. Secrets are stored only as SHA-256 hashes and shown in plaintext exactly once.
+
+    *Scope: control is per **key**. Busbar doesn't model users, teams, or per-model budgets — the
+    virtual key is your unit of control.*
+  </TabItem>
+  <TabItem label="Configure it">
+    Enable governance and set pricing + the admin token in `config.yaml`:
+
+    ```yaml
+    governance:
+      enabled: true
+      admin_token: "${BUSBAR_ADMIN_TOKEN}"   # guards /admin; unset = admin API off
+      price_per_request_cents: 1             # flat charge per request (default 1)
+      price_per_1k_tokens_cents: 20          # + per 1k input+output tokens (default 0)
+      db_path: busbar-governance.db          # SQLite store (default)
+    ```
+
+    Mint a key — budget and period are set at creation:
+
+    ```bash
+    curl -s http://localhost:8080/admin/keys \
+      -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN" \
+      -H "content-type: application/json" \
+      -d '{"name":"staging-app","max_budget_cents":50000,"budget_period":"monthly"}'
+    # → 201 with the secret, shown once. Store it now; only its SHA-256 is kept.
+    ```
+
+    Check spend any time; raise a budget with `PATCH`, revoke with `DELETE`:
+
+    ```bash
+    curl -s http://localhost:8080/admin/keys/<id>/usage \
+      -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN"
+    # → { "spend_cents": ..., "tokens": ..., "requests": ... }
+    ```
+  </TabItem>
+</Tabs>
+
+## Rate limits
+
+<Tabs>
+  <TabItem label="What it does">
+    Each virtual key can carry a **requests-per-minute (RPM)** and a **tokens-per-minute (TPM)** cap.
+    RPM is enforced **precisely** — the counter increments synchronously on admission. TPM is
+    best-effort under concurrency, since token counts are known only after the response.
+
+    **Why it matters:** you can rate-limit an internal tool independently of the production path, or
+    keep a noisy batch job from starving interactive traffic — per key, without writing limiter code.
+  </TabItem>
+  <TabItem label="Configure it">
+    Set limits at key creation (or update them later). Omit a field to leave it unlimited:
+
+    ```bash
+    curl -s http://localhost:8080/admin/keys \
+      -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN" \
+      -H "content-type: application/json" \
+      -d '{"name":"internal-tool","rpm_limit":120,"tpm_limit":200000}'
+    ```
+  </TabItem>
+</Tabs>
+
+## Model access
+
+<Tabs>
+  <TabItem label="What it does">
+    A key's **`allowed_pools`** list restricts which pools it may target. An empty list means all
+    pools are allowed. Access is scoped to **pools** — the named routing targets you define — not to
+    individual models or named access groups.
+
+    **Why it matters:** a cheap-staging key can be locked to a low-cost pool; a partner key can be
+    fenced to exactly the pools you intend to expose, with no way to reach the rest.
+  </TabItem>
+  <TabItem label="Configure it">
+    ```bash
+    curl -s http://localhost:8080/admin/keys \
+      -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN" \
+      -H "content-type: application/json" \
+      -d '{"name":"partner-key","allowed_pools":["public-fast","public-smart"]}'
+    ```
+
+    The key now returns `403` if it targets any pool outside that list.
+  </TabItem>
+</Tabs>

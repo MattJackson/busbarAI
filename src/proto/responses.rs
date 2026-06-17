@@ -19,13 +19,13 @@ const MAX_OUTPUT_INDEX: usize = 127;
 /// omits it, making the omission a distinguishability tell. On any cross-protocol path
 /// (Anthropic→Responses, Bedrock→Responses) the IR `model` is `None`; emit this fallback rather
 /// than dropping the key. Mirrors `openai.rs::DEFAULT_MODEL`.
-const DEFAULT_MODEL: &str = "gpt-4o";
+const DEFAULT_MODEL: &str = crate::proto::OPENAI_FAMILY_DEFAULT_MODEL;
 
 /// Hard cap on the number of DISTINCT output indices tracked per stream in `StreamDecodeState`
 /// (`open_tools`) and in the writer's open-item sets. Bounds per-request memory against a
 /// pathological backend that emits a unique `output_index` per event (a per-connection amplification
 /// DoS). Matches `openai.rs::MAX_OPEN_TOOLS` (OpenAI's documented parallel-tool-call limit, 128).
-const MAX_OPEN_TOOLS: usize = 128;
+const MAX_OPEN_TOOLS: usize = crate::proto::OPENAI_FAMILY_MAX_OPEN_TOOLS;
 
 /// Key offset under which the streaming reader tracks OPEN TEXT output indices inside the shared
 /// `StreamDecodeState::open_tools` set. A native /v1/responses stream can carry MULTIPLE message
@@ -39,11 +39,12 @@ const MAX_OPEN_TOOLS: usize = 128;
 /// offset text key (>=1000) can never collide; the function-call routing guards
 /// (`open_tools.contains(&idx)`) keep matching only raw tool indices, and the terminal arm
 /// distinguishes a tool close (`remove(&idx)`) from a text close (`remove(&(idx + offset))`).
-const TEXT_INDEX_KEY_OFFSET: usize = 1000;
+const TEXT_INDEX_KEY_OFFSET: usize = 1_000;
 
-/// Lowercase+uppercase+digit base62 alphabet — the character class native Responses ids draw their
-/// opaque suffix from. Shared by [`synthesize_item_id`] and [`synthesize_response_id`].
-const BASE62: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+/// Base62 alphabet the native Responses ids draw their opaque suffix from — the shared
+/// single-source-of-truth atom (see `crate::proto::BASE62_ALPHABET`), aliased locally. Used by
+/// [`synthesize_item_id`] and [`synthesize_response_id`].
+const BASE62: &[u8; 62] = crate::proto::BASE62_ALPHABET;
 
 /// Width of the opaque base62 suffix on a synthesized item id (`msg_…`/`fc_…`). Native Responses
 /// item ids carry a long opaque random token with no positional structure; 48 base62 chars matches
@@ -93,7 +94,7 @@ fn synth_token<const N: usize>() -> String {
     // Largest multiple of 62 that fits in a u8 (62 * 4). A byte in `0..REJECT_THRESHOLD` maps to a
     // base62 digit with NO modular bias; a byte >= this threshold (248..=255) is rejected so every
     // base62 character stays equiprobable. See the docstring for the bias rationale.
-    const REJECT_THRESHOLD: u8 = 248;
+    const REJECT_THRESHOLD: u8 = crate::proto::BASE62_REJECT_THRESHOLD;
 
     let mut token = [b'0'; N];
     for slot in token.iter_mut() {
@@ -161,31 +162,6 @@ fn synthesize_response_id() -> String {
     format!("resp_{}", synth_token::<RESPONSE_ID_TOKEN_LEN>())
 }
 
-/// Parse a Responses `image_url` string into an IR `(media_type, data)` pair.
-///
-/// A base64 data URI (`data:<mime>;base64,<payload>`) is split on the FIRST comma — the single `;`
-/// canonical shape has only two `;`-delimited fields, so the previous `splitn(3, ';')` logic could
-/// never recover the payload and silently dropped every image. We take the MIME type from the
-/// metadata before the comma and the base64 payload after it, matching `openai.rs`'s
-/// `parse_image_url`. Any non-data URL (an https reference, or a data URI we cannot confidently
-/// split) is preserved verbatim in `data` with the `image_url` media_type sentinel so the writer can
-/// reconstruct the exact original `image_url` on a same-protocol round-trip — never a human-readable
-/// comment embedded in the payload.
-fn parse_image_url(url: &str) -> (String, String) {
-    if let Some(rest) = url.strip_prefix("data:") {
-        if let Some((meta, payload)) = rest.split_once(',') {
-            // meta is e.g. "image/png;base64" or "image/png" — keep only the MIME type.
-            let media_type = meta.split(';').next().unwrap_or("").to_string();
-            if meta.contains("base64") && !media_type.is_empty() {
-                return (media_type, payload.to_string());
-            }
-        }
-    }
-    // Non-data URL (https://...) or an unrecognized data URI: keep it verbatim under the
-    // `image_url` sentinel so the writer round-trips it as-is rather than mangling it.
-    ("image_url".to_string(), url.to_string())
-}
-
 /// Accumulate the content of a Responses `system`/`developer` input turn into `system_blocks`
 /// (which feeds `IrRequest.system` -> the provider's top-level instructions/system prompt).
 /// These turns are NOT conversation messages; routing their text here prevents the system prompt
@@ -240,49 +216,57 @@ fn message_content_blocks(content: Option<&serde_json::Value>) -> Option<Vec<cra
     }
 }
 
-/// Reconstruct a Responses `image_url` string from the IR `Image` (media_type, data) pair — the
-/// inverse of [`parse_image_url`]. A URL-sentinel image is emitted verbatim; a base64 image is
-/// re-wrapped into a `data:<mime>;base64,<payload>` URI.
-fn image_url_from_ir(media_type: &str, data: &str) -> String {
-    if media_type == "image_url" {
-        data.to_string()
-    } else {
-        format!("data:{media_type};base64,{data}")
+/// Normalize the Responses API `tool_choice` into the IR union (PF-H1).
+///
+/// The Responses surface shares Chat Completions' string forms (`"auto"`/`"none"`/`"required"`) but
+/// FLATTENS the targeted object: `{"type":"function","name":"X"}` carries `name` at the top level
+/// (Chat nests it under `function`). Accept both shapes (flat preferred, nested as a defensive
+/// fallback) so a forced/targeted tool survives the cross-protocol seam instead of degrading to
+/// `auto`. Absent / unrecognized → `None` (omitted), so a request that never carried a directive does
+/// not gain a spurious one.
+fn read_responses_tool_choice(val: Option<&serde_json::Value>) -> Option<crate::ir::IrToolChoice> {
+    match val? {
+        serde_json::Value::String(s) => match s.as_str() {
+            "auto" => Some(crate::ir::IrToolChoice::Auto),
+            "none" => Some(crate::ir::IrToolChoice::None),
+            "required" => Some(crate::ir::IrToolChoice::Required),
+            _ => None,
+        },
+        serde_json::Value::Object(o) => {
+            if o.get("type").and_then(|t| t.as_str()) == Some("function") {
+                o.get("name")
+                    .and_then(|n| n.as_str())
+                    .or_else(|| {
+                        o.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                    })
+                    .map(|name| crate::ir::IrToolChoice::Tool {
+                        name: name.to_string(),
+                    })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Emit the IR tool-choice union in the Responses API's native shape (PF-H1) — string forms for
+/// auto/none/required, the FLAT `{"type":"function","name":...}` object for a targeted tool.
+fn write_responses_tool_choice(tc: &crate::ir::IrToolChoice) -> serde_json::Value {
+    match tc {
+        crate::ir::IrToolChoice::Auto => serde_json::json!("auto"),
+        crate::ir::IrToolChoice::None => serde_json::json!("none"),
+        crate::ir::IrToolChoice::Required => serde_json::json!("required"),
+        crate::ir::IrToolChoice::Tool { name } => {
+            serde_json::json!({"type": "function", "name": name})
+        }
     }
 }
 
 /// Derive the native `error.code` value for a Responses/OpenAI `error.type`.
 ///
-/// The `/v1/responses` surface shares the OpenAI error envelope, and a real bad-key 401 returns
-/// `{"type":"authentication_error", ..., "code":"invalid_api_key"}` — the official SDKs surface
-/// `error.code` (e.g. `AuthenticationError.code`) to callers, so emitting `code: null` on an auth
-/// failure is a deterministic proxy tell that contradicts the total-indistinguishability promise.
-/// This mirrors `openai.rs::openai_error_code` (the sibling writer fixed this exact case) so the
-/// two surfaces stay consistent. Every other type keeps `null` — the shape OpenAI uses when no
-/// machine-readable code applies. No `_ =>` catch-all: the final arm explicitly binds and handles
-/// all remaining (including caller-passthrough) types by emitting `null`, the correct native value.
-fn responses_error_code(error_type: &str) -> serde_json::Value {
-    match error_type {
-        "authentication_error" => serde_json::Value::String("invalid_api_key".to_string()),
-        // Native OpenAI/Responses carries a populated machine-readable `code` for the over-quota
-        // path: `{"type":"insufficient_quota","code":"insufficient_quota"}`. Emitting `null` here
-        // (as the older code did) was a fingerprintable divergence on the budget-exceeded 429.
-        "insufficient_quota" => serde_json::Value::String("insufficient_quota".to_string()),
-        "invalid_request_error"
-        | "permission_error"
-        | "not_found_error"
-        | "rate_limit_error"
-        | "server_error" => serde_json::Value::Null,
-        other => {
-            // A caller-supplied passthrough type we model no code for: OpenAI carries no
-            // machine-readable code for these, so `null` matches the native shape. Named binding
-            // (not `_`) keeps the arm explicit per the no-catch-all rule.
-            let _ = other;
-            serde_json::Value::Null
-        }
-    }
-}
-
 /// Map a terminal `response.failed` provider signal (the captured `error.code`/`error.type`) to the
 /// breaker `StatusClass` that drives disposition and failover.
 ///
@@ -343,19 +327,25 @@ impl ProtocolReader for ResponsesReader {
         // path, so the common case flows straight through. But some upstreams (and the OpenAI
         // Chat-Completions-shaped surface this proxy also fronts) signal the same condition only via
         // the error MESSAGE — e.g. `This model's maximum context length is 8192 tokens...` — with a
-        // null or generic `code`. Mirror anthropic.rs: when no canonical code was parsed, scan the
-        // body for the protocol's context-length phrasing and synthesize the canonical code so the
-        // breaker pipeline (normalize_raw_error, breaker.rs ~122) → StatusClass::ContextLength and
-        // oversized-request failover triggers WITHOUT penalizing the lane. This is the production
+        // null or generic `code`. Mirror openai.rs / anthropic.rs: when no canonical code was parsed,
+        // scan the body for the protocol's context-length phrasing and synthesize the canonical code
+        // so the breaker pipeline (normalize_raw_error, breaker.rs ~122) → StatusClass::ContextLength
+        // and oversized-request failover triggers WITHOUT penalizing the lane. This is the production
         // counterpart of the `#[cfg(test)] classify()` helper's message scan below.
+        //
+        // GATE the message scan to the HTTP statuses an oversized request actually uses (400
+        // invalid_request_error; 413 payload-too-large), mirroring `OpenAiReader::extract_error`.
+        // Without the gate a 401/429/5xx whose prose happens to contain "maximum context length"
+        // would synthesize `context_length_exceeded` → the breaker maps it to ContextLength → the
+        // genuine auth/rate-limit/server failure escapes fault attribution (no fault recorded).
         let provider_code = provider_code.or_else(|| {
+            let oversized_status =
+                status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE;
+            if !oversized_status {
+                return None;
+            }
             let lower = String::from_utf8_lossy(body).to_lowercase();
-            if lower.contains("maximum context length")
-                || lower.contains("reduce the length")
-                || lower.contains("context length exceeded")
-                || (lower.contains("exceeds")
-                    && (lower.contains("context") || lower.contains("token limit")))
-            {
+            if super::openai_context_length_prose_scan(&lower) {
                 Some("context_length_exceeded".to_string())
             } else {
                 None
@@ -372,65 +362,9 @@ impl ProtocolReader for ResponsesReader {
 
     #[cfg(test)]
     fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal {
-        let code_is_context = serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
-            .and_then(|j| {
-                j.get("error")
-                    .and_then(|e| e.get("code"))
-                    .and_then(|c| c.as_str())
-                    .map(|s| s.to_string())
-            })
-            .as_deref()
-            == Some("context_length_exceeded");
-        if code_is_context
-            || String::from_utf8_lossy(body)
-                .to_lowercase()
-                .contains("maximum context length")
-        {
-            return CanonicalSignal {
-                class: StatusClass::ContextLength,
-                provider_signal: Some("context_length".to_string()),
-                retry_after: None,
-            };
-        }
-
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return CanonicalSignal {
-                class: StatusClass::RateLimit,
-                provider_signal: Some("429".to_string()),
-                retry_after: None,
-            };
-        }
-
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return CanonicalSignal {
-                class: StatusClass::Auth,
-                provider_signal: Some("auth".to_string()),
-                retry_after: None,
-            };
-        }
-
-        if status.is_server_error() {
-            return CanonicalSignal {
-                class: StatusClass::ServerError,
-                provider_signal: Some("5xx".to_string()),
-                retry_after: None,
-            };
-        }
-
-        if status.is_client_error() {
-            return CanonicalSignal {
-                class: StatusClass::ClientError,
-                provider_signal: Some(format!("{}", status.as_u16())),
-                retry_after: None,
-            };
-        }
-
-        CanonicalSignal {
-            class: StatusClass::ClientError,
-            provider_signal: None,
-            retry_after: None,
-        }
+        // Identical to OpenAiReader::classify — both emit the same OpenAI error envelope, so the
+        // mapping is single-sourced in `super::openai_classify`.
+        super::openai_classify(status, body)
     }
 
     fn read_request(&self, body: &serde_json::Value) -> Result<crate::ir::IrRequest, IrError> {
@@ -495,7 +429,7 @@ impl ProtocolReader for ResponsesReader {
                         Some("input_image") => {
                             let image_url =
                                 item.get("image_url").and_then(|u| u.as_str()).unwrap_or("");
-                            let (media_type, data) = parse_image_url(image_url);
+                            let (media_type, data) = super::parse_image_url(image_url);
                             messages.push(crate::ir::IrMessage {
                                 role: crate::ir::IrRole::User,
                                 content: vec![crate::ir::IrBlock::Image { media_type, data }],
@@ -544,6 +478,7 @@ impl ProtocolReader for ResponsesReader {
                                     id: call_id,
                                     name,
                                     input,
+                                    cache_control: None,
                                 }],
                             });
                         }
@@ -576,6 +511,7 @@ impl ProtocolReader for ResponsesReader {
                                     tool_use_id: call_id,
                                     content: content_blocks,
                                     is_error: false,
+                                    cache_control: None,
                                 }],
                             });
                         }
@@ -683,6 +619,7 @@ impl ProtocolReader for ResponsesReader {
                     name,
                     description,
                     input_schema,
+                    cache_control: None,
                 });
             }
         }
@@ -703,6 +640,10 @@ impl ProtocolReader for ResponsesReader {
         let top_p = obj.get("top_p").and_then(|v| v.as_f64());
         // The Responses API carries `stream` in the request body — read it (don't drop the intent).
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+        // `tool_choice` (PF-H1): promote to the IR union so a forced/targeted directive survives the
+        // cross-protocol seam instead of degrading to `auto`. "tool_choice" is added to the modeled
+        // keys below so it does not also linger in `extra`.
+        let tool_choice = read_responses_tool_choice(obj.get("tool_choice"));
 
         // NOTE: `metadata` is deliberately NOT in this exclusion set. The Responses API accepts a
         // top-level `metadata` object (user-defined key/value tagging used for audit logging and
@@ -718,6 +659,7 @@ impl ProtocolReader for ResponsesReader {
             "temperature",
             "top_p",
             "stream",
+            "tool_choice",
         ]
         .iter()
         .cloned()
@@ -742,6 +684,7 @@ impl ProtocolReader for ResponsesReader {
             top_p,
             top_k: None,
             stop: vec![],
+            tool_choice,
             stream,
             extra,
         })
@@ -1317,6 +1260,7 @@ impl ProtocolReader for ResponsesReader {
                             id: call_id,
                             name,
                             input,
+                            cache_control: None,
                         });
                     }
 
@@ -1416,7 +1360,7 @@ fn responses_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, 
         }
         "input_image" => {
             let image_url = obj.get("image_url").and_then(|v| v.as_str()).unwrap_or("");
-            let (media_type, data) = parse_image_url(image_url);
+            let (media_type, data) = super::parse_image_url(image_url);
             Ok(crate::ir::IrBlock::Image { media_type, data })
         }
         _ => Err(IrError {
@@ -1942,17 +1886,10 @@ impl ProtocolWriter for ResponsesWriter {
     }
 
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
-        vec![(
-            HeaderName::from_static("authorization"),
-            HeaderValue::from_str(&format!("Bearer {key}"))
-                .unwrap_or_else(|_| HeaderValue::from_static("")),
-        )]
-    }
-
-    fn rewrite_model(&self, body: &mut serde_json::Value, model: &str) {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("model".to_string(), serde_json::json!(model));
-        }
+        // Shared warn+OMIT policy: a credential with bytes invalid for an HTTP header value is
+        // dropped (with a protocol-named warn, never the key bytes) rather than emitting an empty
+        // `Authorization:` tell. See `super::bearer_auth_headers`.
+        super::bearer_auth_headers("responses", key)
     }
 
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
@@ -2008,13 +1945,15 @@ impl ProtocolWriter for ResponsesWriter {
                                 // emitted verbatim, a base64 image is re-wrapped as a data URI. This
                                 // is the inverse of `parse_image_url` so a same-protocol round-trip
                                 // is lossless.
-                                let image_url = image_url_from_ir(media_type, data);
+                                let image_url = super::image_url_from_ir(media_type, data);
                                 content_arr.push(serde_json::json!({
                                     "type": "input_image",
                                     "image_url": image_url
                                 }));
                             }
-                            crate::ir::IrBlock::ToolUse { id, name, input } => {
+                            crate::ir::IrBlock::ToolUse {
+                                id, name, input, ..
+                            } => {
                                 let args_str = serde_json::to_string(input)
                                     .unwrap_or_else(|_| "{}".to_string());
                                 tool_items.push(serde_json::json!({
@@ -2028,6 +1967,7 @@ impl ProtocolWriter for ResponsesWriter {
                                 tool_use_id,
                                 content,
                                 is_error: _,
+                                ..
                             } => {
                                 // Concatenate adjacent text blocks WITHOUT a separator: a space
                                 // between fragments corrupts base64 / split JSON payloads.
@@ -2072,6 +2012,7 @@ impl ProtocolWriter for ResponsesWriter {
                             tool_use_id,
                             content,
                             is_error: _,
+                            ..
                         } = block
                         {
                             // Concatenate adjacent text blocks WITHOUT a separator: a space
@@ -2124,6 +2065,12 @@ impl ProtocolWriter for ResponsesWriter {
                 tools_arr.push(serde_json::Value::Object(tool_obj));
             }
             out.insert("tools".to_string(), serde_json::Value::Array(tools_arr));
+        }
+
+        // Emit `tool_choice` (PF-H1) in the Responses native shape when present so a forced/targeted
+        // directive translated from another protocol does not silently degrade to `auto`.
+        if let Some(tc) = &req.tool_choice {
+            out.insert("tool_choice".to_string(), write_responses_tool_choice(tc));
         }
 
         if let Some(max_tokens) = req.max_tokens {
@@ -2665,7 +2612,9 @@ impl ProtocolWriter for ResponsesWriter {
                         }]
                     }));
                 }
-                crate::ir::IrBlock::ToolUse { id, name, input } => {
+                crate::ir::IrBlock::ToolUse {
+                    id, name, input, ..
+                } => {
                     let args_str =
                         serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                     output_arr.push(serde_json::json!({
@@ -2800,7 +2749,7 @@ impl ProtocolWriter for ResponsesWriter {
             "error": {
                 "message": message,
                 "type": error_type,
-                "code": responses_error_code(error_type),
+                "code": bearer_error_code(error_type),
                 "param": serde_json::Value::Null,
             }
         })
@@ -2838,6 +2787,7 @@ mod tests {
                         id: "fc_1".to_string(),
                         name: "get_weather".to_string(),
                         input: serde_json::json!({"city": "SF"}),
+                        cache_control: None,
                     }],
                 },
                 crate::ir::IrMessage {
@@ -2850,6 +2800,7 @@ mod tests {
                             citations: Vec::new(),
                         }],
                         is_error: false,
+                        cache_control: None,
                     }],
                 },
             ],
@@ -2861,12 +2812,14 @@ mod tests {
                     "properties": {"city": {"type": "string"}},
                     "required": ["city"]
                 }),
+                cache_control: None,
             }],
             max_tokens: Some(1024),
             temperature: Some(0.7),
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3084,6 +3037,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3126,6 +3080,19 @@ mod tests {
         assert_eq!(headers[0].1.to_str().unwrap(), "Bearer sk-test");
     }
 
+    /// Warn+OMIT policy (`proto::bearer_auth_headers`): a key with bytes invalid for an HTTP header
+    /// value (embedded newline) must OMIT the header entirely (empty Vec), never emit an empty
+    /// `authorization` value (a syntactically invalid header AND a fingerprinting tell). No panic.
+    #[test]
+    fn auth_headers_invalid_key_omits_header_no_panic() {
+        let writer = ResponsesWriter;
+        let headers = writer.auth_headers("sk-bad\nkey");
+        assert!(
+            headers.is_empty(),
+            "an invalid key must omit the auth header, not emit an empty value"
+        );
+    }
+
     #[test]
     fn test_read_response_decode() {
         let json = serde_json::json!({
@@ -3161,7 +3128,9 @@ mod tests {
             _ => panic!("first block should be Text"),
         }
         match &resp.content[1] {
-            crate::ir::IrBlock::ToolUse { id, name, input } => {
+            crate::ir::IrBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "fc_1");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input.get("city").and_then(|v| v.as_str()), Some("SF"));
@@ -3248,6 +3217,7 @@ mod tests {
                 id: "call_abc".to_string(),
                 name: "get_weather".to_string(),
                 input: serde_json::json!({"city": "SF"}),
+                cache_control: None,
             }],
             stop_reason: Some("tool_use".to_string()),
             stop_sequence: None,
@@ -3338,6 +3308,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "get_weather".to_string(),
                     input: serde_json::json!({"city": "SF"}),
+                    cache_control: None,
                 },
                 crate::ir::IrBlock::Text {
                     text: "Here is the weather.".to_string(),
@@ -4127,6 +4098,7 @@ mod tests {
                     id: "fc_1".to_string(),
                     name: "get_weather".to_string(),
                     input: serde_json::json!({"city": "SF"}),
+                    cache_control: None,
                 }],
             }],
             tools: Vec::new(),
@@ -4135,6 +4107,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -4185,6 +4158,7 @@ mod tests {
                         id: "fc_9".to_string(),
                         name: "lookup".to_string(),
                         input: serde_json::json!({}),
+                        cache_control: None,
                     },
                 ],
             }],
@@ -4194,6 +4168,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -4480,6 +4455,7 @@ mod tests {
             tool_use_id: "call_1".to_string(),
             content: vec![text_block("AAA"), text_block("BBB")],
             is_error: false,
+            cache_control: None,
         };
 
         // Tool-role path.
@@ -4495,6 +4471,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -4522,6 +4499,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -4738,6 +4716,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -4791,6 +4770,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -4822,6 +4802,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream,
             extra: serde_json::Map::new(),
         };
@@ -6297,6 +6278,57 @@ mod tests {
         assert_eq!(raw.provider_code.as_deref(), Some("invalid_api_key"));
     }
 
+    /// Regression (MED/breaker-conformance): the message-only context-length synthesis is GATED to
+    /// the oversized HTTP statuses (400/413), mirroring `OpenAiReader::extract_error`. A 429 (or 401,
+    /// 5xx) whose prose happens to contain "maximum context length" must NOT synthesize
+    /// `context_length_exceeded` — otherwise the breaker maps it to ContextLength and the genuine
+    /// rate-limit/auth/server failure escapes fault attribution (no fault recorded). This test FAILS
+    /// on the un-gated code (which synthesized the code from the message regardless of status) and
+    /// passes with the status gate.
+    #[test]
+    fn test_extract_error_oversized_phrase_on_non_oversized_status_not_synthesized() {
+        let reader = ResponsesReader;
+        // A 429 whose body carries no canonical code but whose message contains the context-length
+        // phrase. The gate must block synthesis so this stays a rate-limit (not ContextLength).
+        let body = br#"{"error":{"message":"This model's maximum context length is 8192 tokens.","type":"rate_limit_error","code":null}}"#;
+        let raw = reader.extract_error(StatusCode::TOO_MANY_REQUESTS, body);
+        assert_eq!(
+            raw.provider_code.as_deref(),
+            None,
+            "a 429 mentioning context length must NOT be reclassified as context_length_exceeded"
+        );
+        // And the same body on a 401 must likewise not synthesize.
+        let raw_401 = reader.extract_error(StatusCode::UNAUTHORIZED, body);
+        assert_eq!(
+            raw_401.provider_code.as_deref(),
+            None,
+            "a 401 mentioning context length must NOT be reclassified as context_length_exceeded"
+        );
+    }
+
+    /// `ResponsesReader::classify` delegates to `super::openai_classify` (single-sourced after the R6
+    /// dedup). Every other reader has a direct `classify` test, but the Responses delegate was only
+    /// ever exercised through OpenAi's copy — this guards the delegation directly, mirroring
+    /// `test_openai_classify`. 429 → RateLimit.
+    #[test]
+    fn test_responses_classify_delegates() {
+        let reader = ResponsesReader;
+        let signal = reader.classify(StatusCode::TOO_MANY_REQUESTS, b"{}");
+        assert_eq!(signal.class, StatusClass::RateLimit);
+
+        // After the `openai_classify` oversized-status gate fix, a 429 whose body carries the
+        // context-length prose (but no canonical code) must classify as RateLimit, NOT ContextLength
+        // — the gate blocks the un-gated message scan from hijacking a genuine rate-limit signal.
+        let ctx_body =
+            br#"{"error":{"message":"This model's maximum context length is 8192 tokens."}}"#;
+        let signal = reader.classify(StatusCode::TOO_MANY_REQUESTS, ctx_body);
+        assert_eq!(
+            signal.class,
+            StatusClass::RateLimit,
+            "a 429 mentioning context length must stay RateLimit, not ContextLength"
+        );
+    }
+
     /// Regression (HIGH/conformance, Round 11): a max_tokens-truncated stream's terminal event must
     /// be `response.incomplete` (event name AND inner `type`), NOT `response.completed`. A native
     /// stream never wraps a `status:"incomplete"` response in a `response.completed` envelope; the
@@ -7707,5 +7739,68 @@ mod tests {
             "first-8 base62 digits must not be over-represented (group ratio={ratio:.4}; \
              ~1.25 indicates the biased `byte % 62` reduction). counts={counts:?}"
         );
+    }
+
+    // PF-H1: `tool_choice: "required"` must round-trip through the Responses reader into the IR
+    // union and back out the writer — not silently degrade to `auto`/omitted on the seam.
+    #[test]
+    fn test_responses_tool_choice_required_roundtrips() {
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [{"role": "user", "content": "hi"}],
+            "tool_choice": "required",
+        });
+        let reader = ResponsesReader;
+        let ir = reader.read_request(&json).expect("read_request");
+        assert_eq!(ir.tool_choice, Some(crate::ir::IrToolChoice::Required));
+        // It must NOT also linger in `extra` (modeled key).
+        assert!(!ir.extra.contains_key("tool_choice"));
+
+        let writer = ResponsesWriter;
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out.get("tool_choice").and_then(|v| v.as_str()),
+            Some("required")
+        );
+    }
+
+    // PF-H1: a targeted `{"type":"function","name":"X"}` (the Responses flat shape) must preserve the
+    // pinned tool name through the IR and re-emit it in the same flat shape.
+    #[test]
+    fn test_responses_tool_choice_specific_function() {
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "function", "name": "get_weather"},
+        });
+        let reader = ResponsesReader;
+        let ir = reader.read_request(&json).expect("read_request");
+        assert_eq!(
+            ir.tool_choice,
+            Some(crate::ir::IrToolChoice::Tool {
+                name: "get_weather".to_string()
+            })
+        );
+        let writer = ResponsesWriter;
+        let out = writer.write_request(&ir);
+        let tc = out.get("tool_choice").expect("tool_choice emitted");
+        assert_eq!(tc.get("type").and_then(|v| v.as_str()), Some("function"));
+        assert_eq!(tc.get("name").and_then(|v| v.as_str()), Some("get_weather"));
+    }
+
+    // A request with no `tool_choice` must yield `None` (omitted) and the writer must NOT synthesize
+    // a spurious directive — preserving the "absent stays absent" contract.
+    #[test]
+    fn test_responses_tool_choice_absent_is_none() {
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [{"role": "user", "content": "hi"}],
+        });
+        let reader = ResponsesReader;
+        let ir = reader.read_request(&json).expect("read_request");
+        assert_eq!(ir.tool_choice, None);
+        let writer = ResponsesWriter;
+        let out = writer.write_request(&ir);
+        assert!(out.get("tool_choice").is_none());
     }
 }

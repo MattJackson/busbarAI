@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.astro/
+# published from ../providers.yaml at build time
+public/providers.yaml
+# synced from ../docs at build time
+src/content/docs/getting-started.md
+src/content/docs/why-busbar.md
+src/content/docs/configuration.md
+src/content/docs/protocols.md
+src/content/docs/providers.md
+src/content/docs/reliability.md
+# synced from ../CHANGELOG.md at build time
+src/content/docs/changelog.md

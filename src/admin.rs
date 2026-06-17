@@ -81,6 +81,12 @@ pub(crate) struct CreateKeyReq {
     rpm_limit: Option<u32>,
     #[serde(default)]
     tpm_limit: Option<u32>,
+    /// When true, ALSO issue an AWS-style access-key-id + secret access key (the MinIO/S3-compatible
+    /// model) so a Bedrock-SDK client can authenticate to this key via inbound SigV4. Both the
+    /// `aws_access_key_id` and the `aws_secret_access_key` are returned ONCE here at creation; the
+    /// SECRET is never exposed again by any read API (mirroring the bearer `secret`). Defaults to false.
+    #[serde(default)]
+    issue_aws_credential: bool,
 }
 
 /// The budget periods `governance::budget_window` actually enforces. An unrecognized value (a typo
@@ -234,18 +240,39 @@ pub(crate) async fn create_key(
         tpm_limit: req.tpm_limit,
     };
     // Offload the blocking rusqlite write off the Tokio worker thread (matches the request-path
-    // discipline in governance::is_over_budget_async / offload_store_write).
+    // discipline in governance::charge_within_budget_async / offload_store_write).
     let gov = gov.clone();
     let now = crate::store::now();
-    let res = tokio::task::spawn_blocking(move || gov.create_key(spec, now)).await;
-    match res {
-        Ok(Ok((key, secret))) => {
-            let mut body = key_meta(&key);
-            body["secret"] = json!(secret); // shown exactly once
-            json_response(StatusCode::CREATED, body)
+    let issue_aws = req.issue_aws_credential;
+    // When AWS credentials are requested, mint via `create_key_with_aws` (issues the AccessKeyId +
+    // secret access key alongside the bearer secret). Otherwise the unchanged bearer-only mint.
+    if issue_aws {
+        let res = tokio::task::spawn_blocking(move || gov.create_key_with_aws(spec, now)).await;
+        match res {
+            Ok(Ok((key, secret, access_key_id, secret_access_key))) => {
+                let mut body = key_meta(&key);
+                body["secret"] = json!(secret); // bearer secret, shown exactly once
+                                                // The AccessKeyId is NOT secret (it travels in plaintext in the SigV4 header), but it
+                                                // is returned here at creation. The AWS SECRET access key is shown ONCE here only —
+                                                // never returned by any read API, mirroring the bearer `secret`.
+                body["aws_access_key_id"] = json!(access_key_id);
+                body["aws_secret_access_key"] = json!(secret_access_key);
+                json_response(StatusCode::CREATED, body)
+            }
+            Ok(Err(e)) => internal_error("create_key", &e),
+            Err(e) => join_error("create_key", &e),
         }
-        Ok(Err(e)) => internal_error("create_key", &e),
-        Err(e) => join_error("create_key", &e),
+    } else {
+        let res = tokio::task::spawn_blocking(move || gov.create_key(spec, now)).await;
+        match res {
+            Ok(Ok((key, secret))) => {
+                let mut body = key_meta(&key);
+                body["secret"] = json!(secret); // shown exactly once
+                json_response(StatusCode::CREATED, body)
+            }
+            Ok(Err(e)) => internal_error("create_key", &e),
+            Err(e) => join_error("create_key", &e),
+        }
     }
 }
 
@@ -503,6 +530,76 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_reads() {
+        // Minting with `issue_aws_credential: true` returns the AccessKeyId AND the secret access key
+        // ONCE at creation; neither the AWS secret nor the key_hash is ever returned by a later read.
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (addr, handle) = serve_with_gov(gov).await;
+        let client = reqwest::Client::new();
+
+        let created = client
+            .post(format!("http://{addr}/admin/keys"))
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"name": "bedrock-key", "issue_aws_credential": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+        let body: serde_json::Value = created.json().await.unwrap();
+        let akid = body["aws_access_key_id"].as_str().unwrap().to_string();
+        let aws_secret = body["aws_secret_access_key"].as_str().unwrap().to_string();
+        assert!(akid.starts_with("AKIA"), "akid shape: {akid}");
+        assert_eq!(aws_secret.len(), 40, "aws secret is 40 chars");
+        assert!(
+            body["secret"].is_string(),
+            "bearer secret returned once too"
+        );
+
+        // A plain mint (no flag) carries NO AWS fields.
+        let plain: serde_json::Value = client
+            .post(format!("http://{addr}/admin/keys"))
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"name": "plain"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            plain["aws_secret_access_key"].is_null() && plain["aws_access_key_id"].is_null(),
+            "a bearer-only key must not carry AWS fields: {plain}"
+        );
+
+        // The list endpoint must NEVER expose the AWS secret (nor key_hash).
+        let listed: serde_json::Value = client
+            .get(format!("http://{addr}/admin/keys"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let listed_str = listed.to_string();
+        assert!(
+            !listed_str.contains(&aws_secret),
+            "the AWS secret access key must NEVER appear in a read response: {listed_str}"
+        );
+        for k in listed["keys"].as_array().unwrap() {
+            assert!(
+                k["aws_secret_access_key"].is_null(),
+                "list must not leak the AWS secret"
+            );
+            assert!(k["key_hash"].is_null(), "list must not leak key_hash");
+        }
+
+        handle.abort();
     }
 
     #[tokio::test]
@@ -1373,6 +1470,24 @@ mod tests {
             window_start: u64,
         ) -> crate::governance::StoreResult<crate::governance::Usage> {
             self.inner.get_usage(key_id, window_start)
+        }
+        fn charge_within_budget(
+            &self,
+            key_id: &str,
+            window_start: u64,
+            cost_cents: i64,
+            max_cents: Option<i64>,
+        ) -> crate::governance::StoreResult<bool> {
+            self.inner
+                .charge_within_budget(key_id, window_start, cost_cents, max_cents)
+        }
+        fn refund_request(
+            &self,
+            key_id: &str,
+            window_start: u64,
+            cost_cents: i64,
+        ) -> crate::governance::StoreResult<()> {
+            self.inner.refund_request(key_id, window_start, cost_cents)
         }
     }
 

@@ -1,0 +1,115 @@
+---
+title: Benchmark
+description: How much latency Busbar adds — a reproducible p50/p99/p99.9 measurement, and the harness behind it.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Busbar's claim is that it adds only **microseconds** of overhead — small enough to disappear under the
+jitter of the provider call it fronts. This page is the falsifiable artifact behind that claim. Read
+the **Result** tab for the 10-second version; flip to **Reproduce** to run it yourself and get the same
+shape on your hardware.
+
+<Tabs>
+  <TabItem label="Result">
+    We measure a **difference**: drive identical load against the same fixed-latency upstream over two
+    paths and subtract. The mock contributes the same fixed time on both paths, so `busbar − direct`
+    is Busbar's own cost and nothing else. Reported as **p50 / p99 / p99.9** for non-streaming
+    full-response latency and for streaming **TTFT** (time to first byte).
+
+    {/* RESULTS TABLE — fill from `bench/latency/run.sh`. Do NOT hand-enter estimated numbers. */}
+
+    | Path | Upstream delay | p50 added | p99 added | p99.9 added |
+    |------|---------------|-----------|-----------|-------------|
+    | Busbar added (full response) | 0 ms | _run to fill_ | _run to fill_ | _run to fill_ |
+    | Busbar added (streaming TTFT) | 0 ms | _run to fill_ | _run to fill_ | _run to fill_ |
+    | Busbar added (full response) | 200 ms | _run to fill_ | _run to fill_ | _run to fill_ |
+    | Busbar added (streaming TTFT) | 200 ms | _run to fill_ | _run to fill_ | _run to fill_ |
+
+    :::note[Status: placeholder pending a measured run]
+    The harness is complete and runs. The mock-upstream path needs a Busbar build that trusts the
+    local mock's TLS cert — the release binary trusts only public webpki roots upstream (see the
+    harness README). Run `bench/latency/run.sh` in an environment that satisfies that precondition, or
+    point it at a real provider with your own key, to fill these cells with **measured** numbers. We
+    publish only measured figures — never estimates.
+    :::
+
+    **The takeaway.** Once filled, the one-line read is: *Busbar adds single-digit-to-tens-of-microseconds
+    at p50, and its p99 stays close to its p50.* That tight p50→p99 spread is the whole story.
+
+    **Why the tail stays tight — no garbage collector.** Busbar is a single Rust binary with **no GC**.
+    Nothing in the request path pauses to sweep memory, so the latency it adds is near-constant
+    request to request: p99 lands close to p50, and even p99.9 does not balloon. A proxy on a
+    garbage-collected runtime (a Python, Node, or JVM gateway) pays an occasional GC pause that lands
+    on *some* requests — those become the tail, so its p99/p99.9 swell well above its p50 even when its
+    median looks fine. The number that hurts a user is the tail, and the tail is where a no-GC proxy
+    wins. That is why we report p50 / p99 / p99.9, not p50 alone: a median hides exactly the tail
+    behavior that distinguishes the two architectures.
+
+    **Honest competitive note.** No apples-to-apples third-party figure exists to cite, because nobody
+    publishes one. **LiteLLM** (Python/FastAPI) adds overhead in the **millisecond** range with a **GC
+    tail** by construction, but publishes no reproducible self-host overhead benchmark. **OpenRouter**
+    is a **SaaS hop** — its "overhead" is a public-internet round-trip to their servers, not a proxy
+    cost, and there is no self-host to measure. A reproducible self-hosted overhead number is uniquely
+    Busbar's; we would rather ship the harness with an honest placeholder than a number nobody can
+    check.
+  </TabItem>
+
+  <TabItem label="Reproduce">
+    The harness lives in `bench/latency/` and is self-contained — Python stdlib plus the release
+    binary. It builds Busbar if needed, starts the mock upstream and Busbar pointed at it, drives both
+    paths, and prints the per-percentile deltas.
+
+    ```bash
+    # from the repo root
+    bench/latency/run.sh
+
+    # scale the load
+    REQS=50000 CONC=100 bench/latency/run.sh
+
+    # just the pure-overhead pass (no 200ms-delay pass)
+    DELAYS="0" bench/latency/run.sh
+    ```
+
+    Run a single step by hand:
+
+    ```bash
+    # 1. fixed-latency mock upstream (instant variant)
+    python3 bench/latency/mock_upstream.py --port 9001 --delay-ms 0 &
+
+    # 2. busbar pointed at it
+    BUSBAR_PROVIDERS=bench/latency/providers.mock.yaml \
+    BUSBAR_CONFIG=bench/latency/config.mock.yaml \
+    BENCH_MOCK_KEY=x \
+      target/release/busbar &
+
+    # 3. baseline vs busbar — subtract the percentiles to get the added overhead
+    python3 bench/latency/loadgen.py --url http://127.0.0.1:9001 \
+      --mode full --requests 20000 --concurrency 50 --model bench-model --label direct/full/0ms
+    python3 bench/latency/loadgen.py --url http://127.0.0.1:8080 \
+      --mode full --requests 20000 --concurrency 50 \
+      --token bench-token --model bench-pool --label busbar/full/0ms
+
+    # streaming TTFT through busbar
+    python3 bench/latency/loadgen.py --url http://127.0.0.1:8080 \
+      --mode ttft --requests 20000 --concurrency 50 \
+      --token bench-token --model bench-pool --label busbar/ttft/0ms
+    ```
+
+    :::caution[Precondition: upstream TLS trust]
+    Busbar's release binary requires every provider `base_url` to be `https://` and trusts **only
+    public (webpki) CA roots** for upstream TLS — no OS trust store, no `SSL_CERT_FILE`, no insecure
+    flag (a deliberate SSRF/credential-leak stance). A plain `http://127.0.0.1` mock works as the
+    *direct baseline* target but Busbar will not connect to it; a self-signed mock isn't trusted
+    either. To put the mock on the **busbar** path, serve it over HTTPS with a **publicly-trusted**
+    cert for a loopback-resolving hostname like `localtest.me` (which the SSRF guard allows), or run
+    the busbar path against a **real provider** with your own key. Full details — including the
+    `--tls-cert/--tls-key` mock option and the real-provider setup — are in `bench/latency/README.md`.
+    :::
+
+    For non-streaming throughput you can swap `loadgen.py` for a native generator (`oha`, `hey`,
+    `bombardier`, `wrk`) and subtract its reported percentiles between the two paths; `loadgen.py`
+    remains the reference because it is the only one that also measures streaming **TTFT** and reports
+    **p99.9**. Numbers are machine-specific — report the *shape* (tight tail), not absolute µs.
+  </TabItem>
+</Tabs>

@@ -4,11 +4,30 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::config::RootCfg;
+// SSRF obfuscation-defense primitives shared with the observability/OTLP webhook guard — the
+// byte-identical atoms live in one tested leaf so the two SSRF guards can never drift apart.
+use crate::net_guard::{
+    is_alternate_ipv4_encoding, is_cgnat_shared_v4, is_link_local_v6, is_unique_local_v6,
+};
 
 /// Validate the loaded configuration and collect all errors at once.
 /// Returns Ok(()) if valid; Err(Vec<String>) with all validation failures otherwise.
 pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
+
+    // The metadata host-lists are matched by EXACT IP/hostname (see `host_matches_any`); a CIDR/slash
+    // entry silently never matches — a confusing no-op. Reject any `/`-bearing entry at boot so a bad
+    // config fails fast. Covers the two global lists here and each provider's list inside the loop.
+    reject_cidr_metadata_entries(
+        "security.blocked_metadata_hosts",
+        &cfg.blocked_metadata_hosts,
+        &mut errors,
+    );
+    reject_cidr_metadata_entries(
+        "security.allow_metadata_hosts",
+        &cfg.allow_metadata_hosts,
+        &mut errors,
+    );
 
     // Collect provider names for pool-name conflict check and member resolution
     let provider_names: HashSet<&str> = cfg.providers.keys().map(|s| s.as_str()).collect();
@@ -162,24 +181,71 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
 
         // The resolved base_url is the actual upstream target for signed (API-key-bearing) calls.
-        // It is operator-controllable via a config.yaml override, so enforce `https://` at startup:
-        // a plaintext `http://` upstream leaks the API key on the wire, and an `http://169.254.169.254/`
-        // / `file://` / internal override is an SSRF target. Mirror the shipped-catalog test assertion
-        // as a hard validation rule rather than a test-only check.
-        if !provider_cfg.base_url.starts_with("https://") {
+        // It is operator config (a client never chooses a provider URL — it picks a model NAME that
+        // maps through a pool to an operator URL), so there is no client-driven SSRF. Two startup
+        // rules apply:
+        //
+        // SCHEME — keyed off whether the host is PRIVATE/LOOPBACK, not off a flag. A PUBLIC host MUST
+        // use `https://` (cleartext would leak the API key on the wire to an off-box wiretap); a
+        // PRIVATE/LOOPBACK host (a local Ollama / vLLM / LM Studio on `localhost`, `127.0.0.1`,
+        // RFC-1918, or a Tailscale CGNAT address) MAY use plain `http://` — local models rarely
+        // terminate TLS and there is no off-box hop to wiretap. So `http://localhost:11434` and
+        // `http://10.0.0.5:8000` validate with NO flag, while `http://api.example.com` is rejected.
+        // The allow-overrides for THIS provider: the union of its own `allow_metadata_hosts` and the
+        // global `security.allow_metadata_hosts`. A host on the denylist is unblocked iff it appears
+        // in this union (or `allow_all_metadata` is set). Built once and passed to both the base_url
+        // and the path-override SSRF checks below so the two reason over the identical carve-out set.
+        reject_cidr_metadata_entries(
+            &format!("provider '{provider_name}' allow_metadata_hosts"),
+            &provider_cfg.allow_metadata_hosts,
+            &mut errors,
+        );
+        let allow_overrides: Vec<String> = provider_cfg
+            .allow_metadata_hosts
+            .iter()
+            .chain(cfg.allow_metadata_hosts.iter())
+            .cloned()
+            .collect();
+
+        let base_url = &provider_cfg.base_url;
+        let host_for_scheme = extract_normalized_host(base_url);
+        let host_is_local = host_for_scheme
+            .as_deref()
+            .map(host_is_private_or_loopback)
+            .unwrap_or(false);
+        let scheme_ok =
+            base_url.starts_with("https://") || (host_is_local && base_url.starts_with("http://"));
+        if !scheme_ok {
+            errors.push(if base_url.starts_with("http://") {
+                // An http:// scheme that failed the check ⇒ the host is public (or unparseable):
+                // plaintext to a public host would leak the key.
+                format!(
+                    "provider '{}' base_url must use https for a public host (got '{}'); plaintext http is permitted only for a private/loopback local-model upstream",
+                    provider_name, base_url
+                )
+            } else {
+                format!(
+                    "provider '{}' base_url must use http or https (got '{}')",
+                    provider_name, base_url
+                )
+            });
+        } else if let Some(host) = ssrf_blocked_host(
+            base_url,
+            &allow_overrides,
+            cfg.allow_all_metadata,
+            &cfg.blocked_metadata_hosts,
+        ) {
+            // SSRF — block the cloud-metadata DENYLIST (hardcoded + operator additions). A passing
+            // scheme alone does not stop SSRF: `https://169.254.169.254/`, `http://100.100.100.200/`,
+            // `https://metadata.google.internal/`, etc. point busbar's key-bearing traffic at a
+            // credential-leaking metadata service. Everything NOT on the denylist (loopback, RFC-1918,
+            // CGNAT, public) is allowed — so local models just work. The three escape hatches (this
+            // provider's `allow_metadata_hosts`, the global `security.allow_metadata_hosts`, and the
+            // nuclear `security.allow_all_metadata`) carve exceptions (then `ssrf_blocked_host`
+            // returns None).
             errors.push(format!(
-                "provider '{}' base_url must use https (got '{}')",
-                provider_name, provider_cfg.base_url
-            ));
-        } else if let Some(host) = ssrf_blocked_host(&provider_cfg.base_url) {
-            // The `https://` prefix alone does not stop SSRF: `https://169.254.169.254/`,
-            // `https://[::1]/`, `https://10.0.0.1/`, `https://metadata.google.internal/` etc. all
-            // pass the scheme check yet point busbar's signed (API-key-bearing) traffic at the cloud
-            // metadata service or an internal host. Reject internal/loopback/link-local/private
-            // targets and known metadata hostnames at startup (fail-loud).
-            errors.push(format!(
-                "provider '{}' base_url '{}' targets a blocked internal/metadata host '{}' (loopback, link-local, RFC-1918 private, or cloud metadata endpoints are not permitted)",
-                provider_name, provider_cfg.base_url, host
+                "provider '{}' base_url '{}' targets a blocked cloud-metadata host '{}' (cloud-metadata/IMDS endpoints are denied; to override add the host to this provider's allow_metadata_hosts, or security.allow_metadata_hosts to unblock it for all providers, or set security.allow_all_metadata: true to disable the guard entirely — and security.blocked_metadata_hosts extends the denylist)",
+                provider_name, base_url, host
             ));
         }
 
@@ -202,11 +268,16 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     "provider '{}' path '{}' must begin with '/': a path override is appended to base_url verbatim, so a path that does not start with '/' fuses into the host (e.g. base_url + '{}') and can redirect signed traffic to an attacker-controlled host",
                     provider_name, path, path
                 ));
-            } else if provider_cfg.base_url.starts_with("https://") {
+            } else if scheme_ok {
                 let composed = format!("{}{}", provider_cfg.base_url, path);
-                if let Some(host) = ssrf_blocked_host(&composed) {
+                if let Some(host) = ssrf_blocked_host(
+                    &composed,
+                    &allow_overrides,
+                    cfg.allow_all_metadata,
+                    &cfg.blocked_metadata_hosts,
+                ) {
                     errors.push(format!(
-                        "provider '{}' base_url+path '{}' targets a blocked internal/metadata host '{}' (loopback, link-local, RFC-1918 private, or cloud metadata endpoints are not permitted)",
+                        "provider '{}' base_url+path '{}' targets a blocked cloud-metadata host '{}' (cloud-metadata/IMDS endpoints are denied; to override add the host to this provider's allow_metadata_hosts, or security.allow_metadata_hosts, or set security.allow_all_metadata: true)",
                         provider_name, composed, host
                     ));
                 }
@@ -494,6 +565,23 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
+    // Rule (routing/webhook): a `route: webhook` pool MUST carry a `policy.url`, and that URL MUST
+    // pass the routing-webhook SSRF guard (the OTLP loopback carve-out: loopback/localhost sidecars
+    // allowed, link-local/IMDS/RFC1918/CGNAT/cloud-metadata blocked; plaintext http:// only on
+    // loopback). Rejected at startup rather than silently degrading to SWRR at runtime, so an operator
+    // who asked for a webhook policy learns immediately that it is misconfigured.
+    for (pool_name, pool_cfg) in &cfg.pools {
+        if pool_cfg.route != crate::config::RouteKind::Webhook {
+            continue;
+        }
+        let url = pool_cfg.policy.as_ref().and_then(|p| p.url.as_deref());
+        if let Err(msg) = crate::observability::validate_routing_webhook_url(url) {
+            errors.push(format!(
+                "pool '{pool_name}' route: webhook is invalid: {msg}"
+            ));
+        }
+    }
+
     // Rule 5: Validate the auth mode (otherwise AuthMiddleware::new would panic at startup).
     if let Some(auth) = &cfg.auth {
         match crate::auth::AuthMode::from_config_str(&auth.mode) {
@@ -705,19 +793,31 @@ fn percent_decode_host(host: &str) -> String {
     }
 }
 
-fn ssrf_blocked_host(url: &str) -> Option<String> {
-    use std::net::{IpAddr, Ipv4Addr};
-
-    // Strip "https://" (caller guarantees this prefix).
-    let rest = url.strip_prefix("https://")?;
+/// Extract the connect host from a `base_url`, normalized the SAME way the connecting stack
+/// (reqwest's `url` crate + glibc getaddrinfo) sees it: scheme stripped, backslashes folded to
+/// forward slashes, authority isolated, userinfo dropped, port removed (IPv6 brackets handled),
+/// percent-decoded, and a single trailing FQDN-root dot removed. Returns the lowercased-comparison
+/// is left to the caller; the returned string preserves original case but with the above
+/// normalizations applied. `None` when the scheme is not http/https or the host is empty.
+///
+/// Centralizing this means the SSRF metadata check and the private/loopback scheme classifier both
+/// reason over the EXACT host the connecting stack will, so neither can be bypassed by an authority
+/// trick (backslash, userinfo flip, percent-encoded dots, trailing dot) that only one of them
+/// normalized away.
+fn extract_normalized_host(url: &str) -> Option<String> {
+    // Strip the scheme. The host extraction is scheme-agnostic; accept either prefix so an
+    // `http://` upstream is still run through the metadata block.
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
     // Normalize backslashes to forward slashes BEFORE splitting the authority. `https` is a WHATWG
     // "special" scheme, so reqwest's `url` crate converts every `\` to `/` while parsing — meaning a
     // `base_url` like `https://10.0.0.1\x.allowed.com` is parsed by reqwest with authority `10.0.0.1`
     // (the `\` terminates the authority exactly as `/` would) and then CONNECTS to `10.0.0.1` /
     // `169.254.169.254`, even though a hand-parser that split only on `['/', '?', '#']` would see the
-    // whole `10.0.0.1\x.allowed.com` as the host (which passes every internal/metadata check) — an
-    // SSRF credential-relay bypass. Mirroring reqwest's `\`→`/` rewrite here makes the guard see the
-    // SAME authority boundary the connecting stack will, closing the bypass.
+    // whole `10.0.0.1\x.allowed.com` as the host — an SSRF credential-relay bypass. Mirroring
+    // reqwest's `\`→`/` rewrite here makes the guard see the SAME authority boundary the connecting
+    // stack will, closing the bypass.
     let rest = rest.replace('\\', "/");
     // Authority is everything before the first path/query/fragment delimiter.
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest.as_str());
@@ -746,180 +846,388 @@ fn ssrf_blocked_host(url: &str) -> Option<String> {
         return None;
     }
 
-    // Percent-decode the host BEFORE any check below. The guard operates on the literal config
-    // string, but the `url` crate `reqwest` uses percent-decodes host components per RFC 3986 at
-    // request time — so a `base_url` like `https://169%2E254%2E169%2E254/` would pass every check
-    // here (not in METADATA_HOSTS, not a parseable `IpAddr`, and the `%` defeats
-    // `is_alternate_ipv4_encoding`) yet could resolve to the IMDS target downstream. Decoding here
-    // makes the guard's safety property independent of the URL library's normalization details.
+    // Percent-decode the host BEFORE returning. The guard operates on the literal config string, but
+    // the `url` crate reqwest uses percent-decodes host components per RFC 3986 at request time — so
+    // a `base_url` like `https://169%2E254%2E169%2E254/` would pass every check (not a parseable
+    // `IpAddr`, and the `%` defeats `is_alternate_ipv4_encoding`) yet resolve to the IMDS target
+    // downstream. Decoding here makes the safety property independent of URL-library details.
     let host_decoded = percent_decode_host(host);
-    let host = host_decoded.as_str();
 
-    // Normalize a single trailing FQDN-root dot off the host BEFORE any check below. glibc
-    // getaddrinfo (reqwest's default resolver) treats a trailing dot as a rooted FQDN and still
-    // resolves the literal it precedes — so `https://127.0.0.1./`, `https://169.254.169.254./`,
-    // and `https://10.0.0.1./` connect to exactly the loopback / IMDS / RFC1918 targets the bare
-    // forms do. Without stripping it, an IP-literal+dot does NOT parse as `IpAddr` (so the
-    // loopback/link-local/private arms never fire), is not in `METADATA_HOSTS`, and fails
-    // `is_alternate_ipv4_encoding` (the trailing empty segment makes `all_numeric` false) — an SSRF
-    // credential-relay bypass. Stripping here covers IP literals, alternate encodings, and the
-    // `localhost.` FQDN spelling uniformly (the explicit `localhost.` METADATA_HOSTS entry below is
-    // now redundant but kept as belt-and-suspenders).
-    let host = host.strip_suffix('.').unwrap_or(host);
+    // Normalize a single trailing FQDN-root dot. glibc getaddrinfo treats a trailing dot as a rooted
+    // FQDN and still resolves the literal it precedes — so `169.254.169.254.` connects to exactly the
+    // IMDS target the bare form does. Without stripping, an IP-literal+dot does NOT parse as
+    // `IpAddr`, defeating every range check.
+    let host = host_decoded
+        .strip_suffix('.')
+        .unwrap_or(host_decoded.as_str());
 
-    // Known cloud metadata / internal hostnames (case-insensitive). `localhost` does NOT parse as
-    // an `IpAddr` and is not an alternate IPv4 encoding, so without listing it here it would slip
-    // past every IP-range check below and a `base_url: https://localhost:11434/` would forward
-    // inbound API keys to a loopback service (e.g. a local Ollama or metadata sidecar) — an SSRF
-    // credential-relay. The trailing-dot `localhost.` spelling is normalized off above.
+    Some(host.to_string())
+}
+
+/// True when `host` (already normalized by [`extract_normalized_host`]) is a private, loopback, or
+/// link-local target — the legitimate LOCAL-MODEL destinations (Ollama / vLLM / LM Studio on
+/// `localhost`, `127.0.0.1`, RFC-1918, or a Tailscale CGNAT address). Used to KEY THE SCHEME RULE:
+/// plaintext `http://` is permitted to these (a local model rarely terminates TLS and there is no
+/// off-box wiretap), while a PUBLIC host must use `https://` (cleartext would leak the API key on the
+/// wire). This is NOT the SSRF decision — under the metadata-denylist model these hosts are ALLOWED
+/// as upstreams; this predicate only governs whether plaintext is acceptable for the hop.
+fn host_is_private_or_loopback(host: &str) -> bool {
+    use std::net::IpAddr;
+
+    let host_lc = host.to_ascii_lowercase();
+    // `localhost` and the `*.localhost` TLD (RFC 6761) resolve to loopback.
+    if host_lc == "localhost"
+        || host_lc
+            .rsplit_once('.')
+            .is_some_and(|(_, tld)| tld == "localhost")
+    {
+        return true;
+    }
+    // Obfuscated IPv4 encodings that resolve to an internal address (decimal int, hex, octal, short
+    // dotted) — treat as private so they at least don't get the public-host plaintext rejection on a
+    // technicality. (They are an unusual way to spell a local model, but a connecting stack maps them
+    // to an IPv4 target all the same.)
+    if is_alternate_ipv4_encoding(host) {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            v4.is_loopback()        // 127.0.0.0/8
+                || v4.is_private()  // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local() // 169.254.0.0/16
+                || v4.is_unspecified() // 0.0.0.0
+                || is_cgnat_shared_v4(&v4) // 100.64.0.0/10 (RFC 6598 CGNAT, Tailscale)
+        }
+        Ok(IpAddr::V6(v6)) => {
+            let embedded = v6.to_ipv4();
+            v6.is_loopback()        // ::1
+                || v6.is_unspecified() // ::
+                || is_unique_local_v6(&v6) // fc00::/7
+                || is_link_local_v6(&v6)   // fe80::/10
+                || embedded.is_some_and(|m| {
+                    m.is_loopback()
+                        || m.is_private()
+                        || m.is_link_local()
+                        || m.is_unspecified()
+                        || is_cgnat_shared_v4(&m)
+                })
+        }
+        Err(_) => false,
+    }
+}
+
+/// True when the already-normalized `host` (as produced by [`extract_normalized_host`]) matches any
+/// entry in `entries`, using the EXACT canonicalization the denylist block check uses for operator-
+/// supplied `blocked_metadata_hosts`. This is shared by the allow-override path so an allow entry
+/// unblocks every spelling of an IP the same way a block entry blocks every spelling:
+///   * a hostname entry matches case-insensitively, trailing dot stripped;
+///   * an IP-literal entry matches the parsed connect-host AND its IPv4-mapped/compatible-IPv6 and
+///     alternate-encoding (decimal-int / hex / octal / short-dotted) spellings.
+///
+/// Empty / whitespace-only entries never match.
+/// Push an error for every entry in a metadata host-list config key that contains a `/` (CIDR /
+/// slash). These lists (`security.blocked_metadata_hosts`, `security.allow_metadata_hosts`, and each
+/// provider's `allow_metadata_hosts`) are matched by EXACT IP/hostname via `host_matches_any` — a
+/// CIDR like `169.254.0.0/16` never parses as an `Ipv4Addr` and never equals a connect-host string,
+/// so it silently matches nothing (a confusing no-op that reads as a working rule). Reject it at boot
+/// with a clear message naming the key + offending value, so the operator learns CIDR is unsupported
+/// here and lists exact IPs/hostnames instead.
+fn reject_cidr_metadata_entries(key: &str, entries: &[String], errors: &mut Vec<String>) {
+    for entry in entries {
+        if entry.contains('/') {
+            errors.push(format!(
+                "{key} entry '{entry}' contains '/' (CIDR is not supported here): these lists are matched by EXACT IP or hostname, so a CIDR/slash entry silently never matches and is a no-op. List exact IPs/hostnames instead (e.g. '169.254.169.254', not '169.254.0.0/16')"
+            ));
+        }
+    }
+}
+
+fn host_matches_any(host: &str, entries: &[String]) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    if entries.is_empty() {
+        return false;
+    }
+
+    // Hostname / verbatim match (case-insensitive, trailing dot stripped on the entry).
+    for entry in entries {
+        let entry_norm = entry.trim().trim_end_matches('.');
+        if !entry_norm.is_empty() && entry_norm.eq_ignore_ascii_case(host) {
+            return true;
+        }
+    }
+
+    // IP-literal entries: parse each once so an entry like `169.254.169.254` also matches this host's
+    // mapped-IPv6 and alternate-encoding spellings, mirroring the block path's `extra_v4`/`extra_v6`.
+    let entry_v4: Vec<Ipv4Addr> = entries
+        .iter()
+        .filter_map(|e| e.trim().trim_end_matches('.').parse::<Ipv4Addr>().ok())
+        .collect();
+    let entry_v6: Vec<Ipv6Addr> = entries
+        .iter()
+        .filter_map(|e| e.trim().trim_end_matches('.').parse::<Ipv6Addr>().ok())
+        .collect();
+    if entry_v4.is_empty() && entry_v6.is_empty() {
+        return false;
+    }
+
+    // Alternate / obfuscated encodings of THIS host expand to a canonical v4 and re-check.
+    if let Some(expanded) = expand_alternate_ipv4(host) {
+        if entry_v4.contains(&expanded) {
+            return true;
+        }
+    }
+
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => entry_v4.contains(&v4),
+        Ok(IpAddr::V6(v6)) => {
+            let embedded = v6.to_ipv4();
+            entry_v6.contains(&v6) || embedded.is_some_and(|m| entry_v4.contains(&m))
+        }
+        Err(_) => false,
+    }
+}
+
+/// Return `Some(host)` if the given URL targets a CLOUD-METADATA endpoint that must be blocked, else
+/// `None`. This is the SSRF guard under the metadata-denylist model.
+///
+/// Threat model: a client can NEVER influence a provider `base_url` — it picks a model NAME, which
+/// maps through an operator pool to an operator-configured URL. So there is no client-driven SSRF.
+/// The ONLY real risk is an operator typo / templated-config accidentally pointing a key-bearing lane
+/// at a credential-leaking metadata service. Therefore: block a comprehensive metadata DENYLIST and
+/// ALLOW EVERYTHING ELSE — loopback, RFC-1918, CGNAT, and public are all legitimate upstreams (local
+/// Ollama/vLLM "just works" with no flag).
+///
+/// The hardcoded denylist:
+///   * link-local `169.254.0.0/16` — catches IMDS `169.254.169.254`, AWS ECS task-creds
+///     `169.254.170.2`, Tencent `169.254.0.23`, and any other link-local metadata in one range
+///     (nothing legitimate runs on link-local);
+///   * `100.100.100.200` (Alibaba Cloud ECS, inside the otherwise-allowed CGNAT /10);
+///   * `168.63.129.16` (Azure WireServer / platform);
+///   * the EC2 IMDSv6 `fd00:ec2::254`;
+///   * the metadata hostnames in `METADATA_HOSTS`.
+///
+/// All IP entries are matched through the SAME obfuscation defenses (IPv4-mapped/compatible IPv6,
+/// decimal-int / hex / octal encoding, percent-encoded dots, trailing-dot FQDN), not just IMDS.
+///
+/// `extra_blocked` is `security.blocked_metadata_hosts` — operator additions APPENDED to the
+/// hardcoded list (the answer to an unknown cloud's metadata IP/hostname).
+///
+/// Precedence (the LOCKED one-rule matrix): a host is blocked IFF
+/// `!allow_all` AND on-denylist(hardcoded ∪ `extra_blocked`) AND NOT in `allow_overrides`.
+///
+/// * `allow_all` is `security.allow_all_metadata` — the nuclear override; when `true` the guard is
+///   fully disabled and the function always returns `None`.
+/// * `allow_overrides` is the UNION of the provider's `allow_metadata_hosts` and the global
+///   `security.allow_metadata_hosts` — a surgical carve-out. An entry is matched with the SAME
+///   canonicalization as the block check (an IP entry unblocks all its obfuscated spellings —
+///   decimal-int, IPv4-mapped/compatible IPv6, trailing-dot — mirroring how a block entry blocks
+///   all spellings; a hostname entry matches case-insensitively, trailing dot stripped). Allow
+///   always wins: a host on the denylist that ALSO appears in `allow_overrides` is permitted.
+fn ssrf_blocked_host(
+    url: &str,
+    allow_overrides: &[String],
+    allow_all: bool,
+    extra_blocked: &[String],
+) -> Option<String> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    // Nuclear override: the metadata guard is disabled wholesale.
+    if allow_all {
+        return None;
+    }
+
+    let host = extract_normalized_host(url)?;
+    let host = host.as_str();
+
+    // Surgical allow-override: if THIS host matches any allow entry (with the same canonicalization
+    // the block check uses), it is permitted regardless of the denylist. Computed up front so allow
+    // unconditionally wins over every block arm below.
+    if host_matches_any(host, allow_overrides) {
+        return None;
+    }
+
+    // Cloud-metadata / IMDS hostnames (case-insensitive). The IPv4 / IPv6 metadata literals are
+    // caught in the IP arms below; these are the DNS names a connecting stack would resolve.
     const METADATA_HOSTS: &[&str] = &[
         "metadata.google.internal",
         "metadata.internal",
-        "localhost",
-        "localhost.",
+        "metadata.tencentyun.com",
+        "metadata.platformequinix.com",
+        "instance-data",
+        "instance-data.ec2.internal",
     ];
     let host_lc = host.to_ascii_lowercase();
     if METADATA_HOSTS.contains(&host_lc.as_str()) {
         return Some(host.to_string());
     }
 
-    // Block any `*.localhost` subdomain too. RFC 6761 reserves the entire `.localhost` TLD to
-    // loopback, and glibc getaddrinfo (reqwest's default resolver) resolves `api.localhost`,
-    // `service.localhost`, etc. to 127.0.0.1 — so a `base_url: https://api.localhost:11434/` would
-    // forward inbound API keys to a co-located loopback service (SSRF credential-relay) exactly as
-    // the bare `localhost` entry guards against. The exact-label `localhost` spelling is already
-    // covered by METADATA_HOSTS above; here we catch the subdomain case by testing the right-most
-    // label. This mirrors `observability::host_is_internal` so the two SSRF guards stay at parity.
-    // The trailing-dot FQDN-root spelling (`sub.localhost.`) was normalized off above.
-    if host_lc
-        .rsplit_once('.')
-        .is_some_and(|(_, tld)| tld == "localhost")
-    {
+    // Operator-supplied extensions to the denylist (`security.blocked_metadata_hosts`). Matched with
+    // the SAME canonicalization the allow-override path uses (hostname case-insensitive; IP literal
+    // matched against the parsed connect-host and its mapped-IPv6 / alternate-encoding spellings), so
+    // an operator who writes `10.99.99.99` also blocks `[::ffff:10.99.99.99]` and the decimal-int
+    // form. `host_matches_any` is the single shared canonicalizer for both allow and block.
+    if host_matches_any(host, extra_blocked) {
         return Some(host.to_string());
     }
 
-    // Alternate / non-canonical IP encodings that Rust's `IpAddr::from_str` REJECTS but the OS
-    // resolver (glibc getaddrinfo, used by reqwest's default resolver) still interprets as an
-    // IPv4 address — decimal int (`2130706433` = 127.0.0.1), hex (`0x7f000001`), octal
-    // (`017700000001`), and short dotted forms (`127.1`, `10.0.1`). A canonical-only `parse()`
-    // would treat these as opaque DNS hostnames (allowed), yet they connect to loopback / the IMDS
-    // endpoint (`2852039166` = 169.254.169.254) at request time — defeating the SSRF guard. Flag
-    // any host that looks like one of these alternate IPv4 encodings as blocked.
-    if is_alternate_ipv4_encoding(host) {
-        return Some(host.to_string());
-    }
+    // The hardcoded metadata IP literals.
+    //  * link-local `169.254.0.0/16` (IMDS `169.254.169.254`, ECS `169.254.170.2`, Tencent
+    //    `169.254.0.23`, …);
+    //  * Alibaba `100.100.100.200`; Azure `168.63.129.16`; EC2 IMDSv6 `fd00:ec2::254`.
+    let imds_v6 = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x254);
+    let alibaba_v4 = Ipv4Addr::new(100, 100, 100, 200);
+    let azure_v4 = Ipv4Addr::new(168, 63, 129, 16);
+    // Predicate: is this PARSED v4 address a hardcoded metadata target? (link-local /16 + the two
+    // non-link-local literals.)
+    let is_metadata_v4 =
+        |v4: &Ipv4Addr| -> bool { v4.is_link_local() || *v4 == alibaba_v4 || *v4 == azure_v4 };
 
-    // IP-literal checks. A hostname that does not parse as an IP is allowed (DNS targets are not
-    // resolved here; the metadata-host list above covers the well-known names).
-    let blocked = match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) => {
-            v4.is_loopback()            // 127.0.0.0/8
-                || v4.is_private()      // 10/8, 172.16/12, 192.168/16
-                || v4.is_link_local()   // 169.254.0.0/16 (covers IMDS 169.254.169.254)
-                || v4.is_unspecified()  // 0.0.0.0
-                || is_cgnat_shared_v4(&v4) // 100.64.0.0/10 (RFC 6598 CGNAT, routable in cloud VPCs)
-                || v4 == Ipv4Addr::new(169, 254, 169, 254)
+    // Alternate / non-canonical IPv4 encodings (decimal int `2852039166` = 169.254.169.254, hex,
+    // octal, short dotted) that `IpAddr::from_str` rejects but the OS resolver still maps to an IPv4
+    // target. Expand them to a canonical address and re-check against the metadata predicate, so an
+    // obfuscated metadata literal is caught while a non-metadata obfuscated form (e.g. a decimal
+    // loopback) is simply allowed (it is not a metadata target).
+    if let Some(expanded) = expand_alternate_ipv4(host) {
+        if is_metadata_v4(&expanded) {
+            return Some(host.to_string());
         }
+    }
+
+    // Canonical IP-literal checks. A hostname that does not parse as an IP and is not in the lists
+    // above is ALLOWED — private/loopback/CGNAT/public upstreams are all legitimate.
+    let is_blocked = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => is_metadata_v4(&v4),
         Ok(IpAddr::V6(v6)) => {
-            v6.is_loopback()            // ::1
-                || v6.is_unspecified()  // ::
-                || is_unique_local_v6(&v6)   // fc00::/7
-                || is_link_local_v6(&v6)     // fe80::/10
-                // An IPv6 literal that embeds an IPv4 address reaches the same v4 target as the bare
-                // `a.b.c.d` form, so it MUST apply the IDENTICAL block set as the direct IPv4 arm
-                // above — otherwise `https://[::ffff:100.64.0.1]/` slips past while `https://100.64.0.1/`
-                // is rejected (an SSRF credential-relay gap). Use `to_ipv4()` rather than
-                // `to_ipv4_mapped()`: it is a SUPERSET that also covers the IPv4-COMPATIBLE form
-                // (`[::a.b.c.d]`, e.g. `[::127.0.0.1]` / `[::169.254.169.254]`), where the leading
-                // `segments()[0] == 0` makes the ULA/link-local masks miss and `to_ipv4_mapped()`
-                // returns None — yet a connecting stack still routes it to the embedded v4 target.
-                || v6.to_ipv4().is_some_and(|m| {
-                    m.is_loopback()
-                        || m.is_private()
-                        || m.is_link_local()
-                        || m.is_unspecified()
-                        || is_cgnat_shared_v4(&m)
-                        || m == Ipv4Addr::new(169, 254, 169, 254)
-                })
+            // An IPv6 literal embedding an IPv4 address reaches the same v4 target as the bare form,
+            // so apply the IDENTICAL metadata predicate to the embedded v4 (covers `[::ffff:a.b.c.d]`
+            // mapped AND `[::a.b.c.d]` compatible via `to_ipv4()`).
+            let embedded = v6.to_ipv4();
+            v6 == imds_v6 || embedded.is_some_and(|m| is_metadata_v4(&m))
         }
         Err(_) => false,
     };
 
-    blocked.then(|| host.to_string())
+    is_blocked.then(|| host.to_string())
 }
 
-/// RFC 6598 Shared Address Space `100.64.0.0/10` (a.k.a. CGNAT). Not covered by
-/// `Ipv4Addr::is_private()`, yet routable inside AWS/GCP VPCs and many Kubernetes clusters where it
-/// fronts internal services — so it is an SSRF target the private/link-local checks miss. The /10
-/// is the addresses whose first octet is 100 and whose top two bits of the second octet are `01`.
-fn is_cgnat_shared_v4(v4: &std::net::Ipv4Addr) -> bool {
-    let o = v4.octets();
-    o[0] == 100 && (o[1] & 0xC0) == 64
+/// The hardcoded cloud-metadata denylist entries, as human-readable strings — the single source of
+/// truth `ssrf_blocked_host` enforces, surfaced for the `--print-metadata-blocklist` CLI flag and the
+/// startup count so `main.rs` does NOT duplicate the list. The CIDR / individual literals are spelled
+/// the way an operator would recognize them; the obfuscation defenses (mapped-IPv6, decimal-int,
+/// trailing-dot) apply to each but are not enumerated here.
+pub(crate) fn metadata_denylist_entries() -> Vec<String> {
+    [
+        // Link-local /16 — IMDS 169.254.169.254, AWS ECS task-creds 169.254.170.2, Tencent
+        // 169.254.0.23, and every other link-local metadata endpoint.
+        "169.254.0.0/16",
+        "100.100.100.200", // Alibaba Cloud ECS
+        "168.63.129.16",   // Azure WireServer / platform
+        "fd00:ec2::254",   // AWS EC2 IMDSv6
+        "metadata.google.internal",
+        "metadata.internal",
+        "metadata.tencentyun.com",
+        "metadata.platformequinix.com",
+        "instance-data",
+        "instance-data.ec2.internal",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
-/// True when `host` is an alternate (non-dotted-quad) IPv4 encoding that `IpAddr::from_str` rejects
-/// but the OS resolver still maps to an IPv4 address: a bare decimal integer (`2130706433`), a
-/// `0x`/`0X` hex literal (`0x7f000001`), a leading-zero octal literal (`017700000001`), or a dotted
-/// form with FEWER than four octets (`127.1`, `10.0.1`). These bypass the canonical IP-literal
-/// checks while still resolving to loopback / link-local / private targets at connect time, so they
-/// must be treated as blocked. A canonical four-octet dotted-quad is NOT matched here (it is handled
-/// by the `parse::<IpAddr>()` path); a normal DNS hostname (containing a non-digit, non-`.` char in
-/// a way that isn't all-hex-after-`0x`) is not matched either.
-fn is_alternate_ipv4_encoding(host: &str) -> bool {
+/// Expand an alternate (non-dotted-quad) IPv4 encoding to its canonical [`std::net::Ipv4Addr`], the
+/// way glibc getaddrinfo (reqwest's default resolver) would. Returns `None` for a canonical
+/// dotted-quad (handled by `IpAddr::parse`), a DNS name, or an out-of-range value. Used by the SSRF
+/// guard to re-check an obfuscated literal (e.g. decimal `2852039166` → `169.254.169.254`) against
+/// the metadata denylist rather than blocking ALL obfuscated forms indiscriminately.
+///
+/// Handles: a whole-host `0x`/`0X` hex or bare decimal/octal integer (interpreted as a 32-bit
+/// address); and the inet_aton "parts" forms — 1, 2, 3, or 4 dotted components where the LAST part
+/// absorbs the remaining low bytes (`a` = 32-bit; `a.b` = a<<24 | b(24-bit); `a.b.c` = a<<24 |
+/// b<<16 | c(16-bit); `a.b.c.d` = the usual quad). Each component may itself be decimal, `0x` hex, or
+/// leading-zero octal.
+fn expand_alternate_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
     if host.is_empty() {
-        return false;
+        return None;
     }
 
-    // Whole-host `0x...` / `0X...` hex literal (e.g. `0x7f000001`). Only when there is no `.`;
-    // a dotted per-octet hex form (`0x7f.0.0.1`) is handled by the dotted branch below.
-    if !host.contains('.') {
-        if let Some(hex) = host.strip_prefix("0x").or_else(|| host.strip_prefix("0X")) {
-            return !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    // Parse a single inet_aton component: `0x..`/`0X..` hex, leading-zero octal, or decimal.
+    fn parse_component(p: &str) -> Option<u64> {
+        if p.is_empty() {
+            return None;
         }
-    }
-
-    // Dotted form: split on '.'. A canonical dotted-quad has exactly 4 parts and parses via
-    // `IpAddr` — leave it to that path. Fewer than 4 numeric parts (e.g. `127.1`, `10.0.1`) is an
-    // alternate short form getaddrinfo expands; flag it. Any part using a `0x` hex or leading-zero
-    // octal encoding is also an alternate form.
-    if host.contains('.') {
-        let parts: Vec<&str> = host.split('.').collect();
-        // Every part must be a numeric encoding (decimal, hex, or octal) for this to be an IP-ish
-        // host at all; if any part has a non-numeric character it's a DNS name → not our concern.
-        let all_numeric = parts.iter().all(|p| {
-            if let Some(hex) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
-                !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
-            } else {
-                !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())
+        if let Some(hex) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
+            if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
             }
-        });
-        if !all_numeric {
-            return false;
+            u64::from_str_radix(hex, 16).ok()
+        } else if p.len() > 1 && p.starts_with('0') {
+            // Leading-zero octal (e.g. `0177`). All digits must be 0-7.
+            if !p.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+                return None;
+            }
+            u64::from_str_radix(p, 8).ok()
+        } else {
+            if !p.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            p.parse::<u64>().ok()
         }
-        // Short dotted form (fewer than 4 parts) is an alternate encoding getaddrinfo expands.
-        if parts.len() < 4 {
-            return true;
-        }
-        // Four numeric parts: alternate iff any part is hex (`0x`) or leading-zero octal.
-        return parts.iter().any(|p| {
-            p.starts_with("0x")
-                || p.starts_with("0X")
-                || (p.len() > 1 && p.starts_with('0') && p.bytes().all(|b| b.is_ascii_digit()))
-        });
     }
 
-    // No '.', not `0x`: a bare all-digits host is a decimal integer IP encoding (e.g. `2130706433`).
-    host.bytes().all(|b| b.is_ascii_digit())
-}
+    let parts: Vec<&str> = host.split('.').collect();
+    let vals: Vec<u64> = parts
+        .iter()
+        .map(|p| parse_component(p))
+        .collect::<Option<Vec<u64>>>()?;
 
-/// IPv6 unique-local range `fc00::/7` (the first 7 bits are `1111110`).
-fn is_unique_local_v6(addr: &std::net::Ipv6Addr) -> bool {
-    (addr.segments()[0] & 0xfe00) == 0xfc00
-}
+    // A canonical dotted-quad (4 parts, each a plain 0..=255 decimal with no hex/octal prefix) is
+    // left to `IpAddr::parse`. A component is "alternate" if it is out of u8 range OR uses a hex/octal
+    // prefix; the quad is canonical iff NO component is alternate.
+    let is_alternate_octet = |p: &&str, v: &u64| {
+        *v > 255
+            || p.starts_with("0x")
+            || p.starts_with("0X")
+            || (p.len() > 1 && p.starts_with('0'))
+    };
+    let is_canonical_quad = parts.len() == 4
+        && !parts
+            .iter()
+            .zip(&vals)
+            .any(|(p, v)| is_alternate_octet(p, v));
+    if is_canonical_quad {
+        return None;
+    }
 
-/// IPv6 link-local range `fe80::/10` (the first 10 bits are `1111111010`).
-fn is_link_local_v6(addr: &std::net::Ipv6Addr) -> bool {
-    (addr.segments()[0] & 0xffc0) == 0xfe80
+    let addr: u32 = match vals.as_slice() {
+        // `a` — the whole 32-bit address.
+        [a] => u32::try_from(*a).ok()?,
+        // `a.b` — a is the top octet, b the low 24 bits.
+        [a, b] => {
+            if *a > 0xff || *b > 0x00ff_ffff {
+                return None;
+            }
+            ((*a as u32) << 24) | (*b as u32)
+        }
+        // `a.b.c` — a, b top two octets, c the low 16 bits.
+        [a, b, c] => {
+            if *a > 0xff || *b > 0xff || *c > 0x0000_ffff {
+                return None;
+            }
+            ((*a as u32) << 24) | ((*b as u32) << 16) | (*c as u32)
+        }
+        // `a.b.c.d` — the usual quad (reached only for the alternate-encoding case, e.g. per-octet
+        // hex/octal, since a canonical quad returned above).
+        [a, b, c, d] => {
+            if *a > 0xff || *b > 0xff || *c > 0xff || *d > 0xff {
+                return None;
+            }
+            ((*a as u32) << 24) | ((*b as u32) << 16) | ((*c as u32) << 8) | (*d as u32)
+        }
+        _ => return None,
+    };
+    Some(std::net::Ipv4Addr::from(addr))
 }
 
 #[cfg(test)]
@@ -935,11 +1243,25 @@ mod tests {
     ) -> RootCfg {
         config::RootCfg {
             listen: "0.0.0.0:8080".into(),
+            tls: None,
             auth: None,
             providers,
             models,
             pools,
+            blocked_metadata_hosts: Vec::new(),
+            allow_metadata_hosts: Vec::new(),
+            allow_all_metadata: false,
         }
+    }
+
+    /// Like [`make_root_cfg`] but with operator-supplied `security.blocked_metadata_hosts` entries.
+    fn make_root_cfg_with_blocked(
+        providers: HashMap<String, config::ProviderCfg>,
+        blocked_metadata_hosts: Vec<String>,
+    ) -> RootCfg {
+        let mut cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        cfg.blocked_metadata_hosts = blocked_metadata_hosts;
+        cfg
     }
 
     fn make_provider(protocol: &str, base_url: &str, api_key_env: &str) -> config::ProviderCfg {
@@ -956,6 +1278,7 @@ mod tests {
             path: None,
             auth: None,
             _legacy_api_key: None,
+            allow_metadata_hosts: Vec::new(),
         }
     }
 
@@ -975,6 +1298,8 @@ mod tests {
             failover: None,
             on_exhausted: None,
             affinity: None,
+            route: config::RouteKind::default(),
+            policy: None,
         }
     }
 
@@ -983,6 +1308,9 @@ mod tests {
             target: target.into(),
             weight: 1,
             context_max: None,
+            tier: None,
+            cost_per_mtok: None,
+            tags: Vec::new(),
         }
     }
 
@@ -1166,6 +1494,7 @@ mod tests {
                 path: None,
                 auth: None,
                 _legacy_api_key: None,
+                allow_metadata_hosts: Vec::new(),
             },
         );
 
@@ -1206,6 +1535,7 @@ mod tests {
                 path: None,
                 auth: None,
                 _legacy_api_key: None,
+                allow_metadata_hosts: Vec::new(),
             },
         );
 
@@ -1245,6 +1575,7 @@ mod tests {
                 path: None,
                 auth: None,
                 _legacy_api_key: None,
+                allow_metadata_hosts: Vec::new(),
             },
         );
 
@@ -1298,6 +1629,7 @@ mod tests {
                 path: None,
                 auth: None,
                 _legacy_api_key: None,
+                allow_metadata_hosts: Vec::new(),
             },
         );
         providers.insert(
@@ -1311,6 +1643,7 @@ mod tests {
                 path: None,
                 auth: None,
                 _legacy_api_key: None,
+                allow_metadata_hosts: Vec::new(),
             },
         );
 
@@ -1359,6 +1692,7 @@ mod tests {
                 path: None,
                 auth: None,
                 _legacy_api_key: None,
+                allow_metadata_hosts: Vec::new(),
             },
         );
 
@@ -1462,11 +1796,12 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_non_https_base_url() {
-        for bad in [
-            "http://api.example.com",
-            "http://169.254.169.254/latest/meta-data/",
-            "file:///etc/shadow",
-            "",
+        // A PUBLIC host over plaintext http leaks the key on the wire → rejected with the https rule.
+        for (bad, fragment) in [
+            ("http://api.example.com", "must use https for a public host"),
+            // A non-http(s) scheme (file://) or an empty url is not a valid upstream scheme at all.
+            ("file:///etc/shadow", "must use http or https"),
+            ("", "must use http or https"),
         ] {
             let mut providers = HashMap::new();
             providers.insert("p".to_string(), make_provider("anthropic", bad, "API_KEY"));
@@ -1474,11 +1809,29 @@ mod tests {
             let errs = validate(&cfg)
                 .unwrap_err_or_default(format!("non-https base_url '{bad}' must fail validation"));
             assert!(
-                errs.iter()
-                    .any(|e| e.contains("base_url must use https") && e.contains('p')),
-                "expected an https base_url error for '{bad}'; got: {errs:?}"
+                errs.iter().any(|e| e.contains(fragment) && e.contains('p')),
+                "expected a scheme error ('{fragment}') for '{bad}'; got: {errs:?}"
             );
         }
+        // An http:// IMDS literal passes the scheme rule (link-local ⇒ private/loopback) but is then
+        // rejected by the metadata denylist.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            make_provider(
+                "anthropic",
+                "http://169.254.169.254/latest/meta-data/",
+                "API_KEY",
+            ),
+        );
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        let errs =
+            validate(&cfg).unwrap_err_or_default("http IMDS base_url must fail validation".into());
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("blocked cloud-metadata host") && e.contains("169.254.169.254")),
+            "expected a metadata-host error for the http IMDS literal; got: {errs:?}"
+        );
     }
 
     #[test]
@@ -1558,35 +1911,34 @@ mod tests {
     }
 
     #[test]
-    fn test_ssrf_blocks_localhost() {
-        // `localhost` does not parse as an IpAddr and is not an alternate IPv4 encoding, so without
-        // an explicit entry it would slip past every IP-range check and forward inbound keys to a
-        // loopback service (SSRF credential-relay). Both `localhost` and the trailing-dot FQDN form
-        // must be flagged, case-insensitively, with or without a port.
-        for blocked in [
+    fn test_localhost_is_allowed_by_default() {
+        // Under the metadata-denylist model, `localhost` is a legitimate LOCAL-MODEL upstream and is
+        // ALLOWED with NO flag — it is not a metadata endpoint. Both the bare name and the
+        // trailing-dot FQDN form, case-insensitively, are NOT flagged by the SSRF guard.
+        for ok in [
             "https://localhost/",
             "https://localhost:11434/",
             "https://LOCALHOST/v1",
             "https://localhost./",
             "https://localhost.:443/api",
+            "http://localhost:11434/", // plaintext to loopback is fine
         ] {
             assert!(
-                ssrf_blocked_host(blocked).is_some(),
-                "expected '{blocked}' to be flagged as an SSRF target"
+                ssrf_blocked_host(ok, &[], false, &[]).is_none(),
+                "expected '{ok}' to be allowed (localhost is a local-model target, not metadata)"
             );
         }
-        // A full validate() pass must reject a localhost base_url.
+        // A full validate() pass must ACCEPT an https localhost base_url with no flag.
         let mut providers = HashMap::new();
         providers.insert(
             "p".to_string(),
             make_provider("anthropic", "https://localhost:11434/", "API_KEY"),
         );
         let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
-        let errs = validate(&cfg).expect_err("a localhost base_url must fail validation");
         assert!(
-            errs.iter()
-                .any(|e| e.contains("blocked internal/metadata host") && e.contains("localhost")),
-            "expected an SSRF/metadata-host error for localhost; got: {errs:?}"
+            validate(&cfg).is_ok(),
+            "a localhost base_url must validate with no flag; got: {:?}",
+            validate(&cfg)
         );
     }
 
@@ -1966,6 +2318,7 @@ mod tests {
                 price_per_request_cents: 1,
                 price_per_1k_tokens_cents: 0,
                 admin_token: missing.clone(),
+                budget_on_store_error: Default::default(),
             };
             let errs = validate_governance(&gov, None)
                 .expect_err("enabled governance without admin_token must fail");
@@ -1992,6 +2345,7 @@ mod tests {
                 price_per_request_cents: 1,
                 price_per_1k_tokens_cents: 0,
                 admin_token: Some(blank.to_string()),
+                budget_on_store_error: Default::default(),
             };
             let errs = validate_governance(&gov, None).unwrap_err_or_default(format!(
                 "a whitespace-only admin_token {blank:?} must fail validation"
@@ -2011,6 +2365,7 @@ mod tests {
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: Some("  real-secret  ".to_string()),
+            budget_on_store_error: Default::default(),
         };
         assert!(
             validate_governance(&gov, None).is_ok(),
@@ -2026,6 +2381,7 @@ mod tests {
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: Some("an-operator-secret".to_string()),
+            budget_on_store_error: Default::default(),
         };
         assert!(
             validate_governance(&gov, None).is_ok(),
@@ -2042,6 +2398,7 @@ mod tests {
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: None,
+            budget_on_store_error: Default::default(),
         };
         assert!(
             validate_governance(&gov, None).is_ok(),
@@ -2072,6 +2429,7 @@ mod tests {
                 price_per_request_cents: 1,
                 price_per_1k_tokens_cents: 0,
                 admin_token: Some("an-operator-secret".to_string()),
+                budget_on_store_error: Default::default(),
             };
             let errs = validate_governance(&gov, Some(&auth_cfg(mode)))
                 .expect_err("governance + passthrough must be rejected at boot");
@@ -2094,6 +2452,7 @@ mod tests {
                 price_per_request_cents: 1,
                 price_per_1k_tokens_cents: 0,
                 admin_token: Some("an-operator-secret".to_string()),
+                budget_on_store_error: Default::default(),
             };
             assert!(
                 validate_governance(&gov, Some(&auth_cfg(mode))).is_ok(),
@@ -2112,6 +2471,7 @@ mod tests {
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: None,
+            budget_on_store_error: Default::default(),
         };
         assert!(
             validate_governance(&gov, Some(&auth_cfg("passthrough"))).is_ok(),
@@ -2291,80 +2651,316 @@ mod tests {
     }
 
     #[test]
-    fn test_ssrf_blocked_host_rejects_internal_targets() {
-        // IP literals and metadata hostnames over https must be flagged.
+    fn test_ssrf_blocks_metadata_denylist_by_default() {
+        // Under the metadata-denylist model, ONLY cloud-metadata endpoints are blocked by default —
+        // and every obfuscation form of each metadata IP must be caught, not just the canonical
+        // spelling. The link-local /16 covers IMDS, ECS task-creds, Tencent, etc. in one range.
         for blocked in [
-            "https://169.254.169.254/latest/meta-data/",
+            // --- link-local /16 (IMDS, ECS, Tencent, …) ---
+            "https://169.254.169.254/latest/meta-data/", // IMDS
             "https://169.254.169.254/",
+            "http://169.254.169.254/", // http form (link-local ⇒ scheme ok, then metadata-blocked)
+            "https://169.254.170.2/v2/credentials", // AWS ECS task-credentials
+            "https://169.254.0.23/",   // Tencent metadata (still link-local)
+            // --- non-link-local metadata literals ---
+            "https://100.100.100.200/latest/meta-data/", // Alibaba ECS (inside CGNAT /10)
+            "http://100.100.100.200/",
+            "https://168.63.129.16/",   // Azure WireServer/platform
+            "https://[fd00:ec2::254]/", // EC2 IMDSv6
+            // --- metadata hostnames (case-insensitive, trailing-dot stripped) ---
+            "https://metadata.google.internal/computeMetadata/v1/",
+            "https://METADATA.INTERNAL/",
+            "https://metadata.tencentyun.com/",
+            "https://metadata.platformequinix.com/",
+            "https://instance-data/latest/meta-data/",
+            "https://instance-data.ec2.internal/",
+            "https://metadata.google.internal./", // trailing-dot FQDN form
+            // --- obfuscation forms of the metadata IPs (must apply to every literal) ---
+            "https://[::ffff:169.254.169.254]/", // IMDS via IPv4-mapped IPv6
+            "https://[::169.254.169.254]/",      // IMDS via IPv4-compatible IPv6
+            "https://[::ffff:169.254.170.2]/",   // ECS creds via mapped IPv6
+            "https://[::ffff:100.100.100.200]/", // Alibaba via mapped IPv6
+            "https://[::ffff:168.63.129.16]/",   // Azure via mapped IPv6
+            "https://2852039166/",               // IMDS via decimal-int (= 169.254.169.254)
+            "https://0xa9fea9fe/",               // IMDS via hex
+            "https://169.254.169.254./",         // IMDS, trailing dot
+            "https://169%2E254%2E169%2E254/",    // IMDS, percent-encoded dots
+            "https://169.254.169.254:8443/",     // IMDS with port
+            "https://user:pass@169.254.169.254/latest", // IMDS behind userinfo
+            // --- obfuscated inet_aton forms of IMDS (M2/H5: must be caught and canonicalized) ---
+            "https://169.254.43518/", // 3-part inet_aton of 169.254.169.254
+            "https://169.16689662/",  // 2-part inet_aton of 169.254.169.254
+        ] {
+            // M2: assert the ACTUAL returned host is a non-empty string (so a bug returning
+            // Some("") / Some("garbage") cannot pass). The returned host is the normalized authority.
+            let got = ssrf_blocked_host(blocked, &[], false, &[]);
+            let host = got
+                .as_deref()
+                .unwrap_or_else(|| panic!("expected '{blocked}' to be flagged as a metadata SSRF target"));
+            assert!(
+                !host.is_empty(),
+                "blocked '{blocked}' returned an EMPTY host string"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ssrf_blocked_returns_exact_host_string() {
+        // M2: pin the EXACT host string `ssrf_blocked_host` returns for representative targets, so a
+        // regression returning `Some("")` / `Some("garbage")` (which `.is_some()` would accept) fails.
+        assert_eq!(
+            ssrf_blocked_host("https://169.254.169.254/latest", &[], false, &[]).as_deref(),
+            Some("169.254.169.254")
+        );
+        assert_eq!(
+            ssrf_blocked_host("https://user:pass@169.254.169.254:8443/x", &[], false, &[]).as_deref(),
+            Some("169.254.169.254"),
+            "userinfo and port must be stripped from the returned host"
+        );
+        assert_eq!(
+            ssrf_blocked_host("https://metadata.google.internal/", &[], false, &[]).as_deref(),
+            Some("metadata.google.internal")
+        );
+        assert_eq!(
+            ssrf_blocked_host("https://100.100.100.200/", &[], false, &[]).as_deref(),
+            Some("100.100.100.200")
+        );
+    }
+
+    #[test]
+    fn test_expand_alternate_ipv4_imds_obfuscations() {
+        // H5: DIRECT unit tests for the inet_aton canonicalizer. The 1-, 2-, and 3-part obfuscated
+        // forms of the IMDS address all canonicalize to 169.254.169.254. (0xA9FEA9FE = 2852039166.)
+        let imds: std::net::Ipv4Addr = "169.254.169.254".parse().unwrap();
+        assert_eq!(expand_alternate_ipv4("2852039166"), Some(imds), "1-part decimal");
+        assert_eq!(expand_alternate_ipv4("169.16689662"), Some(imds), "2-part inet_aton");
+        assert_eq!(expand_alternate_ipv4("169.254.43518"), Some(imds), "3-part inet_aton");
+        // Don't-double-process invariant: an already-canonical dotted quad returns None (left to the
+        // IpAddr parse path), so the expander never re-canonicalizes a normal address.
+        assert_eq!(
+            expand_alternate_ipv4("169.254.169.254"),
+            None,
+            "an already-canonical dotted quad must return None from the expander"
+        );
+        assert_eq!(expand_alternate_ipv4("8.8.8.8"), None);
+        // And those obfuscated forms must be BLOCKED through the full guard.
+        for base in [
+            "https://2852039166/",
+            "https://169.16689662/",
+            "https://169.254.43518/",
+        ] {
+            assert!(
+                ssrf_blocked_host(base, &[], false, &[]).is_some(),
+                "obfuscated IMDS form '{base}' must be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_alternate_ipv4_imds_hex_octal_forms() {
+        // Companion to `test_expand_alternate_ipv4_imds_obfuscations` (which covers the DECIMAL
+        // inet_aton forms): the canonicalizer must also collapse the HEX and OCTAL encodings of the
+        // IMDS address 169.254.169.254 (= 0xA9FEA9FE = 2852039166 = octal 025177524776) so the SSRF
+        // guard can't be bypassed by spelling the octets in base 16 or base 8.
+        let imds: std::net::Ipv4Addr = "169.254.169.254".parse().unwrap();
+
+        // HEX, single 32-bit integer (`0xA9FEA9FE`) and dotted per-octet hex (`0xA9.0xFE.0xA9.0xFE`).
+        assert_eq!(
+            expand_alternate_ipv4("0xA9FEA9FE"),
+            Some(imds),
+            "single-integer hex form of IMDS"
+        );
+        assert_eq!(
+            expand_alternate_ipv4("0xA9.0xFE.0xA9.0xFE"),
+            Some(imds),
+            "dotted per-octet hex form of IMDS"
+        );
+
+        // OCTAL: single 32-bit integer and dotted per-octet octal (leading-zero octets).
+        assert_eq!(
+            expand_alternate_ipv4("025177524776"),
+            Some(imds),
+            "single-integer octal form of IMDS"
+        );
+        assert_eq!(
+            expand_alternate_ipv4("0251.0376.0251.0376"),
+            Some(imds),
+            "dotted per-octet octal form of IMDS"
+        );
+
+        // Each form must be BLOCKED through the full guard (ssrf_blocked_host returns the host).
+        for base in [
+            "https://0xA9FEA9FE/",
+            "https://0xA9.0xFE.0xA9.0xFE/",
+            "https://025177524776/",
+            "https://0251.0376.0251.0376/",
+        ] {
+            assert!(
+                ssrf_blocked_host(base, &[], false, &[]).is_some(),
+                "hex/octal-obfuscated IMDS form '{base}' must be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reject_cidr_metadata_entries() {
+        // F1: a `/`-bearing entry in any metadata host-list is a no-op (these lists match by EXACT
+        // IP/hostname), so validate() must REJECT it at boot with a clear, key+value-naming error.
+
+        // Global blocked list.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            make_provider("openai", "https://api.openai.com", "API_KEY"),
+        );
+        let cfg = make_root_cfg_with_blocked(providers, vec!["169.254.0.0/16".to_string()]);
+        let errs = validate(&cfg).expect_err("a CIDR blocked_metadata_hosts entry must fail validation");
+        assert!(
+            errs.iter().any(|e| e.contains("security.blocked_metadata_hosts")
+                && e.contains("169.254.0.0/16")
+                && e.contains("CIDR")),
+            "expected a CIDR rejection naming the key+value; got: {errs:?}"
+        );
+
+        // Global allow list.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            make_provider("openai", "https://api.openai.com", "API_KEY"),
+        );
+        let mut cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        cfg.allow_metadata_hosts = vec!["10.0.0.0/8".to_string()];
+        let errs = validate(&cfg).expect_err("a CIDR allow_metadata_hosts entry must fail validation");
+        assert!(
+            errs.iter().any(|e| e.contains("security.allow_metadata_hosts")
+                && e.contains("10.0.0.0/8")),
+            "expected a CIDR rejection naming security.allow_metadata_hosts; got: {errs:?}"
+        );
+
+        // Per-provider allow list.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "prov".to_string(),
+            make_provider_allow_hosts("https://api.openai.com", &["169.254.169.254/32"]),
+        );
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        let errs = validate(&cfg)
+            .expect_err("a CIDR per-provider allow_metadata_hosts entry must fail validation");
+        assert!(
+            errs.iter().any(|e| e.contains("provider 'prov' allow_metadata_hosts")
+                && e.contains("169.254.169.254/32")),
+            "expected a CIDR rejection naming the provider's allow_metadata_hosts; got: {errs:?}"
+        );
+
+        // Sanity: exact IPs/hostnames (no slash) do NOT trip the CIDR guard. (validate() may still
+        // error for other reasons — assert specifically that no CIDR error is produced.)
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            make_provider("openai", "https://api.openai.com", "API_KEY"),
+        );
+        let mut cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        cfg.blocked_metadata_hosts = vec!["169.254.169.254".to_string()];
+        cfg.allow_metadata_hosts = vec!["metadata.example.com".to_string()];
+        if let Err(errs) = validate(&cfg) {
+            assert!(
+                !errs.iter().any(|e| e.contains("CIDR")),
+                "exact IP/hostname entries must not trip the CIDR guard; got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_global_allow_overrides_blocked_metadata_hosts() {
+        // M3: global security.allow_metadata_hosts must override an entry in blocked_metadata_hosts
+        // (allow always wins) — both at the guard level and through full validate().
+        let blocked = vec!["10.77.77.77".to_string()];
+        let allow = vec!["10.77.77.77".to_string()];
+        assert!(
+            ssrf_blocked_host("https://10.77.77.77/", &allow, false, &blocked).is_none(),
+            "global allow_metadata_hosts must override blocked_metadata_hosts"
+        );
+        // Without the allow, it is blocked (proving the block entry is real).
+        assert!(
+            ssrf_blocked_host("https://10.77.77.77/", &[], false, &blocked).is_some(),
+            "the host must be blocked when not allow-listed"
+        );
+        // Full validate(): global allow overrides global blocked.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            make_provider("openai", "https://10.77.77.77/", "API_KEY"),
+        );
+        let mut cfg = make_root_cfg_with_blocked(providers, vec!["10.77.77.77".to_string()]);
+        cfg.allow_metadata_hosts = vec!["10.77.77.77".to_string()];
+        assert!(
+            validate(&cfg).is_ok(),
+            "global allow_metadata_hosts must override blocked_metadata_hosts in validate(); got: {:?}",
+            validate(&cfg)
+        );
+    }
+
+    #[test]
+    fn test_allow_all_metadata_beats_nonempty_blocked_list() {
+        // M3: allow_all_metadata: true wins even with a NON-EMPTY blocked_metadata_hosts — the nuclear
+        // override disables the guard wholesale.
+        let blocked = vec!["10.0.0.7".to_string(), "metadata.x.example".to_string()];
+        for base in [
+            "https://169.254.169.254/", // hardcoded denylist
+            "https://10.0.0.7/",        // operator-listed
+            "https://metadata.x.example/",
+        ] {
+            assert!(
+                ssrf_blocked_host(base, &[], true, &blocked).is_none(),
+                "allow_all_metadata must unblock '{base}' even with a non-empty blocked list"
+            );
+        }
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            make_provider("openai", "https://10.0.0.7/", "API_KEY"),
+        );
+        let mut cfg = make_root_cfg_with_blocked(providers, vec!["10.0.0.7".to_string()]);
+        cfg.allow_all_metadata = true;
+        assert!(
+            validate(&cfg).is_ok(),
+            "allow_all_metadata must win over a non-empty blocked_metadata_hosts; got: {:?}",
+            validate(&cfg)
+        );
+    }
+
+    #[test]
+    fn test_ssrf_allows_private_and_loopback_by_default() {
+        // Loopback / RFC-1918 / CGNAT / localhost are legitimate LOCAL-MODEL upstreams and are
+        // ALLOWED with no flag — they are NOT metadata endpoints. (The link-local /16 minus the
+        // metadata literals is still allowed too, but link-local is unusual for a model; the key
+        // cases are loopback/RFC-1918/CGNAT.)
+        for allowed in [
             "https://127.0.0.1/",
             "https://10.0.0.1/v1",
             "https://172.16.0.1/",
             "https://192.168.1.1:8443/",
             "https://[::1]/",
             "https://[::1]:443/",
-            "https://[fe80::1]/",
-            "https://[fc00::1]/",
-            "https://metadata.google.internal/computeMetadata/v1/",
-            "https://METADATA.INTERNAL/",
+            "https://[fe80::1]/", // IPv6 link-local (not a metadata literal)
+            "https://[fc00::1]/", // IPv6 ULA
             "https://0.0.0.0/",
             "https://user:pass@10.0.0.5/path",
-            // RFC 6598 CGNAT shared address space (100.64.0.0/10) — routable in cloud VPCs.
-            "https://100.64.0.1/",
-            "https://100.64.1.1/",
+            "https://100.64.0.1/", // CGNAT (Tailscale)
             "https://100.127.255.255/",
-            // IPv4-mapped IPv6 forms of internal targets MUST be blocked identically to the bare v4
-            // form: the mapped branch reaches the same host, so a parity gap is an SSRF bypass.
-            "https://[::ffff:100.64.0.1]/", // CGNAT (RFC 6598) via mapped IPv6
-            "https://[::ffff:169.254.169.254]/", // IMDS via mapped IPv6
-            "https://[::ffff:127.0.0.1]/",  // loopback via mapped IPv6
-            "https://[::ffff:10.0.0.1]/",   // RFC-1918 private via mapped IPv6
-            "https://[::ffff:169.254.1.1]:8443/", // link-local via mapped IPv6, with port
-            // IPv4-COMPATIBLE IPv6 forms (`[::a.b.c.d]`, leading segment 0, NOT the `::ffff:` mapped
-            // prefix). `to_ipv4_mapped()` returns None for these and the ULA/link-local masks miss
-            // (segments()[0]==0), but `to_ipv4()` still yields the embedded v4 a connecting stack
-            // routes internally — so they MUST be blocked identically to the bare v4 form.
-            "https://[::127.0.0.1]/", // loopback via IPv4-compatible IPv6
-            "https://[::169.254.169.254]/", // IMDS via IPv4-compatible IPv6
-            "https://[::10.0.0.1]/v1", // RFC-1918 private via IPv4-compatible IPv6
-            "https://[::100.64.0.1]:8443/", // CGNAT (RFC 6598) via IPv4-compatible IPv6, with port
-            // Alternate IPv4 encodings the OS resolver maps to loopback / IMDS but `IpAddr` rejects.
-            "https://2130706433/",          // decimal int = 127.0.0.1
-            "https://0x7f000001/",          // hex = 127.0.0.1
-            "https://017700000001/",        // octal-ish leading-zero = 127.0.0.1
+            "https://[::ffff:10.0.0.1]/",   // RFC-1918 via mapped IPv6
+            "https://[::ffff:100.64.0.1]/", // CGNAT via mapped IPv6
+            "https://[::127.0.0.1]/",       // loopback via compatible IPv6
+            "https://2130706433/",          // decimal int = 127.0.0.1 (private, allowed)
             "https://127.1/",               // short dotted form = 127.0.0.1
-            "https://10.0.1/",              // short dotted form = 10.0.0.1
-            "https://2852039166/",          // decimal int = 169.254.169.254 (IMDS)
-            "https://0x0a.0x00.0x00.0x01/", // per-octet hex
-            // Trailing-dot FQDN-root spellings of IP literals. glibc getaddrinfo treats the trailing
-            // dot as a rooted FQDN and still resolves the literal, but an IP+dot does NOT parse as
-            // `IpAddr` and is not in METADATA_HOSTS — without the normalize-trailing-dot step these
-            // slipped past every check (an SSRF credential-relay bypass).
-            "https://127.0.0.1./",        // loopback, trailing dot
-            "https://169.254.169.254./",  // IMDS, trailing dot
-            "https://10.0.0.1./v1",       // RFC1918, trailing dot
-            "https://192.168.1.1.:8443/", // RFC1918 with port, trailing dot
-            // Percent-encoded host components. The `url` crate `reqwest` uses decodes these per
-            // RFC 3986, so the guard must decode them too — otherwise the `%` defeats every check
-            // and a blocked literal is smuggled past config validation (SSRF credential-relay).
-            "https://169%2E254%2E169%2E254/", // IMDS, percent-encoded dots
-            "https://127%2e0%2e0%2e1/",       // loopback, percent-encoded dots (lowercase hex)
-            "https://%31%30.0.0.1/",          // "10.0.0.1" with first octet percent-encoded
-            // The well-known loopback name and any `*.localhost` subdomain. RFC 6761 reserves the
-            // whole `.localhost` TLD to loopback and glibc getaddrinfo resolves these to 127.0.0.1,
-            // so a `base_url` using one would relay inbound API keys to a co-located loopback
-            // service (SSRF credential-relay). Must be at parity with `host_is_internal`.
             "https://localhost/",
-            "https://localhost:11434/v1",
-            "https://localhost./", // trailing-dot FQDN-root spelling, normalized off
-            "https://api.localhost/",
             "https://api.localhost:11434/v1",
             "https://service.internal.localhost/",
-            "https://API.LOCALHOST/",    // case-insensitive
-            "https://sub.localhost./v1", // subdomain + trailing dot
+            "https://API.LOCALHOST/",
         ] {
             assert!(
-                ssrf_blocked_host(blocked).is_some(),
-                "expected '{blocked}' to be flagged as an SSRF target"
+                ssrf_blocked_host(allowed, &[], false, &[]).is_none(),
+                "expected '{allowed}' to be ALLOWED (private/loopback is a local-model target, not metadata)"
             );
         }
     }
@@ -2377,33 +2973,39 @@ mod tests {
         // the host (passing every internal/metadata check) while reqwest connected to `10.0.0.1` /
         // `169.254.169.254` with the lane API key attached — a credential-relay SSRF. The guard must
         // normalize `\`→`/` BEFORE splitting so it sees the SAME authority boundary reqwest will.
+        // The real host before the `\` here is a METADATA endpoint; the trick tries to disguise it as
+        // a benign `allowed.com` suffix. The guard must still see the metadata target.
         for blocked in [
-            "https://10.0.0.1\\x.allowed.com",
-            "https://10.0.0.1\\x.allowed.com/v1/messages",
             "https://169.254.169.254\\a.b",
-            "https://127.0.0.1\\evil.example.com/",
-            "https://localhost\\x.allowed.com",
+            "https://169.254.169.254\\x.allowed.com/v1/messages",
+            "https://100.100.100.200\\evil.example.com/",
+            "https://metadata.google.internal\\x.allowed.com",
             // Mixed delimiters: the backslash must still terminate the authority before the slash.
-            "https://10.0.0.1\\@allowed.com/path",
+            "https://169.254.169.254\\@allowed.com/path",
         ] {
             assert!(
-                ssrf_blocked_host(blocked).is_some(),
+                ssrf_blocked_host(blocked, &[], false, &[]).is_some(),
                 "expected '{blocked}' to be flagged: the backslash terminates the authority \
-                 (reqwest rewrites \\ to /), so the real host is the internal target before it"
+                 (reqwest rewrites \\ to /), so the real host is the metadata target before it"
             );
         }
-        // A full validate() pass must reject a base_url using the backslash-authority trick.
+        // A full validate() pass must reject a base_url using the backslash-authority trick to reach
+        // a metadata host.
         let mut providers = HashMap::new();
         providers.insert(
             "p".to_string(),
-            make_provider("anthropic", "https://10.0.0.1\\x.allowed.com", "API_KEY"),
+            make_provider(
+                "anthropic",
+                "https://169.254.169.254\\x.allowed.com",
+                "API_KEY",
+            ),
         );
         let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
         let errs = validate(&cfg).expect_err("backslash-authority base_url must fail validation");
         assert!(
             errs.iter()
-                .any(|e| e.contains("blocked internal/metadata host") && e.contains("10.0.0.1")),
-            "expected an SSRF/metadata-host error naming the real internal host; got: {errs:?}"
+                .any(|e| e.contains("blocked cloud-metadata host") && e.contains("169.254.169.254")),
+            "expected a metadata-host error naming the real metadata host; got: {errs:?}"
         );
     }
 
@@ -2463,39 +3065,19 @@ mod tests {
     }
 
     #[test]
-    fn test_ssrf_cgnat_boundary() {
-        // 100.64.0.0/10 spans 100.64.0.0 .. 100.127.255.255. Just outside the /10 must be allowed:
-        // 100.63.255.255 (below) and 100.128.0.1 (above) are public.
-        assert!(ssrf_blocked_host("https://100.64.0.0/").is_some());
-        assert!(ssrf_blocked_host("https://100.127.255.255/").is_some());
+    fn test_ssrf_cgnat_allowed_but_alibaba_literal_blocked() {
+        // CGNAT 100.64.0.0/10 is a legitimate local-model range (Tailscale) and is ALLOWED — EXCEPT
+        // the single Alibaba metadata literal 100.100.100.200 that lives inside it, which stays
+        // blocked. Addresses just outside the /10 are ordinary public addresses (also allowed).
+        assert!(ssrf_blocked_host("https://100.64.0.0/", &[], false, &[]).is_none());
+        assert!(ssrf_blocked_host("https://100.127.255.255/", &[], false, &[]).is_none());
+        assert!(ssrf_blocked_host("https://100.63.255.255/", &[], false, &[]).is_none());
+        assert!(ssrf_blocked_host("https://100.128.0.1/", &[], false, &[]).is_none());
+        // The Alibaba metadata literal inside the CGNAT range stays blocked.
         assert!(
-            ssrf_blocked_host("https://100.63.255.255/").is_none(),
-            "100.63.255.255 is below the CGNAT /10 and is a public address"
+            ssrf_blocked_host("https://100.100.100.200/", &[], false, &[]).is_some(),
+            "the Alibaba metadata literal 100.100.100.200 must stay blocked even though CGNAT is allowed"
         );
-        assert!(
-            ssrf_blocked_host("https://100.128.0.1/").is_none(),
-            "100.128.0.1 is above the CGNAT /10 and is a public address"
-        );
-    }
-
-    #[test]
-    fn test_alternate_ipv4_encoding_detection() {
-        // Alternate encodings of loopback / internal addresses are flagged.
-        assert!(is_alternate_ipv4_encoding("2130706433")); // decimal 127.0.0.1
-        assert!(is_alternate_ipv4_encoding("0x7f000001")); // hex
-        assert!(is_alternate_ipv4_encoding("0X7F000001")); // hex, uppercase prefix
-        assert!(is_alternate_ipv4_encoding("017700000001")); // leading-zero octal
-        assert!(is_alternate_ipv4_encoding("127.1")); // short dotted
-        assert!(is_alternate_ipv4_encoding("10.0.1")); // short dotted
-        assert!(is_alternate_ipv4_encoding("0x7f.0.0.1")); // per-octet hex
-        assert!(is_alternate_ipv4_encoding("0177.0.0.1")); // per-octet octal
-                                                           // A canonical dotted-quad is NOT flagged here (handled by the IpAddr parse path).
-        assert!(!is_alternate_ipv4_encoding("127.0.0.1"));
-        assert!(!is_alternate_ipv4_encoding("8.8.8.8"));
-        // A real DNS hostname is not flagged.
-        assert!(!is_alternate_ipv4_encoding("api.openai.com"));
-        assert!(!is_alternate_ipv4_encoding("example.com"));
-        assert!(!is_alternate_ipv4_encoding(""));
     }
 
     #[test]
@@ -2579,7 +3161,7 @@ mod tests {
             "https://localhost.example.com/", // `localhost` is a left label, TLD is `com`
         ] {
             assert!(
-                ssrf_blocked_host(ok).is_none(),
+                ssrf_blocked_host(ok, &[], false, &[]).is_none(),
                 "expected '{ok}' to be allowed (not an SSRF target)"
             );
         }
@@ -2597,7 +3179,7 @@ mod tests {
         let errs = validate(&cfg).expect_err("https IMDS base_url must fail validation");
         assert!(
             errs.iter()
-                .any(|e| e.contains("blocked internal/metadata host")
+                .any(|e| e.contains("blocked cloud-metadata host")
                     && e.contains("169.254.169.254")),
             "expected an SSRF/metadata-host error; got: {errs:?}"
         );
@@ -2909,6 +3491,87 @@ mod tests {
         );
     }
 
+    /// Build a single-pool config whose pool uses `route: webhook` with the given `policy.url`. The
+    /// pool has one member targeting a valid model+provider, so the ONLY thing under test is the
+    /// routing-webhook URL validation rule.
+    fn webhook_pool_cfg(url: Option<&str>) -> RootCfg {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "prov".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        models.insert("m1".to_string(), make_model("prov", 4));
+        let mut pool = make_pool(vec![make_member("m1")]);
+        pool.route = config::RouteKind::Webhook;
+        pool.policy = Some(config::PolicyCfg {
+            url: url.map(str::to_string),
+            timeout_ms: 150,
+            on_error: config::PolicyOnError::default(),
+            script: None,
+            script_file: None,
+            name: None,
+        });
+        let mut pools = HashMap::new();
+        pools.insert("p1".to_string(), pool);
+        make_root_cfg(providers, models, pools)
+    }
+
+    #[test]
+    fn test_webhook_route_allows_loopback_sidecar() {
+        // Loopback / localhost sidecars are the carve-out (the OTLP precedent): plaintext http:// is
+        // permitted on loopback, and https loopback too.
+        for ok in [
+            "http://127.0.0.1:9000/route",
+            "http://localhost:9000/route",
+            "https://localhost:9000/route",
+            "http://[::1]:9000/route",
+        ] {
+            let cfg = webhook_pool_cfg(Some(ok));
+            let res = validate(&cfg);
+            if let Err(errs) = res {
+                assert!(
+                    !errs.iter().any(|e| e.contains("route: webhook")),
+                    "loopback sidecar '{ok}' must pass the routing-webhook guard; got: {errs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_webhook_route_blocks_internal_and_metadata() {
+        // Internal / cloud-metadata / RFC1918 / link-local targets are blocked even though loopback
+        // is allowed — the routing webhook is NOT routed through the looser-than-base_url path blindly.
+        for bad in [
+            "https://169.254.169.254/route", // IMDS
+            "https://10.0.0.5/route",        // RFC1918
+            "https://metadata.google.internal/route",
+            "http://example.com/route", // plaintext to a non-loopback host
+        ] {
+            let cfg = webhook_pool_cfg(Some(bad));
+            let errs = validate(&cfg)
+                .unwrap_err_or_default(format!("'{bad}' must fail routing-webhook validation"));
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("p1") && e.contains("route: webhook")),
+                "internal/plaintext target '{bad}' must be rejected; got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_webhook_route_requires_url() {
+        // A `route: webhook` pool with no `policy.url` is a misconfiguration caught at startup.
+        let cfg = webhook_pool_cfg(None);
+        let errs = validate(&cfg)
+            .unwrap_err_or_default("missing policy.url must fail validation".to_string());
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("route: webhook") && e.contains("required")),
+            "missing url must be reported; got: {errs:?}"
+        );
+    }
+
     // Small ergonomic helper: like `expect_err` but with a custom message and returning the Vec.
     trait UnwrapErrOrDefault {
         fn unwrap_err_or_default(self, msg: String) -> Vec<String>;
@@ -2917,5 +3580,371 @@ mod tests {
         fn unwrap_err_or_default(self, msg: String) -> Vec<String> {
             self.err().unwrap_or_else(|| panic!("{msg}"))
         }
+    }
+
+    // ---- metadata-denylist model: local upstreams allowed by default; metadata blocked ----
+
+    /// Build a provider whose per-provider `allow_metadata_hosts` lists the given entries.
+    fn make_provider_allow_hosts(base_url: &str, hosts: &[&str]) -> config::ProviderCfg {
+        let mut p = make_provider("openai", base_url, "API_KEY");
+        p.allow_metadata_hosts = hosts.iter().map(|s| s.to_string()).collect();
+        p
+    }
+
+    #[test]
+    fn test_local_upstreams_allowed_by_default_no_flag() {
+        // The core use case: an operator fronts a local Ollama / vLLM / LM Studio. Under the
+        // metadata-denylist model this validates with NO flag — plain http:// is allowed because the
+        // host is private/loopback, and the SSRF guard allows everything that is not metadata.
+        for base in [
+            "http://localhost:11434",
+            "http://127.0.0.1",
+            "http://127.0.0.1:11434",
+            "http://10.0.0.5:8000",     // RFC-1918
+            "http://192.168.1.50:1234", // RFC-1918 (LM Studio)
+            "http://172.16.3.4:8000",   // RFC-1918
+            "http://100.64.0.5:8000",   // CGNAT (Tailscale)
+            "http://[::1]:11434",       // IPv6 loopback
+            "https://localhost",        // https local also fine
+            "https://localhost:11434",
+        ] {
+            let mut providers = HashMap::new();
+            providers.insert(
+                "local".to_string(),
+                make_provider("openai", base, "API_KEY"),
+            );
+            let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+            assert!(
+                validate(&cfg).is_ok(),
+                "local base_url '{base}' should validate with no flag, got: {:?}",
+                validate(&cfg)
+            );
+        }
+    }
+
+    #[test]
+    fn test_scheme_rule_public_http_rejected_https_allowed() {
+        // PUBLIC http:// is rejected (cleartext would leak the API key on the wire); public https://
+        // is allowed; local http:// is allowed (no off-box wiretap, local models are plaintext).
+        // public http → rejected with the https-for-public-host diagnostic.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "pub".to_string(),
+            make_provider("openai", "http://api.example.com", "API_KEY"),
+        );
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        let errs = validate(&cfg).expect_err("public http base_url must be rejected");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("must use https for a public host")),
+            "expected the public-host https diagnostic; got: {errs:?}"
+        );
+
+        // public https → allowed; local http → allowed.
+        for ok in ["https://api.example.com", "http://10.0.0.5:8000"] {
+            let mut providers = HashMap::new();
+            providers.insert("p".to_string(), make_provider("openai", ok, "API_KEY"));
+            let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+            assert!(
+                validate(&cfg).is_ok(),
+                "'{ok}' must validate (public https / local http); got: {:?}",
+                validate(&cfg)
+            );
+        }
+    }
+
+    #[test]
+    fn test_metadata_blocked_by_default_every_form() {
+        // SECURITY INVARIANT: every metadata form stays blocked by default (no flag). Covers the
+        // canonical literals, the link-local /16 (IMDS, ECS), the non-link-local literals (Alibaba,
+        // Azure), IMDSv6, the metadata hostnames, and the obfuscated encodings.
+        for base in [
+            "http://169.254.169.254/latest/meta-data/", // IMDSv4, plain http
+            "https://169.254.169.254/",                 // IMDSv4, https
+            "https://169.254.170.2/v2/credentials",     // AWS ECS task-credentials
+            "https://100.100.100.200/",                 // Alibaba (CGNAT range)
+            "https://168.63.129.16/",                   // Azure WireServer
+            "http://[fd00:ec2::254]/latest/meta-data/", // EC2 IMDSv6
+            "https://[fd00:ec2::254]/",
+            // Metadata DNS names over https (a DNS name is not classed private/loopback, so an http
+            // scheme rule would preempt the SSRF check; https reaches the metadata denylist directly).
+            "https://metadata.google.internal/computeMetadata/v1/",
+            "https://metadata.tencentyun.com/",
+            "https://instance-data/latest/meta-data/",
+            "http://[::ffff:169.254.169.254]/", // IMDS via IPv4-mapped IPv6
+            "http://[::169.254.169.254]/",      // IMDS via IPv4-compatible IPv6
+            "http://2852039166/",               // IMDS via decimal-int encoding
+            "https://169%2E254%2E169%2E254/",   // IMDS via percent-encoded dots
+            "https://169.254.169.254./",        // IMDS, trailing dot
+        ] {
+            // Direct guard call (no flag, no extra entries).
+            assert!(
+                ssrf_blocked_host(base, &[], false, &[]).is_some(),
+                "metadata target '{base}' must be blocked by default"
+            );
+            // And full validate() pass.
+            let mut providers = HashMap::new();
+            providers.insert("p".to_string(), make_provider("openai", base, "API_KEY"));
+            let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+            let errs = validate(&cfg)
+                .expect_err(&format!("metadata base_url '{base}' must fail validation"));
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("blocked cloud-metadata host")),
+                "expected a metadata-host error for '{base}'; got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_per_provider_allow_metadata_hosts_is_surgical_and_scoped() {
+        // Per-provider `allow_metadata_hosts: ["169.254.169.254"]` unblocks ONLY that host for ONLY
+        // that provider: a DIFFERENT metadata IP stays blocked, and another provider still blocks the
+        // same IP. (https so the scheme rule passes — the override governs the SSRF denylist only.)
+        let allow = vec!["169.254.169.254".to_string()];
+
+        // Direct guard: the listed host is unblocked; a different metadata IP is still blocked.
+        assert!(
+            ssrf_blocked_host("https://169.254.169.254/", &allow, false, &[]).is_none(),
+            "the listed host must be unblocked by the override"
+        );
+        assert!(
+            ssrf_blocked_host("https://100.100.100.200/", &allow, false, &[]).is_some(),
+            "a DIFFERENT metadata IP must stay blocked"
+        );
+        assert!(
+            ssrf_blocked_host("https://169.254.170.2/", &allow, false, &[]).is_some(),
+            "another link-local metadata IP must stay blocked (override is exact, not the /16)"
+        );
+
+        // Full validate(): provider `surgical` allows IMDS; provider `other` (no override) targeting a
+        // different metadata IP must still fail.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "surgical".to_string(),
+            make_provider_allow_hosts("https://169.254.169.254/", &["169.254.169.254"]),
+        );
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        assert!(
+            validate(&cfg).is_ok(),
+            "the provider's own allow_metadata_hosts must let its IMDS base_url validate; got: {:?}",
+            validate(&cfg)
+        );
+
+        // Another provider WITHOUT the override still blocks the same IP (scope is per-provider).
+        let mut providers = HashMap::new();
+        providers.insert(
+            "other".to_string(),
+            make_provider("openai", "https://169.254.169.254/", "API_KEY"),
+        );
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        validate(&cfg).expect_err("a provider without the override must still block IMDS");
+    }
+
+    #[test]
+    fn test_global_allow_metadata_hosts_unblocks_all_providers() {
+        // security.allow_metadata_hosts unblocks the listed host for EVERY provider.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "a".to_string(),
+            make_provider("openai", "https://100.100.100.200/", "API_KEY"),
+        );
+        providers.insert(
+            "b".to_string(),
+            make_provider("openai", "https://100.100.100.200/", "API_KEY"),
+        );
+        let mut cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        cfg.allow_metadata_hosts = vec!["100.100.100.200".to_string()];
+        assert!(
+            validate(&cfg).is_ok(),
+            "security.allow_metadata_hosts must unblock the host for ALL providers; got: {:?}",
+            validate(&cfg)
+        );
+
+        // A metadata host NOT in the global allow-list is still blocked.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "c".to_string(),
+            make_provider("openai", "https://169.254.169.254/", "API_KEY"),
+        );
+        let mut cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        cfg.allow_metadata_hosts = vec!["100.100.100.200".to_string()];
+        validate(&cfg).expect_err("a host not in the global allow-list must stay blocked");
+    }
+
+    #[test]
+    fn test_allow_all_metadata_disables_guard_entirely() {
+        // security.allow_all_metadata: true disables the metadata guard for everything.
+        for base in [
+            "https://169.254.169.254/",
+            "https://metadata.google.internal/",
+            "https://100.100.100.200/",
+            "https://168.63.129.16/",
+            "https://[fd00:ec2::254]/",
+        ] {
+            // Direct guard: allow_all=true ⇒ never blocked.
+            assert!(
+                ssrf_blocked_host(base, &[], true, &[]).is_none(),
+                "allow_all_metadata must unblock '{base}'"
+            );
+            let mut providers = HashMap::new();
+            providers.insert("meta".to_string(), make_provider("openai", base, "API_KEY"));
+            let mut cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+            cfg.allow_all_metadata = true;
+            assert!(
+                validate(&cfg).is_ok(),
+                "allow_all_metadata must let '{base}' validate; got: {:?}",
+                validate(&cfg)
+            );
+        }
+    }
+
+    #[test]
+    fn test_allow_override_matches_obfuscated_spellings() {
+        // An allow entry written as the canonical IP also unblocks that IP's obfuscated spellings
+        // (mirroring how a block entry blocks all spellings). Allow `169.254.169.254` and confirm its
+        // decimal-int, IPv4-mapped-IPv6, and trailing-dot forms are all permitted too.
+        let allow = vec!["169.254.169.254".to_string()];
+        for base in [
+            "https://169.254.169.254/",         // canonical
+            "http://2852039166/",               // decimal-int
+            "http://[::ffff:169.254.169.254]/", // IPv4-mapped IPv6
+            "https://169.254.169.254./",        // trailing dot
+        ] {
+            assert!(
+                ssrf_blocked_host(base, &allow, false, &[]).is_none(),
+                "an allow entry must unblock the obfuscated spelling '{base}'"
+            );
+        }
+        // A DIFFERENT metadata IP's obfuscated form is still blocked.
+        assert!(
+            ssrf_blocked_host("https://168.63.129.16/", &allow, false, &[]).is_some(),
+            "a non-allowed metadata IP must stay blocked"
+        );
+    }
+
+    #[test]
+    fn test_blocked_metadata_hosts_extends_denylist() {
+        // security.blocked_metadata_hosts appends to the hardcoded denylist. An RFC-1918 address that
+        // is normally ALLOWED becomes blocked once listed; a DNS hostname likewise; and an obfuscated
+        // spelling of a listed IP is caught too. An UN-listed RFC-1918 host stays allowed.
+        // IP entry blocks the literal AND its mapped-IPv6 form.
+        for base in [
+            "https://10.99.99.99/",
+            "https://[::ffff:10.99.99.99]/", // mapped form of the listed IP
+        ] {
+            assert!(
+                ssrf_blocked_host(base, &[], false, &["10.99.99.99".to_string()]).is_some(),
+                "'{base}' must be blocked once 10.99.99.99 is in blocked_metadata_hosts"
+            );
+        }
+        // A different RFC-1918 host (not listed) stays allowed.
+        assert!(
+            ssrf_blocked_host(
+                "https://10.0.0.1/",
+                &[],
+                false,
+                &["10.99.99.99".to_string()]
+            )
+            .is_none(),
+            "an un-listed private host must stay allowed"
+        );
+        // Hostname entry (case-insensitive).
+        assert!(
+            ssrf_blocked_host(
+                "https://metadata.mycloud.example/",
+                &[],
+                false,
+                &["metadata.mycloud.example".to_string()]
+            )
+            .is_some(),
+            "a listed metadata hostname must be blocked"
+        );
+
+        // Full validate() pass: the provider base_url is RFC-1918 (normally allowed) but listed.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            make_provider("openai", "https://10.99.99.99/", "API_KEY"),
+        );
+        let cfg = make_root_cfg_with_blocked(providers, vec!["10.99.99.99".to_string()]);
+        let errs = validate(&cfg)
+            .expect_err("a base_url listed in blocked_metadata_hosts must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("blocked cloud-metadata host") && e.contains("10.99.99.99")),
+            "expected a metadata-host error for the listed host; got: {errs:?}"
+        );
+
+        // An allow-override beats even an operator-listed blocked host (allow always wins).
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            make_provider_allow_hosts("https://10.99.99.99/", &["10.99.99.99"]),
+        );
+        let cfg = make_root_cfg_with_blocked(providers, vec!["10.99.99.99".to_string()]);
+        assert!(
+            validate(&cfg).is_ok(),
+            "allow_metadata_hosts must override an operator-listed blocked host; got: {:?}",
+            validate(&cfg)
+        );
+    }
+
+    #[test]
+    fn test_public_targets_unaffected() {
+        // A normal public https provider validates and the guard allows it regardless of the flag.
+        for base in [
+            "https://api.openai.com",
+            "https://api.anthropic.com/v1/messages",
+            "https://8.8.8.8/",
+        ] {
+            assert!(ssrf_blocked_host(base, &[], false, &[]).is_none());
+            assert!(ssrf_blocked_host(base, &[], true, &[]).is_none());
+            let mut providers = HashMap::new();
+            providers.insert("p".to_string(), make_provider("openai", base, "API_KEY"));
+            let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+            assert!(
+                validate(&cfg).is_ok(),
+                "public https '{base}' must validate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_path_override_composition_under_metadata_rules() {
+        // A leading-slash path on a local http base_url validates (composed url re-checked, allowed).
+        let mut ok = make_provider("openai", "http://localhost:11434", "API_KEY");
+        ok.path = Some("/v1/chat/completions".to_string());
+        let mut providers = HashMap::new();
+        providers.insert("local".to_string(), ok);
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        assert!(
+            validate(&cfg).is_ok(),
+            "local http base_url + leading-slash path should validate, got: {:?}",
+            validate(&cfg)
+        );
+
+        // A path that fuses into the authority to re-home at IMDS is rejected by the leading-slash
+        // rule (and the composed url is a metadata target).
+        let mut evil = make_provider("openai", "https://api.example.com", "API_KEY");
+        evil.path = Some(".169.254.169.254/latest".to_string()); // no leading slash → host fusion
+        let mut providers = HashMap::new();
+        providers.insert("evil".to_string(), evil);
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        validate(&cfg).expect_err("authority-fusing path must be rejected");
+
+        // A leading-slash path whose composition still lands on a metadata host (base already
+        // metadata-ish via an allowed-by-scheme local host, path extends to nothing risky) — verify
+        // the composed-url metadata recheck fires when base is a benign public host but allow_metadata
+        // is off and a path cannot smuggle a host (leading slash) — so this should PASS.
+        let mut p = make_provider("openai", "https://api.example.com/api/paas/v4", "API_KEY");
+        p.path = Some("/chat/completions".to_string());
+        let mut providers = HashMap::new();
+        providers.insert("ok".to_string(), p);
+        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
+        assert!(
+            validate(&cfg).is_ok(),
+            "well-formed leading-slash path on a public host must validate"
+        );
     }
 }

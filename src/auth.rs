@@ -163,7 +163,7 @@ impl AuthMiddleware {
     /// an early-exit branch (which would reintroduce a timing signal). The length check is a
     /// deliberate fast-path: token *length* is not treated as secret.
     #[inline(never)]
-    fn constant_time_eq(a: &str, b: &str) -> bool {
+    pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
         let a_bytes = a.as_bytes();
         let b_bytes = b.as_bytes();
 
@@ -199,11 +199,15 @@ impl AuthMiddleware {
     /// does not mask a token in a lower-precedence carrier. The returned token is validated
     /// identically and in constant time regardless of which header carried it.
     ///
-    /// Bedrock SDKs authenticate with inbound AWS SigV4, NOT a bearer-style token. busbar does NOT
-    /// verify inbound SigV4 (no inbound verifier exists; `src/sigv4.rs` is sign-only). Bedrock
-    /// ingress under `token` mode is therefore UNSUPPORTED and must run under `passthrough`, where
-    /// `validate_token` returns `true` unconditionally and the caller's SigV4 creds are forwarded
-    /// upstream. We deliberately do not read any `x-amz-*` / SigV4 `Authorization` header here.
+    /// Bedrock SDKs authenticate with inbound AWS SigV4, NOT a bearer-style token, so this extractor
+    /// deliberately does NOT read any `x-amz-*` / SigV4 `Authorization` header — a non-Bearer
+    /// `Authorization` (AWS4-HMAC-SHA256 or Basic) falls through to the vendor carriers and otherwise
+    /// yields `None` here. Inbound SigV4 is now handled SEPARATELY, under governance, by
+    /// `verify_bedrock_sigv4` (the MinIO/S3-compatible model: an AWS-style access-key-id + secret
+    /// access key issued per virtual key, whose signature busbar verifies via `crate::sigv4`). On a
+    /// successful verify the same `GovCtx` a bearer auth attaches is attached, so Bedrock ingress now
+    /// receives full virtual-key governance under `token`/governance mode — it no longer requires
+    /// `passthrough`. This token path itself is unchanged.
     fn extract_client_token(req: &Request<Body>) -> Option<String> {
         let header_str = |name: &str| {
             req.headers()
@@ -303,7 +307,7 @@ fn vendor_auth_failure_message(proto: &str) -> &'static str {
 ///     `AuthenticationError.code`. Emitting `code: null` is a deterministic proxy tell a native SDK
 ///     keys its typed-exception comparison off. The openai/responses writers pair
 ///     `code: "invalid_api_key"` ONLY with `error.type: "authentication_error"` (see
-///     `openai_error_code`/`responses_error_code`); the alternate `invalid_request_error` type maps
+///     `proto::bearer_error_code`); the alternate `invalid_request_error` type maps
 ///     to `code: null`. We therefore pass `authentication_error` here so the wire body carries the
 ///     real `code: "invalid_api_key"` pairing — matching the modern OpenAI bad-key shape the writers
 ///     document — rather than the `code: null` tell.
@@ -444,16 +448,36 @@ pub(crate) async fn auth_middleware(
             // `u8`, OR them, and `black_box` the result so the optimizer can't reintroduce an early
             // exit. A missing carrier contributes 0 (no compare to a secret leaks via its absence).
             Some(t) => {
+                // Length-independent compare: `constant_time_eq` early-returns on a length mismatch,
+                // which leaks the admin token's LENGTH via timing (a candidate of the right length runs
+                // the full byte loop; a wrong-length one returns immediately). Remove that oracle by
+                // hashing BOTH the presented candidate and the configured token with SHA-256 (the same
+                // `sha256_hex` facility used for virtual keys) and constant-time-comparing the
+                // fixed-length (64-hex-char) digests — every candidate now does identical work
+                // regardless of its length. A missing carrier contributes 0 (no compare against a
+                // secret-derived digest, so its absence leaks nothing). The compares run
+                // UNCONDITIONALLY and fold with bitwise-OR (see the no-short-circuit rationale above).
+                let configured_hash = crate::sigv4::sha256_hex(t.as_bytes());
                 let bearer_match = u8::from(
                     admin_bearer
                         .as_deref()
-                        .map(|b| AuthMiddleware::constant_time_eq(b, t))
+                        .map(|b| {
+                            AuthMiddleware::constant_time_eq(
+                                &crate::sigv4::sha256_hex(b.as_bytes()),
+                                &configured_hash,
+                            )
+                        })
                         .unwrap_or(false),
                 );
                 let header_match = u8::from(
                     admin_header_token
                         .as_deref()
-                        .map(|h| AuthMiddleware::constant_time_eq(h, t))
+                        .map(|h| {
+                            AuthMiddleware::constant_time_eq(
+                                &crate::sigv4::sha256_hex(h.as_bytes()),
+                                &configured_hash,
+                            )
+                        })
                         .unwrap_or(false),
                 );
                 std::hint::black_box(bearer_match | header_match) != 0
@@ -463,6 +487,16 @@ pub(crate) async fn auth_middleware(
         if !authorized {
             return Err(unauthorized_response(&path));
         }
+        // INTENTIONAL governance bypass for the operator admin token. A successful admin auth attaches
+        // an EMPTY `GovCtx::default()` (no resolved virtual key) and returns HERE — BEFORE the
+        // virtual-key governance resolution below — so per-key controls (`allowed_pools`, budget, RPM/
+        // TPM) are deliberately NOT applied to admin requests. This is by design, not an oversight:
+        // the admin token is an operator-only credential, and the /admin routes expose ONLY
+        // key-management (create / list / disable / usage), never inference. There is no per-key
+        // budget or pool to enforce on a key-management call, and holding the admin token already
+        // confers full authority over EVERY key by design, so subjecting it to a single key's
+        // governance would be meaningless. Inference ingress (every non-/admin path) still falls
+        // through to the governance resolution below and is fully governed.
         req.extensions_mut()
             .insert(crate::governance::GovCtx::default());
         return Ok(next.run(req).await);
@@ -531,6 +565,45 @@ pub(crate) async fn auth_middleware(
                 );
             });
         }
+        // BEDROCK INGRESS via inbound AWS SigV4 (the MinIO/S3-compatible model). A Bedrock-SDK client
+        // does NOT present a bearer-style token — it signs the request with an AWS-style
+        // access-key-id + secret access key busbar issued (tied to a virtual key). When the request
+        // targets the Bedrock ingress protocol AND carries an `AWS4-HMAC-SHA256` Authorization header,
+        // VERIFY that signature and, on success, attach the SAME `GovCtx` a bearer auth would — so
+        // budgets / RPM / TPM / allowed_pools all apply. This runs ONLY for the bedrock+SigV4 shape;
+        // every other request (bearer / x-api-key / x-goog-api-key, or a non-bedrock path) falls
+        // straight through to the unchanged token path below. On a verification failure we return the
+        // native-vendor (Bedrock 403 AccessDenied) auth error — never a bearer-style 401.
+        if proto_for_path(&path) == "bedrock" && has_sigv4_authorization(&req) {
+            // BODY INTEGRITY: a SigV4 signature only binds the payload if we re-hash the actual bytes
+            // and confirm they match the signed `x-amz-content-sha256` (which the signature covers).
+            // Verifying the signature alone leaves a MitM free to tamper the body in transit while the
+            // request still authenticates. Buffer the body HERE (Bedrock ingress is bounded JSON; the
+            // 32 MiB `DefaultBodyLimit` layer already caps it, so `to_bytes(usize::MAX)` cannot be used
+            // to exhaust memory) so the verifier can compare `sha256_hex(body)` to the declared hash,
+            // then reconstruct the request from the SAME bytes so the downstream handler receives the
+            // payload intact (no consumption bug). A buffering failure (e.g. a truncated/aborted body)
+            // is itself a failed request — collapse it to the same opaque auth error so it leaks
+            // nothing about why it failed.
+            let (parts, body) = req.into_parts();
+            let Ok(body_bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+                return Err(unauthorized_response(&path));
+            };
+            let mut req = Request::from_parts(parts, Body::from(body_bytes.clone()));
+            return match verify_bedrock_sigv4(gov, &req, &body_bytes) {
+                Ok(key) => {
+                    req.extensions_mut()
+                        .insert(crate::governance::GovCtx { key: Some(key) });
+                    Ok(next.run(req).await)
+                }
+                // EVERY failure (missing/malformed header, unknown AccessKeyId, expired date,
+                // signed-headers mismatch, bad signature, OR a body whose bytes don't match the signed
+                // x-amz-content-sha256) maps to the identical native auth error — the distinction is
+                // logged inside the verifier, never surfaced, so there is no oracle.
+                Err(()) => Err(unauthorized_response(&path)),
+            };
+        }
+
         // Reject a missing / empty token BEFORE the governance lookup, mirroring the
         // `validate_token` guard that the static-token path applies. Without this, an
         // unauthenticated request would call `gov.lookup(sha256(""))` — admitting the caller if any
@@ -560,6 +633,199 @@ pub(crate) async fn auth_middleware(
     }
 
     Ok(next.run(req).await)
+}
+
+/// Does the request carry an inbound AWS SigV4 `Authorization` header (`AWS4-HMAC-SHA256 ...`)? Cheap
+/// pre-check so the SigV4 verify path is entered ONLY for genuine SigV4 requests; everything else
+/// (bearer, x-api-key, x-goog-api-key, or no Authorization) takes the unchanged token path. The full
+/// structural parse/validation happens inside the verifier — this only gates entry.
+fn has_sigv4_authorization(req: &Request<Body>) -> bool {
+    req.headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim_start().starts_with("AWS4-HMAC-SHA256"))
+        .unwrap_or(false)
+}
+
+/// Canonicalize the request query string for SigV4: split into key=value pairs, URI-encode each key
+/// and value (RFC 3986 unreserved pass through), sort by encoded key (then encoded value), and join
+/// with `&`. An empty/absent query yields `""`. A bare key (`?foo`) canonicalizes to `foo=` (AWS
+/// signs a missing value as empty). This must match what the client's signer produced. Bedrock
+/// Converse requests normally carry no query, but canonicalizing correctly keeps the verifier general.
+fn canonical_query_string(query: Option<&str>) -> String {
+    let Some(q) = query.filter(|q| !q.is_empty()) else {
+        return String::new();
+    };
+    let mut pairs: Vec<(String, String)> = q
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (
+                crate::sigv4::uri_encode_query(k),
+                crate::sigv4::uri_encode_query(v),
+            )
+        })
+        .collect();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Verify an inbound Bedrock SigV4 request against the governance virtual-key store. On success
+/// returns the resolved, ENABLED `VirtualKey` (so the caller attaches its `GovCtx`); on ANY failure
+/// returns `Err(())` — the SINGLE opaque failure the caller maps to the native auth error, with no
+/// distinction reaching the wire (the specific `VerifyError` is logged here for operators only).
+///
+/// Indistinguishability / no enumeration oracle: an UNKNOWN AccessKeyId does NOT short-circuit. We
+/// still run the full constant-time signature verification against a fixed DUMMY secret, so the
+/// unknown-key path and the wrong-signature path do the same work and reject identically. A DISABLED
+/// key likewise still verifies before rejecting, so "disabled" is not distinguishable from "bad sig".
+fn verify_bedrock_sigv4(
+    gov: &crate::governance::GovState,
+    req: &Request<Body>,
+    body: &[u8],
+) -> Result<crate::governance::VirtualKey, ()> {
+    use crate::sigv4::{parse_authorization_header, verify_inbound_sigv4, InboundRequest};
+
+    // Parse the Authorization header. (has_sigv4_authorization already confirmed the algorithm token,
+    // but re-parse fully here — a malformed-but-AWS4-prefixed header still rejects.)
+    let auth_value = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let parsed = match parse_authorization_header(auth_value) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(reason = ?e, "inbound SigV4 rejected: unparseable Authorization");
+            return Err(());
+        }
+    };
+
+    // Gather the signed-header VALUES from the request (every name the client listed in SignedHeaders;
+    // the verifier rejects if any is missing). Lowercase the names to match the signer.
+    //
+    // PREFILTER: `verify_inbound_sigv4` consumes ONLY the headers named in `SignedHeaders` (plus the
+    // payload-hash and amzdate it reads from struct fields, both of which are themselves signed
+    // headers). Lowercasing + allocating EVERY inbound header — many of them irrelevant — is wasted
+    // work on every request. Restrict to the signed subset BEFORE allocating, matching names
+    // case-insensitively against the signer's list. Semantics are unchanged: the verifier's signed-set
+    // selection (step 3) sees exactly the same {name→value} mapping it would have found in the full
+    // list; an unsigned `x-amz-content-sha256`/`x-amz-date` would not have been bound by the signature
+    // anyway, so omitting it here is the same fail-closed outcome the verifier already produces.
+    let signed_names: std::collections::HashSet<String> = parsed
+        .signed_headers
+        .split(';')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
+    let headers: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            let lname = name.as_str().to_ascii_lowercase();
+            if !signed_names.contains(&lname) {
+                return None;
+            }
+            value.to_str().ok().map(|v| (lname, v.to_string()))
+        })
+        .collect();
+
+    // The payload hash the client signed is its `x-amz-content-sha256` header value. We verify the
+    // signature against that DECLARED hash (it is itself a signed header, so the signature binds it).
+    // A request that omits the header cannot have signed it, so reject — there is nothing to feed the
+    // canonical request.
+    let Some(payload_hash) = headers
+        .iter()
+        .find(|(k, _)| k == "x-amz-content-sha256")
+        .map(|(_, v)| v.clone())
+    else {
+        tracing::debug!("inbound SigV4 rejected: missing x-amz-content-sha256");
+        return Err(());
+    };
+
+    // BODY INTEGRITY (the real bind): the signature only proves the client signed `payload_hash`; it
+    // does NOT prove the bytes we actually received hash to that value. Without this check a MitM who
+    // cannot forge the signature can still tamper the body in transit and the request authenticates —
+    // the signature stops binding the payload. Re-hash the buffered body and require it to equal the
+    // signed declared hash (lowercase-hex, constant-time compare to avoid leaking a prefix-match
+    // length via timing). `UNSIGNED-PAYLOAD` is the AWS sentinel for "I did not hash my body"; for
+    // this governed ingress we REQUIRE a signed payload, so reject it outright (it can never equal a
+    // real sha256 digest anyway — the explicit reject documents the decision and avoids a future
+    // signer that hashes the literal string "UNSIGNED-PAYLOAD" sneaking past). On ANY mismatch reject
+    // with the SAME opaque `Err(())` every other failure returns — the reason is logged here only, so
+    // the wire cannot tell "body tampered" from "bad signature".
+    const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+    if payload_hash.eq_ignore_ascii_case(UNSIGNED_PAYLOAD) {
+        tracing::debug!("inbound SigV4 rejected: UNSIGNED-PAYLOAD not permitted for governed ingress");
+        return Err(());
+    }
+    let actual_body_hash = crate::sigv4::sha256_hex(body);
+    if !AuthMiddleware::constant_time_eq(&actual_body_hash, &payload_hash.to_ascii_lowercase()) {
+        tracing::debug!("inbound SigV4 rejected: request body does not match signed x-amz-content-sha256");
+        return Err(());
+    };
+    let Some(amzdate) = headers
+        .iter()
+        .find(|(k, _)| k == "x-amz-date")
+        .map(|(_, v)| v.clone())
+    else {
+        tracing::debug!("inbound SigV4 rejected: missing x-amz-date");
+        return Err(());
+    };
+
+    let canonical_uri = crate::sigv4::uri_encode_path(req.uri().path());
+    let canonical_qs = canonical_query_string(req.uri().query());
+    let method = req.method().as_str().to_string();
+
+    let inbound = InboundRequest {
+        method: &method,
+        canonical_uri: &canonical_uri,
+        canonical_querystring: &canonical_qs,
+        headers: &headers,
+        payload_hash: &payload_hash,
+        amzdate: &amzdate,
+    };
+
+    // Resolve the AccessKeyId to (key, secret). On an UNKNOWN AccessKeyId, verify against a fixed dummy
+    // secret so the work — and the timing/response — is indistinguishable from a wrong-signature
+    // rejection (no AccessKeyId-enumeration oracle). The dummy is a constant, never a real secret.
+    const DUMMY_SECRET: &str = "AWS4-DUMMY-SECRET-FOR-CONSTANT-TIME-REJECT-PATH";
+    let now = crate::store::now();
+    let (secret, resolved): (String, Option<crate::governance::VirtualKey>) =
+        match gov.lookup_by_access_key_id(&parsed.access_key_id) {
+            Some(entry) => (entry.secret_access_key, Some(entry.key)),
+            None => (DUMMY_SECRET.to_string(), None),
+        };
+
+    let verify = verify_inbound_sigv4(&parsed, &inbound, &secret, now);
+
+    // Decide admission. The signature must verify; the resolved key must exist AND be enabled. All
+    // three conditions are evaluated, and only the combined success admits — a failure in any one
+    // rejects with the same opaque `Err(())`. An unknown AccessKeyId has `resolved == None`, so even a
+    // (cryptographically impossible) signature match against the dummy secret cannot admit.
+    match (verify, resolved) {
+        (Ok(()), Some(key)) if key.enabled => Ok(key),
+        (Ok(()), Some(_key)) => {
+            tracing::debug!("inbound SigV4 rejected: virtual key disabled");
+            Err(())
+        }
+        (Ok(()), None) => {
+            // Signature "verified" against the dummy secret but the AccessKeyId is unknown — this is
+            // not reachable for a real signer (it would need to have signed with the dummy secret) but
+            // is handled explicitly so an unknown key can NEVER authenticate.
+            tracing::debug!("inbound SigV4 rejected: unknown access key id");
+            Err(())
+        }
+        (Err(e), _) => {
+            tracing::debug!(reason = ?e, "inbound SigV4 rejected");
+            Err(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1307,9 +1573,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             r_bearer.status().as_u16(),
-            401,
+            200,
             "valid token via Authorization: Bearer must pass (got {})",
             r_bearer.status()
         );
@@ -1322,9 +1588,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             r_xapi.status().as_u16(),
-            401,
+            200,
             "valid token via x-api-key must pass (got {})",
             r_xapi.status()
         );
@@ -1337,9 +1603,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             r_goog.status().as_u16(),
-            401,
+            200,
             "valid token via x-goog-api-key must pass (got {})",
             r_goog.status()
         );
@@ -1842,9 +2108,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             r_ena.status().as_u16(),
-            401,
+            200,
             "an enabled virtual key must pass auth (got {})",
             r_ena.status()
         );
@@ -1937,9 +2203,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             r_ok.status().as_u16(),
-            401,
+            200,
             "a valid enabled key must pass auth under governance+none (got {})",
             r_ok.status()
         );
@@ -2056,9 +2322,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             r_ok.status().as_u16(),
-            401,
+            200,
             "a valid enabled key must pass auth under governance+passthrough (got {})",
             r_ok.status()
         );
@@ -2220,8 +2486,8 @@ mod tests {
             })
         });
 
-        assert_ne!(
-            admitted, 401,
+        assert_eq!(
+            admitted, 200,
             "the valid enabled virtual key must pass governance auth (got {admitted})"
         );
 
@@ -2312,9 +2578,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             r_ok.status().as_u16(),
-            401,
+            200,
             "a correct x-admin-token must authorize, got {}",
             r_ok.status()
         );
@@ -2358,9 +2624,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             r.status().as_u16(),
-            401,
+            200,
             "correct Bearer + wrong x-admin-token must authorize (OR fold), got {}",
             r.status()
         );
@@ -2375,9 +2641,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             r.status().as_u16(),
-            401,
+            200,
             "wrong Bearer + correct x-admin-token must authorize (header compare must run), got {}",
             r.status()
         );
@@ -2466,9 +2732,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             r_bearer.status().as_u16(),
-            401,
+            200,
             "Authorization: Bearer admintok must authorize the admin surface, got {}",
             r_bearer.status()
         );
@@ -2478,9 +2744,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             r_hdr.status().as_u16(),
-            401,
+            200,
             "x-admin-token: admintok must authorize the admin surface, got {}",
             r_hdr.status()
         );
@@ -2569,9 +2835,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             r_goog.status().as_u16(),
-            401,
+            200,
             "valid virtual key via x-goog-api-key must pass governance (got {})",
             r_goog.status()
         );
@@ -2584,9 +2850,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             r_xapi.status().as_u16(),
-            401,
+            200,
             "valid virtual key via x-api-key must pass governance (got {})",
             r_xapi.status()
         );
@@ -2763,5 +3029,324 @@ mod tests {
             dbg_absent.contains("absent"),
             "CallerToken Debug should report absence: {dbg_absent}"
         );
+    }
+
+    // ===================== INBOUND BEDROCK SigV4 WIRING TESTS =====================
+
+    /// Sign a Bedrock-shaped POST and return the full `Authorization` header value plus the headers
+    /// (host / x-amz-date / x-amz-content-sha256) the client would send, using the SAME signer
+    /// (`crate::sigv4::sign_v4`) a real client uses. `amzdate` controls the signature timestamp.
+    fn sign_bedrock_request(
+        secret: &str,
+        access_key_id: &str,
+        region: &str,
+        service: &str,
+        path: &str,
+        body: &[u8],
+        amzdate: &str,
+    ) -> (String, Vec<(String, String)>) {
+        let datestamp = &amzdate[0..8];
+        let payload_hash = crate::sigv4::sha256_hex(body);
+        let headers = vec![
+            (
+                "host".to_string(),
+                "bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            ),
+            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+            ("x-amz-date".to_string(), amzdate.to_string()),
+        ];
+        let canonical_uri = crate::sigv4::uri_encode_path(path);
+        let (sig, signed_headers) = crate::sigv4::sign_v4(
+            secret,
+            region,
+            service,
+            "POST",
+            &canonical_uri,
+            "",
+            &headers,
+            &payload_hash,
+            amzdate,
+            datestamp,
+        );
+        let auth = format!(
+            "AWS4-HMAC-SHA256 Credential={access_key_id}/{datestamp}/{region}/{service}/aws4_request, \
+             SignedHeaders={signed_headers}, Signature={sig}"
+        );
+        (auth, headers)
+    }
+
+    /// Build a `Request` with the given Authorization + signed headers (for `verify_bedrock_sigv4`).
+    fn bedrock_request(path: &str, auth: &str, headers: &[(String, String)]) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(AUTHORIZATION, auth);
+        for (k, v) in headers {
+            b = b.header(k.as_str(), v.as_str());
+        }
+        b.body(Body::empty()).expect("test request must build")
+    }
+
+    fn gov_with_aws_key() -> (std::sync::Arc<crate::governance::GovState>, String, String) {
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        let store = std::sync::Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = std::sync::Arc::new(GovState::new(store, 0, 0, None).unwrap());
+        let (_key, _bearer, akid, secret) = gov
+            .create_key_with_aws(
+                NewKeySpec {
+                    name: "bedrock".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                crate::store::now(),
+            )
+            .unwrap();
+        (gov, akid, secret)
+    }
+
+    #[test]
+    fn test_verify_bedrock_sigv4_roundtrip_admits_with_govctx() {
+        // A request signed with the key's REAL secret verifies and yields the owning (enabled) key.
+        crate::metrics::init();
+        let (gov, akid, secret) = gov_with_aws_key();
+        let amzdate = {
+            let (a, _d) = crate::sigv4::format_amz_time(crate::store::now());
+            a
+        };
+        let path = "/model/anthropic.claude/converse";
+        let (auth, headers) =
+            sign_bedrock_request(&secret, &akid, "us-east-1", "bedrock", path, b"", &amzdate);
+        let req = bedrock_request(path, &auth, &headers);
+        let key = verify_bedrock_sigv4(&gov, &req, b"").expect("a correctly-signed request must verify");
+        // Behavioral: the function resolved the SPECIFIC owning key (not just "some enabled key").
+        // Tying to the key's identity (name) is a stronger statement than `key.enabled`, which merely
+        // restates an input property. The owning key here is the one `gov_with_aws_key` created.
+        assert_eq!(
+            key.name, "bedrock",
+            "verify must resolve the AWS-credentialed key that owns this AccessKeyId"
+        );
+    }
+
+    #[test]
+    fn test_verify_bedrock_sigv4_wrong_secret_rejected() {
+        crate::metrics::init();
+        let (gov, akid, _secret) = gov_with_aws_key();
+        let (a, _d) = crate::sigv4::format_amz_time(crate::store::now());
+        let path = "/model/anthropic.claude/converse";
+        // Sign with a DIFFERENT secret than the key's.
+        let (auth, headers) = sign_bedrock_request(
+            "not-the-real-secret",
+            &akid,
+            "us-east-1",
+            "bedrock",
+            path,
+            b"",
+            &a,
+        );
+        let req = bedrock_request(path, &auth, &headers);
+        // `verify_bedrock_sigv4` collapses every failure to the SAME opaque `Err(())` (no
+        // enumeration oracle). Assert that exact value, not just `is_err()`. The variant-level
+        // distinction — that a wrong secret is a `SignatureMismatch`, NOT a distinct key-not-found
+        // variant — is pinned one layer down in `sigv4::verify_inbound_sigv4`'s tests (a real-secret
+        // signature verified against the dummy secret yields `SignatureMismatch`).
+        assert_eq!(
+            verify_bedrock_sigv4(&gov, &req, b""),
+            Err(()),
+            "a wrong-secret signature must be rejected with the opaque Err(())"
+        );
+    }
+
+    #[test]
+    fn test_verify_bedrock_sigv4_unknown_access_key_id_rejected() {
+        crate::metrics::init();
+        let (gov, _akid, secret) = gov_with_aws_key();
+        let (a, _d) = crate::sigv4::format_amz_time(crate::store::now());
+        let path = "/model/anthropic.claude/converse";
+        // A well-formed signature under an AccessKeyId that does not exist in the store.
+        let (auth, headers) = sign_bedrock_request(
+            &secret,
+            "AKIADOESNOTEXIST0000",
+            "us-east-1",
+            "bedrock",
+            path,
+            b"",
+            &a,
+        );
+        let req = bedrock_request(path, &auth, &headers);
+        // Identical opaque `Err(())` to the wrong-secret case above — the unknown-AccessKeyId path is
+        // verified against a dummy secret precisely so it is indistinguishable from a bad signature
+        // (no AccessKeyId-enumeration oracle). Assert the exact value, not just `is_err()`.
+        assert_eq!(
+            verify_bedrock_sigv4(&gov, &req, b""),
+            Err(()),
+            "unknown AccessKeyId must be rejected with the SAME opaque Err(()) as a bad signature"
+        );
+    }
+
+    #[test]
+    fn test_verify_bedrock_sigv4_expired_date_rejected() {
+        crate::metrics::init();
+        let (gov, akid, secret) = gov_with_aws_key();
+        // Sign with a timestamp 10 minutes in the past — outside the ±5min skew window.
+        let stale = crate::store::now().saturating_sub(crate::sigv4::CLOCK_SKEW_SECS + 60);
+        let (a, _d) = crate::sigv4::format_amz_time(stale);
+        let path = "/model/anthropic.claude/converse";
+        let (auth, headers) =
+            sign_bedrock_request(&secret, &akid, "us-east-1", "bedrock", path, b"", &a);
+        let req = bedrock_request(path, &auth, &headers);
+        assert!(
+            verify_bedrock_sigv4(&gov, &req, b"").is_err(),
+            "an expired x-amz-date must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_verify_bedrock_sigv4_missing_authorization_rejected() {
+        crate::metrics::init();
+        let (gov, _akid, _secret) = gov_with_aws_key();
+        // No Authorization header at all.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/model/anthropic.claude/converse")
+            .body(Body::empty())
+            .unwrap();
+        assert!(verify_bedrock_sigv4(&gov, &req, b"").is_err());
+    }
+
+    #[test]
+    fn test_verify_bedrock_sigv4_disabled_key_rejected() {
+        crate::metrics::init();
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        let store = std::sync::Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = std::sync::Arc::new(GovState::new(store, 0, 0, None).unwrap());
+        let (key, _b, akid, secret) = gov
+            .create_key_with_aws(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                crate::store::now(),
+            )
+            .unwrap();
+        // Disable the key.
+        gov.update_key(&key.id, Some(false), None, None, None)
+            .unwrap();
+        let (a, _d) = crate::sigv4::format_amz_time(crate::store::now());
+        let path = "/model/anthropic.claude/converse";
+        let (auth, headers) =
+            sign_bedrock_request(&secret, &akid, "us-east-1", "bedrock", path, b"", &a);
+        let req = bedrock_request(path, &auth, &headers);
+        assert!(
+            verify_bedrock_sigv4(&gov, &req, b"").is_err(),
+            "a correctly-signed request for a DISABLED key must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_verify_bedrock_sigv4_body_matches_signed_hash_admits() {
+        // (a) A non-empty body whose bytes hash to the signed `x-amz-content-sha256` is accepted.
+        // This exercises the body-integrity bind on a real payload (the roundtrip test signs an empty
+        // body): the verifier must re-hash THESE bytes and find they match the signed digest.
+        crate::metrics::init();
+        let (gov, akid, secret) = gov_with_aws_key();
+        let (a, _d) = crate::sigv4::format_amz_time(crate::store::now());
+        let path = "/model/anthropic.claude/converse";
+        let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let (auth, headers) =
+            sign_bedrock_request(&secret, &akid, "us-east-1", "bedrock", path, body, &a);
+        let req = bedrock_request(path, &auth, &headers);
+        let key = verify_bedrock_sigv4(&gov, &req, body)
+            .expect("a correctly-signed request whose body matches the signed hash must verify");
+        assert_eq!(key.name, "bedrock");
+    }
+
+    #[test]
+    fn test_verify_bedrock_sigv4_tampered_body_rejected() {
+        // (b) THE core fix: a VALID signature (signed over the original body) but the body bytes
+        // actually delivered are DIFFERENT (a MitM tampered them in transit). The signature still
+        // verifies against the declared `x-amz-content-sha256`, but the bytes no longer hash to it, so
+        // the request MUST be rejected — fail-closed — with the SAME opaque `Err(())` as any other
+        // failure (no oracle distinguishing "body tampered" from "bad signature").
+        crate::metrics::init();
+        let (gov, akid, secret) = gov_with_aws_key();
+        let (a, _d) = crate::sigv4::format_amz_time(crate::store::now());
+        let path = "/model/anthropic.claude/converse";
+        let signed_body = br#"{"max_tokens":16}"#;
+        let tampered_body = br#"{"max_tokens":999999}"#;
+        // Sign over the ORIGINAL body (so Authorization + x-amz-content-sha256 are valid for it)...
+        let (auth, headers) =
+            sign_bedrock_request(&secret, &akid, "us-east-1", "bedrock", path, signed_body, &a);
+        let req = bedrock_request(path, &auth, &headers);
+        // ...but feed the verifier the TAMPERED bytes (what the middleware would have buffered).
+        assert_eq!(
+            verify_bedrock_sigv4(&gov, &req, tampered_body),
+            Err(()),
+            "a body whose bytes don't match the signed x-amz-content-sha256 must fail-closed"
+        );
+    }
+
+    #[test]
+    fn test_verify_bedrock_sigv4_unsigned_payload_rejected() {
+        // (c) `UNSIGNED-PAYLOAD` is rejected for this governed ingress: we require a signed payload, so
+        // a client declaring it did not hash its body cannot authenticate. Sign a request normally,
+        // then overwrite the x-amz-content-sha256 header with the sentinel; the body-integrity gate
+        // rejects it independently of any signature check, with the same opaque `Err(())`.
+        crate::metrics::init();
+        let (gov, akid, secret) = gov_with_aws_key();
+        let (a, _d) = crate::sigv4::format_amz_time(crate::store::now());
+        let path = "/model/anthropic.claude/converse";
+        let body = b"some-body";
+        let (auth, mut headers) =
+            sign_bedrock_request(&secret, &akid, "us-east-1", "bedrock", path, body, &a);
+        for (k, v) in headers.iter_mut() {
+            if k == "x-amz-content-sha256" {
+                *v = "UNSIGNED-PAYLOAD".to_string();
+            }
+        }
+        let req = bedrock_request(path, &auth, &headers);
+        assert_eq!(
+            verify_bedrock_sigv4(&gov, &req, body),
+            Err(()),
+            "UNSIGNED-PAYLOAD must be rejected for governed Bedrock ingress"
+        );
+    }
+
+    #[test]
+    fn test_has_sigv4_authorization_detects_scheme() {
+        let yes = Request::builder()
+            .uri("/x")
+            .header(
+                AUTHORIZATION,
+                "AWS4-HMAC-SHA256 Credential=a/b/c/d/aws4_request, SignedHeaders=host, Signature=z",
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert!(has_sigv4_authorization(&yes));
+        let bearer = Request::builder()
+            .uri("/x")
+            .header(AUTHORIZATION, "Bearer tok")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!has_sigv4_authorization(&bearer));
+        let none = Request::builder().uri("/x").body(Body::empty()).unwrap();
+        assert!(!has_sigv4_authorization(&none));
+    }
+
+    #[test]
+    fn test_canonical_query_string_sorts_and_encodes() {
+        assert_eq!(canonical_query_string(None), "");
+        assert_eq!(canonical_query_string(Some("")), "");
+        // Sorted by key; values URI-encoded (with '/' → %2F).
+        assert_eq!(canonical_query_string(Some("b=2&a=1")), "a=1&b=2");
+        assert_eq!(canonical_query_string(Some("p=a/b")), "p=a%2Fb");
+        // Bare key signs as key= (empty value).
+        assert_eq!(canonical_query_string(Some("flag")), "flag=");
     }
 }

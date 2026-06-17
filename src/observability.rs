@@ -10,6 +10,14 @@ use reqwest::Client;
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+// SSRF obfuscation-defense primitives shared with the provider-base-URL guard in `config_validate`.
+// Here they are a defense-in-depth parity mirror (the webhook/OTLP URL is already
+// `reqwest::Url::parse`-normalized, so the canonical `parse::<IpAddr>()` path does the real
+// blocking); keeping the byte-identical atoms in one tested leaf stops the two guards drifting.
+use crate::net_guard::{
+    is_alternate_ipv4_encoding, is_cgnat_shared_v4, is_link_local_v6, is_unique_local_v6,
+};
 use tokio::sync::Semaphore;
 
 /// The configured webhook URL, stored as an `Arc<String>` so the per-request fast path in
@@ -212,10 +220,12 @@ fn scheme_is(url: &str, scheme: &str) -> bool {
 ///     itself (`percent_decode_host`) to neutralize spellings like `169%2E254%2E169%2E254`.
 ///   - BROADCAST: this guard ALSO blocks `255.255.255.255` (`is_broadcast()`); `ssrf_blocked_host`
 ///     does not — so this validator is strictly more conservative on that one literal.
-///   - LIST SHAPE: here `localhost`/`*.localhost` are handled in the DNS arm of `host_is_internal`
-///     and `METADATA_HOSTS` holds only the two metadata names, whereas `ssrf_blocked_host` keeps
-///     `localhost`/`localhost.` inside its own `METADATA_HOSTS`. The blocked SET is equivalent for
-///     the localhost family; only the code structure differs.
+///   - LOCALHOST (a deliberate divergence, NOT just code shape): this webhook guard BLOCKS the
+///     `localhost`/`*.localhost` family in the DNS arm of `host_is_internal` — no request-log
+///     webhook should POST to a co-located loopback process. `ssrf_blocked_host`, by contrast,
+///     ALLOWS `localhost`: it is a metadata-denylist guard for provider base-URLs, and `localhost`
+///     is a legitimate local-model upstream (e.g. Ollama on `http://localhost:11434`). So the two
+///     guards do NOT block the same set on the localhost family — they intentionally differ.
 ///
 /// `None` (webhook disabled) is always valid. Pure, so it is unit-testable without touching the
 /// process-wide `OnceLock`s.
@@ -250,20 +260,11 @@ fn validate_webhook_url(url: Option<String>) -> Result<Option<String>, String> {
 /// Well-known cloud-metadata / internal DNS names that must be blocked even though they are not IP
 /// literals (they resolve, at connect time, to the IMDS family). This holds ONLY the two metadata
 /// names; the `localhost` / `*.localhost` family is blocked separately in the `Err(_)` DNS arm of
-/// `host_is_internal`. `config_validate::ssrf_blocked_host` folds `localhost`/`localhost.` into its
-/// own `METADATA_HOSTS` instead — so this const is a SUBSET of that list, not an exact copy, even
-/// though the two guards block the same set of names overall.
+/// `host_is_internal`. NOTE the deliberate divergence: `config_validate::ssrf_blocked_host` (the
+/// provider-base-URL guard) does NOT block `localhost` — it ALLOWS it as a legitimate local-model
+/// upstream — so this const overlaps `ssrf_blocked_host`'s metadata denylist only on the shared
+/// cloud-metadata names; the two guards block DIFFERENT sets on the localhost family.
 const METADATA_HOSTS: &[&str] = &["metadata.google.internal", "metadata.internal"];
-
-/// RFC 6598 Shared Address Space `100.64.0.0/10` (a.k.a. CGNAT). NOT covered by
-/// `Ipv4Addr::is_private()`, yet routable inside AWS/GCP VPCs and many Kubernetes clusters where it
-/// fronts internal services — an SSRF target the private/link-local checks miss. The /10 is the set
-/// of addresses whose first octet is `100` and whose top two bits of the second octet are `01`.
-/// Mirrors `config_validate::is_cgnat_shared_v4`.
-fn is_cgnat_shared_v4(v4: &std::net::Ipv4Addr) -> bool {
-    let o = v4.octets();
-    o[0] == 100 && (o[1] & 0xC0) == 64
-}
 
 /// True for an IPv4 literal busbar must not POST telemetry to. Shared by the V4 arm and the
 /// IPv4-mapped-IPv6 arm so the two stay identical. Covers loopback, link-local (incl. the
@@ -275,69 +276,6 @@ fn is_internal_v4(v4: &std::net::Ipv4Addr) -> bool {
         || is_cgnat_shared_v4(v4)
         || v4.is_unspecified()
         || v4.is_broadcast()
-}
-
-/// True when `host` is an alternate (non-dotted-quad) IPv4 encoding that `IpAddr::from_str` rejects
-/// but the OS resolver (glibc `getaddrinfo`, used by reqwest's default resolver) still maps to an
-/// IPv4 address: a bare decimal integer (`2130706433` = 127.0.0.1), a `0x`/`0X` hex literal
-/// (`0x7f000001`), a leading-zero octal literal (`017700000001`), or a dotted form with FEWER than
-/// four octets (`127.1`, `10.0.1`). On a raw, un-normalized host string these bypass the canonical
-/// IP-literal checks while still resolving to loopback / link-local / private targets at connect
-/// time, so they must be treated as blocked. A canonical four-octet dotted-quad is NOT matched here
-/// (it is handled by the `parse::<IpAddr>()` path); a normal DNS hostname is not matched either.
-///
-/// NOTE ON ITS ROLE IN THIS MODULE: in the webhook / OTLP SSRF guards this is a defense-in-depth
-/// parity mirror of `config_validate::is_alternate_ipv4_encoding`, NOT the primary guard. Those
-/// guards read the host from an already-`reqwest::Url::parse`d http(s) URL, and http(s) is a WHATWG
-/// "special scheme" whose host parser already canonicalizes every alternate encoding above to a
-/// dotted-quad — so the host reaches those callers as `127.0.0.1` (etc.) and the canonical
-/// `parse::<IpAddr>()` path does the real blocking. This function stays load-bearing in
-/// `config_validate`, which hand-parses a raw config string where no such normalization has run.
-fn is_alternate_ipv4_encoding(host: &str) -> bool {
-    if host.is_empty() {
-        return false;
-    }
-
-    // Whole-host `0x...` / `0X...` hex literal (e.g. `0x7f000001`). Only when there is no `.`; a
-    // dotted per-octet hex form (`0x7f.0.0.1`) is handled by the dotted branch below.
-    if !host.contains('.') {
-        if let Some(hex) = host.strip_prefix("0x").or_else(|| host.strip_prefix("0X")) {
-            return !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit());
-        }
-    }
-
-    // Dotted form: split on '.'. A canonical dotted-quad has exactly 4 parts and parses via
-    // `IpAddr` — leave it to that path. Fewer than 4 numeric parts (e.g. `127.1`, `10.0.1`) is an
-    // alternate short form getaddrinfo expands; flag it. Any part using a `0x` hex or leading-zero
-    // octal encoding is also an alternate form.
-    if host.contains('.') {
-        let parts: Vec<&str> = host.split('.').collect();
-        // Every part must be a numeric encoding (decimal, hex, or octal) for this to be an IP-ish
-        // host at all; if any part has a non-numeric character it's a DNS name → not our concern.
-        let all_numeric = parts.iter().all(|p| {
-            if let Some(hex) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
-                !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
-            } else {
-                !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())
-            }
-        });
-        if !all_numeric {
-            return false;
-        }
-        // Short dotted form (fewer than 4 parts) is an alternate encoding getaddrinfo expands.
-        if parts.len() < 4 {
-            return true;
-        }
-        // Four numeric parts: alternate iff any part is hex (`0x`) or leading-zero octal.
-        return parts.iter().any(|p| {
-            p.starts_with("0x")
-                || p.starts_with("0X")
-                || (p.len() > 1 && p.starts_with('0') && p.bytes().all(|b| b.is_ascii_digit()))
-        });
-    }
-
-    // No '.', not `0x`: a bare all-digits host is a decimal integer IP encoding (e.g. `2130706433`).
-    host.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// True if the URL's host is an address busbar must not POST telemetry to: a literal loopback,
@@ -355,9 +293,10 @@ fn is_alternate_ipv4_encoding(host: &str) -> bool {
 /// mirror — the divergences are (1) host parsing: this guard reads the host from an already
 /// `reqwest::Url::parse`d URL, while `ssrf_blocked_host` hand-parses and percent-decodes the raw
 /// config string; (2) broadcast: this guard ALSO blocks `255.255.255.255`, which `ssrf_blocked_host`
-/// does not; (3) code shape: `localhost`/`*.localhost` are matched in the `Err(_)` DNS arm below
-/// rather than via the `METADATA_HOSTS` list. The blocked localhost/metadata/IP SET is equivalent
-/// apart from the broadcast literal. Full DNS-rebinding is out of scope for a startup-validated,
+/// does not; (3) LOCALHOST: this guard BLOCKS `localhost`/`*.localhost` (matched in the `Err(_)`
+/// DNS arm below), whereas `ssrf_blocked_host` deliberately ALLOWS it as a local-model upstream — so
+/// the blocked SETS differ on the localhost family (as well as on the broadcast literal). Full
+/// DNS-rebinding is out of scope for a startup-validated,
 /// operator-supplied URL. Returns `true` (reject) when the host is missing entirely.
 fn host_is_internal(url: &reqwest::Url) -> bool {
     use std::net::IpAddr;
@@ -381,7 +320,7 @@ fn host_is_internal(url: &reqwest::Url) -> bool {
                 return true;
             }
 
-            // Defense-in-depth parity mirror of `config_validate::is_alternate_ipv4_encoding`, NOT the
+            // Defense-in-depth parity mirror via the shared `net_guard::is_alternate_ipv4_encoding`, NOT the
             // primary guard. For an http(s) URL the PRIMARY protection is `reqwest::Url::parse`: http(s)
             // is a WHATWG "special scheme", so its host parser already canonicalizes every alternate
             // IPv4 encoding to a dotted-quad BEFORE we ever read `host_str()` — `2130706433` /
@@ -417,10 +356,10 @@ fn host_is_internal(url: &reqwest::Url) -> bool {
                         return is_internal_v4(&v4);
                     }
                     v6.is_unspecified()
-                        // unique-local (fc00::/7) and link-local (fe80::/10): no stable std
-                        // predicate on this toolchain, so check the leading bits directly.
-                        || (v6.segments()[0] & 0xfe00) == 0xfc00
-                        || (v6.segments()[0] & 0xffc0) == 0xfe80
+                        // unique-local (fc00::/7) and link-local (fe80::/10): via the shared
+                        // net_guard predicates so the two SSRF guards can't drift on the bit-masks.
+                        || is_unique_local_v6(&v6)
+                        || is_link_local_v6(&v6)
                 }
                 // Not an IP literal — a DNS name. Block the well-known loopback name `localhost`
                 // (and any `*.localhost` subdomain, which RFC 6761 reserves to loopback) so it can't
@@ -513,7 +452,7 @@ pub(crate) fn fire_request_log(payload: Value) {
         let body = payload.to_string();
         let _ = client
             .post(url.as_str())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, crate::forward::APPLICATION_JSON)
             .body(body)
             .timeout(WEBHOOK_DELIVERY_TIMEOUT)
             .send()
@@ -670,6 +609,52 @@ fn validate_otlp_endpoint(endpoint: Option<&str>) -> Result<Option<String>, Stri
     Ok(Some(e.to_string()))
 }
 
+/// Validate an operator-configured ROUTING-WEBHOOK sidecar URL, reusing the OTLP SSRF carve-out
+/// rather than the stricter request-log webhook / provider-`base_url` guards. The routing webhook is
+/// an operator-run policy sidecar that is TYPICALLY co-located on loopback (`http://127.0.0.1:<port>`
+/// or `http://localhost:<port>`), so — exactly like the OTLP collector — loopback/`localhost` MUST be
+/// allowed here. This is the deliberate carve-out: the stricter request-log-webhook guard
+/// (`host_is_internal`) BLOCKS loopback (a request-log webhook must leave the host), so the routing
+/// URL is INTENTIONALLY NOT routed through it; instead it shares semantics with `validate_otlp_endpoint`
+/// (note `config_validate::ssrf_blocked_host`, the provider-`base_url` guard, is a different code path
+/// and itself ALLOWS loopback — so it is not the contrast here):
+///   - scheme must be `http`/`https` (case-insensitive);
+///   - the host must not be a link-local/IMDS/RFC1918/CGNAT/cloud-metadata/unspecified target
+///     (`otlp_host_is_blocked`), but loopback/`localhost`/`*.localhost` ARE allowed;
+///   - plaintext `http://` is permitted ONLY for a loopback/localhost sidecar; a non-loopback host
+///     must use `https://` (`otlp_host_is_loopback`).
+///
+/// `None` (no URL) is rejected — a `route: webhook` pool with no `policy.url` is a misconfiguration,
+/// caught at config load. Pure, so it is unit-testable. Returns the validated URL on success.
+pub(crate) fn validate_routing_webhook_url(url: Option<&str>) -> Result<String, String> {
+    let Some(u) = url else {
+        return Err("routing policy.url is required when route: webhook".to_string());
+    };
+    if !(scheme_is(u, "https") || scheme_is(u, "http")) {
+        return Err(format!(
+            "routing policy.url must be an http:// or https:// URL (got '{}')",
+            mask_userinfo(u)
+        ));
+    }
+    let parsed = reqwest::Url::parse(u)
+        .map_err(|err| format!("routing policy.url is not a valid URL: {err}"))?;
+    if otlp_host_is_blocked(&parsed) {
+        return Err(format!(
+            "routing policy.url must not target a link-local/private/CGNAT/cloud-metadata host \
+             (SSRF guard; loopback/localhost sidecars are allowed); got '{}'",
+            mask_userinfo(u)
+        ));
+    }
+    if scheme_is(u, "http") && !otlp_host_is_loopback(&parsed) {
+        return Err(format!(
+            "routing policy.url must use https:// for a non-loopback sidecar (plaintext http:// is \
+             only permitted for a loopback/localhost sidecar); got '{}'",
+            mask_userinfo(u)
+        ));
+    }
+    Ok(u.to_string())
+}
+
 /// True iff the OTLP endpoint URL's host is the loopback/localhost collector target — the exact
 /// carve-out `otlp_host_is_blocked` leaves un-blocked: the `localhost` / `*.localhost` DNS names
 /// (RFC 6761), the loopback v4 block `127.0.0.0/8`, IPv6 `::1` (incl. its `::ffff:127.x` mapped
@@ -729,7 +714,7 @@ fn otlp_host_is_blocked(url: &reqwest::Url) -> bool {
             if METADATA_HOSTS.iter().any(|m| host.eq_ignore_ascii_case(m)) {
                 return true;
             }
-            // Defense-in-depth parity mirror of `config_validate::is_alternate_ipv4_encoding`, NOT the
+            // Defense-in-depth parity mirror via the shared `net_guard::is_alternate_ipv4_encoding`, NOT the
             // primary guard. As in `host_is_internal`, for an http(s) URL `reqwest::Url::parse` has
             // already canonicalized every alternate IPv4 encoding to a dotted-quad before `host_str()`
             // is read (http(s) is a WHATWG special scheme): `2130706433` / `0x7f000001` /
@@ -757,8 +742,8 @@ fn otlp_host_is_blocked(url: &reqwest::Url) -> bool {
                         return !v4.is_loopback() && is_internal_v4(&v4);
                     }
                     v6.is_unspecified()
-                        || (v6.segments()[0] & 0xfe00) == 0xfc00
-                        || (v6.segments()[0] & 0xffc0) == 0xfe80
+                        || is_unique_local_v6(&v6)
+                        || is_link_local_v6(&v6)
                 }
                 // DNS name: block the cloud-metadata names (handled above) but ALLOW `localhost`
                 // (and `*.localhost`) — the loopback carve-out — and any external collector hostname.
@@ -1205,9 +1190,9 @@ mod tests {
             "https://api.localhost/log", // `*.localhost` subdomain -> loopback per RFC 6761
             "https://service.LocalHost/log",
             // Trailing-dot FQDN-root spellings: getaddrinfo resolves `localhost.` to loopback exactly
-            // like `localhost`, and `config_validate::ssrf_blocked_host` lists `localhost.` — these
-            // previously slipped past `host_is_internal` (the bare-label compare missed the dot and
-            // the rsplit TLD was the empty string), enabling `https://localhost./exfil`.
+            // like `localhost`, so this webhook guard must block them too — these previously slipped
+            // past `host_is_internal` (the bare-label compare missed the dot and the rsplit TLD was
+            // the empty string), enabling `https://localhost./exfil`.
             "https://localhost./log",
             "https://localhost.:443/exfil",
             "https://api.localhost./log", // `*.localhost.` subdomain, trailing dot

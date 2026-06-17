@@ -19,7 +19,7 @@ const HARD_DOWN_COOLDOWN_SECS: u64 = 1800;
 // cap — but never past this ceiling (24h), so a hostile/buggy upstream sending a near-`u64::MAX`
 // `Retry-After` cannot overflow `now + duration` (breaker bypass in release / panic in debug) or
 // bench a lane for millennia.
-const MAX_HONORED_RETRY_AFTER_SECS: u64 = 24 * 60 * 60;
+const MAX_HONORED_RETRY_AFTER_SECS: u64 = 86_400; // 24h
 
 // Breaker-state encoding for the per-cell `AtomicU64` (stored as u64 so it can be CAS'd).
 const ST_CLOSED: u64 = 0;
@@ -132,20 +132,20 @@ impl Permit {
 /// Snapshot of lane stats for /stats endpoint.
 #[derive(Debug, Clone)]
 pub(crate) struct LaneSnapshot {
-    pub model: String,
-    pub provider: String,
-    pub max_concurrent: usize,
-    pub inflight: i64,
-    pub free_slots: usize,
-    pub ok: u64,
-    pub err: u64,
-    pub client_fault: u64,
-    pub usable: bool,
-    pub dead: bool,
-    pub dead_reason: String,
-    pub cooldown_remaining_s: u64,
-    pub streak: u32,
-    pub budget: i64,
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    pub(crate) max_concurrent: usize,
+    pub(crate) inflight: i64,
+    pub(crate) free_slots: usize,
+    pub(crate) ok: u64,
+    pub(crate) err: u64,
+    pub(crate) client_fault: u64,
+    pub(crate) usable: bool,
+    pub(crate) dead: bool,
+    pub(crate) dead_reason: String,
+    pub(crate) cooldown_remaining_s: u64,
+    pub(crate) streak: u32,
+    pub(crate) budget: i64,
 }
 
 /// StateStore trait - the seam for lane state access.
@@ -179,6 +179,33 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// serviceable even though its default `""` cell (which pool-routed traffic never touches) reads
     /// ready — and `/healthz` would otherwise return 200 while every pool lane is circuit-broken.
     fn is_ready_any_cell(&self, lane: usize, now: u64) -> bool;
+    /// Side-effect-FREE, POOL-AWARE readiness: would this lane admit a request right now in THIS
+    /// pool's breaker cell, WITHOUT the Open→HalfOpen transition or single-flight probe CAS that
+    /// `usable_in` performs. This is the EXACT predicate `select_weighted_in` uses to filter its
+    /// healthy candidate set (lane-admissible + `cell_ready_breaker`), exposed for the routing-policy
+    /// ordered walk so it filters the policy's ranked order by health identically to SWRR — the walk
+    /// only ORDERS; the unchanged `acquire_for_dispatch_in` (called once on the chosen lane) still
+    /// owns the HalfOpen probe race. Using `usable_in` here instead would steal recovery probes for
+    /// every ranked lane the walk merely peeks at.
+    // ROUTING-POLICY SIGNAL ACCESSORS: read per-request by `forward::decide_policy_order` (and
+    // `pick_among` for `ready_in`) to build the `Candidate` projection the resolved policy ranks on.
+    fn ready_in(&self, pool: &str, lane: usize, now: u64) -> bool;
+    /// Available (free) concurrency permits on a lane's semaphore right now — a routing-policy signal
+    /// (`least_busy`). Read-only snapshot; racy by nature (permits change between read and dispatch),
+    /// which is fine for a ranking hint.
+    fn available_permits(&self, lane: usize) -> usize;
+    /// Per-lane lifetime request budget remaining (`None` = unlimited / unmetered). A routing-policy
+    /// signal (`usage`) read cheaply from the store. Read-only.
+    fn lane_budget_remaining(&self, lane: usize) -> Option<i64>;
+    /// Rolling EWMA of observed end-to-end latency for this lane, in milliseconds — a routing-policy
+    /// signal (`fastest`). `None` until the lane has served at least one request. Read-only, lock-free.
+    fn lane_latency_ms(&self, lane: usize) -> Option<f64>;
+    /// Fold one observed end-to-end latency SAMPLE (milliseconds) into this lane's rolling EWMA. Called
+    /// after a request completes (off the selection hot path). Lock-free, bounded, allocation-free; a
+    /// non-finite or non-positive sample is ignored so a bad measurement can never poison the signal.
+    /// `pool` is accepted for symmetry with the other `_in` recorders, but latency is lane-global, so
+    /// the EWMA is shared across every pool fronting the lane.
+    fn record_latency_in(&self, pool: &str, lane: usize, latency_ms: f64);
     /// Mutating admission for a lane selection is about to DISPATCH to: performs the Open→HalfOpen
     /// transition + single-flight probe CAS exactly once. Returns false if the probe was already
     /// taken (lost the race) so the caller can pick another lane.
@@ -550,14 +577,26 @@ type PoolCellMap = std::collections::HashMap<usize, Vec<(Box<str>, Arc<BreakerCe
 /// strength, is all that matters: it only picks which lock shard a pool's selections serialize on.
 /// `SWRR_SHARDS` is a power of two, so the reduction is a cheap mask.
 fn swrr_shard_index(pool: &str) -> usize {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    for &byte in pool.as_bytes() {
+    (fnv1a_u64(pool) as usize) & (SWRR_SHARDS - 1)
+}
+
+/// FNV-1a 64-bit offset-basis and prime (the canonical constants). Module-level so both the string
+/// hash (`fnv1a_u64`) and the cooldown-jitter seed mixer (which folds 128-bit inputs with the same
+/// FNV step) share one named definition instead of repeating the bare magic literals.
+const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Deterministic FNV-1a 64-bit hash of a string's bytes. Stable across processes/restarts (unlike
+/// the std `DefaultHasher`, whose seed is randomized), so callers that need a process-independent
+/// hash (SWRR shard selection, session affinity) get identical results everywhere. Distribution,
+/// not cryptographic strength, is all that matters.
+pub(crate) fn fnv1a_u64(s: &str) -> u64 {
+    let mut hash = FNV1A_OFFSET_BASIS;
+    for &byte in s.as_bytes() {
         hash ^= byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
+        hash = hash.wrapping_mul(FNV1A_PRIME);
     }
-    (hash as usize) & (SWRR_SHARDS - 1)
+    hash
 }
 
 /// Number of SWRR lock shards. The SWRR weight read-modify-write only needs to be serialized
@@ -615,7 +654,22 @@ struct LaneState {
     current_weight: AtomicI64,
     // Serializes state+cooldown transitions on the default cell — see `BreakerCell::transition_lock`.
     transition_lock: std::sync::Mutex<()>,
+    // Rolling EWMA of observed end-to-end request latency for this lane, in MILLISECONDS, stored as
+    // the raw bits of an `f64` (`f64::to_bits`) so it can be read/updated lock-free with a single
+    // atomic — mirroring the lock-free atomic style the rest of this struct uses for cheap per-lane
+    // signals. A sentinel of `0` bits (== `+0.0`) means "no sample yet" (a real end-to-end latency is
+    // always strictly positive), which the routing-policy projection maps to `latency_ms: None`. This
+    // is a lane-GLOBAL signal (latency is a property of the shared upstream, not of any one pool's
+    // breaker cell), so it lives on `LaneState`, not on `BreakerCell`. Read by the `fastest` policy
+    // via `lane_latency_ms`; updated after each request completes via `record_latency_in`.
+    latency_ewma_bits: AtomicU64,
 }
+
+/// Smoothing factor (α) for the per-lane latency EWMA: `ewma = α·sample + (1-α)·ewma`. A smaller α
+/// gives a longer memory (steadier signal, slower to react); 0.2 weights the most recent ~5 requests
+/// most heavily, which is responsive enough to notice a degrading upstream without thrashing the
+/// `fastest` ranking on a single slow outlier. Cheap, bounded, allocation-free.
+const LATENCY_EWMA_ALPHA: f64 = 0.2;
 
 impl InMemoryStore {
     /// Read a (pool, lane) cell's cumulative error counter — for concurrency/isolation tests.
@@ -649,6 +703,8 @@ impl InMemoryStore {
                     )),
                     current_weight: AtomicI64::new(0),
                     transition_lock: std::sync::Mutex::new(()),
+                    // `0` bits == "no latency sample yet" (see `latency_ewma_bits`).
+                    latency_ewma_bits: AtomicU64::new(0),
                 })
             })
             .collect();
@@ -775,7 +831,7 @@ impl InMemoryStore {
                 let errors = window.error_count_in_window(now, cfg.trip.window_s);
                 (errors as f64 / count as f64) >= cfg.trip.threshold
             }
-            TripMode::Consecutive => c.streak().load(Ordering::Relaxed) >= cfg.trip.n,
+            TripMode::Consecutive => c.streak().load(Ordering::Relaxed) >= cfg.trip.consecutive_n,
         }
     }
 
@@ -831,9 +887,9 @@ impl InMemoryStore {
             // the current streak into the seed so each lane's jitter is independent regardless of
             // wall-clock proximity. FNV-1a folds the mixed inputs into a well-distributed value.
             let cell_id = c as *const _ as *const () as usize as u128;
-            let mut seed = 0xcbf2_9ce4_8422_2325u128;
+            let mut seed = FNV1A_OFFSET_BASIS as u128;
             for part in [time_seed, cell_id, streak as u128] {
-                seed = (seed ^ part).wrapping_mul(0x0000_0100_0000_01b3);
+                seed = (seed ^ part).wrapping_mul(FNV1A_PRIME as u128);
             }
             let jitter_seed = seed;
 
@@ -1320,19 +1376,19 @@ impl InMemoryStore {
 
 #[derive(Clone)]
 pub(crate) struct LaneData {
-    pub model: String,
-    pub provider: String,
-    pub max: usize,
-    pub sem: Arc<Semaphore>,
-    pub limited: bool,
-    pub budget: i64,
-    pub cooldown_until: u64,
-    pub streak: u32,
-    pub dead: bool,
-    pub dead_reason: String,
-    pub ok: u64,
-    pub err: u64,
-    pub client_fault: u64,
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    pub(crate) max: usize,
+    pub(crate) sem: Arc<Semaphore>,
+    pub(crate) limited: bool,
+    pub(crate) budget: i64,
+    pub(crate) cooldown_until: u64,
+    pub(crate) streak: u32,
+    pub(crate) dead: bool,
+    pub(crate) dead_reason: String,
+    pub(crate) ok: u64,
+    pub(crate) err: u64,
+    pub(crate) client_fault: u64,
 }
 
 /// Helper for weighted selection tests - creates a lane with specific weight.
@@ -1359,10 +1415,10 @@ fn make_lane_data_with_weight(id: usize, max_permits: usize) -> (LaneData, u32) 
 /// Breaker configuration per pool.
 #[derive(Debug, Clone)]
 pub(crate) struct BreakerCfg {
-    pub base_cooldown_secs: u64,
-    pub max_cooldown_secs: u64,
-    pub honor_retry_after: bool,
-    pub trip: TripConfig,
+    pub(crate) base_cooldown_secs: u64,
+    pub(crate) max_cooldown_secs: u64,
+    pub(crate) honor_retry_after: bool,
+    pub(crate) trip: TripConfig,
 }
 
 impl Default for BreakerCfg {
@@ -1392,7 +1448,7 @@ impl From<&crate::config::BreakerCfg> for BreakerCfg {
                 window_s: t.window_s,
                 threshold: t.threshold,
                 min_requests: t.min_requests,
-                n: t.n,
+                consecutive_n: t.n,
             })
             .unwrap_or_default();
         Self {
@@ -1414,11 +1470,11 @@ pub(crate) enum TripMode {
 /// Trip configuration parameters (ADR-0002 defaults).
 #[derive(Debug, Clone)]
 pub(crate) struct TripConfig {
-    pub mode: TripMode,
-    pub window_s: u64,
-    pub threshold: f64,
-    pub min_requests: usize,
-    pub n: u32, // For consecutive mode
+    pub(crate) mode: TripMode,
+    pub(crate) window_s: u64,
+    pub(crate) threshold: f64,
+    pub(crate) min_requests: usize,
+    pub(crate) consecutive_n: u32, // For consecutive mode
 }
 
 impl Default for TripConfig {
@@ -1428,7 +1484,7 @@ impl Default for TripConfig {
             window_s: 30,
             threshold: 0.5,
             min_requests: 5,
-            n: 3, // 3 consecutive errors
+            consecutive_n: 3, // 3 consecutive errors
         }
     }
 }
@@ -1456,10 +1512,9 @@ impl InMemoryStore {
         Self::cell_acquire_breaker(self.cell(pool, lane).as_ref(), now)
     }
 
-    /// Side-effect-FREE readiness check (lane-global gates + a non-mutating breaker peek). Reached
-    /// only via the now-test-gated bare `is_ready` (`/healthz` uses the all-cells `is_ready_any_cell`
-    /// → `lane_usable_any_cell`), so it is dead in the release binary but a tested part of the API.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Side-effect-FREE readiness check (lane-global gates + a non-mutating breaker peek). Shared
+    /// body for both `is_ready` (test-gated) and `ready_in` (the non-test `StateStore` trait method,
+    /// production-wired via `forward::decide_policy_order`/`pick_among`), so it is production-live.
     fn ready_for(&self, pool: &str, lane: usize, now: u64) -> bool {
         if !self.lane_admissible(lane) {
             return false;
@@ -1724,6 +1779,73 @@ impl StateStore for InMemoryStore {
 
     fn is_ready_any_cell(&self, lane: usize, now: u64) -> bool {
         self.lane_usable_any_cell(lane, now)
+    }
+
+    fn ready_in(&self, pool: &str, lane: usize, now: u64) -> bool {
+        // Read-only, pool-aware health peek — the EXACT predicate `select_weighted_in` uses to filter
+        // its healthy candidate set (lane-admissible + non-mutating `cell_ready_breaker`), exposed for
+        // the routing-policy ordered walk. Never the probe-stealing `usable`.
+        self.ready_for(pool, lane, now)
+    }
+
+    fn available_permits(&self, lane: usize) -> usize {
+        // Read-only snapshot of free concurrency permits — racy by nature (a ranking hint).
+        self.get_lane(lane).sem.available_permits()
+    }
+
+    fn lane_budget_remaining(&self, lane: usize) -> Option<i64> {
+        let ls = self.get_lane(lane);
+        if ls.limited {
+            Some(ls.budget.load(Ordering::Relaxed))
+        } else {
+            None // unlimited / unmetered
+        }
+    }
+
+    fn lane_latency_ms(&self, lane: usize) -> Option<f64> {
+        // `0` bits is the "no sample yet" sentinel (a real latency EWMA is strictly positive).
+        let bits = self
+            .get_lane(lane)
+            .latency_ewma_bits
+            .load(Ordering::Relaxed);
+        if bits == 0 {
+            None
+        } else {
+            Some(f64::from_bits(bits))
+        }
+    }
+
+    fn record_latency_in(&self, _pool: &str, lane: usize, latency_ms: f64) {
+        // Ignore a non-finite or non-positive sample — it would poison the EWMA (and `<= 0` collides
+        // with the "no sample" sentinel). A real end-to-end latency is always strictly positive.
+        if !latency_ms.is_finite() || latency_ms <= 0.0 {
+            return;
+        }
+        let atomic = &self.get_lane(lane).latency_ewma_bits;
+        // Lock-free read-modify-write CAS loop, the same idiom `spend_budget` uses. Contention here is
+        // negligible (one update per completed request, off the selection path), so a CAS retry is far
+        // cheaper than a lock and keeps the no-new-locks-on-the-hot-path requirement.
+        let mut cur = atomic.load(Ordering::Relaxed);
+        loop {
+            let next = if cur == 0 {
+                // First sample seeds the EWMA directly.
+                latency_ms
+            } else {
+                let prev = f64::from_bits(cur);
+                LATENCY_EWMA_ALPHA * latency_ms + (1.0 - LATENCY_EWMA_ALPHA) * prev
+            };
+            // Guard against a degenerate update landing on the sentinel (e.g. underflow to +0.0),
+            // which would silently reset the lane to "no sample". Keep the previous value instead.
+            let next_bits = next.to_bits();
+            if next_bits == 0 {
+                return;
+            }
+            match atomic.compare_exchange_weak(cur, next_bits, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(observed) => cur = observed, // a concurrent update won; retry on the fresh value
+            }
+        }
     }
 
     fn acquire_for_dispatch_in(&self, pool: &str, lane: usize, now: u64) -> bool {
@@ -2319,7 +2441,7 @@ mod tests {
                 window_s: 30,
                 threshold: 0.5,
                 min_requests: 5,
-                n: 2,
+                consecutive_n: 2,
             },
         };
 
@@ -3132,7 +3254,7 @@ mod tests {
                 window_s: 30,
                 threshold: 0.5,
                 min_requests: 5,
-                n: 3,
+                consecutive_n: 3,
             },
         };
         // Two failures: streak=2 < n=3 → still Closed.
@@ -3170,7 +3292,7 @@ mod tests {
                 window_s: 30,
                 threshold: 0.5,
                 min_requests: 5,
-                n: 2,
+                consecutive_n: 2,
             },
         };
 
@@ -3224,7 +3346,7 @@ mod tests {
                 window_s: 100,
                 threshold: 0.5,
                 min_requests: 3,
-                n: 99, // irrelevant in error-rate mode
+                consecutive_n: 99, // irrelevant in error-rate mode
             },
         };
 
@@ -3260,7 +3382,7 @@ mod tests {
         assert!(rcfg.honor_retry_after, "always honored (no config knob)");
         assert!(matches!(rcfg.trip.mode, TripMode::Consecutive));
         assert_eq!(rcfg.trip.window_s, 42);
-        assert_eq!(rcfg.trip.n, 4);
+        assert_eq!(rcfg.trip.consecutive_n, 4);
 
         // Absent trip block → ADR-0002 defaults.
         let bare = crate::config::BreakerCfg {
@@ -3542,7 +3664,7 @@ mod tests {
                 window_s: 30,
                 threshold: 0.5,
                 min_requests: 5,
-                n: 1,
+                consecutive_n: 1,
             },
         };
 
@@ -3940,6 +4062,80 @@ mod tests {
         );
     }
 
+    /// ZERO-COST-DEFAULT PERF GATE (routing-policy feature). An in-crate, deterministic micro-bench
+    /// of the default selection seam (`select_weighted_in`) — the hot path a `route: weighted`
+    /// (default) pool takes. Captured as a BASELINE before the routing-policy seam refactor and
+    /// re-run after Phase E to prove the default path shows no regression. `#[ignore]` so it never
+    /// runs in the normal suite (timing is environment-sensitive); invoke explicitly with
+    /// `cargo test --release bench_select_weighted_in_seam -- --ignored --nocapture`. (criterion
+    /// would require restructuring this binary-only crate into a lib+bin to reach `pub(crate)`
+    /// internals; an `Instant`-based in-crate bench measures the EXACT same code with no crate
+    /// surgery — the honest, low-risk way to gate the default path.)
+    #[test]
+    #[ignore]
+    fn bench_select_weighted_in_seam() {
+        let store = Arc::new(InMemoryStore::new(vec![
+            make_lane_data(0, 100),
+            make_lane_data(1, 100),
+            make_lane_data(2, 100),
+            make_lane_data(3, 100),
+        ]));
+        set_now_for_test(1000);
+        let cands = [0usize, 1, 2, 3];
+        let weights = [5u32, 3, 1, 1];
+        // Warm up.
+        for _ in 0..100_000 {
+            std::hint::black_box(store.select_weighted_in(
+                std::hint::black_box("bench-pool"),
+                std::hint::black_box(&cands),
+                std::hint::black_box(&weights),
+                std::hint::black_box(1000),
+            ));
+        }
+        let iters = 2_000_000u64;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(store.select_weighted_in(
+                std::hint::black_box("bench-pool"),
+                std::hint::black_box(&cands),
+                std::hint::black_box(&weights),
+                std::hint::black_box(1000),
+            ));
+        }
+        let elapsed = start.elapsed();
+        let per = elapsed.as_nanos() as f64 / iters as f64;
+        println!(
+            "BENCH select_weighted_in_seam: {iters} iters in {elapsed:?} => {per:.2} ns/iter \
+             (4 candidates, weighted 5:3:1:1)"
+        );
+    }
+
+    /// Per-lane latency EWMA (routing `fastest` signal): `None` before any sample; the first sample
+    /// seeds the EWMA exactly; subsequent samples fold in at α; non-finite/non-positive samples are
+    /// ignored (never poison the signal).
+    #[test]
+    fn test_lane_latency_ewma_records_and_reads() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        // No sample yet.
+        assert_eq!(store.lane_latency_ms(0), None);
+        // First sample seeds the EWMA exactly.
+        store.record_latency_in("p", 0, 100.0);
+        assert_eq!(store.lane_latency_ms(0), Some(100.0));
+        // Second sample folds in at α=0.2: 0.2*200 + 0.8*100 = 120.
+        store.record_latency_in("p", 0, 200.0);
+        let v = store.lane_latency_ms(0).unwrap();
+        assert!((v - 120.0).abs() < 1e-9, "EWMA must be 120, got {v}");
+        // Garbage samples are ignored — the signal is unchanged.
+        store.record_latency_in("p", 0, f64::NAN);
+        store.record_latency_in("p", 0, 0.0);
+        store.record_latency_in("p", 0, -5.0);
+        let v2 = store.lane_latency_ms(0).unwrap();
+        assert!(
+            (v2 - 120.0).abs() < 1e-9,
+            "bad samples must not move the EWMA, got {v2}"
+        );
+    }
+
     /// MEDIUM/performance (store.rs swrr shards): the SWRR lock is now per-pool (sharded), not a
     /// single global lock. Correctness must be unchanged — each pool's weighted distribution stays
     /// proportional and pool-local (disjoint pools share no `current_weight` state). Drive two
@@ -4170,7 +4366,7 @@ mod tests {
                 window_s: 1,
                 threshold: 2.0,           // unreachable fraction
                 min_requests: usize::MAX, // never meets the floor
-                n: u32::MAX,
+                consecutive_n: u32::MAX,
             },
         };
 
@@ -4232,7 +4428,7 @@ mod tests {
                 window_s: 30,
                 threshold: 0.5,
                 min_requests: 5,
-                n: u32::MAX,
+                consecutive_n: u32::MAX,
             },
         };
 
@@ -4274,7 +4470,7 @@ mod tests {
                 window_s: 30,
                 threshold: 0.5,
                 min_requests: usize::MAX,
-                n: u32::MAX,
+                consecutive_n: u32::MAX,
             },
         };
 

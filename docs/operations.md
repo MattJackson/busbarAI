@@ -23,6 +23,53 @@ will fail auth on first use). `auth.mode: none` prints a loud open-relay warning
 
 The HTTP client uses a 300s request timeout and pools up to 64 idle keep-alive connections per upstream host.
 
+## Inbound TLS & mutual-TLS (mTLS)
+
+Busbar terminates TLS natively for the client↔Busbar hop. Add an optional `tls`
+block to `config.yaml`; when it is **absent**, Busbar serves plain HTTP exactly as
+before (no behavior change). When present, Busbar handles the TLS handshake itself —
+no sidecar required.
+
+```yaml
+listen: "0.0.0.0:8443"
+tls:
+  cert_file: /etc/busbar/tls/fullchain.pem  # PEM cert chain, leaf first
+  key_file:  /etc/busbar/tls/privkey.pem    # PEM private key (PKCS#8 / PKCS#1 / SEC1)
+  # client_ca_file: /etc/busbar/tls/ca.pem  # OPTIONAL — see "Mutual TLS" below
+```
+
+**Certificate & key formats.** `cert_file` is a PEM certificate chain with the leaf
+(server) certificate first, followed by any intermediates — exactly what most CAs
+ship as `fullchain.pem`. `key_file` is the matching PEM private key in PKCS#8
+(`BEGIN PRIVATE KEY`), PKCS#1 (`BEGIN RSA PRIVATE KEY`), or SEC1
+(`BEGIN EC PRIVATE KEY`) encoding. Busbar advertises **http/1.1** over ALPN.
+
+**Fail-fast.** Any missing, unreadable, or unparseable cert/key/CA file stops the
+process at startup with a message naming the offending file — a misconfigured
+certificate can never silently downgrade or half-start the listener. Key bytes are
+never logged.
+
+### Mutual TLS (client-cert auth)
+
+Set `client_ca_file` to a PEM CA bundle to require **mutual TLS**: every client must
+present a certificate that chains to that CA, or the TLS handshake is rejected before
+any request is processed. This is transport-level zero-trust — only holders of a
+cert your CA signed can establish a connection at all, with no service mesh or
+external proxy. It composes with (and runs before) the normal `auth` token / virtual-key
+check. A client with a missing or wrong certificate is dropped at handshake; the
+rejection is contained to that one connection and never affects the server or other
+clients.
+
+### Certificate rotation
+
+Certs are loaded once at startup. To rotate, replace the PEM files on disk and
+restart Busbar (e.g. `systemctl restart busbar`). The graceful-shutdown path drains
+in-flight requests first, so a restart on rotation does not drop live traffic.
+
+**Reverse proxy alternative.** A TLS-terminating reverse proxy (nginx, Caddy,
+Envoy) in front of a plain-HTTP Busbar still works if you prefer to manage certs
+there — simply omit the `tls` block.
+
 ## Health & readiness
 
 | Endpoint | Auth | Meaning |

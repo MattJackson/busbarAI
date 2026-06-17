@@ -86,17 +86,17 @@ pub(crate) fn classify(sig: &CanonicalSignal) -> Disposition {
 /// Raw upstream error extracted from HTTP response (Stage 1a output).
 #[derive(Debug, Clone)]
 pub(crate) struct RawUpstreamError {
-    pub http_status: u16,
+    pub(crate) http_status: u16,
     /// Provider-specific error *code* (e.g. a numeric `code` field), checked against `error_map`.
-    pub provider_code: Option<String>,
+    pub(crate) provider_code: Option<String>,
     /// Provider-specific structured error *type* (e.g. a `type`/`error.type` string), checked
     /// against `error_map` as a second signal when the code doesn't match.
-    pub structured_type: Option<String>,
+    pub(crate) structured_type: Option<String>,
     /// Upstream `Retry-After` header value in whole seconds, when present. The per-protocol
     /// `extract_error` methods only see the body (no headers), so the forwarding layer — which has
     /// the response headers — parses and sets this after `extract_error` returns. `normalize_raw_error`
     /// then propagates it into `CanonicalSignal.retry_after` so the cooldown floor is honored.
-    pub retry_after_secs: Option<u64>,
+    pub(crate) retry_after_secs: Option<u64>,
 }
 
 /// Classify a raw upstream error into a canonical signal using an error_map.

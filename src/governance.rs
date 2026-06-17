@@ -24,7 +24,14 @@ const RATE_WINDOW_SECS: u64 = 60;
 /// while still guaranteeing the map cannot grow unboundedly across windows.
 const RATE_SWEEP_INTERVAL: u32 = 256;
 /// `price_per_1k_tokens_cents` is priced per this many tokens.
-const TOKENS_PER_PRICE_UNIT: u64 = 1000;
+const TOKENS_PER_PRICE_UNIT: u64 = 1_000;
+/// Seconds in a UTC day, for `budget_window`'s day/month arithmetic. `pub(crate)` so sibling
+/// modules (which need the same constant for their own window math) reference it as
+/// `crate::governance::SECS_PER_DAY` rather than re-hardcoding `86_400`.
+pub(crate) const SECS_PER_DAY: u64 = 86_400;
+/// SQLite `busy_timeout` for the on-disk DB: a transient lock contention retries for this many
+/// milliseconds (5s) before failing, rather than erroring instantly with `SQLITE_BUSY`.
+const SQLITE_BUSY_TIMEOUT_MS: i64 = 5_000;
 
 /// Per-key rate-limit state for the current 60s window. Ephemeral (in-memory, not persisted):
 /// rate windows are single-node; cross-node distributed limits would be a future concern.
@@ -35,12 +42,29 @@ struct RateState {
     tokens: u64,
 }
 
+/// The two auth-path key caches, held together under `GovState::caches`'s single `RwLock` so
+/// `refresh` can swap both in one critical section. `by_hash` is the hashed-secret → key index; it
+/// backs `lookup`. `by_access_key_id` is the AWS AccessKeyId → resolved-credential index for inbound
+/// SigV4 resolution on the Bedrock-ingress hot path: the AccessKeyId arrives in plaintext in the
+/// SigV4 `Authorization` header's `Credential=` field, so it is keyed on the plaintext AccessKeyId
+/// (NOT hashed like `by_hash`) — a lookup handle, not a secret. Each entry bundles the owning
+/// `VirtualKey` with its secret access key, so the verify path resolves both in one lookup. Only keys
+/// minted WITH an AWS credential appear in `by_access_key_id`. Both are rebuilt by `refresh` from the
+/// SAME store snapshot, so a disabled/deleted/re-minted key is reflected in both — now also visible
+/// to readers atomically (the one lock guarantees no reader sees a half-applied swap).
+struct GovCaches {
+    by_hash: HashMap<String, VirtualKey>,
+    by_access_key_id: HashMap<String, AwsKeyEntry>,
+}
+
 /// Per-instance governance runtime: the durable `Store` plus an in-memory key cache (hashed-secret
 /// → key) so validation on the hot path is a map lookup, not a DB round-trip. Held in `App`
 /// (`Option`: `None` = governance disabled) — NOT a process-global, so tests stay isolated.
 pub(crate) struct GovState {
     store: Arc<dyn Store>,
-    by_hash: RwLock<HashMap<String, VirtualKey>>,
+    /// Both auth-path caches under ONE lock so `refresh` swaps them atomically — a reader can never
+    /// observe a new `by_hash` against a stale `by_access_key_id` (LOW-1). See `GovCaches`.
+    caches: RwLock<GovCaches>,
     /// Flat cents charged per request (one half of the cost model; the other is per-token, below).
     /// Total budget spend = per-request fee + tokens/1000 * price_per_1k_tokens_cents.
     price_per_request_cents: i64,
@@ -54,16 +78,21 @@ pub(crate) struct GovState {
     rate_sweep_ticker: AtomicU32,
     /// bearer token guarding the /admin management API (None = admin API disabled).
     admin_token: Option<String>,
+    /// Fail-mode for the atomic budget check-and-charge on a STORE ERROR (fix 2b). `Allow` (default)
+    /// fails open (proceed → availability); `Deny` fails closed (reject → hard guarantee). Only the
+    /// store-error path consults this; a definitive over-budget result always rejects. Set from
+    /// `GovernanceCfg::budget_on_store_error` via `with_budget_on_store_error` at construction.
+    budget_on_store_error: crate::config::BudgetOnStoreError,
 }
 
 /// parameters for minting a new virtual key (from the management API).
 pub(crate) struct NewKeySpec {
-    pub name: String,
-    pub allowed_pools: Vec<String>,
-    pub max_budget_cents: Option<i64>,
-    pub budget_period: String,
-    pub rpm_limit: Option<u32>,
-    pub tpm_limit: Option<u32>,
+    pub(crate) name: String,
+    pub(crate) allowed_pools: Vec<String>,
+    pub(crate) max_budget_cents: Option<i64>,
+    pub(crate) budget_period: String,
+    pub(crate) rpm_limit: Option<u32>,
+    pub(crate) tpm_limit: Option<u32>,
 }
 
 impl GovState {
@@ -74,38 +103,62 @@ impl GovState {
         admin_token: Option<String>,
     ) -> StoreResult<Self> {
         let by_hash = Self::load(store.as_ref())?;
+        let by_access_key_id = Self::load_by_access_key_id(store.as_ref(), &by_hash)?;
         Ok(Self {
             store,
-            by_hash: RwLock::new(by_hash),
+            caches: RwLock::new(GovCaches {
+                by_hash,
+                by_access_key_id,
+            }),
             price_per_request_cents,
             price_per_1k_tokens_cents,
             rate: RwLock::new(HashMap::new()),
             rate_sweep_ticker: AtomicU32::new(0),
             admin_token,
+            // Default fail-open (today's behavior); main.rs overrides from config via the setter.
+            budget_on_store_error: crate::config::BudgetOnStoreError::Allow,
         })
     }
 
-    /// Run a best-effort, fire-and-forget store write WITHOUT blocking the async executor thread.
+    /// Set the budget store-error fail-mode (fix 2b). Builder-style so `GovState::new`'s signature is
+    /// unchanged (its many call sites stay intact); main.rs chains this from `GovernanceCfg`.
+    pub(crate) fn with_budget_on_store_error(
+        mut self,
+        mode: crate::config::BudgetOnStoreError,
+    ) -> Self {
+        self.budget_on_store_error = mode;
+        self
+    }
+
+    /// The configured budget store-error fail-mode (fix 2b). Consulted by the route.rs admission site.
+    pub(crate) fn budget_on_store_error(&self) -> crate::config::BudgetOnStoreError {
+        self.budget_on_store_error
+    }
+
+    /// Run a best-effort, FIRE-AND-FORGET store write WITHOUT blocking the async executor thread.
     ///
-    /// `Store` I/O is synchronous (a mutex-guarded SQLite connection that may fsync / checkpoint /
-    /// contend on the WAL). Running it directly on a Tokio worker thread would stall every other
-    /// task scheduled there. When a Tokio runtime is present we hand the SQL off to the blocking
-    /// pool (`spawn_blocking`) and return immediately; the write completes asynchronously and any
-    /// error is logged. Outside a runtime (unit tests that call the accounting methods directly) we
-    /// run the closure inline so behaviour is observable synchronously.
+    /// SINGLE OFFLOAD. The op is a SYNCHRONOUS store closure (it calls the sync `Store` trait methods,
+    /// which run the SQL inline via `*_inner` — NO nested `spawn_blocking`). When a runtime is present
+    /// we move it into ONE `tokio::task::spawn_blocking`: the blocking SQL runs on the blocking pool,
+    /// any error is logged (never propagated), and we return immediately (fire-and-forget). This is
+    /// deliberately NOT the `*_async` path: those methods are for the hot blocking-AWAIT gate and would
+    /// here cost a second task — a `tokio::spawn`ed future whose only job is to await a `spawn_blocking`
+    /// (two tasks + extra key-id allocs) — for no benefit, since a fire-and-forget caller never awaits
+    /// the result. Outside a runtime (unit tests that call the accounting methods directly) we run the
+    /// sync op INLINE on the calling thread, so behaviour stays observable synchronously.
     fn offload_store_write<F>(&self, what: &'static str, key_id: &str, op: F)
     where
         F: FnOnce(&dyn Store) -> StoreResult<()> + Send + 'static,
     {
         let store = self.store.clone();
+        let key_id = key_id.to_string();
         if tokio::runtime::Handle::try_current().is_ok() {
-            let key_id = key_id.to_string();
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = op(store.as_ref()) {
+                if let Err(e) = op(&*store) {
                     tracing::warn!(key = %key_id, error = %e, "{what}");
                 }
             });
-        } else if let Err(e) = op(store.as_ref()) {
+        } else if let Err(e) = op(&*store) {
             tracing::warn!(key = %key_id, error = %e, "{what}");
         }
     }
@@ -123,10 +176,11 @@ impl GovState {
         let spend = (tokens.saturating_mul(self.price_per_1k_tokens_cents.max(0) as u64)
             / TOKENS_PER_PRICE_UNIT) as i64;
         let key_owned = key_id.to_string();
-        // count_request = false: this accrues token spend for a request already counted by
-        // record_request, so it must not increment the request counter again.
-        self.offload_store_write("token usage record failed", key_id, move |store| {
-            store.add_usage(&key_owned, window, spend, tokens, false)
+        // count_request = false: this accrues token spend for a request already counted at admission
+        // (production: the atomic `charge_within_budget`; tests: `record_request`), so it must not
+        // increment the request counter again.
+        self.offload_store_write("token usage record failed", key_id, move |s| {
+            s.add_usage(&key_owned, window, spend, tokens, false)
         });
         // Feed the TPM counter. `add_rate_tokens` is UPDATE-only: it credits an existing entry
         // (created by `check_rate` for a capped key) but never materialises one — an uncapped key has
@@ -146,19 +200,74 @@ impl GovState {
         self.rate.write().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Acquire the `by_hash` key cache for reading, recovering from a poisoned lock instead of
-    /// panicking. Mirrors `rate_write`'s rationale for the auth hot path: `lookup` runs per request
-    /// and must never panic, so a poisoned cache (from a panic in some prior `refresh`) is recovered
-    /// rather than propagated. The cache content is a snapshot of the durable store, so the recovered
-    /// guard yields a consistent (if possibly slightly stale) view.
-    fn by_hash_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, VirtualKey>> {
-        self.by_hash.read().unwrap_or_else(|p| p.into_inner())
+    /// Acquire the `rate` map for reading (poison-recovering, same rationale as `rate_write`).
+    /// Read by `rate_headroom`, which is wired into production routing: `decide_policy_order` in
+    /// `forward.rs` calls `rate_headroom_for_token` (→ `rate_headroom`) to compute the per-lane
+    /// `usage` routing signal.
+    fn rate_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, RateState>> {
+        self.rate.read().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Acquire the `by_hash` key cache for writing, recovering from a poisoned lock instead of
-    /// panicking (see `by_hash_read`). Used by `refresh` after a management-API mutation.
-    fn by_hash_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, VirtualKey>> {
-        self.by_hash.write().unwrap_or_else(|p| p.into_inner())
+    /// READ-ONLY rate-limit headroom for a key: the fraction `[0.0, 1.0]` of the most-constrained
+    /// configured rate limit (RPM and/or TPM) still available in the current 60s window, where `1.0`
+    /// is "fully unused" and `0.0` is "at the cap". `None` when the key has neither an RPM nor a TPM
+    /// limit (nothing to be near). The routing `usage` policy ranks by this (more headroom = preferred).
+    ///
+    /// This is a pure observation: it NEVER mutates the window (no increment, no stale-reset, no
+    /// sweep) — `check_rate` owns all of that on the admission path. A stale entry (from an older
+    /// window) reads as fully-available for the current window, which is correct: its counters do not
+    /// carry forward. When both RPM and TPM are set, the headroom is the MINIMUM of the two (the
+    /// tighter constraint governs how close the key is to a 429).
+    // Wired into production routing: `forward.rs::decide_policy_order` calls this (via
+    // `rate_headroom_for_token`) to produce the per-lane `usage` signal; the in-crate tests also
+    // exercise it directly.
+    pub(crate) fn rate_headroom(&self, key: &VirtualKey, now: u64) -> Option<f64> {
+        if key.rpm_limit.is_none() && key.tpm_limit.is_none() {
+            return None;
+        }
+        let window = now / RATE_WINDOW_SECS * RATE_WINDOW_SECS;
+        // Counters for THIS window only; a stale (older-window) entry contributes zero usage.
+        let (requests, tokens) = match self.rate_read().get(&key.id) {
+            Some(st) if st.window_start == window => (st.requests, st.tokens),
+            _ => (0, 0),
+        };
+        let mut headroom = 1.0_f64;
+        if let Some(rpm) = key.rpm_limit {
+            // `rpm == 0` is a fully-closed limit: no headroom. Avoid a divide-by-zero.
+            let frac = if rpm == 0 {
+                0.0
+            } else {
+                1.0 - (requests as f64 / rpm as f64)
+            };
+            headroom = headroom.min(frac);
+        }
+        if let Some(tpm) = key.tpm_limit {
+            let frac = if tpm == 0 {
+                0.0
+            } else {
+                1.0 - (tokens as f64 / tpm as f64)
+            };
+            headroom = headroom.min(frac);
+        }
+        // Clamp to [0,1]: a window that already exceeded its cap (in-flight concurrency can push usage
+        // past the limit, per `check_rate`'s best-effort note) would otherwise yield a negative value.
+        Some(headroom.clamp(0.0, 1.0))
+    }
+
+    /// Acquire the combined key caches (`by_hash` + `by_access_key_id`) for reading, recovering from a
+    /// poisoned lock instead of panicking. Mirrors `rate_write`'s rationale for the auth hot path:
+    /// `lookup`/`lookup_by_access_key_id` run per request and must never panic, so a poisoned cache
+    /// (from a panic in some prior `refresh`) is recovered rather than propagated. The cache content is
+    /// a snapshot of the durable store, so the recovered guard yields a consistent (if possibly
+    /// slightly stale) view.
+    fn caches_read(&self) -> std::sync::RwLockReadGuard<'_, GovCaches> {
+        self.caches.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Acquire the combined key caches for writing, recovering from a poisoned lock instead of
+    /// panicking (see `caches_read`). Used by `refresh` after a management-API mutation.
+    fn caches_write(&self) -> std::sync::RwLockWriteGuard<'_, GovCaches> {
+        self.caches.write().unwrap_or_else(|p| p.into_inner())
     }
 
     /// the configured admin token (None = admin API disabled).
@@ -201,6 +310,60 @@ impl GovState {
         self.store.put_key(&key)?;
         self.refresh()?;
         Ok((key, secret))
+    }
+
+    /// Mint a virtual key that ALSO carries an AWS-style access-key-id + secret access key for inbound
+    /// SigV4 verification (the MinIO/S3-compatible model). Returns `(key, bearer_secret,
+    /// aws_access_key_id, aws_secret_access_key)`. BOTH secrets — the bearer secret and the AWS secret
+    /// access key — are shown to the caller exactly ONCE here and never again (only the bearer secret's
+    /// HASH is recoverable later; the AWS secret is stored in plaintext for HMAC verification but is
+    /// never echoed by any read API). The AccessKeyId is not secret and IS returned by reads.
+    ///
+    /// The AWS secret is the SYMMETRIC SigV4 signing key: the client signs with it and busbar
+    /// recomputes the signature with the same value. It is therefore stored in plaintext (a one-way
+    /// hash would make verification impossible) and guarded by redaction discipline everywhere it could
+    /// surface (`AwsCredential`'s Debug, and the admin read responses, which never include it).
+    ///
+    /// The credential lives in the separate `aws_credentials` table keyed by the key's id, NOT as
+    /// columns on `VirtualKey` — this ties the credential to the key without changing the `VirtualKey`
+    /// row shape. The bearer key row is persisted first, then the AWS credential; both then refresh
+    /// the in-memory caches so the AccessKeyId resolves on the next request.
+    pub(crate) fn create_key_with_aws(
+        &self,
+        spec: NewKeySpec,
+        now: u64,
+    ) -> StoreResult<(VirtualKey, String, String, String)> {
+        let secret = generate_secret();
+        let hash = crate::sigv4::sha256_hex(secret.as_bytes());
+        let id = format!("vk_{}", &hash[..16]);
+        self.ensure_id_free_for_hash(&id, &hash)?;
+        let access_key_id = generate_aws_access_key_id();
+        let secret_access_key = generate_aws_secret_access_key();
+        let key = VirtualKey {
+            id: id.clone(),
+            key_hash: hash,
+            name: spec.name,
+            allowed_pools: spec.allowed_pools,
+            max_budget_cents: spec.max_budget_cents,
+            budget_period: spec.budget_period,
+            rpm_limit: spec.rpm_limit,
+            tpm_limit: spec.tpm_limit,
+            enabled: true,
+            created_at: now,
+        };
+        // ATOMIC: persist the bearer key row and its paired AWS credential in ONE transaction (see
+        // `put_key_with_aws_credential`). The previous two-call autocommit sequence could orphan an
+        // inert key row if the credential write failed after the key write committed.
+        self.store.put_key_with_aws_credential(
+            &key,
+            &AwsCredential {
+                access_key_id: access_key_id.clone(),
+                key_id: id,
+                secret_access_key: secret_access_key.clone(),
+            },
+        )?;
+        self.refresh()?;
+        Ok((key, secret, access_key_id, secret_access_key))
     }
 
     /// Guard against the silent UPSERT-overwrite described in `create_key`: the PRIMARY KEY `id` is
@@ -297,7 +460,7 @@ impl GovState {
     /// RPM is enforced precisely: the request counter is incremented synchronously on admission.
     ///
     /// TPM is BEST-EFFORT, not a hard cap. Token counts are fed in post-response (from the usage
-    /// tap, via `record_tokens`/`record_request`), so this check only sees tokens from requests
+    /// tap, via `record_tokens`), so this check only sees tokens from requests
     /// that have ALREADY COMPLETED in the current 60s window. Consequences operators must know:
     /// - In-flight concurrent requests are not counted, so N requests can pass the check
     ///   simultaneously while each is under the limit and collectively exceed the configured TPM.
@@ -318,15 +481,18 @@ impl GovState {
         // per-key staleness reset below already resets the looked-up key's own entry). Instead we
         // amortize it: only every `RATE_SWEEP_INTERVAL`th call pays the sweep.
         //
-        // CONTENTION: the sweep is held in its OWN short write-lock scope, SEPARATE from the per-key
-        // check/increment below. Previously both ran under a single guard, so on a sweep call every
-        // other concurrent `check_rate`/`add_rate_tokens` blocked for the full O(N) retain. Splitting
-        // them means the common (non-sweep) admission takes only the fast per-key critical section,
-        // and the rare sweep does not extend the lock hold of the per-key work. The two scopes are
-        // independent for correctness: the sweep only evicts entries whose `window_start != window`,
-        // and the per-key resolution below re-checks/refreshes this key's own entry for `window`
-        // regardless of whether the sweep ran, so nothing the sweep does (or skips) can admit a
-        // request that should be rejected or vice versa.
+        // SINGLE write-lock: the amortized sweep and the per-key check/increment share ONE
+        // `rate_write()` guard. The sweep-needed flag is the cheap lock-free ticker below (an atomic
+        // `fetch_add` + `is_multiple_of`), computed BEFORE the guard; then under one guard we do the
+        // conditional sweep first and the per-key resolution second. Acquiring the write lock twice
+        // (sweep, then a fresh guard for the per-key work) cost a second lock round-trip on every
+        // admission for no benefit: the per-key critical section is O(1) and the sweep, when it fires,
+        // is O(active-key-count) but rare (every `RATE_SWEEP_INTERVAL`th call) — coalescing them under
+        // one guard cannot lengthen the common-case hold (no sweep runs) and saves an acquire/release.
+        // Correctness is unchanged: the sweep only evicts entries whose `window_start != window`, and
+        // the per-key resolution below re-checks/refreshes this key's own entry for `window` regardless
+        // of whether the sweep ran, so nothing the sweep does (or skips) can admit a request that
+        // should be rejected or vice versa.
         // MSRV NOTE: `u32::is_multiple_of` was stabilized in Rust 1.87. It is used here (and clippy's
         // `manual_is_multiple_of` actively REWRITES the equivalent `% N == 0` form back to it, so the
         // two cannot both be satisfied without a declared MSRV), which makes 1.87 the effective
@@ -343,16 +509,15 @@ impl GovState {
         // Using `wrapping_add(1)` on the returned pre-increment value reproduces the value now stored
         // in the atomic: the sweep fires on calls N, 2N, 3N, ... and the wrap boundary (pre = 0xFFFF…F
         // -> post = 0, a multiple of N) is handled correctly with no skipped cycle.
-        if self
+        let sweep_needed = self
             .rate_sweep_ticker
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1)
-            .is_multiple_of(RATE_SWEEP_INTERVAL)
-        {
-            let mut sweep = self.rate_write();
-            sweep.retain(|_, st| st.window_start == window);
-        }
+            .is_multiple_of(RATE_SWEEP_INTERVAL);
         let mut map = self.rate_write();
+        if sweep_needed {
+            map.retain(|_, st| st.window_start == window);
+        }
         // Resolve this key's entry for the CURRENT window. Three cases:
         //  - present & current-window  -> mutate in place (fast path; no key clone).
         //  - present but STALE         -> reset it in place to the current window (counters back to
@@ -395,7 +560,8 @@ impl GovState {
     }
 
     /// Add tokens to the key's rate window for TPM accounting. Called post-response from
-    /// `record_tokens`/`record_request` (the token-fee path). `now` is the request's pinned
+    /// `record_tokens` (the production token-fee path; `record_request` is test-only). `now` is the
+    /// request's pinned
     /// `charged_at` (the header-arrival epoch), i.e. the window the request STARTED in — NOT a fresh
     /// completion clock. This matters for a request that straddles a 60s boundary: it is admitted by
     /// `check_rate` in its start window W0, but by the time its (streamed) response completes, a LATER
@@ -453,8 +619,9 @@ impl GovState {
     }
 
     /// Is this key already at/over its budget for the current window? (No cap → never.) Synchronous
-    /// core; the request-path gate must use [`GovState::is_over_budget_async`] so the SQLite read
-    /// does not block the async executor thread.
+    /// core. The production request-path gate is [`GovState::try_charge_request_within_budget`] (an
+    /// atomic check-and-charge); this read and [`GovState::is_over_budget_async`] are the superseded,
+    /// now test-only budget probes.
     ///
     /// NOTE: the budget cap is BEST-EFFORT (soft) under concurrency. This read and the later
     /// `record_request` charge are separate, non-atomic store round-trips, so N concurrent in-flight
@@ -462,6 +629,11 @@ impl GovState {
     /// overshooting `max_budget_cents` by up to (concurrent in-flight) * (per-request + token cost).
     /// The overshoot is bounded by the caller's parallelism. A hard cap would require an atomic
     /// check-and-charge (a single UPSERT returning post-charge spend) in the `Store`.
+    // Read-only budget probe. The admission path now uses the ATOMIC `try_charge_request_within_budget`
+    // (fix 2a) rather than this read-then-charge pair, so PRODUCTION no longer calls it; it is retained
+    // ONLY as a governance-unit-test helper. Hence `#[cfg(test)]` (compiled out of the release binary)
+    // rather than a dead-code allow.
+    #[cfg(test)]
     pub(crate) fn is_over_budget(&self, key: &VirtualKey, now: u64) -> bool {
         let Some(limit) = key.max_budget_cents else {
             return false;
@@ -473,11 +645,17 @@ impl GovState {
             .unwrap_or(false)
     }
 
-    /// Async budget gate for the request path: runs the (blocking) SQLite read on the blocking pool
-    /// so it never stalls a Tokio worker thread. Falls back to a synchronous read when called
-    /// outside a runtime (defensive — the request path always has one). On a store/join error it
-    /// fails OPEN (returns `false`, i.e. "not over budget") to match the synchronous variant, which
-    /// preserves availability rather than rejecting traffic on a telemetry-store hiccup.
+    /// Async budget gate for the request path: the per-request offload now lives in the backend's
+    /// `get_usage_async` (the SQLite impl runs the blocking read on the blocking pool), so this no
+    /// longer hand-rolls a `spawn_blocking`. Falls back to a synchronous read when called outside a
+    /// runtime (defensive — the request path always has one; the default async impl would inline
+    /// anyway, but the explicit sync path keeps behaviour observable in no-runtime tests). On a
+    /// store/join error it fails OPEN (returns `false`, i.e. "not over budget") to match the
+    /// synchronous variant, preserving availability rather than rejecting traffic on a telemetry-store
+    /// hiccup.
+    // Superseded on the request path by the atomic charge; retained ONLY for tests, so `#[cfg(test)]`
+    // (compiled out of the release binary) rather than a dead-code allow.
+    #[cfg(test)]
     pub(crate) async fn is_over_budget_async(&self, key: &VirtualKey, now: u64) -> bool {
         if key.max_budget_cents.is_none() {
             return false;
@@ -485,27 +663,79 @@ impl GovState {
         if tokio::runtime::Handle::try_current().is_err() {
             return self.is_over_budget(key, now);
         }
-        let store = self.store.clone();
-        let key_id = key.id.clone();
-        let limit = key.max_budget_cents.unwrap_or(i64::MAX);
+        let limit = key.max_budget_cents.expect("guarded is_some above");
         let window = budget_window(&key.budget_period, now);
-        match tokio::task::spawn_blocking(move || store.get_usage(&key_id, window)).await {
-            Ok(Ok(u)) => u.spend_cents >= limit,
-            Ok(Err(e)) => {
+        match self.store.get_usage_async(&key.id, window).await {
+            Ok(u) => u.spend_cents >= limit,
+            Err(e) => {
                 tracing::warn!(key = %key.id, error = %e, "budget read failed; failing open");
                 false
             }
-            Err(e) => {
-                tracing::warn!(key = %key.id, error = %e, "budget read task panicked; failing open");
-                false
-            }
         }
+    }
+
+    /// ATOMIC budget check-and-charge for the admission path — the HARD-cap primitive (fix 2a).
+    ///
+    /// In ONE indivisible store round-trip, charge the flat per-request fee + one request to the key's
+    /// current budget window IFF it stays within `max_budget_cents`. Replaces the old non-atomic
+    /// `is_over_budget_async` (read) → later `record_request` (write) pair, which let N concurrent
+    /// requests for one key each read "under budget" and all charge → overshoot by up to
+    /// concurrency × per-req cost. With a single conditional UPSERT, the flat fee is a HARD cap: a
+    /// request is admitted only if its charge fits.
+    ///
+    /// Residual (documented honestly): token cost is reconciled post-response (`record_tokens`), so a
+    /// single ADMITTED request's own tokens can push spend marginally past the cap — bounded to ONE
+    /// in-flight request, NOT N. The flat-fee overshoot (the N-way race) is gone.
+    ///
+    /// Runs the (blocking) SQLite write on the blocking pool so it never stalls a Tokio worker.
+    /// Returns:
+    ///   * `Ok(true)`  — charged and admitted (or uncapped key: always charged),
+    ///   * `Ok(false)` — would exceed the cap → reject,
+    ///   * `Err(_)`    — store/join error → the caller applies the fail-open/closed knob (fix 2b).
+    ///
+    /// The flat fee is charged HERE (atomically), so the caller must NOT also charge it in `finish`;
+    /// `finish` emits metrics, fires the request-log webhook, and (on a non-2xx outcome) refunds the
+    /// flat fee for an admitted request.
+    pub(crate) async fn try_charge_request_within_budget(
+        &self,
+        key: &VirtualKey,
+        now: u64,
+    ) -> StoreResult<bool> {
+        let window = budget_window(&key.budget_period, now);
+        // Clamp the per-request fee >= 0 (symmetric with record_tokens / the old record_request): a
+        // negative misconfigured fee must never DECREMENT accrued spend and defeat the cap.
+        let fee = self.price_per_request_cents.max(0);
+        let max = key.max_budget_cents;
+        // The per-request offload now lives in the backend's `charge_within_budget_async` (the SQLite
+        // impl runs the atomic UPSERT on the blocking pool); no hand-rolled `spawn_blocking` here.
+        // Outside a runtime (unit tests calling directly) the default async impl runs the charge
+        // inline, so behaviour stays synchronous and observable.
+        self.store
+            .charge_within_budget_async(&key.id, window, fee, max)
+            .await
+    }
+
+    /// Refund the flat per-request fee + request count charged at admission, for a request that
+    /// produced no usable upstream result (non-2xx). Keeps the flat-fee policy "bill 2xx only" intact
+    /// even though the hard-cap charge bills every admitted request up front. Best-effort, offloaded.
+    /// `now` MUST be the same `charged_at` epoch the admission charge used, so the refund lands in the
+    /// SAME budget window the charge did (the request could straddle a window boundary).
+    pub(crate) fn refund_request(&self, key: &VirtualKey, now: u64) {
+        let window = budget_window(&key.budget_period, now);
+        let fee = self.price_per_request_cents.max(0);
+        let key_id = key.id.clone();
+        self.offload_store_write("budget refund failed", &key.id, move |s| {
+            s.refund_request(&key_id, window, fee)
+        });
     }
 
     /// charge one request (flat per-request cost + token count) to the key's current window.
     /// Best-effort: a store error is logged-and-dropped (telemetry must not break serving). The
     /// SQLite write is offloaded to the blocking pool so it never stalls the async executor; the
     /// in-memory TPM counter is updated inline.
+    // Retained ONLY for direct-call governance tests (production charges via the atomic UPSERT), so
+    // `#[cfg(test)]` — compiled out of the release binary — rather than a dead-code allow.
+    #[cfg(test)]
     pub(crate) fn record_request(&self, key: &VirtualKey, now: u64, tokens: u64) {
         let window = budget_window(&key.budget_period, now);
         let key_id = key.id.clone();
@@ -516,8 +746,8 @@ impl GovState {
         // zero and defeating the budget cap (`is_over_budget` compares `spend_cents >= limit`).
         let fee = self.price_per_request_cents.max(0);
         // count_request = true: this is the once-per-request accounting call.
-        self.offload_store_write("usage record failed", &key.id, move |store| {
-            store.add_usage(&key_id, window, fee, tokens, true)
+        self.offload_store_write("usage record failed", &key.id, move |s| {
+            s.add_usage(&key_id, window, fee, tokens, true)
         });
         // Feed the rate window's TPM counter. `add_rate_tokens` is UPDATE-only, so this is a no-op for
         // an uncapped key (which has no entry — `check_rate` early-returns and never creates one for
@@ -536,10 +766,59 @@ impl GovState {
             .collect())
     }
 
+    /// Build the AccessKeyId → resolved-credential index from the durable `aws_credentials` table,
+    /// joined against the already-loaded `by_hash` snapshot (which holds the live `VirtualKey` rows).
+    /// A credential whose owning key is missing from `by_hash` (e.g. the key row was deleted but a
+    /// credential row lingered) is SKIPPED — it can never authenticate, since there is no key to attach
+    /// a `GovCtx` for. `access_key_id` is the PRIMARY KEY of `aws_credentials`, so entries are unique.
+    fn load_by_access_key_id(
+        store: &dyn Store,
+        by_hash: &HashMap<String, VirtualKey>,
+    ) -> StoreResult<HashMap<String, AwsKeyEntry>> {
+        // Index the live keys by id for the join (by_hash is keyed by key_hash, not id).
+        let by_id: HashMap<&str, &VirtualKey> =
+            by_hash.values().map(|k| (k.id.as_str(), k)).collect();
+        let mut map = HashMap::new();
+        for cred in store.list_aws_credentials()? {
+            if let Some(key) = by_id.get(cred.key_id.as_str()) {
+                map.insert(
+                    cred.access_key_id.clone(),
+                    AwsKeyEntry {
+                        key: (*key).clone(),
+                        secret_access_key: cred.secret_access_key,
+                    },
+                );
+            }
+        }
+        Ok(map)
+    }
+
     /// Resolve a presented secret to its virtual key (cache lookup; secret hashed, never compared raw).
     pub(crate) fn lookup(&self, secret: &str) -> Option<VirtualKey> {
         let hash = crate::sigv4::sha256_hex(secret.as_bytes());
-        self.by_hash_read().get(&hash).cloned()
+        self.caches_read().by_hash.get(&hash).cloned()
+    }
+
+    /// Resolve an inbound SigV4 AccessKeyId (parsed in plaintext from the `Credential=` field of the
+    /// `Authorization` header) to the owning virtual key plus its secret access key. Used ONLY by the
+    /// Bedrock-ingress SigV4 verify path. Returns `None` for an unknown AccessKeyId — the verify path
+    /// is written so an unknown AccessKeyId and a bad signature reject indistinguishably (no
+    /// enumeration oracle): on the `None` branch the caller still runs a constant-time signature
+    /// comparison against a dummy secret before rejecting.
+    pub(crate) fn lookup_by_access_key_id(&self, access_key_id: &str) -> Option<AwsKeyEntry> {
+        self.caches_read()
+            .by_access_key_id
+            .get(access_key_id)
+            .cloned()
+    }
+
+    /// Rate-limit headroom for the key presenting `secret` (routing `usage` signal). `None` when the
+    /// secret resolves to no key OR the key has no RPM/TPM limit. A thin convenience over
+    /// `lookup` + `rate_headroom` for the routing seam, which holds the caller token but not the key.
+    /// Consumed by `forward.rs::decide_policy_order` to compute each lane's `usage` routing signal.
+    pub(crate) fn rate_headroom_for_token(&self, secret: &str, now: u64) -> Option<f64> {
+        let key = self.lookup(secret)?;
+        self.rate_headroom(&key, now)
     }
 
     /// Direct handle to the backing store, for tests that seed/inspect persistence.
@@ -548,10 +827,19 @@ impl GovState {
         self.store.clone()
     }
 
-    /// Reload the cache from the store (after a management-API mutation,).
+    /// Reload BOTH caches (the hashed-secret index and the AWS AccessKeyId index) from the store
+    /// after a management-API mutation. Rebuild `by_access_key_id` from the SAME fresh snapshot so the
+    /// two indices can never drift (a key disabled/deleted/re-minted is reflected in both).
     pub(crate) fn refresh(&self) -> StoreResult<()> {
         let fresh = Self::load(self.store.as_ref())?;
-        *self.by_hash_write() = fresh;
+        let fresh_akid = Self::load_by_access_key_id(self.store.as_ref(), &fresh)?;
+        // LOW-1 (fixed): both indices live under the single `caches` lock, so the swap below is ONE
+        // atomic critical section — a concurrent reader holding `caches_read` sees either the entire
+        // old pair or the entire new pair, never a new `by_hash` against a stale `by_access_key_id`
+        // (or vice versa). There is no longer a transient cross-index inconsistency window.
+        let mut c = self.caches_write();
+        c.by_hash = fresh;
+        c.by_access_key_id = fresh_akid;
         Ok(())
     }
 }
@@ -560,7 +848,7 @@ impl GovState {
 /// when governance is disabled (so downstream enforcement is a no-op).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GovCtx {
-    pub key: Option<VirtualKey>,
+    pub(crate) key: Option<VirtualKey>,
 }
 
 /// Generate a virtual-key secret from 16 bytes of the OS CSPRNG (portable across Unix/Windows via
@@ -575,6 +863,58 @@ fn generate_secret() -> String {
     format!("sk-bb-{}", hex::encode(buf))
 }
 
+/// Generate an AWS-style AccessKeyId: the literal `AKIA` prefix (matching the real long-term-key
+/// shape an AWS SDK expects and validates) followed by 16 chars from the AWS access-key alphabet
+/// (uppercase A-Z + 2-7, the base32 set AWS uses). The AccessKeyId is NOT secret — it travels in
+/// plaintext in the SigV4 `Authorization` header and is the public lookup handle — but it is minted
+/// from the OS CSPRNG so it is unguessable and collision-resistant. Fails closed (panics the mint
+/// request only, never the server) if the OS exposes no entropy, mirroring `generate_secret`.
+fn generate_aws_access_key_id() -> String {
+    // AWS access-key alphabet: 32 symbols (A-Z, 2-7). 16 symbols → 80 bits of entropy.
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).expect(
+        "OS CSPRNG (getrandom) unavailable — refusing to mint a guessable AWS access key id",
+    );
+    let mut s = String::with_capacity(20);
+    s.push_str("AKIA");
+    for &b in &buf {
+        // Map each byte into the 32-symbol alphabet. `& 0x1f` is always in 0..=31, so the index can
+        // never go out of bounds (no panic on the mint path).
+        s.push(ALPHABET[(b & 0x1f) as usize] as char);
+    }
+    s
+}
+
+/// Generate an AWS-style secret access key: 40 chars from a base64-like alphabet (matching the shape
+/// real AWS secret keys take), sourced from 30 bytes of the OS CSPRNG (240 bits, encoded). This is
+/// the SYMMETRIC SigV4 signing secret — stored in plaintext (HMAC verification needs the same value
+/// the client signs with) and shown to the operator exactly once at mint. Fails closed on no entropy.
+fn generate_aws_secret_access_key() -> String {
+    // Base64-url-safe-ish alphabet without padding: A-Z a-z 0-9 + /. 64 symbols → 6 bits each.
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    // 40 chars * 6 bits = 240 bits = 30 bytes of entropy; draw the 30 bytes and emit 40 symbols.
+    let mut buf = [0u8; 30];
+    getrandom::getrandom(&mut buf).expect(
+        "OS CSPRNG (getrandom) unavailable — refusing to mint a guessable AWS secret access key",
+    );
+    // Pack the 240 bits and slice them into 40 six-bit groups. A running bit accumulator avoids any
+    // dependency on a base64 crate and keeps the mapping panic-free (every index is `& 0x3f`).
+    let mut out = String::with_capacity(40);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &b in &buf {
+        acc = (acc << 8) | b as u32;
+        bits += 8;
+        while bits >= 6 {
+            bits -= 6;
+            let idx = ((acc >> bits) & 0x3f) as usize;
+            out.push(ALPHABET[idx] as char);
+        }
+    }
+    out
+}
+
 /// Whether `key` may target `pool` (empty allowed_pools = all pools).
 pub(crate) fn pool_allowed(key: &VirtualKey, pool: &str) -> bool {
     key.allowed_pools.is_empty() || key.allowed_pools.iter().any(|p| p == pool)
@@ -584,11 +924,11 @@ pub(crate) fn pool_allowed(key: &VirtualKey, pool: &str) -> bool {
 /// single all-time window (0); "daily" = UTC midnight; "monthly" = UTC first-of-month.
 pub(crate) fn budget_window(period: &str, now: u64) -> u64 {
     match period {
-        "daily" => now / 86_400 * 86_400,
+        "daily" => now / SECS_PER_DAY * SECS_PER_DAY,
         "monthly" => {
-            let days = (now / 86_400) as i64;
+            let days = (now / SECS_PER_DAY) as i64;
             let (y, m, _) = civil_from_days(days);
-            (days_from_civil(y, m, 1) as u64) * 86_400
+            (days_from_civil(y, m, 1) as u64) * SECS_PER_DAY
         }
         "total" => 0, // explicit all-time window (the documented sentinel)
         // An unrecognized period (typo such as `monthlly`, or an unsupported value such as
@@ -634,22 +974,22 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// pools they may use plus their budget/rate-limit policy.
 #[derive(Clone, PartialEq)]
 pub(crate) struct VirtualKey {
-    pub id: String,
+    pub(crate) id: String,
     /// SHA-256 hex of the presented secret (the secret itself is never stored).
-    pub key_hash: String,
-    pub name: String,
+    pub(crate) key_hash: String,
+    pub(crate) name: String,
     /// Pools this key may target; empty = all pools allowed.
-    pub allowed_pools: Vec<String>,
+    pub(crate) allowed_pools: Vec<String>,
     /// Spend cap in cents for the budget period; None = unlimited.
-    pub max_budget_cents: Option<i64>,
+    pub(crate) max_budget_cents: Option<i64>,
     /// "total" | "daily" | "monthly".
-    pub budget_period: String,
+    pub(crate) budget_period: String,
     /// Requests-per-minute cap; None = unlimited.
-    pub rpm_limit: Option<u32>,
+    pub(crate) rpm_limit: Option<u32>,
     /// Tokens-per-minute cap; None = unlimited.
-    pub tpm_limit: Option<u32>,
-    pub enabled: bool,
-    pub created_at: u64,
+    pub(crate) tpm_limit: Option<u32>,
+    pub(crate) enabled: bool,
+    pub(crate) created_at: u64,
 }
 
 // MANUAL Debug that REDACTS `key_hash`. A derived `Debug` would print the SHA-256 of the key's
@@ -683,18 +1023,80 @@ impl std::fmt::Debug for VirtualKey {
     }
 }
 
+/// A durable AWS-style credential row (the `aws_credentials` table), tying an AccessKeyId + secret
+/// access key to a virtual key's id (the MinIO/S3-compatible model). Stored separately from the
+/// `VirtualKey` row so the key's shape is unchanged. The `secret_access_key` is the SYMMETRIC SigV4
+/// signing secret (stored plaintext because HMAC verification needs the same value the client signs
+/// with), so this type carries a manual redacting `Debug`.
+#[derive(Clone, PartialEq)]
+pub(crate) struct AwsCredential {
+    /// The plaintext AccessKeyId carried in the inbound SigV4 `Authorization` header (not secret).
+    pub(crate) access_key_id: String,
+    /// The owning `VirtualKey.id`.
+    pub(crate) key_id: String,
+    /// The symmetric SigV4 secret access key — SECRET-EQUIVALENT (never log it).
+    pub(crate) secret_access_key: String,
+}
+
+// MANUAL Debug that REDACTS `secret_access_key` (the symmetric SigV4 signing secret). A derived Debug
+// would print it verbatim — a credential leak the moment an `AwsCredential` is debug-logged. The
+// AccessKeyId and key_id are NOT secret and are shown for diagnosability; the secret prints presence
+// only, never the value/length (a length is a small oracle).
+impl std::fmt::Debug for AwsCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsCredential")
+            .field("access_key_id", &self.access_key_id)
+            .field("key_id", &self.key_id)
+            .field(
+                "secret_access_key",
+                &if self.secret_access_key.is_empty() {
+                    "<absent>"
+                } else {
+                    "<redacted; present>"
+                },
+            )
+            .finish()
+    }
+}
+
+/// A resolved AWS-credential cache entry: the owning `VirtualKey` plus the secret access key needed to
+/// verify the inbound SigV4 signature. Returned by `GovState::lookup_by_access_key_id`. Carries a
+/// manual redacting `Debug` for the same reason as `AwsCredential` — the secret must never reach a log.
+#[derive(Clone, PartialEq)]
+pub(crate) struct AwsKeyEntry {
+    pub(crate) key: VirtualKey,
+    /// The symmetric SigV4 secret access key — SECRET-EQUIVALENT (never log it).
+    pub(crate) secret_access_key: String,
+}
+
+impl std::fmt::Debug for AwsKeyEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsKeyEntry")
+            .field("key", &self.key)
+            .field(
+                "secret_access_key",
+                &if self.secret_access_key.is_empty() {
+                    "<absent>"
+                } else {
+                    "<redacted; present>"
+                },
+            )
+            .finish()
+    }
+}
+
 /// Accumulated usage for a key within a budget window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Usage {
-    pub spend_cents: i64,
-    pub tokens: u64,
-    pub requests: u64,
+    pub(crate) spend_cents: i64,
+    pub(crate) tokens: u64,
+    pub(crate) requests: u64,
 }
 
 pub(crate) type StoreResult<T> = Result<T, StoreError>;
 
 #[derive(Debug)]
-pub(crate) struct StoreError(pub String);
+pub(crate) struct StoreError(pub(crate) String);
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -710,6 +1112,16 @@ impl From<rusqlite::Error> for StoreError {
 
 /// The durable governance store seam. Swappable: `SqliteStore` today, `PostgresStore`
 /// later behind the same trait.
+///
+/// DUAL FLAVOR (sync + async). The per-request accounting methods come in two flavors: the original
+/// SYNCHRONOUS form (called directly under the governance/admin locks and in tests — e.g. the gated
+/// `EXISTENCE_GATE` compound ops, the batched metrics scrape) and an ASYNC form (`*_async`) used on
+/// the per-request hot path. The per-request offload is now OWNED BY THE BACKEND: each backend
+/// decides how to satisfy the async flavor. The `SqliteStore` impl fulfills it by offloading the
+/// synchronous SQL onto the blocking pool (`spawn_blocking`); a future `PostgresStore` would await a
+/// real async driver natively. The DEFAULT trait impls simply call the matching sync method inline
+/// — correct for lightweight test doubles, where no real offload is needed.
+#[async_trait::async_trait]
 pub(crate) trait Store: Send + Sync + 'static {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()>;
     fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>>;
@@ -733,6 +1145,101 @@ pub(crate) trait Store: Send + Sync + 'static {
         count_request: bool,
     ) -> StoreResult<()>;
     fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage>;
+
+    /// ATOMIC budget check-and-charge (the HARD-cap primitive). In a SINGLE store round-trip, charge
+    /// `cost_cents` (the flat per-request fee) + one request to the key's `window_start` counter IFF
+    /// the post-charge spend stays within `max_cents` (`None` = uncapped → always charges). Returns
+    /// `true` when the charge landed (request admitted), `false` when it would exceed the cap (reject).
+    ///
+    /// This replaces the non-atomic `is_over_budget` (read) + `record_request` (write) pair on the
+    /// admission path: because the check and the charge are one indivisible UPSERT, N concurrent
+    /// requests for the same key can NO LONGER each read "under budget" and all charge — the cap is a
+    /// HARD cap for the flat fee. (Token cost is still reconciled post-response, so a single in-flight
+    /// request's own tokens can push spend marginally over — bounded to ONE request, not N. See the
+    /// call site in `route.rs`.)
+    fn charge_within_budget(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        cost_cents: i64,
+        max_cents: Option<i64>,
+    ) -> StoreResult<bool>;
+
+    /// REFUND a previously-charged flat per-request fee + its request count (fix 2a companion). The
+    /// atomic admission charge bills EVERY admitted request up front (hard cap); a request that then
+    /// produced no usable upstream result (non-2xx) must be refunded so the flat-fee billing policy
+    /// stays "charge successful requests only" — matching the pre-fix behavior where `finish` only
+    /// billed 2xx. Decrements spend by `cost_cents` and requests by one, both floored at 0 so a
+    /// refund can never drive a counter negative. Best-effort (called off the request path).
+    fn refund_request(&self, key_id: &str, window_start: u64, cost_cents: i64) -> StoreResult<()>;
+
+    // ── ASYNC flavor of the per-request accounting methods ───────────────────────────────────────
+    // The per-request offload is owned by the backend (see the trait-level doc). These mirror the
+    // four hot-path accounting methods above; the request path (`GovState`) calls THESE instead of
+    // hand-rolling a `spawn_blocking` around the sync forms. The DEFAULT impl calls the sync method
+    // inline (correct for test doubles); `SqliteStore` overrides each to offload onto the blocking
+    // pool so a slow rusqlite call never stalls a Tokio worker.
+
+    /// Async flavor of [`Store::charge_within_budget`]. Default: calls the sync form inline.
+    async fn charge_within_budget_async(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        cost_cents: i64,
+        max_cents: Option<i64>,
+    ) -> StoreResult<bool> {
+        self.charge_within_budget(key_id, window_start, cost_cents, max_cents)
+    }
+
+    /// Async flavor of [`Store::get_usage`]. Default: calls the sync form inline.
+    // Superseded on the request path by the atomic charge primitive; its only remaining caller is the
+    // test-only `is_over_budget_async`, so `#[cfg(test)]` (compiled out of the release binary) rather
+    // than a dead-code allow — mirrors the `is_over_budget_async` hygiene in the same module.
+    #[cfg(test)]
+    async fn get_usage_async(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
+        self.get_usage(key_id, window_start)
+    }
+
+    /// Persist an AWS-style credential (the MinIO/S3-compatible model) for inbound SigV4 verification.
+    /// UPSERTs on the `access_key_id` PRIMARY KEY. The `secret_access_key` is the symmetric SigV4
+    /// signing secret stored in plaintext (HMAC verification needs the same value the client signs
+    /// with); callers must never log it.
+    ///
+    /// DEFAULTED so the (many) lightweight test-double `Store` impls scattered across the crate need
+    /// not implement the AWS surface — only the real `SqliteStore` does. The default is a no-op-shaped
+    /// error so a misconfigured store that silently dropped a credential cannot pass as success.
+    fn put_aws_credential(&self, _cred: &AwsCredential) -> StoreResult<()> {
+        Err(StoreError(
+            "this Store does not support AWS credentials".to_string(),
+        ))
+    }
+
+    /// ATOMIC key+credential mint. Persist the bearer `VirtualKey` row AND its paired `AwsCredential`
+    /// row together or not at all. Under SQLite autocommit, `put_key` then `put_aws_credential` are two
+    /// independent commits: a storage error (I/O, disk full, constraint) after the first leaves an
+    /// inert key row with no resolvable AccessKeyId — an orphan that `create_key_with_aws` would then
+    /// surface as a failure while the half-written row lingers. A real transactional store overrides
+    /// this to wrap both writes in one `conn.transaction()` (mirroring `delete_key`).
+    ///
+    /// DEFAULT fallback: test-double stores that don't expose a transaction simply do the two writes in
+    /// sequence — they have no durability boundary to violate, and this keeps the (many) lightweight
+    /// `Store` impls from needing to implement the transactional path.
+    fn put_key_with_aws_credential(
+        &self,
+        key: &VirtualKey,
+        cred: &AwsCredential,
+    ) -> StoreResult<()> {
+        self.put_key(key)?;
+        self.put_aws_credential(cred)?;
+        Ok(())
+    }
+
+    /// All AWS credentials (used to rebuild the in-memory AccessKeyId index at boot / on refresh).
+    /// DEFAULTED to an empty list (see `put_aws_credential`): a store with no AWS-credential support
+    /// simply has none to index, so SigV4 ingress is unavailable — never an auth bypass.
+    fn list_aws_credentials(&self) -> StoreResult<Vec<AwsCredential>> {
+        Ok(Vec::new())
+    }
 }
 
 const SCHEMA: &str = "
@@ -748,6 +1255,21 @@ CREATE TABLE IF NOT EXISTS virtual_keys (
     enabled          INTEGER NOT NULL DEFAULT 1,
     created_at       INTEGER NOT NULL
 );
+-- AWS-style credentials for inbound SigV4 verification (the MinIO/S3-compatible model), kept in a
+-- SEPARATE table keyed by the virtual key's id rather than as columns on `virtual_keys`. This keeps
+-- the `VirtualKey` row shape (and every existing construction of it elsewhere) unchanged while still
+-- TYING the credential to the key: `access_key_id` is the plaintext lookup handle carried in the
+-- SigV4 `Authorization` header, and `secret_access_key` is the symmetric signing secret (stored in
+-- plaintext because HMAC verification needs the same value the client signs with). `access_key_id`
+-- is the PRIMARY KEY (a given AccessKeyId resolves to exactly one key); `key_id` carries the FK
+-- relationship to `virtual_keys.id`. Rows are removed when the owning key is deleted (see
+-- `delete_key`), so a revoked key's AWS credential cannot outlive it.
+CREATE TABLE IF NOT EXISTS aws_credentials (
+    access_key_id     TEXT PRIMARY KEY,
+    key_id            TEXT NOT NULL,
+    secret_access_key TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_aws_credentials_key_id ON aws_credentials (key_id);
 CREATE TABLE IF NOT EXISTS usage_counters (
     key_id       TEXT NOT NULL,
     window_start INTEGER NOT NULL,
@@ -761,13 +1283,31 @@ CREATE TABLE IF NOT EXISTS usage_counters (
 /// Embedded SQLite store (the default `Store`). The single `Connection` is mutex-guarded; the
 /// governance surface is low-frequency (key CRUD) or batched (usage), so this is not on the hot path.
 pub(crate) struct SqliteStore {
-    conn: Mutex<Connection>,
+    // `Arc<Mutex<…>>` (not a bare `Mutex`): the async accounting flavor offloads the synchronous SQL
+    // onto the blocking pool, which needs an owned handle to the connection mutex it can move into the
+    // `spawn_blocking` closure. The `Arc` lets each offload clone a cheap shared handle while
+    // `lock_conn()` (and every synchronous method) still locks the SAME single connection — the Arc
+    // derefs to the inner `Mutex`, so serialization across sync and async callers is preserved.
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteStore {
     pub(crate) fn open(path: &str) -> StoreResult<Self> {
+        let conn = Connection::open(path)?;
+        // Harden the on-disk DB against `SQLITE_BUSY` from a second connection or an external tool
+        // (backup/inspection): WAL lets readers and a writer proceed concurrently, and a 5s busy
+        // timeout makes a transient lock contention retry-then-succeed rather than fail instantly.
+        // Skip both for an in-memory path: `:memory:` ignores WAL (no rollback journal file exists)
+        // and has no second connection to contend with, so the pragmas are inapplicable there.
+        if !path.starts_with(":memory:") && !path.contains("mode=memory") {
+            // `journal_mode` returns the resulting mode as a row, so use `pragma_update`/query rather
+            // than `execute` (which rejects a statement that yields rows). `busy_timeout` is a plain
+            // setter and is safe via `execute_batch`.
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)?;
+        }
         let store = Self {
-            conn: Mutex::new(Connection::open(path)?),
+            conn: Arc::new(Mutex::new(conn)),
         };
         store.migrate()?;
         Ok(store)
@@ -777,26 +1317,163 @@ impl SqliteStore {
     #[cfg(test)]
     pub(crate) fn open_in_memory() -> StoreResult<Self> {
         let store = Self {
-            conn: Mutex::new(Connection::open_in_memory()?),
+            conn: Arc::new(Mutex::new(Connection::open_in_memory()?)),
         };
         store.migrate()?;
         Ok(store)
     }
 
     /// Acquire the SQLite connection mutex, recovering from a poisoned lock instead of panicking.
-    /// Mirrors `rate_write`/`by_hash_read`: this lock is reachable from the request path (the budget
-    /// read in `is_over_budget_async` → `get_usage` runs inside `spawn_blocking`), and the project
+    /// Mirrors `rate_write`/`caches_read`: this lock is reachable from the request path (the atomic
+    /// admission charge in `charge_within_budget_async` → `charge_within_budget_inner` runs inside
+    /// `spawn_blocking`), and the project
     /// rule is no panic on the request path. A panic under the connection lock would otherwise poison
     /// it and cascade into a governance-wide outage on every subsequent CRUD/usage call. SQLite's own
     /// state stays consistent across a recovered guard (a panicked statement is rolled back by
     /// rusqlite's Drop), so continuing with `into_inner()` is safe.
     fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|p| p.into_inner())
+        Self::lock_conn_raw(&self.conn)
+    }
+
+    /// Poison-recovering lock of a raw `&Mutex<Connection>` — same rationale as [`Self::lock_conn`],
+    /// but takes the mutex by reference so the shared `*_inner` SQL bodies (called from BOTH the sync
+    /// trait methods, holding `&self.conn`, AND the async offloads, holding a cloned `Arc`) can lock
+    /// it without needing `&self`.
+    fn lock_conn_raw(conn: &Mutex<Connection>) -> std::sync::MutexGuard<'_, Connection> {
+        conn.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     fn migrate(&self) -> StoreResult<()> {
+        // `CREATE TABLE IF NOT EXISTS` for both `virtual_keys` and the new `aws_credentials` table is
+        // idempotent and backward-compatible: an existing on-disk DB keeps its `virtual_keys` rows
+        // untouched and simply gains the `aws_credentials` table (a NEW table, so no `ALTER`/column-add
+        // dance and no risk to existing rows). A bearer-only DB from an older build upgrades cleanly.
         self.lock_conn().execute_batch(SCHEMA)?;
         Ok(())
+    }
+
+    // ── Shared SQL bodies for the dual-flavor accounting methods ─────────────────────────────────
+    // Each `*_inner` holds the EXACT SQL of its accounting method, locking the passed connection
+    // mutex (poison-recovering) so it can run from EITHER the synchronous trait method (`&self.conn`)
+    // OR an async offload (a cloned `Arc<Mutex<Connection>>` moved into a `spawn_blocking` closure).
+    // No `&self`, so the offload closure need not borrow the store. The SQL is byte-for-byte the
+    // original — sync and async share one body, so they can never drift.
+
+    fn add_usage_inner(
+        conn: &Mutex<Connection>,
+        key_id: &str,
+        window_start: u64,
+        spend_cents: i64,
+        tokens: u64,
+        count_request: bool,
+    ) -> StoreResult<()> {
+        let req_delta = i64::from(count_request);
+        let conn = Self::lock_conn_raw(conn);
+        conn.execute(
+            "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(key_id, window_start) DO UPDATE SET
+                spend_cents = spend_cents + excluded.spend_cents,
+                tokens      = tokens + excluded.tokens,
+                requests    = requests + excluded.requests",
+            params![
+                key_id,
+                window_start as i64,
+                spend_cents,
+                i64::try_from(tokens).unwrap_or(i64::MAX),
+                req_delta
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn charge_within_budget_inner(
+        conn: &Mutex<Connection>,
+        key_id: &str,
+        window_start: u64,
+        cost_cents: i64,
+        max_cents: Option<i64>,
+    ) -> StoreResult<bool> {
+        // First-request-in-window guard: if the row does not yet exist the UPSERT's INSERT branch
+        // fires unconditionally (a `WHERE` clause only guards the DO UPDATE branch), so a flat fee
+        // that ALONE exceeds the cap would slip in. Reject it up front — a single request costing
+        // more than the whole budget can never be admitted. (cost_cents is clamped >= 0 by the
+        // caller; max_cents None means uncapped.)
+        if let Some(max) = max_cents {
+            if cost_cents > max {
+                return Ok(false);
+            }
+        }
+        let conn = Self::lock_conn_raw(conn);
+        // ONE atomic UPSERT: insert the first request in the window (always within cap given the
+        // guard above), or accumulate onto an existing row ONLY IF the post-charge spend stays within
+        // `max_cents`. `RETURNING` yields a row exactly when the charge landed; zero rows ⇒ the
+        // conditional DO UPDATE's WHERE failed ⇒ over budget ⇒ reject. SQLite evaluates the bare
+        // column names in the WHERE against the EXISTING row (pre-update), so `spend_cents + :cost`
+        // is the prospective post-charge total. `:max IS NULL` (uncapped) short-circuits to always-charge.
+        // OVERFLOW SAFETY: SQLite arithmetic does NOT wrap on i64 overflow — it promotes the result to
+        // REAL (floating point). So if `spend_cents` were ever near i64::MAX, `spend_cents + :cost`
+        // becomes a large REAL (~9.2e18) which fails `<= :max` and the charge is correctly REJECTED —
+        // there is no C-style negative-wrap that could sneak a charge past the cap. (Verified empirically.)
+        let charged: Option<i64> = conn
+            .query_row(
+                "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
+                 VALUES (?1, ?2, ?3, 0, 1)
+                 ON CONFLICT(key_id, window_start) DO UPDATE SET
+                     spend_cents = spend_cents + ?3,
+                     requests    = requests + 1
+                   WHERE ?4 IS NULL OR spend_cents + ?3 <= ?4
+                 RETURNING spend_cents",
+                params![key_id, window_start as i64, cost_cents, max_cents],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(charged.is_some())
+    }
+
+    fn refund_request_inner(
+        conn: &Mutex<Connection>,
+        key_id: &str,
+        window_start: u64,
+        cost_cents: i64,
+    ) -> StoreResult<()> {
+        let conn = Self::lock_conn_raw(conn);
+        // Reverse exactly one atomic charge: subtract the flat fee from spend and one from requests,
+        // each floored at 0 (MAX(0, …)) so a refund can never push a counter negative even if windows
+        // or rows were reset between charge and refund. UPDATE-only: if the row is gone there is
+        // nothing to refund (a no-op, not an error).
+        conn.execute(
+            "UPDATE usage_counters SET
+                 spend_cents = MAX(0, spend_cents - ?3),
+                 requests    = MAX(0, requests - 1)
+             WHERE key_id = ?1 AND window_start = ?2",
+            params![key_id, window_start as i64, cost_cents],
+        )?;
+        Ok(())
+    }
+
+    fn get_usage_inner(
+        conn: &Mutex<Connection>,
+        key_id: &str,
+        window_start: u64,
+    ) -> StoreResult<Usage> {
+        let conn = Self::lock_conn_raw(conn);
+        let row = conn
+            .query_row(
+                "SELECT spend_cents, tokens, requests FROM usage_counters WHERE key_id=?1 AND window_start=?2",
+                params![key_id, window_start as i64],
+                |r| {
+                    Ok(Usage {
+                        spend_cents: r.get(0)?,
+                        // DI-3: clamp a (corrupt / direct-DB) negative stored counter to 0 instead
+                        // of wrapping a negative i64 to a huge u64 via `as`.
+                        tokens: r.get::<_, i64>(1)?.max(0) as u64,
+                        requests: r.get::<_, i64>(2)?.max(0) as u64,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row.unwrap_or_default())
     }
 }
 
@@ -831,31 +1508,52 @@ fn pools_from_storage(stored: &str) -> Vec<String> {
     trimmed.split(',').map(String::from).collect()
 }
 
-impl Store for SqliteStore {
-    fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
-        let conn = self.lock_conn();
-        conn.execute(
-            "INSERT INTO virtual_keys
+// Shared SQL bodies for the key/credential UPSERTs, so the autocommit single-statement methods
+// (`put_key`, `put_aws_credential`) and the transactional mint (`put_key_with_aws_credential`) hold
+// the SQL EXACTLY ONCE and can never drift. `rusqlite::Transaction` derefs to `Connection`, so a
+// `&tx` coerces to `&Connection` here — the same body runs whether `conn` is a plain connection
+// guard or a transaction. The SQL is byte-for-byte the original inline statements.
+
+fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO virtual_keys
                 (id, key_hash, name, allowed_pools, max_budget_cents, budget_period, rpm_limit, tpm_limit, enabled, created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
              ON CONFLICT(id) DO UPDATE SET
                 key_hash=excluded.key_hash, name=excluded.name, allowed_pools=excluded.allowed_pools,
                 max_budget_cents=excluded.max_budget_cents, budget_period=excluded.budget_period,
                 rpm_limit=excluded.rpm_limit, tpm_limit=excluded.tpm_limit, enabled=excluded.enabled",
-            params![
-                key.id,
-                key.key_hash,
-                key.name,
-                pools_to_storage(&key.allowed_pools),
-                key.max_budget_cents,
-                key.budget_period,
-                key.rpm_limit,
-                key.tpm_limit,
-                key.enabled as i64,
-                key.created_at as i64,
-            ],
-        )?;
-        Ok(())
+        params![
+            key.id,
+            key.key_hash,
+            key.name,
+            pools_to_storage(&key.allowed_pools),
+            key.max_budget_cents,
+            key.budget_period,
+            key.rpm_limit,
+            key.tpm_limit,
+            key.enabled as i64,
+            key.created_at as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+fn put_aws_credential_inner(conn: &rusqlite::Connection, cred: &AwsCredential) -> StoreResult<()> {
+    conn.execute(
+        "INSERT INTO aws_credentials (access_key_id, key_id, secret_access_key)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(access_key_id) DO UPDATE SET
+                key_id=excluded.key_id, secret_access_key=excluded.secret_access_key",
+        params![cred.access_key_id, cred.key_id, cred.secret_access_key],
+    )?;
+    Ok(())
+}
+
+#[async_trait::async_trait]
+impl Store for SqliteStore {
+    fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
+        put_key_inner(&self.lock_conn(), key)
     }
 
     fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>> {
@@ -910,8 +1608,57 @@ impl Store for SqliteStore {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM virtual_keys WHERE id=?1", params![id])?;
         tx.execute("DELETE FROM usage_counters WHERE key_id=?1", params![id])?;
+        // Remove any AWS credential rows tied to this key in the SAME transaction: a revoked key's
+        // SigV4 credential must NOT outlive the key, or a Bedrock-SDK client signing with that
+        // AccessKeyId could keep authenticating after revocation (an auth-bypass). The in-memory
+        // AccessKeyId index is rebuilt on the post-delete `refresh`, and even before that rebuild the
+        // index already skips a credential whose key row is gone (see `load_by_access_key_id`), so the
+        // revocation is effective immediately and durably.
+        tx.execute("DELETE FROM aws_credentials WHERE key_id=?1", params![id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    fn put_aws_credential(&self, cred: &AwsCredential) -> StoreResult<()> {
+        put_aws_credential_inner(&self.lock_conn(), cred)
+    }
+
+    fn put_key_with_aws_credential(
+        &self,
+        key: &VirtualKey,
+        cred: &AwsCredential,
+    ) -> StoreResult<()> {
+        // ATOMIC mint: the bearer-key INSERT and its AWS-credential INSERT commit together or not at
+        // all. Under autocommit a failure of the second statement would orphan the just-written key row
+        // (inert: no resolvable AccessKeyId). Wrap both in one transaction — same pattern as
+        // `delete_key`. The connection Mutex already serializes us against any other writer, so the
+        // transaction cannot deadlock against a concurrent busbar caller.
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        // `&tx` coerces to `&Connection` via `Transaction`'s Deref, so both writes share the exact same
+        // SQL bodies as the autocommit `put_key`/`put_aws_credential` — they can never drift.
+        put_key_inner(&tx, key)?;
+        put_aws_credential_inner(&tx, cred)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn list_aws_credentials(&self) -> StoreResult<Vec<AwsCredential>> {
+        let conn = self.lock_conn();
+        let mut stmt =
+            conn.prepare("SELECT access_key_id, key_id, secret_access_key FROM aws_credentials")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(AwsCredential {
+                access_key_id: r.get(0)?,
+                key_id: r.get(1)?,
+                secret_access_key: r.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     fn add_usage(
@@ -922,42 +1669,97 @@ impl Store for SqliteStore {
         tokens: u64,
         count_request: bool,
     ) -> StoreResult<()> {
-        let req_delta = i64::from(count_request);
-        let conn = self.lock_conn();
-        conn.execute(
-            "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
-             VALUES (?1,?2,?3,?4,?5)
-             ON CONFLICT(key_id, window_start) DO UPDATE SET
-                spend_cents = spend_cents + excluded.spend_cents,
-                tokens      = tokens + excluded.tokens,
-                requests    = requests + excluded.requests",
-            params![
-                key_id,
-                window_start as i64,
-                spend_cents,
-                i64::try_from(tokens).unwrap_or(i64::MAX),
-                req_delta
-            ],
-        )?;
-        Ok(())
+        Self::add_usage_inner(
+            &self.conn,
+            key_id,
+            window_start,
+            spend_cents,
+            tokens,
+            count_request,
+        )
+    }
+
+    fn charge_within_budget(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        cost_cents: i64,
+        max_cents: Option<i64>,
+    ) -> StoreResult<bool> {
+        Self::charge_within_budget_inner(&self.conn, key_id, window_start, cost_cents, max_cents)
+    }
+
+    fn refund_request(&self, key_id: &str, window_start: u64, cost_cents: i64) -> StoreResult<()> {
+        Self::refund_request_inner(&self.conn, key_id, window_start, cost_cents)
     }
 
     fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
-        let conn = self.lock_conn();
-        let row = conn
-            .query_row(
-                "SELECT spend_cents, tokens, requests FROM usage_counters WHERE key_id=?1 AND window_start=?2",
-                params![key_id, window_start as i64],
-                |r| {
-                    Ok(Usage {
-                        spend_cents: r.get(0)?,
-                        tokens: r.get::<_, i64>(1)? as u64,
-                        requests: r.get::<_, i64>(2)? as u64,
-                    })
-                },
-            )
-            .optional()?;
-        Ok(row.unwrap_or_default())
+        Self::get_usage_inner(&self.conn, key_id, window_start)
+    }
+
+    // ── ASYNC flavor overrides — the per-request offload, now OWNED BY THIS BACKEND ──────────────
+    // Each offloads the synchronous `*_inner` SQL onto the Tokio blocking pool (`spawn_blocking`) so
+    // a slow rusqlite call — fsync / WAL checkpoint / lock contention — never stalls a Tokio worker.
+    // This is where the per-request offload now LIVES (relocated out of `GovState`'s hand-rolled
+    // `spawn_blocking`s). Args are owned into the `'static` closure; the connection handle is a cheap
+    // `Arc` clone of the SAME mutex the sync path locks (so sync and async serialize on one DB). A
+    // panic inside the blocking closure is re-raised faithfully via `resume_unwind`; a non-panic join
+    // failure (the blocking pool shut down mid-flight) maps to the crate's `StoreError` convention.
+
+    async fn charge_within_budget_async(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        cost_cents: i64,
+        max_cents: Option<i64>,
+    ) -> StoreResult<bool> {
+        // No runtime (unit tests calling the accounting methods directly): run the SQL inline so
+        // behaviour is observable synchronously — `spawn_blocking` requires a Tokio reactor.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Self::charge_within_budget_inner(
+                &self.conn,
+                key_id,
+                window_start,
+                cost_cents,
+                max_cents,
+            );
+        }
+        let conn = self.conn.clone();
+        let key_id = key_id.to_owned();
+        join_offload(tokio::task::spawn_blocking(move || {
+            Self::charge_within_budget_inner(&conn, &key_id, window_start, cost_cents, max_cents)
+        }))
+        .await
+    }
+
+    #[cfg(test)]
+    async fn get_usage_async(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Self::get_usage_inner(&self.conn, key_id, window_start);
+        }
+        let conn = self.conn.clone();
+        let key_id = key_id.to_owned();
+        join_offload(tokio::task::spawn_blocking(move || {
+            Self::get_usage_inner(&conn, &key_id, window_start)
+        }))
+        .await
+    }
+}
+
+/// Await a `spawn_blocking` handle wrapping a `StoreResult`, flattening the `JoinError`.
+///
+/// On a PANIC inside the blocking closure, re-raise it faithfully (`resume_unwind`) so a bug in the
+/// SQL body surfaces identically to a direct call rather than being silently swallowed into a generic
+/// store error. A NON-panic join failure (the blocking pool was shut down mid-flight, e.g. on
+/// runtime teardown) is mapped to the crate's `StoreError` convention so the caller's fail-open /
+/// fail-closed knob applies, exactly as the old `GovState` offload did.
+async fn join_offload<T>(
+    handle: tokio::task::JoinHandle<StoreResult<T>>,
+) -> StoreResult<T> {
+    match handle.await {
+        Ok(res) => res,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => Err(StoreError(format!("store offload task failed: {e}"))),
     }
 }
 
@@ -969,8 +1771,15 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
         allowed_pools: pools_from_storage(&r.get::<_, String>(3)?),
         max_budget_cents: r.get(4)?,
         budget_period: r.get(5)?,
-        rpm_limit: r.get::<_, Option<i64>>(6)?.map(|v| v as u32),
-        tpm_limit: r.get::<_, Option<i64>>(7)?.map(|v| v as u32),
+        // DI-2: a direct-DB value above u32::MAX would silently wrap to a WRONG (lower) cap with
+        // `as u32`. Saturate instead — the admin API already bounds these on the write path; this
+        // closes the direct-DB hole.
+        rpm_limit: r
+            .get::<_, Option<i64>>(6)?
+            .map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
+        tpm_limit: r
+            .get::<_, Option<i64>>(7)?
+            .map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
         enabled: r.get::<_, i64>(8)? != 0,
         created_at: r.get::<_, i64>(9)? as u64,
     })
@@ -1017,6 +1826,359 @@ mod tests {
 
         s.delete_key("k1").unwrap();
         assert_eq!(s.get_key("k1").unwrap(), None);
+    }
+
+    /// fix 2a: the atomic check-and-charge is a HARD cap. A budget of 100c with a 30c flat fee admits
+    /// exactly 3 requests (90c); the 4th would reach 120c > 100c and is REJECTED atomically. The first
+    /// request in a window inserts; subsequent ones take the conditional UPSERT path.
+    #[test]
+    fn test_charge_within_budget_is_a_hard_cap() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let w = 0u64;
+        // 3 charges fit (30, 60, 90), the 4th (would be 120) is rejected.
+        assert!(
+            s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
+            "1st 30c admitted"
+        );
+        assert!(
+            s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
+            "2nd 60c admitted"
+        );
+        assert!(
+            s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
+            "3rd 90c admitted"
+        );
+        assert!(
+            !s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
+            "4th 120c REJECTED"
+        );
+        // The rejected charge did NOT mutate spend — it stays at 90.
+        assert_eq!(
+            s.get_usage("k", w).unwrap().spend_cents,
+            90,
+            "rejected charge must not bill"
+        );
+        assert_eq!(
+            s.get_usage("k", w).unwrap().requests,
+            3,
+            "only admitted requests counted"
+        );
+    }
+
+    /// fix 2a: a single request whose flat fee ALONE exceeds the cap is rejected even as the FIRST
+    /// request in the window (the INSERT-branch guard), and an UNCAPPED key always charges.
+    #[test]
+    fn test_charge_within_budget_first_request_and_uncapped() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        // First-request fee > cap → rejected, no row created.
+        assert!(!s.charge_within_budget("big", 0, 200, Some(100)).unwrap());
+        assert_eq!(
+            s.get_usage("big", 0).unwrap().requests,
+            0,
+            "rejected first request creates no charge"
+        );
+        // Uncapped (None) always charges.
+        assert!(s.charge_within_budget("free", 0, 999_999, None).unwrap());
+        assert_eq!(s.get_usage("free", 0).unwrap().spend_cents, 999_999);
+    }
+
+    /// fix 2a (the headline): CONCURRENT atomic charges cannot overshoot the cap. 50 tasks each try to
+    /// charge 30c against a 100c cap on ONE shared store; exactly 3 may succeed (90c), the rest are
+    /// rejected, and final spend is EXACTLY 90 — never the N×30 overshoot the old non-atomic
+    /// read-then-charge allowed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_concurrent_charges_cannot_overshoot_cap() {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let s = store.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                s.charge_within_budget("k", 0, 30, Some(100)).unwrap()
+            }));
+        }
+        let mut admitted = 0u32;
+        for h in handles {
+            if h.await.unwrap() {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, 3,
+            "exactly 3 of 50 concurrent charges fit under a 100c/30c cap"
+        );
+        assert_eq!(
+            store.get_usage("k", 0).unwrap().spend_cents,
+            90,
+            "final spend must be EXACTLY 90 — no concurrency overshoot (the hard-cap guarantee)"
+        );
+    }
+
+    /// H1: CONCURRENCY through the REAL admission wrapper. Unlike
+    /// `test_concurrent_charges_cannot_overshoot_cap` (which hits `Store::charge_within_budget`
+    /// directly and bypasses the `spawn_blocking` offload), this fires N concurrent tasks through
+    /// `GovState::try_charge_request_within_budget` on a SHARED `Arc<GovState>` — the exact async
+    /// admission entrypoint the route path calls. With a 1c flat fee and a 5c cap, exactly 5 of 20
+    /// concurrent admissions may land and final spend must be EXACTLY 5 (cap-respecting, no overshoot).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_govstate_admission_respects_cap() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store.clone(), 1, 0, None).unwrap()); // 1c flat fee
+        let (key, _s) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(5), // 5c cap → at most 5 one-cent admissions
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .unwrap();
+        let at = 1_700_000_000u64;
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let gov = gov.clone();
+            let key = key.clone();
+            handles.push(tokio::spawn(async move {
+                gov.try_charge_request_within_budget(&key, at).await.unwrap()
+            }));
+        }
+        let mut admitted = 0u32;
+        for h in handles {
+            if h.await.unwrap() {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, 5,
+            "exactly 5 of 20 concurrent GovState admissions fit under a 5c/1c cap"
+        );
+        assert_eq!(
+            store.get_usage(&key.id, 0).unwrap().spend_cents,
+            5,
+            "final spend must be EXACTLY 5 — the async admission path holds the hard cap, no overshoot"
+        );
+    }
+
+    /// H2: the charge → refund → re-admit money cycle through `GovState`. Charge a key to its cap so the
+    /// next request is rejected; `refund_request` (fire-and-forget `offload_store_write`) reverses one
+    /// charge; after draining the blocking write a new request is admitted again. Proves a refunded fee
+    /// genuinely frees budget on the live admission path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_charge_refund_readmit_cycle() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store.clone(), 1, 0, None).unwrap()); // 1c flat fee
+        let (key, _s) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(1), // 1c cap → exactly one request fits
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .unwrap();
+        let at = 1_700_000_000u64;
+        // Charge to the cap.
+        assert!(
+            gov.try_charge_request_within_budget(&key, at)
+                .await
+                .unwrap(),
+            "1st (1c) admitted, spends the whole 1c cap"
+        );
+        // At cap → next request rejected.
+        assert!(
+            !gov.try_charge_request_within_budget(&key, at)
+                .await
+                .unwrap(),
+            "2nd rejected: budget is exhausted at the cap"
+        );
+        // Refund the charge (fire-and-forget offloaded write), then drain the blocking pool.
+        gov.refund_request(&key, at);
+        let mut spend = i64::MAX;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            spend = store.get_usage(&key.id, 0).unwrap().spend_cents;
+            if spend == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(spend, 0, "refund must reverse the charge back to 0 spend");
+        // Budget is free again → a new request is re-admitted.
+        assert!(
+            gov.try_charge_request_within_budget(&key, at)
+                .await
+                .unwrap(),
+            "post-refund request re-admitted: the refunded fee freed the budget"
+        );
+    }
+
+    /// M9: cap BOUNDARY semantics through `Store::charge_within_budget` (the admission primitive).
+    /// (a) a FIRST request whose `cost_cents == max_cents` must ADMIT (post-charge spend equals, not
+    /// exceeds, the cap). (b) a window PRE-SEEDED with `spend_cents >= max_cents` must REJECT the next
+    /// charge. These pin the `>`-vs-`>=` boundary the hard cap turns on.
+    #[test]
+    fn test_charge_within_budget_cap_boundaries() {
+        // (a) cost == cap on a fresh window → admit.
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(
+            s.charge_within_budget("k", 0, 100, Some(100)).unwrap(),
+            "first request with cost_cents == max_cents must admit (spend lands exactly at the cap)"
+        );
+        assert_eq!(s.get_usage("k", 0).unwrap().spend_cents, 100);
+        // A further charge now that spend == cap must reject.
+        assert!(
+            !s.charge_within_budget("k", 0, 1, Some(100)).unwrap(),
+            "once spend == cap, any further charge is rejected"
+        );
+
+        // (b) window pre-seeded at/above the cap → reject the next charge outright.
+        let s2 = SqliteStore::open_in_memory().unwrap();
+        // Seed spend >= max via an uncapped accounting write, then probe with a capped charge.
+        s2.add_usage("k2", 0, 250, 0, true).unwrap();
+        assert!(
+            !s2.charge_within_budget("k2", 0, 1, Some(200)).unwrap(),
+            "a window pre-seeded with spend_cents >= max_cents must reject"
+        );
+        assert_eq!(
+            s2.get_usage("k2", 0).unwrap().spend_cents,
+            250,
+            "the rejected charge must not mutate spend"
+        );
+    }
+
+    /// fix 2a wrapper: `try_charge_request_within_budget` charges the flat fee and rejects atomically
+    /// at the cap. 1c/request flat fee, 2c cap → 2 admitted, 3rd rejected.
+    #[tokio::test]
+    async fn test_try_charge_request_within_budget_rejects_at_cap() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 1, 0, None).unwrap(); // 1c flat fee
+        let (key, _s) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(2),
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .unwrap();
+        let at = 1_700_000_000u64;
+        assert!(
+            gov.try_charge_request_within_budget(&key, at)
+                .await
+                .unwrap(),
+            "1st (1c) admitted"
+        );
+        assert!(
+            gov.try_charge_request_within_budget(&key, at)
+                .await
+                .unwrap(),
+            "2nd (2c) admitted"
+        );
+        assert!(
+            !gov.try_charge_request_within_budget(&key, at)
+                .await
+                .unwrap(),
+            "3rd (would be 3c > 2c cap) rejected atomically"
+        );
+    }
+
+    /// fix 2a companion: `refund_request` reverses exactly one flat charge, floored at 0 (a refund
+    /// can never drive a counter negative).
+    #[test]
+    fn test_refund_request_reverses_charge_floored_at_zero() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(s.charge_within_budget("k", 0, 30, Some(1000)).unwrap());
+        assert!(s.charge_within_budget("k", 0, 30, Some(1000)).unwrap());
+        assert_eq!(s.get_usage("k", 0).unwrap().spend_cents, 60);
+        assert_eq!(s.get_usage("k", 0).unwrap().requests, 2);
+        s.refund_request("k", 0, 30).unwrap();
+        assert_eq!(
+            s.get_usage("k", 0).unwrap().spend_cents,
+            30,
+            "one refund reverses one charge"
+        );
+        assert_eq!(s.get_usage("k", 0).unwrap().requests, 1);
+        // Over-refunding floors at 0, never negative.
+        s.refund_request("k", 0, 30).unwrap();
+        s.refund_request("k", 0, 30).unwrap();
+        assert_eq!(
+            s.get_usage("k", 0).unwrap().spend_cents,
+            0,
+            "refund floors spend at 0"
+        );
+        assert_eq!(
+            s.get_usage("k", 0).unwrap().requests,
+            0,
+            "refund floors requests at 0"
+        );
+    }
+
+    /// DI-2: a direct-DB `rpm_limit`/`tpm_limit` above `u32::MAX` must SATURATE to `u32::MAX` on read,
+    /// not wrap to a wrong (lower) cap via `as u32`. The admin API bounds these on write; this covers
+    /// the direct-DB hole.
+    #[test]
+    fn test_rpm_tpm_above_u32max_saturate_on_read() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        // Seed a key the normal way to satisfy NOT NULL / schema, then poke oversized limits directly.
+        let k = sample_key("kbig", "hashBIG");
+        s.put_key(&k).unwrap();
+        let huge: i64 = i64::from(u32::MAX) + 1_000; // > u32::MAX, fits i64
+        {
+            let conn = s.lock_conn();
+            conn.execute(
+                "UPDATE virtual_keys SET rpm_limit=?1, tpm_limit=?2 WHERE id='kbig'",
+                params![huge, huge],
+            )
+            .unwrap();
+        }
+        let got = s.get_key("kbig").unwrap().unwrap();
+        assert_eq!(
+            got.rpm_limit,
+            Some(u32::MAX),
+            "an oversized rpm_limit must saturate, not wrap"
+        );
+        assert_eq!(
+            got.tpm_limit,
+            Some(u32::MAX),
+            "an oversized tpm_limit must saturate, not wrap"
+        );
+    }
+
+    /// DI-3: a direct-DB NEGATIVE stored token/request counter must clamp to 0 on read, not wrap to a
+    /// huge u64 via `as u64`.
+    #[test]
+    fn test_negative_usage_counters_clamp_to_zero_on_read() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let window_start: i64 = 1_700_000_000;
+        {
+            let conn = s.lock_conn();
+            conn.execute(
+                "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
+                 VALUES ('kneg', ?1, 0, -5, -3)",
+                params![window_start],
+            )
+            .unwrap();
+        }
+        let u = s.get_usage("kneg", window_start as u64).unwrap();
+        assert_eq!(
+            u.tokens, 0,
+            "a negative stored token counter must clamp to 0"
+        );
+        assert_eq!(
+            u.requests, 0,
+            "a negative stored request counter must clamp to 0"
+        );
     }
 
     #[test]
@@ -1102,6 +2264,198 @@ mod tests {
     }
 
     #[test]
+    fn test_create_key_with_aws_issues_and_resolves_credential() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 0, 0, None).unwrap();
+        let (key, _bearer, akid, secret) = gov
+            .create_key_with_aws(
+                NewKeySpec {
+                    name: "bedrock-key".to_string(),
+                    allowed_pools: vec!["prod".to_string()],
+                    max_budget_cents: Some(1000),
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .unwrap();
+        // AccessKeyId is AKIA-prefixed, 20 chars; secret is 40 chars.
+        assert!(akid.starts_with("AKIA"), "akid shape: {akid}");
+        assert_eq!(akid.len(), 20);
+        assert_eq!(secret.len(), 40);
+        // The AccessKeyId resolves to the SAME key + its secret.
+        let entry = gov.lookup_by_access_key_id(&akid).expect("akid resolves");
+        assert_eq!(entry.key.id, key.id);
+        assert_eq!(entry.secret_access_key, secret);
+        assert!(entry.key.enabled);
+        // An unknown AccessKeyId resolves to None.
+        assert!(gov
+            .lookup_by_access_key_id("AKIAdoesnotexist0000")
+            .is_none());
+        // The bearer secret still resolves the key via the hash index too.
+        assert_eq!(gov.lookup(&_bearer).unwrap().id, key.id);
+    }
+
+    #[test]
+    fn test_aws_credential_persists_across_reload() {
+        // A credential minted in one GovState must be visible to a fresh GovState over the same store
+        // (durable + rebuilt into the AccessKeyId index at construction).
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let akid = {
+            let gov = GovState::new(store.clone(), 0, 0, None).unwrap();
+            let (_k, _b, akid, _s) = gov
+                .create_key_with_aws(
+                    NewKeySpec {
+                        name: "k".to_string(),
+                        allowed_pools: vec![],
+                        max_budget_cents: None,
+                        budget_period: "total".to_string(),
+                        rpm_limit: None,
+                        tpm_limit: None,
+                    },
+                    0,
+                )
+                .unwrap();
+            akid
+        };
+        let gov2 = GovState::new(store, 0, 0, None).unwrap();
+        assert!(
+            gov2.lookup_by_access_key_id(&akid).is_some(),
+            "credential must survive a reload"
+        );
+    }
+
+    #[test]
+    fn test_delete_key_removes_aws_credential() {
+        // Revoking a key must remove its AWS credential so it can no longer authenticate via SigV4.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 0, 0, None).unwrap();
+        let (key, _b, akid, _s) = gov
+            .create_key_with_aws(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                0,
+            )
+            .unwrap();
+        assert!(gov.lookup_by_access_key_id(&akid).is_some());
+        gov.delete_key(&key.id).unwrap();
+        assert!(
+            gov.lookup_by_access_key_id(&akid).is_none(),
+            "a revoked key's AWS credential must be gone"
+        );
+        // And the durable credential row is gone too.
+        assert!(gov.store().list_aws_credentials().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_refresh_updates_both_indices_atomically() {
+        // LOW-1 invariant: a key minted WITH an AWS credential is resolvable through BOTH auth
+        // indices (the hashed-bearer `by_hash` index AND the AccessKeyId `by_access_key_id` index),
+        // and a `delete_key` (which calls `refresh`) clears it from BOTH in the same swap. This pins
+        // the single-lock atomic refresh against a future split-lock regression where one index could
+        // be updated without the other.
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 0, 0, None).unwrap();
+        let (key, bearer, akid, _secret) = gov
+            .create_key_with_aws(
+                NewKeySpec {
+                    name: "dual-index-key".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1_700_000_000,
+            )
+            .unwrap();
+
+        // Present in BOTH indices before deletion.
+        assert_eq!(
+            gov.lookup(&bearer).map(|k| k.id),
+            Some(key.id.clone()),
+            "bearer must resolve via by_hash before delete"
+        );
+        assert_eq!(
+            gov.lookup_by_access_key_id(&akid).map(|e| e.key.id),
+            Some(key.id.clone()),
+            "akid must resolve via by_access_key_id before delete"
+        );
+
+        // delete_key -> refresh swaps both indices under the single caches lock.
+        gov.delete_key(&key.id).unwrap();
+
+        // Absent from BOTH indices after deletion — neither lags the other.
+        assert!(
+            gov.lookup(&bearer).is_none(),
+            "bearer must be gone from by_hash after delete"
+        );
+        assert!(
+            gov.lookup_by_access_key_id(&akid).is_none(),
+            "akid must be gone from by_access_key_id after delete"
+        );
+    }
+
+    #[test]
+    fn test_aws_credential_debug_redacts_secret() {
+        // The symmetric SigV4 secret must NEVER appear in Debug output (AwsCredential or AwsKeyEntry).
+        let cred = AwsCredential {
+            access_key_id: "AKIAPUBLIC1234567890".to_string(),
+            key_id: "vk_x".to_string(),
+            secret_access_key: "SUPER-SECRET-SIGNING-KEY-zzz".to_string(),
+        };
+        let dbg = format!("{cred:?}");
+        assert!(
+            !dbg.contains("SUPER-SECRET-SIGNING-KEY-zzz"),
+            "AwsCredential Debug leaked the secret: {dbg}"
+        );
+        assert!(dbg.contains("<redacted; present>"));
+        assert!(dbg.contains("AKIAPUBLIC1234567890"), "akid is not secret");
+
+        let entry = AwsKeyEntry {
+            key: sample_key("vk_x", "hash"),
+            secret_access_key: "SUPER-SECRET-SIGNING-KEY-zzz".to_string(),
+        };
+        let edbg = format!("{entry:?}");
+        assert!(
+            !edbg.contains("SUPER-SECRET-SIGNING-KEY-zzz"),
+            "AwsKeyEntry Debug leaked the secret: {edbg}"
+        );
+    }
+
+    #[test]
+    fn test_generated_aws_credentials_are_distinct() {
+        // Two mints must produce distinct AccessKeyIds and secrets (CSPRNG-sourced, not constant).
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 0, 0, None).unwrap();
+        let mk = |gov: &GovState, n: &str| {
+            gov.create_key_with_aws(
+                NewKeySpec {
+                    name: n.to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                0,
+            )
+            .unwrap()
+        };
+        let (_k1, _b1, akid1, s1) = mk(&gov, "a");
+        let (_k2, _b2, akid2, s2) = mk(&gov, "b");
+        assert_ne!(akid1, akid2);
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
     fn test_govstate_lookup_pool_allowed_refresh() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let secret = "sk-vk-abc";
@@ -1138,8 +2492,15 @@ mod tests {
         assert_eq!(budget_window("monthly", 1_700_000_000), 1_698_796_800);
     }
 
+    /// LEGACY / NON-PRODUCTION PATH. This exercises the deprecated, non-atomic read-then-write pair
+    /// `is_over_budget` then `record_request`. That pair is NO LONGER on the admission path; the live
+    /// request path charges atomically via `GovState::try_charge_request_within_budget` and
+    /// `Store::charge_within_budget` — see `test_concurrent_charges_cannot_overshoot_cap` and
+    /// `test_concurrent_govstate_admission_respects_cap`. This test covers only the still-present
+    /// tests-plus-token-reconciliation API surface of the old pair; it does NOT imply the live hard-cap
+    /// path is covered. Renamed with a `legacy_` prefix to make that explicit.
     #[test]
-    fn test_is_over_budget_and_record() {
+    fn legacy_test_is_over_budget_and_record() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let mut k = sample_key("k1", "h1");
         k.max_budget_cents = Some(100);
@@ -1171,6 +2532,38 @@ mod tests {
         assert_eq!(u.tokens, 2000);
     }
 
+    /// Token-charge offload UNDER a real Tokio runtime: `test_record_tokens_cost` runs with no runtime
+    /// and so exercises only the INLINE branch of `offload_store_write`. This one calls `record_tokens`
+    /// from inside a multi-thread runtime, where `offload_store_write` takes the `spawn_blocking` branch
+    /// — the fire-and-forget SYNC `add_usage` write lands on the blocking pool, asynchronously. We then
+    /// DRAIN that write (bounded poll on `get_usage`, mirroring `test_charge_refund_readmit_cycle`'s
+    /// drain) and assert the token cost is reflected. Pins the
+    /// `record_tokens → offload_store_write → spawn_blocking → add_usage` path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_record_tokens_offload_under_runtime() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        // 50 cents per 1000 tokens, no per-request fee.
+        let gov = GovState::new(store.clone(), 0, 50, None).unwrap();
+        // 2000 tokens * 50c / 1000 = 100c. Fire-and-forget; the SQLite write is offloaded to the
+        // blocking pool, so the charge is NOT yet visible synchronously after this returns.
+        gov.record_tokens("k1", "total", 1_700_000_000, 2000);
+        // Drain the offloaded write with a bounded poll (NOT a fixed sleep): yield to let the blocking
+        // task be scheduled, then re-read until the charge lands or the retry budget is exhausted.
+        let mut usage = None;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            let u = store.get_usage("k1", 0).unwrap();
+            if u.spend_cents == 100 {
+                usage = Some(u);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let u = usage.expect("token charge must land after draining the offloaded spawn_blocking write");
+        assert_eq!(u.spend_cents, 100, "2000 tokens at 50c/1k must spend exactly 100c");
+        assert_eq!(u.tokens, 2000, "raw token count must be recorded for TPM accounting");
+    }
+
     #[test]
     fn test_check_rate_rpm_window() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -1197,6 +2590,52 @@ mod tests {
         for _ in 0..100 {
             assert!(gov.check_rate(&unl, now).is_ok());
         }
+    }
+
+    /// `rate_headroom` (routing `usage` signal): pure observation of the per-key RPM/TPM budget
+    /// remaining this window, as a `[0,1]` fraction. `None` when neither limit is set; never mutates
+    /// the window; clamps an over-budget window to `0.0`; takes the MIN of RPM/TPM when both are set.
+    #[test]
+    fn test_rate_headroom_reports_fraction_remaining() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 0, 0, None).unwrap();
+        let now = 1_700_000_040; // mid-window
+
+        // No limits → no headroom signal.
+        let mut unl = sample_key("ku", "hu");
+        unl.rpm_limit = None;
+        unl.tpm_limit = None;
+        assert_eq!(gov.rate_headroom(&unl, now), None);
+
+        // RPM=4: fresh window is fully available (1.0). Observation must NOT consume budget.
+        let mut k = sample_key("k1", "h1");
+        k.rpm_limit = Some(4);
+        k.tpm_limit = None;
+        assert_eq!(gov.rate_headroom(&k, now), Some(1.0));
+        assert_eq!(
+            gov.rate_headroom(&k, now),
+            Some(1.0),
+            "rate_headroom is read-only; repeated reads must not drain the window"
+        );
+
+        // Consume 1 of 4 via the admission path → 3/4 headroom = 0.75.
+        assert!(gov.check_rate(&k, now).is_ok());
+        let h = gov.rate_headroom(&k, now).unwrap();
+        assert!((h - 0.75).abs() < 1e-9, "expected 0.75 headroom, got {h}");
+
+        // Both RPM and TPM set: headroom is the tighter (min). Drive RPM to the cap → 0.0, clamped.
+        let mut kb = sample_key("k2", "h2");
+        kb.rpm_limit = Some(2);
+        kb.tpm_limit = Some(100_000); // very loose; RPM governs
+        let w = 1_700_000_100;
+        assert!(gov.check_rate(&kb, w).is_ok());
+        assert!(gov.check_rate(&kb, w).is_ok());
+        // RPM now at 2/2 used → 0.0 headroom (min with the loose TPM).
+        let hb = gov.rate_headroom(&kb, w).unwrap();
+        assert!(
+            hb.abs() < 1e-9,
+            "RPM at cap must yield 0.0 headroom, got {hb}"
+        );
     }
 
     #[test]
@@ -1868,10 +3307,10 @@ mod tests {
 
         let g = gov.clone();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = g.by_hash.write().unwrap();
+            let _guard = g.caches.write().unwrap();
             panic!("intentional poison");
         }));
-        assert!(gov.by_hash.is_poisoned(), "cache lock must be poisoned");
+        assert!(gov.caches.is_poisoned(), "cache lock must be poisoned");
 
         // lookup still works (no panic) and refresh still succeeds on the recovered guard.
         assert_eq!(gov.lookup(secret).unwrap().id, "k1");

@@ -47,11 +47,27 @@ pub(crate) struct WeightedLane {
     pub(crate) weight: u32, // member weight from config
 }
 
+/// Operator-declared per-member routing metadata (config), projected into the routing `Candidate`
+/// at the seam. Lives on `PoolRuntime` keyed by lane idx (NOT on the shared `Lane`, since the same
+/// lane can be a member of several pools with different tier/cost/tags). Built ONLY for pools that
+/// declare a non-default `route:` is NOT required — it is cheap to populate for every pool, but it is
+/// READ only inside the policy arm of the seam, so the zero-cost default path never touches it.
+#[derive(Clone, Default)]
+pub(crate) struct MemberMeta {
+    pub(crate) tier: Option<String>,
+    pub(crate) cost_per_mtok: Option<f64>,
+    pub(crate) tags: Vec<String>,
+}
+
 /// Per-pool runtime config resolved from config.yaml. Keyed by pool name so the re-entrant
 /// `forward_with_pool` (which knows its pool name) can look up the right failover/breaker/affinity
 /// settings — pools are first-class, but lanes are shared, so this config lives per pool.
 #[derive(Clone, Default)]
 pub(crate) struct PoolRuntime {
+    /// Operator-declared member metadata (tier / cost / tags) keyed by lane idx, for the routing
+    /// `Candidate` projection. Read ONLY inside the policy arm of the seam; the default SWRR path
+    /// never touches it. Empty for a pool with no members declaring metadata.
+    pub(crate) members: std::collections::HashMap<usize, MemberMeta>,
     /// Per-pool failover settings (deadline, cap, and member exclusions).
     pub(crate) failover: Option<crate::config::FailoverCfg>,
     /// Per-pool session-affinity settings (which request header pins a session to a lane).
@@ -59,6 +75,12 @@ pub(crate) struct PoolRuntime {
     /// Per-pool breaker settings (trip mode/thresholds + cooldown backoff), resolved into the
     /// runtime `store::BreakerCfg` the FSM evaluates. `None` falls back to ADR-0002 defaults.
     pub(crate) breaker: Option<crate::store::BreakerCfg>,
+    /// Per-pool routing policy, resolved ONCE at config load. `None` is the ZERO-COST default
+    /// (`route: weighted` / absent / explicit-native-weighted): no policy object, no projection, the
+    /// unchanged inline SWRR hot path. `Some(_)` is a non-default policy whose ranked order feeds the
+    /// failover loop: `forward::decide_policy_order` invokes it per request and `pick_among` walks the
+    /// resulting order.
+    pub(crate) policy: Option<crate::routing::ResolvedPolicy>,
 }
 
 pub(crate) struct App {

@@ -101,16 +101,31 @@ impl ProtocolReader for GeminiReader {
         // message heuristic. Scan the lowercased raw body so the match is independent of which
         // structured field carried the text. The substring set mirrors `classify()` above.
         let provider_code = {
-            let lower = String::from_utf8_lossy(body).to_lowercase();
-            if lower.contains("input is longer than the maximum number of tokens")
-                || (lower.contains("maximum-tokens") && lower.contains("requested"))
-                || (lower.contains("token count")
-                    && (lower.contains("exceeds") || lower.contains("exceed"))
-                    && lower.contains("maximum"))
-                || (lower.contains("exceeds the maximum")
-                    && (lower.contains("token") || lower.contains("context")))
-            {
-                Some("context_length_exceeded".to_string())
+            // C4: STATUS-GATE the context-length override (mirroring `AnthropicReader::extract_error`,
+            // which gates on 400/413). Gemini signals context-length-exceeded ONLY as a 400
+            // `INVALID_ARGUMENT` (or, for some deployments, a 413). A 429 (rate limit) or 5xx whose
+            // body happens to contain token-overflow phrasing — e.g. a retry-after message that quotes
+            // the request's token count — must NOT be reclassified to ContextLength: that would
+            // disposition a genuine rate-limit/server fault as a (non-faulting) ContextLength failover,
+            // so the breaker never records the fault and the lane is never benched. Only on 400/413 do
+            // we treat the token-phrased body as the canonical context-length signal. `or_else` (not an
+            // unconditional shadow) so an already-derived `provider_code` is preserved when the
+            // heuristic does not fire.
+            let st = status.as_u16();
+            if st == 400 || st == 413 {
+                let lower = String::from_utf8_lossy(body).to_lowercase();
+                if lower.contains("input is longer than the maximum number of tokens")
+                    || (lower.contains("maximum-tokens") && lower.contains("requested"))
+                    || (lower.contains("token count")
+                        && (lower.contains("exceeds") || lower.contains("exceed"))
+                        && lower.contains("maximum"))
+                    || (lower.contains("exceeds the maximum")
+                        && (lower.contains("token") || lower.contains("context")))
+                {
+                    Some("context_length_exceeded".to_string())
+                } else {
+                    provider_code
+                }
             } else {
                 provider_code
             }
@@ -329,6 +344,7 @@ impl ProtocolReader for GeminiReader {
                                 id,
                                 name,
                                 input: args,
+                                cache_control: None,
                             });
                         }
                         // FunctionResponse (ToolResult)
@@ -364,6 +380,7 @@ impl ProtocolReader for GeminiReader {
                                     citations: Vec::new(),
                                 }],
                                 is_error: false,
+                                cache_control: None,
                             });
                         }
                         // InlineData (Image, base64)
@@ -435,6 +452,7 @@ impl ProtocolReader for GeminiReader {
                             name,
                             description,
                             input_schema: parameters,
+                            cache_control: None,
                         });
                     }
                 }
@@ -472,6 +490,12 @@ impl ProtocolReader for GeminiReader {
                 .and_then(|gc| gc.get("stopSequences")),
         );
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+        // Promote Gemini's native `toolConfig.functionCallingConfig` into the IR `tool_choice` union
+        // (PF-H1) so a forced / targeted directive survives the cross-protocol seam instead of
+        // degrading to `auto`. The raw `toolConfig` is ALSO preserved in `extra` (it is not in
+        // `modeled_keys`, like `generationConfig`), so a same-protocol Gemini→Gemini passthrough stays
+        // byte-identical; the writer overlays a fresh `functionCallingConfig` from this typed field.
+        let tool_choice = read_gemini_tool_choice(obj.get("toolConfig"));
 
         // Collect unmodeled top-level keys into extra (excluding modeled ones). `model` is in the
         // set so the loop below does NOT re-insert it: it is preserved in `extra` exactly once via
@@ -526,6 +550,7 @@ impl ProtocolReader for GeminiReader {
             top_p,
             top_k,
             stop,
+            tool_choice,
             stream,
             extra,
         })
@@ -780,12 +805,9 @@ impl ProtocolReader for GeminiReader {
             // 3. finishReason → close blocks + MessageDelta + MessageStop
             if let Some(finish_reason_val) = candidate.get("finishReason").and_then(|r| r.as_str())
             {
-                let mut stop_reason = match finish_reason_val {
-                    "STOP" => "end_turn".to_string(),
-                    "MAX_TOKENS" => "max_tokens".to_string(),
-                    "SAFETY" => "safety".to_string(),
-                    other => other.to_lowercase(),
-                };
+                // PF-M2: map Gemini's full FinishReason set to the canonical IR stop reasons (no
+                // verbatim-lowercased Gemini-only token leaks to a non-Gemini client).
+                let mut stop_reason = map_gemini_finish_reason(finish_reason_val);
 
                 // Gemini's `FinishReason` enum has NO TOOL_USE member: a tool-call turn ends with
                 // STOP, mapped to `end_turn` above. But this turn emitted `functionCall` parts (tracked
@@ -939,22 +961,20 @@ impl ProtocolReader for GeminiReader {
                         id,
                         name: name_val,
                         input: args,
+                        cache_control: None,
                     });
                 }
             }
         }
 
         // Parse finishReason → stop_reason (map Gemini→canonical)
-        let stop_reason =
-            candidate
-                .get("finishReason")
-                .and_then(|r| r.as_str())
-                .map(|fr| match fr {
-                    "STOP" => "end_turn".to_string(),
-                    "MAX_TOKENS" => "max_tokens".to_string(),
-                    "SAFETY" => "safety".to_string(),
-                    other => other.to_lowercase(),
-                });
+        let stop_reason = candidate
+            .get("finishReason")
+            .and_then(|r| r.as_str())
+            // PF-M2: canonical-map the full Gemini FinishReason set (see
+            // `map_gemini_finish_reason`) so a Gemini-only reason never reaches a non-Gemini
+            // client as an unrecognized lowercased token.
+            .map(map_gemini_finish_reason);
 
         // Gemini's `FinishReason` enum has NO TOOL_USE member: a tool-call turn ends with STOP, which
         // maps to `end_turn` above. But the IR carries `ToolUse` blocks in `content`, and every other
@@ -1020,8 +1040,9 @@ impl ProtocolReader for GeminiReader {
 /// Lowercase+uppercase+digit base62 alphabet — the mixed-case alphanumeric character class a native
 /// Gemini `responseId` draws from (e.g. `PXmFaPzVMI…`). Carries no `-`/`_`, so no separator or
 /// hyphen leaks the synthetic boundary the old `{:x}-{:x}` form exposed.
-const RESPONSE_ID_ALPHABET: &[u8; 62] =
-    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+/// Base62 alphabet for the synthesized `responseId` — the shared single-source-of-truth atom (see
+/// `crate::proto::BASE62_ALPHABET`), aliased locally so the generator below reads naturally.
+const RESPONSE_ID_ALPHABET: &[u8; 62] = crate::proto::BASE62_ALPHABET;
 
 /// Width of a synthesized Gemini `responseId`. Native Gemini bodies/streams carry a short opaque
 /// base64url-style token (~11–16 chars) with NO positional structure; 16 base62 chars stays in that
@@ -1033,7 +1054,7 @@ const RESPONSE_ID_TOKEN_LEN: usize = 16;
 /// of 62 that fits in a `u8` is `4 * 62 = 248`. Any random byte `>= 248` is in the partial final
 /// block (`248..=255` → residues `0..=7`) that would otherwise be over-represented by a bare
 /// `byte % 62`, so we reject and resample those to keep the symbol distribution uniform.
-const RESPONSE_ID_REJECT_THRESHOLD: u8 = 248;
+const RESPONSE_ID_REJECT_THRESHOLD: u8 = crate::proto::BASE62_REJECT_THRESHOLD;
 
 /// Mint a Gemini-shaped `responseId` for the cross-protocol path where the backend supplied none.
 ///
@@ -1116,6 +1137,53 @@ fn synth_tool_call_id(call_index: usize, function_name: &str) -> String {
     format!("call_{:016x}", hasher.finish())
 }
 
+/// Normalize Gemini's native `toolConfig.functionCallingConfig` into the IR `tool_choice` union
+/// (PF-H1).
+///
+/// Mapping: `AUTO` → `Auto`; `NONE` → `None`; `ANY` with no `allowedFunctionNames` → `Required`
+/// (must call some tool); `ANY` + `allowedFunctionNames:[X, …]` → the targeted `Tool{name:X}` (the
+/// IR models a single targeted tool, so the FIRST allowed name is used). An absent `toolConfig`,
+/// absent `functionCallingConfig`/`mode`, or an unrecognized mode yields `None` (the `Option`) so a
+/// request that never carried a directive does not gain a spurious one on translation. Takes the
+/// whole `toolConfig` object so the caller can pass `obj.get("toolConfig")` directly.
+fn read_gemini_tool_choice(
+    tool_config: Option<&serde_json::Value>,
+) -> Option<crate::ir::IrToolChoice> {
+    let fcc = tool_config?.get("functionCallingConfig")?;
+    let mode = fcc.get("mode").and_then(|m| m.as_str())?;
+    match mode.to_uppercase().as_str() {
+        "AUTO" => Some(crate::ir::IrToolChoice::Auto),
+        "NONE" => Some(crate::ir::IrToolChoice::None),
+        "ANY" => {
+            // `allowedFunctionNames` is a LIST in Gemini, but the IR's `Tool` variant models a
+            // SINGLE targeted tool — so when N>1 names are allowed, only the FIRST survives into the
+            // IR, and the remaining names are dropped on cross-protocol egress (PF-L2). Same-protocol
+            // Gemini round-trips through a single-element list and stay faithful; the loss only
+            // affects a multi-name allow-list translated to a protocol with single-tool targeting.
+            let names = fcc.get("allowedFunctionNames").and_then(|a| a.as_array());
+            match names.and_then(|a| a.first()).and_then(|n| n.as_str()) {
+                Some(name) => Some(crate::ir::IrToolChoice::Tool {
+                    name: name.to_string(),
+                }),
+                None => Some(crate::ir::IrToolChoice::Required),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Emit the IR `tool_choice` union as a Gemini `functionCallingConfig` object (PF-H1).
+fn write_gemini_tool_choice(tc: &crate::ir::IrToolChoice) -> serde_json::Value {
+    match tc {
+        crate::ir::IrToolChoice::Auto => serde_json::json!({"mode": "AUTO"}),
+        crate::ir::IrToolChoice::None => serde_json::json!({"mode": "NONE"}),
+        crate::ir::IrToolChoice::Required => serde_json::json!({"mode": "ANY"}),
+        crate::ir::IrToolChoice::Tool { name } => {
+            serde_json::json!({"mode": "ANY", "allowedFunctionNames": [name]})
+        }
+    }
+}
+
 /// Default a possibly-absent Gemini `functionCall.args` to an empty JSON OBJECT (`{}`), not `null`.
 ///
 /// A zero-argument Gemini `functionCall` either OMITS the `args` field or sends an empty object.
@@ -1187,6 +1255,34 @@ fn prompt_block_reason(data: &serde_json::Value) -> Option<&str> {
         .and_then(|pf| pf.get("blockReason"))
         .and_then(|r| r.as_str())
         .filter(|s| !s.is_empty())
+}
+
+/// Map a Gemini candidate `finishReason` to a canonical IR stop reason (PF-M2).
+///
+/// `STOP`/`MAX_TOKENS`/`SAFETY` map to their direct canonical siblings (`end_turn`/`max_tokens`/
+/// `safety`). The remaining Gemini-only reasons — `RECITATION`, `IMAGE_SAFETY`, `SPII`,
+/// `BLOCKLIST`, `PROHIBITED_CONTENT` (content-policy stops) → `safety`; `MALFORMED_FUNCTION_CALL`
+/// (the model emitted an unparseable tool call) → `tool_use`; `OTHER`, `LANGUAGE`, and any unknown
+/// future reason → `end_turn` (a benign natural stop) — were previously passed through
+/// `to_lowercase()` VERBATIM, producing values (`recitation`, `malformed_function_call`, `spii`, …)
+/// that NO downstream SDK enum recognizes. Mapping them to the canonical IR set the
+/// Anthropic/OpenAI writers already translate (`safety`→Anthropic `safety`/OpenAI `content_filter`;
+/// `tool_use`→`tool_use`/`tool_calls`; `end_turn`→`end_turn`/`stop`) keeps the translation lossless
+/// instead of leaking an unrecognized Gemini token to a non-Gemini client. A Gemini→Gemini
+/// round-trip is unaffected: the writer's reverse map turns `end_turn` back into `STOP` and `safety`
+/// back into `SAFETY` (the dominant cases), and these stops are terminal — the body is not replayed.
+fn map_gemini_finish_reason(finish_reason: &str) -> String {
+    match finish_reason {
+        "STOP" => "end_turn",
+        "MAX_TOKENS" => "max_tokens",
+        "SAFETY" | "RECITATION" | "IMAGE_SAFETY" | "SPII" | "BLOCKLIST" | "PROHIBITED_CONTENT" => {
+            "safety"
+        }
+        "MALFORMED_FUNCTION_CALL" => "tool_use",
+        // OTHER / LANGUAGE / any novel future reason → a benign natural stop the SDKs accept.
+        _ => "end_turn",
+    }
+    .to_string()
 }
 
 /// Map a Gemini `promptFeedback.blockReason` to a canonical IR stop reason. A prompt block is a
@@ -1420,12 +1516,6 @@ impl ProtocolWriter for GeminiWriter {
         }
     }
 
-    fn rewrite_model(&self, body: &mut serde_json::Value, model: &str) {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("model".to_string(), serde_json::json!(model));
-        }
-    }
-
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
         let mut out = serde_json::Map::new();
 
@@ -1500,7 +1590,9 @@ impl ProtocolWriter for GeminiWriter {
                     crate::ir::IrBlock::Text { text, .. } => {
                         parts_arr.push(serde_json::json!({ "text": text }))
                     }
-                    crate::ir::IrBlock::ToolUse { id: _, name, input } => {
+                    crate::ir::IrBlock::ToolUse {
+                        id: _, name, input, ..
+                    } => {
                         // ToolUse → functionCall{name, args}. `args` MUST be a JSON OBJECT (Gemini
                         // Struct); coerce any non-object input (array/scalar/null/unparseable string)
                         // the same way `functionResponse.response` is coerced below.
@@ -1513,6 +1605,7 @@ impl ProtocolWriter for GeminiWriter {
                         tool_use_id,
                         content,
                         is_error: _,
+                        ..
                     } => {
                         // ToolResult → functionResponse{name, response}. Resolve the REAL function
                         // name from the cross-protocol id→name map built above so the emitted
@@ -1625,6 +1718,33 @@ impl ProtocolWriter for GeminiWriter {
             out.insert(
                 "tools".to_string(),
                 serde_json::json!([{"functionDeclarations": func_decls}]),
+            );
+        }
+
+        // toolConfig{functionCallingConfig{mode, allowedFunctionNames}} (PF-H1).
+        //
+        // Start from the RAW `toolConfig` the reader preserved in `extra` (same-protocol Gemini→Gemini
+        // byte-identity), then OVERLAY a fresh `functionCallingConfig` built from the typed
+        // `req.tool_choice`. Same map key, so the overlay REPLACES (never duplicates) any preserved
+        // `functionCallingConfig`. On cross-protocol egress `extra` is already cleared, so this object
+        // holds only the typed `functionCallingConfig` and no foreign Gemini sub-field leaks. Mirrors
+        // the `generationConfig` overlay below. Emitted only when there is something to say.
+        let mut tool_config = req
+            .extra
+            .get("toolConfig")
+            .and_then(|tc| tc.as_object())
+            .cloned()
+            .unwrap_or_default();
+        if let Some(tc) = &req.tool_choice {
+            tool_config.insert(
+                "functionCallingConfig".to_string(),
+                write_gemini_tool_choice(tc),
+            );
+        }
+        if !tool_config.is_empty() {
+            out.insert(
+                "toolConfig".to_string(),
+                serde_json::Value::Object(tool_config),
             );
         }
 
@@ -2074,7 +2194,9 @@ impl ProtocolWriter for GeminiWriter {
                 // ToolUse → functionCall{name, args}. `args` MUST be a JSON OBJECT (Gemini Struct);
                 // coerce any non-object input (array/scalar/null/unparseable string) the same way
                 // `write_request` does.
-                crate::ir::IrBlock::ToolUse { id: _, name, input } => {
+                crate::ir::IrBlock::ToolUse {
+                    id: _, name, input, ..
+                } => {
                     let args_val = coerce_tool_args(input);
                     parts_arr.push(serde_json::json!({
                         "functionCall": {"name": name, "args": args_val}
@@ -3423,6 +3545,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: true,
             extra: serde_json::Map::new(),
         };
@@ -3549,6 +3672,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3605,6 +3729,7 @@ mod tests {
                         citations: Vec::new(),
                     }],
                     is_error: false,
+                    cache_control: None,
                 }],
             }],
             tools: Vec::new(),
@@ -3613,6 +3738,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3654,6 +3780,7 @@ mod tests {
                         citations: Vec::new(),
                     }],
                     is_error: false,
+                    cache_control: None,
                 }],
             }],
             tools: Vec::new(),
@@ -3662,6 +3789,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3784,6 +3912,7 @@ mod tests {
                         },
                     ],
                     is_error: false,
+                    cache_control: None,
                 }],
             }],
             tools: Vec::new(),
@@ -3792,6 +3921,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3827,6 +3957,7 @@ mod tests {
                         citations: Vec::new(),
                     }],
                     is_error: false,
+                    cache_control: None,
                 }],
             }],
             tools: Vec::new(),
@@ -3835,6 +3966,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -4563,6 +4695,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: Vec::new(),
+            tool_choice: None,
             stream: false,
             extra,
         };
@@ -4904,6 +5037,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "get_weather".to_string(),
                 input: serde_json::json!({"city": "SF"}),
+                cache_control: None,
             }],
             stop_reason: Some("tool_use".to_string()),
             usage: crate::ir::IrUsage {
@@ -4978,6 +5112,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -5014,6 +5149,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -5324,6 +5460,7 @@ mod tests {
                         citations: Vec::new(),
                     }],
                     is_error: false,
+                    cache_control: None,
                 }],
             }],
             tools: Vec::new(),
@@ -5332,6 +5469,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -5370,6 +5508,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "get_weather".to_string(),
                     input: serde_json::json!({ "city": "SF" }),
+                    cache_control: None,
                 }],
             }],
             tools: Vec::new(),
@@ -5378,6 +5517,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -5583,6 +5723,7 @@ mod tests {
                         id: synthetic_id.clone(),
                         name: "get_weather".to_string(),
                         input: serde_json::json!({ "city": "SF" }),
+                        cache_control: None,
                     }],
                 },
                 // Tool turn: the RESULT references the call by the SAME synthetic id (cross-protocol
@@ -5597,6 +5738,7 @@ mod tests {
                             citations: Vec::new(),
                         }],
                         is_error: false,
+                        cache_control: None,
                     }],
                 },
             ],
@@ -5606,6 +5748,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -5653,6 +5796,7 @@ mod tests {
                         citations: Vec::new(),
                     }],
                     is_error: false,
+                    cache_control: None,
                 }],
             }],
             tools: Vec::new(),
@@ -5661,6 +5805,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -5850,6 +5995,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "do_thing".to_string(),
             input: serde_json::json!([1, 2, 3]),
+            cache_control: None,
         };
 
         // write_request path
@@ -5866,6 +6012,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -5926,6 +6073,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "do_thing".to_string(),
                 input: serde_json::json!({"city": "SF", "unit": "C"}),
+                cache_control: None,
             }],
             stop_reason: Some("tool_use".to_string()),
             usage: crate::ir::IrUsage {
@@ -5948,6 +6096,180 @@ mod tests {
             rargs,
             &serde_json::json!({"city": "SF", "unit": "C"}),
             "object input must pass through unchanged (no `args` wrapper): {rargs}"
+        );
+    }
+
+    // ---- PF-H1: Gemini tool_choice (functionCallingConfig) round-trips ----
+
+    fn gemini_read(body: serde_json::Value) -> crate::ir::IrRequest {
+        GeminiReader
+            .read_request(&body)
+            .expect("gemini read_request")
+    }
+
+    #[test]
+    fn tool_choice_any_required_roundtrips() {
+        let ir = gemini_read(serde_json::json!({
+            "contents": [],
+            "toolConfig": {"functionCallingConfig": {"mode": "ANY"}}
+        }));
+        assert_eq!(ir.tool_choice, Some(crate::ir::IrToolChoice::Required));
+        let writer = GeminiWriter;
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out["toolConfig"]["functionCallingConfig"],
+            serde_json::json!({"mode": "ANY"})
+        );
+    }
+
+    #[test]
+    fn tool_choice_specific_tool_roundtrips() {
+        let ir = gemini_read(serde_json::json!({
+            "contents": [],
+            "toolConfig": {"functionCallingConfig":
+                {"mode": "ANY", "allowedFunctionNames": ["get_weather"]}}
+        }));
+        assert_eq!(
+            ir.tool_choice,
+            Some(crate::ir::IrToolChoice::Tool {
+                name: "get_weather".to_string()
+            })
+        );
+        let writer = GeminiWriter;
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out["toolConfig"]["functionCallingConfig"],
+            serde_json::json!({"mode": "ANY", "allowedFunctionNames": ["get_weather"]})
+        );
+    }
+
+    #[test]
+    fn tool_choice_none_and_auto_roundtrip() {
+        for (mode, variant) in [
+            ("AUTO", crate::ir::IrToolChoice::Auto),
+            ("NONE", crate::ir::IrToolChoice::None),
+        ] {
+            let ir = gemini_read(serde_json::json!({
+                "contents": [],
+                "toolConfig": {"functionCallingConfig": {"mode": mode}}
+            }));
+            assert_eq!(ir.tool_choice, Some(variant));
+            let writer = GeminiWriter;
+            let out = writer.write_request(&ir);
+            assert_eq!(out["toolConfig"]["functionCallingConfig"]["mode"], mode);
+        }
+    }
+
+    #[test]
+    fn tool_choice_absent_emits_no_function_calling_config() {
+        let ir = gemini_read(serde_json::json!({"contents": []}));
+        assert_eq!(ir.tool_choice, None);
+        let writer = GeminiWriter;
+        let out = writer.write_request(&ir);
+        assert!(
+            out.get("toolConfig")
+                .and_then(|tc| tc.get("functionCallingConfig"))
+                .is_none(),
+            "absent tool_choice must NOT synthesize a functionCallingConfig"
+        );
+    }
+
+    #[test]
+    fn tool_choice_no_duplicate_function_calling_config() {
+        // Same-protocol passthrough: the raw toolConfig is preserved in `extra` AND the writer
+        // overlays a fresh functionCallingConfig — there must be exactly ONE in the output (the
+        // overlay replaces, never duplicates).
+        let ir = gemini_read(serde_json::json!({
+            "contents": [],
+            "toolConfig": {"functionCallingConfig": {"mode": "ANY"}}
+        }));
+        let writer = GeminiWriter;
+        let out = writer.write_request(&ir);
+        let s = serde_json::to_string(&out).unwrap();
+        assert_eq!(
+            s.matches("functionCallingConfig").count(),
+            1,
+            "exactly one functionCallingConfig must appear, got: {s}"
+        );
+    }
+
+    // ---- PF-M2: Gemini finishReason mapping ----
+
+    #[test]
+    fn finish_reason_maps_gemini_only_reasons_to_canonical() {
+        // The Gemini-only reasons must map to canonical IR stop reasons, NOT verbatim lowercase.
+        assert_eq!(map_gemini_finish_reason("RECITATION"), "safety");
+        assert_eq!(map_gemini_finish_reason("IMAGE_SAFETY"), "safety");
+        assert_eq!(map_gemini_finish_reason("SPII"), "safety");
+        assert_eq!(
+            map_gemini_finish_reason("MALFORMED_FUNCTION_CALL"),
+            "tool_use"
+        );
+        assert_eq!(map_gemini_finish_reason("OTHER"), "end_turn");
+        assert_eq!(map_gemini_finish_reason("LANGUAGE"), "end_turn");
+        // The direct ones still map.
+        assert_eq!(map_gemini_finish_reason("STOP"), "end_turn");
+        assert_eq!(map_gemini_finish_reason("MAX_TOKENS"), "max_tokens");
+        assert_eq!(map_gemini_finish_reason("SAFETY"), "safety");
+        // None of these is a verbatim lowercase of the input (the bug being fixed).
+        for bad in [
+            "recitation",
+            "spii",
+            "malformed_function_call",
+            "language",
+            "other",
+        ] {
+            assert_ne!(
+                map_gemini_finish_reason(&bad.to_uppercase()),
+                bad,
+                "{bad} must be canonicalized, not passed through lowercased"
+            );
+        }
+    }
+
+    #[test]
+    fn finish_reason_recitation_in_response_is_safety() {
+        // End-to-end through read_response: a RECITATION finishReason surfaces as the canonical
+        // `safety` stop_reason, which the Anthropic/OpenAI writers recognize.
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "x"}], "role": "model"},
+                "finishReason": "RECITATION"
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
+        });
+        let resp = GeminiReader.read_response(&body).expect("read_response");
+        assert_eq!(resp.stop_reason.as_deref(), Some("safety"));
+    }
+
+    // ---- C4: context-length override is status-gated ----
+
+    #[test]
+    fn context_length_override_only_fires_on_400_or_413() {
+        let token_body =
+            br#"{"error":{"code":429,"message":"input is longer than the maximum number of tokens"}}"#;
+        // A 429 with token-phrased body must NOT be reclassified to context_length_exceeded — the
+        // breaker must still record the rate-limit fault.
+        let err = GeminiReader.extract_error(StatusCode::TOO_MANY_REQUESTS, token_body);
+        assert_ne!(
+            err.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "a 429 with token-phrased body must NOT be mis-dispositioned as ContextLength (C4)"
+        );
+        // The same body on a real 400 IS the canonical context-length signal.
+        let body_400 =
+            br#"{"error":{"code":400,"message":"input is longer than the maximum number of tokens"}}"#;
+        let err = GeminiReader.extract_error(StatusCode::BAD_REQUEST, body_400);
+        assert_eq!(
+            err.provider_code.as_deref(),
+            Some("context_length_exceeded"),
+            "a 400 with the token-overflow message must classify as context_length_exceeded"
+        );
+        // ...and on a 413 as well.
+        let err = GeminiReader.extract_error(StatusCode::PAYLOAD_TOO_LARGE, token_body);
+        assert_eq!(
+            err.provider_code.as_deref(),
+            Some("context_length_exceeded")
         );
     }
 }

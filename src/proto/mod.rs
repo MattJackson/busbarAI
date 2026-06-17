@@ -22,12 +22,232 @@ use crate::ir::{IrBlockMeta, IrDelta, IrStreamEvent, IrUsage};
 /// An IR-level error, currently an alias for `CanonicalSignal` (the normalized error signal).
 pub(crate) type IrError = crate::breaker::CanonicalSignal;
 
+/// Map an OpenAI-family error `type` string onto its canonical machine-readable `code`, shared by
+/// the OpenAI Chat Completions and `/v1/responses` writers (both emit the identical OpenAI error
+/// envelope). A real bad-key 401 returns `{"type":"authentication_error", ..., "code":"invalid_api_key"}`
+/// and the official SDKs surface `error.code` to callers, so emitting `code: null` on an auth (or
+/// over-quota) failure is a deterministic proxy tell that contradicts the total-indistinguishability
+/// promise — we mirror the native pairing for those two types. Every other modeled type, plus any
+/// caller-supplied passthrough type, keeps `null`: the shape OpenAI uses when no machine-readable
+/// code applies. There is no `_ =>` catch-all hiding an unhandled case; the final arm binds `other`
+/// explicitly and emits `null`, the correct native value for those types.
+pub(crate) fn bearer_error_code(error_type: &str) -> serde_json::Value {
+    match error_type {
+        "authentication_error" => serde_json::Value::String("invalid_api_key".to_string()),
+        // Real OpenAI quota-exhaustion errors carry BOTH `type` and `code` set to
+        // `insufficient_quota` (HTTP 429). The over-budget governance path
+        // (route.rs `ingress_error(..., "insufficient_quota", ...)`) reaches these writers with that
+        // type; emitting `code: null` for it is an SDK-visible mismatch (the official client surfaces
+        // `error.code == "insufficient_quota"`) and a proxy tell, so we mirror the native pairing.
+        "insufficient_quota" => serde_json::Value::String("insufficient_quota".to_string()),
+        "invalid_request_error"
+        | "permission_error"
+        | "not_found_error"
+        | "rate_limit_error"
+        | "server_error"
+        | "api_error" => serde_json::Value::Null,
+        other => {
+            // A caller-supplied passthrough type we model no code for: OpenAI carries no
+            // machine-readable code for these, so `null` matches the native shape. Named binding
+            // (not `_`) keeps the arm explicit per the no-catch-all rule.
+            let _ = other;
+            serde_json::Value::Null
+        }
+    }
+}
+
+/// Build the `Authorization: Bearer <key>` header pair for the pure-Bearer protocol writers
+/// (OpenAI, `/v1/responses`, Gemini's `x-goog`… aside, Cohere). Shared so the warn+OMIT policy lives
+/// in ONE place rather than being copy-pasted (and drifting) per writer.
+///
+/// `HeaderValue::from_str` rejects ASCII control bytes (a stray CR/LF/NUL a config system may have
+/// injected). The previous per-writer `unwrap_or_else(HeaderValue::from_static(""))` SILENTLY emitted
+/// a syntactically empty `Authorization: ` header — the upstream then 401s every request on the lane
+/// with no proxy-side signal, and the empty-Bearer form is itself a fingerprinting tell a backend can
+/// compare against well-formed tokens. Instead we surface a `tracing::warn!` (naming the protocol so
+/// the operator can locate the misconfigured lane) and OMIT the header entirely (empty Vec). The
+/// request is still sent (the trait can't refuse it here) and the upstream answers 401, but the warn
+/// line tells the operator the lane's credential bytes are invalid. The key is NEVER logged (it is the
+/// secret); only the protocol name and the fact that the bytes are malformed.
+pub(crate) fn bearer_auth_headers(proto: &str, key: &str) -> Vec<(HeaderName, HeaderValue)> {
+    match HeaderValue::from_str(&format!("Bearer {key}")) {
+        Ok(value) => vec![(HeaderName::from_static("authorization"), value)],
+        Err(_) => {
+            tracing::warn!(
+                protocol = proto,
+                "authorization credential contains invalid header bytes (ASCII control character); \
+                 omitting auth header — upstream will reject with 401"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Decompose an OpenAI/Responses `image_url` string into the IR `(media_type, data)` pair. Shared
+/// verbatim by `openai.rs` and `responses.rs` (both surfaces use the same `image_url` wire shape).
+///
+/// A `data:<mime>;base64,<payload>` URI is decomposed into its real MIME type ("image/png") and raw
+/// base64 payload, matching the IR contract the Anthropic reader/writer use for base64 images. Any
+/// other URL (an https reference, or a data URI we cannot confidently split) is preserved verbatim in
+/// `data` with an "image_url" media_type sentinel so the writer can reconstruct the exact original
+/// `image_url` on a same-protocol round-trip rather than mangling it.
+pub(crate) fn parse_image_url(url: &str) -> (String, String) {
+    if let Some(rest) = url.strip_prefix("data:") {
+        if let Some((meta, payload)) = rest.split_once(',') {
+            // meta is e.g. "image/png;base64" or "image/png" — keep only the MIME type.
+            let media_type = meta.split(';').next().unwrap_or("").to_string();
+            if meta.contains("base64") && !media_type.is_empty() {
+                return (media_type, payload.to_string());
+            }
+        }
+    }
+    // Non-data URL (https://...) or an unrecognized data URI: keep it verbatim under the
+    // `image_url` sentinel so the writer round-trips it as-is rather than mangling it.
+    ("image_url".to_string(), url.to_string())
+}
+
+/// Reconstruct an OpenAI/Responses `image_url` string from the IR `Image` (media_type, data) pair —
+/// the inverse of [`parse_image_url`]. A URL-sentinel image is emitted verbatim; a base64 image is
+/// re-wrapped into a `data:<mime>;base64,<payload>` URI. Shared verbatim by `openai.rs` and
+/// `responses.rs`.
+pub(crate) fn image_url_from_ir(media_type: &str, data: &str) -> String {
+    if media_type == "image_url" {
+        data.to_string()
+    } else {
+        format!("data:{media_type};base64,{data}")
+    }
+}
+
+/// Scan an already-lowercased error text for OpenAI-family context-length-overflow prose. Holds the
+/// four phrases shared verbatim by `OpenAiReader::extract_error` and `ResponsesReader::extract_error`
+/// (the message scan was duplicated). The scan must be PRECISE: a naive OR of weak tokens
+/// (`token`/`maximum`) misclassifies unrelated errors (e.g. a quota body like "maximum number of
+/// tokens allowed per day" — a rate-limit, not oversized). Require a CO-LOCATED context-length
+/// phrase: a self-contained canonical phrase, or `exceeds` paired specifically with `context`/`token
+/// limit`. The caller supplies its own lowercased source (openai scans `error.message`; responses
+/// scans the whole body) and applies the `oversized_status` (400/413) GATE itself — that gate is NOT
+/// part of this helper.
+pub(crate) fn openai_context_length_prose_scan(text: &str) -> bool {
+    text.contains("maximum context length")
+        || text.contains("context length exceeded")
+        || text.contains("reduce the length")
+        || (text.contains("exceeds") && (text.contains("context") || text.contains("token limit")))
+}
+
+/// Canonical OpenAI-family error classification, shared verbatim by `OpenAiReader::classify` and
+/// `ResponsesReader::classify` (the two were word-for-word identical). Both surfaces emit the same
+/// OpenAI error envelope, so the mapping — context-length-exceeded (fail over without penalty) first,
+/// then 429→RateLimit, 401/403→Auth, 5xx→ServerError, other 4xx→ClientError — is single-sourced here.
+#[cfg(test)]
+pub(crate) fn openai_classify(status: StatusCode, body: &[u8]) -> CanonicalSignal {
+    // context-length-exceeded — the lane is healthy; this must fail over (to a larger-context
+    // model), not penalize the breaker. Detect by OpenAI code/message first.
+    let code_is_context = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|j| {
+            j.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string())
+        })
+        .as_deref()
+        == Some("context_length_exceeded");
+    // Mirror production `extract_error`: the prose message scan is GATED to the HTTP statuses an
+    // oversized request actually uses (400 invalid_request_error; 413 payload-too-large). Without the
+    // gate a 401/429/5xx whose prose happens to contain "maximum context length" would reclassify as
+    // ContextLength — letting a genuine auth/rate-limit/server failure escape fault attribution. The
+    // structured `code: "context_length_exceeded"` path is NOT gated (it is unambiguous).
+    let oversized =
+        status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE;
+    let body_lower = String::from_utf8_lossy(body).to_lowercase();
+    if code_is_context || (oversized && body_lower.contains("maximum context length")) {
+        return CanonicalSignal {
+            class: StatusClass::ContextLength,
+            provider_signal: Some("context_length".to_string()),
+            retry_after: None,
+        };
+    }
+
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return CanonicalSignal {
+            class: StatusClass::RateLimit,
+            provider_signal: Some("429".to_string()),
+            retry_after: None,
+        };
+    }
+
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return CanonicalSignal {
+            class: StatusClass::Auth,
+            provider_signal: Some("auth".to_string()),
+            retry_after: None,
+        };
+    }
+
+    if status.is_server_error() {
+        return CanonicalSignal {
+            class: StatusClass::ServerError,
+            provider_signal: Some("5xx".to_string()),
+            retry_after: None,
+        };
+    }
+
+    if status.is_client_error() {
+        return CanonicalSignal {
+            class: StatusClass::ClientError,
+            provider_signal: Some(format!("{}", status.as_u16())),
+            retry_after: None,
+        };
+    }
+
+    CanonicalSignal {
+        class: StatusClass::ClientError,
+        provider_signal: None,
+        retry_after: None,
+    }
+}
+
 /// Conservative fallback for the `max_tokens` injected at a translation boundary when the source
 /// protocol omitted it (legal for OpenAI) but the target REQUIRES it (Anthropic, Bedrock — see
 /// `ProtocolWriter::requires_max_tokens`). Used only when the lane has no configured
 /// `default_max_tokens`. 4096 is a safe output ceiling across current chat models — large enough
 /// not to truncate typical completions, small enough not to be refused.
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 4096;
+
+/// The two response headers a native AWS Bedrock endpoint ALWAYS emits (lowercase on the wire):
+/// the per-request id the AWS SDK surfaces via `*Output::request_id()`, and the error-type header
+/// the SDK reads BEFORE the body `__type` for typed-exception dispatch. Hoisted to consts so the
+/// ~13 production sites across `forward.rs`/`main.rs`/`proto/mod.rs` that capture, forward, or
+/// synthesize these headers cannot drift on spelling.
+pub(crate) const HDR_AMZN_REQUEST_ID: &str = "x-amzn-requestid";
+pub(crate) const HDR_AMZN_ERROR_TYPE: &str = "x-amzn-errortype";
+
+/// Mixed-case base62 alphabet (digits + lowercase + uppercase, no `-`/`_`) and the rejection-sampling
+/// threshold used when synthesizing opaque ids for protocols whose native ids are flat random tokens
+/// (Gemini `responseId`, Responses `msg_`/`fc_`/`resp_` suffixes). Hoisted here as the single source
+/// of truth so the two id generators cannot drift on the character set or the bias-elimination cutoff
+/// — `REJECT_THRESHOLD` is the largest multiple of 62 that fits in a `u8` (62 × 4 = 248); a draw in
+/// `0..248` maps uniformly via `% 62`, a draw `>= 248` is rejected and redrawn.
+pub(crate) const BASE62_ALPHABET: &[u8; 62] =
+    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+pub(crate) const BASE62_REJECT_THRESHOLD: u8 = 248;
+
+/// OpenAI-family shared constants. The Chat-Completions (`openai.rs`) and Responses (`responses.rs`)
+/// writers are two wire formats of the SAME provider family, so these values are deliberately
+/// identical and MUST stay in lockstep — hoisted here as the single source of truth instead of being
+/// copy-pasted with "// Mirrors openai.rs" comments. If the two protocols ever genuinely diverge on
+/// one of these, split it back out at that point.
+/// Fallback model name when a cross-protocol request carries none.
+pub(crate) const OPENAI_FAMILY_DEFAULT_MODEL: &str = "gpt-4o";
+/// DoS cap on concurrently-tracked open tool-call accumulators per stream.
+pub(crate) const OPENAI_FAMILY_MAX_OPEN_TOOLS: usize = 128;
+
+/// Client-visible detail string for a mid-stream abort (the upstream connection dropped or a
+/// translate step failed after first byte). Lives in the proto layer — the lowest common ancestor —
+/// because BOTH `forward.rs` (SSE/forward abort path) and the Bedrock-eventstream reassembler in this
+/// module emit it, and `forward.rs → proto` is the only legal dependency direction. Single source of
+/// truth so the abort text a client sees is identical on every framing.
+pub(crate) const STREAM_ABORT_DETAIL: &str = "The response stream was interrupted.";
 
 /// Mint a UUID-v4-shaped request id (`8-4-4-4-12` lowercase hex) for the `x-amzn-RequestId` header a
 /// native AWS Bedrock response always carries — on EVERY response, success and error, stream and
@@ -62,13 +282,13 @@ pub(crate) fn synth_amzn_request_id() -> Option<String> {
 /// `request-id` to forward (the error path mirrors the writer's own body `request_id` into the header
 /// instead; the same-protocol passthrough forwards the UPSTREAM `request-id` verbatim and never calls
 /// this). The shape mirrors a native id EXACTLY: the `req_` prefix, the `01` version marker, then a
-/// fixed-width 24-char lowercase/mixed-base62 token from the OS CSPRNG — `req_01` + 24 = 30 chars
+/// fixed-width 24-char mixed-case base62 token from the OS CSPRNG — `req_01` + 24 = 30 chars
 /// total, matching `anthropic.rs::synth_id_with_prefix("req_")` (used for the body `request_id`) so
 /// the response-header length is not a fingerprint tell (a 22-char value would be 8 chars short of
 /// native). Returns `None` (caller OMITS the header) only if entropy is unavailable — on the request
 /// path, must never panic.
 pub(crate) fn synth_anthropic_request_id() -> Option<String> {
-    const ALPHABET: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const ALPHABET: &[u8; 62] = BASE62_ALPHABET;
     // 24 base62 chars (≈143 bits) of CSPRNG entropy. A u128 holds at most 12 base62 digits worth of
     // headroom safely (62^12 < 2^128), so build the 24-char token from two independent 9-byte (72-bit)
     // draws, each emitting 12 base62 digits — collision-free in practice and matching the native
@@ -180,12 +400,12 @@ pub(crate) fn vendor_auth_failure_message(proto: &str) -> &'static str {
 pub(crate) fn attach_bedrock_error_headers(headers: &mut axum::http::HeaderMap, kind: &str) {
     if let Some(id) = synth_amzn_request_id() {
         if let Ok(hv) = HeaderValue::from_str(&id) {
-            headers.insert(HeaderName::from_static("x-amzn-requestid"), hv);
+            headers.insert(HeaderName::from_static(HDR_AMZN_REQUEST_ID), hv);
         }
     }
     let errortype = error_kind_to_bedrock_type(kind);
     if let Ok(hv) = HeaderValue::from_str(errortype) {
-        headers.insert(HeaderName::from_static("x-amzn-errortype"), hv);
+        headers.insert(HeaderName::from_static(HDR_AMZN_ERROR_TYPE), hv);
     }
 }
 
@@ -252,19 +472,19 @@ pub(crate) trait ProtocolReader: Send + Sync {
 /// sign the whole request (AWS SigV4 for Bedrock) need the method/host/path/body/time.
 pub(crate) struct SigningContext<'a> {
     /// Upstream host (no scheme), e.g. `bedrock-runtime.us-east-1.amazonaws.com`.
-    pub host: String,
+    pub(crate) host: String,
     /// URI-encoded request path (no query), e.g. `/model/anthropic.claude%3A0/converse`.
-    pub canonical_uri: String,
+    pub(crate) canonical_uri: String,
     /// The exact request body bytes that will be sent.
-    pub body: &'a [u8],
+    pub(crate) body: &'a [u8],
     /// Unix epoch seconds at signing time.
-    pub timestamp_epoch: u64,
+    pub(crate) timestamp_epoch: u64,
     /// The front-door auth mode for this request. Lets a writer resolve a credential whose scheme is
     /// otherwise ambiguous (e.g. Anthropic's API-key-vs-Bearer choice) to the single native header
     /// the mode implies — Passthrough forwards the caller's Bearer token; Token/None present the
     /// configured-key shape. Without it, an ambiguous credential must emit BOTH headers, which is an
     /// upstream-distinguishability tell no native client produces.
-    pub auth_mode: crate::auth::AuthMode,
+    pub(crate) auth_mode: crate::auth::AuthMode,
 }
 
 /// ProtocolWriter rewrites intents for the upstream wire format.
@@ -298,7 +518,15 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     }
 
     /// Rewrites the model field in the request body.
-    fn rewrite_model(&self, body: &mut serde_json::Value, model: &str);
+    ///
+    /// The default inserts/overwrites a top-level `"model"` string — the shape every JSON-body
+    /// protocol (Anthropic, Cohere, OpenAI, Gemini, Responses) needs. `BedrockWriter` overrides
+    /// this with a no-op because the target model is carried in the request URL, not the body.
+    fn rewrite_model(&self, body: &mut serde_json::Value, model: &str) {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("model".to_string(), serde_json::json!(model));
+        }
+    }
 
     /// Write an IR request to wire JSON.
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value;
@@ -388,6 +616,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -1308,8 +1537,9 @@ impl StreamTranslate {
         // transport-error path in forward.rs (`mid_stream_error_bytes`, also keyed off
         // `ingress_eventstream`). This is the only terminator on an aborted stream, so return early.
         if self.aborted {
-            // Single source of truth for the terminal detail across both ingress framings.
-            const ABORT_DETAIL: &str = "The response stream was interrupted.";
+            // The shared abort detail (see `STREAM_ABORT_DETAIL`) so the text a client sees is
+            // identical across this Bedrock-eventstream path and forward.rs's SSE/forward abort path.
+            const ABORT_DETAIL: &str = STREAM_ABORT_DETAIL;
             if self.ingress_eventstream {
                 out.extend_from_slice(&crate::eventstream::encode_exception_frame(
                     "InternalServerException",
@@ -2877,7 +3107,10 @@ mod tests {
         for msg in &ir.messages {
             if msg.role == crate::ir::IrRole::Assistant {
                 for block in &msg.content {
-                    if let crate::ir::IrBlock::ToolUse { id, name, input } = block {
+                    if let crate::ir::IrBlock::ToolUse {
+                        id, name, input, ..
+                    } = block
+                    {
                         found_tool_use = true;
                         assert_eq!(id, "call_123");
                         assert_eq!(name, "get_weather");
@@ -3151,7 +3384,10 @@ mod tests {
             for msg in &ir.messages {
                 if msg.role == crate::ir::IrRole::Assistant {
                     for block in &msg.content {
-                        if let crate::ir::IrBlock::ToolUse { id, name, input } = block {
+                        if let crate::ir::IrBlock::ToolUse {
+                            id, name, input, ..
+                        } = block
+                        {
                             found_tool_use = true;
                             assert_eq!(id, "call_123");
                             assert_eq!(name, "get_weather");
@@ -3198,6 +3434,7 @@ mod tests {
                             ref tool_use_id,
                             ref content,
                             ref is_error,
+                            ..
                         } = block
                         {
                             found_tool_result = true;
@@ -3502,7 +3739,10 @@ mod tests {
             for msg in &ir.messages {
                 if msg.role == crate::ir::IrRole::Assistant {
                     for block in &msg.content {
-                        if let crate::ir::IrBlock::ToolUse { id, name, input } = block {
+                        if let crate::ir::IrBlock::ToolUse {
+                            id, name, input, ..
+                        } = block
+                        {
                             found_tool_use = true;
                             assert_eq!(id, "call_123");
                             assert_eq!(name, "get_weather");
@@ -6109,7 +6349,10 @@ mod stream_translate_tests {
 
         // Verify IR has ToolUse block
         assert_eq!(ir_resp.content.len(), 1);
-        if let crate::ir::IrBlock::ToolUse { id, name, input } = &ir_resp.content[0] {
+        if let crate::ir::IrBlock::ToolUse {
+            id, name, input, ..
+        } = &ir_resp.content[0]
+        {
             assert_eq!(id, "call_1");
             assert_eq!(name, "f");
             match input {
@@ -6290,6 +6533,7 @@ mod stream_translate_tests {
                 tool_use_id: client_id,
                 content: vec![],
                 is_error: false,
+                cache_control: None,
             }],
         }];
         decode_request_tool_ids("anthropic", &mut messages);
@@ -6447,7 +6691,10 @@ mod stream_translate_tests {
         // Second message: Assistant with functionCall (ToolUse)
         assert_eq!(ir.messages[1].role, crate::ir::IrRole::Assistant);
         assert_eq!(ir.messages[1].content.len(), 1);
-        if let crate::ir::IrBlock::ToolUse { id: _, name, input } = &ir.messages[1].content[0] {
+        if let crate::ir::IrBlock::ToolUse {
+            id: _, name, input, ..
+        } = &ir.messages[1].content[0]
+        {
             assert_eq!(name, "get_weather");
             assert_eq!(
                 input.get("location").and_then(|v| v.as_str()),
@@ -6464,6 +6711,7 @@ mod stream_translate_tests {
             tool_use_id,
             content,
             is_error,
+            ..
         } = &ir.messages[2].content[0]
         {
             assert_eq!(tool_use_id, "get_weather");
@@ -6485,6 +6733,7 @@ mod stream_translate_tests {
             name,
             description,
             input_schema,
+            ..
         } = &ir.tools[0];
         {
             assert_eq!(name, "get_weather");
@@ -6657,7 +6906,10 @@ mod gemini_tests {
             panic!("expected Text block");
         }
 
-        if let crate::ir::IrBlock::ToolUse { id: _, name, input } = &resp.content[1] {
+        if let crate::ir::IrBlock::ToolUse {
+            id: _, name, input, ..
+        } = &resp.content[1]
+        {
             assert_eq!(name, "get_weather");
             match input {
                 serde_json::Value::Object(obj) => {

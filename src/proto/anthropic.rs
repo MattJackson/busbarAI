@@ -58,7 +58,9 @@ fn synth_id_with_prefix(prefix: &str) -> String {
     // >= 248 (the largest multiple of 62 that fits in a u8) and consume only the in-range bytes,
     // mirroring `openai::synth_completion_id` and `proto::mod::synth_anthropic_request_id`. On an
     // entropy failure we leave the remaining '0' fill rather than panic; there is no counter overlay.
-    const BASE62_REJECT_FLOOR: u8 = 248; // 4 * 62
+    // Same ordering-independent reduction cutoff as every other base62 synth (4 * 62 = 248); only
+    // this module's ALPHABET *ordering* (uppercase-first) is intentionally local.
+    const BASE62_REJECT_FLOOR: u8 = crate::proto::BASE62_REJECT_THRESHOLD;
     let mut token = [b'0'; SYNTH_ID_TOKEN_LEN];
     let mut filled = 0usize;
     'outer: while filled < SYNTH_ID_TOKEN_LEN {
@@ -354,6 +356,9 @@ impl ProtocolReader for AnthropicReader {
             .and_then(|v| u32::try_from(v).ok());
         // Anthropic's native `stop_sequences` is an array of strings.
         let stop = crate::ir::read_stop_sequences(obj.get("stop_sequences"));
+        // Anthropic `tool_choice` is an object: {type:"auto"|"any"|"tool"|"none", name?}. Normalize
+        // into the IR union so forced/targeted tool use survives the cross-protocol seam.
+        let tool_choice = read_anthropic_tool_choice(obj.get("tool_choice"));
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Collect unmodeled top-level keys into `extra`. The set of modeled keys is a static,
@@ -370,6 +375,7 @@ impl ProtocolReader for AnthropicReader {
             "stream",
             "system",
             "temperature",
+            "tool_choice",
             "tools",
             "top_k",
             "top_p",
@@ -394,6 +400,7 @@ impl ProtocolReader for AnthropicReader {
             top_p,
             top_k,
             stop,
+            tool_choice,
             stream,
             extra,
         })
@@ -754,29 +761,7 @@ fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrErr
                 .unwrap_or("")
                 .to_string();
             // Parse cache_control - object form: {"type": "ephemeral"}
-            let cache_control = if let Some(cc_val) = obj.get("cache_control") {
-                if let Some(cc_obj) = cc_val.as_object() {
-                    if let Some(cc_type) = cc_obj.get("type").and_then(|t| t.as_str()) {
-                        if cc_type == "ephemeral" {
-                            Some(crate::ir::CacheControl {
-                                kind: crate::ir::CacheKind::Ephemeral,
-                            })
-                        } else {
-                            return Err(IrError {
-                                class: StatusClass::ClientError,
-                                provider_signal: Some("ir_parse".to_string()),
-                                retry_after: None,
-                            });
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let cache_control = read_cache_control(obj.get("cache_control"))?;
             let citations = obj
                 .get("citations")
                 .and_then(|v| v.as_array())
@@ -811,7 +796,13 @@ fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrErr
                 .unwrap_or("")
                 .to_string();
             let input = obj.get("input").cloned().unwrap_or(serde_json::Value::Null);
-            Ok(crate::ir::IrBlock::ToolUse { id, name, input })
+            let cache_control = read_cache_control(obj.get("cache_control"))?;
+            Ok(crate::ir::IrBlock::ToolUse {
+                id,
+                name,
+                input,
+                cache_control,
+            })
         }
         "tool_result" => {
             let tool_use_id = obj
@@ -833,10 +824,12 @@ fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrErr
                 .get("is_error")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let cache_control = read_cache_control(obj.get("cache_control"))?;
             Ok(crate::ir::IrBlock::ToolResult {
                 tool_use_id,
                 content,
                 is_error,
+                cache_control,
             })
         }
         "image" => {
@@ -962,12 +955,99 @@ fn read_tool(tool_val: &serde_json::Value) -> Result<crate::ir::IrTool, IrError>
         .get("input_schema")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let cache_control = read_cache_control(obj.get("cache_control"))?;
 
     Ok(crate::ir::IrTool {
         name,
         description,
         input_schema,
+        cache_control,
     })
+}
+
+/// Parse Anthropic's `cache_control` object (`{"type":"ephemeral"}`) into the IR's `CacheControl`.
+///
+/// Shared by every site that can carry an Anthropic cache breakpoint — text/system blocks, tool
+/// definitions, and tool_use/tool_result blocks — so a breakpoint placed ON a tool def or tool
+/// result survives the cross-protocol seam instead of being silently dropped (PF-H2). Absent/`null`
+/// yields `None`; the only valid `type` is `ephemeral` (Anthropic's sole cache kind today), and an
+/// unrecognized `type` is a client error (matching the strictness the text-block parser already had).
+fn read_cache_control(
+    val: Option<&serde_json::Value>,
+) -> Result<Option<crate::ir::CacheControl>, IrError> {
+    let Some(cc_val) = val else { return Ok(None) };
+    let Some(cc_obj) = cc_val.as_object() else {
+        return Ok(None);
+    };
+    match cc_obj.get("type").and_then(|t| t.as_str()) {
+        Some("ephemeral") => Ok(Some(crate::ir::CacheControl {
+            kind: crate::ir::CacheKind::Ephemeral,
+        })),
+        None => Ok(None),
+        Some(_) => Err(IrError {
+            class: StatusClass::ClientError,
+            provider_signal: Some("ir_parse".to_string()),
+            retry_after: None,
+        }),
+    }
+}
+
+/// Serialize the IR's `CacheControl` back to Anthropic's native `{"type":"ephemeral"}` object.
+fn write_cache_control(cc: &crate::ir::CacheControl) -> serde_json::Value {
+    match cc.kind {
+        crate::ir::CacheKind::Ephemeral => serde_json::json!({"type": "ephemeral"}),
+    }
+}
+
+/// Normalize Anthropic's native `tool_choice` object into the IR union (PF-H1).
+///
+/// Anthropic shape: `{"type":"auto"|"any"|"tool"|"none","name"?:"..."}`. `auto` → `Auto`, `none` →
+/// `None`, `any` → `Required` (must call some tool), `tool` + `name` → the targeted `Tool{name}`. An
+/// absent field or an unrecognized/`tool`-without-`name` shape maps to `None` (omitted) so a request
+/// that never carried a directive does not gain a spurious one — except `tool` with a name, which is
+/// the load-bearing targeted case this fix exists to preserve.
+fn read_anthropic_tool_choice(val: Option<&serde_json::Value>) -> Option<crate::ir::IrToolChoice> {
+    let obj = val?.as_object()?;
+    match obj.get("type").and_then(|t| t.as_str())? {
+        "auto" => Some(crate::ir::IrToolChoice::Auto),
+        "none" => Some(crate::ir::IrToolChoice::None),
+        "any" => Some(crate::ir::IrToolChoice::Required),
+        "tool" => {
+            obj.get("name")
+                .and_then(|n| n.as_str())
+                .map(|name| crate::ir::IrToolChoice::Tool {
+                    name: name.to_string(),
+                })
+        }
+        _ => None,
+    }
+}
+
+/// Emit the IR tool-choice union in Anthropic's native `tool_choice` object shape (PF-H1).
+fn write_anthropic_tool_choice(tc: &crate::ir::IrToolChoice) -> serde_json::Value {
+    match tc {
+        crate::ir::IrToolChoice::Auto => serde_json::json!({"type": "auto"}),
+        crate::ir::IrToolChoice::None => serde_json::json!({"type": "none"}),
+        crate::ir::IrToolChoice::Required => serde_json::json!({"type": "any"}),
+        crate::ir::IrToolChoice::Tool { name } => {
+            serde_json::json!({"type": "tool", "name": name})
+        }
+    }
+}
+
+/// Map an IR stop_reason to a value valid on the Anthropic egress (PF-L1).
+///
+/// Anthropic's native `StopReason` enum is `end_turn | max_tokens | stop_sequence | tool_use |
+/// pause_turn` — there is NO `safety` member. The IR's `safety` reason (synthesized from Gemini
+/// `SAFETY`/`RECITATION` and OpenAI `content_filter`) would otherwise be emitted verbatim and
+/// decode-fail against the typed SDKs, so collapse it to `end_turn` (the closest native value:
+/// the turn ended, just not by the model's choice). All other reasons pass through unchanged so
+/// same-protocol round-trips stay lossless.
+fn map_stop_reason_for_anthropic(reason: &str) -> &str {
+    match reason {
+        "safety" => "end_turn",
+        other => other,
+    }
 }
 
 fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
@@ -1003,13 +1083,27 @@ fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
             }
             serde_json::Value::Object(obj)
         }
-        crate::ir::IrBlock::ToolUse { id, name, input } => {
-            serde_json::json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+        crate::ir::IrBlock::ToolUse {
+            id,
+            name,
+            input,
+            cache_control,
+        } => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".to_string(), serde_json::json!("tool_use"));
+            obj.insert("id".to_string(), serde_json::json!(id));
+            obj.insert("name".to_string(), serde_json::json!(name));
+            obj.insert("input".to_string(), input.clone());
+            if let Some(cc) = cache_control {
+                obj.insert("cache_control".to_string(), write_cache_control(cc));
+            }
+            serde_json::Value::Object(obj)
         }
         crate::ir::IrBlock::ToolResult {
             tool_use_id,
             content,
             is_error,
+            cache_control,
         } => {
             let mut obj = serde_json::Map::new();
             obj.insert("type".to_string(), serde_json::json!("tool_result"));
@@ -1024,6 +1118,9 @@ fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
             }
             if *is_error {
                 obj.insert("is_error".to_string(), serde_json::Value::Bool(true));
+            }
+            if let Some(cc) = cache_control {
+                obj.insert("cache_control".to_string(), write_cache_control(cc));
             }
             serde_json::Value::Object(obj)
         }
@@ -1105,6 +1202,9 @@ fn write_tool(tool: &crate::ir::IrTool) -> serde_json::Value {
         obj.insert("description".to_string(), serde_json::json!(desc));
     }
     obj.insert("input_schema".to_string(), tool.input_schema.clone());
+    if let Some(cc) = &tool.cache_control {
+        obj.insert("cache_control".to_string(), write_cache_control(cc));
+    }
     serde_json::Value::Object(obj)
 }
 
@@ -1189,31 +1289,37 @@ impl AnthropicWriter {
 ///
 /// The `anthropic-version` header is common to all.
 ///
-/// A key with bytes invalid in an HTTP header value (e.g. a stray newline) yields an empty header
-/// (one diagnostic warning, key bytes never logged) rather than panicking the worker — the upstream
-/// then returns a clean 401 the breaker classifies normally. Defense-in-depth; keys should be
-/// validated at config load.
+/// A key with bytes invalid in an HTTP header value (e.g. a stray newline) is OMITTED rather than
+/// emitted with an empty value (one diagnostic warning naming the protocol, key bytes never logged)
+/// — matching the warn+OMIT policy of the Bearer writers (`proto::bearer_auth_headers`) and the
+/// Gemini/Cohere/Responses writers. An empty `x-api-key: ` is both a syntactically invalid header the
+/// upstream 401s on AND a fingerprinting tell against well-formed tokens, so we drop just that
+/// credential header and keep `anthropic-version`. The worker never panics; the upstream returns a
+/// clean 401 the breaker classifies normally. Defense-in-depth; keys should be validated at config
+/// load.
 fn anthropic_auth_headers(
     key: &str,
     mode: Option<crate::auth::AuthMode>,
 ) -> Vec<(HeaderName, HeaderValue)> {
-    let safe = |label: &'static str, raw: String| {
-        HeaderValue::from_str(&raw).unwrap_or_else(|_| {
-            tracing::warn!(
-                header = label,
-                "anthropic auth credential contains bytes invalid for an HTTP header value \
-                 (e.g. a trailing newline); sending an empty value, the upstream will return \
-                 401 — check the key configuration"
-            );
-            HeaderValue::from_static("")
-        })
+    // Build a credential header pair, OMITTING it (returning None) when the value carries bytes
+    // invalid for an HTTP header value. Never logs the key bytes — only the header name and the fact
+    // that they were malformed.
+    let safe = |name: &'static str, raw: String| -> Option<(HeaderName, HeaderValue)> {
+        match HeaderValue::from_str(&raw) {
+            Ok(v) => Some((HeaderName::from_static(name), v)),
+            Err(_) => {
+                tracing::warn!(
+                    protocol = "anthropic",
+                    header = name,
+                    "auth credential contains bytes invalid for an HTTP header value (e.g. a \
+                     trailing newline); omitting the credential header — upstream will return 401, \
+                     check the key configuration"
+                );
+                None
+            }
+        }
     };
-    let x_api_key = || {
-        (
-            HeaderName::from_static("x-api-key"),
-            safe("x-api-key", key.to_string()),
-        )
-    };
+    let x_api_key = || safe("x-api-key", key.to_string());
     // ApiKey-scheme variant of `x-api-key` that strips LEADING whitespace from the configured key
     // (R25 LOW #15). `classify_credential` matches on `key.trim_start()`, so `"  sk-ant-api…"`
     // classifies as `ApiKey` — but the raw `x_api_key` closure above forwards the key VERBATIM,
@@ -1223,38 +1329,35 @@ fn anthropic_auth_headers(
     // (`ApiKey`) scheme is trimmed here. The OAuth (`authorization: Bearer`) and the Ambiguous
     // passthrough/static fallbacks keep the raw closures below, preserving their byte-for-byte
     // round-trip contract — a forwarded caller token must reach the upstream exactly as presented.
-    let x_api_key_trimmed = || {
-        (
-            HeaderName::from_static("x-api-key"),
-            safe("x-api-key", key.trim_start().to_string()),
-        )
-    };
-    let authorization = || {
-        (
-            HeaderName::from_static("authorization"),
-            safe("authorization", format!("Bearer {key}")),
-        )
-    };
+    let x_api_key_trimmed = || safe("x-api-key", key.trim_start().to_string());
+    let authorization = || safe("authorization", format!("Bearer {key}"));
     let version = (
         HeaderName::from_static("anthropic-version"),
         HeaderValue::from_static(ANTHROPIC_API_VERSION),
     );
+    // Assemble the credential header(s) (each an `Option`, omitted on bad bytes) followed by the
+    // always-present `anthropic-version`.
+    let assemble = |creds: Vec<Option<(HeaderName, HeaderValue)>>| -> Vec<(HeaderName, HeaderValue)> {
+        let mut out: Vec<(HeaderName, HeaderValue)> = creds.into_iter().flatten().collect();
+        out.push(version.clone());
+        out
+    };
     match AnthropicWriter::classify_credential(key) {
         // Configured Anthropic API key: native API-key client shape — `x-api-key` only. Use the
         // leading-whitespace-trimmed builder so a configured key with a stray leading space (the
         // value `classify_credential` already matched on its trimmed form) is forwarded clean.
-        AnthropicCredScheme::ApiKey => vec![x_api_key_trimmed(), version],
+        AnthropicCredScheme::ApiKey => assemble(vec![x_api_key_trimmed()]),
         // OAuth access token / passthrough Bearer token: native OAuth client shape —
         // `authorization: Bearer` only.
-        AnthropicCredScheme::OAuth => vec![authorization(), version],
+        AnthropicCredScheme::OAuth => assemble(vec![authorization()]),
         // Unrecognized shape: the mode resolves it to a single native header on the wire path;
         // the mode-blind primitive falls back to both so neither path silently drops.
         AnthropicCredScheme::Ambiguous => match mode {
-            Some(crate::auth::AuthMode::Passthrough) => vec![authorization(), version],
+            Some(crate::auth::AuthMode::Passthrough) => assemble(vec![authorization()]),
             Some(crate::auth::AuthMode::Token) | Some(crate::auth::AuthMode::None) => {
-                vec![x_api_key(), version]
+                assemble(vec![x_api_key()])
             }
-            None => vec![x_api_key(), authorization(), version],
+            None => assemble(vec![x_api_key(), authorization()]),
         },
     }
 }
@@ -1282,12 +1385,6 @@ impl ProtocolWriter for AnthropicWriter {
         // forwards the caller's token as `authorization: Bearer`; Token/None present the configured
         // key as `x-api-key`. Clear ApiKey/OAuth credentials are unaffected (still single-header).
         anthropic_auth_headers(key, Some(ctx.auth_mode))
-    }
-
-    fn rewrite_model(&self, body: &mut serde_json::Value, model: &str) {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("model".to_string(), serde_json::json!(model));
-        }
     }
 
     fn requires_max_tokens(&self) -> bool {
@@ -1374,11 +1471,20 @@ impl ProtocolWriter for AnthropicWriter {
             let tools_array: Vec<_> = req.tools.iter().map(write_tool).collect();
             out.insert("tools".to_string(), serde_json::Value::Array(tools_array));
         }
+        // Emit `tool_choice` in Anthropic's native object shape when present (PF-H1) so a forced /
+        // targeted directive translated from another protocol does not silently degrade to `auto`.
+        if let Some(tc) = &req.tool_choice {
+            out.insert("tool_choice".to_string(), write_anthropic_tool_choice(tc));
+        }
         if let Some(max_tokens) = req.max_tokens {
             out.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
         }
         if let Some(temperature) = req.temperature {
-            out.insert("temperature".to_string(), serde_json::json!(temperature));
+            // Clamp to Anthropic's valid [0.0, 1.0] (PF-M1). OpenAI / Responses accept temperature up
+            // to 2.0, so a cross-protocol request can carry a value Anthropic's API rejects with a 422;
+            // clamping forwards the closest valid value instead of bouncing a 422 back to the caller.
+            let clamped = temperature.clamp(0.0, 1.0);
+            out.insert("temperature".to_string(), serde_json::json!(clamped));
         }
         // Sampling controls promoted to first-class IR fields (see `IrRequest`): emit each in
         // Anthropic's native shape when present. `top_p`/`top_k` map 1:1; the IR's normalized `stop`
@@ -1550,7 +1656,10 @@ impl ProtocolWriter for AnthropicWriter {
             } => {
                 let mut delta_obj = serde_json::Map::new();
                 if let Some(reason) = stop_reason {
-                    delta_obj.insert("stop_reason".to_string(), serde_json::json!(reason));
+                    delta_obj.insert(
+                        "stop_reason".to_string(),
+                        serde_json::json!(map_stop_reason_for_anthropic(reason)),
+                    );
                 } else {
                     delta_obj.insert("stop_reason".to_string(), serde_json::Value::Null);
                 }
@@ -1688,7 +1797,10 @@ impl ProtocolWriter for AnthropicWriter {
         // stop_reason (omit if None — a native body omits it until the turn ends, and omitting
         // keeps same-protocol round-trips lossless)
         if let Some(ref reason) = resp.stop_reason {
-            obj.insert("stop_reason".to_string(), serde_json::json!(reason));
+            obj.insert(
+                "stop_reason".to_string(),
+                serde_json::json!(map_stop_reason_for_anthropic(reason)),
+            );
         }
 
         // stop_sequence: a native non-streaming Anthropic `Message` ALWAYS carries this key — the
@@ -1971,31 +2083,40 @@ mod anthropic_hardening_tests {
     }
 
     /// A key with bytes invalid for an HTTP header value (e.g. a trailing newline) must not panic
-    /// the worker; the (single) credential header falls back to empty so the upstream returns a
-    /// clean 401. An invalid API key emits only the empty `x-api-key` (no `authorization`).
+    /// the worker. Under the warn+OMIT policy (matching the Bearer/Gemini/Cohere/Responses writers)
+    /// the credential header is now OMITTED entirely — an empty `x-api-key: ` was both a
+    /// syntactically invalid header and a fingerprinting tell. `anthropic-version` stays present so
+    /// the upstream still gets a versioned (but unauthenticated) request and returns a clean 401.
     #[test]
-    fn auth_headers_invalid_api_key_falls_back_to_empty_no_panic() {
+    fn auth_headers_invalid_api_key_omits_credential_no_panic() {
         // A recognizable API key (so the single-header API-key path is exercised) whose bytes are
         // invalid for an HTTP header value.
         let headers = AnthropicWriter.auth_headers("sk-ant-api03-bad\nkey");
-        assert_eq!(header_value(&headers, "x-api-key").as_deref(), Some(""));
+        assert!(
+            header_value(&headers, "x-api-key").is_none(),
+            "an invalid API key must OMIT x-api-key, not emit an empty value"
+        );
         assert!(
             header_value(&headers, "authorization").is_none(),
             "an invalid API key still must not emit an authorization header"
         );
-        // anthropic-version is static and unaffected by the bad key.
+        // anthropic-version is static and unaffected by the bad key — it remains the only header.
         assert_eq!(
             header_value(&headers, "anthropic-version").as_deref(),
             Some("2023-06-01")
         );
+        assert_eq!(headers.len(), 1, "only anthropic-version remains on a bad key");
     }
 
-    /// The same empty-value-no-panic guarantee on the OAuth path: an invalid OAuth token emits
-    /// only the empty `authorization` header (no `x-api-key`).
+    /// The same warn+OMIT guarantee on the OAuth path: an invalid OAuth token OMITS the
+    /// `authorization` header (and never emits `x-api-key`), keeping only `anthropic-version`.
     #[test]
-    fn auth_headers_invalid_oauth_token_falls_back_to_empty_no_panic() {
+    fn auth_headers_invalid_oauth_token_omits_credential_no_panic() {
         let headers = AnthropicWriter.auth_headers("sk-ant-oat01-bad\ntoken");
-        assert_eq!(header_value(&headers, "authorization").as_deref(), Some(""));
+        assert!(
+            header_value(&headers, "authorization").is_none(),
+            "an invalid OAuth token must OMIT authorization, not emit an empty value"
+        );
         assert!(
             header_value(&headers, "x-api-key").is_none(),
             "an invalid OAuth token still must not emit an x-api-key header"
@@ -2004,6 +2125,7 @@ mod anthropic_hardening_tests {
             header_value(&headers, "anthropic-version").as_deref(),
             Some("2023-06-01")
         );
+        assert_eq!(headers.len(), 1, "only anthropic-version remains on a bad token");
     }
 
     /// extract_error parses the body once and surfaces both provider_code and structured_type.
@@ -3925,6 +4047,7 @@ mod anthropic_hardening_tests {
             top_p: None,
             top_k: None,
             stop: Vec::new(),
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3976,5 +4099,315 @@ mod anthropic_hardening_tests {
             Some("system"),
             "write_message must never emit role:\"system\" for an IrRole::System message"
         );
+    }
+
+    // ---- PF-H1: tool_choice round-trips (Anthropic native shape) ----
+
+    fn read_anthropic_request(body: serde_json::Value) -> crate::ir::IrRequest {
+        AnthropicReader.read_request(&body).expect("read_request")
+    }
+
+    #[test]
+    fn tool_choice_any_required_roundtrips() {
+        // Anthropic {type:"any"} == "must call some tool" == IR Required; round-trips back to {any}.
+        let ir = read_anthropic_request(serde_json::json!({
+            "model": "claude", "max_tokens": 16, "messages": [],
+            "tool_choice": {"type": "any"}
+        }));
+        assert_eq!(ir.tool_choice, Some(crate::ir::IrToolChoice::Required));
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(out["tool_choice"], serde_json::json!({"type": "any"}));
+    }
+
+    #[test]
+    fn tool_choice_specific_tool_roundtrips() {
+        let ir = read_anthropic_request(serde_json::json!({
+            "model": "claude", "max_tokens": 16, "messages": [],
+            "tool_choice": {"type": "tool", "name": "get_weather"}
+        }));
+        assert_eq!(
+            ir.tool_choice,
+            Some(crate::ir::IrToolChoice::Tool {
+                name: "get_weather".to_string()
+            })
+        );
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(
+            out["tool_choice"],
+            serde_json::json!({"type": "tool", "name": "get_weather"})
+        );
+    }
+
+    #[test]
+    fn tool_choice_auto_and_none_roundtrip() {
+        for (native_type, variant) in [
+            ("auto", crate::ir::IrToolChoice::Auto),
+            ("none", crate::ir::IrToolChoice::None),
+        ] {
+            let ir = read_anthropic_request(serde_json::json!({
+                "model": "c", "max_tokens": 16, "messages": [],
+                "tool_choice": {"type": native_type}
+            }));
+            assert_eq!(ir.tool_choice, Some(variant));
+            let out = AnthropicWriter.write_request(&ir);
+            assert_eq!(out["tool_choice"], serde_json::json!({"type": native_type}));
+        }
+    }
+
+    #[test]
+    fn tool_choice_absent_emits_nothing() {
+        let ir = read_anthropic_request(serde_json::json!({
+            "model": "c", "max_tokens": 16, "messages": []
+        }));
+        assert_eq!(ir.tool_choice, None);
+        let out = AnthropicWriter.write_request(&ir);
+        assert!(
+            out.get("tool_choice").is_none(),
+            "absent tool_choice must NOT gain a spurious value on write"
+        );
+    }
+
+    /// Cross-protocol PF-H1: an OpenAI forced-function `tool_choice` reaches an Anthropic backend as
+    /// the native `{type:"tool", name}` directive — NOT silently degraded to auto. Simulates the
+    /// cross-protocol seam by clearing `extra` between read and write (forward.rs `ir.extra.clear()`).
+    #[test]
+    fn tool_choice_openai_specific_to_anthropic_targeted() {
+        let openai_body = serde_json::json!({
+            "model": "gpt", "messages": [],
+            "tools": [{"type":"function","function":{"name":"get_weather","parameters":{}}}],
+            "tool_choice": {"type":"function","function":{"name":"get_weather"}}
+        });
+        let mut ir = crate::proto::OpenAiReader
+            .read_request(&openai_body)
+            .expect("openai read");
+        assert_eq!(
+            ir.tool_choice,
+            Some(crate::ir::IrToolChoice::Tool {
+                name: "get_weather".to_string()
+            })
+        );
+        ir.extra.clear(); // cross-protocol seam
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(
+            out["tool_choice"],
+            serde_json::json!({"type": "tool", "name": "get_weather"}),
+            "forced OpenAI tool must round-trip to Anthropic's targeted tool_choice, not auto"
+        );
+    }
+
+    // ---- PF-H2: tool-scoped cache_control survives ----
+
+    #[test]
+    fn tool_definition_cache_control_roundtrips() {
+        let ir = read_anthropic_request(serde_json::json!({
+            "model": "c", "max_tokens": 16, "messages": [],
+            "tools": [{
+                "name": "big_tool", "input_schema": {"type":"object"},
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }));
+        assert!(
+            ir.tools[0].cache_control.is_some(),
+            "tool-def cache_control must be promoted into the IR (PF-H2)"
+        );
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(
+            out["tools"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "tool-def cache breakpoint must survive to the Anthropic egress"
+        );
+    }
+
+    #[test]
+    fn tool_use_and_result_cache_control_roundtrips() {
+        let ir = read_anthropic_request(serde_json::json!({
+            "model": "c", "max_tokens": 16,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type":"tool_use","id":"t1","name":"f","input":{},
+                     "cache_control":{"type":"ephemeral"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type":"tool_result","tool_use_id":"t1","content":"ok",
+                     "cache_control":{"type":"ephemeral"}}
+                ]}
+            ]
+        }));
+        // ToolUse cache_control promoted...
+        match &ir.messages[0].content[0] {
+            crate::ir::IrBlock::ToolUse { cache_control, .. } => {
+                assert!(cache_control.is_some(), "tool_use cache_control lost")
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+        // ...and ToolResult cache_control promoted.
+        match &ir.messages[1].content[0] {
+            crate::ir::IrBlock::ToolResult { cache_control, .. } => {
+                assert!(cache_control.is_some(), "tool_result cache_control lost")
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(
+            out["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            out["messages"][1]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    // ---- PF-M1: temperature clamp to Anthropic's [0,1] ----
+
+    #[test]
+    fn temperature_above_one_is_clamped_not_422() {
+        // An OpenAI/Responses-valid temp of 1.5 must be clamped to 1.0 for Anthropic (which rejects
+        // >1.0 with a 422), never forwarded verbatim.
+        let mut ir = read_anthropic_request(serde_json::json!({
+            "model": "c", "max_tokens": 16, "messages": []
+        }));
+        ir.temperature = Some(1.5);
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(
+            out["temperature"],
+            serde_json::json!(1.0),
+            "temperature 1.5 must clamp to 1.0, not produce a 422-bound body"
+        );
+        // A value already in range is untouched.
+        ir.temperature = Some(0.7);
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(out["temperature"], serde_json::json!(0.7));
+        // A negative value clamps up to 0.0.
+        ir.temperature = Some(-0.3);
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(out["temperature"], serde_json::json!(0.0));
+    }
+
+    // ---- PF-H7: OpenAI -> Anthropic tool_choice direction ----
+    // The IR variant is protocol-neutral, so an OpenAI-ingress tool_choice (read into the IR by the
+    // OpenAI reader) must emit the correct Anthropic native shape on the Anthropic writer. The
+    // `required` -> `{"type":"any"}` mapping is the load-bearing case.
+    #[test]
+    fn test_openai_to_anthropic_tool_choice_directions() {
+        use crate::ir::IrToolChoice;
+        let cases = [
+            (IrToolChoice::Auto, serde_json::json!({"type": "auto"})),
+            (IrToolChoice::None, serde_json::json!({"type": "none"})),
+            // OpenAI `"required"` reads to IR `Required`; Anthropic's native form is `{"type":"any"}`.
+            (IrToolChoice::Required, serde_json::json!({"type": "any"})),
+            (
+                IrToolChoice::Tool {
+                    name: "get_weather".to_string(),
+                },
+                serde_json::json!({"type": "tool", "name": "get_weather"}),
+            ),
+        ];
+        for (tc, expected) in cases {
+            let mut ir = read_anthropic_request(serde_json::json!({
+                "model": "c", "max_tokens": 16, "messages": []
+            }));
+            ir.tool_choice = Some(tc.clone());
+            let out = AnthropicWriter.write_request(&ir);
+            assert_eq!(out["tool_choice"], expected, "tool_choice {tc:?}");
+        }
+    }
+
+    // ---- PF-M5: catch-all tool_choice values map to None (never silently Auto/Required) ----
+    #[test]
+    fn test_anthropic_unknown_tool_choice_type_is_none() {
+        // An object with an unrecognized `type` must degrade to None, not force a tool call.
+        assert_eq!(
+            read_anthropic_tool_choice(Some(&serde_json::json!({"type": "future_mode"}))),
+            None
+        );
+    }
+
+    #[test]
+    fn test_anthropic_tool_choice_tool_without_name_is_none() {
+        // `{"type":"tool"}` with NO `name` is structurally incomplete -> None (we can't target an
+        // unnamed tool, and must not fall back to forcing some tool).
+        assert_eq!(
+            read_anthropic_tool_choice(Some(&serde_json::json!({"type": "tool"}))),
+            None
+        );
+    }
+
+    // ---- PF-L1: IR `safety` stop_reason is not a native Anthropic StopReason -> map to end_turn ----
+    #[test]
+    fn test_anthropic_safety_stop_reason_maps_to_end_turn() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![],
+            stop_reason: Some("safety".to_string()),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("claude-x".to_string()),
+            id: Some("msg_01abc".to_string()),
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = AnthropicWriter.write_response(&resp);
+        assert_eq!(
+            out["stop_reason"],
+            serde_json::json!("end_turn"),
+            "IR `safety` must collapse to the native `end_turn` on Anthropic egress; got {out}"
+        );
+        // A native reason still passes through verbatim.
+        let resp2 = crate::ir::IrResponse {
+            stop_reason: Some("max_tokens".to_string()),
+            ..resp
+        };
+        let out2 = AnthropicWriter.write_response(&resp2);
+        assert_eq!(out2["stop_reason"], serde_json::json!("max_tokens"));
+    }
+
+    // ---- PF-L1 (streaming egress): the SAME `safety` -> `end_turn` collapse must hold on the
+    // streaming path (`write_response_event` / `MessageDelta`), not just the non-stream
+    // `write_response`. A non-native IR `safety` reason must never leak into the wire
+    // `message_delta.delta.stop_reason`. ----
+    #[test]
+    fn test_anthropic_streaming_safety_stop_reason_maps_to_end_turn() {
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: Some("safety".to_string()),
+            stop_sequence: None,
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (event, data) = AnthropicWriter
+            .write_response_event(&ev)
+            .expect("MessageDelta must emit a message_delta event");
+        assert_eq!(event, "message_delta");
+        assert_eq!(
+            data["delta"]["stop_reason"],
+            serde_json::json!("end_turn"),
+            "IR `safety` must collapse to native `end_turn` on the STREAMING Anthropic egress \
+             (not leak `safety`); got {data}"
+        );
+
+        // A native reason still passes through verbatim on the streaming path.
+        let ev2 = IrStreamEvent::MessageDelta {
+            stop_reason: Some("max_tokens".to_string()),
+            stop_sequence: None,
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+        let (_event2, data2) = AnthropicWriter
+            .write_response_event(&ev2)
+            .expect("MessageDelta must emit a message_delta event");
+        assert_eq!(data2["delta"]["stop_reason"], serde_json::json!("max_tokens"));
     }
 }

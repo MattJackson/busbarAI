@@ -85,6 +85,20 @@ fn clamp_frame_index(data: &serde_json::Value) -> usize {
 /// `extra`). Built once per process via `OnceLock` instead of being reconstructed on every
 /// `read_request` call — the rebuild was a pointless per-request allocation on the Cohere ingress
 /// hot path (the MEDIUM/performance finding, shared with the Gemini/Bedrock readers).
+/// Normalize Cohere v2's native `tool_choice` (a top-level enum STRING) into the IR's tool-choice
+/// union so a forced directive survives the cross-protocol seam instead of degrading to `auto`
+/// (PF-H1). Cohere v2 models only `REQUIRED` (must call some tool) and `NONE` (no tool); it has no
+/// `auto` literal (auto is the default when omitted) and no way to pin ONE specific tool. So an
+/// unrecognized/absent value yields `None` (omitted), and the targeted-tool case is handled lossily
+/// on the WRITE side (degraded to `REQUIRED`). The reader can only ever observe `REQUIRED`/`NONE`.
+fn read_cohere_tool_choice(val: Option<&serde_json::Value>) -> Option<crate::ir::IrToolChoice> {
+    match val?.as_str()? {
+        "REQUIRED" => Some(crate::ir::IrToolChoice::Required),
+        "NONE" => Some(crate::ir::IrToolChoice::None),
+        _ => None,
+    }
+}
+
 fn cohere_modeled_keys() -> &'static std::collections::HashSet<&'static str> {
     static MODELED_KEYS: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
     MODELED_KEYS.get_or_init(|| {
@@ -92,6 +106,7 @@ fn cohere_modeled_keys() -> &'static std::collections::HashSet<&'static str> {
             "model",
             "messages",
             "tools",
+            "tool_choice",
             "max_tokens",
             "temperature",
             "p",
@@ -526,6 +541,7 @@ impl ProtocolReader for CohereReader {
                                         id,
                                         name,
                                         input,
+                                        cache_control: None,
                                     });
                                 }
                             }
@@ -586,6 +602,7 @@ impl ProtocolReader for CohereReader {
                             citations: Vec::new(),
                         }],
                         is_error: false,
+                        cache_control: None,
                     });
                 }
 
@@ -622,6 +639,7 @@ impl ProtocolReader for CohereReader {
                         name,
                         description,
                         input_schema,
+                        cache_control: None,
                     });
                 }
             }
@@ -650,6 +668,9 @@ impl ProtocolReader for CohereReader {
             .and_then(|v| v.as_u64())
             .and_then(|v| u32::try_from(v).ok());
         let stop = crate::ir::read_stop_sequences(obj.get("stop_sequences"));
+        // Cohere v2 `tool_choice` is a top-level enum string (REQUIRED/NONE). Promote it to the IR
+        // union so a forced directive survives the cross-protocol seam (PF-H1).
+        let tool_choice = read_cohere_tool_choice(obj.get("tool_choice"));
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Built once per process and reused across every request rather than rebuilt on each
@@ -671,6 +692,7 @@ impl ProtocolReader for CohereReader {
             top_p,
             top_k,
             stop,
+            tool_choice,
             stream,
             extra,
         })
@@ -1030,7 +1052,12 @@ impl ProtocolReader for CohereReader {
                         .unwrap_or("{}");
                     let input = serde_json::from_str(arguments)
                         .unwrap_or(serde_json::Value::String(arguments.to_string()));
-                    content.push(crate::ir::IrBlock::ToolUse { id, name, input });
+                    content.push(crate::ir::IrBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        cache_control: None,
+                    });
                 }
             }
         }
@@ -1220,32 +1247,10 @@ impl ProtocolWriter for CohereWriter {
     }
 
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
-        // Validate the composed `Bearer <key>` value against the HTTP header-value byte rules
-        // (`HeaderValue::from_str` rejects ASCII control bytes such as a newline or NUL — e.g. a
-        // stray CR/LF injected by a config system). The prior `unwrap_or_else(HeaderValue::from_static(""))`
-        // SILENTLY emitted a syntactically invalid `Authorization: ` header: Cohere then 401s every
-        // request on the lane with NO proxy-side signal, and the empty-Bearer form is itself a tell
-        // a backend can compare against well-formed tokens. Instead — mirroring `GeminiWriter::auth_headers`
-        // and `BedrockWriter::sign_request` — surface a `tracing::warn!` and OMIT the header entirely
-        // (empty vec). The request is still sent (the trait can't refuse it here) and Cohere answers
-        // 401, but the warn line tells the operator the lane's credential bytes are invalid. The key
-        // itself is NEVER logged (it is the secret); only the fact that it is malformed.
-        match HeaderValue::from_str(&format!("Bearer {key}")) {
-            Ok(value) => vec![(HeaderName::from_static("authorization"), value)],
-            Err(_) => {
-                tracing::warn!(
-                    "cohere: authorization credential contains invalid header bytes (ASCII \
-                     control character); omitting auth header — upstream will reject with 401"
-                );
-                Vec::new()
-            }
-        }
-    }
-
-    fn rewrite_model(&self, body: &mut serde_json::Value, model: &str) {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("model".to_string(), serde_json::json!(model));
-        }
+        // Shared warn+OMIT policy: a credential with bytes invalid for an HTTP header value is
+        // dropped (with a protocol-named warn, never the key bytes) rather than emitting an empty
+        // `Authorization:` tell. See `super::bearer_auth_headers`.
+        super::bearer_auth_headers("cohere", key)
     }
 
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
@@ -1316,6 +1321,7 @@ impl ProtocolWriter for CohereWriter {
                         tool_use_id,
                         content,
                         is_error: _,
+                        ..
                     } = block
                     {
                         let mut tool_result_obj = serde_json::Map::new();
@@ -1380,7 +1386,10 @@ impl ProtocolWriter for CohereWriter {
             if msg.role == crate::ir::IrRole::Assistant {
                 let mut tool_calls_arr: Vec<serde_json::Value> = Vec::new();
                 for block in &msg.content {
-                    if let crate::ir::IrBlock::ToolUse { id, name, input } = block {
+                    if let crate::ir::IrBlock::ToolUse {
+                        id, name, input, ..
+                    } = block
+                    {
                         let args_str =
                             serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                         tool_calls_arr.push(serde_json::json!({ "id": id, "type": "function", "function": { "name": name, "arguments": args_str }}));
@@ -1424,11 +1433,38 @@ impl ProtocolWriter for CohereWriter {
             out.insert("tools".to_string(), serde_json::Value::Array(tools_arr));
         }
 
+        // Cohere v2 `tool_choice` is a top-level enum string with only REQUIRED/NONE — there is NO
+        // single-tool targeting in the Cohere v2 API. `Auto` is Cohere's default (omit the field).
+        //
+        // A targeted single tool (`IrToolChoice::Tool { name }`) therefore has NO faithful Cohere
+        // representation, so we degrade it to REQUIRED — force *some* tool — rather than silently
+        // dropping to `auto`: this preserves the caller's "must call a tool" intent, which is the
+        // load-bearing half of the request. What is lost is the *target* (the specific tool name):
+        // Cohere may pick any tool, not the one the caller named. This is the ONE documented
+        // tool_choice degradation in the codebase — lossy-by-target, intentional, and unavoidable
+        // until/unless the Cohere v2 API gains a named-tool choice (PF-H1).
+        if let Some(tc) = &req.tool_choice {
+            let v = match tc {
+                crate::ir::IrToolChoice::Required | crate::ir::IrToolChoice::Tool { .. } => {
+                    Some("REQUIRED")
+                }
+                crate::ir::IrToolChoice::None => Some("NONE"),
+                crate::ir::IrToolChoice::Auto => None,
+            };
+            if let Some(s) = v {
+                out.insert("tool_choice".to_string(), serde_json::json!(s));
+            }
+        }
+
         if let Some(max_tokens) = req.max_tokens {
             out.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
         }
         if let Some(temperature) = req.temperature {
-            out.insert("temperature".to_string(), serde_json::json!(temperature));
+            // Clamp to Cohere's native [0.0, 1.0] (PF-M1). OpenAI / Responses accept temperature up to
+            // 2.0, so a cross-protocol request can carry a value Cohere's API rejects with a hard 400
+            // ValidationException; clamping forwards the closest valid value instead.
+            let clamped = temperature.clamp(0.0, 1.0);
+            out.insert("temperature".to_string(), serde_json::json!(clamped));
         }
         // Promoted sampling controls in Cohere v2's native names: `p` (top_p), `k` (top_k),
         // `stop_sequences`. Emitted before the `extra` overlay (the reader pulled these keys out of
@@ -1710,7 +1746,9 @@ impl ProtocolWriter for CohereWriter {
                 crate::ir::IrBlock::Text { text, .. } => {
                     content_arr.push(serde_json::json!({ "type": "text", "text": text }));
                 }
-                crate::ir::IrBlock::ToolUse { id, name, input } => {
+                crate::ir::IrBlock::ToolUse {
+                    id, name, input, ..
+                } => {
                     let args_str =
                         serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                     // Accumulate every tool call. Inserting per-iteration would overwrite the
@@ -1843,6 +1881,7 @@ mod tests {
                         id: "t1".to_string(),
                         name: "f".to_string(),
                         input: serde_json::json!({"x": 1}),
+                        cache_control: None,
                     }],
                 },
                 crate::ir::IrMessage {
@@ -1855,6 +1894,7 @@ mod tests {
                             citations: Vec::new(),
                         }],
                         is_error: false,
+                        cache_control: None,
                     }],
                 },
             ],
@@ -1862,12 +1902,14 @@ mod tests {
                 name: "f".to_string(),
                 description: Some("..".to_string()),
                 input_schema: serde_json::json!({}),
+                cache_control: None,
             }],
             max_tokens: Some(1024),
             temperature: Some(0.7),
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -1936,6 +1978,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: true,
             extra: serde_json::Map::new(),
         };
@@ -2151,16 +2194,19 @@ mod tests {
                     id: "t1".to_string(),
                     name: "get_weather".to_string(),
                     input: serde_json::json!({"city": "SF"}),
+                    cache_control: None,
                 },
                 crate::ir::IrBlock::ToolUse {
                     id: "t2".to_string(),
                     name: "get_time".to_string(),
                     input: serde_json::json!({"tz": "PST"}),
+                    cache_control: None,
                 },
                 crate::ir::IrBlock::ToolUse {
                     id: "t3".to_string(),
                     name: "get_news".to_string(),
                     input: serde_json::json!({}),
+                    cache_control: None,
                 },
             ],
             stop_reason: Some("tool_use".to_string()),
@@ -2205,6 +2251,7 @@ mod tests {
                     id: "t1".to_string(),
                     name: "f".to_string(),
                     input: serde_json::json!({"x": 1}),
+                    cache_control: None,
                 }],
             }],
             tools: vec![],
@@ -2213,6 +2260,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2251,6 +2299,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3033,11 +3082,13 @@ mod tests {
                     id: "t1".to_string(),
                     name: "get_weather".to_string(),
                     input: serde_json::json!({"city": "SF"}),
+                    cache_control: None,
                 },
                 crate::ir::IrBlock::ToolUse {
                     id: "t2".to_string(),
                     name: "get_time".to_string(),
                     input: serde_json::json!({"tz": "PST"}),
+                    cache_control: None,
                 },
             ],
             stop_reason: Some("tool_use".to_string()),
@@ -3545,6 +3596,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3713,6 +3765,7 @@ mod tests {
                             citations: Vec::new(),
                         }],
                         is_error: false,
+                        cache_control: None,
                     },
                 ],
             }],
@@ -3722,6 +3775,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3760,6 +3814,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3807,6 +3862,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -5263,6 +5319,135 @@ mod tests {
         assert_eq!(
             stop_data.get("type").and_then(|t| t.as_str()),
             Some("content-end")
+        );
+    }
+
+    /// Minimal IR request carrying a single tool and an explicit `tool_choice`, for the PF-H1
+    /// round-trip tests below.
+    fn ir_with_tool_choice(tc: Option<crate::ir::IrToolChoice>) -> crate::ir::IrRequest {
+        crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: vec![crate::ir::IrTool {
+                name: "get_weather".to_string(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                cache_control: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            tool_choice: tc,
+            stream: false,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn test_cohere_tool_choice_required_roundtrips() {
+        // REQUIRED reads into the IR union and re-emits as the native enum string (PF-H1).
+        let body = serde_json::json!({
+            "model": "command-r",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "REQUIRED"
+        });
+        let ir = CohereReader
+            .read_request(&body)
+            .expect("read_request should succeed");
+        assert_eq!(ir.tool_choice, Some(crate::ir::IrToolChoice::Required));
+
+        let writer = CohereWriter;
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out.get("tool_choice").and_then(|v| v.as_str()),
+            Some("REQUIRED")
+        );
+    }
+
+    #[test]
+    fn test_cohere_tool_choice_none() {
+        // NONE round-trips to the IR `None` variant (forbid tools), distinct from omission.
+        let body = serde_json::json!({
+            "model": "command-r",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "NONE"
+        });
+        let ir = CohereReader
+            .read_request(&body)
+            .expect("read_request should succeed");
+        assert_eq!(ir.tool_choice, Some(crate::ir::IrToolChoice::None));
+
+        let writer = CohereWriter;
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out.get("tool_choice").and_then(|v| v.as_str()),
+            Some("NONE")
+        );
+    }
+
+    #[test]
+    fn test_cohere_tool_choice_specific_degrades_to_required() {
+        // Cohere cannot pin ONE tool; a targeted IrToolChoice::Tool (e.g. translated from an OpenAI
+        // `tool_choice:{type:function,...}`) must degrade to REQUIRED — force *some* tool — NOT
+        // silently drop to auto. This is the load-bearing PF-H1 behavior on a lossy-by-target hop.
+        let ir = ir_with_tool_choice(Some(crate::ir::IrToolChoice::Tool {
+            name: "get_weather".to_string(),
+        }));
+        let writer = CohereWriter;
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out.get("tool_choice").and_then(|v| v.as_str()),
+            Some("REQUIRED"),
+            "a forced specific tool must degrade to REQUIRED, never to auto"
+        );
+    }
+
+    #[test]
+    fn test_cohere_tool_choice_auto_omitted() {
+        // Auto is Cohere's default — the writer must omit the field entirely (emitting "auto" would
+        // be invalid for Cohere v2), and an absent inbound tool_choice reads as None (the Option).
+        let ir = ir_with_tool_choice(Some(crate::ir::IrToolChoice::Auto));
+        let writer = CohereWriter;
+        let out = writer.write_request(&ir);
+        assert!(
+            out.get("tool_choice").is_none(),
+            "Auto must omit tool_choice (it is Cohere's default)"
+        );
+
+        let body = serde_json::json!({
+            "model": "command-r",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let ir = CohereReader
+            .read_request(&body)
+            .expect("read_request should succeed");
+        assert_eq!(ir.tool_choice, None);
+        let writer = CohereWriter;
+        let out = writer.write_request(&ir);
+        assert!(out.get("tool_choice").is_none());
+    }
+
+    // PF-M1: OpenAI/Responses ingress accepts temperature up to 2.0, but Cohere's native range is
+    // [0.0, 1.0] and rejects >1 with a hard 400 ValidationException. The writer must clamp.
+    #[test]
+    fn test_cohere_writer_clamps_temperature_above_one() {
+        let mut ir = ir_with_tool_choice(None);
+        ir.temperature = Some(1.8);
+        let writer = CohereWriter;
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out.get("temperature").and_then(|v| v.as_f64()),
+            Some(1.0),
+            "an OpenAI-ingress temperature of 1.8 must clamp to 1.0 on the Cohere writer; got {out}"
         );
     }
 }

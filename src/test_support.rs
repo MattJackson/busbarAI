@@ -1259,6 +1259,7 @@ mod tests {
             .pool_runtime(
                 "pe",
                 crate::state::PoolRuntime {
+                    members: Default::default(),
                     failover: Some(crate::config::FailoverCfg {
                         deadline_secs: 120,
                         exclusions: Some(vec!["beta".to_string()]),
@@ -1266,6 +1267,7 @@ mod tests {
                     }),
                     affinity: None,
                     breaker: None,
+                    policy: None,
                 },
             )
             .build();
@@ -1492,7 +1494,7 @@ mod tests {
 
     /// a virtual key over its budget is rejected (429 for body/Anthropic ingress) before forwarding.
     #[tokio::test]
-    async fn test_governance_budget_402() {
+    async fn test_governance_budget_over_quota() {
         use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
 
         crate::metrics::init();
@@ -1565,9 +1567,9 @@ mod tests {
     }
 
     /// Build a router whose ONLY virtual key is already over its (total-window) budget, so every
-    /// request is rejected with a 402 by `budget_check` before any forwarding. Returns the bound
-    /// address, the serve handle, and the secret to present. Shared by the per-protocol 402
-    /// envelope tests below: the rejection fires before resolution, so no lane/pool/backend is
+    /// request is rejected with a 429 (Bedrock ingress: 400) by `budget_check` before any forwarding.
+    /// Returns the bound address, the serve handle, and the secret to present. Shared by the
+    /// per-protocol over-quota envelope tests below: the rejection fires before resolution, so no lane/pool/backend is
     /// needed — only a parseable body that carries `model` where the protocol expects it.
     async fn over_budget_router() -> (
         std::net::SocketAddr,
@@ -1603,10 +1605,10 @@ mod tests {
         (addr, handle, secret)
     }
 
-    /// OpenAI ingress (`/v1/chat/completions`): an over-budget 402 must carry the native OpenAI error
+    /// OpenAI ingress (`/v1/chat/completions`): an over-budget 429 must carry the native OpenAI error
     /// envelope (`error.type == "insufficient_quota"`).
     #[tokio::test]
-    async fn test_budget_402_openai_envelope() {
+    async fn test_budget_over_quota_openai_envelope() {
         crate::metrics::init();
         let (addr, handle, secret) = over_budget_router().await;
 
@@ -1630,15 +1632,15 @@ mod tests {
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
             Some("insufficient_quota"),
-            "openai 402 carries insufficient_quota error.type; got {body}"
+            "openai 429 carries insufficient_quota error.type; got {body}"
         );
         handle.abort();
     }
 
-    /// Responses ingress (`/v1/responses`): an over-budget 402 must carry the native Responses error
+    /// Responses ingress (`/v1/responses`): an over-budget 429 must carry the native Responses error
     /// envelope (`error.type == "insufficient_quota"`).
     #[tokio::test]
-    async fn test_budget_402_responses_envelope() {
+    async fn test_budget_over_quota_responses_envelope() {
         crate::metrics::init();
         let (addr, handle, secret) = over_budget_router().await;
 
@@ -1668,10 +1670,10 @@ mod tests {
         handle.abort();
     }
 
-    /// Cohere ingress (`/v2/chat`): an over-budget 402 must carry the native Cohere error envelope —
+    /// Cohere ingress (`/v2/chat`): an over-budget 429 must carry the native Cohere error envelope —
     /// a BARE top-level `message` with NO `error`/`type` wrapper.
     #[tokio::test]
-    async fn test_budget_402_cohere_envelope() {
+    async fn test_budget_over_quota_cohere_envelope() {
         crate::metrics::init();
         let (addr, handle, secret) = over_budget_router().await;
 
@@ -1686,20 +1688,20 @@ mod tests {
         let body: serde_json::Value = r.json().await.unwrap();
         assert!(
             body.get("message").and_then(|m| m.as_str()).is_some(),
-            "cohere 402 envelope carries a bare top-level message; got {body}"
+            "cohere 429 envelope carries a bare top-level message; got {body}"
         );
         assert!(
             body.get("error").is_none() && body.get("type").is_none(),
-            "cohere 402 envelope has NO error/type wrapper (native Cohere shape); got {body}"
+            "cohere 429 envelope has NO error/type wrapper (native Cohere shape); got {body}"
         );
         handle.abort();
     }
 
     /// Gemini ingress (`/v1beta/models/x:generateContent`): an over-budget rejection must carry the
     /// native Gemini quota envelope — `error.code == 429` and `error.status == "RESOURCE_EXHAUSTED"`
-    /// (the canonical quota shape; the old 402 yielded a mismatched INVALID_ARGUMENT status).
+    /// (the canonical quota shape; the old behavior yielded a mismatched INVALID_ARGUMENT status).
     #[tokio::test]
-    async fn test_budget_402_gemini_envelope() {
+    async fn test_budget_over_quota_gemini_envelope() {
         crate::metrics::init();
         let (addr, handle, secret) = over_budget_router().await;
 
@@ -1733,10 +1735,10 @@ mod tests {
 
     /// Bedrock ingress (`/model/x/converse`): an over-budget rejection must carry the native AWS
     /// JSON-1.1 error envelope (`__type == "ServiceQuotaExceededException"`) at a 400-class status
-    /// (the native AWS shape for ServiceQuotaExceededException — NOT 429/402) AND the
+    /// (the native AWS shape for ServiceQuotaExceededException — NOT 429) AND the
     /// `x-amzn-errortype` / `x-amzn-RequestId` headers a native Bedrock runtime response carries.
     #[tokio::test]
-    async fn test_budget_402_bedrock_envelope() {
+    async fn test_budget_over_quota_bedrock_envelope() {
         crate::metrics::init();
         let (addr, handle, secret) = over_budget_router().await;
 
@@ -3663,11 +3665,16 @@ mod tests {
                     target: "m".into(),
                     weight: 1,
                     context_max: None,
+                    tier: None,
+                    cost_per_mtok: None,
+                    tags: Vec::new(),
                 }],
                 breaker: None,
                 failover: None,
                 on_exhausted: None,
                 affinity: None,
+                route: crate::config::RouteKind::default(),
+                policy: None,
             };
             let make = |error_map: std::collections::HashMap<String, String>| {
                 let mut providers = HashMap::new();
@@ -3682,6 +3689,7 @@ mod tests {
                         path: None,
                         auth: None,
                         _legacy_api_key: None,
+                        allow_metadata_hosts: Vec::new(),
                     },
                 );
                 let mut models = HashMap::new();
@@ -3690,10 +3698,14 @@ mod tests {
                 pools.insert("mypool".to_string(), pool.clone());
                 RootCfg {
                     listen: "0.0.0.0:8080".into(),
+                    tls: None,
                     auth: None,
                     providers,
                     models,
                     pools,
+                    blocked_metadata_hosts: Vec::new(),
+                    allow_metadata_hosts: Vec::new(),
+                    allow_all_metadata: false,
                 }
             };
 

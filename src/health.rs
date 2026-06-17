@@ -160,7 +160,7 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
         .client
         .post(format!("{}{}", lane.base_url, wire_path))
         .headers(convert_headers(auth))
-        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_TYPE, crate::forward::APPLICATION_JSON)
         .header(USER_AGENT, crate::forward::egress_user_agent(egress_name))
         .header(ACCEPT, crate::forward::egress_accept(egress_name, false))
         .timeout(timeout)

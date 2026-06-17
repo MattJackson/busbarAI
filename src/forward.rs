@@ -28,18 +28,6 @@ use crate::store::{now, Permit};
 /// Without this the upstream 400s with `max_tokens: Field required`. Uses the lane's configured
 /// `default_max_tokens`, falling back to `crate::proto::DEFAULT_MAX_TOKENS`. No-op when the IR
 /// already carries a value or the egress protocol treats `max_tokens` as optional.
-/// Current unix time in whole seconds, or 0 if the system clock predates the epoch. Never panics —
-/// it is on the request path, where a clock error must degrade (a `created: 0` is still a valid int
-/// every SDK accepts) rather than abort. Mirrors the per-protocol `unix_now_secs` helpers; used at
-/// the cross-protocol seam to stamp a synthesized `created` so an identity-empty egress reader's IR
-/// (e.g. Bedrock) trips the writers' `created`-based boundary signal.
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn apply_required_max_tokens(ir: &mut crate::ir::IrRequest, lane: &Lane) {
     if ir.max_tokens.is_none() && lane.protocol.writer().requires_max_tokens() {
         ir.max_tokens = Some(
@@ -48,6 +36,16 @@ fn apply_required_max_tokens(ir: &mut crate::ir::IrRequest, lane: &Lane) {
         );
     }
 }
+
+/// The two `x-busbar-*` TRANSPARENCY response headers stamped when a non-default routing policy
+/// chose the target lane: the policy name and the chosen lane's model. Hoisted to consts so the
+/// emit site and any future readers cannot drift on spelling.
+const HDR_ROUTE_POLICY: &str = "x-busbar-route-policy";
+const HDR_ROUTE_TARGET: &str = "x-busbar-route-target";
+
+/// The `application/json` media type — the default `Content-Type`/`Accept` for the JSON REST
+/// surfaces. Hoisted to one const so the literal isn't repeated across egress/health/observability.
+pub(crate) const APPLICATION_JSON: &str = "application/json";
 
 /// Attach the `x-amzn-RequestId` header to a SUCCESS response builder when the ingress client is a
 /// native AWS Bedrock SDK. A genuine Bedrock `Converse`/`ConverseStream` 2xx ALWAYS carries this
@@ -66,7 +64,7 @@ fn maybe_attach_bedrock_amzn_id(
         return rb;
     }
     match crate::proto::synth_amzn_request_id() {
-        Some(id) => rb.header("x-amzn-requestid", id),
+        Some(id) => rb.header(crate::proto::HDR_AMZN_REQUEST_ID, id),
         None => rb,
     }
 }
@@ -93,6 +91,26 @@ fn maybe_attach_anthropic_request_id(
         .or_else(crate::proto::synth_anthropic_request_id)
     {
         Some(id) => rb.header("request-id", id),
+        None => rb,
+    }
+}
+
+/// TRANSPARENCY: stamp which routing POLICY chose which TARGET onto a successful response, mirroring
+/// the `x-busbar-*` header convention (e.g. the bedrock/anthropic request-id headers above):
+/// `x-busbar-route-policy: <policy name>` and `x-busbar-route-target: <chosen lane model>`. Emitted
+/// ONLY when a non-default policy actually produced the order (`policy_name == Some`); a default
+/// `route: weighted` pool (or a policy that Abstained → SWRR) attaches NOTHING, so the zero-cost path
+/// adds no header. Both values are bounded, operator-defined strings (a fixed policy enumeration + a
+/// configured model name), never request-derived data.
+fn maybe_attach_route_policy(
+    rb: axum::http::response::Builder,
+    policy_name: Option<&'static str>,
+    target_model: &str,
+) -> axum::http::response::Builder {
+    match policy_name {
+        Some(name) => rb
+            .header(HDR_ROUTE_POLICY, name)
+            .header(HDR_ROUTE_TARGET, target_model),
         None => rb,
     }
 }
@@ -129,7 +147,7 @@ pub(crate) fn ingress_error(ingress: &str, status: StatusCode, kind: &str, msg: 
     });
     let mut resp = Response::builder()
         .status(status)
-        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_TYPE, APPLICATION_JSON)
         .body(Body::from(body))
         .unwrap_or_else(|_| status.into_response());
     // Bedrock ingress: a real AWS Bedrock runtime response ALWAYS carries `x-amzn-RequestId` (the
@@ -389,6 +407,13 @@ pub(crate) fn translate_request_cross_protocol(
 /// cross-protocol 2xx completion (see [`MAX_TRANSLATED_BODY_BYTES`]).
 const MAX_UPSTREAM_BUFFERED_BYTES: usize = 256 * 1024;
 
+/// Worst-case per-poll scan budget for the [`UsageTap`] stream scanners (`feed` and
+/// `feed_eventstream`). A single coalesced terminal flush is realistically far smaller than this;
+/// the cap bounds per-poll scan time on the Tokio worker. A chunk larger than this is skipped with
+/// a `warn!` so the resulting accounting gap is observable rather than silent. Shared by both
+/// scanners (and the non-stream test predicate) so the threshold is defined in exactly one place.
+const MAX_SCAN_BYTES: usize = 512 * 1024;
+
 /// Upper bound on a buffered cross-protocol non-stream SUCCESS (2xx) body that must be parsed and
 /// translated egress→IR→ingress. A real completion (large `max_tokens` output, big tool-call
 /// arguments, embedded content) can far exceed the tight error-body cap; truncating it would make
@@ -516,7 +541,7 @@ fn extract_error_message(bytes: &[u8]) -> Option<String> {
 /// SSE `error` event, or a Gemini `google.rpc.Status` element carries generic service phrasing, never
 /// the word "upstream" — leaking it is a protocol-indistinguishability tell on the most-exercised
 /// cross-protocol error path. Keep this generic and free of any intermediary/translation vocabulary.
-pub(crate) const MID_STREAM_GENERIC_DETAIL: &str = "The response stream was interrupted.";
+pub(crate) const MID_STREAM_GENERIC_DETAIL: &str = crate::proto::STREAM_ABORT_DETAIL;
 
 /// Vendor-neutral fallback `error.message` for a NON-2xx response whose body carried no extractable
 /// human message. Rendered into the CLIENT's native error envelope via `ingress_error`, so it must
@@ -684,7 +709,9 @@ fn bedrock_response_to_eventstream(ir: &crate::ir::IrResponse, elapsed_ms: Optio
                 );
                 push(&IrStreamEvent::BlockStop { index }, &mut out);
             }
-            IrBlock::ToolUse { id, name, input } => {
+            IrBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 push(
                     &IrStreamEvent::BlockStart {
                         index,
@@ -767,15 +794,15 @@ fn bedrock_response_to_eventstream(ir: &crate::ir::IrResponse, elapsed_ms: Optio
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UsageTap {
     /// Extracted input tokens (from message_delta.usage.input_tokens or message_stop.usage.input_tokens)
-    pub input_tokens: Option<u64>,
+    pub(crate) input_tokens: Option<u64>,
     /// Extracted output tokens (from message_delta.usage.output_tokens or message_stop.usage.output_tokens)
-    pub output_tokens: Option<u64>,
+    pub(crate) output_tokens: Option<u64>,
     /// A genuine terminal ERROR frame seen mid-stream (an SSE `{"type":"error", ...}` event). This
     /// is the signal that gates breaker failure recording at stream end: a clean stream ends with a
     /// normal terminator (`message_stop` / `[DONE]`) and leaves this `None` (→ success, already
     /// recorded synchronously), whereas a stream that carried an explicit error frame ended
     /// abnormally (→ record one breaker failure). Holds the error message for observability.
-    pub terminal_error: Option<String>,
+    pub(crate) terminal_error: Option<String>,
     /// Cross-chunk reassembly buffer for the BINARY `application/vnd.amazon.eventstream` body of a
     /// same-protocol bedrock→bedrock passthrough (`feed_eventstream`). The JSON `feed` path keeps no
     /// cross-chunk state (it scans complete objects per chunk), but binary eventstream frames carry a
@@ -852,7 +879,6 @@ impl UsageTap {
         // TPM/spend budget. A chunk still larger than this is skipped (the worst-case poll-latency
         // guard), but now with a `warn!` so the accounting gap is OBSERVABLE in production instead of
         // invisible — ops can raise the cap or investigate the upstream's chunking if it fires.
-        const MAX_SCAN_BYTES: usize = 512 * 1024;
         if chunk.len() > MAX_SCAN_BYTES {
             tracing::warn!(
                 chunk_len = chunk.len(),
@@ -883,7 +909,6 @@ impl UsageTap {
         // MAX_FRAME_BYTES, but a chunk far larger than a realistically coalesced terminal flush is
         // skipped to bound per-poll scan time on the Tokio worker, with a warn so the accounting gap
         // is observable rather than silent.
-        const MAX_SCAN_BYTES: usize = 512 * 1024;
         if self.eventstream_buf.len().saturating_add(chunk.len()) > MAX_SCAN_BYTES {
             tracing::warn!(
                 buffered = self.eventstream_buf.len(),
@@ -1097,14 +1122,7 @@ impl UsageTap {
 /// Deterministic FNV-1a hash of a string — stable across processes/restarts (unlike the
 /// std `DefaultHasher`, whose seed is randomized), so session affinity pins consistently.
 fn stable_hash(s: &str) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    for &byte in s.as_bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+    crate::store::fnv1a_u64(s)
 }
 
 /// Find the start of a JSON object (opening brace) in bytes.
@@ -1154,17 +1172,17 @@ fn find_matching_brace(chunk: &[u8]) -> Option<usize> {
 /// key + its budget period + the governance store). `None` when governance is off or no key resolved.
 #[derive(Clone)]
 pub(crate) struct UsageSink {
-    pub gov: Arc<crate::governance::GovState>,
-    pub key_id: String,
-    pub period: String,
+    pub(crate) gov: Arc<crate::governance::GovState>,
+    pub(crate) key_id: String,
+    pub(crate) period: String,
     /// Wall-clock epoch (seconds) captured ONCE at header-arrival time for this request. Both the
-    /// flat per-request fee (`route::finish` → `record_request`) and the token fee (`record_tokens`,
+    /// flat per-request fee (`route::budget_check` → `try_charge_request_within_budget`) and the token fee (`record_tokens`,
     /// fired at stream end / on the buffered path) are attributed to the window this epoch implies,
     /// so a single streaming request whose stream completes in a later rate-limit/budget window than
     /// its headers arrived cannot split its two charges across two windows (#29). Without it, the two
     /// calls read the clock independently and could land in different 60s rate windows / budget
     /// periods, mis-attributing spend and TPM.
-    pub charged_at: u64,
+    pub(crate) charged_at: u64,
 }
 
 /// Integrated UsageTap for non-buffering usage extraction from streaming responses.
@@ -1631,7 +1649,9 @@ where
                     // ERROR frame (`tap.terminal_error` set) OR whose cross-protocol translate
                     // aborted mid-flight (`translate_aborted`) delivered a partial/aborted response
                     // the caller cannot use, and billing it contradicts the flat-fee-only-on-success
-                    // policy (`route::finish` charges the per-request fee only on 2xx). Mirror that
+                    // policy (the per-request fee is charged at admission by
+                    // `route::budget_check`→`try_charge_request_within_budget`, and `route::finish`
+                    // REFUNDS it on a non-2xx, so the net flat fee lands only on a 2xx). Mirror that
                     // here with the SAME `failed` predicate the breaker gate above uses: a failed
                     // stream is not token-billed, covering BOTH the SSE-ingress and json-array close
                     // paths (the json-array path previously fell through and billed an aborted
@@ -1754,6 +1774,11 @@ async fn pick_among(
     request_ctx: &mut RequestCtx,
     _affinity_key: Option<&str>,
     pool_name: &str,
+    // The routing policy's ranked preference for this request, resolved ONCE before the failover loop
+    // (see the ROUTING-POLICY SEAM in `forward_with_pool`). `None` is the ZERO-COST default: pure
+    // SWRR, byte-identical to pre-feature behavior. `Some(order)` makes selection walk the ranked
+    // lanes through the unchanged breaker filter instead of the blind SWRR pick (see SELECTION below).
+    policy_order: Option<&[usize]>,
 ) -> Option<(usize, Permit)> {
     let t = now();
 
@@ -1796,28 +1821,95 @@ async fn pick_among(
             return None;
         }
 
-        let filtered_cands: Vec<&WeightedLane> = request_ctx
-            .filter_candidates(cands)
-            .into_iter()
-            .filter(|wl| !local_excluded.contains(&wl.idx))
-            .collect();
+        // Pre-size to the candidate count: this loop body re-runs on every within-pick retry hop, so
+        // avoiding per-iteration Vec growth reallocations matters on the hot path. The filter can only
+        // DROP entries, so `cands.len()` is an upper bound (capacity, not fill); selection semantics
+        // are unchanged.
+        let mut filtered_cands: Vec<&WeightedLane> = Vec::with_capacity(cands.len());
+        filtered_cands.extend(
+            request_ctx
+                .filter_candidates(cands)
+                .into_iter()
+                .filter(|wl| !local_excluded.contains(&wl.idx)),
+        );
         if filtered_cands.is_empty() {
             return None;
         }
 
         // Extract lane indices and weights for select_weighted call
-        let candidates: Vec<usize> = filtered_cands.iter().map(|wl| wl.idx).collect();
-        let weights: Vec<u32> = filtered_cands.iter().map(|wl| wl.weight).collect();
+        let mut candidates: Vec<usize> = Vec::with_capacity(filtered_cands.len());
+        candidates.extend(filtered_cands.iter().map(|wl| wl.idx));
+        let mut weights: Vec<u32> = Vec::with_capacity(filtered_cands.len());
+        weights.extend(filtered_cands.iter().map(|wl| wl.weight));
 
-        // SWRR selection (side-effect-free filter) over healthy members only, per this pool's cells.
-        let picked_lane_idx =
-            match app
+        // SELECTION. Two paths, and ONLY two:
+        //
+        //  • `policy_order == None` (the ZERO-COST DEFAULT, `route: weighted` / absent): byte-identical
+        //    to pre-feature behavior — a single `select_weighted_in` call, the unchanged inline SWRR.
+        //
+        //  • `policy_order == Some(order)` (a routing policy returned `Prefer`): an ORDERED WALK.
+        //    Honor EXACTLY the same health filter SWRR honors — `select_weighted_in` admits a candidate
+        //    iff it is lane-admissible (not dead / in budget) AND its per-pool breaker cell is ready
+        //    (the side-effect-FREE `ready_in`, the SAME predicate SWRR's filter uses). So: pick the
+        //    FIRST lane in the policy's ranked `order` that is (a) still in this hop's candidate set
+        //    (`candidates` is already exclusions- and local_excluded-filtered) and (b) `ready_in`. A
+        //    preferred lane that is tripped / dead / excluded / at-capacity-by-breaker fails this check
+        //    and we walk to the next. If NO ranked lane qualifies — every preferred lane is
+        //    unhealthy/excluded, OR the policy ranked only a subset and those are exhausted — we fall
+        //    THROUGH to `select_weighted_in` over the same candidate set, which both (i) preserves the
+        //    contract's "an omitted/unranked candidate is lowest-priority but still REACHABLE, never
+        //    stranded" guarantee, and (ii) keeps `Abstain` ⇒ today's SWRR exact (Abstain resolves to
+        //    `policy_order == None`, so it never reaches this arm at all).
+        //
+        // The walk only ORDERS. It does NOT touch the breaker/probe/failover machinery: `ready_in` is
+        // a read-only peek (no Open→HalfOpen transition, no single-flight probe CAS), and the SOLE
+        // mutating admission — `acquire_for_dispatch_in` below — still runs EXACTLY ONCE on the chosen
+        // lane, identically to the SWRR path. A preferred lane that then loses the HalfOpen probe race
+        // is `local_excluded` + re-walked just like an SWRR pick, so it falls to the next preferred
+        // lane (or to SWRR) with no change to breaker, failover, or translation behavior.
+        let picked_lane_idx = match policy_order {
+            Some(order) => {
+                let now_t = now();
+                // First ranked lane that is in this hop's candidate set, NOT drained, AND breaker-ready.
+                //
+                // C2 (weight:0 drain): SWRR's `select_weighted_in` skips `weight == 0` members (the
+                // operator drain signal — see store.rs). The side-effect-free `ready_in` does NOT
+                // check weight, so without this filter the ordered walk could rank a DRAINED lane #1
+                // and dispatch to it, violating operator drain intent. Mirror SWRR here: a candidate
+                // weighted to 0 is excluded from the preferred walk. It still falls through to
+                // `select_weighted_in` below if no ranked lane qualifies — which itself re-skips
+                // weight-0 — so a fully-drained candidate set strands nothing it shouldn't.
+                let preferred = order.iter().copied().find(|idx| {
+                    candidates
+                        .iter()
+                        .position(|c| c == idx)
+                        .is_some_and(|pos| weights[pos] != 0)
+                        && app.store.ready_in(pool_name, *idx, now_t)
+                });
+                match preferred {
+                    Some(idx) => idx,
+                    // No ranked lane qualifies: fall through to SWRR over the same candidates so an
+                    // unranked-but-healthy lane is still reachable (never stranded by the policy).
+                    None => {
+                        match app
+                            .store
+                            .select_weighted_in(pool_name, &candidates, &weights, now_t)
+                        {
+                            Some(i) => i,
+                            None => return None,
+                        }
+                    }
+                }
+            }
+            // Zero-cost default: today's exact inline SWRR, one predictable branch.
+            None => match app
                 .store
                 .select_weighted_in(pool_name, &candidates, &weights, now())
             {
                 Some(i) => i,
                 None => return None,
-            };
+            },
+        };
 
         // The dispatched lane does the breaker probe acquisition exactly once here (Open→HalfOpen
         // CAS). If it lost the single-flight probe race, drop it locally and re-select another lane.
@@ -1956,9 +2048,25 @@ pub(crate) fn host_from_base(base: &str) -> String {
 /// `url` crate's path parser unchanged, so the transmitted request path equals the signed canonical
 /// path byte-for-byte and AWS cannot reject with SignatureDoesNotMatch over a path-encoding mismatch.
 pub(crate) fn sign_and_wire_path(url_path: &str) -> String {
+    sign_and_wire_path_parts(url_path).0
+}
+
+/// Like [`sign_and_wire_path`] but ALSO returns the SigV4 `canonical_uri` (the encoded path with the
+/// query stripped) so callers that need both don't re-split the wire path and allocate a SECOND
+/// `String` for the canonical URI. On the common no-query path the encoded path IS the canonical URI,
+/// so it is reused for both fields and only the wire path is (cheaply) cloned; with a query the wire
+/// path is `canonical?query`. Output is byte-identical to the previous split-and-`to_string` form.
+pub(crate) fn sign_and_wire_path_parts(url_path: &str) -> (String, String) {
     match url_path.split_once('?') {
-        Some((path, query)) => format!("{}?{}", crate::sigv4::uri_encode_path(path), query),
-        None => crate::sigv4::uri_encode_path(url_path),
+        Some((path, query)) => {
+            let canonical = crate::sigv4::uri_encode_path(path);
+            let wire = format!("{canonical}?{query}");
+            (wire, canonical)
+        }
+        None => {
+            let canonical = crate::sigv4::uri_encode_path(url_path);
+            (canonical.clone(), canonical)
+        }
     }
 }
 
@@ -2046,7 +2154,7 @@ pub(crate) fn egress_accept(egress_protocol: &str, wants_stream: bool) -> &'stat
             if wants_stream {
                 "application/vnd.amazon.eventstream"
             } else {
-                "application/json"
+                APPLICATION_JSON
             }
         }
         // Anthropic, OpenAI/Responses, Gemini, and Cohere SDKs all negotiate JSON for the unary call
@@ -2055,7 +2163,7 @@ pub(crate) fn egress_accept(egress_protocol: &str, wants_stream: bool) -> &'stat
             if wants_stream {
                 "text/event-stream"
             } else {
-                "application/json"
+                APPLICATION_JSON
             }
         }
         // Unknown/foreign egress: a present, plausible Accept still beats sending none.
@@ -2063,7 +2171,7 @@ pub(crate) fn egress_accept(egress_protocol: &str, wants_stream: bool) -> &'stat
             if wants_stream {
                 "text/event-stream"
             } else {
-                "application/json"
+                APPLICATION_JSON
             }
         }
     }
@@ -2130,11 +2238,11 @@ pub(crate) async fn forward(
 /// counter for non-pool traffic. Resolve the metric label to the routed lane's model name when the
 /// cell key is empty, leaving named-pool traffic labeled by its pool name. This decouples the metric
 /// label from the cell key WITHOUT touching the cell key itself.
-fn metric_pool_label(app: &Arc<App>, pool_name: &str, i: usize) -> String {
+fn metric_pool_label<'a>(app: &'a Arc<App>, pool_name: &'a str, i: usize) -> &'a str {
     if pool_name.is_empty() {
-        app.lanes[i].model.clone()
+        app.lanes[i].model.as_str()
     } else {
-        pool_name.to_string()
+        pool_name
     }
 }
 
@@ -2146,11 +2254,226 @@ fn metric_pool_label(app: &Arc<App>, pool_name: &str, i: usize) -> String {
 fn emit_breaker_trip(app: &Arc<App>, pool_name: &str, i: usize) {
     metrics::counter!(
         crate::metrics::BREAKER_TRIPS_TOTAL,
-        "pool" => metric_pool_label(app, pool_name, i),
+        "pool" => metric_pool_label(app, pool_name, i).to_owned(),
         "lane" => app.lanes[i].model.clone()
     )
     .increment(1);
     tracing::warn!(pool = %pool_name, lane = %app.lanes[i].model, "lane breaker tripped (Closed→Open)");
+}
+
+/// The coerced result of running a routing policy at the seam — what the ordered walk should do.
+enum PolicyOutcome {
+    /// Use this ranked order (the policy returned `Prefer`, or `on_error == first` produced the
+    /// config member order). `name` is the policy/transport name for the transparency header.
+    Order {
+        order: Vec<usize>,
+        name: &'static str,
+    },
+    /// Fall through to today's SWRR (the policy Abstained, or an error coerced to `on_error: weighted`).
+    Weighted,
+    /// Fail closed with a 503 (`on_error: reject` and the policy errored / timed out).
+    Reject,
+}
+
+/// Sum the chars of a string value, or 0 for a non-string. Cheap v1 SIZE signal (NOT a token count).
+fn json_str_chars(v: &Value) -> usize {
+    v.as_str().map(|s| s.chars().count()).unwrap_or(0)
+}
+
+/// Total chars across the system prompt + every message's text content. Anthropic's `content` is
+/// either a bare string or an array of blocks (`{type:"text", text:"…"}`); both shapes are summed.
+/// A best-effort projection over the pristine ingress body — never fails, never allocates per char.
+fn total_text_chars(v: &Value, system_chars: usize) -> usize {
+    let mut total = system_chars;
+    if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
+        for m in msgs {
+            match m.get("content") {
+                Some(Value::String(s)) => total += s.chars().count(),
+                Some(Value::Array(blocks)) => {
+                    for b in blocks {
+                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                            total += t.chars().count();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    total
+}
+
+/// Build the routing projection (request + candidates + context) and run the resolved policy ONCE,
+/// bounded by its configured timeout, coercing the result to a `PolicyOutcome` per `on_error`.
+///
+/// This runs ONLY for a pool with a non-default `route:` — the zero-cost default path never calls it
+/// and never constructs any of these projection types. Every signal is REAL data: `cost_per_mtok`
+/// from member config, `latency_ms` from the per-lane EWMA, `available_concurrency` from the lane
+/// semaphore, `budget_remaining` from the lane budget, and `rate_headroom` from the caller key's
+/// governance rate window. A policy error/timeout NEVER reaches the client: it degrades per `on_error`
+/// (weighted / reject / first).
+#[allow(clippy::too_many_arguments)]
+async fn decide_policy_order(
+    app: &Arc<App>,
+    resolved: &crate::routing::ResolvedPolicy,
+    cands: &[WeightedLane],
+    request_ctx: &RequestCtx,
+    v: &Value,
+    pool_name: &str,
+    ingress_protocol: &str,
+    wants_stream: bool,
+    caller_token: Option<&str>,
+) -> PolicyOutcome {
+    use crate::routing::{
+        Candidate, ResolvedPolicy, RoutingContext, RoutingDecision, RoutingRequest,
+    };
+
+    // `Weighted` resolves to `None` at config load, so a `ResolvedPolicy::Weighted` never reaches the
+    // seam — but handle it defensively as "fall through to SWRR" rather than panicking.
+    let (policy, on_error, timeout) = match resolved {
+        ResolvedPolicy::Weighted => return PolicyOutcome::Weighted,
+        ResolvedPolicy::Policy {
+            policy,
+            on_error,
+            timeout,
+        } => (policy, on_error, *timeout),
+    };
+
+    // The candidate set the policy ranks over = this pool's members MINUS the already-excluded ones
+    // (configured exclusions). `idx` is the stable lane handle the ordered walk speaks.
+    let live: Vec<&WeightedLane> = request_ctx.filter_candidates(cands);
+    if live.is_empty() {
+        // Nothing to rank — let the loop's exhaustion handling take over (SWRR will also find none).
+        return PolicyOutcome::Weighted;
+    }
+
+    // Per-key governance rate headroom (same value across candidates today — rate limits are per-key;
+    // see `Candidate.rate_headroom`). Computed ONCE: a single key lookup + window read.
+    let rate_headroom: Option<f64> = match (app.governance.as_ref(), caller_token) {
+        (Some(gov), Some(tok)) => gov.rate_headroom_for_token(tok, now()),
+        _ => None,
+    };
+
+    let member_meta = app.pool_runtime.get(pool_name).map(|r| &r.members);
+
+    // Count the system prompt's chars ONCE: it feeds both `total_chars` (via `total_text_chars`) and
+    // `system_chars`, so computing it inline twice would run the O(n) UTF-8 scan over the system block
+    // twice. Off the zero-cost default path (only non-default route policies reach here).
+    let system_chars = v.get("system").map(json_str_chars).unwrap_or(0);
+
+    let req = RoutingRequest {
+        pool: pool_name,
+        ingress_protocol,
+        requested_model: v.get("model").and_then(|m| m.as_str()),
+        message_count: v
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
+        tool_count: v
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
+        has_tools: v
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .is_some_and(|a| !a.is_empty()),
+        total_chars: total_text_chars(v, system_chars),
+        system_chars,
+        max_tokens: v
+            .get("max_tokens")
+            .and_then(|m| m.as_u64())
+            .map(|n| n as u32),
+        stream: wants_stream,
+    };
+
+    let candidates: Vec<Candidate> = live
+        .iter()
+        .map(|wl| {
+            let lane = &app.lanes[wl.idx];
+            let meta = member_meta.and_then(|m| m.get(&wl.idx));
+            Candidate {
+                idx: wl.idx,
+                model: &lane.model,
+                provider: &lane.provider,
+                weight: wl.weight,
+                context_max: lane.context_max,
+                tier: meta.and_then(|m| m.tier.as_deref()),
+                cost_per_mtok: meta.and_then(|m| m.cost_per_mtok),
+                tags: meta.map(|m| m.tags.as_slice()).unwrap_or(&[]),
+                latency_ms: app.store.lane_latency_ms(wl.idx),
+                available_concurrency: app.store.available_permits(wl.idx),
+                budget_remaining: app.store.lane_budget_remaining(wl.idx),
+                rate_headroom,
+            }
+        })
+        .collect();
+
+    let ctx = RoutingContext {
+        pool: pool_name,
+        // The per-key governance BUDGET is intentionally NOT fed to the routing seam: budget is an
+        // admission concern (enforced upstream of routing), not a lane-selection signal, so exposing
+        // it here would let a policy reshape traffic on a quantity that does not describe lane health.
+        // The per-key RATE signal IS surfaced — as each lane's `rate_headroom` above (the RPM/TPM
+        // fraction remaining), which is a legitimate "is this key near its limit" routing input.
+        budget_remaining: None,
+    };
+
+    // Run the decision under a HARD wall-clock timeout (the policy is also asked to respect `budget`).
+    // A timeout or an `Err` is coerced to `on_error`; an impl that simply has no opinion returns
+    // `Ok(Abstain)`. The decision NEVER blocks past `timeout` and NEVER propagates an error to the
+    // client.
+    let decision: RoutingDecision = match tokio::time::timeout(
+        timeout,
+        policy.decide(&req, &candidates, &ctx, timeout),
+    )
+    .await
+    {
+        Ok(Ok(d)) => d,
+        // Policy errored, or timed out: apply on_error. The policy/transport stays cancel-safe — a
+        // dropped future on timeout is fine.
+        Ok(Err(_)) | Err(_) => {
+            return coerce_on_error(on_error, &candidates, policy.name());
+        }
+    };
+
+    match decision {
+        RoutingDecision::Prefer(order) => {
+            // Normalize against the valid candidate idxs (drop unknown, dedup). An empty result is
+            // Abstain — fall through to SWRR.
+            let valid: std::collections::HashSet<usize> =
+                candidates.iter().map(|c| c.idx).collect();
+            match RoutingDecision::from_ranked(order, &valid) {
+                RoutingDecision::Prefer(o) => PolicyOutcome::Order {
+                    order: o,
+                    name: policy.name(),
+                },
+                RoutingDecision::Abstain => PolicyOutcome::Weighted,
+            }
+        }
+        // Abstain is the clean "no opinion" — today's exact SWRR (NOT coerced via on_error).
+        RoutingDecision::Abstain => PolicyOutcome::Weighted,
+    }
+}
+
+/// Coerce an `on_error` fallback into a `PolicyOutcome` when the policy errored / timed out:
+/// `weighted` ⇒ SWRR, `first` ⇒ the config member order (a deterministic degraded pick), `reject`
+/// ⇒ a 503. `first` advertises the policy name so the degraded pick is still observable.
+fn coerce_on_error(
+    on_error: &crate::config::PolicyOnError,
+    candidates: &[crate::routing::Candidate<'_>],
+    policy_name: &'static str,
+) -> PolicyOutcome {
+    use crate::config::PolicyOnError;
+    match on_error {
+        PolicyOnError::Weighted => PolicyOutcome::Weighted,
+        PolicyOnError::Reject => PolicyOutcome::Reject,
+        PolicyOnError::First => PolicyOutcome::Order {
+            order: candidates.iter().map(|c| c.idx).collect(),
+            name: policy_name,
+        },
+    }
 }
 
 /// Forward with pool name context for on_exhausted config lookup.
@@ -2209,7 +2532,7 @@ pub(crate) async fn forward_with_pool(
     let gemini_json_array = ingress_protocol == "gemini" && wants_gemini_json_array(&v);
 
     // Derive affinity key early (before any mutations to v)
-    let _affinity_key_str: Option<String> = if let Some(k) = affinity_key {
+    let affinity_key_str: Option<String> = if let Some(k) = affinity_key {
         Some(k.to_string())
     } else {
         v.get("system")
@@ -2262,6 +2585,74 @@ pub(crate) async fn forward_with_pool(
         }
     }
 
+    // ── ROUTING-POLICY SEAM ───────────────────────────────────────────────────────────────────────
+    // Resolve this pool's routing policy ONCE, here, before the failover loop. The policy (when
+    // present) produces a ranked member preference that the loop's `pick_among` walks instead of the
+    // blind SWRR pick — composing with the unchanged breaker filter + already-tried exclusion.
+    //
+    // ZERO-COST DEFAULT: a `route: weighted` (default / absent) pool has `policy == None`, so this is
+    // a single predictable always-false branch — no `RoutingRequest`/`Candidate` projection is built,
+    // no async policy is entered, and `policy_order` stays `None`, leaving the loop on today's exact
+    // inline `select_weighted_in` path. The projection + async decision + ordered-walk only ever run
+    // for a pool that resolved a non-default policy.
+    //
+    // `chosen_policy_name` is the policy that actually produced `policy_order` (for the
+    // `x-busbar-route-policy` transparency header). It stays `None` on the default path AND when a
+    // configured policy Abstains / errors-to-weighted (both fall through to SWRR, which is not a
+    // "policy choice" worth advertising).
+    let mut chosen_policy_name: Option<&'static str> = None;
+    let policy_order: Option<Vec<usize>> = match app
+        .pool_runtime
+        .get(pool_name)
+        .and_then(|r| r.policy.as_ref())
+    {
+        // Default fast path: no policy ⇒ SWRR, byte-identical to pre-feature behavior. NOTHING below
+        // this arm runs — no projection, no async, one predictable branch.
+        None => None,
+        // A non-default policy is configured: build the projection, run the decision (bounded by its
+        // timeout), and coerce the outcome to a ranked order (or `None` ⇒ SWRR) per `on_error`.
+        Some(resolved) => {
+            let outcome = decide_policy_order(
+                &app,
+                resolved,
+                &cands,
+                &request_ctx,
+                &v,
+                pool_name,
+                ingress_protocol,
+                wants_stream,
+                caller_token,
+            )
+            .await;
+            match outcome {
+                // The policy returned a usable ranked order — record its name (for the
+                // `x-busbar-route-policy` header + the metric) and hand the order to the ordered walk.
+                PolicyOutcome::Order { order, name } => {
+                    chosen_policy_name = Some(name);
+                    metrics::counter!(
+                        crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
+                        "policy" => name,
+                        "pool" => pool_name.to_string(),
+                    )
+                    .increment(1);
+                    Some(order)
+                }
+                // Abstain / error-coerced-to-weighted: fall through to today's exact SWRR.
+                PolicyOutcome::Weighted => None,
+                // on_error == reject (and the policy errored/timed out / saturated): fail closed with a
+                // 503 rather than silently degrading. Never strands as a hang — a clean rejection.
+                PolicyOutcome::Reject => {
+                    return ingress_error(
+                        ingress_protocol,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "overloaded",
+                        "The routing policy could not select an upstream. Please retry shortly.",
+                    );
+                }
+            }
+        }
+    };
+
     for _attempt in 0..=max_cap {
         // Check deadline first (propagated across hops)
         if request_ctx.expired(now()) {
@@ -2277,8 +2668,9 @@ pub(crate) async fn forward_with_pool(
             &app,
             &cands,
             &mut request_ctx,
-            _affinity_key_str.as_deref(),
+            affinity_key_str.as_deref(),
             pool_name,
+            policy_order.as_deref(),
         )
         .await
         {
@@ -2318,12 +2710,15 @@ pub(crate) async fn forward_with_pool(
         // Resolves to the routed lane's model name on the default (`""`) cell so these series
         // correlate with REQUESTS_TOTAL (which labels model-routed traffic by model, not `""`);
         // the breaker-cell key below stays `pool_name` (`""`) — only the metric LABEL is decoupled.
-        let metric_pool = metric_pool_label(&app, pool_name, i);
+        // Held as a borrow (no up-front allocation); each metric emit owns it (`.to_owned()`) only on
+        // the branch that actually fires, so an attempt allocates the label once per emitted series
+        // instead of eagerly building a `String` and cloning it at every (mostly-unreached) site.
+        let metric_pool: &str = metric_pool_label(&app, pool_name, i);
 
         // count this upstream attempt (re-entrant across failover hops — each is a real attempt).
         metrics::counter!(
             crate::metrics::UPSTREAM_ATTEMPTS_TOTAL,
-            "pool" => metric_pool.clone(),
+            "pool" => metric_pool.to_owned(),
             "lane" => app.lanes[i].model.clone()
         )
         .increment(1);
@@ -2397,14 +2792,10 @@ pub(crate) async fn forward_with_pool(
         // reserved chars like `:` signs `%3A` but a raw send transmits `:`). Encode the path ONCE and
         // use it for both signing and the wire URL — the percent-encoded `%XX` sequences pass through
         // the `url` crate's path parser unchanged, so transmitted path == signed canonical path.
-        let wire_path = sign_and_wire_path(&url_path);
+        let (wire_path, canonical_uri) = sign_and_wire_path_parts(&url_path);
         let signing_ctx = crate::proto::SigningContext {
             host: host_from_base(base),
-            canonical_uri: wire_path
-                .split('?')
-                .next()
-                .unwrap_or(&wire_path)
-                .to_string(),
+            canonical_uri,
             body: &payload,
             timestamp_epoch: now(),
             auth_mode: app.auth_mode(),
@@ -2415,7 +2806,7 @@ pub(crate) async fn forward_with_pool(
             .client
             .post(format!("{base}{wire_path}"))
             .headers(convert_headers(auth))
-            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_TYPE, APPLICATION_JSON)
             // Native-SDK User-Agent for the egress protocol. The shared client sets none, so without
             // this the backend sees a UA-less request — a proxy fingerprint (see egress_user_agent).
             .header(USER_AGENT, egress_user_agent(egress_name))
@@ -2462,14 +2853,14 @@ pub(crate) async fn forward_with_pool(
                 }
                 metrics::counter!(
                     crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                    "pool" => metric_pool.clone(),
+                    "pool" => metric_pool.to_owned(),
                     "lane" => app.lanes[i].model.clone(),
                     "disposition" => "transient_upstream"
                 )
                 .increment(1);
                 metrics::counter!(
                     crate::metrics::FAILOVERS_TOTAL,
-                    "pool" => metric_pool.clone(),
+                    "pool" => metric_pool.to_owned(),
                     "reason" => err_type.to_string()
                 )
                 .increment(1);
@@ -2507,14 +2898,17 @@ pub(crate) async fn forward_with_pool(
                         axum::http::HeaderName,
                         axum::http::HeaderValue,
                     )> = if ingress_protocol == "bedrock" {
-                        ["x-amzn-requestid", "x-amzn-errortype"]
-                            .iter()
-                            .filter_map(|name| {
-                                let v = r.headers().get(*name)?.clone();
-                                let n = axum::http::HeaderName::from_static(name);
-                                Some((n, v))
-                            })
-                            .collect()
+                        [
+                            crate::proto::HDR_AMZN_REQUEST_ID,
+                            crate::proto::HDR_AMZN_ERROR_TYPE,
+                        ]
+                        .iter()
+                        .filter_map(|name| {
+                            let v = r.headers().get(*name)?.clone();
+                            let n = axum::http::HeaderName::from_static(name);
+                            Some((n, v))
+                        })
+                        .collect()
                     } else {
                         Vec::new()
                     };
@@ -2666,14 +3060,14 @@ pub(crate) async fn forward_with_pool(
                             }
                             metrics::counter!(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                                "pool" => metric_pool.clone(),
+                                "pool" => metric_pool.to_owned(),
                                 "lane" => app.lanes[i].model.clone(),
                                 "disposition" => "transient_upstream"
                             )
                             .increment(1);
                             metrics::counter!(
                                 crate::metrics::FAILOVERS_TOTAL,
-                                "pool" => metric_pool.clone(),
+                                "pool" => metric_pool.to_owned(),
                                 "reason" => "transient_upstream"
                             )
                             .increment(1);
@@ -2716,14 +3110,14 @@ pub(crate) async fn forward_with_pool(
                             // a hard-down is a breaker trip for this lane.
                             metrics::counter!(
                                 crate::metrics::BREAKER_TRIPS_TOTAL,
-                                "pool" => metric_pool.clone(),
+                                "pool" => metric_pool.to_owned(),
                                 "lane" => app.lanes[i].model.clone()
                             )
                             .increment(1);
                             tracing::warn!(pool = %pool_name, lane = %app.lanes[i].model, reason = %reason, "lane hard-down (breaker trip)");
                             metrics::counter!(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                                "pool" => metric_pool.clone(),
+                                "pool" => metric_pool.to_owned(),
                                 "lane" => app.lanes[i].model.clone(),
                                 "disposition" => "hard_down"
                             )
@@ -2771,7 +3165,7 @@ pub(crate) async fn forward_with_pool(
                             // For billing hard downs: continue to next lane (failover)
                             metrics::counter!(
                                 crate::metrics::FAILOVERS_TOTAL,
-                                "pool" => metric_pool.clone(),
+                                "pool" => metric_pool.to_owned(),
                                 "reason" => "hard_down"
                             )
                             .increment(1);
@@ -2801,14 +3195,14 @@ pub(crate) async fn forward_with_pool(
 
                             metrics::counter!(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                                "pool" => metric_pool.clone(),
+                                "pool" => metric_pool.to_owned(),
                                 "lane" => app.lanes[i].model.clone(),
                                 "disposition" => "context_length"
                             )
                             .increment(1);
                             metrics::counter!(
                                 crate::metrics::FAILOVERS_TOTAL,
-                                "pool" => metric_pool.clone(),
+                                "pool" => metric_pool.to_owned(),
                                 "reason" => "context_length"
                             )
                             .increment(1);
@@ -2830,6 +3224,16 @@ pub(crate) async fn forward_with_pool(
                 // of its lifetime request budget (the `max_requests` cost cap; `usable()` stops
                 // admitting the lane once it reaches 0).
                 app.store.record_success_in(pool_name, i);
+                // Fold this request's time-to-headers into the lane's latency EWMA (the routing
+                // `fastest` signal). Measured to the upstream RESPONSE HEADERS (`req.send().await`
+                // completion) — a cheap, bounded proxy that does NOT wait out an unbounded streaming
+                // body. Lane-global + off the selection path; a no-op unless a `route: fastest` (or a
+                // webhook/script policy reading `latency_ms`) consults it.
+                app.store.record_latency_in(
+                    pool_name,
+                    i,
+                    upstream_started.elapsed().as_secs_f64() * 1000.0,
+                );
                 // BIND the spend result (#21): the post-success spend is COST accounting, not the
                 // admission gate (that was `lane_admissible`/`usable` before dispatch). It can no
                 // longer over-spend; `false` means this lane was already at 0 (the next admission
@@ -2851,7 +3255,7 @@ pub(crate) async fn forward_with_pool(
                 // real endpoint and the error path).
                 let upstream_amzn_id = r
                     .headers()
-                    .get("x-amzn-requestid")
+                    .get(crate::proto::HDR_AMZN_REQUEST_ID)
                     .and_then(|h| h.to_str().ok())
                     .map(|s| s.to_string());
                 // Anthropic-ingress: capture the upstream `request-id` so a same-protocol passthrough
@@ -3008,7 +3412,7 @@ pub(crate) async fn forward_with_pool(
                                 // back ON. The same-protocol minimal roundtrip is unaffected because it
                                 // never enters this seam.
                                 if ir.created.is_none() {
-                                    ir.created = Some(unix_now_secs());
+                                    ir.created = Some(now());
                                 }
                                 // CROSS-PROTOCOL tool-id native remap (the response half of the
                                 // §Finding-2 class fix). The egress backend's tool-call ids are in its
@@ -3040,6 +3444,11 @@ pub(crate) async fn forward_with_pool(
                                         .status(status)
                                         .header(CONTENT_TYPE, "application/vnd.amazon.eventstream");
                                     let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
+                                    let rb = maybe_attach_route_policy(
+                                        rb,
+                                        chosen_policy_name,
+                                        &app.lanes[i].model,
+                                    );
                                     return rb
                                         .body(Body::from(frames))
                                         .unwrap_or_else(|_| status.into_response());
@@ -3075,9 +3484,15 @@ pub(crate) async fn forward_with_pool(
                                 // a cross-protocol non-SSE hop; the SSE path uses GeminiJsonArrayFramer.)
                                 if gemini_json_array && wants_stream {
                                     let arr = Value::Array(vec![translated]);
-                                    return Response::builder()
+                                    let rb = Response::builder()
                                         .status(status)
-                                        .header(CONTENT_TYPE, "application/json")
+                                        .header(CONTENT_TYPE, APPLICATION_JSON);
+                                    let rb = maybe_attach_route_policy(
+                                        rb,
+                                        chosen_policy_name,
+                                        &app.lanes[i].model,
+                                    );
+                                    return rb
                                         .body(Body::from(arr.to_string()))
                                         .unwrap_or_else(|_| status.into_response());
                                 }
@@ -3087,13 +3502,18 @@ pub(crate) async fn forward_with_pool(
                                 // Converse response and the error path).
                                 let rb = Response::builder()
                                     .status(status)
-                                    .header(CONTENT_TYPE, "application/json");
+                                    .header(CONTENT_TYPE, APPLICATION_JSON);
                                 let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
                                 // Anthropic-ingress 2xx carries `request-id`. This is the
                                 // CROSS-protocol translate path (ingress != egress), so there is no
                                 // upstream anthropic id to forward — synthesize one.
                                 let rb =
                                     maybe_attach_anthropic_request_id(rb, ingress_protocol, None);
+                                let rb = maybe_attach_route_policy(
+                                    rb,
+                                    chosen_policy_name,
+                                    &app.lanes[i].model,
+                                );
                                 return rb
                                     .body(Body::from(translated.to_string()))
                                     .unwrap_or_else(|_| status.into_response());
@@ -3162,7 +3582,7 @@ pub(crate) async fn forward_with_pool(
                 let cross_protocol = ingress_protocol != app.lanes[i].protocol.name();
                 if gemini_json_array && is_sse {
                     // JSON-array streaming body: a `[ {...}, {...} ]` document, not SSE.
-                    rb = rb.header(CONTENT_TYPE, "application/json");
+                    rb = rb.header(CONTENT_TYPE, APPLICATION_JSON);
                 } else {
                     match (cross_protocol && is_sse)
                         .then(|| ingress_stream_content_type(ingress_protocol))
@@ -3184,7 +3604,7 @@ pub(crate) async fn forward_with_pool(
                 if ingress_protocol == "bedrock" {
                     if let Some(id) = upstream_amzn_id.or_else(crate::proto::synth_amzn_request_id)
                     {
-                        rb = rb.header("x-amzn-requestid", id);
+                        rb = rb.header(crate::proto::HDR_AMZN_REQUEST_ID, id);
                     }
                 }
                 // Anthropic-ingress streaming 2xx must carry `request-id` (a real Anthropic stream
@@ -3194,6 +3614,9 @@ pub(crate) async fn forward_with_pool(
                     ingress_protocol,
                     upstream_request_id.as_deref(),
                 );
+                // TRANSPARENCY: stamp which routing policy chose this target (no-op on the default
+                // path / when the policy Abstained). Covers same-protocol passthrough + all streaming.
+                rb = maybe_attach_route_policy(rb, chosen_policy_name, &app.lanes[i].model);
                 return rb
                     .body(axum_body)
                     .unwrap_or_else(|_| status.into_response());
@@ -3458,7 +3881,7 @@ async fn forward_once(
         .client
         .post(format!("{base}{wire_path}"))
         .headers(convert_headers(auth))
-        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_TYPE, APPLICATION_JSON)
         // Native-SDK User-Agent for the egress protocol (mirrors the main forward path).
         .header(USER_AGENT, egress_user_agent(egress_name))
         // Native-SDK Accept for the egress protocol (mirrors the main forward path; see egress_accept).
@@ -3484,7 +3907,7 @@ async fn forward_once(
             // passthrough forwards the real one; cross-protocol bedrock ingress synthesizes below).
             let upstream_amzn_id = r
                 .headers()
-                .get("x-amzn-requestid")
+                .get(crate::proto::HDR_AMZN_REQUEST_ID)
                 .and_then(|h| h.to_str().ok())
                 .map(|s| s.to_string());
             // The upstream Bedrock `x-amzn-errortype` (a native ConverseStream/Converse error always
@@ -3494,7 +3917,7 @@ async fn forward_once(
             // detectable proxy tell against a native Bedrock endpoint.
             let upstream_amzn_errortype = r
                 .headers()
-                .get("x-amzn-errortype")
+                .get(crate::proto::HDR_AMZN_ERROR_TYPE)
                 .and_then(|h| h.to_str().ok())
                 .map(|s| s.to_string());
             // Anthropic-ingress `request-id` (same-protocol degraded relay forwards it verbatim;
@@ -3548,10 +3971,10 @@ async fn forward_once(
                 // previously captured the id but never attached it, and dropped the errortype.)
                 if ingress_protocol == "bedrock" {
                     if let Some(id) = upstream_amzn_id.as_deref() {
-                        rb = rb.header("x-amzn-requestid", id);
+                        rb = rb.header(crate::proto::HDR_AMZN_REQUEST_ID, id);
                     }
                     if let Some(et) = upstream_amzn_errortype.as_deref() {
-                        rb = rb.header("x-amzn-errortype", et);
+                        rb = rb.header(crate::proto::HDR_AMZN_ERROR_TYPE, et);
                     }
                 }
                 // Probe-leak guard (HIGH #1): same as the cross-protocol non-2xx branch above —
@@ -3572,6 +3995,10 @@ async fn forward_once(
             // lifetime request budget. The degraded callers select via the pool cell, so recording on
             // the default `""` cell left the pool cell wedged HalfOpen + probe_in_flight forever.
             app.store.record_success_in(pool, i);
+            // Mirror the main path: fold time-to-headers into the lane's latency EWMA (routing
+            // `fastest` signal). Lane-global; off the selection path.
+            app.store
+                .record_latency_in(pool, i, upstream_started.elapsed().as_secs_f64() * 1000.0);
             // BIND the spend result (#21): a paired post-headers body TransportError below refunds the
             // budget, but `refund_budget` UNCONDITIONALLY fetch_adds — so refunding a spend that was a
             // no-op (budget already 0) would raise the budget ABOVE its cap. Only refund if this spend
@@ -3668,7 +4095,7 @@ async fn forward_once(
                             // stamp a synthesized `created` so the ingress writers trip their
                             // `created`-based identity gate, exactly as on the main forward path above.
                             if ir.created.is_none() {
-                                ir.created = Some(unix_now_secs());
+                                ir.created = Some(now());
                             }
                             // CROSS-PROTOCOL tool-id native remap — the SAME seam transform the main
                             // forward path applies at 2666-2667. This degraded (LeastBad/FallbackPool)
@@ -3721,7 +4148,7 @@ async fn forward_once(
                                 let arr = Value::Array(vec![translated]);
                                 return Ok(Response::builder()
                                     .status(status)
-                                    .header(CONTENT_TYPE, "application/json")
+                                    .header(CONTENT_TYPE, APPLICATION_JSON)
                                     .body(Body::from(arr.to_string()))
                                     .unwrap_or_else(|_| status.into_response()));
                             }
@@ -3729,7 +4156,7 @@ async fn forward_once(
                             // Converse response and the error path).
                             let rb = Response::builder()
                                 .status(status)
-                                .header(CONTENT_TYPE, "application/json");
+                                .header(CONTENT_TYPE, APPLICATION_JSON);
                             let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
                             // Cross-protocol degraded translate (ingress != egress): no upstream
                             // anthropic id to forward — synthesize the `request-id` header.
@@ -3788,7 +4215,7 @@ async fn forward_once(
             // describe the ingress client's wire, not the upstream's. Same-protocol keeps the upstream
             // CT verbatim.
             if gemini_json_array && is_sse {
-                rb = rb.header(CONTENT_TYPE, "application/json");
+                rb = rb.header(CONTENT_TYPE, APPLICATION_JSON);
             } else {
                 match (cross_protocol && is_sse)
                     .then(|| ingress_stream_content_type(ingress_protocol))
@@ -3808,7 +4235,7 @@ async fn forward_once(
             // id on same-protocol passthrough, else synthesize. Non-bedrock ingress: omit.
             if ingress_protocol == "bedrock" {
                 if let Some(id) = upstream_amzn_id.or_else(crate::proto::synth_amzn_request_id) {
-                    rb = rb.header("x-amzn-requestid", id);
+                    rb = rb.header(crate::proto::HDR_AMZN_REQUEST_ID, id);
                 }
             }
             // Anthropic-ingress 2xx carries `request-id`: forward the upstream's verbatim on a
@@ -3891,7 +4318,11 @@ async fn handle_fallback_pool(
         }
 
         let Some((i, permit)) =
-            pick_among(&app, &fallback_cands, request_ctx, None, pool_name).await
+            // Fallback-pool selection uses plain SWRR by design: routing POLICY applies to the PRIMARY
+            // pool (where it shapes the normal-path lane choice); the fallback pool is the
+            // already-degraded overflow path, so it deliberately selects with the unchanged inline SWRR
+            // (`policy_order == None`) rather than re-running a policy over the spillover candidates.
+            pick_among(&app, &fallback_cands, request_ctx, None, pool_name, None).await
         else {
             // Fallback pool itself exhausted — consult ITS on_exhausted config (multi-level
             // chains). The visited-set guarantees this recursion terminates.
@@ -3991,7 +4422,10 @@ async fn handle_least_bad(
 
 #[cfg(test)]
 mod usage_tap_tests {
-    use super::{find_matching_brace, record_nonstream_usage, stable_hash, UsageSink, UsageTap};
+    use super::{
+        find_matching_brace, record_nonstream_usage, stable_hash, UsageSink, UsageTap,
+        MAX_SCAN_BYTES,
+    };
     use bytes::Bytes;
     use std::sync::Arc;
 
@@ -4000,12 +4434,12 @@ mod usage_tap_tests {
     // epoch), NOT a fresh `store::now()` read at completion time. With a `daily` budget period, a
     // request that arrives on day N but whose (buffered or streamed) response is accounted "now" on
     // day N+1 would, under the old `now()`-based code, charge the token fee into day N+1's window —
-    // splitting it from the flat per-request fee (charged into day N by `route::finish`). The fix
+    // splitting it from the flat per-request fee (charged into day N by `route::budget_check`→`try_charge_request_within_budget`). The fix
     // threads `charged_at` so both land in day N. We pin `charged_at` to a fixed past day and assert
     // the spend lands in THAT day's window regardless of the real wall clock (which is always later).
     #[test]
     fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
-        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        use crate::governance::{GovState, NewKeySpec, SqliteStore, SECS_PER_DAY};
 
         let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
         // 0c per request, 100c per 1k tokens → a 1000-token response costs 100c.
@@ -4027,8 +4461,8 @@ mod usage_tap_tests {
         // A fixed epoch on a specific UTC day, far in the past so the real clock is always a
         // different (later) day — making the bug observable: the old code charged into "today".
         let charged_at: u64 = 1_700_000_000; // 2023-11-14 (day window = 1_700_000_000/86400*86400)
-        let day_window = charged_at / 86_400 * 86_400;
-        let today_window = crate::store::now() / 86_400 * 86_400;
+        let day_window = charged_at / SECS_PER_DAY * SECS_PER_DAY;
+        let today_window = crate::store::now() / SECS_PER_DAY * SECS_PER_DAY;
         assert_ne!(
             day_window, today_window,
             "test precondition: charged_at must be a different day than now, or the bug is masked"
@@ -4246,7 +4680,7 @@ mod usage_tap_tests {
             r#"{{"id":"chatcmpl-big","object":"chat.completion","choices":[{{"message":{{"role":"assistant","content":"{big_content}"}}}}],"usage":{{"prompt_tokens":4000,"completion_tokens":9000}}}}"#
         );
         assert!(
-            body.len() > 512 * 1024,
+            body.len() > MAX_SCAN_BYTES,
             "test body must exceed the per-poll MAX_SCAN_BYTES to be meaningful"
         );
 
@@ -4534,6 +4968,7 @@ mod bedrock_eventstream_tests {
                 id: "toolu_abc123".to_string(),
                 name: "get_weather".to_string(),
                 input: serde_json::json!({"city": "Paris"}),
+                cache_control: None,
             }],
             stop_reason: Some("tool_use".to_string()),
             usage: IrUsage {
@@ -4606,6 +5041,7 @@ mod bedrock_eventstream_tests {
                     id: "toolu_abc123".to_string(),
                     name: "get_weather".to_string(),
                     input: serde_json::json!({"city": "Paris"}),
+                    cache_control: None,
                 },
                 IrBlock::Text {
                     text: "One moment.".to_string(),
@@ -4708,6 +5144,7 @@ mod bedrock_eventstream_tests {
                 id: "toolu_xyz".to_string(),
                 name: "get_weather".to_string(),
                 input: serde_json::json!({"city": "Paris"}),
+                cache_control: None,
             }],
             // The hazard: upstream omitted a stop reason on the cross-protocol 2xx.
             stop_reason: None,
@@ -4784,6 +5221,7 @@ mod bedrock_eventstream_tests {
                 id: "toolu_xyz".to_string(),
                 name: "get_weather".to_string(),
                 input: serde_json::json!({"city": "Paris"}),
+                cache_control: None,
             }],
             stop_reason: Some("end_turn".to_string()),
             usage: IrUsage {
@@ -7326,7 +7764,7 @@ data: {"type":"message_stop"}"#
         let breaker_cfg = std::sync::Arc::new(BreakerCfg {
             trip: TripConfig {
                 mode: TripMode::Consecutive,
-                n: 1,
+                consecutive_n: 1,
                 ..TripConfig::default()
             },
             ..BreakerCfg::default()
@@ -7437,7 +7875,7 @@ data: {"type":"message_stop"}"#
         let breaker_cfg = Arc::new(BreakerCfg {
             trip: TripConfig {
                 mode: TripMode::Consecutive,
-                n: 1,
+                consecutive_n: 1,
                 ..TripConfig::default()
             },
             ..BreakerCfg::default()
@@ -7925,6 +8363,171 @@ mod forward_once_pool_cell_tests {
             metric_pool_label(&app, "prod-pool", 0),
             "prod-pool",
             "named-pool traffic stays labeled by its pool name"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ordered_walk_tests {
+    //! Tests for the routing-policy ORDERED WALK in `pick_among` (the audit-sensitive seam). The walk
+    //! must dispatch in the policy's ranked order while honoring EXACTLY the same health filter SWRR
+    //! honors (a tripped / dead / at-capacity preferred lane is skipped to the next), and fall through
+    //! to SWRR when no ranked lane qualifies — never stranding an unranked-but-healthy lane.
+    use super::{pick_among, RequestCtx};
+    use crate::state::WeightedLane;
+    use crate::test_support::{LaneSpec, TestApp};
+
+    fn three_lane_app() -> std::sync::Arc<crate::state::App> {
+        TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .lane(LaneSpec::new(
+                "m1",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .lane(LaneSpec::new(
+                "m2",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .pool("p", &[(0, 1), (1, 1), (2, 1)])
+            .build()
+    }
+
+    fn cands() -> Vec<WeightedLane> {
+        vec![
+            WeightedLane { idx: 0, weight: 1 },
+            WeightedLane { idx: 1, weight: 1 },
+            WeightedLane { idx: 2, weight: 1 },
+        ]
+    }
+
+    /// The walk dispatches to the FIRST ranked lane that is healthy: order [2,0,1] all-healthy ⇒ 2.
+    #[tokio::test]
+    async fn ordered_walk_picks_first_preferred_when_healthy() {
+        let app = three_lane_app();
+        let mut rc = RequestCtx::new(60);
+        let order = [2usize, 0, 1];
+        let (idx, _permit) = pick_among(&app, &cands(), &mut rc, None, "p", Some(&order))
+            .await
+            .expect("a healthy preferred lane is selected");
+        assert_eq!(idx, 2, "the #1 ranked healthy lane must be chosen");
+    }
+
+    /// A tripped (Open) preferred lane is SKIPPED to the next ranked lane — same health filter as SWRR.
+    #[tokio::test]
+    async fn ordered_walk_skips_tripped_preferred_to_next() {
+        let app = three_lane_app();
+        // Trip lane 2 (the #1 preference) Open with a cooldown well past the REAL wall clock that
+        // `pick_among` reads (it passes `state::now()` to `ready_in`/SWRR), so the lane is not
+        // breaker-ready. No test clock here — everything uses the real clock consistently.
+        app.store
+            .force_open_in("p", 2, crate::state::now() + 1_000_000);
+        let mut rc = RequestCtx::new(60);
+        let order = [2usize, 0, 1];
+        let (idx, _permit) = pick_among(&app, &cands(), &mut rc, None, "p", Some(&order))
+            .await
+            .expect("falls to the next ranked lane");
+        assert_eq!(
+            idx, 0,
+            "a tripped #1 preference is skipped to the #2 (lane 0)"
+        );
+    }
+
+    /// An EXCLUDED preferred lane (already tried this request) is skipped to the next ranked lane.
+    #[tokio::test]
+    async fn ordered_walk_skips_excluded_preferred() {
+        let app = three_lane_app();
+        let mut rc = RequestCtx::new(60);
+        rc.exclude(2); // lane 2 already tried
+        let order = [2usize, 0, 1];
+        let (idx, _permit) = pick_among(&app, &cands(), &mut rc, None, "p", Some(&order))
+            .await
+            .expect("excluded #1 falls to next");
+        assert_eq!(idx, 0, "an excluded #1 preference is skipped");
+    }
+
+    /// When NO ranked lane qualifies (the policy ranked only lane 2, and it is tripped), the walk falls
+    /// THROUGH to SWRR over the remaining candidates — an unranked-but-healthy lane is still reachable.
+    #[tokio::test]
+    async fn ordered_walk_falls_through_to_swrr_when_no_preferred_ready() {
+        let app = three_lane_app();
+        app.store
+            .force_open_in("p", 2, crate::state::now() + 1_000_000); // the only ranked lane is tripped
+        let mut rc = RequestCtx::new(60);
+        let order = [2usize]; // ranked subset of one, now unhealthy
+        let (idx, _permit) = pick_among(&app, &cands(), &mut rc, None, "p", Some(&order))
+            .await
+            .expect("SWRR finds an unranked healthy lane");
+        assert!(
+            idx == 0 || idx == 1,
+            "an unranked-but-healthy lane (0 or 1) must still be reachable via SWRR, got {idx}"
+        );
+    }
+
+    /// An empty order (the contract's normalized Abstain shape never produces this, but defend it):
+    /// the walk has nothing preferred, so it falls straight through to SWRR.
+    #[tokio::test]
+    async fn ordered_walk_empty_order_is_swrr() {
+        let app = three_lane_app();
+        let mut rc = RequestCtx::new(60);
+        let order: [usize; 0] = [];
+        let (idx, _permit) = pick_among(&app, &cands(), &mut rc, None, "p", Some(&order))
+            .await
+            .expect("empty order behaves as SWRR");
+        assert!(idx <= 2);
+    }
+
+    /// C2 (weight:0 drain): a policy that ranks a DRAINED (weight 0) lane #1 must NOT dispatch to it.
+    /// SWRR skips weight-0; the ordered walk now mirrors that, so the walk skips the drained #1 lane
+    /// to the next healthy ranked lane.
+    #[tokio::test]
+    async fn ordered_walk_skips_weight_zero_drained_preferred() {
+        let app = three_lane_app();
+        // Lane 2 drained (weight 0); 0 and 1 still serve.
+        let cands = vec![
+            WeightedLane { idx: 0, weight: 1 },
+            WeightedLane { idx: 1, weight: 1 },
+            WeightedLane { idx: 2, weight: 0 },
+        ];
+        let mut rc = RequestCtx::new(60);
+        // Policy ranks the drained lane #1.
+        let order = [2usize, 0, 1];
+        let (idx, _permit) = pick_among(&app, &cands, &mut rc, None, "p", Some(&order))
+            .await
+            .expect("a non-drained ranked lane is selected");
+        assert_ne!(
+            idx, 2,
+            "a weight-0 (drained) lane must NOT be dispatched to"
+        );
+        assert_eq!(
+            idx, 0,
+            "the walk skips the drained #1 to the next ranked lane (0)"
+        );
+    }
+
+    /// C2 corollary: when EVERY ranked candidate is drained (weight 0), the walk dispatches nothing
+    /// (it falls through to SWRR, which also skips weight-0, and SWRR finds none) — a fully-drained
+    /// set must not serve traffic.
+    #[tokio::test]
+    async fn ordered_walk_all_weight_zero_selects_none() {
+        let app = three_lane_app();
+        let cands = vec![
+            WeightedLane { idx: 0, weight: 0 },
+            WeightedLane { idx: 1, weight: 0 },
+            WeightedLane { idx: 2, weight: 0 },
+        ];
+        let mut rc = RequestCtx::new(60);
+        let order = [0usize, 1, 2];
+        let picked = pick_among(&app, &cands, &mut rc, None, "p", Some(&order)).await;
+        assert!(
+            picked.is_none(),
+            "a fully-drained candidate set must select no lane, got {:?}",
+            picked.map(|(i, _)| i)
         );
     }
 }

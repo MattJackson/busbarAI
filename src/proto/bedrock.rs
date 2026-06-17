@@ -485,6 +485,46 @@ fn read_bedrock_image_block(image: &serde_json::Value) -> Option<crate::ir::IrBl
     None
 }
 
+/// Normalize Bedrock Converse's native `toolConfig.toolChoice` into the IR union (PF-H1).
+///
+/// Bedrock shape: `{"auto":{}}` → `Auto`, `{"any":{}}` → `Required` (must call some tool),
+/// `{"tool":{"name":"X"}}` → the targeted `Tool{name:"X"}`. Bedrock has NO native "none". An
+/// absent or unrecognized shape yields `None` (omitted) so a request that never carried a directive
+/// does not gain a spurious one. Takes the whole `toolConfig` object so the caller can pass
+/// `obj.get("toolConfig")` directly.
+fn read_bedrock_tool_choice(
+    tool_config: Option<&serde_json::Value>,
+) -> Option<crate::ir::IrToolChoice> {
+    let tc = tool_config?.get("toolChoice")?.as_object()?;
+    if tc.contains_key("auto") {
+        Some(crate::ir::IrToolChoice::Auto)
+    } else if tc.contains_key("any") {
+        Some(crate::ir::IrToolChoice::Required)
+    } else if let Some(tool) = tc.get("tool") {
+        tool.get("name")
+            .and_then(|n| n.as_str())
+            .map(|name| crate::ir::IrToolChoice::Tool {
+                name: name.to_string(),
+            })
+    } else {
+        None
+    }
+}
+
+/// Emit the IR tool-choice union in Bedrock's native `toolChoice` shape (PF-H1).
+///
+/// Returns `None` for `IrToolChoice::None`: Bedrock Converse has no native "don't call a tool"
+/// directive, so the closest faithful behavior is to omit `toolChoice` entirely (the backend then
+/// applies its own default) rather than emit an invalid shape.
+fn write_bedrock_tool_choice(tc: &crate::ir::IrToolChoice) -> Option<serde_json::Value> {
+    match tc {
+        crate::ir::IrToolChoice::Auto => Some(serde_json::json!({"auto": {}})),
+        crate::ir::IrToolChoice::Required => Some(serde_json::json!({"any": {}})),
+        crate::ir::IrToolChoice::Tool { name } => Some(serde_json::json!({"tool": {"name": name}})),
+        crate::ir::IrToolChoice::None => None,
+    }
+}
+
 /// Bedrock stopReason → canonical IR stop_reason.
 fn stop_reason_map(ward: &str) -> String {
     match ward {
@@ -851,6 +891,7 @@ impl ProtocolReader for BedrockReader {
                                 id: tu_id,
                                 name,
                                 input,
+                                cache_control: None,
                             });
                         } else if let Some(tool_result) = content_val.get("toolResult") {
                             let tu_id = tool_result
@@ -927,6 +968,7 @@ impl ProtocolReader for BedrockReader {
                                 tool_use_id: tu_id,
                                 content: inner_content,
                                 is_error,
+                                cache_control: None,
                             });
                         } else if let Some(image) = content_val.get("image") {
                             // Decode both `source.bytes` (base64) AND `source.s3Location` (an S3
@@ -1010,11 +1052,16 @@ impl ProtocolReader for BedrockReader {
                             name,
                             description,
                             input_schema,
+                            cache_control: None,
                         });
                     }
                 }
             }
         }
+
+        // Promote Bedrock's native `toolConfig.toolChoice` into the IR union (PF-H1) so a forced /
+        // targeted directive survives the cross-protocol seam instead of degrading to `auto`.
+        let tool_choice = read_bedrock_tool_choice(obj.get("toolConfig"));
 
         let max_tokens = if let Some(inference_config) =
             obj.get("inferenceConfig").and_then(|i| i.as_object())
@@ -1104,6 +1151,7 @@ impl ProtocolReader for BedrockReader {
             top_p,
             top_k: None,
             stop,
+            tool_choice,
             // Bedrock's native Converse request body has no `stream` field — streaming is selected
             // by the endpoint (converse vs converse-stream). The Bedrock ingress route therefore
             // INJECTS `"stream": true` into the body for converse-stream requests before this reader
@@ -1437,7 +1485,7 @@ impl ProtocolReader for BedrockReader {
                     }
                     // Unreachable given the outer `Some(exc @ (...))` guard restricts `exc` to the
                     // five strings above. A NAMED binding (not a `_` wildcard, per the no-catch-all
-                    // rule — mirrors the `other =>` pattern in responses.rs::responses_error_code)
+                    // rule — mirrors the `other =>` pattern in proto::bearer_error_code)
                     // keeps the arm explicit; ServerError is the safe class for any exception event
                     // whose class is otherwise unknown.
                     other => {
@@ -1512,6 +1560,7 @@ impl ProtocolReader for BedrockReader {
                         id: tu_id,
                         name,
                         input,
+                        cache_control: None,
                     });
                 } else if let Some(reasoning) = block_val.get("reasoningContent") {
                     // A Converse response message can carry a `reasoningContent` (extended-thinking)
@@ -1836,13 +1885,16 @@ impl ProtocolWriter for BedrockWriter {
                     crate::ir::IrBlock::Text { text, .. } => {
                         content_arr.push(serde_json::json!({ "text": text }));
                     }
-                    crate::ir::IrBlock::ToolUse { id, name, input } => {
+                    crate::ir::IrBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         content_arr.push(serde_json::json!({"toolUse": {"toolUseId": id, "name": name, "input": input}}));
                     }
                     crate::ir::IrBlock::ToolResult {
                         tool_use_id,
                         content,
                         is_error,
+                        ..
                     } => {
                         let mut inner_content: Vec<serde_json::Value> = Vec::new();
                         for inner_block in content {
@@ -1881,7 +1933,9 @@ impl ProtocolWriter for BedrockWriter {
                                             .push(serde_json::json!({ "image": image_block }));
                                     }
                                 }
-                                crate::ir::IrBlock::ToolUse { id, name, input } => {
+                                crate::ir::IrBlock::ToolUse {
+                                    id, name, input, ..
+                                } => {
                                     // Nested ToolUse inside a tool result has no native Bedrock
                                     // tool-result shape; carry it as a structured `json` block rather
                                     // than discarding the call identity.
@@ -1991,7 +2045,11 @@ impl ProtocolWriter for BedrockWriter {
             inference_config.insert("maxTokens".to_string(), serde_json::json!(max_tokens));
         }
         if let Some(temperature) = req.temperature {
-            inference_config.insert("temperature".to_string(), serde_json::json!(temperature));
+            // Clamp to Bedrock's native [0.0, 1.0] (PF-M1). OpenAI / Responses accept temperature up
+            // to 2.0, so a cross-protocol request can carry a value Bedrock's API rejects with a hard
+            // 400 ValidationException; clamping forwards the closest valid value instead.
+            let clamped = temperature.clamp(0.0, 1.0);
+            inference_config.insert("temperature".to_string(), serde_json::json!(clamped));
         }
         // Promoted sampling controls overlaid in Bedrock's inferenceConfig shape (typed IR wins over
         // the raw captured value, so same-protocol round-trips re-emit the identical value and
@@ -2054,11 +2112,23 @@ impl ProtocolWriter for BedrockWriter {
 
             tool_config.insert("tools".to_string(), serde_json::Value::Array(tools_arr));
         }
-        // Emit only when the resulting `toolConfig` actually carries a tools array. A raw `toolConfig`
-        // that survived in `extra` but had no `tools` (only `toolChoice`) is meaningless to AWS without
-        // tools, so dropping `toolChoice` in that degenerate case matches AWS's own validation rather
-        // than emitting an invalid `toolConfig`.
-        if tool_config.contains_key("tools") {
+        // Emit `toolChoice` from the typed IR union (PF-H1). The reader promoted a native `toolChoice`
+        // into `req.tool_choice`, but the RAW `toolConfig` cloned from `extra` (same-protocol Bedrock
+        // passthrough) still carries the original `toolChoice` key — drop it first so the typed value
+        // is the single source of truth and there is no stale duplicate. `IrToolChoice::None` has no
+        // native Bedrock representation, so `write_bedrock_tool_choice` returns `None` and no
+        // `toolChoice` is emitted in that case.
+        tool_config.remove("toolChoice");
+        if let Some(tc) = &req.tool_choice {
+            if let Some(v) = write_bedrock_tool_choice(tc) {
+                tool_config.insert("toolChoice".to_string(), v);
+            }
+        }
+        // Emit only when the resulting `toolConfig` actually carries a tools array OR a toolChoice.
+        // A raw `toolConfig` that survived in `extra` but had no `tools` (only `toolChoice`) is
+        // meaningless to AWS without tools — but a typed `toolChoice` alongside typed/raw tools is
+        // valid, so the gate now also fires on a present `toolChoice`.
+        if tool_config.contains_key("tools") || tool_config.contains_key("toolChoice") {
             out.insert(
                 "toolConfig".to_string(),
                 serde_json::Value::Object(tool_config),
@@ -2294,7 +2364,9 @@ impl ProtocolWriter for BedrockWriter {
                     }
                 }
 
-                crate::ir::IrBlock::ToolUse { id, name, input } => {
+                crate::ir::IrBlock::ToolUse {
+                    id, name, input, ..
+                } => {
                     content_arr.push(serde_json::json!({
                         "toolUse": {
                             "toolUseId": id,
@@ -2554,6 +2626,7 @@ mod tests {
                         id: "tool_123".to_string(),
                         name: "get_weather".to_string(),
                         input: serde_json::json!({"city": "San Francisco"}),
+                        cache_control: None,
                     }],
                 },
                 crate::ir::IrMessage {
@@ -2566,6 +2639,7 @@ mod tests {
                             citations: Vec::new(),
                         }],
                         is_error: false,
+                        cache_control: None,
                     }],
                 },
             ],
@@ -2573,12 +2647,14 @@ mod tests {
                 name: "get_weather".to_string(),
                 description: Some("Get weather for a city".to_string()),
                 input_schema: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}),
+                cache_control: None,
             }],
             max_tokens: Some(1024),
             temperature: Some(0.7_f64),
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -2701,7 +2777,10 @@ mod tests {
             panic!("messages[0].content[0] should be Text block");
         }
 
-        if let crate::ir::IrBlock::ToolUse { id, name, input } = &ir.messages[1].content[0] {
+        if let crate::ir::IrBlock::ToolUse {
+            id, name, input, ..
+        } = &ir.messages[1].content[0]
+        {
             assert_eq!(id, "tool_123");
             assert_eq!(name, "get_weather");
             match input {
@@ -2718,6 +2797,7 @@ mod tests {
             tool_use_id,
             content,
             is_error,
+            ..
         } = &ir.messages[2].content[0]
         {
             assert_eq!(tool_use_id, "tool_123");
@@ -2816,7 +2896,10 @@ mod tests {
             panic!("content[0] should be Text block");
         }
 
-        if let crate::ir::IrBlock::ToolUse { id, name, input } = &resp.content[1] {
+        if let crate::ir::IrBlock::ToolUse {
+            id, name, input, ..
+        } = &resp.content[1]
+        {
             assert_eq!(id, "tu_1");
             assert_eq!(name, "get_weather");
             match input {
@@ -3617,6 +3700,7 @@ mod tests {
                             citations: Vec::new(),
                         }],
                         is_error: false,
+                        cache_control: None,
                     }],
                 },
             ],
@@ -3626,6 +3710,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3670,6 +3755,7 @@ mod tests {
                         data: "BASE64DATA".to_string(),
                     }],
                     is_error: false,
+                    cache_control: None,
                 }],
             }],
             tools: vec![],
@@ -3678,6 +3764,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3919,12 +4006,14 @@ mod tests {
                 name: "f".to_string(),
                 description: None,
                 input_schema: serde_json::json!({"type": "object"}),
+                cache_control: None,
             }],
             max_tokens: None,
             temperature: None,
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -3952,6 +4041,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -4348,6 +4438,7 @@ mod tests {
                 tool_use_id: "tu_1".to_string(),
                 content: Vec::new(),
                 is_error: false,
+                cache_control: None,
             }],
             stop_reason: Some("end_turn".to_string()),
             usage: IrUsage {
@@ -4475,6 +4566,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra,
         };
@@ -4509,6 +4601,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -4657,6 +4750,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -4748,6 +4842,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -5042,6 +5137,7 @@ mod tests {
                         },
                     ],
                     is_error: false,
+                    cache_control: None,
                 }],
             }],
             tools: vec![],
@@ -5050,6 +5146,7 @@ mod tests {
             top_p: None,
             top_k: None,
             stop: vec![],
+            tool_choice: None,
             stream: false,
             extra: serde_json::Map::new(),
         };
@@ -6518,6 +6615,151 @@ mod tests {
                 .any(|b| matches!(b, crate::ir::IrBlock::Thinking { .. })),
             "an unknown reasoningContent member must not be mis-mapped to a Thinking block; got {:?}",
             ir.messages[0].content
+        );
+    }
+
+    /// Helper: a minimal IR request carrying only a tool_choice (and one tool so toolConfig is valid).
+    fn tool_choice_req(tc: Option<crate::ir::IrToolChoice>) -> crate::ir::IrRequest {
+        crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![],
+            tools: vec![crate::ir::IrTool {
+                name: "get_weather".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            tool_choice: tc,
+            stream: false,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// PF-H1: Bedrock `toolChoice:{any:{}}` (must call SOME tool) round-trips through the IR's
+    /// `Required` variant — read promotes it, write re-emits the native `{any:{}}`.
+    #[test]
+    fn test_bedrock_tool_choice_any_required_roundtrips() {
+        let reader = BedrockReader;
+        let j = serde_json::json!({
+            "messages": [],
+            "toolConfig": {
+                "tools": [{"toolSpec": {"name": "get_weather", "inputSchema": {"json": {}}}}],
+                "toolChoice": {"any": {}}
+            }
+        });
+        let ir = reader.read_request(&j).expect("read ok");
+        assert_eq!(ir.tool_choice, Some(crate::ir::IrToolChoice::Required));
+
+        let out = BedrockWriter.write_request(&ir);
+        let tc = out
+            .get("toolConfig")
+            .and_then(|t| t.get("toolChoice"))
+            .expect("toolChoice emitted");
+        assert_eq!(tc, &serde_json::json!({"any": {}}));
+    }
+
+    /// PF-H1: Bedrock `toolChoice:{tool:{name}}` (forced specific tool) round-trips through the IR's
+    /// `Tool{name}` variant.
+    #[test]
+    fn test_bedrock_tool_choice_specific_tool() {
+        let reader = BedrockReader;
+        let j = serde_json::json!({
+            "messages": [],
+            "toolConfig": {
+                "tools": [{"toolSpec": {"name": "get_weather", "inputSchema": {"json": {}}}}],
+                "toolChoice": {"tool": {"name": "get_weather"}}
+            }
+        });
+        let ir = reader.read_request(&j).expect("read ok");
+        assert_eq!(
+            ir.tool_choice,
+            Some(crate::ir::IrToolChoice::Tool {
+                name: "get_weather".to_string()
+            })
+        );
+
+        let out = BedrockWriter.write_request(&ir);
+        let tc = out
+            .get("toolConfig")
+            .and_then(|t| t.get("toolChoice"))
+            .expect("toolChoice emitted");
+        assert_eq!(tc, &serde_json::json!({"tool": {"name": "get_weather"}}));
+    }
+
+    /// PF-H1: `IrToolChoice::None` has no native Bedrock representation, so the writer must omit
+    /// `toolChoice` entirely (rather than emit an invalid shape) while still emitting the tools.
+    #[test]
+    fn test_bedrock_tool_choice_none_omitted_on_write() {
+        let req = tool_choice_req(Some(crate::ir::IrToolChoice::None));
+        let out = BedrockWriter.write_request(&req);
+        let tool_config = out
+            .get("toolConfig")
+            .expect("toolConfig with tools emitted");
+        assert!(
+            tool_config.get("toolChoice").is_none(),
+            "Bedrock has no native 'none' — toolChoice must be omitted; got {tool_config:?}"
+        );
+        assert!(
+            tool_config.get("tools").is_some(),
+            "tools must still be emitted"
+        );
+    }
+
+    /// PF-H1: a request with no native `toolChoice` reads back as `tool_choice == None` (no spurious
+    /// directive minted on translation).
+    #[test]
+    fn test_bedrock_tool_choice_absent_is_none() {
+        let reader = BedrockReader;
+        let j = serde_json::json!({
+            "messages": [],
+            "toolConfig": {"tools": [{"toolSpec": {"name": "f", "inputSchema": {"json": {}}}}]}
+        });
+        let ir = reader.read_request(&j).expect("read ok");
+        assert_eq!(ir.tool_choice, None);
+        let out = BedrockWriter.write_request(&ir);
+        assert!(
+            out.get("toolConfig")
+                .and_then(|t| t.get("toolChoice"))
+                .is_none(),
+            "no toolChoice should be emitted when none was provided"
+        );
+    }
+
+    // PF-M1: OpenAI/Responses ingress accepts temperature up to 2.0, but Bedrock's native range is
+    // [0.0, 1.0] and rejects >1 with a hard 400 ValidationException. The writer must clamp.
+    #[test]
+    fn test_bedrock_writer_clamps_temperature_above_one() {
+        let ir = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: Some(1.8),
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            tool_choice: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = BedrockWriter.write_request(&ir);
+        assert_eq!(
+            out.pointer("/inferenceConfig/temperature")
+                .and_then(|v| v.as_f64()),
+            Some(1.0),
+            "an OpenAI-ingress temperature of 1.8 must clamp to 1.0 on the Bedrock writer; got {out}"
         );
     }
 }

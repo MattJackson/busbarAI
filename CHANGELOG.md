@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.5] — Unreleased
+
+Three independent features land together: pluggable routing policies, deeper Prometheus
+observability, and native inbound TLS/mTLS. The request path, wire protocols, breaker FSM,
+and governance contract are unchanged.
+
+### Added
+
+- **Pluggable routing policies (`route:` per pool).** A pool can declare a `route:` key
+  that produces an ordered preference over its members. The ranked list feeds the existing
+  failover loop — if the policy's first choice is tripped or at capacity, Busbar walks to
+  the next; a policy can never strand a request.
+
+  Five built-in native policies, selected with `route: <name>`:
+
+  - `weighted` — default smooth weighted round-robin (SWRR); no behavioral change from rc.4.
+  - `cheapest` — prefer the member with the lowest operator-declared `cost_per_mtok`.
+  - `fastest` — prefer the member with the lowest rolling-EWMA latency.
+  - `least_busy` — prefer the member with the most available concurrency permits.
+  - `usage` — prefer the member with the most rate-limit headroom (fraction of the
+    caller key's RPM/TPM budget still available this window), steering traffic away from
+    candidates approaching a provider 429.
+
+  Members missing a signal are demoted to the back of the preference list but never
+  dropped, so incomplete signal data cannot strand a lane.
+
+  Two additional transports for operator-defined logic:
+
+  - `webhook` — POSTs a stable JSON projection of the request and candidates to an
+    operator-run HTTP sidecar (any language, any runtime); the sidecar returns a ranked
+    `{ "order": [...] }`.
+  - `script` — evaluates an operator-supplied [Rhai](https://rhai.rs/) script compiled
+    once at config load. Gated behind the `script-policy` Cargo feature (off by default),
+    keeping the default binary free of the Rhai dependency.
+
+  Both transports honor a per-pool `timeout_ms`; a timeout or transport error falls back
+  to the pool's `on_error` setting (`abstain | weighted | reject | first`) and never
+  blocks or fails the client request.
+
+  **Zero-cost default path.** A pool with `route: weighted` — including any pool that
+  omits the `route:` key entirely — resolves to no policy object at config load. The hot
+  path is a single branch that is never entered for default pools: no allocation, no signal
+  projection, no I/O, identical throughput to rc.4.
+
+- **Four new Prometheus gauges (scrape-time).** Refreshed on each `/metrics` scrape from
+  in-process reads, not on the request hot path. All label values are drawn from
+  operator-controlled configuration; no client-supplied input appears as a label:
+
+  - `busbar_key_spend_cents` — per-virtual-key accumulated spend in cents for the current
+    budget window (label: `key` = virtual-key id). Only emitted when governance is enabled.
+  - `busbar_key_budget_remaining_cents` — `max_budget_cents` minus current spend for keys
+    that carry a budget cap. Suitable for Prometheus burn-rate alerting. Only emitted for
+    capped keys.
+  - `busbar_key_tokens_total` — accumulated tokens consumed by each virtual key in the
+    current budget window (label: `key`).
+  - `busbar_lane_state` — per-(pool, lane-index) circuit-breaker health: `0` = healthy
+    (Closed), `1` = half-open (cooling, probe admitted), `2` = tripped (Open or
+    hard-down). Labels: `pool` and `lane` (numeric index). Read-only; does not trigger
+    FSM transitions.
+
+- **Native inbound TLS and optional mutual TLS.** Busbar now terminates TLS on the
+  client-to-Busbar hop natively, without a reverse proxy. Add a `tls:` block to
+  `config.yaml`:
+
+  ```yaml
+  tls:
+    cert_file: /etc/busbar/tls/fullchain.pem
+    key_file:  /etc/busbar/tls/privkey.pem
+    client_ca_file: /etc/busbar/tls/ca.pem   # optional — enables mTLS
+  ```
+
+  When `client_ca_file` is present, Busbar requires a client certificate signed by that CA;
+  connections without a valid cert are rejected at the TLS handshake, before any HTTP or
+  bearer-token processing. Omitting `tls:` entirely leaves the plain-HTTP path unchanged.
+
+### Security
+
+- **mTLS client-cert enforcement.** With `client_ca_file` set, unauthenticated connections
+  are rejected at the TLS layer — before HTTP routing or governance checks — providing
+  zero-trust transport without a service mesh.
+- **TLS handshake timeout.** A 10-second wall-clock cap on each incoming TLS handshake
+  prevents a client from parking a file descriptor and task indefinitely before
+  authentication (slowloris / handshake-flood mitigation). A timed-out or failed handshake
+  drops only that connection; the server continues serving other clients.
+- **Webhook response size cap.** The `webhook` routing transport reads sidecar responses
+  under a 64 KiB cap. A slow or hostile sidecar cannot drive unbounded memory allocation;
+  an oversized response is an error and falls back to `on_error`.
+- **Rhai script operation budget.** The `script` transport evaluates operator scripts under
+  a per-invocation Rhai operation count limit and a hard wall-clock deadline (run on the
+  blocking pool so a runaway script cannot pin an async worker). No module resolver, no file
+  or network host functions are registered in the sandboxed engine.
+- **Startup fail-fast for TLS config errors.** PEM cert, key, or CA load/parse failures
+  abort startup with a message naming the offending file; key material is never logged. A
+  single-connection handshake failure is logged at debug level only.
+
 ## [1.0.0-rc.4] — 2026-06-16
 
 A continuation of the rc.3 hardening campaign: nine further rounds (R19→R27) of

@@ -9,13 +9,13 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IrRequest {
-    pub system: Vec<IrBlock>,
-    pub messages: Vec<IrMessage>,
-    pub tools: Vec<IrTool>,
-    pub max_tokens: Option<u32>,
+    pub(crate) system: Vec<IrBlock>,
+    pub(crate) messages: Vec<IrMessage>,
+    pub(crate) tools: Vec<IrTool>,
+    pub(crate) max_tokens: Option<u32>,
     // f64 (not ADR-0005's f32): JSON numbers are f64; an f32 round-trip silently mutates a
     // caller's temperature (0.7 → 0.699999988) — the exact lossiness busbar exists to avoid.
-    pub temperature: Option<f64>,
+    pub(crate) temperature: Option<f64>,
     /// Nucleus-sampling cutoff (`top_p`). A first-class IR field — NOT left in `extra` — because it
     /// is a UNIVERSALLY-modeled sampling control with a clean native shape in every protocol busbar
     /// speaks (OpenAI `top_p`, Anthropic `top_p`, Gemini `generationConfig.topP`, Bedrock
@@ -24,22 +24,59 @@ pub(crate) struct IrRequest {
     /// silently dropped on every cross-protocol hop. `f64` for the same lossless-number reason as
     /// `temperature`. `None` when the caller omitted it. Each reader populates it from its native
     /// shape; each writer emits it in its native shape when present.
-    pub top_p: Option<f64>,
+    pub(crate) top_p: Option<f64>,
     /// Top-k sampling cutoff (`top_k`). First-class for the same reason as `top_p`: it has a real
     /// cross-protocol mapping in the protocols that model it (Anthropic `top_k`, Gemini
     /// `generationConfig.topK`, Cohere `k`, Bedrock via `additionalModelRequestFields`). OpenAI has
     /// NO top_k knob, so the OpenAI writer omits it (and its reader never sets it) — a lossy-by-target
     /// omission, not a leak. `u32`: top_k is a non-negative integer count. `None` when omitted.
-    pub top_k: Option<u32>,
+    pub(crate) top_k: Option<u32>,
     /// Stop sequences (`stop`). First-class because every protocol models it (OpenAI `stop` —
     /// string OR array; Anthropic `stop_sequences`; Gemini `generationConfig.stopSequences`; Bedrock
     /// `inferenceConfig.stopSequences`; Cohere `stop_sequences`). Normalized to a `Vec<String>` (the
     /// common shape); a writer whose native form is a bare string for the single-element case still
     /// round-trips because the SDKs accept the array form. Empty `Vec` == omitted (no `stop` field
     /// emitted), so a request that never carried stops does not gain an empty array on translation.
-    pub stop: Vec<String>,
-    pub stream: bool,
-    pub extra: serde_json::Map<String, serde_json::Value>,
+    pub(crate) stop: Vec<String>,
+    /// Tool-selection directive (`tool_choice`). First-class — NOT left in `extra` — because it is a
+    /// load-bearing, behavior-changing control that EVERY protocol busbar speaks models, just in a
+    /// different native shape (OpenAI `tool_choice`, Anthropic `tool_choice`, Gemini
+    /// `toolConfig.functionCallingConfig`, Bedrock `toolConfig.toolChoice`, Cohere/Responses
+    /// `tool_choice`). `extra` is cleared on the cross-protocol seam, so leaving forced/targeted tool
+    /// use in `extra` silently degrades it to the target's default (`auto`) on every cross-protocol
+    /// hop — directly undercutting the lossless contract. Each reader normalizes its native shape into
+    /// this union; each writer re-emits the union in its native shape when present. `None` when the
+    /// caller omitted it (no `tool_choice` emitted, so a request that never carried one does not gain
+    /// a spurious `auto` on translation).
+    pub(crate) tool_choice: Option<IrToolChoice>,
+    pub(crate) stream: bool,
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Normalized cross-protocol tool-selection directive (`tool_choice`). Models the union every wire
+/// protocol expresses, so forced/targeted tool use ROUND-TRIPS instead of degrading to `auto`:
+///
+/// | Variant    | OpenAI / Responses (Cohere)        | Anthropic                    | Gemini (`functionCallingConfig`)            | Bedrock (`toolChoice`) |
+/// |------------|------------------------------------|------------------------------|---------------------------------------------|------------------------|
+/// | `Auto`     | `"auto"` (Cohere: omit — default)  | `{type:"auto"}`              | `{mode:"AUTO"}`                             | `{auto:{}}`            |
+/// | `None`     | `"none"` (Cohere: `"NONE"`)        | `{type:"none"}`*             | `{mode:"NONE"}`                             | (omit — no native)*    |
+/// | `Required` | `"required"` (Cohere: `"REQUIRED"`)| `{type:"any"}`              | `{mode:"ANY"}`                             | `{any:{}}`             |
+/// | `Tool{n}`  | `{type:"function",function:{name}}`| `{type:"tool",name:n}`      | `{mode:"ANY",allowedFunctionNames:[n]}`    | `{tool:{name:n}}`      |
+///
+/// *Anthropic gained `{type:"none"}` (2024-10+); older targets without a native "none" fall back to
+/// omitting `tool_choice`. A reader maps an unknown/novel native value to `Auto` (the safe default)
+/// rather than dropping the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IrToolChoice {
+    /// Model decides whether to call a tool. The universal default.
+    Auto,
+    /// Model must NOT call a tool (text only).
+    None,
+    /// Model MUST call SOME tool (any of the provided), but the caller does not pin which.
+    /// (OpenAI/Cohere/Responses `"required"`, Anthropic `"any"`, Gemini `ANY`, Bedrock `any`.)
+    Required,
+    /// Model MUST call this SPECIFIC tool by name.
+    Tool { name: String },
 }
 
 /// Normalize a protocol's native stop-sequence field into the IR's `Vec<String>`.
@@ -77,8 +114,9 @@ pub(crate) enum IrStreamEvent {
         /// Stream identity, carried through from the egress backend's stream-start metadata so a
         /// writer can emit the SDK-required top-level identity fields a native stream carries
         /// (Anthropic `message_start.message.id`; OpenAI `chat.completion.chunk` top-level
-        /// `id`/`created`/`model`). Default `None`; populated per-protocol in a later wave (and
-        /// synthesized when the backend supplies none).
+        /// `id`/`created`/`model`). Default `None`; populated per-protocol by each reader and
+        /// synthesized by the writer when the backend supplies none (see the synthesized-ID contract
+        /// below).
         ///
         /// Synthesized-ID contract: on a CROSS-PROTOCOL stream the foreign-format identity is stripped
         /// (`StreamTranslate::translate_event` sets ONLY `id` and `created` to `None`) so the ingress
@@ -123,37 +161,38 @@ pub(crate) enum IrStreamEvent {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IrResponse {
-    pub role: IrRole,
-    pub content: Vec<IrBlock>,
-    pub stop_reason: Option<String>,
-    pub usage: IrUsage,
+    pub(crate) role: IrRole,
+    pub(crate) content: Vec<IrBlock>,
+    pub(crate) stop_reason: Option<String>,
+    pub(crate) usage: IrUsage,
     /// The model that actually served the response, as reported by the upstream. Preserved across
     /// cross-protocol translation so a pool route's response still names the member that served it
     /// (same as a direct route). `None` if the upstream body carried no model field.
-    pub model: Option<String>,
+    pub(crate) model: Option<String>,
     /// Response identity, carried through from the egress backend's `read_response` so a writer can
     /// emit the SDK-required identity field a native response carries (OpenAI `id` =
-    /// `"chatcmpl-..."`, Anthropic `id` = `"msg_..."`). Default `None`; populated per-protocol in a
-    /// later wave (and synthesized when the backend supplies none, so the shape stays SDK-valid).
+    /// `"chatcmpl-..."`, Anthropic `id` = `"msg_..."`). Default `None`; populated per-protocol by
+    /// each reader and synthesized by the writer when the backend supplies none, so the shape stays
+    /// SDK-valid (see the synthesized-ID contract below).
     ///
     /// Synthesized-ID contract: on a CROSS-PROTOCOL non-stream response the foreign-format `id` is
     /// stripped (`forward.rs` sets `ir.id = None`) and the ingress writer mints a NATIVE-format id
     /// when `created` is `Some` (the cross-boundary signal) — so e.g. an OpenAI backend's
     /// `chatcmpl-…` id never reaches an Anthropic client. A same-protocol response preserves the
     /// native id verbatim.
-    pub id: Option<String>,
+    pub(crate) id: Option<String>,
     /// Unix epoch seconds for the response creation time (OpenAI `created`). Default `None`.
-    pub created: Option<u64>,
+    pub(crate) created: Option<u64>,
     /// OpenAI's `system_fingerprint` (opaque backend config marker). Default `None`.
-    pub system_fingerprint: Option<String>,
+    pub(crate) system_fingerprint: Option<String>,
     /// Anthropic's `stop_sequence` (the matched stop string, or `null`). Default `None`.
-    pub stop_sequence: Option<String>,
+    pub(crate) stop_sequence: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IrMessage {
-    pub role: IrRole,
-    pub content: Vec<IrBlock>,
+    pub(crate) role: IrRole,
+    pub(crate) content: Vec<IrBlock>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,11 +218,20 @@ pub(crate) enum IrBlock {
         id: String,
         name: String,
         input: Value,
+        /// Anthropic tool-use cache breakpoint (`cache_control`). First-class so an Anthropic cache
+        /// breakpoint placed ON a tool_use block survives the seam instead of silently vanishing
+        /// (cost/latency regression). Only the Anthropic reader populates it and only the Anthropic
+        /// writer emits it; other protocols have no native analog and leave it `None`.
+        cache_control: Option<CacheControl>,
     },
     ToolResult {
         tool_use_id: String,
         content: Vec<IrBlock>,
         is_error: bool,
+        /// Anthropic tool-result cache breakpoint (`cache_control`). Same rationale as the
+        /// `ToolUse` field — Anthropic places breakpoints on tool_result blocks to cache the
+        /// (often large) result content; without an IR field that breakpoint is lost cross-hop.
+        cache_control: Option<CacheControl>,
     },
     Image {
         media_type: String,
@@ -193,7 +241,7 @@ pub(crate) enum IrBlock {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CacheControl {
-    pub kind: CacheKind,
+    pub(crate) kind: CacheKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,17 +251,22 @@ pub(crate) enum CacheKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IrTool {
-    pub name: String,
-    pub description: Option<String>,
-    pub input_schema: Value,
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+    pub(crate) input_schema: Value,
+    /// Anthropic tool-definition cache breakpoint (`cache_control`). Anthropic lets a `cache_control`
+    /// marker sit on a tool definition to cache the (often large) tool schemas as a prefix; that
+    /// breakpoint was being dropped on every hop. First-class so it survives the seam. Only the
+    /// Anthropic reader populates it / writer emits it; other protocols leave it `None`.
+    pub(crate) cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IrUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_creation_input_tokens: Option<u64>,
-    pub cache_read_input_tokens: Option<u64>,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_creation_input_tokens: Option<u64>,
+    pub(crate) cache_read_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -243,29 +296,29 @@ pub(crate) enum IrDelta {
 /// the text/thinking blocks are open, and which OpenAI tool_call indices have been opened.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StreamDecodeState {
-    pub started: bool,
-    pub text_block_open: bool,
+    pub(crate) started: bool,
+    pub(crate) text_block_open: bool,
     /// The IR block index the Gemini reader assigned to the text block, by order of FIRST appearance
     /// (not hardcoded 0). Gemini emits text and `functionCall` parts in any order across chunks; a
     /// block claims the next free index when it first opens, so text and tools never collide on an
     /// index regardless of arrival order (tool-only streams stay contiguous from 0; a tool that opens
     /// before text takes 0 and text takes the next slot). `None` until the text block opens. Gemini
     /// reader only; other readers leave it `None`.
-    pub text_index: Option<usize>,
-    pub open_tools: std::collections::BTreeSet<usize>,
+    pub(crate) text_index: Option<usize>,
+    pub(crate) open_tools: std::collections::BTreeSet<usize>,
     /// Set once a reasoning (chain-of-thought) delta is seen on the OpenAI stream. When true, the
     /// thinking block occupies IR index 0 and the text/tool block indices shift up by one so the
     /// thinking block precedes the answer (used by the OpenAI reader only).
-    pub reasoning_seen: bool,
+    pub(crate) reasoning_seen: bool,
     /// Whether the reasoning Thinking block (index 0) is currently open.
-    pub thinking_block_open: bool,
+    pub(crate) thinking_block_open: bool,
     /// Stop reason buffered across two Bedrock stream frames. Native Bedrock ConverseStream splits
     /// the stop reason (`messageStop` frame) from the token usage (a following `metadata` frame). To
     /// emit ONE combined `MessageDelta{stop_reason, usage}` (so a cross-protocol ingress sees the
     /// single `message_delta`/usage event a native non-Bedrock stream carries, not two) the Bedrock
     /// reader stashes the `messageStop` stop_reason here and pairs it with the usage when `metadata`
     /// arrives. Used by the Bedrock reader only; other protocols leave it `None`.
-    pub pending_stop_reason: Option<String>,
+    pub(crate) pending_stop_reason: Option<String>,
     /// OpenAI-only: maps each opened OpenAI tool_call `index` (the `oai_idx`) to the IR block index
     /// its `BlockStart` was emitted with. The OpenAI flat stream lets text arrive AFTER tool calls,
     /// and the text block's presence shifts the tool index base — so the IR index a tool's BlockStart
@@ -275,7 +328,7 @@ pub(crate) struct StreamDecodeState {
     /// arrival. Empty for every other reader (which assign IR indices 1:1 or via `open_tools`/
     /// `text_index` directly and never recompute a divergent base). Keyed by `oai_idx` so it tracks
     /// `open_tools` one-for-one.
-    pub tool_ir_index: std::collections::BTreeMap<usize, usize>,
+    pub(crate) tool_ir_index: std::collections::BTreeMap<usize, usize>,
 }
 
 #[cfg(test)]
@@ -382,5 +435,40 @@ mod tests {
             IrDelta::TextDelta("x".into()),
             IrDelta::TextDelta("x".into())
         );
+    }
+
+    // PF-L5: `IrToolChoice` is the protocol-neutral pivot for every reader/writer's tool_choice
+    // mapping, so its variant identity must be precise — distinct variants are never equal, a
+    // targeted `Tool` is keyed on its name, and clone preserves the variant.
+    #[test]
+    fn test_ir_tool_choice_variant_equality() {
+        // Distinct directives are never conflated.
+        assert_ne!(IrToolChoice::Auto, IrToolChoice::None);
+        assert_ne!(IrToolChoice::Auto, IrToolChoice::Required);
+        assert_ne!(IrToolChoice::None, IrToolChoice::Required);
+        assert_ne!(
+            IrToolChoice::Required,
+            IrToolChoice::Tool {
+                name: "f".into()
+            }
+        );
+        // A targeted tool is keyed on its name.
+        assert_eq!(
+            IrToolChoice::Tool {
+                name: "get_weather".into()
+            },
+            IrToolChoice::Tool {
+                name: "get_weather".into()
+            }
+        );
+        assert_ne!(
+            IrToolChoice::Tool { name: "a".into() },
+            IrToolChoice::Tool { name: "b".into() }
+        );
+        // Clone is a faithful round-trip of the variant.
+        let tc = IrToolChoice::Tool {
+            name: "x".into(),
+        };
+        assert_eq!(tc.clone(), tc);
     }
 }

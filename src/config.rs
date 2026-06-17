@@ -91,10 +91,45 @@ pub(crate) fn interpolate_env(s: &str) -> Result<String, String> {
 #[derive(Debug)]
 pub(crate) struct RootCfg {
     pub(crate) listen: String,
+    /// Optional native inbound TLS. `None` ⇒ plain HTTP (today's path, byte-for-byte).
+    pub(crate) tls: Option<TlsCfg>,
     pub(crate) auth: Option<AuthCfg>,
     pub(crate) providers: HashMap<String, ProviderCfg>,
     pub(crate) models: HashMap<String, ModelCfg>,
     pub(crate) pools: HashMap<String, PoolCfg>,
+    /// Operator-supplied additions to the hardcoded cloud-metadata denylist (see
+    /// [`SecurityCfg::blocked_metadata_hosts`]). Resolved from `DeployCfg.security`; empty when no
+    /// `security:` block is present. Threaded into `config_validate::validate` so a provider
+    /// `base_url` (and any path-override composition) targeting one of these hosts is rejected at
+    /// boot unless that host is carved out by an allow-override.
+    pub(crate) blocked_metadata_hosts: Vec<String>,
+    /// Global SURGICAL allow-override: cloud-metadata hosts/IPs to UNBLOCK for ALL providers
+    /// (`security.allow_metadata_hosts`). Unioned with each provider's own `allow_metadata_hosts`
+    /// when the guard runs; a host on the denylist is permitted iff it appears in this union (or
+    /// `allow_all_metadata` is set). Matched with the same canonicalization as the block check (an IP
+    /// entry unblocks all its spellings). Default empty.
+    pub(crate) allow_metadata_hosts: Vec<String>,
+    /// Nuclear override (`security.allow_all_metadata`): when true the metadata SSRF guard is fully
+    /// DISABLED — every cloud-metadata endpoint is reachable by every provider. Logs a startup WARN.
+    /// Default false.
+    pub(crate) allow_all_metadata: bool,
+}
+
+/// Native inbound TLS configuration for the client↔Busbar hop. Absent (`Config.tls == None`) ⇒
+/// Busbar serves plain HTTP exactly as before. Present ⇒ Busbar terminates TLS itself; if
+/// `client_ca_file` is also set, it additionally requires and verifies a client certificate (mTLS).
+/// All three paths are PEM files on the operator's host; they are loaded once at startup and any
+/// load/parse error is fatal (`die`). Key bytes are never logged.
+#[derive(Deserialize, Clone, Debug)]
+pub(crate) struct TlsCfg {
+    /// PEM certificate chain, leaf first (e.g. fullchain.pem).
+    pub(crate) cert_file: String,
+    /// PEM private key matching the leaf cert (PKCS#8, PKCS#1, or SEC1).
+    pub(crate) key_file: String,
+    /// PEM CA bundle to verify client certs against. `Some` ⇒ mTLS required: a client must present
+    /// a cert chaining to this CA to complete the handshake at all. `None` ⇒ server-only TLS.
+    #[serde(default)]
+    pub(crate) client_ca_file: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -191,6 +226,20 @@ pub(crate) struct ProviderCfg {
     /// Optional auth-style override (see ProviderDef::auth).
     #[serde(default)]
     pub(crate) auth: Option<String>,
+    /// Per-provider SURGICAL escape hatch: the cloud-metadata hosts/IPs to UNBLOCK for THIS
+    /// provider's `base_url` (and path-override composition) only. Each entry carves a single
+    /// exception out of the metadata denylist (hardcoded ∪ `security.blocked_metadata_hosts`) — e.g.
+    /// `allow_metadata_hosts: ["169.254.169.254"]` lets only this provider reach IMDS while every
+    /// OTHER metadata endpoint (and every other provider) stays blocked. An entry is matched with the
+    /// SAME canonicalization as the block check, so an IP entry also unblocks its obfuscated spellings
+    /// (decimal-int, IPv4-mapped IPv6, trailing-dot). For an everywhere-unblock use
+    /// `security.allow_metadata_hosts`; for a full disable use `security.allow_all_metadata`.
+    /// Loopback / RFC-1918 / CGNAT / public targets are allowed regardless — a client never chooses a
+    /// provider URL (model NAME → operator pool → operator URL), so private upstreams pose no
+    /// client-driven SSRF and local models (Ollama / vLLM) "just work" with no entry. Default empty
+    /// (all metadata blocked).
+    #[serde(default)]
+    pub(crate) allow_metadata_hosts: Vec<String>,
     // Future fields (parse and be inert):
     #[serde(default, rename = "api_key")]
     pub(crate) _legacy_api_key: Option<String>,
@@ -210,6 +259,7 @@ impl fmt::Debug for ProviderCfg {
             .field("error_map", &self.error_map)
             .field("path", &self.path)
             .field("auth", &self.auth)
+            .field("allow_metadata_hosts", &self.allow_metadata_hosts)
             .field(
                 "_legacy_api_key",
                 &if self._legacy_api_key.is_some() {
@@ -273,20 +323,194 @@ fn neg1() -> i64 {
     -1
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct PoolCfg {
-    #[serde(default)]
     pub(crate) members: Vec<PoolMember>,
     /// Per-pool breaker settings (resolved into `store::BreakerCfg` at startup; drives trip
     /// thresholds and cooldown backoff for this pool's lanes).
-    #[serde(default)]
     pub(crate) breaker: Option<BreakerCfg>,
-    #[serde(default)]
     pub(crate) failover: Option<FailoverCfg>,
-    #[serde(default)]
     pub(crate) on_exhausted: Option<OnExhaustedCfg>,
-    #[serde(default)]
     pub(crate) affinity: Option<AffinityCfg>,
+    /// Routing transport for this pool. `weighted` (the default, also the absent case) is today's
+    /// SWRR with ZERO added cost — no `RoutingPolicy` object is constructed and the hot path is
+    /// byte-identical to the pre-feature behavior. Any other value resolves a pluggable policy that
+    /// runs ONCE before the failover loop to produce a ranked member preference.
+    ///
+    /// Populated by [`PoolCfg`]'s manual `Deserialize`, which also desugars the NATIVE SHORTHANDS:
+    /// `route: cheapest` / `fastest` / `least_busy` / `usage` all map to `RouteKind::Native` with the
+    /// policy name folded into `policy.name` (see below), so the long form (`route: native` +
+    /// `policy.name: cheapest`) and the short form are byte-identical after load. `route: weighted`
+    /// (long or short) stays plain `RouteKind::Weighted` (the zero-cost default), NOT a native object.
+    pub(crate) route: RouteKind,
+    /// Per-transport policy configuration (URL/script/native-name/timeout/on_error). Inert when
+    /// `route: weighted`. For a native shorthand the resolved `name` is synthesized here so the
+    /// native registry lookup in `routing::resolve_policy` sees a single canonical shape.
+    pub(crate) policy: Option<PolicyCfg>,
+}
+
+/// Manual `Deserialize` for [`PoolCfg`] so the `route:` key accepts the NATIVE SHORTHANDS in
+/// addition to the long transport names. A bare `route: cheapest` (or `fastest` / `least_busy` /
+/// `usage`) desugars to `RouteKind::Native` with `policy.name` set to that shorthand, so the rest of
+/// the codebase only ever sees the canonical `(route: native, policy.name: <native>)` shape — the
+/// long form keeps working unchanged. `route: weighted` (long or short) stays `RouteKind::Weighted`
+/// (the zero-cost default); `webhook` / `script` / `native` keep their existing meaning. An explicit
+/// `policy.name` is never overwritten by the shorthand (a long-form config wins).
+impl<'de> Deserialize<'de> for PoolCfg {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Raw mirror of the on-disk shape. `route` is captured as a free string so we can recognize
+        // the native shorthands that `RouteKind`'s snake_case enum cannot express on its own.
+        #[derive(Deserialize)]
+        struct RawPoolCfg {
+            #[serde(default)]
+            members: Vec<PoolMember>,
+            #[serde(default)]
+            breaker: Option<BreakerCfg>,
+            #[serde(default)]
+            failover: Option<FailoverCfg>,
+            #[serde(default)]
+            on_exhausted: Option<OnExhaustedCfg>,
+            #[serde(default)]
+            affinity: Option<AffinityCfg>,
+            #[serde(default)]
+            route: Option<String>,
+            #[serde(default)]
+            policy: Option<PolicyCfg>,
+        }
+
+        let raw = RawPoolCfg::deserialize(deserializer)?;
+        // Desugar `route:` into `(RouteKind, Option<native shorthand name>)`. Unknown values are a
+        // hard error (matching serde's enum behavior), so a typo in `route:` still fails loudly.
+        let (route, shorthand_name): (RouteKind, Option<&'static str>) = match raw.route.as_deref()
+        {
+            None | Some("weighted") => (RouteKind::Weighted, None),
+            Some("webhook") => (RouteKind::Webhook, None),
+            Some("script") => (RouteKind::Script, None),
+            Some("native") => (RouteKind::Native, None),
+            // Native shorthands: a bare policy name in `route:` ⇒ Native + that name in policy.name.
+            Some("cheapest") => (RouteKind::Native, Some("cheapest")),
+            Some("fastest") => (RouteKind::Native, Some("fastest")),
+            Some("least_busy") => (RouteKind::Native, Some("least_busy")),
+            Some("usage") => (RouteKind::Native, Some("usage")),
+            Some(other) => {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown route '{other}': expected one of weighted, webhook, script, native, \
+                     or a native shorthand (cheapest, fastest, least_busy, usage)"
+                )));
+            }
+        };
+
+        // Fold the shorthand name into `policy.name` so downstream resolution sees one canonical
+        // shape. An explicit long-form `policy.name` always wins (never overwritten).
+        let mut policy = raw.policy;
+        if let Some(name) = shorthand_name {
+            // NOTE: `PolicyCfg::default()` leaves `timeout_ms = 0` because serde's
+            // `default = "default_policy_timeout_ms"` only fires on the deserialize path, never on a
+            // code-built struct. A shorthand pool (`route: cheapest`) has no `policy:` block on disk,
+            // so without this the desugared cfg would carry a 0ms policy timeout → an instant
+            // deadline at `resolve_policy`. Stamp the real default on a freshly-synthesized cfg.
+            let needs_default_timeout = policy.is_none();
+            let p = policy.get_or_insert_with(PolicyCfg::default);
+            if needs_default_timeout {
+                p.timeout_ms = DEFAULT_POLICY_TIMEOUT_MS;
+            }
+            if p.name.is_none() {
+                p.name = Some(name.to_string());
+            }
+        }
+
+        Ok(PoolCfg {
+            members: raw.members,
+            breaker: raw.breaker,
+            failover: raw.failover,
+            on_exhausted: raw.on_exhausted,
+            affinity: raw.affinity,
+            route,
+            policy,
+        })
+    }
+}
+
+/// The routing transport for a pool. Resolved ONCE at config load into a runtime policy enum so the
+/// hot path never branches on a string; the default `Weighted` arm builds no policy object at all.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RouteKind {
+    /// Today's smooth-weighted-round-robin (SWRR). Default and also the absent case. Zero added cost.
+    #[default]
+    Weighted,
+    /// An operator-run HTTP sidecar that returns a ranked member preference.
+    Webhook,
+    /// An embedded Rhai script (behind the `script-policy` cargo feature) returning a ranked order.
+    Script,
+    /// A Busbar-native policy selected by `policy.name` (e.g. `cheapest`/`fastest`/`least_busy`/
+    /// `usage`/`weighted`).
+    Native,
+}
+
+/// Behavior when a policy times out, errors, abstains, or saturates. `Weighted` (default) is the
+/// non-negotiable safety stance: a broken/slow policy is indistinguishable from no policy and NEVER
+/// blocks or fails a request. `Reject` is fail-closed (503). `First` uses the configured member
+/// order (a deterministic degraded pick).
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PolicyOnError {
+    #[default]
+    Weighted,
+    Reject,
+    First,
+}
+
+/// Per-pool policy configuration. All transports share `timeout_ms`/`on_error`; the transport-specific
+/// fields (`url`, `script`/`script_file`, `name`) are validated against `route` at startup.
+// The transport-specific fields (`url`, `script`/`script_file`, `name`) are consumed by
+// `routing::resolve_policy` at config load to construct the matching transport, and validated against
+// `route` at startup.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub(crate) struct PolicyCfg {
+    // ── webhook transport ────────────────────────────────────────────────────────────────────────
+    /// The operator sidecar URL. Validated by the routing-URL SSRF guard (loopback allowed, IMDS/
+    /// RFC1918/CGNAT/metadata blocked — the OTLP precedent). Required when `route: webhook`.
+    #[serde(default)]
+    pub(crate) url: Option<String>,
+    // ── shared ───────────────────────────────────────────────────────────────────────────────────
+    /// Hard wall-clock deadline for the policy decision, in milliseconds (default 150). On timeout
+    /// the decision is coerced to `on_error`.
+    #[serde(default = "default_policy_timeout_ms")]
+    pub(crate) timeout_ms: u64,
+    /// Fallback behavior on timeout/error/abstain/saturation (default `weighted`).
+    #[serde(default)]
+    pub(crate) on_error: PolicyOnError,
+    // ── script transport ─────────────────────────────────────────────────────────────────────────
+    /// Inline Rhai source. Exactly one of `script`/`script_file` is required when `route: script`.
+    /// Read by `routing::resolve_policy`'s script arm, which is gated on the `script-policy` feature;
+    /// the default build parses the field (configs round-trip) but compiles out the only reader.
+    #[serde(default)]
+    #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
+    pub(crate) script: Option<String>,
+    /// Path to a Rhai script file. Alternative to inline `script`. Same `script-policy`-gated reader.
+    #[serde(default)]
+    #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
+    pub(crate) script_file: Option<String>,
+    // ── native transport ─────────────────────────────────────────────────────────────────────────
+    /// Native policy name (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`). Required when
+    /// `route: native`.
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+}
+
+/// The default hard wall-clock deadline for a policy decision, in milliseconds. Used by serde's
+/// `default = "default_policy_timeout_ms"` AND applied explicitly to code-built `PolicyCfg`s (the
+/// native-shorthand desugar, where `PolicyCfg::default()` would otherwise leave `timeout_ms = 0`
+/// because serde defaults only fire on deserialize). Also the single source of truth consumed at the
+/// resolution sites in `routing/mod.rs`.
+pub(crate) const DEFAULT_POLICY_TIMEOUT_MS: u64 = 150;
+
+fn default_policy_timeout_ms() -> u64 {
+    DEFAULT_POLICY_TIMEOUT_MS
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -296,6 +520,18 @@ pub(crate) struct PoolMember {
     pub(crate) weight: u32,
     #[serde(default)]
     pub(crate) context_max: Option<usize>,
+    /// Operator-declared routing tier (e.g. `"large"`/`"small"`/`"primary"`/`"overflow"`). Projected
+    /// into the routing `Candidate` (via `MemberMeta`) and read by webhook/script policies.
+    #[serde(default)]
+    pub(crate) tier: Option<String>,
+    /// Operator-declared cost in currency-units per million tokens. Drives the native `cheapest`
+    /// policy and is exposed to webhook/script policies. Inert when unset.
+    #[serde(default)]
+    pub(crate) cost_per_mtok: Option<f64>,
+    /// Free-form operator tags (e.g. `["opus"]`) a policy can match on. Projected into the routing
+    /// `Candidate` and read by webhook/script policies.
+    #[serde(default)]
+    pub(crate) tags: Vec<String>,
 }
 
 fn default_weight() -> u32 {
@@ -315,15 +551,17 @@ pub(crate) enum BreakerTripMode {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub(crate) struct BreakerTripConfig {
     #[serde(default = "default_trip_mode")]
-    pub mode: BreakerTripMode,
+    pub(crate) mode: BreakerTripMode,
     #[serde(default = "default_window_s")]
-    pub window_s: u64,
+    pub(crate) window_s: u64,
     #[serde(default = "default_threshold")]
-    pub threshold: f64,
+    pub(crate) threshold: f64,
     #[serde(default = "default_min_requests")]
-    pub min_requests: usize,
+    pub(crate) min_requests: usize,
+    /// Consecutive-failure threshold for `BreakerTripMode::Consecutive`. Field name kept as `n` to
+    /// preserve the operator config schema (`trip.n`) — do not rename.
     #[serde(default = "default_consecutive_n")]
-    pub n: u32,
+    pub(crate) n: u32,
 }
 
 fn default_trip_mode() -> BreakerTripMode {
@@ -350,11 +588,11 @@ fn default_consecutive_n() -> u32 {
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct BreakerCfg {
     #[serde(default = "default_cooldown")]
-    pub base_cooldown_secs: u64,
+    pub(crate) base_cooldown_secs: u64,
     #[serde(default = "default_max_cooldown")]
-    pub max_cooldown_secs: u64,
+    pub(crate) max_cooldown_secs: u64,
     #[serde(default)]
-    pub trip: Option<BreakerTripConfig>,
+    pub(crate) trip: Option<BreakerTripConfig>,
 }
 
 impl Default for BreakerCfg {
@@ -505,6 +743,11 @@ pub(crate) struct ProviderDef {
     /// its `path`). Recognized values: `bearer` (default) | `api-key`.
     #[serde(default)]
     pub(crate) auth: Option<String>,
+    /// Catalog default for the per-provider metadata allow-override (see
+    /// `ProviderCfg::allow_metadata_hosts`). A deployment's `allow_metadata_hosts` (`Some`) replaces
+    /// this; `None` falls back to the catalog list. Default empty (all metadata blocked).
+    #[serde(default)]
+    pub(crate) allow_metadata_hosts: Vec<String>,
 }
 
 /// Provider deployment - operator config in config.yaml (names provider + supplies key).
@@ -523,6 +766,10 @@ pub(crate) struct ProviderDeploy {
     /// Optional auth-style override (see ProviderDef::auth).
     #[serde(default)]
     pub(crate) auth: Option<String>,
+    /// Per-provider metadata allow-override (see `ProviderCfg::allow_metadata_hosts`). `Some` REPLACES
+    /// the catalog default; `None` falls back to the catalog's `allow_metadata_hosts`.
+    #[serde(default)]
+    pub(crate) allow_metadata_hosts: Option<Vec<String>>,
     /// Optional active health-probe settings (see ProviderDef::health). Overrides the catalog's
     /// `health` when set; this is the block the shipped `config.yaml` documents under a provider.
     #[serde(default)]
@@ -548,6 +795,7 @@ impl fmt::Debug for ProviderDeploy {
             .field("error_map", &self.error_map)
             .field("path", &self.path)
             .field("auth", &self.auth)
+            .field("allow_metadata_hosts", &self.allow_metadata_hosts)
             .field("health", &self.health)
             .field(
                 "_legacy_api_key",
@@ -566,6 +814,9 @@ impl fmt::Debug for ProviderDeploy {
 pub(crate) struct DeployCfg {
     #[serde(default = "default_listen")]
     pub(crate) listen: String,
+    /// Optional native inbound TLS / mTLS. Absent ⇒ plain HTTP (unchanged default).
+    #[serde(default)]
+    pub(crate) tls: Option<TlsCfg>,
     pub(crate) auth: Option<AuthCfg>,
     pub(crate) providers: HashMap<String, ProviderDeploy>,
     pub(crate) models: HashMap<String, ModelCfg>,
@@ -580,6 +831,34 @@ pub(crate) struct DeployCfg {
     /// optional governance (virtual keys, budgets, rate limits). Absent = disabled.
     #[serde(default)]
     pub(crate) governance: Option<GovernanceCfg>,
+    /// Optional security controls. Today this carries only `blocked_metadata_hosts`, the operator
+    /// extension to the hardcoded cloud-metadata SSRF denylist. Absent ⇒ only the hardcoded denylist
+    /// applies.
+    #[serde(default)]
+    pub(crate) security: Option<SecurityCfg>,
+}
+
+/// Operator-owned security controls (config.yaml `security:` block).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub(crate) struct SecurityCfg {
+    /// Additional hosts/IPs APPENDED to the hardcoded cloud-metadata denylist. A provider `base_url`
+    /// resolving to any of these is rejected at boot (unless carved out by an allow-override),
+    /// exactly like the built-in metadata endpoints. This is the answer to "an unknown cloud's
+    /// metadata IP/hostname is not in the built-in list" — add it here. Entries may be IP literals
+    /// (matched against the resolved host, including the obfuscation-decoded forms) or DNS hostnames
+    /// (matched case-insensitively, trailing dot stripped). Default empty.
+    #[serde(default)]
+    pub(crate) blocked_metadata_hosts: Vec<String>,
+    /// Global SURGICAL allow-override: hosts/IPs to UNBLOCK from the cloud-metadata denylist for ALL
+    /// providers. Carves a single exception out of the denylist everywhere (the everywhere-scoped
+    /// twin of per-provider `allow_metadata_hosts`). An IP entry also unblocks its obfuscated
+    /// spellings, mirroring how a block entry blocks all spellings. Default empty.
+    #[serde(default)]
+    pub(crate) allow_metadata_hosts: Vec<String>,
+    /// Nuclear override: when true the cloud-metadata SSRF guard is FULLY DISABLED for every provider
+    /// (every metadata/IMDS endpoint becomes reachable). Logs a startup WARNING. Default false.
+    #[serde(default)]
+    pub(crate) allow_all_metadata: bool,
 }
 
 /// Governance config. When present + enabled, callers authenticate with virtual keys
@@ -601,6 +880,25 @@ pub(crate) struct GovernanceCfg {
     /// bearer token guarding the /admin management API. None = admin API disabled.
     #[serde(default)]
     pub(crate) admin_token: Option<String>,
+    /// Behavior when the budget store errors during the atomic admission check-and-charge (fix 2b).
+    /// `allow` (default) fails OPEN — the request proceeds, preserving availability on a telemetry-
+    /// store hiccup (today's behavior). `deny` fails CLOSED — the request is rejected, the strict
+    /// stance for security/regulated deployments that want a hard budget guarantee. Only the store-
+    /// ERROR path is affected; a definitive over-budget result always rejects regardless.
+    #[serde(default)]
+    pub(crate) budget_on_store_error: BudgetOnStoreError,
+}
+
+/// Fail-mode for the budget check on a store error (fix 2b). Default `allow` (fail-open) preserves
+/// today's availability-first behavior.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BudgetOnStoreError {
+    /// Fail OPEN: on a store error during the budget check, proceed (availability). Today's behavior.
+    #[default]
+    Allow,
+    /// Fail CLOSED: on a store error during the budget check, reject (hard budget guarantee).
+    Deny,
 }
 
 // MANUAL Debug that REDACTS the admin bearer token. A derived `Debug` would print `admin_token` in
@@ -621,6 +919,7 @@ impl fmt::Debug for GovernanceCfg {
                     "<absent>"
                 },
             )
+            .field("budget_on_store_error", &self.budget_on_store_error)
             .finish()
     }
 }
@@ -711,6 +1010,11 @@ pub(crate) fn resolve(
                 // deployment override wins over the catalog default
                 path: deploy_cfg.path.clone().or_else(|| def.path.clone()),
                 auth: deploy_cfg.auth.clone().or_else(|| def.auth.clone()),
+                // deployment override (Some) replaces the catalog default
+                allow_metadata_hosts: deploy_cfg
+                    .allow_metadata_hosts
+                    .clone()
+                    .unwrap_or_else(|| def.allow_metadata_hosts.clone()),
                 _legacy_api_key: None,
             },
         );
@@ -731,10 +1035,26 @@ pub(crate) fn resolve(
     if errors.is_empty() {
         Ok(RootCfg {
             listen: deploy.listen.clone(),
+            tls: deploy.tls.clone(),
             auth: deploy.auth.clone().map(|a| a.normalize()),
             providers: resolved_providers,
             models: deploy.models.clone(),
             pools: deploy.pools.clone(),
+            blocked_metadata_hosts: deploy
+                .security
+                .as_ref()
+                .map(|s| s.blocked_metadata_hosts.clone())
+                .unwrap_or_default(),
+            allow_metadata_hosts: deploy
+                .security
+                .as_ref()
+                .map(|s| s.allow_metadata_hosts.clone())
+                .unwrap_or_default(),
+            allow_all_metadata: deploy
+                .security
+                .as_ref()
+                .map(|s| s.allow_all_metadata)
+                .unwrap_or(false),
         })
     } else {
         Err(errors)
@@ -877,6 +1197,7 @@ models:
                 health: None,
                 path: Some("/chat/completions".to_string()),
                 auth: None,
+                allow_metadata_hosts: Vec::new(),
             },
         );
         let mut providers = HashMap::new();
@@ -896,16 +1217,19 @@ models:
                     timeout_secs: None,
                 }),
                 _legacy_api_key: None,
+                allow_metadata_hosts: None,
             },
         );
         let deploy = DeployCfg {
             listen: "0.0.0.0:8080".into(),
+            tls: None,
             auth: None,
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
             observability: None,
             governance: None,
+            security: None,
         };
         let cfg = resolve(&deploy, &defs).expect("resolve");
         assert_eq!(
@@ -1039,6 +1363,99 @@ models:
             failures.load(std::sync::atomic::Ordering::Relaxed),
             0,
             "guarded set/interpolate/remove of BUSBAR_CLIENT_TOKEN must never observe an unset var"
+        );
+    }
+
+    /// Native SHORTHAND desugaring: `route: cheapest` (a bare native name) must parse to
+    /// `RouteKind::Native` with `policy.name` folded in — byte-identical to the long form
+    /// `route: native` + `policy.name: cheapest`. Covers every shorthand.
+    #[test]
+    fn test_route_native_shorthand_desugars() {
+        for name in ["cheapest", "fastest", "least_busy", "usage"] {
+            let yaml = format!("route: {name}\nmembers: []\n");
+            let pool: PoolCfg = serde_yaml::from_str(&yaml).expect("shorthand must parse");
+            assert_eq!(pool.route, RouteKind::Native, "{name} desugars to Native");
+            assert_eq!(
+                pool.policy.as_ref().and_then(|p| p.name.as_deref()),
+                Some(name),
+                "{name} shorthand must fold into policy.name"
+            );
+            // C1 / CH3: a desugared shorthand has no `policy:` block on disk, so its synthesized
+            // `PolicyCfg` must carry the REAL default timeout (150), NOT the 0 that
+            // `PolicyCfg::default()` leaves behind (serde field-defaults don't fire on code-built
+            // structs). A 0 here becomes an instant 0ms policy deadline at resolution.
+            assert_eq!(
+                pool.policy.as_ref().map(|p| p.timeout_ms),
+                Some(DEFAULT_POLICY_TIMEOUT_MS),
+                "{name} shorthand must inherit the default {DEFAULT_POLICY_TIMEOUT_MS}ms policy timeout, not 0"
+            );
+        }
+    }
+
+    /// `route: weighted` (shorthand or absent) stays the zero-cost `Weighted` default — it must NOT
+    /// be turned into a native policy object.
+    #[test]
+    fn test_route_weighted_and_absent_stay_default() {
+        let absent: PoolCfg = serde_yaml::from_str("members: []\n").expect("absent route parses");
+        assert_eq!(absent.route, RouteKind::Weighted);
+        assert!(absent.policy.is_none());
+
+        let explicit: PoolCfg =
+            serde_yaml::from_str("route: weighted\nmembers: []\n").expect("weighted parses");
+        assert_eq!(explicit.route, RouteKind::Weighted);
+    }
+
+    /// The LONG form still works and an explicit `policy.name` is never overwritten by a shorthand.
+    #[test]
+    fn test_route_long_form_and_explicit_name_preserved() {
+        let long: PoolCfg =
+            serde_yaml::from_str("route: native\nmembers: []\npolicy:\n  name: fastest\n")
+                .expect("long form parses");
+        assert_eq!(long.route, RouteKind::Native);
+        assert_eq!(long.policy.unwrap().name.as_deref(), Some("fastest"));
+
+        // webhook / script keep their kind.
+        let wh: PoolCfg =
+            serde_yaml::from_str("route: webhook\nmembers: []\npolicy:\n  url: http://x\n")
+                .expect("webhook parses");
+        assert_eq!(wh.route, RouteKind::Webhook);
+    }
+
+    /// An unknown `route:` value fails loudly (no silent degrade to weighted at parse time).
+    #[test]
+    fn test_route_unknown_value_errors() {
+        let err = serde_yaml::from_str::<PoolCfg>("route: bogus\nmembers: []\n");
+        assert!(err.is_err(), "unknown route must be a parse error");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("bogus"),
+            "error must name the bad value, got: {msg}"
+        );
+    }
+
+    /// fix 2b: `governance.budget_on_store_error` parses `allow`/`deny`, defaults to `allow` (fail-
+    /// open, today's behavior), and rejects an unknown value (typed enum, not a free string).
+    #[test]
+    fn test_budget_on_store_error_parses() {
+        use crate::config::BudgetOnStoreError;
+        // Default (field absent) is Allow.
+        let g: GovernanceCfg = serde_yaml::from_str("enabled: true\n").expect("parse");
+        assert_eq!(
+            g.budget_on_store_error,
+            BudgetOnStoreError::Allow,
+            "default is allow"
+        );
+        // Explicit allow / deny.
+        let g: GovernanceCfg =
+            serde_yaml::from_str("budget_on_store_error: allow\n").expect("parse allow");
+        assert_eq!(g.budget_on_store_error, BudgetOnStoreError::Allow);
+        let g: GovernanceCfg =
+            serde_yaml::from_str("budget_on_store_error: deny\n").expect("parse deny");
+        assert_eq!(g.budget_on_store_error, BudgetOnStoreError::Deny);
+        // Unknown value is a parse error (no silent degrade).
+        assert!(
+            serde_yaml::from_str::<GovernanceCfg>("budget_on_store_error: maybe\n").is_err(),
+            "unknown budget_on_store_error must fail to parse"
         );
     }
 
@@ -1232,6 +1649,7 @@ models:
                 health: None,
                 path: None,
                 auth: None,
+                allow_metadata_hosts: Vec::new(),
             },
         );
 
@@ -1247,17 +1665,20 @@ models:
                 auth: None,
                 health: None,
                 _legacy_api_key: None,
+                allow_metadata_hosts: None,
             },
         );
 
         let deploy = DeployCfg {
             listen: "0.0.0.0:8080".into(),
+            tls: None,
             auth: None,
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
             observability: None,
             governance: None,
+            security: None,
         };
 
         let result = resolve(&deploy, &defs).expect("resolve should succeed");
@@ -1312,6 +1733,7 @@ models: {}
                 health: None,
                 path: None,
                 auth: None,
+                allow_metadata_hosts: Vec::new(),
             },
         );
         let cfg = resolve(&deploy, &defs).expect("resolve");
@@ -1330,6 +1752,7 @@ models: {}
         let defs = HashMap::new();
         let deploy = DeployCfg {
             listen: "0.0.0.0:8080".into(),
+            tls: None,
             auth: None,
             providers: HashMap::new(),
             models: HashMap::new(),
@@ -1341,7 +1764,9 @@ models: {}
                 price_per_request_cents: 1,
                 price_per_1k_tokens_cents: 0,
                 admin_token: None,
+                budget_on_store_error: Default::default(),
             }),
+            security: None,
         };
         let errs = resolve(&deploy, &defs)
             .expect_err("enabled governance without admin_token must fail resolution");
@@ -1356,6 +1781,7 @@ models: {}
         let defs = HashMap::new();
         let deploy = DeployCfg {
             listen: "0.0.0.0:8080".into(),
+            tls: None,
             auth: None,
             providers: HashMap::new(),
             models: HashMap::new(),
@@ -1367,7 +1793,9 @@ models: {}
                 price_per_request_cents: 1,
                 price_per_1k_tokens_cents: 0,
                 admin_token: Some("operator-secret".to_string()),
+                budget_on_store_error: Default::default(),
             }),
+            security: None,
         };
         assert!(
             resolve(&deploy, &defs).is_ok(),
@@ -1392,17 +1820,20 @@ models: {}
                 auth: None,
                 health: None,
                 _legacy_api_key: None,
+                allow_metadata_hosts: None,
             },
         );
 
         let deploy = DeployCfg {
             listen: "0.0.0.0:8080".into(),
+            tls: None,
             auth: None,
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
             observability: None,
             governance: None,
+            security: None,
         };
 
         let result = resolve(&deploy, &defs);
@@ -1428,6 +1859,7 @@ models: {}
                 health: None,
                 path: None,
                 auth: None,
+                allow_metadata_hosts: Vec::new(),
             },
         );
 
@@ -1446,17 +1878,20 @@ models: {}
                 auth: None,
                 health: None,
                 _legacy_api_key: None,
+                allow_metadata_hosts: None,
             },
         );
 
         let deploy = DeployCfg {
             listen: "0.0.0.0:8080".into(),
+            tls: None,
             auth: None,
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
             observability: None,
             governance: None,
+            security: None,
         };
 
         let result = resolve(&deploy, &defs).expect("resolve should succeed");
@@ -1493,6 +1928,7 @@ models: {}
                 health: None,
                 path: None,
                 auth: None,
+                allow_metadata_hosts: Vec::new(),
             },
         );
 
@@ -1508,17 +1944,20 @@ models: {}
                 auth: None,
                 health: None,
                 _legacy_api_key: None,
+                allow_metadata_hosts: None,
             },
         );
 
         let deploy = DeployCfg {
             listen: "0.0.0.0:8080".into(),
+            tls: None,
             auth: None,
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
             observability: None,
             governance: None,
+            security: None,
         };
 
         let result = resolve(&deploy, &defs).expect("resolve should succeed");
@@ -1659,6 +2098,7 @@ models: {}
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: Some("SECRET-admin-bearer-token-qqq".to_string()),
+            budget_on_store_error: Default::default(),
         };
         let dbg = format!("{gov:?}");
         assert!(
@@ -1679,6 +2119,7 @@ models: {}
             error_map: HashMap::new(),
             path: None,
             auth: None,
+            allow_metadata_hosts: Vec::new(),
             _legacy_api_key: Some("SECRET-inline-provider-key-www".to_string()),
         };
         let dbg = format!("{prov:?}");
@@ -1726,6 +2167,7 @@ models: {}
         );
         let deploy = DeployCfg {
             listen: "127.0.0.1:8080".to_string(),
+            tls: None,
             auth: Some(AuthCfg {
                 mode: "token".to_string(),
                 _legacy_token: Some("SECRET-embedded-legacy-token".to_string()),
@@ -1741,7 +2183,9 @@ models: {}
                 price_per_request_cents: 1,
                 price_per_1k_tokens_cents: 0,
                 admin_token: Some("SECRET-embedded-admin-token".to_string()),
+                budget_on_store_error: Default::default(),
             }),
+            security: None,
         };
         let dbg = format!("{deploy:?}");
         for secret in [

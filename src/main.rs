@@ -44,14 +44,17 @@ mod handlers;
 mod health;
 mod ir;
 mod metrics;
+mod net_guard;
 mod observability;
 mod proto;
 mod route;
+mod routing;
 mod sigv4;
 mod state;
 mod store;
 #[cfg(test)]
 mod test_support;
+mod tls;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -73,6 +76,9 @@ const POOL_MAX_IDLE_PER_HOST: usize = 64;
 /// Maximum accepted request body size. Caps memory per request (the body is buffered before
 /// handling) so a hostile/oversized payload can't exhaust memory — generous enough for long
 /// histories and multimodal/base64 image content, but bounded. (axum's default is only 2 MiB.)
+/// NOTE: `forward::MAX_TRANSLATED_BODY_BYTES` is deliberately kept equal to this (a completion the
+/// gateway accepts inbound must also be buffer-translatable on egress) — if you change this, move
+/// that one in lockstep or large upstream responses will 500 on the cross-protocol path.
 const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// Handle CLI flags before any environment or file access, so they work without a configured
@@ -87,6 +93,29 @@ fn handle_cli_flags() -> Option<i32> {
             println!("busbar {}", env!("CARGO_PKG_VERSION"));
             Some(0)
         }
+        Some("--print-metadata-blocklist") => {
+            // Print the EFFECTIVE cloud-metadata denylist the running binary enforces: the hardcoded
+            // set (single source of truth in config_validate) UNION the operator's
+            // `security.blocked_metadata_hosts`. The hardcoded set always prints (no config needed);
+            // the operator extension is appended best-effort if BUSBAR_CONFIG is readable + parseable,
+            // so the flag is useful even before a deployment is wired up. One entry per line, exit 0.
+            let mut entries = config_validate::metadata_denylist_entries();
+            let config_path =
+                std::env::var("BUSBAR_CONFIG").unwrap_or_else(|_| "/etc/busbar/config.yaml".into());
+            if let Ok(raw) = std::fs::read_to_string(&config_path) {
+                if let Ok(interpolated) = config::interpolate_env(&raw) {
+                    if let Ok(deploy) = serde_yaml::from_str::<config::DeployCfg>(&interpolated) {
+                        if let Some(sec) = deploy.security {
+                            entries.extend(sec.blocked_metadata_hosts);
+                        }
+                    }
+                }
+            }
+            for entry in entries {
+                println!("{entry}");
+            }
+            Some(0)
+        }
         Some("--help" | "-h") => {
             println!(
                 "busbar {ver} — native-protocol LLM gateway
@@ -95,6 +124,8 @@ USAGE:
     busbar              run the gateway (configured entirely via environment + YAML)
     busbar --help       print this help
     busbar --version    print the version
+    busbar --print-metadata-blocklist
+                        print the effective cloud-metadata SSRF denylist and exit
 
 ENVIRONMENT:
     BUSBAR_PROVIDERS    path to providers.yaml  (default: /etc/busbar/providers.yaml)
@@ -114,7 +145,7 @@ ENDPOINTS (once running, listen address from config.yaml `listen`):
     POST /model/<modelId>/converse-stream  Bedrock Converse streaming ingress
     GET  /stats  /healthz  /metrics
 
-Docs: https://github.com/MattJackson/busbarAI",
+Docs: https://getbusbar.com   ·   Source: https://github.com/MattJackson/busbarAI",
                 ver = env!("CARGO_PKG_VERSION")
             );
             Some(0)
@@ -239,6 +270,10 @@ async fn main() {
     // subsequent startup and request-path logging is captured.
     observability::init_logging(observability_cfg.otlp_endpoint.as_deref());
 
+    // First line in the logs: which build is running. Operators need this to confirm a deploy /
+    // correlate logs to a release without shelling in to run `--version`.
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "busbar starting");
+
     // Resolve deployment + definitions into resolved RootCfg
     let cfg = config::resolve(&deploy, &defs)
         .unwrap_or_else(|errs| die(format!("config errors:\n  - {}", errs.join("\n  - "))));
@@ -256,6 +291,20 @@ async fn main() {
             eprintln!("[error] {}", err);
         }
         std::process::exit(1);
+    }
+
+    // Metadata-SSRF protection status (discoverability). When the nuclear `allow_all_metadata` is set
+    // the guard is OFF — that is a security-relevant degradation, so WARN. Otherwise report the count
+    // of blocked hosts (hardcoded denylist ∪ security.blocked_metadata_hosts) and point at the CLI
+    // flag that dumps the full list.
+    if cfg.allow_all_metadata {
+        tracing::warn!("metadata protection DISABLED — all cloud-metadata endpoints reachable");
+    } else {
+        let blocked =
+            config_validate::metadata_denylist_entries().len() + cfg.blocked_metadata_hosts.len();
+        tracing::info!(
+            "metadata protection: {blocked} hosts blocked (--print-metadata-blocklist to view)"
+        );
     }
 
     let mut lanes_data = Vec::new();
@@ -404,6 +453,7 @@ async fn main() {
     }
 
     let listen = cfg.listen.clone();
+    let tls_cfg = cfg.tls.clone();
 
     // Loud warning for auth.mode=none (open relay). Not fatal — busbar still starts (useful for
     // local dev) — but operators must not run this in production. NOTE: an ABSENT `auth:` block
@@ -435,6 +485,24 @@ async fn main() {
     // so it mirrors the pools map (any pool can be a fallback target).
     let fallback_pools = pools.clone();
 
+    // The shared upstream HTTP client, built ONCE. Constructed before the pool-runtime loop so the
+    // webhook routing transport can reuse it (a clone shares the connection pool + the `redirect:none`
+    // SSRF posture); the same client is then moved into `App` below.
+    let upstream_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(UPSTREAM_REQUEST_TIMEOUT_SECS))
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+        // SSRF guard: do NOT follow redirects. The startup SSRF blocklist (config_validate.rs
+        // ssrf_blocked_host) only vets the configured base_url; it does not see redirect targets.
+        // reqwest's default policy follows up to 10 redirects, so a compromised/malicious upstream
+        // could 30x-redirect a vetted base_url to an internal address (169.254.169.254 metadata,
+        // localhost, RFC1918) and busbar would follow it — forwarding the signed request
+        // (x-api-key / SigV4 Authorization on same-host redirects) to the internal target,
+        // defeating the blocklist at runtime. Upstream AI provider APIs do not redirect as part of
+        // normal operation, so disabling redirect following entirely closes the vector at no cost.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build upstream HTTP client");
+
     // Per-pool runtime config (failover/exclusions), keyed by pool name.
     let mut pool_runtime = std::collections::HashMap::new();
     for (pool_name, pool_cfg) in &cfg.pools {
@@ -444,6 +512,28 @@ async fn main() {
                 failover: pool_cfg.failover.clone(),
                 affinity: pool_cfg.affinity.clone(),
                 breaker: pool_cfg.breaker.as_ref().map(store::BreakerCfg::from),
+                // Operator-declared member metadata (tier/cost/tags) keyed by lane idx, for the
+                // routing Candidate projection. Mirrors the WeightedLane construction's target→lane
+                // mapping (by_model). Read only inside the policy arm of the seam.
+                members: pool_cfg
+                    .members
+                    .iter()
+                    .filter_map(|m| {
+                        by_model.get(&m.target).map(|&idx| {
+                            (
+                                idx,
+                                state::MemberMeta {
+                                    tier: m.tier.clone(),
+                                    cost_per_mtok: m.cost_per_mtok,
+                                    tags: m.tags.clone(),
+                                },
+                            )
+                        })
+                    })
+                    .collect(),
+                // Resolve the routing policy ONCE here. `route: weighted` (default) ⇒ `None` ⇒ the
+                // zero-cost inline SWRR path; the webhook transport reuses the shared upstream client.
+                policy: routing::resolve_policy(pool_cfg, &upstream_client),
             },
         );
     }
@@ -479,6 +569,8 @@ async fn main() {
                     g.admin_token.clone(),
                 ) {
                     Ok(gs) => {
+                        // fix 2b: thread the budget store-error fail-mode (allow|deny) onto GovState.
+                        let gs = gs.with_budget_on_store_error(g.budget_on_store_error);
                         eprintln!("busbar: governance enabled (sqlite {})", g.db_path);
                         Some(Arc::new(gs))
                     }
@@ -501,20 +593,7 @@ async fn main() {
         store,
         by_model,
         pools,
-        client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(UPSTREAM_REQUEST_TIMEOUT_SECS))
-            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
-            // SSRF guard: do NOT follow redirects. The startup SSRF blocklist (config_validate.rs
-            // ssrf_blocked_host) only vets the configured base_url; it does not see redirect targets.
-            // reqwest's default policy follows up to 10 redirects, so a compromised/malicious upstream
-            // could 30x-redirect a vetted base_url to an internal address (169.254.169.254 metadata,
-            // localhost, RFC1918) and busbar would follow it — forwarding the signed request
-            // (x-api-key / SigV4 Authorization on same-host redirects) to the internal target,
-            // defeating the blocklist at runtime. Upstream AI provider APIs do not redirect as part of
-            // normal operation, so disabling redirect following entirely closes the vector at no cost.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("build upstream HTTP client"),
+        client: upstream_client.clone(),
         auth: auth_mw.clone(),
         failover_cfg,
         pool_runtime,
@@ -538,15 +617,34 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .unwrap_or_else(|e| die(format!("cannot bind listen address '{listen}': {e}")));
-    tracing::info!(%listen, "busbar listening");
     // Graceful shutdown: on ctrl_c (SIGINT) or SIGTERM, stop accepting new connections, let
     // in-flight requests drain, then flush the OTLP tracer so the final (most diagnostic) spans are
     // exported rather than dropped when the runtime tears down. The signal future is panic-free —
     // a failed registration logs and parks forever (so a missing signal facility degrades to "no
     // graceful shutdown", never a crash), and `shutdown_tracing()` is a no-op when OTLP is off.
-    let serve = axum::serve(listener, router).with_graceful_shutdown(shutdown_signal());
-    if let Err(e) = serve.await {
-        die(format!("server error: {e}"));
+    match tls_cfg {
+        // DEFAULT PATH — unchanged. With no `tls:` block this is byte-for-byte the historical
+        // plain-HTTP server: axum::serve over the TcpListener with graceful shutdown.
+        None => {
+            tracing::info!(%listen, "busbar listening");
+            let serve = axum::serve(listener, router).with_graceful_shutdown(shutdown_signal());
+            if let Err(e) = serve.await {
+                die(format!("server error: {e}"));
+            }
+        }
+        // TLS PATH — terminate TLS natively (+ mTLS if client_ca_file is set). Cert/key/CA are loaded
+        // and validated here so a bad path/parse fails fast at startup (`die`) rather than per
+        // request. The crypto provider is installed once before building the ServerConfig.
+        Some(tls) => {
+            tls::install_crypto_provider();
+            let server_config = tls::build_server_config(&tls)
+                .unwrap_or_else(|e| die(format!("TLS configuration error: {e}")));
+            let mtls = tls.client_ca_file.is_some();
+            tracing::info!(%listen, mtls, "busbar listening (TLS)");
+            if let Err(e) = tls::serve(listener, router, server_config, shutdown_signal()).await {
+                die(format!("server error: {e}"));
+            }
+        }
     }
     observability::shutdown_tracing();
 }
@@ -624,7 +722,7 @@ fn fallback_error_response(
         status,
         [(
             axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/json"),
+            axum::http::HeaderValue::from_static(crate::forward::APPLICATION_JSON),
         )],
         body.to_string(),
     )
@@ -633,12 +731,18 @@ fn fallback_error_response(
         let headers = resp.headers_mut();
         if let Some(id) = proto::synth_amzn_request_id() {
             if let Ok(hv) = axum::http::HeaderValue::from_str(&id) {
-                headers.insert(axum::http::HeaderName::from_static("x-amzn-requestid"), hv);
+                headers.insert(
+                    axum::http::HeaderName::from_static(proto::HDR_AMZN_REQUEST_ID),
+                    hv,
+                );
             }
         }
         let errortype = proto::error_kind_to_bedrock_type(kind);
         if let Ok(hv) = axum::http::HeaderValue::from_str(errortype) {
-            headers.insert(axum::http::HeaderName::from_static("x-amzn-errortype"), hv);
+            headers.insert(
+                axum::http::HeaderName::from_static(proto::HDR_AMZN_ERROR_TYPE),
+                hv,
+            );
         }
     }
     resp
@@ -720,7 +824,7 @@ async fn reshape_oversized_413(
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("application/json"));
+        .is_some_and(|ct| ct.starts_with(crate::forward::APPLICATION_JSON));
     if is_json {
         return resp;
     }
@@ -816,6 +920,8 @@ mod tests {
             failover: None,
             on_exhausted: None,
             affinity: None,
+            route: crate::config::RouteKind::default(),
+            policy: None,
         }
     }
 
@@ -824,6 +930,9 @@ mod tests {
             target: target.to_string(),
             weight: 1,
             context_max,
+            tier: None,
+            cost_per_mtok: None,
+            tags: Vec::new(),
         }
     }
 
