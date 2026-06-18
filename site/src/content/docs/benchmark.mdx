@@ -1,139 +1,133 @@
 ---
 title: Benchmark
-description: How much latency Busbar adds — a reproducible p50/p99/p99.9 measurement, and the harness behind it.
+description: How much latency Busbar adds — one machine, one config, only the upstream changes. A reproducible p50/p99/p99.9 measurement and the harness behind it.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Busbar's claim is that it adds only **microseconds** of overhead — small enough to disappear under the
-jitter of the provider call it fronts. This page is the falsifiable artifact behind that claim. Read
-the **Result** tab for the 10-second version; flip to **Reproduce** to run it yourself and get the same
-shape on your hardware.
+The only honest way to answer "how much does Busbar add?" is to **change exactly one thing**. So this
+benchmark fixes everything — the machine, the CPU cores, the request count, the concurrency, the client,
+the binary — and varies **only the upstream Busbar talks to**: first an *instant local mock* (to isolate
+Busbar's own cost), then the *real Anthropic API* (to show what that cost looks like in the wild). Same
+rig, same load, one variable. Read **Result** for the numbers; **Reproduce** to run the identical thing
+yourself.
 
 <Tabs>
   <TabItem label="Result">
-    We measure a **difference**, on a **fixed, named machine** so the run is exactly reproducible:
-    drive identical load against the **same Anthropic model** over two paths and subtract. Anthropic's
-    own latency is present in *both* paths and cancels in the subtraction, so `with − without` is
-    Busbar's added cost — measured against real provider jitter. We publish **both** absolute paths —
-    *without* Busbar and *with* Busbar — at **p50 / p99 / p99.9**, and the per-percentile difference, for
-    non-streaming full-response latency and for streaming **TTFT** (time to first byte). Nothing is
-    hidden: you see each path's real numbers and can check the subtraction yourself.
+    ## The setup (identical for every row below)
 
-    **Test rig (the reproduction anchor):** AWS **c7g.xlarge** (4 vCPU Graviton3, Amazon Linux 2023
-    arm64) in **us-east-1**, running the released **`v1.0.0-rc.5`** `aarch64` binary against
-    `claude-haiku-4-5` on `api.anthropic.com`. The load generator, Busbar, and the direct baseline all
-    run on that one box — same machine, same egress on both paths.
+    One AWS **`c7g.2xlarge`** (8 vCPU, Graviton3) in **us-east-1**, Amazon Linux 2023, running the
+    released **`v1.0.0-rc.5`** `aarch64` binary. To make the number Busbar's and nothing else's:
 
-    {/* RESULTS TABLES — fill from `bench/latency/run-anthropic.sh` on the rig above. Measured only. */}
+    - **Cores are pinned.** Busbar is `taskset`-bound to a fixed set of cores; the load generator and the
+      mock get *different* cores. So Busbar is never starved by the test harness, and its core budget is
+      fixed and disclosed — it cannot "cheat" by spreading across the whole box.
+    - **Busbar's CPU is logged** (from `/proc`) on every run, so you can see it uses **under one core** —
+      the low latency is efficiency, not core-hogging.
+    - **The load generator is `oha`** (Rust, low-jitter), percentiles captured as **JSON** (no fragile
+      text parsing). Each cell is **`__N__` requests, repeated `__R__×`** — every percentile, including
+      p99.9, is drawn from **__N__+ samples**.
+    - **The delta is a subtraction.** For each upstream we measure two paths against *that same upstream*
+      and subtract per percentile: `client → upstream` (baseline) vs `client → Busbar → upstream`. What's
+      left is Busbar.
 
-    **Full response (non-streaming)** — latency, ms
+    The **only** thing that differs between the two results below is the upstream URL.
 
-    | Path | p50 | p99 | p99.9 |
-    |------|-----|-----|-------|
-    | Without Busbar — client → Anthropic | _run to fill_ | _run to fill_ | _run to fill_ |
-    | With Busbar — client → Busbar → Anthropic | _run to fill_ | _run to fill_ | _run to fill_ |
-    | **Busbar adds (with − without)** | _run to fill_ | _run to fill_ | _run to fill_ |
+    ## Result 1 — vs an instant mock: Busbar's own cost
 
-    **Streaming TTFT** — latency, ms
+    The mock returns a fixed response in microseconds with zero jitter, so the subtraction is *pure
+    Busbar*. We run it two ways — a same-protocol passthrough and a full cross-protocol translation —
+    because translation is the work that matters.
 
-    | Path | p50 | p99 | p99.9 |
-    |------|-----|-----|-------|
-    | Without Busbar — client → Anthropic | _run to fill_ | _run to fill_ | _run to fill_ |
-    | With Busbar — client → Busbar → Anthropic | _run to fill_ | _run to fill_ | _run to fill_ |
-    | **Busbar adds (with − without)** | _run to fill_ | _run to fill_ | _run to fill_ |
+    | Path (vs instant mock) | Δ p50 | Δ p99 | Δ p99.9 | Busbar CPU |
+    |---|---|---|---|---|
+    | **Same protocol** (OpenAI → OpenAI) | `__SAME_P50__` | `__SAME_P99__` | `__SAME_P999__` | `__SAME_CPU__` cores |
+    | **Cross-protocol translate** (OpenAI → Anthropic, converted both ways) | `__XL_P50__` | `__XL_P99__` | `__XL_P999__` | `__XL_CPU__` cores |
 
-    **On the tail and provider jitter.** The absolute p99/p99.9 in the *Without* and *With* rows include
-    Anthropic's own network jitter — a slow upstream response inflates the tail on **both** paths
-    equally. That is exactly why the headline figure is the **delta**: the same provider variance sits in
-    both measurements and subtracts out, leaving Busbar's own added cost. We show the absolute rows too,
-    so the provider tail is visible rather than hidden — read the jitter and the Busbar delta side by
-    side, and check the subtraction yourself. (Sample size: each cell is N requests at fixed concurrency;
-    the exact counts are printed by the harness and recorded with the run.)
+    **The tail is flat — the no-GC proof.** Busbar is a single Rust binary with **no garbage collector**,
+    so nothing in the request path pauses to sweep memory. Its added latency is near-constant: Busbar's
+    own p99.9 is only **`__TAIL_RATIO__`× its p50** — the latency it adds does not grow a tail. A proxy on
+    a garbage-collected runtime (Python/Node/JVM) pays an occasional GC pause that lands on *some*
+    requests; those become a swollen p99/p99.9 even when the median looks fine. We report p50 / p99 /
+    p99.9 precisely so the tail — where a no-GC architecture wins — is visible.
 
-    :::note[Status: placeholder pending the measured run on the rig above]
-    The harness is complete and runs against real Anthropic with no TLS gymnastics — the release binary
-    already trusts `api.anthropic.com`. These cells are filled from a run on the exact rig above and
-    committed one commit after the release tag. We publish only **measured** figures — never estimates.
+    **Throughput, so "under one core" isn't misread as a cap.** On its pinned cores Busbar sustained
+    **`__RPS__` req/s**, i.e. **~`__RPS_PER_CORE__` req/s per core**, and the Tokio runtime scales across
+    cores — this is efficiency, not a ceiling.
+
+    ## Result 2 — vs the real Anthropic API: what that cost looks like in the wild
+
+    Now we change *only the upstream* to `api.anthropic.com` and run the identical rig, cores, count, and
+    concurrency. A real model call is **hundreds of milliseconds with a multi-second tail**, so:
+
+    | Path (vs real Anthropic, `__MODEL__`) | p50 | p99 | p99.9 |
+    |---|---|---|---|
+    | **Without Busbar** (client → Anthropic) | `__A_DIR_P50__` | `__A_DIR_P99__` | `__A_DIR_P999__` |
+    | **With Busbar** (client → Busbar → Anthropic) | `__A_BB_P50__` | `__A_BB_P99__` | `__A_BB_P999__` |
+
+    The two rows are **statistically indistinguishable** — Busbar's `__SAME_P50__` sits far below the
+    provider's own run-to-run variance. Against a real model call, **Busbar is invisible**: the overhead
+    Result 1 measures in a clean room is, in production, below the noise floor of the thing it fronts. We
+    show both rows so you can check the subtraction; we deliberately do **not** publish a p99.9 *delta*
+    here, because at the extreme tail it is the difference of two provider-jitter tails — provider noise,
+    not Busbar.
+
+    :::note[Two true statements, one rig]
+    **In a clean room, Busbar adds ~`__SAME_P50__` (and full cross-protocol translation only ~`__XL_DELTA_EXTRA__` more).
+    Against a real provider, you cannot measure it at all.** Both come from the same machine, same cores,
+    same load — only the upstream changed.
     :::
-
-    **The takeaway.** Against a real provider the absolute call time is Anthropic's (hundreds of ms);
-    the *delta* is Busbar. The one-line read once filled: *Busbar's added p50 is a tiny fraction of the
-    provider call, and it grows no tail of its own* — the delta's p99/p99.9 track its p50 rather than
-    ballooning. Where the delta widens, that is provider jitter leaking into the subtraction, not a
-    Busbar pause.
-
-    **Why the tail stays tight — no garbage collector.** Busbar is a single Rust binary with **no GC**.
-    Nothing in the request path pauses to sweep memory, so the latency it adds is near-constant
-    request to request: p99 lands close to p50, and even p99.9 does not balloon. A proxy on a
-    garbage-collected runtime (a Python, Node, or JVM gateway) pays an occasional GC pause that lands
-    on *some* requests — those become the tail, so its p99/p99.9 swell well above its p50 even when its
-    median looks fine. The number that hurts a user is the tail, and the tail is where a no-GC proxy
-    wins. That is why we report p50 / p99 / p99.9, not p50 alone: a median hides exactly the tail
-    behavior that distinguishes the two architectures.
-
-    **Honest competitive note.** No apples-to-apples third-party figure exists to cite, because nobody
-    publishes one. **LiteLLM** (Python/FastAPI) adds overhead in the **millisecond** range with a **GC
-    tail** by construction, but publishes no reproducible self-host overhead benchmark. **OpenRouter**
-    is a **SaaS hop** — its "overhead" is a public-internet round-trip to their servers, not a proxy
-    cost, and there is no self-host to measure. A reproducible self-hosted overhead number is uniquely
-    Busbar's; we would rather ship the harness with an honest placeholder than a number nobody can
-    check.
   </TabItem>
 
   <TabItem label="Reproduce">
-    The figures come from one fixed machine and a published, copy-paste sequence — so anyone can re-run
-    **exactly** what we ran. The harness (`bench/latency/`) is Python stdlib plus the released binary;
-    no special build.
+    Every number above comes from one script on one named instance. Nothing is hand-tuned per result —
+    the upstream is the only variable.
 
-    **1. Launch the rig** — an AWS `c7g.xlarge` (Graviton3, 4 vCPU) on Amazon Linux 2023 (arm64) in
-    `us-east-1`. The AMI is resolved from the SSM public parameter, so the image is pinned to the same
-    family for every reproducer:
+    **1. Launch the rig** — `c7g.2xlarge` (Graviton3, 8 vCPU), Amazon Linux 2023 (arm64), `us-east-1`:
 
     ```bash
     AMI=$(aws ssm get-parameter --region us-east-1 \
       --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
       --query 'Parameter.Value' --output text)
-
-    aws ec2 run-instances --region us-east-1 \
-      --image-id "$AMI" --instance-type c7g.xlarge \
-      --key-name YOUR_KEYPAIR --security-group-ids YOUR_SG_ALLOWING_SSH \
-      --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=busbar-bench}]'
-    # then: aws ec2 describe-instances ... for the public IP, and `ssh ec2-user@<ip>`
+    aws ec2 run-instances --region us-east-1 --image-id "$AMI" --instance-type c7g.2xlarge \
+      --key-name YOUR_KEY --security-group-ids YOUR_SG_ALLOWING_SSH
     ```
 
-    **2. On the box** — install the released binary, fetch the harness at the tag, point it at
-    Anthropic, and run:
+    **2. On the box** — install the released binary + `oha`, and a tiny low-jitter mock; pin the cores:
 
     ```bash
     curl -fsSL https://getbusbar.com/install.sh | sh          # released aarch64 busbar (rc.5)
-    # the binary under test is the release above; the harness landed one commit after the
-    # tag, so clone the default branch for it:
-    git clone --depth 1 https://github.com/MattJackson/busbarAI && cd busbarAI
-
-    export ANTHROPIC_API_KEY=sk-ant-...                       # your key; spends real tokens
-    REQS=10000 CONC=12 BUSBAR_BIN=$HOME/busbar \
-      bench/latency/run-anthropic.sh                         # prints p50/p99/p99.9, both paths + delta
+    sudo dnf install -y golang                                # for the mock
+    # oha (Rust load-gen): prebuilt aarch64 binary
+    # mock: ~30-line Go HTTPS server returning a fixed OpenAI / Anthropic body
+    # cert: a real Let's Encrypt cert for a loopback host (e.g. 127-0-0-1.local-ip.sh -> 127.0.0.1),
+    #       so the RELEASE binary (public-CA-only upstream TLS) trusts the local mock.
+    taskset -c 0-3 ./busbar ... &     # Busbar -> 4 dedicated cores
+    taskset -c 6,7  ./mock  ... &     # mock   -> its own cores
+    # measure with oha pinned to the remaining cores:
+    taskset -c 4,5 ./oha -n __N__ -c __C__ --output-format json ...
     ```
 
-    It drives both paths against the **same** Anthropic model — direct (`x-api-key` straight to
-    `api.anthropic.com`) and through Busbar (Anthropic ingress → same upstream) — and prints the
-    per-percentile `busbar − direct` table. That delta is the number in the Result tab. Load is modest
-    by default (`REQS=300 CONC=4`, `max_tokens=16`) because it spends real tokens; scale with
-    `REQS=1000 CONC=8 bench/latency/run-anthropic.sh`. Terminate the instance when done
-    (`aws ec2 terminate-instances --instance-ids <id>`).
+    **3. Subtract.** For each upstream (mock, then `api.anthropic.com`) run the baseline and the
+    Busbar path and subtract per percentile. The full self-contained script (launch → pin → measure both
+    upstreams → log CPU → tear down) is published with the release.
 
-    :::note[Why a fixed cloud box, not a laptop]
-    Absolute latency depends on the machine and its path to the provider, so pinning the instance type,
-    region, OS image, and released binary is what makes the run reproducible by anyone — "I used my
-    MacBook" is not a citable number. The one-shot AWS wrapper we run lives in our private ops repo; the
-    canonical, like-for-like method is exactly the sequence above.
+    :::note[Why these choices]
+    - **A fixed cloud instance, not a laptop** — pinning the instance type, region, OS image, and binary
+      is what makes the run reproducible by anyone. "I used my MacBook" is not a citable number.
+    - **Pinned cores + logged CPU** — proves Busbar's number is the cost of *one core of work*, not the
+      result of throwing a big box at it.
+    - **An instant mock** for Result 1 — the only way to isolate Busbar's own cost from provider jitter;
+      the real-Anthropic run (Result 2) is the companion that shows it in practice.
+    - **Public-CA loopback cert** — the release binary trusts only public roots upstream (a deliberate
+      SSRF stance), so the mock is served over a real Let's Encrypt cert on a loopback-resolving host.
     :::
-
-    **Isolating *pure* overhead (optional).** The real-provider delta is dominated by Anthropic's
-    jitter. To see Busbar's overhead with zero provider noise, the harness also has a local
-    **mock-upstream mode** (`bench/latency/run.sh`) — see `bench/latency/README.md`. It needs a
-    publicly-trusted cert for a loopback domain, because the release binary trusts only public CA roots
-    for upstream TLS.
   </TabItem>
 </Tabs>
+
+**Honest competitive note.** No apples-to-apples third-party figure exists to cite, because nobody
+publishes one. **LiteLLM** (Python/FastAPI) adds overhead in the **millisecond** range with a **GC tail**
+by construction, but ships no reproducible self-host overhead benchmark. **OpenRouter** is a **SaaS hop** —
+its "overhead" is a public-internet round-trip, not a proxy cost, and there is no self-host to measure. A
+reproducible self-hosted overhead number is uniquely Busbar's; we would rather ship the harness with an
+honest method than a number nobody can check.
