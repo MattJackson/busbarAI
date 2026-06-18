@@ -47,6 +47,25 @@ const HDR_ROUTE_TARGET: &str = "x-busbar-route-target";
 /// surfaces. Hoisted to one const so the literal isn't repeated across egress/health/observability.
 pub(crate) const APPLICATION_JSON: &str = "application/json";
 
+tokio::task_local! {
+    /// Per-request slot the `server_timing` middleware reads to compute Busbar's INTERNAL
+    /// processing time (= total request wall-clock − upstream round-trip), reported as a
+    /// `Server-Timing: busbar;dur=<ms>` response header. Set via `.scope()` by the middleware;
+    /// written by [`record_upstream_rtt`] when an upstream call returns. Microseconds; the
+    /// `u64::MAX` sentinel means "no upstream hop on this request" (admin/health/early error),
+    /// in which case the middleware reports the full request time.
+    pub(crate) static UPSTREAM_RTT_US: std::sync::Arc<std::sync::atomic::AtomicU64>;
+}
+
+/// Record the upstream round-trip (to response headers) for the current request so the
+/// `server_timing` middleware can subtract it from the total and report Busbar's own added latency.
+/// On failover the last (successful) attempt's value wins. No-op outside the middleware scope —
+/// unit tests and the admin/health routes that never dispatch upstream simply don't record one.
+pub(crate) fn record_upstream_rtt(rtt: std::time::Duration) {
+    let us = u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX);
+    let _ = UPSTREAM_RTT_US.try_with(|slot| slot.store(us, std::sync::atomic::Ordering::Relaxed));
+}
+
 /// Attach the `x-amzn-RequestId` header to a SUCCESS response builder when the ingress client is a
 /// native AWS Bedrock SDK. A genuine Bedrock `Converse`/`ConverseStream` 2xx ALWAYS carries this
 /// header (the SDK surfaces it via `*Output::request_id()`); omitting it on the proxied success path
@@ -2693,6 +2712,7 @@ pub(crate) async fn forward_with_pool(
         // ConverseStream `metadata` frame carries on the buffered-synthesis path below.
         let upstream_started = std::time::Instant::now();
         let res = req.send().await;
+        record_upstream_rtt(upstream_started.elapsed());
 
         match res {
             Err(e) => {
@@ -3136,6 +3156,16 @@ pub(crate) async fn forward_with_pool(
                     // parse+translate. `truncated` distinguishes "too large to translate" from
                     // "genuinely unparseable" so a too-large success is not mis-reported as a 500.
                     let (bytes, read_end) = read_capped(r, MAX_TRANSLATED_BODY_BYTES).await;
+                    // Re-record the upstream RTT now that the WHOLE body has arrived. On this buffered
+                    // cross-protocol path Busbar awaits the entire upstream response before it can
+                    // parse+translate, so the body-download time is part of the upstream cost, not
+                    // Busbar's. The earlier (post-headers) record captured only time-to-headers, which
+                    // would mis-attribute the body-download (a real-WAN cost) to Busbar in the
+                    // `Server-Timing` figure. Overwrite it with the full send→body-complete span so the
+                    // reported `dur` is the parse/translate/serialize work alone. (Streaming and
+                    // same-protocol passthrough keep the time-to-headers value: there Busbar does not
+                    // buffer the body, so the stream time is not Busbar's.)
+                    record_upstream_rtt(upstream_started.elapsed());
                     drop(permit); // upstream call complete; a non-streamed response holds no permit
                     if read_end == ReadEnd::TransportError {
                         // The transfer failed mid-body. We optimistically recorded breaker success +
@@ -3758,6 +3788,7 @@ async fn forward_once(
     // ConverseStream `metadata` frame carries on the buffered-synthesis path below.
     let upstream_started = std::time::Instant::now();
     let res = req.send().await;
+    record_upstream_rtt(upstream_started.elapsed());
 
     match res {
         Ok(r) => {
@@ -3880,6 +3911,10 @@ async fn forward_once(
                 // 256 KiB and must be buffered whole to translate; `truncated` lets us return a
                 // clear error instead of mis-reporting a too-large success as untranslatable.
                 let (bytes, read_end) = read_capped(r, MAX_TRANSLATED_BODY_BYTES).await;
+                // Re-record the upstream RTT through full-body receipt (see the main forward path):
+                // on the buffered cross-protocol path the body-download is upstream cost, not Busbar's,
+                // so the `Server-Timing` figure must exclude it.
+                record_upstream_rtt(upstream_started.elapsed());
                 drop(permit); // a buffered (non-streamed) response holds no permit
                 if read_end == ReadEnd::TransportError {
                     // Body failed mid-transfer after an optimistic success/budget recording on the

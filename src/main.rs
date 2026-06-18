@@ -794,6 +794,45 @@ async fn reshape_body_limit_413(
     reshape_oversized_413(&path, resp).await
 }
 
+/// Compute the `Server-Timing` `dur` value (milliseconds) for a request: Busbar's own processing
+/// time = total request wall-clock minus the upstream round-trip. `upstream_us == u64::MAX` means
+/// "no upstream hop" (admin/health/early error), so the full time is reported. Saturating, so clock
+/// skew (upstream measured slightly larger than total) can never underflow into a huge value.
+fn server_timing_dur_ms(total_us: u64, upstream_us: u64) -> f64 {
+    let internal_us = if upstream_us == u64::MAX {
+        total_us
+    } else {
+        total_us.saturating_sub(upstream_us)
+    };
+    internal_us as f64 / 1000.0
+}
+
+/// Outermost middleware: stamps a standard `Server-Timing: busbar;dur=<ms>` response header
+/// reporting the latency Busbar itself added — total request wall-clock MINUS the upstream
+/// round-trip — so operators (and browser DevTools / APM tools) can see the gateway's own cost
+/// in-band on every response, without scraping `/metrics` or wiring traces. The upstream RTT is
+/// recorded by the forward path into the [`forward::UPSTREAM_RTT_US`] task-local for the duration
+/// of this scope; a request that never dispatched upstream (admin / health / early error) reports
+/// its full processing time. W3C `Server-Timing` `dur` is milliseconds; emitted at µs precision.
+async fn server_timing(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use std::sync::atomic::Ordering;
+    let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let start = std::time::Instant::now();
+    let mut resp = forward::UPSTREAM_RTT_US
+        .scope(slot.clone(), next.run(req))
+        .await;
+    let total_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let dur_ms = server_timing_dur_ms(total_us, slot.load(Ordering::Relaxed));
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("busbar;dur={dur_ms:.3}")) {
+        resp.headers_mut()
+            .insert(axum::http::HeaderName::from_static("server-timing"), v);
+    }
+    resp
+}
+
 /// Pure reshaping step of [`reshape_body_limit_413`], split out so it is unit-testable without
 /// constructing a `Next`. Returns `resp` unchanged unless it is axum's OWN body-limit 413 —
 /// identified by status 413 with a non-JSON content-type AND a body exactly equal to
@@ -896,6 +935,9 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
         // envelope. Must wrap the `DefaultBodyLimit` layer above, so it is applied LAST (the last
         // `.layer()` is the outermost on the response path) and therefore sees that layer's 413.
         .layer(axum::middleware::from_fn(reshape_body_limit_413))
+        // Outermost: stamp the `Server-Timing: busbar;dur=<ms>` gateway-overhead header on every
+        // response (times the full inner stack). Must be the LAST `.layer()` so it wraps everything.
+        .layer(axum::middleware::from_fn(server_timing))
         .with_state(app)
 }
 
@@ -1147,6 +1189,19 @@ mod tests {
             resp.headers().get("x-amzn-requestid").is_none(),
             "non-bedrock fallback must NOT carry x-amzn-* headers"
         );
+    }
+
+    /// `Server-Timing` reports Busbar's OWN processing time = total − upstream RTT, with the
+    /// no-upstream sentinel reporting the full time and clock skew saturating to zero (never a
+    /// huge underflowed value).
+    #[test]
+    fn test_server_timing_dur_ms() {
+        // total 1090µs − upstream 1000µs = 90µs internal = 0.090 ms.
+        assert!((server_timing_dur_ms(1090, 1000) - 0.090).abs() < 1e-9);
+        // No upstream hop (sentinel) → report the full time (e.g. /healthz at 57µs).
+        assert!((server_timing_dur_ms(57, u64::MAX) - 0.057).abs() < 1e-9);
+        // Clock skew (upstream measured ≥ total) saturates to 0, never underflows.
+        assert_eq!(server_timing_dur_ms(500, 800), 0.0);
     }
 
     /// REGRESSION (MED #14, security/indistinguishability): axum's `DefaultBodyLimit` rejects an
