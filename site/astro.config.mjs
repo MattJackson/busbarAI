@@ -11,6 +11,7 @@ export default defineConfig({
       tagline: 'The reliability layer for LLM traffic',
       favicon: '/favicon.svg',
       logo: { src: './src/assets/busbar-glyph.svg', alt: 'Busbar' },
+      customCss: ['./src/styles/global.css'],
       head: [
         { tag: 'link', attrs: { rel: 'icon', href: '/favicon.ico', sizes: 'any' } },
         { tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/apple-touch-icon.png' } },

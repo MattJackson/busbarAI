@@ -322,10 +322,17 @@ const YEAR = new Date().getFullYear();
         .footer-cols { grid-template-columns: repeat(2, 1fr); }
       }
       @media (max-width: 640px) {
+        body { overflow-x: hidden; }
         .nav-links { gap: 14px; }
-        .nav-links a.ghost { display: none; }
+        .nav-links a.ghost, .nav-links a[href='/benchmark/'] { display: none; }
         .footer-cols { grid-template-columns: 1fr 1fr; }
-        .legal-wrap { padding: 48px 20px 72px; }
+        .legal-wrap { padding: 40px 16px 64px; }
+        .legal-doc h1 { font-size: clamp(24px, 7vw, 36px); }
+        .legal-doc h2 { font-size: 17px; }
+      }
+      @media (max-width: 420px) {
+        .wrap { padding: 0 16px; }
+        .nav-links { gap: 10px; font-size: 13.5px; }
       }
     </style>
   </body>

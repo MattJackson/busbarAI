@@ -324,11 +324,26 @@ const groups = [
         .footer-cols { grid-template-columns: repeat(2, 1fr); }
       }
       @media (max-width: 640px) {
+        body { overflow-x: hidden; }
         .nav-links { gap: 14px; }
-        .nav-links a.ghost { display: none; }
+        .nav-links a.ghost, .nav-links a[href='/benchmark/'] { display: none; }
         .footer-cols { grid-template-columns: 1fr 1fr; }
-        .dl-wrap { padding: 48px 20px 72px; }
-        .dl-cmd code { font-size: 12.5px; }
+        .dl-wrap { padding: 48px 16px 72px; }
+        /* Install command row: stack code above copy button on narrow screens so
+           neither overflows the card */
+        .dl-cmd {
+          flex-direction: column;
+          align-items: stretch;
+          gap: 10px;
+        }
+        .dl-cmd code { font-size: 12px; overflow-x: auto; display: block; }
+        .dl-copy { align-self: flex-end; }
+        /* Download grid full-width on phones */
+        .dl-grid { max-width: 100%; }
+      }
+      @media (max-width: 420px) {
+        .wrap { padding: 0 16px; }
+        .nav-links { gap: 10px; font-size: 13.5px; }
       }
     </style>
   </body>

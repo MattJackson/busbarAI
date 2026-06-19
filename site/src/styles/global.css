@@ -1,0 +1,37 @@
+/*
+ * Global CSS injected into all Starlight (docs) pages via astro.config.mjs customCss.
+ * Goals:
+ *   1. Make markdown tables scroll horizontally on narrow screens instead of pushing
+ *      the page wide.
+ *   2. Ensure code blocks scroll horizontally inside their box (Starlight already sets
+ *      overflow-x:auto on pre but this reinforces it and prevents page-level blowout).
+ *   3. Add a body overflow-x guard as a last-resort safety net.
+ */
+
+/* Table overflow — wrap every markdown/Starlight table in a scrollable container.
+   Starlight renders tables as plain <table> inside .sl-markdown-content.
+   We use a display trick: tables become block-level with overflow scroll applied
+   directly rather than a wrapper element (which would require JS). */
+.sl-markdown-content table {
+  display: block;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  max-width: 100%;
+  /* Keep the border-collapse visuals intact */
+  border-collapse: collapse;
+}
+
+/* Code blocks — long lines must scroll inside the pre box, not the page. */
+.sl-markdown-content pre,
+.expressive-code pre {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  max-width: 100%;
+}
+
+/* Body-level guard: catches any element that still escapes (images, iframes, etc.) */
+@media (max-width: 640px) {
+  body {
+    overflow-x: hidden;
+  }
+}

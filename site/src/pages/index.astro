@@ -544,18 +544,54 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       @media (max-width: 900px) {
         .hero-grid, .qs-grid { grid-template-columns: 1fr; gap: 40px; }
         .feature-grid { grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(3, auto 1fr auto); }
-        .diagram { grid-template-columns: 1fr; gap: 18px; }
+        /* Diagram: collapse to vertical stack. Hide SVG connectors. */
+        .diagram {
+          grid-template-columns: 1fr;
+          gap: 0;
+          padding: 32px 20px 32px;
+        }
         .link-zone { display: none; }
+        /* col-label is position:absolute (bottom: calc(100% + 9px)) — on stacked layout that
+           would overlap the cell above. Convert to a normal flow label with margin instead. */
+        .col { padding-top: 28px; }
+        .col-label {
+          position: static;
+          display: block;
+          margin-bottom: 10px;
+          margin-top: 0;
+        }
+        /* hook-line and hook-out are absolute, positioned below col-busbar. On stacked layout
+           they'd overflow the diagram. Hide them — the busbar-box text already conveys the info. */
+        .hook-line, .hook-out { display: none; }
+        .col-busbar { padding-bottom: 0; }
         .footer-inner { grid-template-columns: 1fr; gap: 32px; }
         .footer-cols { grid-template-columns: repeat(2, 1fr); }
       }
       @media (max-width: 640px) {
+        /* Body-level overflow guard — catches any stray element wider than viewport */
+        body { overflow-x: hidden; }
         .nav-links { gap: 14px; }
         .nav-links a.ghost, .nav-links a[href='/why-busbar/'], .nav-links a[href='/benchmark/'] { display: none; }
         .feature-grid, .trust-grid, .footer-cols { grid-template-columns: 1fr; }
         .feature-grid { grid-template-rows: repeat(6, auto 1fr auto); }
         .trust-grid { grid-template-columns: repeat(2, 1fr); }
-        .hero-grid { padding: 56px 22px 50px; }
+        .hero-grid { padding: 48px 20px 44px; }
+        /* Code cards: ensure long lines scroll inside box, not push page wide */
+        .code-card pre, .qs-block pre { overflow-x: auto; }
+        .code-card code, .qs-block code { white-space: pre; }
+        /* Quickstart copy + steps stack was already 1-col from 900px media. Tighten padding. */
+        .quickstart { padding: 56px 0; }
+        .hero h1 { font-size: clamp(30px, 9vw, 42px); }
+        .lede { font-size: 16px; }
+        /* CTA row: allow buttons to wrap and fill width on very small screens */
+        .cta-row { flex-direction: column; align-items: stretch; gap: 10px; }
+        .btn { text-align: center; }
+      }
+      @media (max-width: 420px) {
+        .nav-links { gap: 10px; font-size: 13.5px; }
+        .wrap { padding: 0 16px; }
+        .hero-grid { padding: 40px 16px 36px; }
+        .diagram { padding: 24px 16px 24px; }
       }
     </style>
   </body>
