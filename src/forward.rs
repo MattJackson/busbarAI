@@ -59,7 +59,10 @@ tokio::task_local! {
 
 /// Record the upstream round-trip (to response headers) for the current request so the
 /// `server_timing` middleware can subtract it from the total and report Busbar's own added latency.
-/// On failover the last (successful) attempt's value wins. No-op outside the middleware scope —
+/// On failover the LAST attempt's value wins (recorded after every `send`, before success/error
+/// classification) — so a success overwrites a prior failed hop; on an all-hops-fail exhaustion the
+/// last failed hop's (typically short) RTT is what remains, which can mildly inflate the reported
+/// `busbar;dur` on that error response. Telemetry only; never affects translation. No-op outside the
 /// unit tests and the admin/health routes that never dispatch upstream simply don't record one.
 pub(crate) fn record_upstream_rtt(rtt: std::time::Duration) {
     let us = u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX);
@@ -3421,7 +3424,10 @@ pub(crate) async fn forward_with_pool_parsed(
                                         &app.lanes[i].model,
                                     );
                                     return rb
-                                        .body(Body::from(arr.to_string()))
+                                        .body(Body::from(
+                                            crate::json::to_vec(&arr)
+                                                .unwrap_or_else(|_| arr.to_string().into_bytes()),
+                                        ))
                                         .unwrap_or_else(|_| status.into_response());
                                 }
                                 // Content-Type is the INGRESS JSON CT, not the upstream's — the body
@@ -3718,7 +3724,7 @@ async fn forward_once(
         Ok(v) => v,
         Err(e) => {
             // See the main forward path: log the parser cause for operators, never leak the
-            // serde_json Display detail into the client 400 body (an internal tell + body echo).
+            // the JSON parser's error detail into the client 400 body (an internal tell + body echo).
             tracing::debug!(error = %e, "request body JSON parse failed");
             // Probe-leak guard (HIGH #1): a fallback-pool caller CAS-won a single-flight HalfOpen
             // probe on the POOL cell in `pick_among` before entering here, and the contract is that
@@ -4090,7 +4096,10 @@ async fn forward_once(
                                 return Ok(Response::builder()
                                     .status(status)
                                     .header(CONTENT_TYPE, APPLICATION_JSON)
-                                    .body(Body::from(arr.to_string()))
+                                    .body(Body::from(
+                                        crate::json::to_vec(&arr)
+                                            .unwrap_or_else(|_| arr.to_string().into_bytes()),
+                                    ))
                                     .unwrap_or_else(|_| status.into_response()));
                             }
                             // Bedrock-ingress 2xx carries `x-amzn-RequestId` (matching a real

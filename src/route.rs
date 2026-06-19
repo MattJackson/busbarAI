@@ -471,7 +471,7 @@ async fn ingress_body_model(
         Ok(v) => v,
         Err(e) => {
             // Log the parser's real cause (line/column/expectation) for operators, but NEVER leak it
-            // into the client-facing 400 body: the serde_json Display detail is a busbar-internal tell
+            // into the client-facing 400 body: the JSON parser's error detail is a busbar-internal tell
             // (no native vendor surfaces it) and can echo fragments of the malformed body. The client
             // gets the generic, vendor-plausible message only — matching the CORE fix in forward.rs.
             tracing::debug!(error = %e, "request body JSON parse failed");
@@ -570,7 +570,7 @@ async fn ingress_path_model(
         Ok(v) => v,
         Err(e) => {
             // Log the parser's real cause (line/column/expectation) for operators, but NEVER leak it
-            // into the client-facing 400 body: the serde_json Display detail is a busbar-internal tell
+            // into the client-facing 400 body: the JSON parser's error detail is a busbar-internal tell
             // (no native vendor surfaces it) and can echo fragments of the malformed body. The client
             // gets the generic, vendor-plausible message only — matching the CORE fix in forward.rs.
             tracing::debug!(error = %e, "request body JSON parse failed");
@@ -641,7 +641,7 @@ async fn ingress_path_model(
     let injected: Bytes = match crate::json::to_vec(&v) {
         Ok(b) => b.into(),
         Err(e) => {
-            // Same leak class as the parse arms above: the serde_json Display detail is a
+            // Same leak class as the parse arms above: the JSON parser's error detail is a
             // busbar-internal tell, so it is logged for operators but never returned to the client.
             tracing::debug!(error = %e, "injected request body re-serialization failed");
             // Pre-routing failure (model never reached resolution): route through `finish_rejected`
