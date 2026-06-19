@@ -175,7 +175,7 @@ pub(crate) fn ingress_error(ingress: &str, status: StatusCode, kind: &str, msg: 
     let protocol =
         crate::proto::protocol_for(ingress).unwrap_or_else(crate::proto::Protocol::openai);
     let envelope = protocol.writer().write_error(status.as_u16(), kind, msg);
-    let body = serde_json::to_string(&envelope).unwrap_or_else(|_| {
+    let body = crate::json::to_string(&envelope).unwrap_or_else(|_| {
         // Envelope is built from serde_json::json! values and always serializes; this fallback only
         // exists to avoid an unwrap on the request path. Build it with `json!` (correct JSON string
         // escaping) rather than interpolating Rust `{:?}` Debug formatting, which is NOT guaranteed
@@ -390,6 +390,28 @@ pub(crate) fn translate_request_cross_protocol(
                 // single shared translate seam, BEFORE handing the IR to the egress `write_request`, so
                 // no individual writer can leak them and the fix cannot be missed on any one path.
                 // Same-protocol passthrough never enters this branch, so its `extra` stays intact.
+                //
+                // PF-M4 (response_format fidelity): OpenAI's `response_format` (json_object /
+                // json_schema / structured-output) rides `extra` and is therefore CLEARED here on a
+                // cross-protocol hop — silently disabling JSON/structured-output mode on the foreign
+                // backend even though Gemini (`responseSchema`/`responseMimeType`), Anthropic
+                // (tool-use forcing), and Bedrock have analogs. A full cross-protocol mapping of every
+                // structured-output dialect is large and risky, so it is DEFERRED; the minimal-safe
+                // fix is to NOT drop it SILENTLY — warn so an operator can see the divergence. The
+                // value is still preserved on a same-protocol (OpenAI->OpenAI) round-trip, which never
+                // enters this branch. (See the OpenAI reader for the same note.)
+                if ir.extra.contains_key("response_format") {
+                    tracing::warn!(
+                        from = ingress_protocol,
+                        to = egress_name,
+                        parameter = "response_format",
+                        "dropping `response_format` on cross-protocol translation: the target \
+                         protocol has a structured-output analog (Gemini responseSchema, Anthropic \
+                         tool-use forcing, Bedrock) that busbar does not yet map, so JSON/structured \
+                         output mode is NOT carried to the backend — same-protocol round-trips are \
+                         unaffected"
+                    );
+                }
                 ir.extra.clear();
                 body = app.lanes[i].protocol.writer().write_request(&ir);
             }
@@ -553,7 +575,7 @@ fn client_fault_kind(class: StatusClass) -> &'static str {
 /// not JSON or carries no recognizable message field, so the caller substitutes a generic detail
 /// rather than leaking the raw foreign body.
 fn extract_error_message(bytes: &[u8]) -> Option<String> {
-    let v: Value = serde_json::from_slice(bytes).ok()?;
+    let v: Value = crate::json::parse(bytes).ok()?;
     v.get("error")
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
@@ -647,7 +669,7 @@ fn mid_stream_error_bytes(
     // frame errors in-band, in which case we still emit a decodable bare `data:` error.
     match proto.writer().write_response_event(&ev) {
         Some((event_type, data)) => {
-            let data = serde_json::to_string(&data).unwrap_or_else(|_| {
+            let data = crate::json::to_string(&data).unwrap_or_else(|_| {
                 serde_json::json!({ "error": { "message": message, "type": "api_error" } })
                     .to_string()
             });
@@ -706,7 +728,7 @@ impl UsageTap {
     /// parse it whole first; only if that fails (e.g. a buffered SSE/`[DONE]` body) fall back to the
     /// uncapped brace-scan over the whole slice so a trailing usage frame is still found.
     pub(crate) fn feed_whole(&mut self, body: &[u8]) {
-        if let Ok(obj) = serde_json::from_slice::<Value>(body) {
+        if let Ok(obj) = crate::json::parse::<Value>(body) {
             self.extract_usage_from_message_start(&obj);
             self.extract_usage_from_delta(&obj);
             self.extract_usage_from_stop(&obj);
@@ -729,7 +751,7 @@ impl UsageTap {
                 let start = pos + delta_idx;
                 if let Some(end) = find_matching_brace(&chunk[start..]) {
                     let json_bytes = &chunk[start..start + end];
-                    if let Ok(obj) = serde_json::from_slice::<Value>(json_bytes) {
+                    if let Ok(obj) = crate::json::parse::<Value>(json_bytes) {
                         self.extract_usage_from_message_start(&obj);
                         self.extract_usage_from_delta(&obj);
                         self.extract_usage_from_stop(&obj);
@@ -803,7 +825,7 @@ impl UsageTap {
         self.eventstream_buf.extend_from_slice(chunk);
         for (event_type, payload) in crate::eventstream::drain_frames(&mut self.eventstream_buf) {
             if event_type == "metadata" {
-                if let Ok(obj) = serde_json::from_slice::<Value>(&payload) {
+                if let Ok(obj) = crate::json::parse::<Value>(&payload) {
                     // Native Converse usage shape (inputTokens / outputTokens) — handled by the
                     // protocol-agnostic extractor, which already recognizes the bedrock keys.
                     self.extract_usage_any(&obj);
@@ -812,7 +834,7 @@ impl UsageTap {
                 // In-band modeled exception (e.g. internalServerException, modelStreamErrorException,
                 // throttlingException). Record it as the terminal error so the stream-end breaker arm
                 // trips this lane. Lift the payload `message` for observability where present.
-                let msg = serde_json::from_slice::<Value>(&payload)
+                let msg = crate::json::parse::<Value>(&payload)
                     .ok()
                     .and_then(|v| {
                         v.get("message")
@@ -2371,8 +2393,8 @@ pub(crate) async fn forward_with_pool(
 ) -> Response {
     let v: Value = match crate::json::parse(&body) {
         Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(error = %e, "request body JSON parse failed");
+        Err(_) => {
+            tracing::debug!(detail = %crate::json::parse_err_log(body.len()), "request body JSON parse failed");
             return ingress_error(
                 ingress_protocol,
                 StatusCode::BAD_REQUEST,
@@ -3029,14 +3051,20 @@ pub(crate) async fn forward_with_pool_parsed(
                             // only `pool_name`'s cell left the same dead upstream Closed in the other
                             // cells, so legacy/cross-protocol routes kept hammering it until the
                             // out-of-band prober caught it (the asymmetry this fixes).
-                            app.store.record_hard_down_all_cells(i, &reason);
-                            // a hard-down is a breaker trip for this lane.
-                            metrics::counter!(
-                                crate::metrics::BREAKER_TRIPS_TOTAL,
-                                "pool" => metric_pool.to_owned(),
-                                "lane" => app.lanes[i].model.clone()
-                            )
-                            .increment(1);
+                            let newly_tripped = app.store.record_hard_down_all_cells(i, &reason);
+                            // A hard-down is a breaker trip for this lane — but only count a LOGICAL
+                            // Closed→Open trip. A persistently-dead auth/billing lane re-enters this arm
+                            // on every recovery-probe cycle (a HalfOpen reopen, not a fresh trip); gating
+                            // on `newly_tripped` stops BREAKER_TRIPS_TOTAL inflating once per cooldown
+                            // for a stuck lane (the metric's "once per logical trip" contract).
+                            if newly_tripped {
+                                metrics::counter!(
+                                    crate::metrics::BREAKER_TRIPS_TOTAL,
+                                    "pool" => metric_pool.to_owned(),
+                                    "lane" => app.lanes[i].model.clone()
+                                )
+                                .increment(1);
+                            }
                             tracing::warn!(pool = %pool_name, lane = %app.lanes[i].model, reason = %reason, "lane hard-down (breaker trip)");
                             metrics::counter!(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
@@ -3722,10 +3750,11 @@ async fn forward_once(
     // Re-parse body for per-lane model rewriting.
     let v: Value = match crate::json::parse(body) {
         Ok(v) => v,
-        Err(e) => {
-            // See the main forward path: log the parser cause for operators, never leak the
-            // the JSON parser's error detail into the client 400 body (an internal tell + body echo).
-            tracing::debug!(error = %e, "request body JSON parse failed");
+        Err(_) => {
+            // See the main forward path: log a sanitized note for operators; never the parser's raw
+            // error (with sonic-rs it embeds a fragment of the input body — secrets/PII) nor leak it
+            // into the client 400 body.
+            tracing::debug!(detail = %crate::json::parse_err_log(body.len()), "request body JSON parse failed");
             // Probe-leak guard (HIGH #1): a fallback-pool caller CAS-won a single-flight HalfOpen
             // probe on the POOL cell in `pick_among` before entering here, and the contract is that
             // EVERY early return out of `forward_once` releases it. This is a pre-dispatch bail (no
@@ -3892,6 +3921,23 @@ async fn forward_once(
                     // single-flight HalfOpen probe this fallback attempt CAS-won on the POOL cell
                     // is still in flight. Release it before returning or the cell stays HalfOpen +
                     // `probe_in_flight` forever. Idempotent; no-op off a HalfOpen / default cell.
+                    //
+                    // Cooldown-backoff fix: record a transient failure BEFORE releasing the probe, so
+                    // a non-2xx on a HalfOpen probe bumps the cooldown (exponential backoff) exactly
+                    // like the MAIN forward path's non-2xx branch. Releasing alone left the cooldown
+                    // at its original expiry, so the lane re-probed at the base interval with no
+                    // backoff. No `record_transient_in` exists on this branch today, so this does not
+                    // double-record. A threshold re-trip here is a breaker trip too (#29).
+                    let tripped = app.store.record_transient_in(
+                        pool,
+                        i,
+                        "degraded-non2xx",
+                        forward_once_cfg.as_ref(),
+                        None,
+                    );
+                    if tripped {
+                        emit_breaker_trip(app, pool, i);
+                    }
                     app.store.release_probe_in(pool, i);
                     return Ok(shape_cross_protocol_error(ingress_protocol, status, &bytes));
                 }
@@ -3927,6 +3973,23 @@ async fn forward_once(
                 // POOL-cell single-flight probe this fallback attempt CAS-won before returning, or
                 // the cell stays HalfOpen + `probe_in_flight` forever. Idempotent; no-op off a
                 // HalfOpen / default cell.
+                //
+                // Cooldown-backoff fix: record a transient failure BEFORE releasing the probe, so a
+                // non-2xx on a HalfOpen probe bumps the cooldown (exponential backoff) like the MAIN
+                // forward path's non-2xx branch. Without it the cooldown stayed at its original expiry
+                // and the lane re-probed at the base interval with no backoff. No `record_transient_in`
+                // exists on this branch today, so this does not double-record. A threshold re-trip
+                // here is a breaker trip too (#29).
+                let tripped = app.store.record_transient_in(
+                    pool,
+                    i,
+                    "degraded-non2xx",
+                    forward_once_cfg.as_ref(),
+                    None,
+                );
+                if tripped {
+                    emit_breaker_trip(app, pool, i);
+                }
                 app.store.release_probe_in(pool, i);
                 return Ok(rb
                     .body(Body::from(bytes))
@@ -3986,13 +4049,19 @@ async fn forward_once(
                         "cross-protocol non-stream upstream body failed mid-transfer; \
                          not recording success/usage, refunding budget, returning ingress-native error"
                     );
-                    let _tripped = app.store.record_transient_in(
+                    let tripped = app.store.record_transient_in(
                         pool,
                         i,
                         "transport",
                         forward_once_cfg.as_ref(),
                         None,
                     );
+                    // A threshold-based Closed→Open trip here is a breaker trip too (#29); emit the
+                    // metric, mirroring the main forward path — otherwise BREAKER_TRIPS_TOTAL
+                    // undercounts trips on this degraded (FallbackPool/LeastBad) path.
+                    if tripped {
+                        emit_breaker_trip(app, pool, i);
+                    }
                     if budget_spent {
                         app.store.refund_budget(i);
                     }
@@ -4205,15 +4274,19 @@ async fn forward_once(
             // Pre-response transport error: record transient against the ROUTING POOL cell, drop the
             // permit, signal "try next". The degraded callers selected via the pool cell (fallback CAS
             // -wins a HalfOpen probe on it), so this transport failure must reopen the POOL cell — not
-            // the default `""` cell, which would leave the pool cell wedged HalfOpen forever. The
-            // returned trip bool is discarded here: the failover loop's UPSTREAM_FAILURES_TOTAL /
-            // FAILOVERS_TOTAL accounting lives on the main `forward_with_pool` path, and a logical-trip
-            // BREAKER_TRIPS_TOTAL on this last-resort degraded route is out of scope (#29 covers the
-            // organic path's record sites).
+            // the default `""` cell, which would leave the pool cell wedged HalfOpen forever.
+            // BREAKER_TRIPS_TOTAL is emitted here too, gated on the trip bool, mirroring the sibling
+            // degraded arms (non-2xx at ~3925/3977, post-headers transport at ~4046) so a logical
+            // Closed→Open trip is counted exactly once regardless of which degraded failure shape hit
+            // it. (`tripped` is false for a HalfOpen reopen / already-Open no-op, so it is not
+            // inflated.) Closes the cross-arm counter asymmetry the audit flagged.
             let err_type = if e.is_timeout() { "timeout" } else { "connect" };
-            let _tripped =
+            let tripped =
                 app.store
                     .record_transient_in(pool, i, err_type, forward_once_cfg.as_ref(), None);
+            if tripped {
+                emit_breaker_trip(app, pool, i);
+            }
             drop(permit);
             Err(())
         }
@@ -8192,12 +8265,22 @@ mod forward_once_pool_cell_tests {
             "fb POOL cell must NOT be wedged HalfOpen after a non-2xx (HIGH #1 probe leak); got {:?}",
             app.store.breaker_state_in("fb", 1)
         );
-        // And the slot is reusable: a fresh dispatch acquisition can re-win the probe (the cooldown
-        // is still expired, so an Open cell re-admits exactly one probe). Against the old code the
-        // cell was HalfOpen with `probe_in_flight == true`, so this would return false.
+        // Cooldown-backoff fix: a non-2xx on a HalfOpen probe now RECORDS a transient failure (before
+        // releasing the probe), which bumps the cooldown via exponential backoff — exactly like the
+        // MAIN forward path's non-2xx branch. So the cell is Open but with a FUTURE cooldown: an
+        // immediate re-acquire is refused (no base-interval re-probe with zero backoff anymore).
+        // Before this fix the cooldown stayed expired and this returned true.
         assert!(
-            app.store.acquire_for_dispatch_in("fb", 1, store_now()),
-            "fb POOL cell must be re-acquirable after a non-2xx relay (probe was leaked otherwise)"
+            !app.store.acquire_for_dispatch_in("fb", 1, store_now()),
+            "fb POOL cell cooldown must be extended by backoff after a non-2xx probe failure \
+             (no immediate re-probe)"
+        );
+        // Once the backoff cooldown elapses, the Open cell re-admits exactly one probe again — the
+        // slot is not permanently benched, just backed off. A far-future instant clears the cooldown.
+        assert!(
+            app.store
+                .acquire_for_dispatch_in("fb", 1, store_now().saturating_add(86_400)),
+            "fb POOL cell must be re-acquirable once the backoff cooldown elapses"
         );
         // The default "" cell is never touched by the degraded path's recordings.
         assert!(

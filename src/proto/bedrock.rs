@@ -173,6 +173,36 @@ const GUARD_CONTENT_SENTINEL: &str = "__busbar_bedrock_guard_content";
 /// Bedrock meaning) the block degrades to a plain Thinking the target writer handles.
 const REASONING_REDACTED_SIG_SENTINEL: &str = "__busbar_bedrock_redacted_reasoning";
 
+/// Source-spelling hint for `top_k` (PF — losslessness). Bedrock carries `top_k` in
+/// `additionalModelRequestFields` under two spellings: `top_k` (snake_case) and `topK` (camelCase,
+/// the form some model families require). The reader lifts EITHER into the first-class IR `top_k`,
+/// but a naive writer always re-emits `top_k` — silently RENAMING a native Bedrock->Bedrock
+/// passthrough that arrived as `topK`. Mirroring `MAX_COMPLETION_TOKENS_SENTINEL` in `proto::openai`,
+/// the reader stamps this sentinel in `extra` when the source spelling was `topK`; the writer then
+/// re-emits `topK` (else canonical `top_k`) and CONSUMES the sentinel so it never reaches the wire.
+/// `extra` is cleared on the cross-protocol seam, so cross-protocol egress (no sentinel) always emits
+/// the canonical `top_k`. The leading `__busbar` prefix never collides with a real Bedrock field.
+const TOP_K_CAMEL_SENTINEL: &str = "__busbar_top_k_camel";
+
+/// Clamp a temperature to Bedrock's native `[0.0, 1.0]` range, returning `(clamped, was_clamped)`
+/// where `was_clamped` is `true` iff the clamp ACTUALLY changed the value. Mirrors
+/// `anthropic::clamp_temperature_for_anthropic` (PF non-silent clamp): OpenAI / Responses accept
+/// temperature up to 2.0, so a cross-protocol request can carry a value Bedrock's API rejects with a
+/// hard 400 ValidationException; the writer forwards the closest valid value instead of bouncing the
+/// request, and uses `was_clamped` to emit a `warn!` so the mutation is NOT silent. Factored out so
+/// the non-silent-on-change contract is unit-testable without a tracing subscriber.
+fn clamp_temperature_for_bedrock(temperature: f64) -> (f64, bool) {
+    // Totality guard, mirroring `anthropic::clamp_temperature_for_anthropic`: a non-finite value
+    // (NaN/±Inf) is unreachable via valid JSON (sonic_rs rejects it at parse), but `f64::clamp`
+    // would return NaN and `NaN != NaN` would spuriously report `was_clamped`. Pass it through
+    // unchanged with `was_clamped == false` so the helper is total and the two siblings agree.
+    if !temperature.is_finite() {
+        return (temperature, false);
+    }
+    let clamped = temperature.clamp(0.0, 1.0);
+    (clamped, clamped != temperature)
+}
+
 /// Read a native Bedrock Converse `reasoningContent` content block into an IR `Thinking` block, or
 /// `None` when the block carries neither known member (forward-compatibility: a future
 /// `reasoningContent` union member is left undecoded rather than mis-mapped).
@@ -251,7 +281,7 @@ fn bedrock_reasoning_block(text: &str, signature: &Option<String>) -> serde_json
 /// rather than emitting a corrupt source.
 fn bedrock_image_block(media_type: &str, data: &str) -> Option<serde_json::Value> {
     if media_type == IMAGE_S3_SENTINEL {
-        match serde_json::from_str::<serde_json::Value>(data) {
+        match crate::json::parse_str::<serde_json::Value>(data) {
             Ok(s3_location) if s3_location.is_object() => {
                 // `format` is carried inside the serialized payload (the reader stored it there);
                 // re-emit the whole block shape it captured.
@@ -472,8 +502,8 @@ fn read_bedrock_image_block(image: &serde_json::Value) -> Option<crate::ir::IrBl
                 "__format".to_string(),
                 serde_json::Value::String(format_str),
             );
-            // serde_json::to_string on a Map never fails; fall back defensively rather than panic.
-            let data = serde_json::to_string(&serde_json::Value::Object(stash))
+            // crate::json::to_string on a Map never fails; fall back defensively rather than panic.
+            let data = crate::json::to_string(&serde_json::Value::Object(stash))
                 .unwrap_or_else(|_| "{}".to_string());
             return Some(crate::ir::IrBlock::Image {
                 media_type: IMAGE_S3_SENTINEL.to_string(),
@@ -629,24 +659,23 @@ impl ProtocolReader for BedrockReader {
         // (e.g. `ValidationException`, `ThrottlingException`). The structured
         // type is what the breaker's error_map keys on for fine-grained routing,
         // so it must come from `__type`, not from `message`.
-        let (provider_code, structured_type) =
-            match serde_json::from_slice::<serde_json::Value>(body) {
-                Ok(json) => {
-                    let provider_code = json
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .map(String::from);
-                    // AWS may also serialise the type as `__type` containing a
-                    // shape ARN suffix (e.g. `com.amazon...#ThrottlingException`);
-                    // keep only the trailing type token in that case.
-                    let structured_type = json
-                        .get("__type")
-                        .and_then(|t| t.as_str())
-                        .map(|t| t.rsplit(['#', '/']).next().unwrap_or(t).to_string());
-                    (provider_code, structured_type)
-                }
-                Err(_) => (None, None),
-            };
+        let (provider_code, structured_type) = match crate::json::parse::<serde_json::Value>(body) {
+            Ok(json) => {
+                let provider_code = json
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(String::from);
+                // AWS may also serialise the type as `__type` containing a
+                // shape ARN suffix (e.g. `com.amazon...#ThrottlingException`);
+                // keep only the trailing type token in that case.
+                let structured_type = json
+                    .get("__type")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t.rsplit(['#', '/']).next().unwrap_or(t).to_string());
+                (provider_code, structured_type)
+            }
+            Err(_) => (None, None),
+        };
 
         // Bedrock has no distinct context-length error CODE: an oversized request comes back as a
         // generic `ValidationException` whose human-readable `message` carries the signal (e.g.
@@ -928,10 +957,10 @@ impl ProtocolReader for BedrockReader {
                                         // string (lost fidelity). Mirror the image-sentinel pattern:
                                         // stash the serialized value behind `JSON_BLOCK_SENTINEL` so
                                         // `write_request` re-emits a faithful `{"json": ...}` block.
-                                        // `serde_json::to_string` of an already-parsed `Value` is
+                                        // `crate::json::to_string` of an already-parsed `Value` is
                                         // infallible; on the impossible error fall back to a Text
                                         // block (never panic on the request path).
-                                        match serde_json::to_string(json_val) {
+                                        match crate::json::to_string(json_val) {
                                             Ok(serialized) => {
                                                 inner_content.push(crate::ir::IrBlock::Image {
                                                     media_type: JSON_BLOCK_SENTINEL.to_string(),
@@ -1091,13 +1120,39 @@ impl ProtocolReader for BedrockReader {
             inference_config.and_then(|ic| ic.get("temperature").and_then(|v| v.as_f64()));
         // Promoted sampling controls in Bedrock's `inferenceConfig`: topP and stopSequences. `topK`
         // is NOT an inferenceConfig field (it lives in model-specific `additionalModelRequestFields`),
-        // so it is left in `extra` and `top_k` stays None for Bedrock — promoting it would have no
-        // clean inferenceConfig target. These two are ALSO preserved verbatim in the raw
-        // `inferenceConfig` captured into `extra` for the same-protocol passthrough; the IR fields are
-        // what carry them across the cross-protocol seam (where `extra` is cleared). The writer's
-        // overlay re-emits the typed fields onto the raw object, so a Bedrock->Bedrock round-trip is
-        // unaffected (the overlaid value equals the captured one).
+        // so it is promoted from THERE (see `top_k` below). These two are ALSO preserved verbatim in
+        // the raw `inferenceConfig` captured into `extra` for the same-protocol passthrough; the IR
+        // fields are what carry them across the cross-protocol seam (where `extra` is cleared). The
+        // writer's overlay re-emits the typed fields onto the raw object, so a Bedrock->Bedrock
+        // round-trip is unaffected (the overlaid value equals the captured one).
         let top_p = inference_config.and_then(|ic| ic.get("topP").and_then(|v| v.as_f64()));
+        // Promote `top_k` (PF-H1 fidelity fix). Bedrock's Converse API carries `top_k` only via the
+        // model-specific `additionalModelRequestFields` escape hatch (it has no `inferenceConfig`
+        // home). Anthropic-on-Bedrock and several model families spell it `top_k`; some use `topK`.
+        // Accept either so a native Bedrock request that pins top_k populates the first-class IR field
+        // and survives the cross-protocol seam (where `extra` is cleared) instead of vanishing. The
+        // raw `additionalModelRequestFields` is still captured verbatim into `extra` for the
+        // same-protocol passthrough; the writer overlays the typed `top_k` back onto it.
+        // Track which spelling the source used so the writer can re-emit it (losslessness): prefer
+        // snake_case `top_k`, fall back to camelCase `topK`. `top_k_was_camel` is true only when the
+        // value came from the `topK` key, so a same-protocol passthrough that spelled it `topK`
+        // round-trips byte-identically instead of being renamed to `top_k`.
+        let amrf = obj
+            .get("additionalModelRequestFields")
+            .and_then(|v| v.as_object());
+        let mut top_k_was_camel = false;
+        let top_k = amrf
+            .and_then(|amrf| {
+                amrf.get("top_k").or_else(|| {
+                    top_k_was_camel = true;
+                    amrf.get("topK")
+                })
+            })
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
+        // Only meaningful when a usable top_k actually came from the camel key; reset otherwise so a
+        // present-but-`top_k`-spelled (or absent/out-of-range) value never stamps the sentinel.
+        top_k_was_camel &= top_k.is_some();
         let stop =
             crate::ir::read_stop_sequences(inference_config.and_then(|ic| ic.get("stopSequences")));
 
@@ -1149,6 +1204,18 @@ impl ProtocolReader for BedrockReader {
             );
         }
 
+        // Stamp the source-spelling hint when top_k arrived as camelCase `topK`, so the writer
+        // re-emits `topK` on a same-protocol passthrough (else the canonical `top_k`). `extra` is
+        // cleared on the cross-protocol seam, so the sentinel naturally vanishes there and a
+        // cross-protocol egress emits the canonical `top_k`. Only inserted when it produced a usable
+        // value, so a body that never carried a camel top_k does not gain a stray key.
+        if top_k_was_camel {
+            extra.insert(
+                TOP_K_CAMEL_SENTINEL.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+
         Ok(crate::ir::IrRequest {
             system: system_blocks,
             messages,
@@ -1156,7 +1223,7 @@ impl ProtocolReader for BedrockReader {
             max_tokens,
             temperature,
             top_p,
-            top_k: None,
+            top_k,
             stop,
             tool_choice,
             // Bedrock's native Converse request body has no `stream` field — streaming is selected
@@ -1923,7 +1990,7 @@ impl ProtocolWriter for BedrockWriter {
                                     // to parse back into a Value (it always should — the reader
                                     // serialized a valid Value), fall back to a Text block rather than
                                     // dropping the content.
-                                    match serde_json::from_str::<serde_json::Value>(data) {
+                                    match crate::json::parse_str::<serde_json::Value>(data) {
                                         Ok(value) => {
                                             inner_content
                                                 .push(serde_json::json!({ "json": value }));
@@ -2054,15 +2121,24 @@ impl ProtocolWriter for BedrockWriter {
         if let Some(temperature) = req.temperature {
             // Clamp to Bedrock's native [0.0, 1.0] (PF-M1). OpenAI / Responses accept temperature up
             // to 2.0, so a cross-protocol request can carry a value Bedrock's API rejects with a hard
-            // 400 ValidationException; clamping forwards the closest valid value instead.
-            let clamped = temperature.clamp(0.0, 1.0);
+            // 400 ValidationException; clamping forwards the closest valid value instead. NON-SILENT
+            // (mirrors the Anthropic writer): warn ONLY when the clamp actually changed the value, so
+            // the divergence is visible in logs rather than silently rewriting a caller's temperature.
+            let (clamped, was_clamped) = clamp_temperature_for_bedrock(temperature);
+            if was_clamped {
+                tracing::warn!(
+                    requested_temperature = temperature,
+                    clamped_temperature = clamped,
+                    "clamping temperature to Bedrock's [0.0, 1.0] range; the requested value was \
+                     out of range and would be rejected with a 400 ValidationException",
+                );
+            }
             inference_config.insert("temperature".to_string(), serde_json::json!(clamped));
         }
         // Promoted sampling controls overlaid in Bedrock's inferenceConfig shape (typed IR wins over
         // the raw captured value, so same-protocol round-trips re-emit the identical value and
         // cross-protocol egress emits the value carried in the IR). `top_k` has no inferenceConfig
-        // home, so it is never emitted here (a source protocol's top_k stays in extra / is dropped on
-        // the cross-protocol seam — documented in the reader).
+        // home — it is emitted below via `additionalModelRequestFields` (PF-H1 fidelity fix).
         if let Some(top_p) = req.top_p {
             inference_config.insert("topP".to_string(), serde_json::json!(top_p));
         }
@@ -2142,12 +2218,51 @@ impl ProtocolWriter for BedrockWriter {
             );
         }
 
+        // Emit `top_k` (PF-H1 fidelity fix). Bedrock's Converse API has no `inferenceConfig` slot for
+        // top_k; it rides in the model-specific `additionalModelRequestFields` escape hatch. OVERLAY
+        // the typed IR `top_k` (as `top_k`) onto the RAW `additionalModelRequestFields` the reader
+        // captured into `extra` — same pattern as `inferenceConfig`/`toolConfig`. This re-emits a
+        // same-protocol Bedrock->Bedrock top_k faithfully AND carries a cross-protocol top_k (e.g.
+        // from Anthropic, where `extra` is cleared) onto the wire instead of dropping it. The raw
+        // `additionalModelRequestFields` is consumed here (skipped in the trailing extra-merge) to
+        // avoid a double-emit. The typed `top_k` WINS over any same-named raw entry.
+        let mut additional_fields = req
+            .extra
+            .get("additionalModelRequestFields")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        if let Some(top_k) = req.top_k {
+            // Preserve the source spelling on a same-protocol passthrough: re-emit camelCase `topK`
+            // when the reader stamped the sentinel (the body arrived as `topK`), else the canonical
+            // snake_case `top_k`. The sentinel only survives on the same-protocol path (`extra` is
+            // cleared cross-protocol), so cross-protocol egress always takes the `top_k` branch.
+            let key = if req.extra.contains_key(TOP_K_CAMEL_SENTINEL) {
+                "topK"
+            } else {
+                "top_k"
+            };
+            additional_fields.insert(key.to_string(), serde_json::json!(top_k));
+        }
+        if !additional_fields.is_empty() {
+            out.insert(
+                "additionalModelRequestFields".to_string(),
+                serde_json::Value::Object(additional_fields),
+            );
+        }
+
         for (key, value) in &req.extra {
             // `inferenceConfig` and `toolConfig` were already consumed above (typed fields overlaid
             // onto the raw object); re-inserting the raw copy here would clobber that overlay and drop
             // the typed `maxTokens`/`temperature` (inferenceConfig) or `tools` (toolConfig). Every
             // other unmodeled field passes through verbatim.
             if key == "inferenceConfig" || key == "toolConfig" {
+                continue;
+            }
+            // `additionalModelRequestFields` was already consumed above (typed `top_k` overlaid onto
+            // the raw object); re-inserting the raw copy here would clobber that overlay and drop the
+            // typed `top_k`. Skip it to avoid the double-emit (mirrors inferenceConfig/toolConfig).
+            if key == "additionalModelRequestFields" {
                 continue;
             }
             // The cachePoint stash is a busbar-internal sentinel, NOT a real Bedrock top-level
@@ -2160,6 +2275,12 @@ impl ProtocolWriter for BedrockWriter {
             // The guardContent stash is likewise a busbar-internal sentinel, already consumed above
             // (spliced back into `system`/`messages`). Skip it so it never leaks onto the wire.
             if key == GUARD_CONTENT_SENTINEL {
+                continue;
+            }
+            // The top_k source-spelling hint is a busbar-internal sentinel, already consumed above
+            // (it selected the `topK`/`top_k` key emitted into `additionalModelRequestFields`). Skip
+            // it so it never leaks onto the wire (an invalid body and a proxy tell).
+            if key == TOP_K_CAMEL_SENTINEL {
                 continue;
             }
             out.insert(key.clone(), value.clone());
@@ -2622,7 +2743,7 @@ pub(crate) fn bedrock_response_to_eventstream(
                     );
                 }
             }
-            if let Ok(bytes) = serde_json::to_vec(&payload) {
+            if let Ok(bytes) = crate::json::to_vec(&payload) {
                 out.extend_from_slice(&crate::eventstream::encode_frame(&event_type, &bytes));
             }
         }
@@ -4798,6 +4919,147 @@ mod tests {
         );
         // The whole body round-trips byte-identically (no `inferenceConfig` double-emit).
         assert_eq!(out, wire, "full body must round-trip byte-identically");
+    }
+
+    /// PF-H1: `top_k` (a first-class IR field) must reach a Bedrock egress via
+    /// `additionalModelRequestFields.top_k`. A cross-protocol request (e.g. Anthropic) carries `top_k`
+    /// in the IR with an empty `extra`; the Bedrock writer must emit it instead of dropping it. And a
+    /// native Bedrock request that pins `top_k` in `additionalModelRequestFields` must round-trip
+    /// through the reader/writer.
+    #[test]
+    fn test_top_k_reaches_bedrock_via_additional_model_request_fields() {
+        let writer = BedrockWriter;
+
+        // Cross-protocol shape: top_k set in the IR, extra cleared (as the translate seam leaves it).
+        let ir = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: Some(64),
+            temperature: None,
+            top_p: None,
+            top_k: Some(40),
+            stop: vec![],
+            tool_choice: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out.pointer("/additionalModelRequestFields/top_k")
+                .and_then(|v| v.as_u64()),
+            Some(40),
+            "top_k must be emitted under additionalModelRequestFields.top_k; got {out}"
+        );
+
+        // Native Bedrock round-trip: a request that pins top_k in additionalModelRequestFields must
+        // read into the IR and re-emit faithfully (no double-emit of additionalModelRequestFields).
+        let reader = BedrockReader;
+        let wire = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+            "inferenceConfig": {"maxTokens": 64},
+            "additionalModelRequestFields": {"top_k": 40}
+        });
+        let ir2 = reader.read_request(&wire).expect("read_request");
+        assert_eq!(ir2.top_k, Some(40), "reader must promote top_k into the IR");
+        let out2 = writer.write_request(&ir2);
+        assert_eq!(
+            out2.pointer("/additionalModelRequestFields/top_k")
+                .and_then(|v| v.as_u64()),
+            Some(40),
+            "top_k must survive the Bedrock round-trip; got {out2}"
+        );
+        assert_eq!(
+            out2, wire,
+            "native Bedrock body must round-trip byte-identically"
+        );
+    }
+
+    /// Losslessness (top_k spelling preservation): a native Bedrock->Bedrock passthrough whose body
+    /// spelled top_k as camelCase `topK` must round-trip byte-identically (NOT be renamed to
+    /// `top_k`), while a cross-protocol egress (empty `extra`, no sentinel) still emits the canonical
+    /// snake_case `top_k`.
+    #[test]
+    fn test_top_k_camel_spelling_round_trips_and_cross_protocol_stays_snake() {
+        let reader = BedrockReader;
+        let writer = BedrockWriter;
+
+        // Same-protocol: source used camelCase `topK`. The reader lifts it into the IR AND stamps the
+        // source-spelling sentinel; the writer re-emits `topK` and consumes the sentinel.
+        let wire = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+            "inferenceConfig": {"maxTokens": 64},
+            "additionalModelRequestFields": {"topK": 40}
+        });
+        let ir = reader.read_request(&wire).expect("read_request");
+        assert_eq!(ir.top_k, Some(40), "reader must promote topK into the IR");
+        assert!(
+            ir.extra.contains_key(TOP_K_CAMEL_SENTINEL),
+            "reader must stamp the camel-spelling sentinel when source used topK"
+        );
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out.pointer("/additionalModelRequestFields/topK")
+                .and_then(|v| v.as_u64()),
+            Some(40),
+            "topK source spelling must be preserved; got {out}"
+        );
+        assert!(
+            out.pointer("/additionalModelRequestFields/top_k").is_none(),
+            "must NOT also emit snake_case top_k; got {out}"
+        );
+        // The sentinel must be CONSUMED — never serialized to the wire.
+        assert!(
+            out.get(TOP_K_CAMEL_SENTINEL).is_none(),
+            "the source-spelling sentinel must never reach the wire; got {out}"
+        );
+        assert_eq!(
+            out, wire,
+            "Bedrock->Bedrock topK body must round-trip byte-identically"
+        );
+
+        // Cross-protocol: top_k in the IR, `extra` cleared (as the translate seam leaves it) — no
+        // sentinel, so the writer emits the canonical snake_case `top_k`.
+        let ir_cross = crate::ir::IrRequest {
+            top_k: Some(40),
+            extra: serde_json::Map::new(),
+            ..ir.clone()
+        };
+        let out_cross = writer.write_request(&ir_cross);
+        assert_eq!(
+            out_cross
+                .pointer("/additionalModelRequestFields/top_k")
+                .and_then(|v| v.as_u64()),
+            Some(40),
+            "cross-protocol egress (no sentinel) must emit canonical top_k; got {out_cross}"
+        );
+        assert!(
+            out_cross
+                .pointer("/additionalModelRequestFields/topK")
+                .is_none(),
+            "cross-protocol egress must NOT emit camelCase topK; got {out_cross}"
+        );
+    }
+
+    /// PF (non-silent clamp): the Bedrock temperature clamp helper signals when it changes the value
+    /// (so the writer can warn) and is a no-op (was_clamped=false) for in-range values.
+    #[test]
+    fn test_clamp_temperature_for_bedrock_signals_on_change() {
+        // Out-of-range values are clamped AND flagged as changed.
+        assert_eq!(clamp_temperature_for_bedrock(1.8), (1.0, true));
+        assert_eq!(clamp_temperature_for_bedrock(2.0), (1.0, true));
+        assert_eq!(clamp_temperature_for_bedrock(-0.5), (0.0, true));
+        // In-range values pass through unchanged and are NOT flagged.
+        assert_eq!(clamp_temperature_for_bedrock(0.7), (0.7, false));
+        assert_eq!(clamp_temperature_for_bedrock(0.0), (0.0, false));
+        assert_eq!(clamp_temperature_for_bedrock(1.0), (1.0, false));
     }
 
     /// Regression (finding 2): the typed IR fields WIN over a same-named raw `inferenceConfig` entry

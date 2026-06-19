@@ -56,7 +56,7 @@ impl ProtocolReader for GeminiReader {
     fn extract_error(&self, status: StatusCode, body: &[u8]) -> crate::breaker::RawUpstreamError {
         // Parse the body once; both `provider_code` and `structured_type` are derived from the
         // same parsed value to avoid deserializing the JSON twice on every error response.
-        let json = serde_json::from_slice::<serde_json::Value>(body).ok();
+        let json = crate::json::parse::<serde_json::Value>(body).ok();
         let error_obj = json
             .as_ref()
             .and_then(|j| j.get("error"))
@@ -359,7 +359,7 @@ impl ProtocolReader for GeminiReader {
                                 .cloned()
                                 .unwrap_or(serde_json::Value::Null);
                             // Convert response to string representation for content
-                            let response_text = serde_json::to_string(&response_val)
+                            let response_text = crate::json::to_string(&response_val)
                                 .unwrap_or_else(|_| "unknown".to_string());
                             // ACCEPTED GEMINI-PROTOCOL LIMITATION: a Gemini `functionResponse`
                             // carries only a `name` (no call id). We set `tool_use_id` to the
@@ -790,7 +790,8 @@ impl ProtocolReader for GeminiReader {
                                     });
 
                                     // Emit the whole args as InputJsonDelta (Gemini doesn't stream functionCall)
-                                    let args_str = serde_json::to_string(&args).unwrap_or_default();
+                                    let args_str =
+                                        crate::json::to_string(&args).unwrap_or_default();
                                     out.push(IrStreamEvent::BlockDelta {
                                         index: ir_idx,
                                         delta: crate::ir::IrDelta::InputJsonDelta(args_str),
@@ -1214,7 +1215,7 @@ fn coerce_tool_args(input: &serde_json::Value) -> serde_json::Value {
     // Resolve the candidate value: a string is a serialized payload — parse it, falling back to the
     // string itself (a scalar) when it does not parse as JSON. Any non-string value is used as-is.
     let candidate: serde_json::Value = match input.as_str() {
-        Some(s) => serde_json::from_str(s).unwrap_or_else(|_| input.clone()),
+        Some(s) => crate::json::parse_str(s).unwrap_or_else(|_| input.clone()),
         None => input.clone(),
     };
     if candidate.is_object() {
@@ -1638,7 +1639,7 @@ impl ProtocolWriter for GeminiWriter {
                         // the backend (400). Coerce any non-object parsed value into a valid Struct:
                         // `null` becomes `{}` (an empty-but-valid response), and any other non-object
                         // scalar/array is wrapped under `{"output": <value>}` so its content survives.
-                        let parsed: serde_json::Value = serde_json::from_str(&response_text)
+                        let parsed: serde_json::Value = crate::json::parse_str(&response_text)
                             .unwrap_or_else(|_| serde_json::json!({ "output": response_text }));
                         let response_val: serde_json::Value = if parsed.is_object() {
                             parsed
@@ -2089,7 +2090,7 @@ impl ProtocolWriter for GeminiWriter {
                     let args: serde_json::Value = if args_str.is_empty() {
                         serde_json::json!({})
                     } else {
-                        serde_json::from_str(&args_str).unwrap_or_else(|_| serde_json::json!({}))
+                        crate::json::parse_str(&args_str).unwrap_or_else(|_| serde_json::json!({}))
                     };
                     (
                         "".to_string(),

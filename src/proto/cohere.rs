@@ -302,7 +302,7 @@ impl ProtocolReader for CohereReader {
         // Parse the body exactly once and derive both fields from the single binding — the Gemini
         // and Bedrock readers do the same, preserving the "parse once" invariant. Parsing twice
         // paid a pointless 2x CPU cost on every error response.
-        let json = serde_json::from_slice::<serde_json::Value>(body).ok();
+        let json = crate::json::parse::<serde_json::Value>(body).ok();
         let provider_code = json
             .as_ref()
             .and_then(|j| j.get("message"))
@@ -534,7 +534,7 @@ impl ProtocolReader for CohereReader {
                                         .get("arguments")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("{}");
-                                    let input = serde_json::from_str(arguments).unwrap_or(
+                                    let input = crate::json::parse_str(arguments).unwrap_or(
                                         serde_json::Value::String(arguments.to_string()),
                                     );
                                     msg_content.push(crate::ir::IrBlock::ToolUse {
@@ -576,12 +576,12 @@ impl ProtocolReader for CohereReader {
                                         } else {
                                             // Preserve non-text typed blocks (document, etc.)
                                             // verbatim rather than dropping them.
-                                            serde_json::to_string(b).ok()
+                                            crate::json::to_string(b).ok()
                                         }
                                     } else {
                                         // Non-string, non-object array element: serialize it so no
                                         // content is lost.
-                                        serde_json::to_string(b).ok()
+                                        crate::json::to_string(b).ok()
                                     }
                                 })
                                 .collect::<Vec<_>>()
@@ -589,7 +589,7 @@ impl ProtocolReader for CohereReader {
                         } else if let Some(s) = content_val.as_str() {
                             s.to_string()
                         } else {
-                            serde_json::to_string(content_val).unwrap_or_default()
+                            crate::json::to_string(content_val).unwrap_or_default()
                         }
                     } else {
                         String::new()
@@ -1050,7 +1050,7 @@ impl ProtocolReader for CohereReader {
                         .get("arguments")
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
-                    let input = serde_json::from_str(arguments)
+                    let input = crate::json::parse_str(arguments)
                         .unwrap_or(serde_json::Value::String(arguments.to_string()));
                     content.push(crate::ir::IrBlock::ToolUse {
                         id,
@@ -1391,7 +1391,7 @@ impl ProtocolWriter for CohereWriter {
                     } = block
                     {
                         let args_str =
-                            serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                            crate::json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                         tool_calls_arr.push(serde_json::json!({ "id": id, "type": "function", "function": { "name": name, "arguments": args_str }}));
                     }
                 }
@@ -1750,7 +1750,7 @@ impl ProtocolWriter for CohereWriter {
                     id, name, input, ..
                 } => {
                     let args_str =
-                        serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                        crate::json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                     // Accumulate every tool call. Inserting per-iteration would overwrite the
                     // key and silently drop all but the last call on parallel tool use.
                     tool_calls_arr.push(serde_json::json!({ "id": id, "type": "function", "function": { "name": name, "arguments": args_str }}));

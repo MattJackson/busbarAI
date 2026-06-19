@@ -1561,6 +1561,25 @@ impl StreamTranslate {
                 // and replay them onto every later chunk so the stream is shape-faithful to a genuine
                 // OpenAI stream (and the chunks share ONE id — never a freshly minted per-chunk id).
                 self.apply_openai_chunk_identity(&mut out_data);
+                // PF-M5 (streaming-usage fidelity): the native OpenAI `include_usage` convention emits
+                // token usage on a SEPARATE trailing chunk (`{choices:[], usage:{...}}`) AFTER the
+                // finish_reason chunk — never folded onto the finish chunk. The OpenAI writer's 1:1
+                // `write_response_event` cannot return two events, so it FOLDS `usage` onto the finish
+                // chunk; left as-is that is a detectable proxy tell (a native stream never carries both
+                // a non-null finish_reason AND usage on one chunk). Here at the framing seam — which
+                // CAN append multiple frames — we UN-fold it: if a finish chunk (non-null
+                // finish_reason) also carries a folded `usage`, lift the usage off, frame the finish
+                // chunk alone, then frame a second trailing usage-only chunk that mirrors the latched
+                // stream identity. Result is byte-shape-faithful to a genuine include_usage stream. A
+                // chunk without a folded usage (the common case, and every non-finish chunk) is
+                // untouched. Only reached on OpenAI ingress (`emit_done`), which is always
+                // cross-protocol (a `StreamTranslate` only exists cross-protocol); same-protocol
+                // OpenAI->OpenAI passes the native trailing usage chunk through verbatim.
+                if let Some(trailing) = Self::split_openai_trailing_usage(&mut out_data) {
+                    out.extend_from_slice(reframe_sse(&out_et, &out_data).as_bytes());
+                    out.extend_from_slice(reframe_sse(&out_et, &trailing).as_bytes());
+                    return;
+                }
             }
             out.extend_from_slice(reframe_sse(&out_et, &out_data).as_bytes());
         }
@@ -1606,6 +1625,62 @@ impl StreamTranslate {
                 }
             }
         }
+    }
+
+    /// PF-M5: split a folded-usage OpenAI finish chunk into (finish-chunk-without-usage, trailing
+    /// usage-only chunk). Returns `Some(trailing_chunk)` when `chunk` is a `chat.completion.chunk` that
+    /// carries BOTH a folded top-level `usage` object AND a terminal `finish_reason` (the shape the
+    /// OpenAI writer produces when it cannot emit two events); in that case the folded `usage` is
+    /// REMOVED from `chunk` in place and re-homed onto a fresh trailing chunk shaped exactly like a
+    /// native include_usage trailer: same `id`/`created`/`model`/`object`, an EMPTY `choices` array,
+    /// and the `usage` object. Returns `None` (leaving `chunk` untouched) for any chunk that is not a
+    /// usage-bearing finish chunk — non-finish chunks, finish chunks without usage, or non-chunk
+    /// bodies (e.g. an in-band error envelope) — so the common path is a no-op. The trailing chunk's
+    /// identity is read off `chunk` itself (which `apply_openai_chunk_identity` has already populated
+    /// with the latched id/created/model), so both frames share ONE stream identity.
+    fn split_openai_trailing_usage(chunk: &mut serde_json::Value) -> Option<serde_json::Value> {
+        let obj = chunk.as_object_mut()?;
+        if obj.get("object").and_then(|v| v.as_str()) != Some("chat.completion.chunk") {
+            return None;
+        }
+        // A native include_usage trailer carries usage ONLY on a chunk with no active choice; the
+        // writer folds it onto the FINISH chunk, which has a non-null `finish_reason`. Require both a
+        // present `usage` object and a terminal finish_reason so a non-finish chunk that somehow
+        // carried usage is left alone (defensive — the writer only folds onto the finish chunk).
+        if !obj.contains_key("usage") {
+            return None;
+        }
+        let has_finish = obj
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|c0| c0.get("finish_reason"))
+            .map(|fr| !fr.is_null())
+            .unwrap_or(false);
+        if !has_finish {
+            return None;
+        }
+        let usage = obj.remove("usage")?;
+        // Build the trailing usage-only chunk mirroring the finish chunk's stream identity. `choices`
+        // is an EMPTY array — the native include_usage trailer carries no choice. Fields absent on the
+        // source chunk are simply omitted (kept faithful to what the stream already carries).
+        let mut trailing = serde_json::Map::new();
+        if let Some(id) = obj.get("id") {
+            trailing.insert("id".to_string(), id.clone());
+        }
+        trailing.insert(
+            "object".to_string(),
+            serde_json::Value::String("chat.completion.chunk".to_string()),
+        );
+        if let Some(created) = obj.get("created") {
+            trailing.insert("created".to_string(), created.clone());
+        }
+        if let Some(model) = obj.get("model") {
+            trailing.insert("model".to_string(), model.clone());
+        }
+        trailing.insert("choices".to_string(), serde_json::Value::Array(Vec::new()));
+        trailing.insert("usage".to_string(), usage);
+        Some(serde_json::Value::Object(trailing))
     }
 
     /// Hard cap on the reassembly buffer. An upstream that streams bytes without ever emitting a
@@ -1707,7 +1782,7 @@ impl StreamTranslate {
                     if data_str.is_empty() || data_str == "[DONE]" {
                         continue; // egress terminator/keepalive — ingress terminator is finish()'s
                     }
-                    let Ok(data) = serde_json::from_str::<serde_json::Value>(&data_str) else {
+                    let Ok(data) = crate::json::parse_str::<serde_json::Value>(&data_str) else {
                         continue; // malformed data JSON — skip the frame rather than abort
                     };
                     self.translate_event(&event_type, &data, &mut out);
@@ -2008,7 +2083,7 @@ impl GeminiJsonArrayFramer {
                     }
                     // Validate the payload is JSON before forwarding so a malformed frame cannot
                     // corrupt the array; re-serialize from the parsed Value to normalize whitespace.
-                    let Ok(data) = serde_json::from_str::<serde_json::Value>(&data_str) else {
+                    let Ok(data) = crate::json::parse_str::<serde_json::Value>(&data_str) else {
                         continue;
                     };
                     if self.started {
@@ -2228,6 +2303,87 @@ pub(crate) fn convert_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PF-M5: the streaming `include_usage` trailer must be its OWN chunk, not folded onto the finish
+    /// chunk. `split_openai_trailing_usage` lifts a folded `usage` off a finish chunk and re-homes it
+    /// onto a native-shape trailing usage-only chunk (`{choices:[], usage}`) that mirrors the stream
+    /// identity, leaving the finish chunk usage-free.
+    #[test]
+    fn test_split_openai_trailing_usage_unfolds_finish_chunk() {
+        // A finish chunk as the OpenAI writer folds it: non-null finish_reason AND a top-level usage.
+        let mut finish = serde_json::json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion.chunk",
+            "created": 1234,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        });
+        let trailing = StreamTranslate::split_openai_trailing_usage(&mut finish)
+            .expect("a usage-bearing finish chunk must split");
+
+        // The finish chunk no longer carries usage but keeps its finish_reason.
+        assert!(
+            finish.get("usage").is_none(),
+            "usage must be lifted OFF the finish chunk: {finish}"
+        );
+        assert_eq!(
+            finish.pointer("/choices/0/finish_reason"),
+            Some(&serde_json::json!("stop")),
+            "finish chunk keeps its finish_reason"
+        );
+
+        // The trailing chunk is native-shape: same identity, EMPTY choices, the usage object.
+        assert_eq!(trailing.get("id"), Some(&serde_json::json!("chatcmpl-abc")));
+        assert_eq!(trailing.get("created"), Some(&serde_json::json!(1234)));
+        assert_eq!(trailing.get("model"), Some(&serde_json::json!("gpt-4o")));
+        assert_eq!(
+            trailing.get("object"),
+            Some(&serde_json::json!("chat.completion.chunk"))
+        );
+        assert_eq!(
+            trailing.get("choices"),
+            Some(&serde_json::json!([])),
+            "trailing usage chunk carries an EMPTY choices array (native shape)"
+        );
+        assert_eq!(
+            trailing.get("usage"),
+            Some(
+                &serde_json::json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10})
+            )
+        );
+    }
+
+    /// PF-M5: a chunk WITHOUT a folded usage (every non-finish chunk, and a finish chunk that never
+    /// folded one) is left untouched — the split is a no-op on the common path.
+    #[test]
+    fn test_split_openai_trailing_usage_noop_without_usage() {
+        // A finish chunk with no usage.
+        let mut finish = serde_json::json!({
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        });
+        assert!(
+            StreamTranslate::split_openai_trailing_usage(&mut finish).is_none(),
+            "no usage → no split"
+        );
+
+        // A mid-stream content chunk that somehow carries usage but no terminal finish_reason is also
+        // left alone (defensive: the writer only folds onto the finish chunk).
+        let mut mid = serde_json::json!({
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        assert!(
+            StreamTranslate::split_openai_trailing_usage(&mut mid).is_none(),
+            "usage on a non-finish chunk is not split (defensive)"
+        );
+        assert!(
+            mid.get("usage").is_some(),
+            "non-finish chunk left untouched"
+        );
+    }
 
     /// Regression for the conformance bug where `find_frame_terminator` reported `term_len = 3`
     /// for the spec-legal CRLF blank-line terminator (`\r\n\r\n`, 4 bytes), contradicting its own

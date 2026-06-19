@@ -338,7 +338,10 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// out-of-band prober caught it. This is the lane-global sibling of the per-cell
     /// `record_hard_down`/`record_hard_down_in` primitives, used on the organic forward path so any
     /// route through `forward_with_pool` trips the lane in every namespace at once.
-    fn record_hard_down_all_cells(&self, lane: usize, reason: &str);
+    /// Trips every cell for `lane` hard-down. Returns `true` iff this was a genuine fresh trip of the
+    /// default cell (it was `ST_CLOSED` before) — so callers can gate `BREAKER_TRIPS_TOTAL` on a
+    /// LOGICAL Closed→Open trip and not re-count a persistently-dead lane on every recovery-probe.
+    fn record_hard_down_all_cells(&self, lane: usize, reason: &str) -> bool;
     /// A successful out-of-band health probe: recover the lane to Closed in EVERY cell (default and
     /// all pools), since the probe tests the shared upstream. No-op on cells already Closed.
     fn recover_lane(&self, lane: usize);
@@ -1996,7 +1999,7 @@ impl StateStore for InMemoryStore {
         self.record_hard_down_for("", lane, reason);
     }
 
-    fn record_hard_down_all_cells(&self, lane: usize, reason: &str) {
+    fn record_hard_down_all_cells(&self, lane: usize, reason: &str) -> bool {
         // Mirror `record_probe_failure_all_cells` exactly: operate on the per-pool cell Arcs while
         // holding the `pool_cells` lock, applying the SAME cell mutation `record_hard_down_for` does
         // (sticky Open + cooldown, probe released) — NOT by re-calling `record_hard_down_for`, which
@@ -2029,6 +2032,12 @@ impl StateStore for InMemoryStore {
             // `probe_in_flight == true`, benching the lane permanently after cooldown.
             c.probe_in_flight().store(false, Ordering::Release);
         };
+        // Was the default cell a genuine fresh trip (Closed → Open)? Capture BEFORE tripping so the
+        // caller can gate BREAKER_TRIPS_TOTAL on a logical trip, not a HalfOpen/Open re-classification
+        // that recurs on every recovery-probe cycle of a persistently-dead lane. Best-effort metric: a
+        // rare concurrent trip may miscount by one — far better than the prior unconditional per-probe
+        // over-count.
+        let default_was_closed = ls.as_ref().breaker_state().load(Ordering::Acquire) == ST_CLOSED;
         // Default cell (direct/`named`/`adhoc` routes that read the "" cell).
         trip(ls.as_ref());
         // Every existing per-pool cell for this lane — the cells organic pool-routed traffic is
@@ -2038,6 +2047,7 @@ impl StateStore for InMemoryStore {
         for (_, cell) in cells.get(&lane).into_iter().flatten() {
             trip(cell.as_ref());
         }
+        default_was_closed
     }
 
     fn recover_lane(&self, lane: usize) {

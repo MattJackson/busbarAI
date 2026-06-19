@@ -469,12 +469,11 @@ async fn ingress_body_model(
     let charged_at = crate::store::now();
     let v: Value = match crate::json::parse(&body) {
         Ok(v) => v,
-        Err(e) => {
-            // Log the parser's real cause (line/column/expectation) for operators, but NEVER leak it
-            // into the client-facing 400 body: the JSON parser's error detail is a busbar-internal tell
-            // (no native vendor surfaces it) and can echo fragments of the malformed body. The client
-            // gets the generic, vendor-plausible message only — matching the CORE fix in forward.rs.
-            tracing::debug!(error = %e, "request body JSON parse failed");
+        Err(_) => {
+            // Log a SANITIZED note for operators (just the byte length), never the parser's raw error:
+            // with sonic-rs it embeds a fragment of the malformed body, which can contain secrets/PII.
+            // The client gets only the generic, vendor-plausible message.
+            tracing::debug!(detail = %crate::json::parse_err_log(body.len()), "request body JSON parse failed");
             // Pre-routing failures (the model was never resolved) must still be counted in
             // REQUESTS_TOTAL / REQUEST_DURATION_SECONDS and fire the request-log webhook, the same
             // observability invariant the governance rejections and the model-miss 404s enforce. A
@@ -568,12 +567,11 @@ async fn ingress_path_model(
     let charged_at = crate::store::now();
     let mut v: Value = match crate::json::parse(&body) {
         Ok(v) => v,
-        Err(e) => {
-            // Log the parser's real cause (line/column/expectation) for operators, but NEVER leak it
-            // into the client-facing 400 body: the JSON parser's error detail is a busbar-internal tell
-            // (no native vendor surfaces it) and can echo fragments of the malformed body. The client
-            // gets the generic, vendor-plausible message only — matching the CORE fix in forward.rs.
-            tracing::debug!(error = %e, "request body JSON parse failed");
+        Err(_) => {
+            // Log a SANITIZED note for operators (just the byte length), never the parser's raw error:
+            // with sonic-rs it embeds a fragment of the malformed body, which can contain secrets/PII.
+            // The client gets only the generic, vendor-plausible message.
+            tracing::debug!(detail = %crate::json::parse_err_log(body.len()), "request body JSON parse failed");
             // Pre-routing failure (model never resolved): route through `finish_rejected` with the
             // bounded `"unresolved"` label so the malformed-body request is still counted in REQUESTS_TOTAL /
             // REQUEST_DURATION_SECONDS and fires the request-log webhook, mirroring the model-miss
@@ -640,10 +638,13 @@ async fn ingress_path_model(
     // it is effectively unreachable today, hence not exercised by a dedicated test.
     let injected: Bytes = match crate::json::to_vec(&v) {
         Ok(b) => b.into(),
-        Err(e) => {
-            // Same leak class as the parse arms above: the JSON parser's error detail is a
-            // busbar-internal tell, so it is logged for operators but never returned to the client.
-            tracing::debug!(error = %e, "injected request body re-serialization failed");
+        Err(_e) => {
+            // Same leak class as the parse arms above: the JSON library's error Display is a
+            // busbar-internal tell (on the parse side it embeds raw body fragments), so we never echo
+            // it — a bare operator breadcrumb only, consistent with the `parse_err_log` policy used at
+            // every deserialize site. (Serialization errors don't carry body bytes today, but aligning
+            // here closes the latent leak class if that ever changes.)
+            tracing::debug!("injected request body re-serialization failed");
             // Pre-routing failure (model never reached resolution): route through `finish_rejected`
             // with the bounded `"unresolved"` label so it is observable in metrics + the webhook. This
             // arm is effectively unreachable today (see the comment above), but keeping it on

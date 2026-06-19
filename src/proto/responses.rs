@@ -306,22 +306,21 @@ impl ProtocolReader for ResponsesReader {
         // Parse the error body ONCE and pull both fields from the single JSON tree, rather than
         // re-parsing the same bytes per field (matches the anthropic.rs pattern; error paths are
         // already degraded — avoid the extra parse+alloc on every non-2xx response).
-        let (provider_code, structured_type) =
-            match serde_json::from_slice::<serde_json::Value>(body) {
-                Ok(json) => {
-                    let error = json.get("error").and_then(|e| e.as_object());
-                    let provider_code = error
-                        .and_then(|e_obj| e_obj.get("code"))
-                        .and_then(|c| c.as_str())
-                        .map(String::from);
-                    let structured_type = error
-                        .and_then(|e_obj| e_obj.get("type"))
-                        .and_then(|t| t.as_str())
-                        .map(String::from);
-                    (provider_code, structured_type)
-                }
-                Err(_) => (None, None),
-            };
+        let (provider_code, structured_type) = match crate::json::parse::<serde_json::Value>(body) {
+            Ok(json) => {
+                let error = json.get("error").and_then(|e| e.as_object());
+                let provider_code = error
+                    .and_then(|e_obj| e_obj.get("code"))
+                    .and_then(|c| c.as_str())
+                    .map(String::from);
+                let structured_type = error
+                    .and_then(|e_obj| e_obj.get("type"))
+                    .and_then(|t| t.as_str())
+                    .map(String::from);
+                (provider_code, structured_type)
+            }
+            Err(_) => (None, None),
+        };
 
         // Native /v1/responses already carries `code: "context_length_exceeded"` on the oversized
         // path, so the common case flows straight through. But some upstreams (and the OpenAI
@@ -468,7 +467,7 @@ impl ProtocolReader for ResponsesReader {
                             // On malformed argument JSON, preserve the raw string rather than
                             // discarding the caller's tool arguments to Null (mirrors the OpenAI
                             // reader). Losing arguments entirely is a lossy cross-protocol bug.
-                            let input = serde_json::from_str(arguments).unwrap_or_else(|_| {
+                            let input = crate::json::parse_str(arguments).unwrap_or_else(|_| {
                                 serde_json::Value::String(arguments.to_string())
                             });
 
@@ -1253,7 +1252,7 @@ impl ProtocolReader for ResponsesReader {
                             .unwrap_or("{}");
                         // Preserve the raw string on malformed JSON rather than dropping the tool
                         // arguments to Null (mirrors the OpenAI reader; avoids lossy translation).
-                        let input = serde_json::from_str(arguments)
+                        let input = crate::json::parse_str(arguments)
                             .unwrap_or_else(|_| serde_json::Value::String(arguments.to_string()));
 
                         content.push(crate::ir::IrBlock::ToolUse {
@@ -1954,7 +1953,7 @@ impl ProtocolWriter for ResponsesWriter {
                             crate::ir::IrBlock::ToolUse {
                                 id, name, input, ..
                             } => {
-                                let args_str = serde_json::to_string(input)
+                                let args_str = crate::json::to_string(input)
                                     .unwrap_or_else(|_| "{}".to_string());
                                 tool_items.push(serde_json::json!({
                                     "type": "function_call",
@@ -2616,7 +2615,7 @@ impl ProtocolWriter for ResponsesWriter {
                     id, name, input, ..
                 } => {
                     let args_str =
-                        serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                        crate::json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                     output_arr.push(serde_json::json!({
                         "type": "function_call",
                         // Native function_call items carry an item-level opaque `id` (`fc_…`) DISTINCT

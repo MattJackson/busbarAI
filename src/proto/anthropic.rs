@@ -113,6 +113,24 @@ fn read_clamped_block_index(data: &serde_json::Value) -> Option<usize> {
         .map(|v| v.min(MAX_ANTHROPIC_BLOCK_INDEX) as usize)
 }
 
+/// Clamp a temperature to Anthropic's native `[0.0, 1.0]` range, returning `(clamped, was_clamped)`
+/// where `was_clamped` is `true` iff the clamp ACTUALLY changed the value (PF-M1 clamp + PF-H2
+/// non-silent signal). OpenAI / Responses accept temperature up to 2.0, so a cross-protocol request
+/// can carry a value Anthropic's API rejects with a 422; the writer forwards the closest valid value
+/// instead of bouncing a 422, and uses `was_clamped` to emit a `warn!` so the mutation is NOT silent.
+/// Factored out so the non-silent-on-change contract is unit-testable without a tracing subscriber.
+fn clamp_temperature_for_anthropic(temperature: f64) -> (f64, bool) {
+    // Guard against non-finite input (NaN/±Inf): `f64::clamp` panics on a NaN bound but not a NaN
+    // value, yet a NaN/Inf temperature is not a "real value clamped from range" — return it unchanged
+    // with was_clamped=false so the helper is total. This is confirmed unreachable via valid JSON
+    // (sonic_rs rejects NaN/Inf at parse), so it is a defensive no-op, not a behavior change.
+    if !temperature.is_finite() {
+        return (temperature, false);
+    }
+    let clamped = temperature.clamp(0.0, 1.0);
+    (clamped, clamped != temperature)
+}
+
 #[derive(Clone)]
 pub(crate) struct AnthropicReader;
 
@@ -121,22 +139,21 @@ impl ProtocolReader for AnthropicReader {
         // Parse the error body once and pull both fields from the single JSON tree, rather than
         // re-parsing the same bytes per field (error paths are already degraded; avoid the extra
         // parse+alloc on every non-2xx response).
-        let (provider_code, structured_type) =
-            match serde_json::from_slice::<serde_json::Value>(body) {
-                Ok(json) => {
-                    let error = json.get("error");
-                    let provider_code = error
-                        .and_then(|e| e.get("code"))
-                        .and_then(|c| c.as_str())
-                        .map(String::from);
-                    let structured_type = error
-                        .and_then(|e| e.get("type"))
-                        .and_then(|t| t.as_str())
-                        .map(String::from);
-                    (provider_code, structured_type)
-                }
-                Err(_) => (None, None),
-            };
+        let (provider_code, structured_type) = match crate::json::parse::<serde_json::Value>(body) {
+            Ok(json) => {
+                let error = json.get("error");
+                let provider_code = error
+                    .and_then(|e| e.get("code"))
+                    .and_then(|c| c.as_str())
+                    .map(String::from);
+                let structured_type = error
+                    .and_then(|e| e.get("type"))
+                    .and_then(|t| t.as_str())
+                    .map(String::from);
+                (provider_code, structured_type)
+            }
+            Err(_) => (None, None),
+        };
 
         // Anthropic signals context-length via the error MESSAGE (no distinct code).
         // Surface the canonical code so the breaker pipeline (normalize_raw_error) → ContextLength.
@@ -199,7 +216,7 @@ impl ProtocolReader for AnthropicReader {
         // message-substring billing/auth checks must fire even when the structured `code` field is
         // absent (some Anthropic error shapes carry a 200/non-401-403 body with only a message), so
         // they live OUTSIDE the `if let Some(code_val)` guard rather than nested inside it.
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Ok(json) = crate::json::parse::<serde_json::Value>(body) {
             let error = json.get("error");
 
             if let Some(code_val) = error.and_then(|e| e.get("code")) {
@@ -348,7 +365,11 @@ impl ProtocolReader for AnthropicReader {
         let max_tokens = obj
             .get("max_tokens")
             .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok());
+            .and_then(|v| u32::try_from(v).ok())
+            // Treat `max_tokens: 0` as absent (matches the OpenAI/Gemini/Bedrock/Cohere/Responses
+            // readers). A zero cap is meaningless (no output budget) and would force an invalid body
+            // on egress; dropping it to None lets the target apply its own default.
+            .filter(|&v| v > 0);
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
         let top_p = obj.get("top_p").and_then(|v| v.as_f64());
         let top_k = obj
@@ -1512,10 +1533,26 @@ impl ProtocolWriter for AnthropicWriter {
             out.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
         }
         if let Some(temperature) = req.temperature {
-            // Clamp to Anthropic's valid [0.0, 1.0] (PF-M1). OpenAI / Responses accept temperature up
-            // to 2.0, so a cross-protocol request can carry a value Anthropic's API rejects with a 422;
-            // clamping forwards the closest valid value instead of bouncing a 422 back to the caller.
-            let clamped = temperature.clamp(0.0, 1.0);
+            // Clamp to Anthropic's valid [0.0, 1.0] (PF-M1) — see `clamp_temperature_for_anthropic`.
+            // NON-SILENT clamp (PF-H2 fidelity fix): silently rewriting a caller's sampling temperature
+            // is exactly the lossy mutation busbar exists to avoid; we keep the clamp (Anthropic 422s on
+            // >1.0) but emit a `warn!` whenever it ACTUALLY changes the value so an operator can detect
+            // the divergence in logs. A request-time RESPONSE header (`x-busbar-parameter-clamped`)
+            // cannot be attached from here: `write_request` returns only the egress request JSON and
+            // has no handle on the (much-later-built) client response; surfacing it as a header would
+            // require threading a clamp signal back out through the whole `forward` path / trait
+            // signature, deferred as out-of-scope for this minimal-safe fix. The warn! is the contract.
+            let (clamped, was_clamped) = clamp_temperature_for_anthropic(temperature);
+            if was_clamped {
+                tracing::warn!(
+                    requested_temperature = temperature,
+                    clamped_temperature = clamped,
+                    parameter = "temperature",
+                    "clamping temperature to Anthropic's [0.0, 1.0] range; the requested value was \
+                     outside it (e.g. an OpenAI/Responses value up to 2.0) and would 422 — the \
+                     forwarded value diverges from the caller's request"
+                );
+            }
             out.insert("temperature".to_string(), serde_json::json!(clamped));
         }
         // Sampling controls promoted to first-class IR fields (see `IrRequest`): emit each in
@@ -4322,6 +4359,62 @@ mod anthropic_hardening_tests {
         ir.temperature = Some(-0.3);
         let out = AnthropicWriter.write_request(&ir);
         assert_eq!(out["temperature"], serde_json::json!(0.0));
+    }
+
+    // ---- PF-H2: temperature clamp is NON-SILENT (signals when it changes the value) ----
+    #[test]
+    fn test_clamp_temperature_for_anthropic_signals_on_change() {
+        // An out-of-range value is clamped AND flagged as changed (so the writer warns).
+        assert_eq!(clamp_temperature_for_anthropic(1.5), (1.0, true));
+        assert_eq!(clamp_temperature_for_anthropic(2.0), (1.0, true));
+        assert_eq!(clamp_temperature_for_anthropic(-0.3), (0.0, true));
+        // An in-range value is untouched AND NOT flagged (no spurious warn on a faithful value).
+        assert_eq!(clamp_temperature_for_anthropic(0.7), (0.7, false));
+        assert_eq!(clamp_temperature_for_anthropic(0.0), (0.0, false));
+        assert_eq!(clamp_temperature_for_anthropic(1.0), (1.0, false));
+    }
+
+    // ---- is_finite guard: a non-finite temperature is returned unchanged, was_clamped=false. ----
+    // Unreachable via valid JSON (sonic_rs rejects NaN/Inf at parse) but makes the helper total: a
+    // NaN/Inf must NOT be treated as a real value clamped from range.
+    #[test]
+    fn test_clamp_temperature_for_anthropic_passes_through_non_finite() {
+        let (nan_out, nan_clamped) = clamp_temperature_for_anthropic(f64::NAN);
+        assert!(nan_out.is_nan(), "NaN must pass through unchanged");
+        assert!(!nan_clamped, "NaN must NOT be flagged as clamped");
+        assert_eq!(
+            clamp_temperature_for_anthropic(f64::INFINITY),
+            (f64::INFINITY, false)
+        );
+        assert_eq!(
+            clamp_temperature_for_anthropic(f64::NEG_INFINITY),
+            (f64::NEG_INFINITY, false)
+        );
+    }
+
+    // ---- max_tokens: 0 is treated as absent (matches the 5 sibling readers' `.filter(|&v| v > 0)`).
+    #[test]
+    fn test_anthropic_reader_max_tokens_zero_yields_none() {
+        let wire = serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 0,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let ir = AnthropicReader.read_request(&wire).expect("read_request");
+        assert_eq!(
+            ir.max_tokens, None,
+            "max_tokens: 0 must be treated as absent (None), matching the sibling readers"
+        );
+        // A positive cap is still read normally.
+        let wire_ok = serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let ir_ok = AnthropicReader
+            .read_request(&wire_ok)
+            .expect("read_request");
+        assert_eq!(ir_ok.max_tokens, Some(256));
     }
 
     // ---- PF-H7: OpenAI -> Anthropic tool_choice direction ----

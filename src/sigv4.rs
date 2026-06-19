@@ -342,6 +342,13 @@ pub(crate) fn parse_amz_date(amzdate: &str) -> Option<u64> {
     if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
         return None;
     }
+    // The slices below index by char position; guard against a non-ASCII multi-byte char straddling a
+    // boundary (`amzdate[0..4]` etc. would panic). The valid format is pure ASCII (digits + 'T'/'Z'),
+    // so any non-ASCII byte is already invalid. (Defense-in-depth: callers feed `HeaderValue::to_str`,
+    // which today rejects non-ASCII before this — but the guarantee now lives locally, not implicitly.)
+    if !amzdate.is_ascii() {
+        return None;
+    }
     let digits = |s: &str| -> Option<i64> {
         if s.bytes().all(|c| c.is_ascii_digit()) {
             s.parse::<i64>().ok()

@@ -26,6 +26,18 @@ const MAX_OPEN_TOOLS: usize = crate::proto::OPENAI_FAMILY_MAX_OPEN_TOOLS;
 /// model id keeps the synthesized value plausible.
 const DEFAULT_MODEL: &str = crate::proto::OPENAI_FAMILY_DEFAULT_MODEL;
 
+/// Busbar-internal sentinel key (PF-H3 fidelity fix). The reader folds BOTH `max_tokens` and the
+/// modern `max_completion_tokens` into the single IR `max_tokens` field so a caller's output-token
+/// cap survives the cross-protocol seam. But OpenAI's o1/o3 reasoning models REJECT `max_tokens` and
+/// require `max_completion_tokens`; an OpenAI->OpenAI passthrough to such a model that arrived as
+/// `max_completion_tokens` must re-emit `max_completion_tokens`, not `max_tokens`. The reader records
+/// the source spelling under this sentinel in `extra` so the writer can re-emit the SAME key on a
+/// same-protocol passthrough. `extra` is cleared on the cross-protocol seam, so the sentinel
+/// naturally vanishes there and a cross-protocol egress emits the canonical `max_tokens` — exactly
+/// the desired scope (other protocols have no `max_completion_tokens`). The `__busbar` prefix never
+/// collides with a real OpenAI field, and the writer consumes (does not leak) it.
+const MAX_COMPLETION_TOKENS_SENTINEL: &str = "__busbar_max_completion_tokens";
+
 /// Resolve the `model` to emit on an OpenAI response: the upstream-supplied value when present,
 /// otherwise the [`DEFAULT_MODEL`] fallback so the required non-nullable `model` field is never
 /// omitted on a cross-protocol response. Never panics on the request path.
@@ -115,7 +127,7 @@ impl ProtocolReader for OpenAiReader {
         // Parse the error body exactly once and derive both fields from the single tree, mirroring
         // the single-parse pattern in AnthropicReader::extract_error. The previous code parsed the
         // same bytes twice (once per field), doubling alloc/CPU on every non-2xx response.
-        let json = serde_json::from_slice::<serde_json::Value>(body).ok();
+        let json = crate::json::parse::<serde_json::Value>(body).ok();
         let error_obj = json
             .as_ref()
             .and_then(|j| j.get("error"))
@@ -211,6 +223,14 @@ impl ProtocolReader for OpenAiReader {
             .and_then(|v| v.as_u64())
             .and_then(|v| u32::try_from(v).ok())
             .filter(|&v| v > 0);
+        // PF-H3: remember whether the cap arrived as `max_completion_tokens` (and NOT `max_tokens`) so a
+        // same-protocol OpenAI passthrough to an o1/o3 reasoning model re-emits `max_completion_tokens`
+        // (which those models require) rather than the canonical `max_tokens` (which they 400 on). Only
+        // record when `max_tokens` is genuinely absent — if both are present the writer's canonical
+        // `max_tokens` is correct. The sentinel rides `extra` and is cleared on the cross-protocol seam,
+        // so it scopes to same-protocol exactly.
+        let max_completion_tokens_was_source =
+            !obj.contains_key("max_tokens") && obj.contains_key("max_completion_tokens");
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
         let top_p = obj.get("top_p").and_then(|v| v.as_f64());
         // OpenAI's `stop` is a string OR an array of strings; normalize to the IR's Vec<String>.
@@ -332,7 +352,7 @@ impl ProtocolReader for OpenAiReader {
                                         .get("arguments")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("{}");
-                                    let input = serde_json::from_str(arguments).unwrap_or(
+                                    let input = crate::json::parse_str(arguments).unwrap_or(
                                         serde_json::Value::String(arguments.to_string()),
                                     );
 
@@ -416,6 +436,13 @@ impl ProtocolReader for OpenAiReader {
         // knob, so they lack a clean universal mapping; only the universally-modeled controls (top_p,
         // stop) are promoted. top_p and stop are pulled out here so they survive the cross-protocol
         // seam as first-class IR fields rather than being cleared with the rest of `extra`.
+        //
+        // PF-M4: `response_format` (json_object / json_schema / structured output) is DELIBERATELY left
+        // in `extra` (not in `modeled_keys`), so it survives a SAME-protocol OpenAI->OpenAI passthrough
+        // verbatim — it is NOT dropped on that path. On a CROSS-protocol hop it is cleared with the rest
+        // of `extra`; rather than dropping it silently, the translate seam (`forward.rs`) emits a warn
+        // (full cross-protocol mapping to Gemini `responseSchema` / Anthropic tool-forcing / Bedrock is
+        // deferred). See the matching note at `forward.rs::translate_request_cross_protocol`.
         let modeled_keys: std::collections::HashSet<&str> = [
             "model",
             "messages",
@@ -441,6 +468,16 @@ impl ProtocolReader for OpenAiReader {
             if !modeled_keys.contains(key.as_str()) {
                 extra.insert(key.clone(), value.clone());
             }
+        }
+
+        // PF-H3: stamp the source-key sentinel when the cap arrived as `max_completion_tokens` (and
+        // only when it produced a usable value, so we never claim a phantom cap). Same-protocol only:
+        // `extra` is cleared on the cross-protocol seam.
+        if max_completion_tokens_was_source && max_tokens.is_some() {
+            extra.insert(
+                MAX_COMPLETION_TOKENS_SENTINEL.to_string(),
+                serde_json::Value::Bool(true),
+            );
         }
 
         // `tool_choice` is a first-class IR control (PF-H1) so a forced/targeted directive survives
@@ -883,7 +920,7 @@ impl ProtocolReader for OpenAiReader {
                         .get("arguments")
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
-                    let input = serde_json::from_str(arguments)
+                    let input = crate::json::parse_str(arguments)
                         .unwrap_or(serde_json::Value::String(arguments.to_string()));
 
                     content.push(crate::ir::IrBlock::ToolUse {
@@ -973,13 +1010,13 @@ impl ProtocolReader for OpenAiReader {
 /// OpenAI carries tool-call arguments as a *string* of JSON. The reader stores well-formed
 /// arguments as a parsed `Value`, but falls back to `Value::String(raw)` when the upstream sent
 /// arguments that are not valid JSON (a streaming-partial or malformed tool call). Re-serializing
-/// such a `Value::String` via `serde_json::to_string` would JSON-encode the string a second time —
+/// such a `Value::String` via `crate::json::to_string` would JSON-encode the string a second time —
 /// emitting an escaped, quoted blob on the wire (double-encoding). Emit a `Value::String` verbatim
 /// so the original argument text round-trips unchanged; any other `Value` is serialized normally.
 fn tool_arguments_to_string(input: &serde_json::Value) -> String {
     match input {
         serde_json::Value::String(s) => s.clone(),
-        other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+        other => crate::json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
     }
 }
 
@@ -1335,12 +1372,27 @@ impl ProtocolWriter for OpenAiWriter {
             serde_json::Value::Array(messages_array),
         );
 
-        // Emit the modeled output-token cap as `max_tokens`. The reader promotes BOTH `max_tokens` and
-        // the modern `max_completion_tokens` into this one IR field (so a caller's limit survives the
-        // cross-protocol seam); on a same-protocol OpenAI passthrough this re-emits the canonical
-        // `max_tokens`, preserving wire identity for the common (non-reasoning) case.
+        // Emit the modeled output-token cap. The reader promotes BOTH `max_tokens` and the modern
+        // `max_completion_tokens` into this one IR field (so a caller's limit survives the
+        // cross-protocol seam). PF-H3: re-emit under the SOURCE spelling when the sentinel says the cap
+        // arrived as `max_completion_tokens` — OpenAI's o1/o3 reasoning models REQUIRE
+        // `max_completion_tokens` and 400 on `max_tokens`, so an OpenAI->OpenAI passthrough to such a
+        // model must preserve the modern key. The sentinel only survives the same-protocol path (extra
+        // is cleared cross-protocol), so a cross-protocol egress falls back to the canonical
+        // `max_tokens` (other protocols have no `max_completion_tokens`). For the common
+        // (non-reasoning) same-protocol case the sentinel is absent and we emit `max_tokens`.
         if let Some(max_tokens) = req.max_tokens {
-            out.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+            let key = if req
+                .extra
+                .get(MAX_COMPLETION_TOKENS_SENTINEL)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            out.insert(key.to_string(), serde_json::json!(max_tokens));
         }
 
         if let Some(temperature) = req.temperature {
@@ -1413,6 +1465,12 @@ impl ProtocolWriter for OpenAiWriter {
 
         // Add extra fields
         for (key, value) in &req.extra {
+            // PF-H3: the max-completion-tokens sentinel is a busbar-internal marker consumed above
+            // (it selected the cap's emitted key); it is NOT a real OpenAI field, so skip it here so
+            // it never leaks onto the wire (which would be an invalid body and a proxy tell).
+            if key == MAX_COMPLETION_TOKENS_SENTINEL {
+                continue;
+            }
             out.insert(key.clone(), value.clone());
         }
 
@@ -1569,8 +1627,12 @@ impl ProtocolWriter for OpenAiWriter {
                 // Native OpenAI carries this on a SEPARATE trailing `{choices:[], usage:{...}}` chunk
                 // after the finish chunk; emitting that second chunk would require returning two events
                 // from this 1:1 `write_response_event`, which the `ProtocolWriter` trait (shared, not
-                // owned here) does not allow. Folding `usage` onto the finish chunk recovers the
-                // accounting and the SDK still surfaces `chunk.usage`. We emit it only when a count is
+                // owned here) does not allow. So we FOLD `usage` onto the finish chunk here, and the
+                // framing seam (`StreamTranslate::emit_ir_event` via `split_openai_trailing_usage`,
+                // PF-M5) UN-folds it back into a native-shape trailing usage-only chunk — that seam can
+                // append two frames where this 1:1 writer cannot. Folding here recovers the accounting
+                // even on any path that bypasses the seam, and the SDK still surfaces `chunk.usage`.
+                // We emit it only when a count is
                 // nonzero (a same-protocol passthrough without include_usage carries zeroed usage in
                 // the IR; suppressing the field there avoids stamping a usage object onto a stream that
                 // never asked for one). `total_tokens` is the prompt+completion sum, the native shape.
@@ -2128,15 +2190,87 @@ mod tests {
 
     #[test]
     fn max_completion_tokens_survives_read_write_roundtrip() {
-        // An ingress request carrying only `max_completion_tokens` is promoted into the IR cap and
-        // re-emitted (as `max_tokens`) rather than being dropped at the seam.
+        // PF-H3: an ingress request carrying only `max_completion_tokens` is promoted into the IR cap.
+        // On a SAME-protocol OpenAI->OpenAI passthrough (extra intact) it must re-emit the SOURCE key
+        // `max_completion_tokens` — OpenAI's o1/o3 reasoning models REQUIRE it and 400 on `max_tokens`.
         let body = serde_json::json!({
             "messages": [{ "role": "user", "content": "hi" }],
             "max_completion_tokens": 777
         });
         let ir = OpenAiReader.read_request(&body).expect("parses");
         let out = OpenAiWriter.write_request(&ir);
-        assert_eq!(out["max_tokens"], serde_json::json!(777));
+        assert_eq!(
+            out["max_completion_tokens"],
+            serde_json::json!(777),
+            "same-protocol passthrough must preserve the source `max_completion_tokens` key"
+        );
+        // And it must NOT also emit `max_tokens` (a reasoning model 400s on a conflicting duplicate).
+        assert!(
+            out.as_object().expect("object").get("max_tokens").is_none(),
+            "must not emit `max_tokens` alongside the preserved `max_completion_tokens`"
+        );
+        // The busbar-internal sentinel never leaks onto the wire.
+        assert!(out
+            .as_object()
+            .expect("object")
+            .get(MAX_COMPLETION_TOKENS_SENTINEL)
+            .is_none());
+    }
+
+    #[test]
+    fn max_completion_tokens_maps_to_max_tokens_cross_protocol() {
+        // PF-H3: on the CROSS-protocol seam `extra` is cleared (the sentinel vanishes with it), so the
+        // cap re-emits as the canonical `max_tokens` — other protocols have no `max_completion_tokens`.
+        // Mirror the seam by clearing extra before the write.
+        let body = serde_json::json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_completion_tokens": 777
+        });
+        let mut ir = OpenAiReader.read_request(&body).expect("parses");
+        ir.extra.clear(); // the translate seam clears extra on a cross-protocol hop
+        let out = OpenAiWriter.write_request(&ir);
+        assert_eq!(
+            out["max_tokens"],
+            serde_json::json!(777),
+            "cross-protocol egress emits the canonical `max_tokens`"
+        );
+        assert!(
+            out.as_object()
+                .expect("object")
+                .get("max_completion_tokens")
+                .is_none(),
+            "cross-protocol egress must not carry `max_completion_tokens`"
+        );
+    }
+
+    #[test]
+    fn response_format_survives_same_protocol_roundtrip() {
+        // PF-M4: `response_format` (json_object / json_schema / structured output) is NOT a modeled
+        // key, so it rides `extra` and must survive a SAME-protocol OpenAI->OpenAI passthrough verbatim
+        // (it is NOT dropped on that path). On a cross-protocol hop the translate seam clears extra and
+        // warns (full mapping to Gemini/Anthropic/Bedrock analogs is deferred).
+        let body = serde_json::json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "out", "schema": {"type": "object"}}
+            }
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        // It lands in extra (not silently dropped at read time).
+        assert!(
+            ir.extra.contains_key("response_format"),
+            "response_format must be preserved in extra for same-protocol passthrough"
+        );
+        let out = OpenAiWriter.write_request(&ir);
+        assert_eq!(
+            out["response_format"],
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "out", "schema": {"type": "object"}}
+            }),
+            "response_format must round-trip verbatim on a same-protocol OpenAI passthrough"
+        );
     }
 
     #[test]
