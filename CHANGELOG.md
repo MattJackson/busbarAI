@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.6] — 2026-06-19
+
+Performance and observability. Busbar now reports its own added latency in-band, and the hot
+translate path is ~2× faster on large payloads via SIMD JSON. The request path, wire protocols,
+breaker FSM, governance contract, and lossless translation semantics are unchanged.
+
+### Added
+
+- **`Server-Timing: busbar;dur=<ms>` response header.** Busbar reports its own internal processing
+  time — total request time minus the upstream round-trip — on every response. A W3C-standard,
+  per-request measurement of exactly the latency Busbar adds (not the network, not the model), readable
+  in browser DevTools or any APM tool, on your own production traffic.
+
+### Changed
+
+- **SIMD JSON (sonic-rs) on the hot translate path.** Request/response body parse and serialize now go
+  through a single `crate::json` seam backed by sonic-rs (NEON on arm64, AVX2/SSE on x86); `serde_json`
+  is retained for cold/config/error paths and as the in-memory `Value` type. ~5× faster serialize on
+  the large, string-heavy bodies LLM traffic carries.
+- **Single-parse ingest.** The request body is parsed once across the routing and forwarding layers —
+  the ingress layer hands its already-parsed `Value` to the forwarder — instead of being parsed twice.
+- Net effect (measured on a pinned AWS `c7g.2xlarge`, Server-Timing): cross-protocol translation of a
+  ~32 KB payload roughly halved (≈186µs → ≈84µs); small requests are unchanged at the per-request
+  framework floor (~33µs). Full reproducible methodology and numbers are published at
+  [getbusbar.com/benchmark](https://getbusbar.com/benchmark).
+
+### Notes
+
+- The sonic-rs serializer formats some floats differently from serde_json (e.g. `1e26` vs `1e+26`,
+  `-0.0` rendered as `0.0`) — numerically lossless and valid JSON. Only an exact-string comparison on an
+  exotic numeric passthrough field would observe a different byte sequence; the IR round-trip and all
+  translation behavior are unchanged.
+
 ## [1.0.0-rc.5] — 2026-06-17
 
 Three independent features land together: pluggable routing policies, deeper Prometheus
