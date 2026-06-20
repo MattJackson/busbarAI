@@ -67,9 +67,15 @@ pub(crate) enum DrainStatus {
 /// unrecoverable) and the status reflects it, so the caller no longer has to infer abandonment from
 /// the (ambiguous) post-pass buffer length. A clean pass — buffer emptied or a trailing partial
 /// frame left buffered — returns [`DrainStatus::Ok`].
-pub(crate) fn drain_frames_checked(buf: &mut Vec<u8>) -> (Vec<(String, Vec<u8>)>, DrainStatus) {
+pub(crate) fn drain_frames_checked(
+    buf: &mut Vec<u8>,
+) -> (Vec<(String, Vec<u8>)>, DrainStatus, usize) {
     let mut out = Vec::new();
     let mut status = DrainStatus::Ok;
+    // Bytes consumed as COMPLETE, VALID frames from the FRONT. On a MalformedPrelude the buffer is
+    // cleared, but this counts ONLY the valid frames drained before it — so a same-proto verbatim
+    // re-emit can forward exactly those bytes and never the cleared malformed remainder.
+    let mut valid_consumed = 0usize;
     loop {
         if buf.len() < 12 {
             break; // need the full prelude
@@ -97,8 +103,9 @@ pub(crate) fn drain_frames_checked(buf: &mut Vec<u8>) -> (Vec<(String, Vec<u8>)>
         let payload = buf[12 + headers_len..total_len - 4].to_vec();
         out.push((event_type, payload));
         buf.drain(..total_len);
+        valid_consumed += total_len;
     }
-    (out, status)
+    (out, status, valid_consumed)
 }
 
 /// Drain every COMPLETE frame from `buf`, returning `(event_type, payload_bytes)` per frame and
@@ -1045,12 +1052,17 @@ mod tests {
         bad.extend_from_slice(&0u32.to_be_bytes()); // headers_len = 0
         bad.extend_from_slice(&[0, 0, 0, 0]); // prelude CRC
         bad.extend_from_slice(b"trailing junk");
-        let (frames, status) = drain_frames_checked(&mut bad);
+        let (frames, status, valid_consumed) = drain_frames_checked(&mut bad);
         assert!(
             frames.is_empty(),
             "no frame emitted for a malformed prelude"
         );
         assert!(bad.is_empty(), "malformed prelude clears the buffer");
+        assert_eq!(
+            valid_consumed, 0,
+            "a malformed prelude at the front consumes ZERO valid frame bytes — the same-proto \
+             verbatim emit must forward none of the cleared remainder"
+        );
         assert_eq!(
             status,
             DrainStatus::MalformedPrelude,
@@ -1063,7 +1075,7 @@ mod tests {
         bad2.extend_from_slice(&5u32.to_be_bytes()); // headers_len = 5 (> 20 - 16 = 4)
         bad2.extend_from_slice(&[0, 0, 0, 0]); // prelude CRC
         bad2.extend_from_slice(b"junk extra bytes");
-        let (frames2, status2) = drain_frames_checked(&mut bad2);
+        let (frames2, status2, _) = drain_frames_checked(&mut bad2);
         assert!(frames2.is_empty());
         assert!(bad2.is_empty());
         assert_eq!(status2, DrainStatus::MalformedPrelude);
@@ -1071,8 +1083,13 @@ mod tests {
         // (c) The AMBIGUITY case the old length-inference got wrong: a CLEAN full drain that consumes
         // every buffered byte also leaves an EMPTY buffer — but it is NOT an abort. Status is Ok.
         let mut good = encode_frame("contentBlockDelta", br#"{"delta":{"text":"hi"}}"#);
-        let (frames3, status3) = drain_frames_checked(&mut good);
+        let good_len = good.len();
+        let (frames3, status3, valid_consumed3) = drain_frames_checked(&mut good);
         assert_eq!(frames3.len(), 1);
+        assert_eq!(
+            valid_consumed3, good_len,
+            "a clean full drain reports the whole consumed frame length"
+        );
         assert!(
             good.is_empty(),
             "a clean full drain also empties the buffer"
@@ -1086,7 +1103,7 @@ mod tests {
         // (d) A trailing PARTIAL frame is healthy too (buffer non-empty): status Ok, await more bytes.
         let full = encode_frame("messageStop", br#"{"stopReason":"end_turn"}"#);
         let mut partial = full[..full.len() - 4].to_vec();
-        let (frames4, status4) = drain_frames_checked(&mut partial);
+        let (frames4, status4, _) = drain_frames_checked(&mut partial);
         assert!(frames4.is_empty(), "no complete frame yet");
         assert!(!partial.is_empty(), "partial frame stays buffered");
         assert_eq!(

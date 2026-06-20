@@ -99,9 +99,23 @@ fn handle_cli_flags() -> Option<i32> {
                 std::env::var("BUSBAR_CONFIG").unwrap_or_else(|_| "/etc/busbar/config.yaml".into());
             if let Ok(raw) = std::fs::read_to_string(&config_path) {
                 if let Ok(interpolated) = config::interpolate_env(&raw) {
-                    if let Ok(deploy) = serde_yaml::from_str::<config::DeployCfg>(&interpolated) {
-                        if let Some(sec) = deploy.security {
-                            entries.extend(sec.blocked_metadata_hosts);
+                    match serde_yaml::from_str::<config::DeployCfg>(&interpolated) {
+                        Ok(deploy) => {
+                            if let Some(sec) = deploy.security {
+                                entries.extend(sec.blocked_metadata_hosts);
+                            }
+                        }
+                        Err(_) => {
+                            // The config did not parse (e.g. an unknown/typo'd key now rejected by
+                            // deny_unknown_fields). Don't silently print an INCOMPLETE denylist that
+                            // omits the operator's `security.blocked_metadata_hosts` — warn instead.
+                            // (Deliberately NOT echoing the error, which could quote a config value;
+                            // the normal boot path surfaces the precise parse error.)
+                            eprintln!(
+                                "warning: config at {config_path} did not parse; printing the built-in \
+                                 metadata denylist only (security.blocked_metadata_hosts skipped). Run \
+                                 busbar normally to see the parse error."
+                            );
                         }
                     }
                 }

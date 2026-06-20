@@ -1961,14 +1961,17 @@ impl StreamTranslate {
             // length-prefix and CRC32, and any divergence (key ordering, float formatting,
             // whitespace) from the upstream's exact bytes is an undecodable frame for a native AWS
             // SDK. Snapshot the buffer BEFORE draining; `drain_frames_checked` removes only complete
-            // frames from the FRONT (adding nothing), so the consumed prefix
-            // `snapshot[..snapshot.len() - self.buf.len()]` is exactly those frames' original bytes.
+            // frames from the FRONT (adding nothing). Use the drain's reported VALID-consumed length
+            // (NOT `snapshot.len() - self.buf.len()`): on a MalformedPrelude the drain CLEARS the
+            // buffer, so the length delta would inflate to the whole snapshot and splice the malformed
+            // garbage tail into the client stream ahead of the synthesized exception frame.
             let pre_drain = if self.same_proto {
                 Some(self.buf.clone())
             } else {
                 None
             };
-            let (frames, status) = crate::eventstream::drain_frames_checked(&mut self.buf);
+            let (frames, status, valid_consumed) =
+                crate::eventstream::drain_frames_checked(&mut self.buf);
             for (event_type, payload) in frames {
                 let Ok(mut data) = serde_json::from_slice::<serde_json::Value>(&payload) else {
                     continue; // non-JSON payload — skip the frame
@@ -1989,9 +1992,10 @@ impl StreamTranslate {
                 }
             }
             if let Some(snapshot) = pre_drain {
-                // Append exactly the bytes the drain consumed (the complete frames), verbatim.
-                let consumed = snapshot.len() - self.buf.len();
-                out.extend_from_slice(&snapshot[..consumed]);
+                // Append exactly the bytes the drain consumed as COMPLETE, VALID frames, verbatim.
+                // `valid_consumed` excludes a cleared malformed-prelude remainder (see above), so the
+                // client never receives undecodable garbage ahead of the synthesized exception frame.
+                out.extend_from_slice(&snapshot[..valid_consumed]);
             }
             // A malformed prelude is unrecoverable: abandon the stream exactly like the MAX_BUF
             // overflow path so the terminal exception frame is emitted by `finish()` (the `aborted`
@@ -2039,7 +2043,11 @@ impl StreamTranslate {
                         continue; // no data: line, or non-utf8 — skip
                     };
                     if data_str.is_empty() || data_str == "[DONE]" {
-                        continue; // egress terminator/keepalive — ingress terminator is finish()'s
+                        // egress terminator/keepalive — ingress terminator is finish()'s. Carries no
+                        // usage on any current protocol; a future protocol that embeds usage in a
+                        // terminator/keepalive frame MUST extract it here (the A-tap is skipped for
+                        // this frame, but its bytes are still re-emitted verbatim in same_proto mode).
+                        continue;
                     }
                     let Ok(data) = crate::json::parse_str::<serde_json::Value>(&data_str) else {
                         continue; // malformed data JSON — skip the frame rather than abort
@@ -5994,6 +6002,41 @@ mod stream_translate_tests {
         assert!(
             text.contains("error"),
             "an aborted stream's finish must emit a native error event, not a bare close; got: {text}"
+        );
+    }
+
+    /// REGRESSION (MED, Opus rc.7 audit / same-proto verbatim emit): on a SAME-PROTOCOL
+    /// bedrock→bedrock stream, a malformed prelude must NOT splice the cleared garbage tail into the
+    /// client stream ahead of the synthesized exception frame. The verbatim emit uses
+    /// `drain_frames_checked`'s VALID-consumed length, so only the complete valid frame(s) BEFORE the
+    /// malformed prelude are re-emitted; the cleared malformed remainder is discarded.
+    #[test]
+    fn same_proto_bedrock_malformed_prelude_emits_only_valid_frames_not_garbage() {
+        let mut st = StreamTranslate::new_same_proto("bedrock").expect("same-proto translator");
+        // One VALID bedrock eventstream frame, then a MALFORMED prelude (out-of-range total_len) with
+        // a distinctive garbage tail that must NEVER reach the client.
+        let valid =
+            crate::eventstream::encode_frame("contentBlockDelta", br#"{"delta":{"text":"hi"}}"#);
+        let mut bytes = valid.clone();
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes()); // total_len ~4 GiB — malformed prelude
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // headers_len
+        bytes.extend_from_slice(&[0, 0, 0, 0]); // prelude CRC (unchecked by the decoder)
+        bytes.extend_from_slice(b"GARBAGE-MUST-NOT-REACH-CLIENT");
+        let out = st.feed(&bytes);
+        assert_eq!(
+            out, valid,
+            "same-proto verbatim emit must forward ONLY the valid frame bytes, never the cleared \
+             malformed remainder"
+        );
+        assert!(
+            !out.windows(7).any(|w| w == b"GARBAGE"),
+            "the malformed garbage tail must NOT appear in the client stream"
+        );
+        assert!(st.aborted(), "a malformed prelude aborts the stream");
+        // finish() surfaces the native bedrock terminal exception frame (not a silent truncation).
+        assert!(
+            !st.finish().is_empty(),
+            "an aborted same-proto bedrock stream must emit a terminal exception frame"
         );
     }
 

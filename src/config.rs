@@ -847,6 +847,7 @@ pub(crate) struct DeployCfg {
 
 /// Operator-owned security controls (config.yaml `security:` block).
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SecurityCfg {
     /// Additional hosts/IPs APPENDED to the hardcoded cloud-metadata denylist. A provider `base_url`
     /// resolving to any of these is rejected at boot (unless carved out by an allow-override),
@@ -870,7 +871,11 @@ pub(crate) struct SecurityCfg {
 
 /// Governance config. When present + enabled, callers authenticate with virtual keys
 /// (not the static auth token) and are subject to per-key allowed-pools / budgets / rate limits.
+// deny_unknown_fields: a typo in a security-relevant governance key (e.g. `admin_tokn:`) must be a
+// loud startup error, not a silent default (which would leave the admin API unreachable / a budget
+// unset). Mirrors the same guard on AuthCfg.
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GovernanceCfg {
     #[serde(default)]
     pub(crate) enabled: bool,

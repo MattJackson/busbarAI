@@ -200,9 +200,8 @@ pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Resp
         return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            format!(
-                "invalid budget_period '{budget_period}': must be one of {VALID_BUDGET_PERIODS:?}"
-            ),
+            // Do NOT echo the caller-supplied value back in the error body (matches every other 400).
+            format!("invalid budget_period: must be one of {VALID_BUDGET_PERIODS:?}"),
         );
     }
     // Reject a negative budget at the ingress. `max_budget_cents` is a signed `i64` (the store column
