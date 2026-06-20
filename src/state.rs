@@ -26,10 +26,10 @@ pub(crate) struct Lane {
     /// Optional upstream request-path override. When set, used verbatim instead of the protocol's
     /// default path (for providers that embed the API version in base_url and serve /chat/completions).
     pub(crate) path: Option<String>,
-    /// Optional auth-style override. `Some("api-key")` sends an `api-key: <key>` header instead of
-    /// the protocol's native auth (used by Azure OpenAI). `None` / `Some("bearer")` use the
+    /// Optional auth-style override. `Some(ProviderAuth::ApiKey)` sends an `api-key: <key>` header
+    /// instead of the protocol's native auth (used by Azure OpenAI). `None` / `Some(Bearer)` use the
     /// protocol's `sign_request` (bearer, x-goog-api-key, or SigV4).
-    pub(crate) auth: Option<String>,
+    pub(crate) auth: Option<crate::config::ProviderAuth>,
     /// Optional active health-probe settings (from the provider's `health:` block). `None` or
     /// `mode: none` means no background probing for this lane.
     pub(crate) health: Option<crate::config::HealthCfg>,

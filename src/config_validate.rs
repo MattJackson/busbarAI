@@ -170,15 +170,8 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             }
         }
 
-        // Validate the optional auth-style override (fail loud on typos).
-        if let Some(auth) = &provider_cfg.auth {
-            if !matches!(auth.as_str(), "bearer" | "api-key") {
-                errors.push(format!(
-                    "provider '{}' has invalid auth '{}': must be 'bearer' (default) or 'api-key'",
-                    provider_name, auth
-                ));
-            }
-        }
+        // The optional auth-style override (`bearer` / `api-key`) is now a `ProviderAuth` enum, so an
+        // invalid spelling is rejected at deserialize time — no hand-check needed here.
 
         // The resolved base_url is the actual upstream target for signed (API-key-bearing) calls.
         // It is operator config (a client never chooses a provider URL — it picks a model NAME that
@@ -398,9 +391,9 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 }
                 // window_s is the sliding-window length; a 0 window holds no outcomes so the
                 // count is always below min_requests and the error-rate breaker never trips.
-                if trip.window_s == 0 {
+                if trip.window_secs == 0 {
                     errors.push(format!(
-                        "pool '{}' breaker trip.window_s must be >= 1 (got 0)",
+                        "pool '{}' breaker trip.window_secs must be >= 1 (got 0)",
                         pool_name
                     ));
                 }
@@ -418,9 +411,9 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     crate::config::BreakerTripMode::Consecutive => {
                         // n is the consecutive-failure streak length; n == 0 makes `streak >= 0`
                         // always true so the lane trips on every evaluation.
-                        if trip.n == 0 {
+                        if trip.consecutive_n == 0 {
                             errors.push(format!(
-                                "pool '{}' breaker trip.n must be >= 1 for consecutive mode (got 0)",
+                                "pool '{}' breaker trip.consecutive_n must be >= 1 for consecutive mode (got 0)",
                                 pool_name
                             ));
                         }
@@ -429,7 +422,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             }
         }
 
-        // Rule 6b: Validate the per-pool failover budget. `failover.deadline_secs == 0` is the exact
+        // Rule 6b: Validate the per-pool failover budget. `failover.timeout_secs == 0` is the exact
         // twin of the `max_concurrent: 0` / breaker `window_s: 0` foot-guns: `RequestCtx::new(0)` sets
         // `deadline = start.saturating_add(0) == start`, and the failover loop checks
         // `request_ctx.expired(now())` at the TOP of the very first (primary) iteration with
@@ -438,9 +431,9 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         // Reject it loudly here, mirroring the rest of validate()'s fail-loud invariant. (`cap == 0` is
         // benign: the `0..=cap` loop still runs the primary once, so it is NOT rejected.)
         if let Some(failover) = &pool_cfg.failover {
-            if failover.deadline_secs == 0 {
+            if failover.timeout_secs == 0 {
                 errors.push(format!(
-                    "pool '{}' failover.deadline_secs must be >= 1; a 0 budget rejects the primary attempt before it runs (every request 503s)",
+                    "pool '{}' failover.timeout_secs must be >= 1; a 0 budget rejects the primary attempt before it runs (every request 503s)",
                     pool_name
                 ));
             }
@@ -498,19 +491,8 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             }
         }
 
-        // Rule 8: `affinity.mode` is a free-form String defaulting to "session", and "session" is
-        // the only supported mode (route.rs's `affinity_header_for` falls back to the default
-        // header for anything else). An unrecognized mode (e.g. "sticky") is silently accepted and
-        // degrades to default behavior with no diagnostic — reject it to uphold the fail-loud
-        // invariant the rest of validate() enforces.
-        if let Some(affinity) = &pool_cfg.affinity {
-            if affinity.mode != "session" {
-                errors.push(format!(
-                    "pool '{}' affinity.mode '{}' is invalid: the only supported mode is 'session'",
-                    pool_name, affinity.mode
-                ));
-            }
-        }
+        // Rule 8: `affinity.mode` is now an `AffinityMode` enum (`session` is the only variant), so an
+        // unrecognized spelling is rejected at deserialize time — no hand-check needed here.
     }
 
     // Rule 7b: Multi-hop fallback cycle (A -> B -> A, or any longer ring). The per-pool self-ref
@@ -582,22 +564,16 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
-    // Rule 5: Validate the auth mode (otherwise AuthMiddleware::new would panic at startup).
+    // Rule 5: Validate auth-block semantics. `auth.mode` is now a parsed `AuthMode` enum (an invalid
+    // spelling fails at deserialize, so there is no longer an unknown-mode arm here). The legacy
+    // single-token `token:` field was removed in 1.0.0; `AuthCfg` is now `deny_unknown_fields`, so a
+    // stale `token:` key fails AT PARSE with serde's "unknown field `token`" — no validate-time check
+    // needed (and no silent credential drop).
     if let Some(auth) = &cfg.auth {
-        match crate::auth::AuthMode::from_config_str(&auth.mode) {
-            None => {
-                errors.push(format!(
-                    "auth.mode '{}' is invalid: must be '{}', '{}', or '{}'",
-                    auth.mode,
-                    crate::auth::AuthMode::TOKEN,
-                    crate::auth::AuthMode::PASSTHROUGH,
-                    crate::auth::AuthMode::NONE
-                ));
-            }
-            Some(crate::auth::AuthMode::Token) => {
+        match auth.mode {
+            crate::auth::AuthMode::Token => {
                 // Token mode with no client tokens rejects 100% of requests with no startup signal —
-                // the locked-out mirror of the loudly-warned open-relay (mode: none) case. `normalize()`
-                // promotes a single legacy `token:` into the allowlist, so account for it here too.
+                // the locked-out mirror of the loudly-warned open-relay (mode: none) case.
                 if effective_client_tokens_empty(auth) {
                     errors.push(
                         "auth.mode is 'token' but no client_tokens are configured; token mode requires at least one client token (otherwise every request is rejected)".to_string(),
@@ -619,7 +595,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             // lane will, and surface a prominent boot warning naming each offending provider. The
             // resolved `_legacy_api_key` is always None (config::resolve discards+warns on it), so
             // `api_key_env` is the only key source to check.
-            Some(crate::auth::AuthMode::Passthrough) => {
+            crate::auth::AuthMode::Passthrough => {
                 for (provider_name, provider_cfg) in &cfg.providers {
                     let resolved_key = std::env::var(&provider_cfg.api_key_env).unwrap_or_default();
                     if !resolved_key.trim().is_empty() {
@@ -639,7 +615,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     }
                 }
             }
-            Some(crate::auth::AuthMode::None) => {
+            crate::auth::AuthMode::None => {
                 // mode=none is an open relay: `validate_token` admits every request unconditionally,
                 // so a configured `client_tokens` allowlist has ZERO enforcement effect. An operator
                 // who set BOTH `mode: none` and a `client_tokens` list believes the list constrains
@@ -819,12 +795,7 @@ pub(crate) fn validate_governance(
             "governance.enabled is true but no governance.admin_token is configured; the /admin management API is unreachable (every admin call returns 401). Set governance.admin_token (e.g. admin_token: ${BUSBAR_ADMIN_TOKEN})".to_string(),
         );
     }
-    if governance.enabled
-        && auth.is_some_and(|a| {
-            crate::auth::AuthMode::from_config_str(&a.mode)
-                == Some(crate::auth::AuthMode::Passthrough)
-        })
-    {
+    if governance.enabled && auth.is_some_and(|a| a.mode == crate::auth::AuthMode::Passthrough) {
         errors.push(
             "governance.enabled is true together with auth.mode=passthrough; governance supersedes passthrough (every request must resolve to an enabled virtual key), so passthrough's accept-and-forward-caller-credential semantics are NOT honoured and every caller without a virtual key is silently rejected. This combination is unsupported; set auth.mode=token (or omit the auth block) alongside governance.".to_string(),
         );
@@ -864,12 +835,11 @@ fn resolve_fallback_target(cfg: &RootCfg, pool_name: &str) -> Option<String> {
     }
 }
 
-/// True when an `AuthCfg` would resolve to an empty client-token allowlist after `normalize()`.
-/// `normalize()` promotes a single legacy `token:` into the allowlist only when `client_tokens`
-/// is empty, so the effective set is empty iff `client_tokens` is empty AND no legacy token is set.
-#[allow(deprecated)] // intentionally reading the deprecated legacy-token field to mirror normalize()
+/// True when an `AuthCfg` resolves to an empty client-token allowlist. As of 1.0.0 the legacy
+/// `token:` field was removed (setting it is now a hard parse error via `deny_unknown_fields`), so
+/// the effective set is empty iff `client_tokens` is empty.
 fn effective_client_tokens_empty(auth: &crate::config::AuthCfg) -> bool {
-    auth.client_tokens.is_empty() && auth._legacy_token.is_none()
+    auth.client_tokens.is_empty()
 }
 
 /// Return `Some(host)` if the given `https://` URL points at an SSRF-sensitive target (loopback,
@@ -1437,25 +1407,21 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_bad_auth_style() {
-        let mut providers = HashMap::new();
-        let mut p = make_provider("openai", "https://api.example.com", "API_KEY");
-        p.auth = Some("oauth2".into()); // not a recognized auth style
-        providers.insert("bad".to_string(), p);
-        // A valid 'api-key' provider must NOT trigger an error.
-        let mut ok = make_provider("openai", "https://res.openai.azure.com", "AZ_KEY");
-        ok.auth = Some("api-key".into());
-        providers.insert("good".to_string(), ok);
-
-        let cfg = make_root_cfg(providers, HashMap::new(), HashMap::new());
-        let errs = validate(&cfg).expect_err("bad auth must fail validation");
-        assert!(
-            errs.iter().any(|e| e.contains("invalid auth 'oauth2'")),
-            "expected an invalid-auth error for 'oauth2'; got: {errs:?}"
+    fn test_provider_auth_style_is_a_closed_enum() {
+        // The per-provider auth-style override is a `ProviderAuth` enum, so an unrecognized spelling
+        // is rejected at DESERIALIZE time (no hand-check in validate()). The two accepted wire strings
+        // ('bearer' / 'api-key') are unchanged from the pre-enum `Option<String>` field.
+        assert_eq!(
+            serde_yaml::from_str::<config::ProviderAuth>("bearer").unwrap(),
+            config::ProviderAuth::Bearer
+        );
+        assert_eq!(
+            serde_yaml::from_str::<config::ProviderAuth>("api-key").unwrap(),
+            config::ProviderAuth::ApiKey
         );
         assert!(
-            !errs.iter().any(|e| e.contains("invalid auth 'api-key'")),
-            "'api-key' is a valid auth style and must not error; got: {errs:?}"
+            serde_yaml::from_str::<config::ProviderAuth>("oauth2").is_err(),
+            "'oauth2' is not a recognized provider auth style and must fail to deserialize"
         );
     }
 
@@ -1857,11 +1823,10 @@ mod tests {
         assert!(errs[0].contains("references unknown provider"));
     }
 
-    #[allow(deprecated)] // exercising the deprecated legacy-token field on purpose
-    fn make_auth(mode: &str, client_tokens: Vec<&str>, legacy: Option<&str>) -> config::AuthCfg {
+    fn make_auth(mode: &str, client_tokens: Vec<&str>) -> config::AuthCfg {
         config::AuthCfg {
-            mode: mode.into(),
-            _legacy_token: legacy.map(|s| s.to_string()),
+            mode: crate::auth::AuthMode::from_config_str(mode)
+                .unwrap_or_else(|| panic!("invalid auth mode in test: {mode}")),
             client_tokens: client_tokens.into_iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -1880,17 +1845,17 @@ mod tests {
 
     fn make_trip(
         mode: config::BreakerTripMode,
-        window_s: u64,
+        window_secs: u64,
         threshold: f64,
         min_requests: usize,
-        n: u32,
+        consecutive_n: u32,
     ) -> config::BreakerTripConfig {
         config::BreakerTripConfig {
             mode,
-            window_s,
+            window_secs,
             threshold,
             min_requests,
-            n,
+            consecutive_n,
         }
     }
 
@@ -2185,7 +2150,7 @@ mod tests {
                     120,
                     Some(make_trip(config::BreakerTripMode::ErrorRate, 0, 0.5, 5, 3)),
                 ),
-                "trip.window_s must be >= 1",
+                "trip.window_secs must be >= 1",
             ),
             (
                 "threshold > 1.0",
@@ -2218,7 +2183,7 @@ mod tests {
                         0,
                     )),
                 ),
-                "trip.n must be >= 1",
+                "trip.consecutive_n must be >= 1",
             ),
             (
                 "max_cooldown < base_cooldown",
@@ -2344,16 +2309,16 @@ mod tests {
         let mut pools = HashMap::new();
         let mut pool = make_pool(vec![make_member("mymodel")]);
         pool.failover = Some(config::FailoverCfg {
-            deadline_secs: 0,
+            timeout_secs: 0,
             exclusions: None,
-            cap: 3,
+            max_hops: 3,
         });
         pools.insert("mypool".to_string(), pool);
         let cfg = make_root_cfg(providers, models, pools);
-        let errs = validate(&cfg).expect_err("failover.deadline_secs: 0 must fail validation");
+        let errs = validate(&cfg).expect_err("failover.timeout_secs: 0 must fail validation");
         assert!(
             errs.iter()
-                .any(|e| e.contains("failover.deadline_secs must be >= 1") && e.contains("mypool")),
+                .any(|e| e.contains("failover.timeout_secs must be >= 1") && e.contains("mypool")),
             "expected a zero-failover-deadline error for 'mypool'; got: {errs:?}"
         );
     }
@@ -2366,15 +2331,15 @@ mod tests {
         let mut pools = HashMap::new();
         let mut pool = make_pool(vec![make_member("mymodel")]);
         pool.failover = Some(config::FailoverCfg {
-            deadline_secs: 30,
+            timeout_secs: 30,
             exclusions: None,
-            cap: 0,
+            max_hops: 0,
         });
         pools.insert("mypool".to_string(), pool);
         let cfg = make_root_cfg(providers, models, pools);
         assert!(
             validate(&cfg).is_ok(),
-            "a positive failover.deadline_secs with cap:0 must validate"
+            "a positive failover.timeout_secs with max_hops:0 must validate"
         );
     }
 
@@ -2388,9 +2353,9 @@ mod tests {
         let mut pools = HashMap::new();
         let mut pool = make_pool(vec![make_member("mymodel")]);
         pool.failover = Some(config::FailoverCfg {
-            deadline_secs: 30,
+            timeout_secs: 30,
             exclusions: Some(vec!["mymodell".to_string()]), // typo: pool member is `mymodel`
-            cap: 3,
+            max_hops: 3,
         });
         pools.insert("mypool".to_string(), pool);
         let cfg = make_root_cfg(providers, models, pools);
@@ -2416,9 +2381,9 @@ mod tests {
         let mut pools = HashMap::new();
         let mut pool = make_pool(vec![make_member("mymodel"), make_member("secondmodel")]);
         pool.failover = Some(config::FailoverCfg {
-            deadline_secs: 30,
+            timeout_secs: 30,
             exclusions: Some(vec!["secondmodel".to_string()]), // a real member — benched on purpose
-            cap: 3,
+            max_hops: 3,
         });
         pools.insert("mypool".to_string(), pool);
         let cfg = make_root_cfg(providers, models, pools);
@@ -2538,11 +2503,10 @@ mod tests {
         );
     }
 
-    #[allow(deprecated)] // constructing AuthCfg with the legacy `_legacy_token` field in test
     fn auth_cfg(mode: &str) -> config::AuthCfg {
         config::AuthCfg {
-            mode: mode.to_string(),
-            _legacy_token: None,
+            mode: crate::auth::AuthMode::from_config_str(mode)
+                .unwrap_or_else(|| panic!("invalid auth mode in test: {mode}")),
             client_tokens: vec![],
         }
     }
@@ -2621,7 +2585,7 @@ mod tests {
     fn test_validate_rejects_token_mode_with_no_tokens() {
         let (providers, models, pools) = valid_maps();
         let mut cfg = make_root_cfg(providers, models, pools);
-        cfg.auth = Some(make_auth("token", vec![], None));
+        cfg.auth = Some(make_auth("token", vec![]));
         let errs = validate(&cfg).expect_err("token mode with no tokens must fail validation");
         assert!(
             errs.iter()
@@ -2632,19 +2596,50 @@ mod tests {
 
     #[test]
     fn test_validate_token_mode_with_tokens_ok() {
-        // Both the allowlist form and the legacy single-token form satisfy the requirement.
-        for auth in [
-            make_auth("token", vec!["secret"], None),
-            make_auth("token", vec![], Some("legacy-secret")),
-        ] {
-            let (providers, models, pools) = valid_maps();
-            let mut cfg = make_root_cfg(providers, models, pools);
-            cfg.auth = Some(auth);
-            assert!(
-                validate(&cfg).is_ok(),
-                "token mode with at least one token must validate"
-            );
-        }
+        // The allowlist form satisfies the requirement (the legacy single-token form was removed in
+        // 1.0.0; see `test_legacy_token_is_rejected_at_parse`).
+        let (providers, models, pools) = valid_maps();
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.auth = Some(make_auth("token", vec!["secret"]));
+        assert!(
+            validate(&cfg).is_ok(),
+            "token mode with at least one client token must validate"
+        );
+    }
+
+    #[test]
+    fn test_legacy_token_is_rejected_at_parse() {
+        // 1.0.0 MIGRATION: the legacy single-token `token:` field was REMOVED. `AuthCfg` is now
+        // `#[serde(deny_unknown_fields)]`, so a full config that still sets `auth.token` is REJECTED
+        // AT PARSE (the config-LOAD entry point) with serde's "unknown field `token`" — never a
+        // silent credential drop and never a deferred validate-time check. This is the load-level
+        // companion to `config::tests::test_legacy_token_key_is_rejected_at_parse`.
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+auth:
+  mode: token
+  token: "stale-legacy-secret"
+  client_tokens: ["real-secret"]
+providers:
+  anthropic:
+    api_key_env: ANTHROPIC_KEY
+models:
+  claude:
+    provider: anthropic
+    max_concurrent: 10
+"#;
+        let err = serde_yaml::from_str::<crate::config::DeployCfg>(yaml)
+            .expect_err("a config setting the removed `token` field must fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field") && msg.contains("token"),
+            "expected serde's unknown-field error naming `token` at parse; got: {msg}"
+        );
+        // The rejected secret value is NEVER echoed back in the parse error.
+        assert!(
+            !msg.contains("stale-legacy-secret"),
+            "the parse error must not leak the configured token value; got: {msg}"
+        );
     }
 
     /// A `tracing::Layer` that records the messages of WARN-level events it sees, so a test can
@@ -2715,7 +2710,7 @@ mod tests {
         models.insert("leakymodel".to_string(), make_model("leaky", 10));
         models.insert("bedrockmodel".to_string(), make_model("bedrock", 10));
         let mut cfg = make_root_cfg(providers, models, HashMap::new());
-        cfg.auth = Some(make_auth("passthrough", vec![], None));
+        cfg.auth = Some(make_auth("passthrough", vec![]));
 
         let cap = WarnCapture::default();
         let subscriber = tracing_subscriber::registry().with(cap.clone());
@@ -2763,7 +2758,7 @@ mod tests {
         let mut models = HashMap::new();
         models.insert("m".to_string(), make_model("p", 10));
         let mut cfg = make_root_cfg(providers, models, HashMap::new());
-        cfg.auth = Some(make_auth("passthrough", vec![], None));
+        cfg.auth = Some(make_auth("passthrough", vec![]));
 
         let cap = WarnCapture::default();
         let subscriber = tracing_subscriber::registry().with(cap.clone());
@@ -2781,7 +2776,7 @@ mod tests {
     fn test_validate_none_mode_with_no_tokens_ok() {
         let (providers, models, pools) = valid_maps();
         let mut cfg = make_root_cfg(providers, models, pools);
-        cfg.auth = Some(make_auth("none", vec![], None));
+        cfg.auth = Some(make_auth("none", vec![]));
         assert!(
             validate(&cfg).is_ok(),
             "mode 'none' carries no token requirement"
@@ -3524,21 +3519,17 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_bad_affinity_mode() {
-        let (providers, models, _) = valid_maps();
-        let mut pools = HashMap::new();
-        let mut pool = make_pool(vec![make_member("mymodel")]);
-        pool.affinity = Some(config::AffinityCfg {
-            mode: "sticky".to_string(),
-            header_name: None,
-        });
-        pools.insert("mypool".to_string(), pool);
-        let cfg = make_root_cfg(providers, models, pools);
-        let errs = validate(&cfg).expect_err("an unsupported affinity.mode must fail validation");
+    fn test_affinity_mode_is_a_closed_enum() {
+        // `affinity.mode` is now an `AffinityMode` enum, so an unrecognized spelling ('sticky') is
+        // rejected at DESERIALIZE time rather than by a hand-check in validate(). The one accepted
+        // wire string ('session') is unchanged from the pre-enum `String` field.
+        assert_eq!(
+            serde_yaml::from_str::<config::AffinityMode>("session").unwrap(),
+            config::AffinityMode::Session
+        );
         assert!(
-            errs.iter()
-                .any(|e| e.contains("affinity.mode 'sticky' is invalid")),
-            "expected an invalid affinity-mode error; got: {errs:?}"
+            serde_yaml::from_str::<config::AffinityMode>("sticky").is_err(),
+            "'sticky' is not a supported affinity mode and must fail to deserialize"
         );
     }
 
@@ -3548,7 +3539,7 @@ mod tests {
         let mut pools = HashMap::new();
         let mut pool = make_pool(vec![make_member("mymodel")]);
         pool.affinity = Some(config::AffinityCfg {
-            mode: "session".to_string(),
+            mode: config::AffinityMode::Session,
             header_name: Some("x-session-id".to_string()),
         });
         pools.insert("mypool".to_string(), pool);

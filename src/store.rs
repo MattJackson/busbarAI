@@ -118,21 +118,11 @@ pub(crate) enum BreakerState {
     HalfOpen,
 }
 
-/// Permit wrapper that holds an owned semaphore permit.
-/// Must be Send + 'static and movable into FirstByteBody stream.
-#[must_use]
-pub(crate) struct Permit {
-    // RAII guard: never read — held solely to keep the concurrency slot reserved for this request's
-    // lifetime; the slot is returned to the semaphore when the Permit (and this field) is dropped.
-    #[allow(dead_code)]
-    inner: tokio::sync::OwnedSemaphorePermit,
-}
-
-impl Permit {
-    pub(crate) fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
-        Self { inner: permit }
-    }
-}
+/// RAII concurrency permit: an owned semaphore permit, held solely to keep the lane's concurrency
+/// slot reserved for this request's lifetime. The slot is returned to the semaphore when the permit
+/// is dropped. `OwnedSemaphorePermit` is already `Send + 'static` and itself `#[must_use]`, so it is
+/// moved into the `FirstByteBody` stream directly with no wrapper.
+pub(crate) type Permit = tokio::sync::OwnedSemaphorePermit;
 
 /// Snapshot of lane stats for /stats endpoint.
 #[derive(Debug, Clone)]
@@ -1519,10 +1509,10 @@ impl From<&crate::config::BreakerCfg> for BreakerCfg {
                     crate::config::BreakerTripMode::ErrorRate => TripMode::ErrorRate,
                     crate::config::BreakerTripMode::Consecutive => TripMode::Consecutive,
                 },
-                window_s: t.window_s,
+                window_s: t.window_secs,
                 threshold: t.threshold,
                 min_requests: t.min_requests,
-                consecutive_n: t.n,
+                consecutive_n: t.consecutive_n,
             })
             .unwrap_or_default();
         Self {
@@ -2234,10 +2224,7 @@ impl StateStore for InMemoryStore {
 
     fn try_acquire(&self, lane: usize) -> Option<Permit> {
         let ls = self.get_lane(lane);
-        match ls.sem.clone().try_acquire_owned() {
-            Ok(permit) => Some(Permit::new(permit)),
-            Err(_) => None,
-        }
+        ls.sem.clone().try_acquire_owned().ok()
     }
 
     fn lane_semaphore(&self, lane: usize) -> Arc<Semaphore> {
@@ -3469,10 +3456,10 @@ mod tests {
             max_cooldown_secs: 99,
             trip: Some(crate::config::BreakerTripConfig {
                 mode: crate::config::BreakerTripMode::Consecutive,
-                window_s: 42,
+                window_secs: 42,
                 threshold: 0.8,
                 min_requests: 9,
-                n: 4,
+                consecutive_n: 4,
             }),
         };
         let rcfg = BreakerCfg::from(&ccfg);

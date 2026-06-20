@@ -51,18 +51,28 @@ impl AuthMode {
             _ => None,
         }
     }
+}
 
-    /// The canonical config/wire spelling of this mode — the exact inverse of `from_config_str`
-    /// (`from_config_str(m.as_config_str()) == Some(m)` for every variant). Lets callers build an
-    /// `AuthCfg` from a mode without hardcoding the strings. Currently only the test harness needs it
-    /// (to build a mode-carrying `AuthMiddleware`); gated `#[cfg(test)]` so it isn't dead in release.
-    #[cfg(test)]
-    pub(crate) fn as_config_str(self) -> &'static str {
-        match self {
-            AuthMode::Token => Self::TOKEN,
-            AuthMode::Passthrough => Self::PASSTHROUGH,
-            AuthMode::None => Self::NONE,
-        }
+// Deserialize `auth.mode` through `from_config_str` so the accepted wire strings are UNCHANGED from
+// the pre-enum (String) field: case-insensitive and whitespace-trimmed (`"  PassThrough "`, `"NONE"`
+// all parse), with a friendly error naming the valid values for an unknown spelling. A derived
+// `#[serde(rename_all = "snake_case")]` impl would be a strict, case-sensitive subset and would
+// reject configs that loaded before 1.0, so the mapping is done by hand here.
+impl<'de> serde::Deserialize<'de> for AuthMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        AuthMode::from_config_str(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "auth.mode '{}' is invalid: must be '{}', '{}', or '{}'",
+                s,
+                AuthMode::TOKEN,
+                AuthMode::PASSTHROUGH,
+                AuthMode::NONE
+            ))
+        })
     }
 }
 
@@ -112,17 +122,9 @@ impl fmt::Debug for AuthMiddleware {
 
 impl AuthMiddleware {
     pub(crate) fn new(cfg: &AuthCfg) -> Self {
-        // Config is validated before this point (see config_validate), so an unknown mode here is a
-        // programming error rather than user error.
-        let mode = AuthMode::from_config_str(&cfg.mode).unwrap_or_else(|| {
-            panic!(
-                "invalid auth mode '{}': must be '{}', '{}', or '{}'",
-                cfg.mode,
-                AuthMode::TOKEN,
-                AuthMode::PASSTHROUGH,
-                AuthMode::NONE
-            )
-        });
+        // `cfg.mode` is already a parsed `AuthMode` (the config field deserializes through
+        // `from_config_str`, so an invalid spelling fails at load, not here).
+        let mode = cfg.mode;
 
         // client_tokens are already env-interpolated: `interpolate_env` runs over the WHOLE
         // config.yaml text once at load (main.rs), before deserialization. A second per-token pass
@@ -840,7 +842,6 @@ fn verify_bedrock_sigv4(
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // allow deprecated field access in tests
 mod tests {
     use super::*;
     use axum::http::header::CONTENT_TYPE;
@@ -945,9 +946,8 @@ mod tests {
     #[test]
     fn test_auth_mode_token_valid() {
         let cfg = AuthCfg {
-            mode: "token".to_string(),
+            mode: crate::auth::AuthMode::Token,
             client_tokens: vec!["tok1".to_string(), "tok2".to_string()],
-            _legacy_token: None, // deprecated but needed for tests
         };
         let mw = AuthMiddleware::new(&cfg);
 
@@ -964,13 +964,12 @@ mod tests {
         // configured token (bitwise-OR fold, no `.any()` short-circuit). Behaviorally this means a
         // match is found regardless of the token's ordinal position — first, middle, or last.
         let cfg = AuthCfg {
-            mode: "token".to_string(),
+            mode: crate::auth::AuthMode::Token,
             client_tokens: vec![
                 "first-token".to_string(),
                 "middle-token".to_string(),
                 "last-token".to_string(),
             ],
-            _legacy_token: None,
         };
         let mw = AuthMiddleware::new(&cfg);
         assert!(mw.validate_token(Some("first-token")), "match at index 0");
@@ -982,9 +981,8 @@ mod tests {
     #[test]
     fn test_auth_mode_passthrough() {
         let cfg = AuthCfg {
-            mode: "passthrough".to_string(),
+            mode: crate::auth::AuthMode::Passthrough,
             client_tokens: vec![],
-            _legacy_token: None, // deprecated but needed for tests
         };
         let mw = AuthMiddleware::new(&cfg);
 
@@ -996,9 +994,8 @@ mod tests {
     #[test]
     fn test_auth_mode_none() {
         let cfg = AuthCfg {
-            mode: "none".to_string(),
+            mode: crate::auth::AuthMode::None,
             client_tokens: vec![],
-            _legacy_token: None, // deprecated but needed for tests
         };
         let mw = AuthMiddleware::new(&cfg);
 
@@ -1015,9 +1012,8 @@ mod tests {
         // request (including a token NOT in the list, and no token at all), proving the allowlist is
         // inert. (A startup warning is emitted but is not asserted here — behaviour is the contract.)
         let cfg = AuthCfg {
-            mode: "none".to_string(),
+            mode: crate::auth::AuthMode::None,
             client_tokens: vec!["listed-but-ignored".to_string()],
-            _legacy_token: None,
         };
         let mw = AuthMiddleware::new(&cfg);
         assert_eq!(mw.client_tokens, vec!["listed-but-ignored".to_string()]);
@@ -1028,15 +1024,23 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_mode_invalid() {
-        let cfg = AuthCfg {
-            mode: "invalid".to_string(),
-            client_tokens: vec![],
-            _legacy_token: None, // deprecated but needed for tests
-        };
-
-        // Should panic on invalid mode
-        assert!(std::panic::catch_unwind(|| AuthMiddleware::new(&cfg)).is_err());
+    fn test_auth_mode_invalid_is_rejected_at_deserialize() {
+        // `auth.mode` is now an `AuthMode` enum that deserializes through `from_config_str`, so an
+        // invalid spelling is rejected at config LOAD (where the boundary moved to) rather than
+        // panicking later in `AuthMiddleware::new`. The accepted spellings are unchanged.
+        assert!(
+            serde_yaml::from_str::<AuthMode>("invalid").is_err(),
+            "an unrecognized auth mode must fail to deserialize"
+        );
+        // The pre-enum case-insensitive/trimmed acceptance is preserved.
+        assert_eq!(
+            serde_yaml::from_str::<AuthMode>("  PassThrough ").unwrap(),
+            AuthMode::Passthrough
+        );
+        assert_eq!(
+            serde_yaml::from_str::<AuthMode>("NONE").unwrap(),
+            AuthMode::None
+        );
     }
 
     #[test]
@@ -1047,9 +1051,8 @@ mod tests {
         // on an unset var). Regression for the dropped second interpolation pass.
         let raw = "sk-${NOT_A_REAL_ENV_VAR}-suffix";
         let cfg = AuthCfg {
-            mode: "token".to_string(),
+            mode: crate::auth::AuthMode::Token,
             client_tokens: vec![raw.to_string()],
-            _legacy_token: None,
         };
         // Must not panic even though NOT_A_REAL_ENV_VAR is unset.
         let mw = AuthMiddleware::new(&cfg);
@@ -1550,9 +1553,8 @@ mod tests {
         let server = MockServer::new(state).await;
 
         let auth_cfg = crate::config::AuthCfg {
-            mode: "token".to_string(),
+            mode: crate::auth::AuthMode::Token,
             client_tokens: vec![token.to_string()],
-            _legacy_token: None,
         };
         let app = TestApp::new()
             .lane(
@@ -1682,9 +1684,8 @@ mod tests {
         let server = MockServer::new(state).await;
 
         let auth_cfg = crate::config::AuthCfg {
-            mode: "token".to_string(),
+            mode: crate::auth::AuthMode::Token,
             client_tokens: vec!["the-real-token".to_string()],
-            _legacy_token: None,
         };
         let app = TestApp::new()
             .lane(
@@ -1786,9 +1787,8 @@ mod tests {
         let server = MockServer::new(state).await;
 
         let auth_cfg = crate::config::AuthCfg {
-            mode: "token".to_string(),
+            mode: crate::auth::AuthMode::Token,
             client_tokens: vec!["the-real-token".to_string()],
-            _legacy_token: None,
         };
         let app = TestApp::new()
             .lane(
@@ -1873,9 +1873,8 @@ mod tests {
         let server = MockServer::new(state).await;
 
         let auth_cfg = crate::config::AuthCfg {
-            mode: "token".to_string(),
+            mode: crate::auth::AuthMode::Token,
             client_tokens: vec!["the-real-token".to_string()],
-            _legacy_token: None,
         };
         let app = TestApp::new()
             .lane(
@@ -1955,9 +1954,8 @@ mod tests {
         let server = MockServer::new(state).await;
 
         let auth_cfg = crate::config::AuthCfg {
-            mode: "token".to_string(),
+            mode: crate::auth::AuthMode::Token,
             client_tokens: vec!["the-real-token".to_string()],
-            _legacy_token: None,
         };
         let app = TestApp::new()
             .lane(
@@ -2453,9 +2451,8 @@ mod tests {
                 // auth.mode=token WITH a non-empty static allowlist — the inert combination. The
                 // listed static token is NOT the governance virtual key.
                 let auth_cfg = crate::config::AuthCfg {
-                    mode: AuthMode::Token.as_config_str().to_string(),
+                    mode: AuthMode::Token,
                     client_tokens: vec!["static-allowlisted-but-inert".to_string()],
-                    _legacy_token: None,
                 };
 
                 let app = TestApp::new()
@@ -2991,9 +2988,8 @@ mod tests {
         let secret_a = "sk-super-secret-token-AAAA";
         let secret_b = "sk-super-secret-token-BBBB";
         let cfg = AuthCfg {
-            mode: "token".to_string(),
+            mode: crate::auth::AuthMode::Token,
             client_tokens: vec![secret_a.to_string(), secret_b.to_string()],
-            _legacy_token: None,
         };
         let mw = AuthMiddleware::new(&cfg);
         let dbg = format!("{mw:?}");

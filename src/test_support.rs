@@ -571,7 +571,11 @@ impl LaneSpec {
             error_map: std::sync::Arc::new(self.error_map.clone()),
             context_max: self.context_max,
             path: self.path.clone(),
-            auth: self.auth.clone(),
+            auth: self.auth.as_deref().map(|a| match a {
+                "api-key" => crate::config::ProviderAuth::ApiKey,
+                "bearer" => crate::config::ProviderAuth::Bearer,
+                other => panic!("unexpected test auth style in LaneSpec: {other}"),
+            }),
             health: self.health.clone(),
             default_max_tokens: self.default_max_tokens,
         }
@@ -641,9 +645,9 @@ impl TestApp {
     /// is last-wins.
     pub(crate) fn auth_mode(mut self, m: crate::auth::AuthMode) -> Self {
         // Struct-update from `default_none()` (mode none, empty client_tokens) so we only override
-        // `mode` and never name the deprecated `_legacy_token` field.
+        // `mode` and stay forward-compatible with any future `AuthCfg` field.
         let cfg = crate::config::AuthCfg {
-            mode: m.as_config_str().to_string(),
+            mode: m,
             ..crate::config::AuthCfg::default_none()
         };
         self.auth = Some(std::sync::Arc::new(crate::auth::AuthMiddleware::new(&cfg)));
@@ -711,7 +715,6 @@ fn weighted(members: &[(usize, u32)]) -> Vec<crate::state::WeightedLane> {
         .collect()
 }
 
-#[allow(deprecated)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,9 +1265,9 @@ mod tests {
                 crate::state::PoolRuntime {
                     members: Default::default(),
                     failover: Some(crate::config::FailoverCfg {
-                        deadline_secs: 120,
+                        timeout_secs: 120,
                         exclusions: Some(vec!["beta".to_string()]),
-                        cap: 3,
+                        max_hops: 3,
                     }),
                     affinity: None,
                     breaker: None,
@@ -1370,9 +1373,8 @@ mod tests {
 
         let token = "sk-metrics-scrape";
         let auth_cfg = crate::config::AuthCfg {
-            mode: "token".to_string(),
+            mode: crate::auth::AuthMode::Token,
             client_tokens: vec![token.to_string()],
-            _legacy_token: None,
         };
         let app = TestApp::new()
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
@@ -2528,9 +2530,8 @@ mod tests {
 
         // Scenario A: Passthrough mode — lane should NOT be tripped
         let auth_cfg_passthrough = AuthCfg {
-            mode: "passthrough".to_string(),
+            mode: crate::auth::AuthMode::Passthrough,
             client_tokens: vec![],
-            _legacy_token: None,
         };
         let app_passthrough = TestApp::new()
             .lane(
@@ -2585,9 +2586,8 @@ mod tests {
         });
 
         let auth_cfg_token = AuthCfg {
-            mode: "token".to_string(),
+            mode: crate::auth::AuthMode::Token,
             client_tokens: vec!["caller-token-123".to_string()],
-            _legacy_token: None,
         };
         let app_token = TestApp::new()
             .lane(
@@ -2691,9 +2691,8 @@ mod tests {
         let server = MockServer::new(state.clone()).await;
 
         let auth_cfg_passthrough = AuthCfg {
-            mode: "passthrough".to_string(),
+            mode: crate::auth::AuthMode::Passthrough,
             client_tokens: vec![],
-            _legacy_token: None,
         };
         let app = TestApp::new()
             .lane(
@@ -2912,9 +2911,9 @@ mod tests {
             ))
             .pool("default", &[(0, 1), (1, 1)])
             .failover(crate::config::FailoverCfg {
-                deadline_secs: 120,
+                timeout_secs: 120,
                 exclusions: None,
-                cap: 3,
+                max_hops: 3,
             })
             .build();
 
@@ -5876,8 +5875,8 @@ mod tests {
             .pool("default", &[(0, 1)])
             // 1s failover deadline so the test is fast but still exercises the bounded wait.
             .failover(crate::config::FailoverCfg {
-                deadline_secs: 1,
-                cap: 0,
+                timeout_secs: 1,
+                max_hops: 0,
                 exclusions: None,
             })
             .build();

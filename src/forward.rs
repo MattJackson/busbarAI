@@ -1866,7 +1866,7 @@ async fn pick_among(
         {
             // Got a permit before the deadline — this is a genuine dispatch; keep the probe (the
             // request itself will record the success/failure that releases it).
-            Ok(Ok(permit)) => return Some((picked_lane_idx, Permit::new(permit))),
+            Ok(Ok(permit)) => return Some((picked_lane_idx, permit)),
             // Semaphore closed (shutdown) — no request dispatched; release the probe before bailing.
             Ok(Err(_)) => {
                 app.store.release_probe_in(pool_name, picked_lane_idx);
@@ -1989,8 +1989,8 @@ pub(crate) fn lane_auth_headers(
     key: &str,
     ctx: &crate::proto::SigningContext,
 ) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
-    match lane.auth.as_deref() {
-        Some("api-key") => match axum::http::HeaderValue::from_str(key) {
+    match lane.auth {
+        Some(crate::config::ProviderAuth::ApiKey) => match axum::http::HeaderValue::from_str(key) {
             Ok(v) => vec![(axum::http::HeaderName::from_static("api-key"), v)],
             Err(_) => Vec::new(),
         },
@@ -2486,7 +2486,7 @@ pub(crate) async fn forward_with_pool_parsed(
         .and_then(|r| r.failover.as_ref())
         .or(app.failover_cfg.as_ref());
     let (deadline_secs, max_cap) = match pool_failover {
-        Some(f) => (f.deadline_secs, f.cap),
+        Some(f) => (f.timeout_secs, f.max_hops),
         None => (
             crate::config::DEFAULT_FAILOVER_DEADLINE_SECS,
             crate::config::DEFAULT_FAILOVER_CAP,
@@ -5293,7 +5293,11 @@ mod auth_style_tests {
             path: Some(
                 "/openai/deployments/gpt-4o/chat/completions?api-version=2024-06-01".to_string(),
             ),
-            auth: auth.map(String::from),
+            auth: auth.map(|a| match a {
+                "api-key" => crate::config::ProviderAuth::ApiKey,
+                "bearer" => crate::config::ProviderAuth::Bearer,
+                other => panic!("unexpected test auth style: {other}"),
+            }),
             health: None,
         }
     }
@@ -5442,6 +5446,82 @@ mod auth_style_tests {
             url.path(),
             signed_canonical,
             "transmitted path must equal the signed canonical path"
+        );
+    }
+}
+
+#[cfg(test)]
+mod max_tokens_precedence_tests {
+    use super::apply_required_max_tokens;
+    use crate::ir::IrRequest;
+    use crate::proto::Protocol;
+    use crate::state::Lane;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // An Anthropic lane (its writer `requires_max_tokens()` is true) with a given per-model default.
+    fn anthropic_lane(default_max_tokens: Option<u32>) -> Lane {
+        Lane {
+            default_max_tokens,
+            model: "claude".to_string(),
+            provider: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "k".to_string(),
+            protocol: Arc::new(Protocol::anthropic()),
+            max: 1,
+            error_map: Arc::new(HashMap::new()),
+            context_max: None,
+            path: None,
+            auth: None,
+            health: None,
+        }
+    }
+
+    /// `default_max_tokens` resolution precedence on the translation seam (only fires when the source
+    /// omitted `max_tokens` AND the egress protocol REQUIRES it): per-model lane default wins → else
+    /// the global `limits.default_max_tokens` (the `global` arg) → else the historical 4096 (which is
+    /// just the value the global itself defaults to). This pins all three rungs.
+    #[test]
+    fn per_model_then_global_then_4096() {
+        let global = 8192; // a non-4096 global to prove it is consulted distinctly.
+
+        // 1. Per-model set → per-model wins over the global.
+        let mut ir = IrRequest::default();
+        apply_required_max_tokens(&mut ir, &anthropic_lane(Some(1234)), global);
+        assert_eq!(ir.max_tokens, Some(1234), "per-model default must win");
+
+        // 2. Per-model unset → fall back to the global.
+        let mut ir = IrRequest::default();
+        apply_required_max_tokens(&mut ir, &anthropic_lane(None), global);
+        assert_eq!(
+            ir.max_tokens,
+            Some(global),
+            "with no per-model default, the global limit must be used"
+        );
+
+        // 3. Per-model unset AND global left at its historical default → 4096.
+        let mut ir = IrRequest::default();
+        apply_required_max_tokens(
+            &mut ir,
+            &anthropic_lane(None),
+            crate::proto::DEFAULT_MAX_TOKENS,
+        );
+        assert_eq!(
+            ir.max_tokens,
+            Some(4096),
+            "with neither per-model nor a custom global, the 4096 fallback must be used"
+        );
+
+        // 4. A caller-supplied value is NEVER overridden by any default.
+        let mut ir = IrRequest {
+            max_tokens: Some(7),
+            ..IrRequest::default()
+        };
+        apply_required_max_tokens(&mut ir, &anthropic_lane(Some(1234)), global);
+        assert_eq!(
+            ir.max_tokens,
+            Some(7),
+            "an explicit caller max_tokens must be preserved over every default"
         );
     }
 }
@@ -6514,7 +6594,7 @@ mod ingress_indistinguishability_tests {
         // Passthrough mode + a MISCONFIGURED lane that DOES carry an operator key. Lane speaks OpenAI
         // (Bearer auth), ingress same-protocol openai.
         let passthrough = AuthCfg {
-            mode: "passthrough".to_string(),
+            mode: crate::auth::AuthMode::Passthrough,
             ..AuthCfg::default_none()
         };
         let app = TestApp::new()

@@ -207,7 +207,7 @@ auth:
 |---|---|---|---|---|
 | `mode` | string | no | `none` | `token`, `passthrough`, or `none` (case-insensitive). An unknown value is a startup error. |
 | `client_tokens` | list<string> | no | `[]` | Allowed bearer tokens (env-interpolated). Required to be non-empty when `mode: token`. All comparisons are constant-time (no timing oracle). |
-| `token` | string | no | — | **Deprecated** single-token field. Promoted into `client_tokens` if that list is otherwise empty; discarded with a warning if `client_tokens` is also set. |
+| `token` | string | no | — | **Removed in 1.0.0.** The `auth` block now rejects unknown keys, so setting `token:` is a hard parse error (`unknown field \`token\``) — the gateway refuses to boot. Move its value into the `client_tokens` allowlist instead. |
 
 **Token extraction order (for `token` and `passthrough` modes):** `Authorization: Bearer`, then `x-api-key`, then `x-goog-api-key`. Blank values are treated as absent.
 
@@ -426,7 +426,7 @@ pools:
     breaker:
       trip:
         mode: error_rate
-        window_s: 30
+        window_secs: 30
         threshold: 0.5
         min_requests: 5
       base_cooldown_secs: 15
@@ -435,11 +435,11 @@ pools:
 
 | Field | Type | Default | Validation | Notes |
 |---|---|---|---|---|
-| `trip.mode` | string | `error_rate` | Must be `error_rate` or `consecutive` | **`error_rate`**: trips when `errors/total ≥ threshold` over `window_s` seconds, with at least `min_requests` outcomes in the window. **`consecutive`**: trips after `n` consecutive failures regardless of window. |
-| `trip.window_s` | integer | `30` | Must be ≥ 1 | Sliding outcome window for `error_rate` mode. Outcomes older than `window_s` are evicted. |
+| `trip.mode` | string | `error_rate` | Must be `error_rate` or `consecutive` | **`error_rate`**: trips when `errors/total ≥ threshold` over `window_secs` seconds, with at least `min_requests` outcomes in the window. **`consecutive`**: trips after `consecutive_n` consecutive failures regardless of window. |
+| `trip.window_secs` | integer | `30` | Must be ≥ 1 | Sliding outcome window for `error_rate` mode. Outcomes older than `window_secs` are evicted. (Renamed from `window_s` in 1.0.0; the old key still loads via a serde alias.) |
 | `trip.threshold` | float | `0.5` | Must be in `(0.0, 1.0]` | Error fraction threshold for `error_rate` mode. `0.5` means more than half of outcomes in the window must be errors to trip. |
 | `trip.min_requests` | integer | `5` | Must be ≥ 1 | `error_rate` mode: minimum outcomes required in the window before the threshold is evaluated. Prevents tripping on a single failure with no baseline. |
-| `trip.n` | integer | `3` | Must be ≥ 1 | `consecutive` mode: number of consecutive failures that trip the breaker. |
+| `trip.consecutive_n` | integer | `3` | Must be ≥ 1 | `consecutive` mode: number of consecutive failures that trip the breaker. (Renamed from `n` in 1.0.0; the old key still loads via a serde alias.) |
 | `base_cooldown_secs` | integer | `15` | Must be ≥ 1 | Initial cooldown duration after a trip. Subsequent trips without a successful recovery double the cooldown (exponential backoff). |
 | `max_cooldown_secs` | integer | `120` | Must be ≥ `base_cooldown_secs` | Maximum cooldown regardless of backoff. |
 
@@ -477,16 +477,16 @@ pools:
       - target: gemini-1.5-pro
         weight: 1
     failover:
-      deadline_secs: 30
-      cap: 3
+      timeout_secs: 30
+      max_hops: 3
       exclusions:
         - gemini-1.5-pro   # never used as a failover destination; still receives primary traffic
 ```
 
 | Field | Type | Default | Validation | Notes |
 |---|---|---|---|---|
-| `deadline_secs` | integer | `120` | Must be ≥ 1 | Wall-clock budget for the entire request across all hops. Exceeded → 503 immediately. |
-| `cap` | integer | `3` | — | Maximum number of failover hops for one request. A hop is one upstream attempt that fails before the first response byte. |
+| `timeout_secs` | integer | `120` | Must be ≥ 1 | Wall-clock budget for the entire request across all hops. Exceeded → 503 immediately. (Renamed from `deadline_secs` in 1.0.0; the old key still loads via a serde alias.) |
+| `max_hops` | integer | `3` | — | Maximum number of failover hops for one request. A hop is one upstream attempt that fails before the first response byte. (Renamed from `cap` in 1.0.0; the old key still loads via a serde alias.) |
 | `exclusions` | list<string> | none | Each entry must name a member of **this** pool | Model names that are **never** selected as a failover destination, primary or otherwise. Use to reserve a member for affinity-only use or to permanently exclude a degraded lane. |
 
 **Failover boundary: the first upstream byte.** Failover is only possible before the first byte of the upstream response reaches the client. Once streaming has begun (any SSE or event-stream byte sent to the client), an upstream failure cannot fail over. Busbar instead records the breaker penalty and emits an in-band SSE error event. The client is responsible for retrying at the application level.
@@ -581,12 +581,14 @@ All sinks are opt-in. Prometheus `/metrics` is always on and needs no config ent
 observability:
   otlp_endpoint: "http://localhost:4318/v1/traces"
   request_log_webhook_url: "https://logs.example.com/busbar"
+  emit_server_timing: true
 ```
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `otlp_endpoint` | string | none | When set, installs an OTLP/HTTP trace exporter. Loopback `http://` is allowed (standard collector default). Remote endpoints must use `https://`. SSRF-guarded: rejects RFC-1918, link-local, CGNAT, metadata hosts. Traces are flushed on graceful shutdown. |
 | `request_log_webhook_url` | string | none | When set, fires a fire-and-forget JSON POST per completed request: `{ts, ingress_protocol, pool, outcome, latency_ms}`. Must be `https://`. SSRF-guarded (same classes as `otlp_endpoint` plus broadcast). At most 64 deliveries in flight; drops rather than queues. 2-second delivery timeout. |
+| `emit_server_timing` | bool | `true` | Controls whether the `Server-Timing: busbar;dur=<ms>` response header is emitted on every response. Set to `false` to suppress it entirely — it is an in-band busbar fingerprint operators may want to hide for backend indistinguishability. |
 
 **OTLP credential hygiene.** If your OTLP endpoint requires auth, supply credentials in the URL userinfo (`https://user:pass@collector.example.com/…`) — Busbar moves them to an `Authorization: Basic` header and strips them from the URL before logging, so they do not appear in logs or spans.
 
@@ -772,13 +774,13 @@ pools:
     breaker:
       trip:
         mode: consecutive     # trip fast on a short streak
-        n: 2
+        consecutive_n: 2
       base_cooldown_secs: 5
       max_cooldown_secs: 60
 
     failover:
-      deadline_secs: 30       # total wall-clock budget across all hops
-      cap: 3                  # at most 3 failover attempts
+      timeout_secs: 30        # total wall-clock budget across all hops
+      max_hops: 3             # at most 3 failover attempts
 
     on_exhausted:
       action: fallback_pool:overflow
@@ -808,8 +810,8 @@ pools:
         weight: 1
         cost_per_mtok: 3.0
     failover:
-      deadline_secs: 120
-      cap: 3
+      timeout_secs: 120
+      max_hops: 3
     on_exhausted:
       action: reject
 
@@ -820,6 +822,7 @@ pools:
 observability:
   otlp_endpoint: "http://localhost:4318/v1/traces"
   request_log_webhook_url: "https://logs.example.com/busbar"
+  emit_server_timing: true
 
 # ---------------------------------------------------------------------------
 # Governance: virtual keys, budgets, rate limits.
@@ -849,6 +852,9 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 | `base_url` plaintext | `base_url` does not start with `https://` |
 | `error_map` value unknown | A value in `error_map` is not one of the nine canonical disposition classes |
 | `auth` value unknown | `auth` field value not `bearer` or `api-key` |
+| `auth.mode` value unknown | `auth.mode` not one of `token`, `passthrough`, `none` (case-insensitive) |
+| `affinity.mode` value unknown | `affinity.mode` not `session` (the only supported value) |
+| Removed `token` field set | The 1.0.0-removed `auth.token` field is present — rejected at parse as an unknown field (`unknown field \`token\``); move its value into `client_tokens` |
 | `path` malformed | `path` does not begin with `/` |
 | Model name reserved | Model named `admin` |
 | `provider` reference missing | `models.<name>.provider` does not name a configured provider |
@@ -860,7 +866,7 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 | Empty `members` | A pool with no members is un-routable |
 | `weight: 0` | Pool member weight of 0 is invalid |
 | `target` reference missing | Pool member `target` does not name a configured model |
-| `failover.deadline_secs: 0` | Zero failover deadline |
+| `failover.timeout_secs: 0` | Zero failover deadline |
 | `failover.exclusions` dangling | An exclusion names a model not in the pool |
 | Fallback pool cycle | `on_exhausted: fallback_pool:<X>` where following the chain creates a cycle |
 | Fallback pool self-reference | `on_exhausted: fallback_pool:<self>` |
@@ -890,6 +896,5 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 | `auth.mode: passthrough` with a provider whose API key env var is non-empty (credential-leak risk) |
 | Heterogeneous pool (members span more than one backend protocol — cross-protocol translation applies) |
 | `api_key_env` names an env var that is unset or empty at boot (lane will fail auth) |
-| Deprecated `token` field used alongside `client_tokens` (field is discarded) |
 | `allowed_pools` on a virtual key (admin API) names a pool not currently configured |
 | `auth.mode: token` or `auth.mode: none` with governance enabled (static auth is superseded; effective mode is governance virtual keys) |

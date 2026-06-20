@@ -112,8 +112,13 @@ fn usage_sink(
 /// pool's `affinity` config (mode `session`) may name a different header (e.g. `x-user-id`).
 fn affinity_header_for<'a>(app: &'a Arc<App>, pool: &str) -> &'a str {
     match app.pool_runtime.get(pool).and_then(|r| r.affinity.as_ref()) {
-        Some(a) if a.mode == "session" => a.header_name.as_deref().unwrap_or("x-session-id"),
-        _ => "x-session-id",
+        // `mode` is `AffinityMode::Session` (the only variant); honour the configured header name.
+        Some(a) => match a.mode {
+            crate::config::AffinityMode::Session => {
+                a.header_name.as_deref().unwrap_or("x-session-id")
+            }
+        },
+        None => "x-session-id",
     }
 }
 
@@ -1402,7 +1407,7 @@ mod tests {
                 members: Default::default(),
                 failover: None,
                 affinity: Some(crate::config::AffinityCfg {
-                    mode: "session".to_string(),
+                    mode: crate::config::AffinityMode::Session,
                     header_name: Some("x-user-id".to_string()),
                 }),
                 breaker: None,
@@ -1427,7 +1432,7 @@ mod tests {
                 members: Default::default(),
                 failover: None,
                 affinity: Some(crate::config::AffinityCfg {
-                    mode: "session".to_string(),
+                    mode: crate::config::AffinityMode::Session,
                     header_name: None,
                 }),
                 breaker: None,

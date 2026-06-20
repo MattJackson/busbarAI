@@ -108,15 +108,30 @@ fn json_response(status: StatusCode, body: Value) -> Response {
         .into_response()
 }
 
+/// Admin error envelope — the SAME vendor object shape the proxy emits
+/// (`{"error":{"message":...,"type":...}}`, see `forward::ingress_error`), so a client parses admin
+/// and proxy errors with one code path instead of a flat `{"error":"<string>"}` special case. The
+/// `type` taxonomy mirrors `forward::cross_protocol_error_kind`: `invalid_request_error` for 4xx
+/// client errors, `not_found_error` for 404, `internal_error` for 5xx. `message` carries only
+/// caller-safe text — store/DB details are logged server-side (see `internal_error`/`join_error`)
+/// and never reach this body.
+fn error_response(status: StatusCode, error_type: &str, message: impl Into<String>) -> Response {
+    json_response(
+        status,
+        json!({"error": {"message": message.into(), "type": error_type}}),
+    )
+}
+
 /// 500 for an internal store/DB failure. The detailed error (which may embed raw SQL fragments,
 /// column/table names, or file paths from rusqlite) is logged server-side via `tracing::error!`;
 /// the HTTP body carries only a generic message so internal storage details are never disclosed to
 /// the client (even an authenticated admin). `op` names the operation for log correlation.
 fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
     tracing::error!(operation = op, error = %e, "admin store operation failed");
-    json_response(
+    error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
-        json!({"error": "internal error"}),
+        "internal_error",
+        "internal error",
     )
 }
 
@@ -136,9 +151,10 @@ fn key_meta(k: &VirtualKey) -> Value {
 }
 
 fn disabled() -> Response {
-    json_response(
+    error_response(
         StatusCode::NOT_FOUND,
-        json!({"error": "governance/admin API is not enabled"}),
+        "not_found_error",
+        "governance/admin API is not enabled",
     )
 }
 
@@ -147,9 +163,10 @@ fn disabled() -> Response {
 /// propagate as an `unwrap()` on the request path — map it to a generic 500 (details logged).
 fn join_error(op: &str, e: &tokio::task::JoinError) -> Response {
     tracing::error!(operation = op, error = %e, "admin store task failed to join");
-    json_response(
+    error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
-        json!({"error": "internal error"}),
+        "internal_error",
+        "internal error",
     )
 }
 
@@ -167,7 +184,11 @@ pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Resp
         Ok(req) => req,
         Err(_) => {
             tracing::warn!("create_key: {}", crate::json::parse_err_log(body.len()));
-            return json_response(StatusCode::BAD_REQUEST, json!({"error": "invalid JSON"}));
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid JSON",
+            );
         }
     };
     // Default to the all-time `"total"` window when omitted; otherwise the value MUST be one
@@ -176,13 +197,12 @@ pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Resp
     // metadata disagrees with the cap it actually enforces).
     let budget_period = req.budget_period.unwrap_or_else(|| "total".to_string());
     if !VALID_BUDGET_PERIODS.contains(&budget_period.as_str()) {
-        return json_response(
+        return error_response(
             StatusCode::BAD_REQUEST,
-            json!({
-                "error": format!(
-                    "invalid budget_period '{budget_period}': must be one of {VALID_BUDGET_PERIODS:?}"
-                )
-            }),
+            "invalid_request_error",
+            format!(
+                "invalid budget_period '{budget_period}': must be one of {VALID_BUDGET_PERIODS:?}"
+            ),
         );
     }
     // Reject a negative budget at the ingress. `max_budget_cents` is a signed `i64` (the store column
@@ -196,9 +216,10 @@ pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Resp
     // for them is already a 400 at deserialization — no parallel range check is reachable here.
     if let Some(budget) = req.max_budget_cents {
         if budget < 0 {
-            return json_response(
+            return error_response(
                 StatusCode::BAD_REQUEST,
-                json!({"error": "max_budget_cents must be >= 0"}),
+                "invalid_request_error",
+                "max_budget_cents must be >= 0",
             );
         }
     }
@@ -211,15 +232,17 @@ pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Resp
     // both so the operator gets a coherent error instead of a dead key. Any positive value, and an
     // omitted field (unlimited), still create the key.
     if req.rpm_limit == Some(0) {
-        return json_response(
+        return error_response(
             StatusCode::BAD_REQUEST,
-            json!({"error": "rpm_limit must be >= 1 (omit the field for unlimited)"}),
+            "invalid_request_error",
+            "rpm_limit must be >= 1 (omit the field for unlimited)",
         );
     }
     if req.tpm_limit == Some(0) {
-        return json_response(
+        return error_response(
             StatusCode::BAD_REQUEST,
-            json!({"error": "tpm_limit must be >= 1 (omit the field for unlimited)"}),
+            "invalid_request_error",
+            "tpm_limit must be >= 1 (omit the field for unlimited)",
         );
     }
     // NON-FATAL ingress diagnostic for `allowed_pools`. Unlike the rejections above, an
@@ -328,7 +351,11 @@ pub(crate) async fn update_key(
         Ok(req) => req,
         Err(_) => {
             tracing::warn!("update_key: {}", crate::json::parse_err_log(body.len()));
-            return json_response(StatusCode::BAD_REQUEST, json!({"error": "invalid JSON"}));
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid JSON",
+            );
         }
     };
     // Create-parity validation (see create_key for the rationale on each): a negative budget is a
@@ -341,22 +368,25 @@ pub(crate) async fn update_key(
     // guards. Absent (`None`) leaves the field unchanged and likewise needs no check.
     if let Some(Some(budget)) = req.max_budget_cents {
         if budget < 0 {
-            return json_response(
+            return error_response(
                 StatusCode::BAD_REQUEST,
-                json!({"error": "max_budget_cents must be >= 0 (use null to clear to unlimited)"}),
+                "invalid_request_error",
+                "max_budget_cents must be >= 0 (use null to clear to unlimited)",
             );
         }
     }
     if req.rpm_limit == Some(Some(0)) {
-        return json_response(
+        return error_response(
             StatusCode::BAD_REQUEST,
-            json!({"error": "rpm_limit must be >= 1 (omit to leave unchanged, null to clear to unlimited)"}),
+            "invalid_request_error",
+            "rpm_limit must be >= 1 (omit to leave unchanged, null to clear to unlimited)",
         );
     }
     if req.tpm_limit == Some(Some(0)) {
-        return json_response(
+        return error_response(
             StatusCode::BAD_REQUEST,
-            json!({"error": "tpm_limit must be >= 1 (omit to leave unchanged, null to clear to unlimited)"}),
+            "invalid_request_error",
+            "tpm_limit must be >= 1 (omit to leave unchanged, null to clear to unlimited)",
         );
     }
     let gov = gov.clone();
@@ -386,7 +416,7 @@ pub(crate) async fn update_key(
     .await;
     match res {
         Ok(Ok(Some(key))) => json_response(StatusCode::OK, key_meta(&key)),
-        Ok(Ok(None)) => json_response(StatusCode::NOT_FOUND, json!({"error": "key not found"})),
+        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, "not_found_error", "key not found"),
         Ok(Err(e)) => internal_error("update_key", &e),
         Err(e) => join_error("update_key", &e),
     }
@@ -423,7 +453,7 @@ pub(crate) async fn key_usage(State(app): State<Arc<App>>, Path(id): Path<String
             StatusCode::OK,
             json!({"id": id, "spend_cents": u.spend_cents, "tokens": u.tokens, "requests": u.requests}),
         ),
-        Ok(Ok(None)) => json_response(StatusCode::NOT_FOUND, json!({"error": "key not found"})),
+        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, "not_found_error", "key not found"),
         Ok(Err(e)) => internal_error("key_usage", &e),
         Err(e) => join_error("key_usage", &e),
     }
@@ -471,7 +501,7 @@ pub(crate) async fn delete_key(State(app): State<Arc<App>>, Path(id): Path<Strin
     .await;
     match res {
         Ok(Ok(Some(()))) => json_response(StatusCode::OK, json!({"deleted": id})),
-        Ok(Ok(None)) => json_response(StatusCode::NOT_FOUND, json!({"error": "key not found"})),
+        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, "not_found_error", "key not found"),
         Ok(Err(e)) => internal_error("delete_key", &e),
         Err(e) => join_error("delete_key", &e),
     }
@@ -703,11 +733,15 @@ mod tests {
             );
             let body: serde_json::Value = resp.json().await.unwrap();
             assert!(
-                body["error"]
+                body["error"]["message"]
                     .as_str()
                     .unwrap_or("")
                     .contains("budget_period"),
                 "400 body must name budget_period: {body}"
+            );
+            assert_eq!(
+                body["error"]["type"], "invalid_request_error",
+                "400 error type must be invalid_request_error: {body}"
             );
         }
 
@@ -799,8 +833,12 @@ mod tests {
             );
             let body: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert_eq!(
-                body["error"], "invalid JSON",
+                body["error"]["message"], "invalid JSON",
                 "the 400 body on {path} must be the generic envelope; got {text}"
+            );
+            assert_eq!(
+                body["error"]["type"], "invalid_request_error",
+                "the 400 error type must be invalid_request_error; got {text}"
             );
         }
 
@@ -836,7 +874,7 @@ mod tests {
             );
             let body: serde_json::Value = resp.json().await.unwrap();
             assert!(
-                body["error"]
+                body["error"]["message"]
                     .as_str()
                     .unwrap_or("")
                     .contains("max_budget_cents"),
@@ -991,7 +1029,10 @@ mod tests {
             );
             let body: serde_json::Value = resp.json().await.unwrap();
             assert!(
-                body["error"].as_str().unwrap_or("").contains(field),
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains(field),
                 "400 body must name {field}: {body}"
             );
         }
@@ -1299,7 +1340,8 @@ mod tests {
             "deleting a non-existent key must 404, not a spurious 200"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["error"], "key not found");
+        assert_eq!(body["error"]["message"], "key not found");
+        assert_eq!(body["error"]["type"], "not_found_error");
         handle.abort();
     }
 

@@ -134,7 +134,8 @@ pools:
         context_max: 2000000
 
   # 5) Failover tuning: bound how long/often busbar retries across members for one request.
-  #    deadline_secs — give up after this wall-clock budget. cap — at most this many failover hops.
+  #    timeout_secs — give up after this wall-clock budget. max_hops — at most this many failover hops.
+  #    (the old keys `deadline_secs` / `cap` still load via aliases.)
   #    exclusions — member models to never fail a request over TO (e.g. an expensive last resort).
   resilient:
     members:
@@ -145,8 +146,8 @@ pools:
       - target: glm-4.6
         weight: 1
     failover:
-      deadline_secs: 30
-      cap: 3
+      timeout_secs: 30
+      max_hops: 3
       exclusions:
         - glm-4.6        # kept in the pool for capacity, but never used as a failover destination
 
@@ -189,10 +190,10 @@ pools:
   # 8) Per-pool circuit breaker: tune when a member trips out and how long it cools down. Omit the
   #    block entirely for the ADR-0002 defaults (error_rate, 0.5 over a 30s/5-request floor).
   #      trip.mode        — error_rate (fraction of failures in a window) | consecutive (a streak).
-  #      trip.window_s    — sliding window for error_rate.
+  #      trip.window_secs — sliding window for error_rate (old key `window_s` still loads via alias).
   #      trip.threshold   — error fraction that trips (error_rate mode).
   #      trip.min_requests— floor: never trip on error_rate below this many outcomes in-window.
-  #      trip.n           — consecutive failures that trip (consecutive mode).
+  #      trip.consecutive_n — consecutive failures that trip (consecutive mode; old key `n` aliased).
   #      base/max_cooldown_secs — first cooldown after a trip, and the exponential-backoff ceiling.
   #    (A server Retry-After header is always honored as a cooldown floor, on top of these.)
   sensitive:
@@ -202,17 +203,21 @@ pools:
     breaker:
       trip:
         mode: consecutive        # trip fast on a short streak rather than a windowed rate
-        n: 2                     # two consecutive failures trip the member out
+        consecutive_n: 2         # two consecutive failures trip the member out
       base_cooldown_secs: 5      # quick first probe-back…
       max_cooldown_secs: 60      # …backing off exponentially up to a minute
 
 # ── Observability (optional) ─────────────────────────────────────────────────────────────────────
-# Prometheus `/metrics` is always on and needs no config. These two sinks are opt-in:
+# Prometheus `/metrics` is always on and needs no config. These sinks/toggles are opt-in:
 #   otlp_endpoint            — export OpenTelemetry traces (OTLP/HTTP) to a collector.
 #   request_log_webhook_url  — fire-and-forget a JSON request-log POST per request.
+#   emit_server_timing       — emit the `Server-Timing: busbar;dur=<ms>` response header (default
+#                              true). Set false to suppress it entirely (it is an in-band busbar
+#                              fingerprint you may want to hide for backend indistinguishability).
 # observability:
 #   otlp_endpoint: "http://localhost:4318/v1/traces"
 #   request_log_webhook_url: "https://logs.example.com/busbar"
+#   emit_server_timing: true
 
 # ── Governance (optional) ────────────────────────────────────────────────────────────────────────
 # When enabled, clients authenticate with busbar-issued VIRTUAL KEYS (managed via the admin API)

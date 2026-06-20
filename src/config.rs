@@ -139,34 +139,23 @@ pub(crate) struct TlsCfg {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AuthCfg {
     #[serde(default = "default_auth_mode")]
-    pub(crate) mode: String,
-    #[deprecated(since = "0.1.0", note = "use client_tokens allowlist instead")]
-    #[serde(rename = "token", default)]
-    pub(crate) _legacy_token: Option<String>,
+    pub(crate) mode: crate::auth::AuthMode,
     #[serde(default)]
     pub(crate) client_tokens: Vec<String>,
 }
 
 // MANUAL Debug that REDACTS every credential field. A derived `Debug` would print every entry of
-// `client_tokens` AND the deprecated `_legacy_token` in PLAINTEXT — a latent credential leak the
-// moment an `AuthCfg` (or any struct that embeds it, e.g. `RootCfg`/`DeployCfg`) is debug-logged.
-// Print only the COUNT of allowlist tokens and presence of the legacy token, never the values (and
-// never any prefix/suffix, which would be a partial-secret oracle). Mirrors `auth::AuthMiddleware`.
+// `client_tokens` in PLAINTEXT — a latent credential leak the moment an `AuthCfg` (or any struct
+// that embeds it, e.g. `RootCfg`/`DeployCfg`) is debug-logged. Print only the COUNT of allowlist
+// tokens, never the values (and never any prefix/suffix, which would be a partial-secret oracle).
+// Mirrors `auth::AuthMiddleware`.
 impl fmt::Debug for AuthCfg {
-    #[allow(deprecated)] // reading the deprecated field solely to redact it
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthCfg")
             .field("mode", &self.mode)
-            .field(
-                "_legacy_token",
-                &if self._legacy_token.is_some() {
-                    "<redacted; present>"
-                } else {
-                    "<absent>"
-                },
-            )
             .field(
                 "client_tokens",
                 &format_args!("<redacted; {} configured>", self.client_tokens.len()),
@@ -176,43 +165,17 @@ impl fmt::Debug for AuthCfg {
 }
 
 impl AuthCfg {
-    /// Normalize legacy single-token format into allowlist.
-    #[allow(deprecated)] // accessing deprecated field for normalization logic
-    pub(crate) fn normalize(mut self) -> Self {
-        if let Some(tok) = self._legacy_token.take() {
-            // If client_tokens is empty and we have legacy token, promote it.
-            if self.client_tokens.is_empty() {
-                self.client_tokens.push(tok);
-            } else {
-                // Both the deprecated `token` and the `client_tokens` allowlist were
-                // supplied. The allowlist wins and the legacy token is discarded; warn
-                // so the operator notices their `token:` is being ignored rather than
-                // silently merged (which could otherwise mask a stale credential).
-                // `normalize` returns Self with no error channel, so we warn rather
-                // than fail.
-                tracing::warn!(
-                    "auth config specifies both the deprecated `token` and a non-empty \
-                     `client_tokens` allowlist; the legacy `token` is being ignored. Remove \
-                     `token:` and add its value to `client_tokens` if it should remain valid."
-                );
-            }
-        }
-        self
-    }
-
     /// Create a default AuthCfg for initialization.
-    #[allow(deprecated)] // accessing deprecated field in constructor
     pub(crate) fn default_none() -> Self {
         Self {
-            mode: crate::auth::AuthMode::NONE.to_string(),
-            _legacy_token: None,
+            mode: crate::auth::AuthMode::None,
             client_tokens: vec![],
         }
     }
 }
 
-fn default_auth_mode() -> String {
-    crate::auth::AuthMode::NONE.to_string()
+fn default_auth_mode() -> crate::auth::AuthMode {
+    crate::auth::AuthMode::None
 }
 
 #[derive(Deserialize)]
@@ -231,7 +194,7 @@ pub(crate) struct ProviderCfg {
     pub(crate) path: Option<String>,
     /// Optional auth-style override (see ProviderDef::auth).
     #[serde(default)]
-    pub(crate) auth: Option<String>,
+    pub(crate) auth: Option<ProviderAuth>,
     /// Per-provider SURGICAL escape hatch: the cloud-metadata hosts/IPs to UNBLOCK for THIS
     /// provider's `base_url` (and path-override composition) only. Each entry carves a single
     /// exception out of the metadata denylist (hardcoded ∪ `security.blocked_metadata_hosts`) — e.g.
@@ -280,6 +243,18 @@ impl fmt::Debug for ProviderCfg {
 
 fn default_protocol() -> String {
     "anthropic".to_string()
+}
+
+/// Per-provider auth-style override. Closed set: the request is signed with the protocol's native
+/// auth (`bearer`) unless `api-key` selects an `api-key: <key>` header (Azure OpenAI). The wire
+/// strings are unchanged from the pre-enum `Option<String>` field (`bearer` / `api-key`), so an
+/// unknown spelling is now a deserialize error instead of a hand-checked validation error.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderAuth {
+    #[serde(rename = "bearer")]
+    Bearer,
+    #[serde(rename = "api-key")]
+    ApiKey,
 }
 
 /// Active health-probe mode for a provider's lanes.
@@ -558,23 +533,25 @@ pub(crate) enum BreakerTripMode {
 pub(crate) struct BreakerTripConfig {
     #[serde(default = "default_trip_mode")]
     pub(crate) mode: BreakerTripMode,
-    #[serde(default = "default_window_s")]
-    pub(crate) window_s: u64,
+    /// Sliding-window length in seconds. Renamed from `window_s` in 1.0.0; the old key is still
+    /// accepted via the serde alias so existing configs keep loading.
+    #[serde(default = "default_window_secs", alias = "window_s")]
+    pub(crate) window_secs: u64,
     #[serde(default = "default_threshold")]
     pub(crate) threshold: f64,
     #[serde(default = "default_min_requests")]
     pub(crate) min_requests: usize,
-    /// Consecutive-failure threshold for `BreakerTripMode::Consecutive`. Field name kept as `n` to
-    /// preserve the operator config schema (`trip.n`) — do not rename.
-    #[serde(default = "default_consecutive_n")]
-    pub(crate) n: u32,
+    /// Consecutive-failure threshold for `BreakerTripMode::Consecutive`. Renamed from `n` in 1.0.0;
+    /// the old key is still accepted via the serde alias so existing configs keep loading.
+    #[serde(default = "default_consecutive_n", alias = "n")]
+    pub(crate) consecutive_n: u32,
 }
 
 fn default_trip_mode() -> BreakerTripMode {
     BreakerTripMode::ErrorRate
 }
 
-fn default_window_s() -> u64 {
+fn default_window_secs() -> u64 {
     30
 }
 
@@ -628,26 +605,30 @@ fn default_max_cooldown() -> u64 {
 
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct FailoverCfg {
-    #[serde(default = "default_failover_deadline")]
-    pub(crate) deadline_secs: u64,
+    /// Failover wall-clock budget in seconds. Renamed from `deadline_secs` in 1.0.0; the old key is
+    /// still accepted via the serde alias so existing configs keep loading.
+    #[serde(default = "default_failover_timeout", alias = "deadline_secs")]
+    pub(crate) timeout_secs: u64,
     /// Member model names excluded from this pool's candidate set — never selected (primary or
     /// failover). A per-pool blocklist for temporarily benching a member without editing `members`.
     #[serde(default)]
     pub(crate) exclusions: Option<Vec<String>>,
-    #[serde(default = "default_cap")]
-    pub(crate) cap: usize,
+    /// Maximum failover hops per request. Renamed from `cap` in 1.0.0; the old key is still accepted
+    /// via the serde alias so existing configs keep loading.
+    #[serde(default = "default_max_hops", alias = "cap")]
+    pub(crate) max_hops: usize,
 }
 
-/// Default failover wall-clock budget (seconds) when a pool doesn't set `failover.deadline_secs`.
+/// Default failover wall-clock budget (seconds) when a pool doesn't set `failover.timeout_secs`.
 pub(crate) const DEFAULT_FAILOVER_DEADLINE_SECS: u64 = 120;
-/// Default maximum failover hops per request when a pool doesn't set `failover.cap`.
+/// Default maximum failover hops per request when a pool doesn't set `failover.max_hops`.
 pub(crate) const DEFAULT_FAILOVER_CAP: usize = 3;
 
-fn default_failover_deadline() -> u64 {
+fn default_failover_timeout() -> u64 {
     DEFAULT_FAILOVER_DEADLINE_SECS
 }
 
-fn default_cap() -> usize {
+fn default_max_hops() -> usize {
     DEFAULT_FAILOVER_CAP
 }
 
@@ -708,19 +689,26 @@ impl OnExhausted {
     }
 }
 
+/// Affinity mode. `session` is the default and only supported mode. Modelled as a (currently
+/// single-variant) enum so an unrecognized spelling (e.g. `sticky`) is a deserialize error rather
+/// than a silently-accepted value that degrades to default behaviour. The wire string (`session`)
+/// is unchanged from the pre-enum `String` field.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AffinityMode {
+    #[default]
+    Session,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct AffinityCfg {
     /// Affinity mode. `session` (the default and only supported mode) pins a session to a lane
     /// using the header named by `header_name`.
-    #[serde(default = "default_affinity_mode")]
-    pub(crate) mode: String,
+    #[serde(default)]
+    pub(crate) mode: AffinityMode,
     /// Request header carrying the session id (defaults to `x-session-id` when unset).
     #[serde(default)]
     pub(crate) header_name: Option<String>,
-}
-
-fn default_affinity_mode() -> String {
-    "session".to_string()
 }
 
 fn default_listen() -> String {
@@ -748,7 +736,7 @@ pub(crate) struct ProviderDef {
     /// bearer token — e.g. Azure OpenAI (which also carries `?api-version=` and the deployment in
     /// its `path`). Recognized values: `bearer` (default) | `api-key`.
     #[serde(default)]
-    pub(crate) auth: Option<String>,
+    pub(crate) auth: Option<ProviderAuth>,
     /// Catalog default for the per-provider metadata allow-override (see
     /// `ProviderCfg::allow_metadata_hosts`). A deployment's `allow_metadata_hosts` (`Some`) replaces
     /// this; `None` falls back to the catalog list. Default empty (all metadata blocked).
@@ -771,7 +759,7 @@ pub(crate) struct ProviderDeploy {
     pub(crate) path: Option<String>,
     /// Optional auth-style override (see ProviderDef::auth).
     #[serde(default)]
-    pub(crate) auth: Option<String>,
+    pub(crate) auth: Option<ProviderAuth>,
     /// Per-provider metadata allow-override (see `ProviderCfg::allow_metadata_hosts`). `Some` REPLACES
     /// the catalog default; `None` falls back to the catalog's `allow_metadata_hosts`.
     #[serde(default)]
@@ -992,6 +980,12 @@ pub(crate) struct ObservabilityCfg {
     /// Per-delivery webhook timeout (seconds, default 2).
     #[serde(default = "default_webhook_delivery_timeout_secs")]
     pub(crate) webhook_delivery_timeout_secs: u64,
+    /// Emit the `Server-Timing: busbar;dur=<ms>` response header (default `true`). The header is a
+    /// useful latency probe, but it is also an in-band busbar fingerprint on an otherwise
+    /// anti-fingerprinting gateway, so operators who want backend-facing indistinguishability can set
+    /// this to `false` to suppress it entirely (no Server-Timing header is emitted at all).
+    #[serde(default = "default_emit_server_timing")]
+    pub(crate) emit_server_timing: bool,
 }
 
 impl Default for ObservabilityCfg {
@@ -1003,8 +997,15 @@ impl Default for ObservabilityCfg {
             request_log_webhook_url: None,
             max_inflight_webhook_deliveries: default_max_inflight_webhook_deliveries(),
             webhook_delivery_timeout_secs: default_webhook_delivery_timeout_secs(),
+            emit_server_timing: default_emit_server_timing(),
         }
     }
+}
+
+/// `Server-Timing: busbar` header is emitted by default; operators opt OUT for indistinguishability.
+pub(crate) const DEFAULT_EMIT_SERVER_TIMING: bool = true;
+fn default_emit_server_timing() -> bool {
+    DEFAULT_EMIT_SERVER_TIMING
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -1335,7 +1336,7 @@ pub(crate) fn resolve(
                 error_map,
                 // deployment override wins over the catalog default
                 path: deploy_cfg.path.clone().or_else(|| def.path.clone()),
-                auth: deploy_cfg.auth.clone().or_else(|| def.auth.clone()),
+                auth: deploy_cfg.auth.or(def.auth),
                 // deployment override (Some) replaces the catalog default
                 allow_metadata_hosts: deploy_cfg
                     .allow_metadata_hosts
@@ -1362,7 +1363,7 @@ pub(crate) fn resolve(
         Ok(RootCfg {
             listen: deploy.listen.clone(),
             tls: deploy.tls.clone(),
-            auth: deploy.auth.clone().map(|a| a.normalize()),
+            auth: deploy.auth.clone(),
             providers: resolved_providers,
             models: deploy.models.clone(),
             pools: deploy.pools.clone(),
@@ -1412,92 +1413,53 @@ mod tests {
     /// Per-test vars use unique `BUSBAR_T_*` names and so do not need this guard.
     static CLIENT_TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// A `tracing::Layer` that records the messages of WARN-level events it sees, so a test can
-    /// assert a particular `tracing::warn!` fired.
-    #[derive(Clone, Default)]
-    struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if *event.metadata().level() != tracing::Level::WARN {
-                return;
-            }
-            struct Vis(String);
-            impl tracing::field::Visit for Vis {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    if field.name() == "message" {
-                        self.0 = format!("{value:?}");
-                    }
-                }
-            }
-            let mut vis = Vis(String::new());
-            event.record(&mut vis);
-            if let Ok(mut msgs) = self.0.lock() {
-                msgs.push(vis.0);
-            }
-        }
-    }
-
-    /// Construct an `AuthCfg` directly for normalization tests (the deprecated `_legacy_token`
-    /// field is only settable inside the crate with the deprecation lint suppressed).
-    #[allow(deprecated)]
-    fn auth_cfg(legacy_token: Option<&str>, client_tokens: &[&str]) -> AuthCfg {
-        AuthCfg {
-            mode: "token".to_string(),
-            _legacy_token: legacy_token.map(str::to_string),
-            client_tokens: client_tokens.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    /// When only the deprecated `token` is supplied (no `client_tokens`), normalize promotes it
-    /// into the allowlist — the legacy single-token format keeps working.
+    /// 1.0.0 MIGRATION: the legacy single-token `token:` key was REMOVED. `AuthCfg` is now
+    /// `#[serde(deny_unknown_fields)]`, so a config still setting `token:` is REJECTED AT PARSE with
+    /// serde's "unknown field `token`, expected one of `mode`, `client_tokens`" — a hard, clear
+    /// migration error, never a silent credential drop. (Previously the key deserialized into a
+    /// tombstone field and was caught later at validate time; that mechanism was removed.)
     #[test]
-    fn test_normalize_promotes_legacy_token_when_allowlist_empty() {
-        let normalized = auth_cfg(Some("sk-bb-legacy"), &[]).normalize();
-        assert_eq!(
-            normalized.client_tokens,
-            vec!["sk-bb-legacy".to_string()],
-            "a lone legacy `token` must be promoted into client_tokens"
-        );
-    }
-
-    /// REGRESSION (LOW #33, config.rs:113-121): when BOTH the deprecated `token` and a non-empty
-    /// `client_tokens` allowlist are supplied, `normalize` discards the legacy token (the allowlist
-    /// wins) — but that drop MUST be observable via a `tracing::warn!`, not silent. This captures
-    /// WARN events: against the old (silent) code it FAILS (no warning), and passes once the warn!
-    /// is emitted. It also asserts the allowlist is left untouched (no merge).
-    #[test]
-    fn test_normalize_dropping_legacy_token_warns() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let cap = WarnCapture::default();
-        let subscriber = tracing_subscriber::registry().with(cap.clone());
-
-        let normalized = tracing::subscriber::with_default(subscriber, || {
-            auth_cfg(Some("sk-bb-legacy-dropped"), &["sk-bb-allowlisted"]).normalize()
-        });
-
-        // The legacy token is NOT merged into the existing allowlist.
-        assert_eq!(
-            normalized.client_tokens,
-            vec!["sk-bb-allowlisted".to_string()],
-            "an existing client_tokens allowlist must win and not absorb the legacy token"
-        );
-
-        let msgs = cap.0.lock().unwrap();
+    fn test_legacy_token_key_is_rejected_at_parse() {
+        let yaml = "mode: token\ntoken: \"sk-bb-legacy\"\nclient_tokens: []";
+        let err = serde_yaml::from_str::<AuthCfg>(yaml)
+            .expect_err("legacy `token:` must be rejected at parse, not deserialize");
+        let msg = err.to_string();
         assert!(
-            msgs.iter().any(|m| m.contains("`token`")),
-            "dropping the legacy `token` when client_tokens is non-empty must emit an observable \
-             warn!, got: {msgs:?}"
+            msg.contains("unknown field") && msg.contains("token"),
+            "expected serde's unknown-field error naming `token`; got: {msg}"
         );
+        // The rejected secret value is NEVER echoed back in the parse error.
+        assert!(
+            !msg.contains("sk-bb-legacy"),
+            "the parse error must not leak the configured token value; got: {msg}"
+        );
+    }
+
+    /// 1.0.0 KEY RENAMES — back-compat: every renamed key still loads from its OLD spelling via a
+    /// serde alias, and the new spelling loads too. Pins the alias surface so a future field rename
+    /// can't silently drop the alias (which would break a deployed pre-1.0 config on upgrade).
+    #[test]
+    fn test_renamed_keys_accept_old_and_new_spellings() {
+        // breaker trip: window_s → window_secs, n → consecutive_n
+        let old: BreakerTripConfig =
+            serde_yaml::from_str("mode: consecutive\nwindow_s: 42\nn: 7").expect("old trip keys");
+        assert_eq!(old.window_secs, 42);
+        assert_eq!(old.consecutive_n, 7);
+        let new: BreakerTripConfig =
+            serde_yaml::from_str("mode: consecutive\nwindow_secs: 42\nconsecutive_n: 7")
+                .expect("new trip keys");
+        assert_eq!(new.window_secs, 42);
+        assert_eq!(new.consecutive_n, 7);
+
+        // failover: deadline_secs → timeout_secs, cap → max_hops
+        let old: FailoverCfg =
+            serde_yaml::from_str("deadline_secs: 30\ncap: 5").expect("old failover keys");
+        assert_eq!(old.timeout_secs, 30);
+        assert_eq!(old.max_hops, 5);
+        let new: FailoverCfg =
+            serde_yaml::from_str("timeout_secs: 30\nmax_hops: 5").expect("new failover keys");
+        assert_eq!(new.timeout_secs, 30);
+        assert_eq!(new.max_hops, 5);
     }
 
     /// A minimal config without a `pools:` section parses fine — pools are optional (direct
@@ -2435,22 +2397,17 @@ models: {}
     /// redacting impls are in place. The secret values are deliberately distinctive so a substring
     /// search is decisive.
     #[test]
-    #[allow(deprecated)] // constructing the deprecated `_legacy_token` field solely to verify redaction
     fn test_debug_redacts_all_config_secrets() {
-        // AuthCfg: client_tokens + the deprecated _legacy_token.
+        // AuthCfg: client_tokens (the 1.0.0 `token` field was removed — setting it is now a parse
+        // error, so it can no longer reach `Debug`).
         let auth = AuthCfg {
-            mode: "token".to_string(),
-            _legacy_token: Some("SECRET-legacy-auth-token-xyz".to_string()),
+            mode: crate::auth::AuthMode::Token,
             client_tokens: vec![
                 "SECRET-client-token-aaa".to_string(),
                 "SECRET-client-token-bbb".to_string(),
             ],
         };
         let dbg = format!("{auth:?}");
-        assert!(
-            !dbg.contains("SECRET-legacy-auth-token-xyz"),
-            "AuthCfg Debug leaked the legacy token: {dbg}"
-        );
         assert!(
             !dbg.contains("SECRET-client-token-aaa") && !dbg.contains("SECRET-client-token-bbb"),
             "AuthCfg Debug leaked a client token: {dbg}"
@@ -2525,7 +2482,6 @@ models: {}
     /// above are what protect the whole-config dump an operator is most likely to log. This builds a
     /// DeployCfg containing every secret and asserts none survive its Debug output.
     #[test]
-    #[allow(deprecated)]
     fn test_debug_redacts_secrets_transitively_through_deploycfg() {
         let mut providers = HashMap::new();
         providers.insert(
@@ -2540,8 +2496,7 @@ models: {}
             listen: "127.0.0.1:8080".to_string(),
             tls: None,
             auth: Some(AuthCfg {
-                mode: "token".to_string(),
-                _legacy_token: Some("SECRET-embedded-legacy-token".to_string()),
+                mode: crate::auth::AuthMode::Token,
                 client_tokens: vec!["SECRET-embedded-client-token".to_string()],
             }),
             providers,
@@ -2567,7 +2522,6 @@ models: {}
         let dbg = format!("{deploy:?}");
         for secret in [
             "SECRET-embedded-deploy-key",
-            "SECRET-embedded-legacy-token",
             "SECRET-embedded-client-token",
             "SECRET-embedded-admin-token",
         ] {

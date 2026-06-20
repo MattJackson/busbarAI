@@ -409,7 +409,7 @@ async fn main() {
             error_map: Arc::new(provider_cfg.error_map.clone()),
             context_max: model_context_max.get(&ld.model).copied().flatten(),
             path: provider_cfg.path.clone(),
-            auth: provider_cfg.auth.clone(),
+            auth: provider_cfg.auth,
             health: provider_cfg.health.clone(),
             default_max_tokens: model_default_max_tokens.get(&ld.model).copied().flatten(),
         });
@@ -462,10 +462,7 @@ async fn main() {
     // `auth:` silently becomes an open relay. Surface this at ERROR level (not warn — a warn is
     // suppressed under RUST_LOG=error, the very level an operator most likely runs in production)
     // AND unconditionally on stderr, so the open-relay state cannot be masked by log configuration.
-    if let Some(banner) = open_relay_banner(
-        auth::AuthMode::from_config_str(&auth_cfg.mode),
-        cfg.auth.is_some(),
-    ) {
+    if let Some(banner) = open_relay_banner(Some(auth_cfg.mode), cfg.auth.is_some()) {
         eprintln!("[error] {banner}");
         tracing::error!("{banner}");
     }
@@ -483,9 +480,9 @@ async fn main() {
     // default (not "whatever pool HashMap iteration happens to yield first", which was
     // nondeterministic across restarts).
     let failover_cfg = Some(crate::config::FailoverCfg {
-        deadline_secs: crate::config::DEFAULT_FAILOVER_DEADLINE_SECS,
+        timeout_secs: crate::config::DEFAULT_FAILOVER_DEADLINE_SECS,
         exclusions: None,
-        cap: crate::config::DEFAULT_FAILOVER_CAP,
+        max_hops: crate::config::DEFAULT_FAILOVER_CAP,
     });
 
     // The fallback-pool routing table: on_exhausted `fallback_pool:<name>` looks a pool up here,
@@ -629,6 +626,7 @@ async fn main() {
         app,
         cfg.limits.request_body_max_bytes,
         cfg.limits.max_inbound_concurrent,
+        observability_cfg.emit_server_timing,
     );
 
     let listener = tokio::net::TcpListener::bind(&listen)
@@ -832,6 +830,7 @@ fn server_timing_dur_ms(total_us: u64, upstream_us: u64) -> f64 {
 /// of this scope; a request that never dispatched upstream (admin / health / early error) reports
 /// its full processing time. W3C `Server-Timing` `dur` is milliseconds; emitted at µs precision.
 async fn server_timing(
+    axum::extract::State(emit): axum::extract::State<bool>,
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -841,11 +840,17 @@ async fn server_timing(
     let mut resp = forward::UPSTREAM_RTT_US
         .scope(slot.clone(), next.run(req))
         .await;
-    let total_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
-    let dur_ms = server_timing_dur_ms(total_us, slot.load(Ordering::Relaxed));
-    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("busbar;dur={dur_ms:.3}")) {
-        resp.headers_mut()
-            .insert(axum::http::HeaderName::from_static("server-timing"), v);
+    // Gated by `observability.emit_server_timing` (default true). When disabled, NO Server-Timing
+    // header is emitted at all — the inner stack still runs unchanged, only the header is suppressed
+    // (the header is an in-band busbar fingerprint an operator may want to hide). We still scope the
+    // RTT task-local so disabling this never changes any other timing behavior.
+    if emit {
+        let total_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let dur_ms = server_timing_dur_ms(total_us, slot.load(Ordering::Relaxed));
+        if let Ok(v) = axum::http::HeaderValue::from_str(&format!("busbar;dur={dur_ms:.3}")) {
+            resp.headers_mut()
+                .insert(axum::http::HeaderName::from_static("server-timing"), v);
+        }
     }
     resp
 }
@@ -914,6 +919,7 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
         app,
         limits::translate_body_max_bytes(),
         crate::config::DEFAULT_MAX_INBOUND_CONCURRENT,
+        crate::config::DEFAULT_EMIT_SERVER_TIMING,
     )
 }
 
@@ -925,6 +931,7 @@ pub(crate) fn build_router_with_limits(
     app: std::sync::Arc<state::App>,
     request_body_max_bytes: usize,
     max_inbound_concurrent: usize,
+    emit_server_timing: bool,
 ) -> Router {
     let router = Router::new()
         .route("/stats", get(handlers::stats))
@@ -980,7 +987,13 @@ pub(crate) fn build_router_with_limits(
         .layer(axum::middleware::from_fn(reshape_body_limit_413))
         // Outermost: stamp the `Server-Timing: busbar;dur=<ms>` gateway-overhead header on every
         // response (times the full inner stack). Must be the LAST `.layer()` so it wraps everything.
-        .layer(axum::middleware::from_fn(server_timing))
+        // Gated on `observability.emit_server_timing` (default true): when false the header is fully
+        // suppressed (see `server_timing`). The `bool` state is independent of the router's `App`
+        // state, so it is wired with its own `from_fn_with_state`.
+        .layer(axum::middleware::from_fn_with_state(
+            emit_server_timing,
+            server_timing,
+        ))
         .with_state(app);
 
     apply_inbound_concurrency_limit(router, max_inbound_concurrent)
