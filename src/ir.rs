@@ -369,6 +369,16 @@ pub(crate) enum IrDelta {
     ThinkingDelta(String),
     InputJsonDelta(String),
     SignatureDelta(String),
+    /// L2-5 STREAMING grounding/web-search citations. ADDITIVE variant (no existing variant changed
+    /// — 1.0-freeze-safe): a streamed citation that arrives mid-block is carried as a
+    /// [`crate::ir::IrCitation`] (neutral fields + the byte-exact `raw` escape hatch) rather than
+    /// dropped. The Anthropic reader maps a `citations_delta` content_block_delta here (one citation
+    /// per delta, wrapped in the vec); the Gemini reader maps a late chunk's `citationMetadata`
+    /// (which can carry several sources) here. Writers that model streaming citations (Anthropic
+    /// `citations_delta`, Gemini `citationMetadata`) re-emit it; protocols with no streaming-citation
+    /// shape simply don't emit it (no panic, no corrupt output). Carried inside
+    /// `IrStreamEvent::BlockDelta`, attached to the active text block's index.
+    CitationsDelta(Vec<IrCitation>),
 }
 
 /// Per-request decode state for stateful stream fan-out.

@@ -2570,6 +2570,10 @@ impl ProtocolWriter for BedrockWriter {
                         )),
                     }
                 }
+                // L2-5: Bedrock ConverseStream has no streaming-citation delta shape; suppress
+                // rather than emit a non-native frame (the citation is preserved in the IR and
+                // re-emitted by any protocol that does model streaming citations).
+                crate::ir::IrDelta::CitationsDelta(_) => None,
             },
 
             IrStreamEvent::BlockStop { index } => Some((

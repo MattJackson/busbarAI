@@ -2764,6 +2764,11 @@ impl ProtocolWriter for ResponsesWriter {
                 &crate::ir::IrDelta::ThinkingDelta(_) | crate::ir::IrDelta::SignatureDelta(_) => {
                     None
                 }
+                // L2-5: the Responses streaming surface has no confirmable citation/annotation
+                // delta shape to map this onto, so suppress rather than synthesize one (the
+                // citation stays in the IR and is re-emitted by protocols that model streaming
+                // citations). No panic on this otherwise-unhandled variant.
+                crate::ir::IrDelta::CitationsDelta(_) => None,
             },
 
             IrStreamEvent::BlockStop { index } => {

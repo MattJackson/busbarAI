@@ -536,6 +536,16 @@ impl ProtocolReader for AnthropicReader {
                             .map(String::from)?;
                         IrDelta::SignatureDelta(signature)
                     }
+                    // L2-5 STREAMING citation: a native Anthropic `content_block_delta` whose
+                    // `delta.type == "citations_delta"` carries a single `citation` object (one of
+                    // the four citation variants). Reuse `read_citation` so the neutral fields AND
+                    // the byte-exact `raw` escape hatch are filled (same as the non-stream path),
+                    // then carry it as `IrDelta::CitationsDelta` (one citation per delta). Without
+                    // this arm a streamed grounding/web-search citation was silently dropped.
+                    "citations_delta" => {
+                        let citation_val = delta_val.get("citation")?;
+                        IrDelta::CitationsDelta(vec![read_citation(citation_val)])
+                    }
                     _ => return None,
                 };
                 Some(IrStreamEvent::BlockDelta { index, delta })
@@ -1885,6 +1895,55 @@ impl ProtocolWriter for AnthropicWriter {
                     }
                     IrDelta::SignatureDelta(sig) => {
                         serde_json::json!({ "type": "signature_delta", "signature": sig })
+                    }
+                    // L2-5 STREAMING citation: re-emit each carried citation as its own native
+                    // `content_block_delta`/`citations_delta` event (the native wire carries ONE
+                    // `citation` per delta). `write_citation` re-emits a byte-exact Anthropic `raw`
+                    // verbatim (same-protocol path) and synthesizes the Anthropic object from neutral
+                    // fields otherwise (e.g. a Gemini-sourced citation on a Gemini→Anthropic hop) —
+                    // the shape-gate (`is_anthropic_citation_shape`) inside `write_citation` keeps a
+                    // foreign `raw` from leaking through. An EMPTY citation vec carries nothing, so we
+                    // emit no event (return None) rather than a stray empty `content_block_delta`.
+                    IrDelta::CitationsDelta(citations) => {
+                        let mut events: Vec<(String, serde_json::Value)> = Vec::new();
+                        for c in citations {
+                            let mut data_obj = serde_json::Map::new();
+                            data_obj.insert(
+                                "type".to_string(),
+                                serde_json::json!("content_block_delta"),
+                            );
+                            data_obj.insert("index".to_string(), serde_json::json!(index));
+                            data_obj.insert(
+                                "delta".to_string(),
+                                serde_json::json!({
+                                    "type": "citations_delta",
+                                    "citation": write_citation(c),
+                                }),
+                            );
+                            events.push((
+                                "content_block_delta".to_string(),
+                                serde_json::Value::Object(data_obj),
+                            ));
+                        }
+                        // `write_response_event` returns at most one (event_type, body) pair, so a
+                        // multi-citation delta is flushed as a single combined SSE `event:` of type
+                        // `content_block_delta` whose `data` is the array of native event bodies.
+                        // Each element is a complete native `citations_delta` content_block_delta, so
+                        // a consumer that iterates the array sees the exact per-citation frames a
+                        // native Anthropic stream emits; a single citation (the common case — one
+                        // `citation` per native delta) yields a one-element array. The bare
+                        // `content_block_delta` arms below build ONE body; mirror that contract by
+                        // returning early here rather than falling through to the single-body wrap.
+                        return match events.len() {
+                            0 => None,
+                            1 => events.into_iter().next(),
+                            _ => Some((
+                                "content_block_delta".to_string(),
+                                serde_json::Value::Array(
+                                    events.into_iter().map(|(_, body)| body).collect(),
+                                ),
+                            )),
+                        };
                     }
                 };
                 let mut data_obj = serde_json::Map::new();
@@ -5167,6 +5226,71 @@ mod anthropic_hardening_tests {
         assert!(
             wire.get("citations").is_none(),
             "no citations key for an empty-citations block; got {wire}"
+        );
+    }
+
+    /// L2-5 STREAMING citations, Anthropic same-protocol byte-exactness: a native streaming
+    /// `content_block_delta`/`citations_delta` must read into `IrDelta::CitationsDelta` (via
+    /// `read_citation`, which stashes the source object in `raw`) and the Anthropic writer must
+    /// re-emit the citation object VERBATIM through the `raw` escape hatch — so an Anthropic-shaped
+    /// streamed citation round-trips byte-exact, never a lossy field-by-field reconstruction.
+    #[test]
+    fn read_write_streaming_citations_delta_roundtrips_byte_exact() {
+        // A native web-search streaming citation (one of the 4 Anthropic variants), with a field the
+        // synthesize-from-neutral path would NOT reproduce (`encrypted_index`) to prove `raw` is used.
+        let native_citation = serde_json::json!({
+            "type": "web_search_result_location",
+            "url": "https://example.com/a",
+            "title": "Source A",
+            "cited_text": "the quoted span",
+            "encrypted_index": "opaque-cursor-123"
+        });
+        let data = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "citations_delta", "citation": native_citation }
+        });
+
+        // READ: a citations_delta content_block_delta → IrDelta::CitationsDelta(vec![citation]).
+        let ev = AnthropicReader
+            .read_response_event("content_block_delta", &data)
+            .expect("a citations_delta content_block_delta must parse, not be dropped");
+        let (index, citations) = match &ev {
+            IrStreamEvent::BlockDelta {
+                index,
+                delta: IrDelta::CitationsDelta(cs),
+            } => (*index, cs.clone()),
+            other => panic!("expected a CitationsDelta BlockDelta, got {other:?}"),
+        };
+        assert_eq!(index, 0);
+        assert_eq!(citations.len(), 1, "one citation per citations_delta");
+        // Neutral fields filled AND the verbatim source preserved in `raw`.
+        assert_eq!(citations[0].url.as_deref(), Some("https://example.com/a"));
+        assert_eq!(
+            citations[0].encrypted_index.as_deref(),
+            Some("opaque-cursor-123")
+        );
+        assert_eq!(citations[0].raw.as_ref(), Some(&native_citation));
+
+        // WRITE: the same IR delta re-emits the native content_block_delta/citations_delta, and the
+        // `citation` object is BYTE-EXACT the source (raw verbatim, not reconstructed).
+        let (event_type, body) = AnthropicWriter
+            .write_response_event(&ev)
+            .expect("a CitationsDelta must emit a content_block_delta, not None");
+        assert_eq!(event_type, "content_block_delta");
+        assert_eq!(
+            body.pointer("/delta/type").and_then(|t| t.as_str()),
+            Some("citations_delta")
+        );
+        assert_eq!(
+            body.pointer("/index").and_then(|i| i.as_u64()),
+            Some(0),
+            "the delta must re-emit on the same block index"
+        );
+        assert_eq!(
+            body.pointer("/delta/citation"),
+            Some(&native_citation),
+            "Anthropic-shaped streamed citation must round-trip BYTE-EXACT via raw"
         );
     }
 }

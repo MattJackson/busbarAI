@@ -870,6 +870,33 @@ impl ProtocolReader for GeminiReader {
                 }
             }
 
+            // 2b. L2-5 STREAMING citations. Gemini delivers grounding/web-search citations at the
+            // CANDIDATE level (`candidates[].citationMetadata.citationSources[]`), typically on a
+            // late chunk (often the same chunk that carries `finishReason`), not per content-part.
+            // Reuse `read_gemini_citations` so each source's neutral fields + byte-exact `raw` are
+            // filled (same as the non-stream path), then carry them as ONE `IrDelta::CitationsDelta`
+            // attached to the active text block's index. The IR's delta model keys a BlockDelta to a
+            // block index; a grounding citation annotates the answer text, so we open/own the text
+            // block's index (`state.text_index`, or the next free slot if no text part has appeared
+            // yet) and emit the citations delta against it BEFORE the finishReason path closes the
+            // block below. Without this arm a streamed Gemini citation was silently dropped.
+            let citations = read_gemini_citations(candidate);
+            if !citations.is_empty() {
+                let ti = state.text_index.unwrap_or(state.open_tools.len());
+                if !state.text_block_open {
+                    state.text_block_open = true;
+                    state.text_index = Some(ti);
+                    out.push(IrStreamEvent::BlockStart {
+                        index: ti,
+                        block: crate::ir::IrBlockMeta::Text,
+                    });
+                }
+                out.push(IrStreamEvent::BlockDelta {
+                    index: ti,
+                    delta: crate::ir::IrDelta::CitationsDelta(citations),
+                });
+            }
+
             // 3. finishReason → close blocks + MessageDelta + MessageStop
             if let Some(finish_reason_val) = candidate.get("finishReason").and_then(|r| r.as_str())
             {
@@ -2472,6 +2499,31 @@ impl ProtocolWriter for GeminiWriter {
                         }]
                     }),
                 )),
+
+                // L2-5 STREAMING citations → emit a candidate-level `citationMetadata.citationSources`
+                // chunk, mirroring the non-stream `read_response`/`write_response` shape (Gemini
+                // carries citations at the candidate level, not per part). `write_gemini_citation`
+                // re-emits a byte-exact Gemini source verbatim when `raw` is Gemini-shaped (uri /
+                // startIndex / endIndex present — the same-protocol path) and synthesizes one from the
+                // neutral fields otherwise (e.g. an Anthropic-sourced citation on an Anthropic→Gemini
+                // hop), so a foreign `raw` never leaks through this writer. An EMPTY citation vec
+                // carries nothing → emit no chunk (None) rather than a stray empty `citationMetadata`.
+                crate::ir::IrDelta::CitationsDelta(citations) => {
+                    if citations.is_empty() {
+                        None
+                    } else {
+                        let sources: Vec<serde_json::Value> =
+                            citations.iter().map(write_gemini_citation).collect();
+                        Some((
+                            "".to_string(),
+                            serde_json::json!({
+                                "candidates": [{
+                                    "citationMetadata": { "citationSources": sources }
+                                }]
+                            }),
+                        ))
+                    }
+                }
             },
 
             // BlockStop → FLUSH the open tool block as a single native `{name, args}` part. This is
@@ -7443,5 +7495,192 @@ mod tests {
                 .is_none(),
             "no citationMetadata for a citation-free response; got {plain_wire}"
         );
+    }
+
+    /// L2-5 STREAMING citations, cross-protocol: a Gemini stream chunk carrying candidate-level
+    /// `citationMetadata.citationSources[]` must read into an `IrDelta::CitationsDelta` on the answer
+    /// text block, and a cross-protocol Anthropic egress must re-emit it as a native
+    /// `content_block_delta`/`citations_delta` event carrying the url/title — closing the streaming
+    /// grounding-citation gap that previously dropped the citation entirely.
+    #[test]
+    fn stream_gemini_citation_metadata_projects_to_anthropic_citations_delta() {
+        // Gemini delivers citations on a (late) chunk, here alongside the finishReason.
+        let events = collect_stream(&[
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "The sky is blue."}]}
+                }]
+            }),
+            serde_json::json!({
+                "candidates": [{
+                    "citationMetadata": {
+                        "citationSources": [
+                            {
+                                "startIndex": 0,
+                                "endIndex": 15,
+                                "uri": "https://example.com/sky",
+                                "title": "Why the sky is blue"
+                            }
+                        ]
+                    },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 4}
+            }),
+        ]);
+
+        // A CitationsDelta lands on the answer text block, neutral fields populated.
+        let (cite_idx, citations) = events
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::BlockDelta {
+                    index,
+                    delta: crate::ir::IrDelta::CitationsDelta(cs),
+                } if !cs.is_empty() => Some((*index, cs.clone())),
+                _ => None,
+            })
+            .expect("a CitationsDelta must be emitted for a streamed Gemini citation");
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].url.as_deref(), Some("https://example.com/sky"));
+        assert_eq!(citations[0].title.as_deref(), Some("Why the sky is blue"));
+        assert_eq!(citations[0].start_index, Some(0));
+        assert_eq!(citations[0].end_index, Some(15));
+
+        // The citation block index must be opened by a BlockStart and closed by a BlockStop —
+        // the stream stays balanced.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStart { index, .. } if *index == cite_idx
+            )),
+            "citation block must be opened: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockStop { index } if *index == cite_idx
+            )),
+            "citation block must be closed: {events:?}"
+        );
+
+        // Cross-protocol Anthropic egress: the CitationsDelta becomes a native
+        // content_block_delta/citations_delta carrying the synthesized Anthropic citation.
+        let aw = crate::proto::anthropic::AnthropicWriter;
+        let delta_ev = events
+            .iter()
+            .find_map(|e| match e {
+                IrStreamEvent::BlockDelta {
+                    delta: crate::ir::IrDelta::CitationsDelta(_),
+                    ..
+                } => aw.write_response_event(e),
+                _ => None,
+            })
+            .expect("Anthropic writer must emit a frame for the CitationsDelta");
+        assert_eq!(delta_ev.0, "content_block_delta");
+        // One citation → a single citations_delta body (not an array).
+        let citation = delta_ev
+            .1
+            .pointer("/delta/citation")
+            .expect("body must carry delta.citation");
+        assert_eq!(
+            delta_ev.1.pointer("/delta/type").and_then(|t| t.as_str()),
+            Some("citations_delta")
+        );
+        assert_eq!(
+            citation.get("type").and_then(|v| v.as_str()),
+            Some("web_search_result_location")
+        );
+        assert_eq!(
+            citation.get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/sky")
+        );
+        assert_eq!(
+            citation.get("title").and_then(|v| v.as_str()),
+            Some("Why the sky is blue")
+        );
+    }
+
+    /// L2-5 STREAMING citations, reverse direction: an `IrDelta::CitationsDelta` (as an Anthropic
+    /// stream reader would produce) must project onto a native Gemini `citationMetadata.citationSources`
+    /// chunk when written by the Gemini writer — and the shape-gate must REBUILD the Gemini source from
+    /// the neutral fields rather than leak the foreign Anthropic `raw` through.
+    #[test]
+    fn stream_anthropic_citation_projects_to_gemini_citation_metadata() {
+        let writer = GeminiWriter;
+        // A CitationsDelta whose `raw` is an ANTHROPIC-shaped object (a Gemini→Anthropic would never
+        // produce this; here we model the Anthropic→Gemini direction). The Gemini writer must NOT
+        // emit the Anthropic `raw` verbatim — it has no Gemini uri/index keys — and must synthesize
+        // a Gemini source from the neutral fields instead.
+        let cit = crate::ir::IrCitation {
+            kind: Some("web_search_result_location".to_string()),
+            cited_text: None,
+            title: Some("Doc Title".to_string()),
+            url: Some("https://anthropic.example/doc".to_string()),
+            document_index: None,
+            start_index: Some(3),
+            end_index: Some(9),
+            encrypted_index: Some("enc-xyz".to_string()),
+            raw: Some(serde_json::json!({
+                "type": "web_search_result_location",
+                "url": "https://anthropic.example/doc",
+                "title": "Doc Title",
+                "encrypted_index": "enc-xyz"
+            })),
+        };
+        let ev = IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::CitationsDelta(vec![cit]),
+        };
+        let (_, body) = writer
+            .write_response_event(&ev)
+            .expect("Gemini writer must emit a citationMetadata chunk for a CitationsDelta");
+        let src = body
+            .pointer("/candidates/0/citationMetadata/citationSources/0")
+            .expect("chunk must carry candidate-level citationSources");
+        // Synthesized from neutral fields — NOT the Anthropic raw (which has no `uri`).
+        assert_eq!(
+            src.get("uri").and_then(|v| v.as_str()),
+            Some("https://anthropic.example/doc")
+        );
+        assert_eq!(src.get("title").and_then(|v| v.as_str()), Some("Doc Title"));
+        assert_eq!(src.get("startIndex").and_then(|v| v.as_i64()), Some(3));
+        assert_eq!(src.get("endIndex").and_then(|v| v.as_i64()), Some(9));
+        // The foreign Anthropic `type` tag must NOT leak into the Gemini source.
+        assert!(
+            src.get("type").is_none(),
+            "Anthropic `raw` must not leak through the Gemini writer: {src}"
+        );
+    }
+
+    /// L2-5: a Gemini stream with NO citations must be unaffected — no `CitationsDelta` is produced,
+    /// and the block balance is unchanged.
+    #[test]
+    fn stream_gemini_no_citations_unaffected() {
+        let events = collect_stream(&[serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Plain answer."}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 1}
+        })]);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockDelta {
+                    delta: crate::ir::IrDelta::CitationsDelta(_),
+                    ..
+                }
+            )),
+            "a citation-free stream must not produce a CitationsDelta: {events:?}"
+        );
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, IrStreamEvent::BlockStart { .. }))
+            .count();
+        let stops = events
+            .iter()
+            .filter(|e| matches!(e, IrStreamEvent::BlockStop { .. }))
+            .count();
+        assert_eq!(starts, stops, "unbalanced block events: {events:?}");
     }
 }

@@ -1785,6 +1785,10 @@ impl ProtocolWriter for CohereWriter {
                 // emit a non-native frame.
                 crate::ir::IrDelta::ThinkingDelta(_) => None,
                 crate::ir::IrDelta::SignatureDelta(_) => None,
+                // L2-5: Cohere v2 streams carry no citation delta shape; suppress rather than emit
+                // a non-native frame. The citation is preserved in the IR for protocols that model
+                // streaming citations.
+                crate::ir::IrDelta::CitationsDelta(_) => None,
             },
 
             IrStreamEvent::BlockStop { index } => {

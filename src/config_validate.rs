@@ -698,6 +698,13 @@ fn validate_limits(limits: &crate::config::LimitsResolved, errors: &mut Vec<Stri
                 .to_string(),
         );
     }
+    if limits.max_inflight_webhook_deliveries < 1 {
+        errors.push(
+            "observability.max_inflight_webhook_deliveries must be >= 1 (a 0-permit semaphore admits \
+             nothing, silently dropping every webhook delivery)"
+                .to_string(),
+        );
+    }
     // The honored-Retry-After ceiling and hard-down cooldown must be >= 1s to be meaningful.
     if limits.max_honored_retry_after_secs < 1 {
         errors.push(

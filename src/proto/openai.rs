@@ -1641,6 +1641,12 @@ impl ProtocolWriter for OpenAiWriter {
                     // Lossy-by-necessity: OpenAI has no signature stream equivalent.
                     None
                 }
+                crate::ir::IrDelta::CitationsDelta(_) => {
+                    // L2-5: OpenAI chat-completions streaming has no citation delta shape; suppress
+                    // rather than emit a non-native frame. The citation is preserved in the IR and
+                    // re-emitted by any protocol that models streaming citations.
+                    None
+                }
             },
             IrStreamEvent::BlockStop { .. } => None,
             IrStreamEvent::MessageDelta {
