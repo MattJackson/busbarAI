@@ -2001,7 +2001,12 @@ impl ProtocolWriter for BedrockWriter {
         out
     }
 
-    fn rewrite_model(&self, _body: &mut serde_json::Value, _model: &str) {}
+    // Bedrock carries the target model in the request URL, not the body, so this is a no-op and
+    // never changes the body → always reports `false` for pristine-tracking (a same-protocol Bedrock
+    // passthrough is never made non-pristine by model rewriting).
+    fn rewrite_model_if_needed(&self, _body: &mut serde_json::Value, _model: &str) -> bool {
+        false
+    }
 
     // NOTE: Bedrock Converse treats `inferenceConfig.maxTokens` as OPTIONAL (it applies the model's
     // default when omitted, and this writer omits an empty `inferenceConfig` entirely). So Bedrock

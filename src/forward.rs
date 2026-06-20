@@ -47,6 +47,17 @@ const HDR_ROUTE_TARGET: &str = "x-busbar-route-target";
 /// surfaces. Hoisted to one const so the literal isn't repeated across egress/health/observability.
 pub(crate) const APPLICATION_JSON: &str = "application/json";
 
+/// Universal same-protocol response-translate FLAG (Change B step 2). When `true`, a same-protocol
+/// streaming SSE / event-stream response is routed through a `StreamTranslate` built via
+/// `StreamTranslate::new_same_proto` — which runs the full reader→IR pipeline for usage extraction
+/// (the future A-tap) but re-emits the ORIGINAL frame bytes VERBATIM, so the client stream is
+/// byte-for-byte identical to today's raw-chunk passthrough. When `false`, the legacy
+/// `translate == None` raw-chunk passthrough is used instead. This is the reversible rollout switch:
+/// flipping it to `false` fully reverts step 2's response-path change with no other edits. It does
+/// NOT affect billing — step 2 keeps the live `UsageTap` authoritative and only SHADOW-checks the
+/// IR-derived usage against it (see the `shadow_check` test-only assertions).
+pub(crate) const ENABLE_UNIVERSAL_SAME_PROTO_TRANSLATE: bool = true;
+
 tokio::task_local! {
     /// Per-request slot the `server_timing` middleware reads to compute Busbar's INTERNAL
     /// processing time (= total request wall-clock − upstream round-trip), reported as a
@@ -267,11 +278,21 @@ fn shape_cross_protocol_error(
 ///     `rewrite_model` installs the authoritative one.
 ///
 /// The gemini array key is stripped for body-model ingress too (it is never native to any protocol).
-fn strip_router_shim_keys(v: &mut Value, egress_protocol: &str) {
+///
+/// Returns whether the body actually CHANGED (a key was present and removed). This is invalidation
+/// set entries #1 (gemini JSON-array key) and #2 (`stream` for path-model egress) of the request
+/// short-circuit safety contract: a `true` here makes a same-protocol request NON-pristine. A
+/// same-proto request that carries NEITHER of these keys is left byte-for-byte untouched and can
+/// short-circuit to its retained original bytes.
+fn strip_router_shim_keys(v: &mut Value, egress_protocol: &str) -> bool {
+    let mut changed = false;
     if let Some(obj) = v.as_object_mut() {
         // The gemini JSON-array key is never native to ANY protocol → strip unconditionally (also
         // closes the leak where a body-model client smuggles the key in its own controlled body).
-        obj.remove(GEMINI_JSON_ARRAY_SHIM_KEY);
+        // `remove` returns the previous value iff the key was present → that is a real mutation (#1).
+        if obj.remove(GEMINI_JSON_ARRAY_SHIM_KEY).is_some() {
+            changed = true;
+        }
         // `stream` is a path-model shim for the EGRESS protocols gemini/bedrock (stream intent and
         // model both ride the URL there; `has_model_in_url()` covers both). For body-model egress
         // `stream` is the writer-authored field the backend needs to start streaming, so it must be
@@ -279,10 +300,13 @@ fn strip_router_shim_keys(v: &mut Value, egress_protocol: &str) {
         if crate::proto::protocol_for(egress_protocol)
             .map(|p| p.writer().has_model_in_url())
             .unwrap_or(false)
+            && obj.remove("stream").is_some()
         {
-            obj.remove("stream");
+            // #2: `stream` was present AND the egress is path-model → real mutation.
+            changed = true;
         }
     }
+    changed
 }
 
 /// Remove the SHIM `model` key on the SAME-PROTOCOL gemini/bedrock passthrough path, AFTER
@@ -295,15 +319,22 @@ fn strip_router_shim_keys(v: &mut Value, egress_protocol: &str) {
 /// Thin wrapper: dispatches through `ProtocolWriter::has_model_in_url` so the per-protocol decision
 /// (gemini/bedrock → strip; all others → keep) lives in the writer vtable, not in this agnostic
 /// function. An unknown future url-model protocol only needs an override in its writer.
-fn strip_same_protocol_model_shim(v: &mut Value, ingress_protocol: &str) {
+///
+/// Returns whether the body actually CHANGED (a `model` key was present and removed). This is
+/// invalidation set entry #4 of the request short-circuit safety contract: on a same-protocol
+/// gemini/bedrock passthrough a body that carried `model` is made NON-pristine (the retained
+/// original carries a `model` the native backend must not see). A same-proto path-model request that
+/// arrived without a body `model` is left untouched and stays pristine.
+fn strip_same_protocol_model_shim(v: &mut Value, ingress_protocol: &str) -> bool {
     let model_in_url = crate::proto::protocol_for(ingress_protocol)
         .map(|p| p.writer().has_model_in_url())
         .unwrap_or(false);
     if model_in_url {
         if let Some(obj) = v.as_object_mut() {
-            obj.remove("model");
+            return obj.remove("model").is_some();
         }
     }
+    false
 }
 
 /// Router-internal shim key the gemini ingress route injects into the request body when the client
@@ -350,8 +381,20 @@ pub(crate) fn translate_request_cross_protocol(
     i: usize,
     ingress_protocol: &str,
     mut body: Value,
+    // The PRISTINE source bytes `body` was parsed from THIS hop (the retained original). On a
+    // same-protocol passthrough where no same-proto-reachable mutation fired (the request short-
+    // circuit, Change B step 1), these exact bytes are re-emitted verbatim instead of re-serializing
+    // the `Value` — keeping the upstream payload byte-identical and skipping the serialize hot spot.
+    hop_bytes: &[u8],
 ) -> Result<Vec<u8>, Box<Response>> {
     let egress_name = app.lanes[i].protocol.name();
+    // Request short-circuit pristine-tracking (Change B). Starts true; flips false the moment ANY
+    // same-protocol-reachable mutation actually changes the body. The cross-protocol branch below
+    // always rebuilds the body from the IR (read_request → write_request), so it is never pristine.
+    // The invalidation contract is EXACTLY entries #1-#4 of the design table — strip_router_shim_keys
+    // (#1,#2), rewrite_model_if_needed (#3), strip_same_protocol_model_shim (#4) — each of which now
+    // reports whether it truly changed the body.
+    let mut pristine = true;
     if ingress_protocol != egress_name {
         // one cross-protocol translation hop for this request.
         metrics::counter!(
@@ -398,6 +441,10 @@ pub(crate) fn translate_request_cross_protocol(
                 // it in their own writer. So no seam-level handling is needed here anymore.
                 ir.extra.clear();
                 body = app.lanes[i].protocol.writer().write_request(&ir);
+                // The body was fully rebuilt from the IR (read_request → write_request), so it bears
+                // no fixed relationship to `hop_bytes` — a cross-protocol hop is NEVER pristine and
+                // must serialize the rewritten `Value`, never short-circuit to the original bytes.
+                pristine = false;
             }
             Err(_) => {
                 return Err(Box::new(ingress_error(
@@ -411,18 +458,31 @@ pub(crate) fn translate_request_cross_protocol(
     }
     // Remove the never-native shim keys (gemini JSON-array key on every protocol; `stream` for
     // path-model EGRESS) on EVERY branch — same- AND cross-protocol. `model` is handled below,
-    // ordered relative to `rewrite_model`.
-    strip_router_shim_keys(&mut body, egress_name);
-    // `rewrite_model` installs the authoritative lane model. ORDERING (critical): on a cross-protocol
-    // hop to a BODY-MODEL egress (gemini/bedrock → openai/anthropic/cohere/responses) the backend
-    // REQUIRES this `model` body field, so `model` is stripped ONLY on the same-protocol passthrough
-    // (below), where the model rides the URL and a body `model` is an indistinguishability leak.
-    app.lanes[i]
+    // ordered relative to `rewrite_model`. Each helper reports whether it ACTUALLY changed the body;
+    // any true makes a same-protocol hop non-pristine (`&` accumulates into `pristine`). This is the
+    // structural coupling: a future same-proto-reachable mutation added to these helpers automatically
+    // invalidates the short-circuit (it cannot be silently missed).
+    pristine &= !strip_router_shim_keys(&mut body, egress_name); // invalidators #1, #2
+                                                                 // `rewrite_model_if_needed` installs the authoritative lane model. ORDERING (critical): on a
+                                                                 // cross-protocol hop to a BODY-MODEL egress (gemini/bedrock → openai/anthropic/cohere/responses)
+                                                                 // the backend REQUIRES this `model` body field, so `model` is stripped ONLY on the same-protocol
+                                                                 // passthrough (below), where the model rides the URL and a body `model` is an indistinguishability
+                                                                 // leak. Reports a change only when the written model differs from the body's existing one (#3).
+    pristine &= !app.lanes[i]
         .protocol
         .writer()
-        .rewrite_model(&mut body, &app.lanes[i].model);
+        .rewrite_model_if_needed(&mut body, &app.lanes[i].model); // invalidator #3
     if ingress_protocol == egress_name {
-        strip_same_protocol_model_shim(&mut body, ingress_protocol);
+        pristine &= !strip_same_protocol_model_shim(&mut body, ingress_protocol);
+        // invalidator #4
+    }
+    // Request SHORT-CIRCUIT (Change B step 1): a same-protocol passthrough that triggered none of the
+    // invalidators #1-#4 left `body` byte-for-byte equivalent to the retained `hop_bytes`, so re-emit
+    // those exact bytes verbatim — byte-identical to the old re-serialize path, minus the serialize
+    // cost (and minus any key-ordering / float-formatting drift a round-trip could introduce). Cross-
+    // protocol hops set `pristine = false` above and always fall through to the serialize arm.
+    if ingress_protocol == egress_name && pristine {
+        return Ok(hop_bytes.to_vec());
     }
     // sonic-rs: SIMD serialize of the (large, string-heavy) upstream body — the request-path hot spot.
     match crate::json::to_vec(&body) {
@@ -1213,20 +1273,37 @@ where
                     if !this.first_byte_sent.load(Ordering::Relaxed) {
                         this.first_byte_sent.store(true, Ordering::Relaxed);
                     }
-                    // cross-protocol → translate egress SSE bytes to the ingress format.
+                    // cross-protocol → translate egress SSE bytes to the ingress format. SAME-protocol
+                    // (Change B step 2) → `t.feed` returns the VERBATIM original frame bytes, and the
+                    // IR pipeline ran only as a usage side-channel (`t.usage()` shadow value).
                     if let Some(t) = this.translate.as_mut() {
+                        let same_proto = t.is_same_proto();
                         let out = t.feed(&chunk);
                         let out_bytes = Bytes::from(out);
-                        // Feed the tap with JSON TEXT, never binary frames. For the five SSE ingress
-                        // protocols the translated `out` IS the JSON-bearing SSE text the tap's
-                        // `{`-scanner is built for. But for BEDROCK ingress the translated `out` is
-                        // binary `application/vnd.amazon.eventstream` framing (u32 length prefixes,
-                        // CRC32s, header blocks whose stray `{` bytes would mislead the scanner into
-                        // parsing garbage or zeroing usage). On that path read the pre-encode JSON the
-                        // translator captured (`take_tap_json`) instead, so token accounting is
-                        // reliable. (A same-protocol passthrough — translate=None — feeds the raw chunk
-                        // below, already the right shape there.)
-                        if t.ingress_is_eventstream() {
+                        if same_proto {
+                            // SAME-PROTOCOL: keep the LIVE `UsageTap` behaving EXACTLY as the legacy
+                            // raw-chunk passthrough did — feed it the ORIGINAL `chunk` via the same
+                            // per-protocol mechanism (so token accounting AND in-band-error breaker
+                            // tripping are byte-for-byte unchanged from the `translate == None` path the
+                            // flag replaces). The translator's `take_tap_json`/`out_bytes` are NOT used
+                            // for the live tap here; the IR-derived `t.usage()` is the SHADOW value only.
+                            if this.ingress_eventstream {
+                                // Bedrock binary frames: scan natively (usage `metadata` + in-band
+                                // `*Exception` breaker signal) — the JSON `{`-scanner can't read binary.
+                                this.tap.feed_eventstream(&chunk);
+                            } else {
+                                this.tap.feed(&chunk);
+                            }
+                        } else if t.ingress_is_eventstream() {
+                            // Feed the tap with JSON TEXT, never binary frames. For the five SSE ingress
+                            // protocols the translated `out` IS the JSON-bearing SSE text the tap's
+                            // `{`-scanner is built for. But for BEDROCK ingress the translated `out` is
+                            // binary `application/vnd.amazon.eventstream` framing (u32 length prefixes,
+                            // CRC32s, header blocks whose stray `{` bytes would mislead the scanner into
+                            // parsing garbage or zeroing usage). On that path read the pre-encode JSON the
+                            // translator captured (`take_tap_json`) instead, so token accounting is
+                            // reliable. (A same-protocol passthrough — translate=None — feeds the raw chunk
+                            // below, already the right shape there.)
                             let tap_json = t.take_tap_json();
                             if !tap_json.is_empty() {
                                 this.tap.feed(&Bytes::from(tap_json));
@@ -2693,17 +2770,18 @@ pub(crate) async fn forward_with_pool_parsed(
         // degraded path): read→clear-extra→write, shim-key strip, model rewrite, serialize. Both
         // paths route through `translate_request_cross_protocol` so neither can carry a translation
         // step the other lacks (the recurring drift class this round's unification ends).
-        let payload = match translate_request_cross_protocol(&app, i, ingress_protocol, hop_v) {
-            Ok(p) => p,
-            Err(resp) => {
-                // Probe class guard: a translation failure also bails before dispatch, so release
-                // the (possibly won) single-flight probe before returning — same wedged-HalfOpen
-                // leak as the re-parse path above.
-                app.store.release_probe_in(pool_name, i);
-                drop(permit);
-                return *resp;
-            }
-        };
+        let payload =
+            match translate_request_cross_protocol(&app, i, ingress_protocol, hop_v, &body) {
+                Ok(p) => p,
+                Err(resp) => {
+                    // Probe class guard: a translation failure also bails before dispatch, so release
+                    // the (possibly won) single-flight probe before returning — same wedged-HalfOpen
+                    // leak as the re-parse path above.
+                    app.store.release_probe_in(pool_name, i);
+                    drop(permit);
+                    return *resp;
+                }
+            };
         let base = &app.lanes[i].base_url;
 
         // Mode-aware key selection: passthrough uses caller token, others use lane's api_key
@@ -3508,11 +3586,25 @@ pub(crate) async fn forward_with_pool_parsed(
 
                 // Use FirstByteBody wrapper to track first byte and emit SSE error events on mid-stream failures
                 // on a cross-protocol SSE response, translate egress frames → ingress frames.
+                let egress_name_for_translate = app.lanes[i].protocol.name();
                 let translate = if is_sse {
-                    crate::proto::StreamTranslate::new(
-                        ingress_protocol,
-                        app.lanes[i].protocol.name(),
-                    )
+                    if ingress_protocol == egress_name_for_translate {
+                        // SAME-PROTOCOL SSE/event-stream (Change B step 2): when the universal-translate
+                        // flag is on, run the verbatim same-proto translator (byte-exact re-emit + IR
+                        // usage side-channel). When off, fall back to the legacy raw-chunk passthrough
+                        // (`None`). `new_same_proto` is `None` only for an unknown protocol, in which
+                        // case we also fall back to passthrough.
+                        if ENABLE_UNIVERSAL_SAME_PROTO_TRANSLATE {
+                            crate::proto::StreamTranslate::new_same_proto(ingress_protocol)
+                        } else {
+                            None
+                        }
+                    } else {
+                        crate::proto::StreamTranslate::new(
+                            ingress_protocol,
+                            egress_name_for_translate,
+                        )
+                    }
                 } else {
                     None
                 };
@@ -3797,7 +3889,7 @@ async fn forward_once(
     // previously lacked the `ir.extra.clear()` the hot path had, leaking source-only keys like OpenAI
     // `logprobs`/`top_logprobs`/`n` to a foreign backend): the clear now lives in the one shared fn,
     // so neither path can be missing it.
-    let payload = match translate_request_cross_protocol(app, i, ingress_protocol, v) {
+    let payload = match translate_request_cross_protocol(app, i, ingress_protocol, v, body) {
         Ok(p) => p,
         Err(resp) => {
             // Probe-leak guard (HIGH #1): release the POOL-cell single-flight probe this
@@ -4207,6 +4299,11 @@ async fn forward_once(
             // selected against, never the unrelated default cell.
             let translate = if is_sse && cross_protocol {
                 crate::proto::StreamTranslate::new(ingress_protocol, egress_name)
+            } else if is_sse && !cross_protocol && ENABLE_UNIVERSAL_SAME_PROTO_TRANSLATE {
+                // SAME-PROTOCOL SSE/event-stream (Change B step 2) on the degraded path: mirror the
+                // main `forward_with_pool` wiring — the verbatim same-proto translator (byte-exact
+                // re-emit + IR usage side-channel). `None` for an unknown protocol → legacy passthrough.
+                crate::proto::StreamTranslate::new_same_proto(ingress_protocol)
             } else {
                 None
             };
@@ -5559,6 +5656,369 @@ mod on_exhausted_tests {
     }
 }
 
+/// Change B step 1 — REQUEST short-circuit. Proves that a same-protocol passthrough request whose
+/// body triggers none of invalidators #1-#4 is re-emitted BYTE-IDENTICAL to the retained original
+/// (`hop_bytes`), and that each invalidator individually forces NON-pristine and the correct
+/// rewritten bytes. Cross-protocol behaviour is exercised elsewhere; here we pin the same-proto path.
+#[cfg(test)]
+mod request_short_circuit_tests {
+    use super::translate_request_cross_protocol;
+    use super::GEMINI_JSON_ARRAY_SHIM_KEY;
+    use crate::proto::Protocol;
+    use crate::test_support::{LaneSpec, TestApp};
+    use serde_json::json;
+
+    // Build a single-lane App whose one lane speaks `proto` with the given `lane_model`. The lane
+    // base_url is unused (the short-circuit never dispatches). `i == 0` is the lane index.
+    fn app_with_lane(proto: Protocol, lane_model: &str) -> std::sync::Arc<crate::state::App> {
+        TestApp::new()
+            .lane(LaneSpec::new(lane_model, proto, "http://unused.local"))
+            .build()
+    }
+
+    // Drive the request seam for a SAME-protocol hop (ingress == egress) and return the egress bytes.
+    fn shape_same_proto(
+        proto: Protocol,
+        proto_name: &'static str,
+        lane_model: &str,
+        body: serde_json::Value,
+    ) -> Vec<u8> {
+        let app = app_with_lane(proto, lane_model);
+        // hop_bytes = the exact serialized source bytes the caller retained for this hop.
+        let hop_bytes = crate::json::to_vec(&body).unwrap();
+        translate_request_cross_protocol(&app, 0, proto_name, body, &hop_bytes)
+            .expect("same-proto shaping is infallible for a valid body")
+    }
+
+    // ---- FIDELITY PROOF: pristine same-proto request → bytes == retained original, all 6 protocols.
+
+    // BODY-MODEL protocols (anthropic/openai/cohere/responses): a pristine request carries `model`
+    // == lane.model and no shim keys, so NOTHING mutates → short-circuit emits the original bytes.
+    #[test]
+    fn pristine_same_proto_is_byte_identical_body_model() {
+        let cases: &[(Protocol, &'static str, serde_json::Value)] = &[
+            (
+                Protocol::anthropic(),
+                "anthropic",
+                json!({"model":"claude-3","max_tokens":7,"messages":[{"role":"user","content":"hi"}]}),
+            ),
+            (
+                Protocol::openai(),
+                "openai",
+                json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":0.5}),
+            ),
+            (
+                Protocol::cohere(),
+                "cohere",
+                json!({"model":"command-r","messages":[{"role":"user","content":"hi"}]}),
+            ),
+            (
+                Protocol::responses(),
+                "responses",
+                json!({"model":"gpt-4o","input":"hi"}),
+            ),
+        ];
+        for (proto, name, body) in cases {
+            // lane.model == body.model → rewrite_model_if_needed is a no-op (#3 not triggered).
+            let lane_model = body.get("model").and_then(|m| m.as_str()).unwrap();
+            let hop_bytes = crate::json::to_vec(body).unwrap();
+            let out = shape_same_proto(proto.clone(), name, lane_model, body.clone());
+            assert_eq!(
+                out, hop_bytes,
+                "{name}: pristine same-proto request must short-circuit to the retained original bytes"
+            );
+        }
+    }
+
+    // MODEL-IN-URL protocols (gemini/bedrock): a pristine native request carries NO body `model`
+    // (it rides the URL) and NO `stream`/array-shim key → nothing mutates → original bytes verbatim.
+    #[test]
+    fn pristine_same_proto_is_byte_identical_url_model() {
+        let cases: &[(Protocol, &'static str, serde_json::Value)] = &[
+            (
+                Protocol::gemini(),
+                "gemini",
+                json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}]}),
+            ),
+            (
+                Protocol::bedrock(),
+                "bedrock",
+                json!({"messages":[{"role":"user","content":[{"text":"hi"}]}]}),
+            ),
+        ];
+        for (proto, name, body) in cases {
+            let hop_bytes = crate::json::to_vec(body).unwrap();
+            // The egress payload is byte-identical to the retained original. Bedrock reaches this via
+            // the true short-circuit (its `rewrite_model_if_needed` is a no-op → pristine). Gemini's
+            // default rewrite inserts the lane model which the same-proto strip then removes — a net
+            // no-op on the Value, so canonical re-serialization still yields the identical bytes. Both
+            // satisfy the byte-fidelity contract (the test that matters); only the path differs.
+            let out = shape_same_proto(proto.clone(), name, "url-model-x", body.clone());
+            assert_eq!(
+                out, hop_bytes,
+                "{name}: pristine same-proto url-model request egress must be byte-identical to input"
+            );
+        }
+    }
+
+    // ---- INVALIDATORS #1-#4: each must force NON-pristine and produce the correct rewritten bytes.
+
+    // #1: gemini JSON-array shim key present → stripped → NON-pristine → bytes differ, key gone.
+    #[test]
+    fn invalidator_1_gemini_array_shim_key_forces_non_pristine() {
+        // Use a body-model ingress so only #1 fires (the key is stripped on EVERY egress).
+        let body = json!({"model":"gpt-4o","messages":[],GEMINI_JSON_ARRAY_SHIM_KEY:true});
+        let hop_bytes = crate::json::to_vec(&body).unwrap();
+        let out = shape_same_proto(Protocol::openai(), "openai", "gpt-4o", body);
+        assert_ne!(
+            out, hop_bytes,
+            "#1: array-shim key present must invalidate the short-circuit"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            parsed.get(GEMINI_JSON_ARRAY_SHIM_KEY).is_none(),
+            "#1: the never-native array shim key must be stripped from the egress body"
+        );
+    }
+
+    // #2: `stream` present on a PATH-MODEL egress (gemini) → stripped → NON-pristine → stream gone.
+    #[test]
+    fn invalidator_2_stream_on_path_model_egress_forces_non_pristine() {
+        let body = json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}],"stream":true});
+        let hop_bytes = crate::json::to_vec(&body).unwrap();
+        let out = shape_same_proto(Protocol::gemini(), "gemini", "url-model-x", body);
+        assert_ne!(
+            out, hop_bytes,
+            "#2: `stream` on a path-model egress must invalidate"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            parsed.get("stream").is_none(),
+            "#2: `stream` must be stripped for a path-model (gemini) egress"
+        );
+    }
+
+    // #2 negative control: `stream` on a BODY-MODEL egress (openai) is the writer-authored field the
+    // backend needs → NOT stripped → with model matching lane, request stays pristine + byte-identical.
+    #[test]
+    fn invalidator_2_stream_on_body_model_egress_stays_pristine() {
+        let body = json!({"model":"gpt-4o","messages":[],"stream":true});
+        let hop_bytes = crate::json::to_vec(&body).unwrap();
+        let out = shape_same_proto(Protocol::openai(), "openai", "gpt-4o", body);
+        assert_eq!(
+            out, hop_bytes,
+            "#2 neg: `stream` on a body-model egress must be PRESERVED → request stays pristine"
+        );
+    }
+
+    // #3: lane.model differs from body.model → rewrite_model_if_needed installs the lane model →
+    // NON-pristine → bytes differ, model rewritten to the authoritative lane model.
+    #[test]
+    fn invalidator_3_model_rewrite_forces_non_pristine() {
+        let body = json!({"model":"client-alias","messages":[]});
+        let hop_bytes = crate::json::to_vec(&body).unwrap();
+        let out = shape_same_proto(Protocol::openai(), "openai", "gpt-4o-real", body);
+        assert_ne!(
+            out, hop_bytes,
+            "#3: a model alias differing from lane.model must invalidate"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed.get("model").and_then(|m| m.as_str()),
+            Some("gpt-4o-real"),
+            "#3: the egress body must carry the authoritative lane model"
+        );
+    }
+
+    // #3 negative control: body.model already EQUALS lane.model → no change → pristine short-circuit.
+    #[test]
+    fn invalidator_3_matching_model_stays_pristine() {
+        let body = json!({"model":"gpt-4o-real","messages":[]});
+        let hop_bytes = crate::json::to_vec(&body).unwrap();
+        let out = shape_same_proto(Protocol::openai(), "openai", "gpt-4o-real", body);
+        assert_eq!(
+            out, hop_bytes,
+            "#3 neg: a body model already matching lane.model must NOT invalidate (byte-identical)"
+        );
+    }
+
+    // #4: same-proto gemini passthrough with a body `model` (a router shim) → stripped after rewrite →
+    // NON-pristine → bytes differ, model gone (gemini carries model in the URL).
+    #[test]
+    fn invalidator_4_same_proto_model_shim_strip_forces_non_pristine() {
+        let body =
+            json!({"model":"router-shim","contents":[{"role":"user","parts":[{"text":"hi"}]}]});
+        let hop_bytes = crate::json::to_vec(&body).unwrap();
+        let out = shape_same_proto(Protocol::gemini(), "gemini", "url-model-x", body);
+        assert_ne!(
+            out, hop_bytes,
+            "#4: a same-proto path-model body `model` must invalidate"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            parsed.get("model").is_none(),
+            "#4: a same-proto gemini/bedrock body `model` shim must be stripped"
+        );
+    }
+}
+
+/// Change B step 2 — SHADOW CHECK. Proves the IR-derived A-tap usage (`StreamTranslate::usage()`,
+/// the value step 3 will route billing through) AGREES with the LIVE `UsageTap` byte-scanner for all
+/// 6 protocols, by feeding the SAME captured native frames to BOTH and asserting equal
+/// input_tokens/output_tokens. This is the evidence the A-tap is safe before step 3 deletes the
+/// byte-scanner. UsageTap stays authoritative for billing in step 2 — this is a parallel assertion
+/// only, not a billing change.
+#[cfg(test)]
+mod same_proto_shadow_check_tests {
+    use super::UsageTap;
+    use crate::proto::StreamTranslate;
+    use bytes::Bytes;
+
+    // Drive both the same-proto translator (IR usage = A-tap) AND a UsageTap fed EXACTLY as
+    // `FirstByteBody` feeds it for a same-proto stream (`feed` for SSE, `feed_eventstream` for the
+    // bedrock binary path), then return both token pairs for comparison.
+    fn shadow(proto: &str, frames: &[&[u8]], eventstream: bool) -> ((u64, u64), (u64, u64)) {
+        let mut t = StreamTranslate::new_same_proto(proto).expect("same-proto translator");
+        let mut tap = UsageTap::new();
+        for f in frames {
+            let _ = t.feed(f);
+            let chunk = Bytes::copy_from_slice(f);
+            if eventstream {
+                tap.feed_eventstream(&chunk);
+            } else {
+                tap.feed(&chunk);
+            }
+        }
+        let _ = t.finish();
+        let u = t.usage().cloned().unwrap_or(crate::ir::IrUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        });
+        let ir = (u.input_tokens, u.output_tokens);
+        let tapped = (
+            tap.input_tokens.unwrap_or(0),
+            tap.output_tokens.unwrap_or(0),
+        );
+        (ir, tapped)
+    }
+
+    fn assert_agree(proto: &str, frames: &[&[u8]], eventstream: bool) {
+        let (ir, tapped) = shadow(proto, frames, eventstream);
+        assert_eq!(
+            ir, tapped,
+            "{proto}: IR A-tap usage {ir:?} must EQUAL UsageTap byte-scan {tapped:?} (shadow check)"
+        );
+        assert_ne!(
+            ir,
+            (0, 0),
+            "{proto}: shadow check must exercise non-zero usage"
+        );
+    }
+
+    #[test]
+    fn shadow_anthropic_with_start_usage_backfill() {
+        // Anthropic puts input on message_start, output on message_delta — exercises the start-usage
+        // backfill the A-tap reads AFTER (per design §d).
+        assert_agree(
+            "anthropic",
+            &[
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n\n",
+                b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n\n",
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ],
+            false,
+        );
+    }
+
+    #[test]
+    fn shadow_openai_include_usage_split() {
+        // OpenAI include_usage splits the finish chunk (no usage) from the trailing usage-only chunk
+        // (responses.rs:8910 convention) — exercises the A-tap merge that ignores the first zero.
+        assert_agree(
+            "openai",
+            &[
+                b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+                b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":9,\"total_tokens\":22}}\n\n",
+                b"data: [DONE]\n\n",
+            ],
+            false,
+        );
+    }
+
+    #[test]
+    fn shadow_gemini() {
+        assert_agree(
+            "gemini",
+            &[
+                b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hi\"}]}}]}\n\n",
+                b"data: {\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"\"}]}}],\"usageMetadata\":{\"promptTokenCount\":15,\"candidatesTokenCount\":4,\"totalTokenCount\":19}}\n\n",
+            ],
+            false,
+        );
+    }
+
+    #[test]
+    fn shadow_cohere() {
+        assert_agree(
+            "cohere",
+            &[
+                b"event: message-start\ndata: {\"type\":\"message-start\",\"id\":\"co_1\"}\n\n",
+                b"event: message-end\ndata: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"tokens\":{\"input_tokens\":17,\"output_tokens\":6}}}}\n\n",
+            ],
+            false,
+        );
+    }
+
+    // KNOWN DIVERGENCE (safety-contract finding): OpenAI Responses streaming nests usage under
+    // `response.usage` on the `response.completed` frame, but the LIVE `UsageTap.extract_usage_any`
+    // only reads a TOP-LEVEL `usage` object — so it reports ZERO for a same-protocol Responses stream
+    // (a pre-existing UsageTap gap: that path is under-billed today). The IR A-tap reads the IR the
+    // ResponsesReader decodes and correctly reports the real tokens. This test pins the divergence so
+    // the gap is documented and tracked: the A-tap is MORE correct here, which is exactly why step 3
+    // (route billing through the A-tap) will FIX Responses streaming token accounting. This is NOT a
+    // regression introduced by Change B — the live tap behaves identically with or without the
+    // same-proto translator (the translator re-emits verbatim; the tap reads the same bytes).
+    #[test]
+    fn shadow_responses_known_divergence_a_tap_is_correct() {
+        let frames: &[&[u8]] = &[
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":21,\"output_tokens\":8}}}\n\n",
+        ];
+        let (ir, tapped) = shadow("responses", frames, false);
+        assert_eq!(
+            ir,
+            (21, 8),
+            "responses IR A-tap must capture the nested response.usage tokens"
+        );
+        assert_eq!(
+            tapped,
+            (0, 0),
+            "responses LIVE UsageTap currently MISSES nested response.usage (pre-existing gap; \
+             the A-tap fixes it in step 3)"
+        );
+    }
+
+    #[test]
+    fn shadow_bedrock_binary_eventstream() {
+        // The bedrock binary path: the LIVE tap reads native frames via `feed_eventstream`, the A-tap
+        // reads the IR. Both must land on the same tokens.
+        use crate::eventstream::encode_frame;
+        let mut start = Vec::new();
+        start.extend(encode_frame("messageStart", br#"{"role":"assistant"}"#));
+        let mut stop = Vec::new();
+        stop.extend(encode_frame("messageStop", br#"{"stopReason":"end_turn"}"#));
+        let mut meta = Vec::new();
+        meta.extend(encode_frame(
+            "metadata",
+            br#"{"usage":{"inputTokens":31,"outputTokens":12},"metrics":{"latencyMs":5}}"#,
+        ));
+        assert_agree("bedrock", &[&start, &stop, &meta], true);
+    }
+}
+
 #[cfg(test)]
 mod mid_stream_error_tests {
     use super::{
@@ -5893,7 +6353,7 @@ mod mid_stream_error_tests {
         strip_router_shim_keys(&mut v, egress);
         crate::proto::Protocol::openai()
             .writer()
-            .rewrite_model(&mut v, "gpt-4o");
+            .rewrite_model_if_needed(&mut v, "gpt-4o");
         if ingress == egress {
             strip_same_protocol_model_shim(&mut v, ingress);
         }
@@ -5919,7 +6379,7 @@ mod mid_stream_error_tests {
         strip_router_shim_keys(&mut v, egress);
         crate::proto::Protocol::gemini()
             .writer()
-            .rewrite_model(&mut v, "gemini-1.5-pro");
+            .rewrite_model_if_needed(&mut v, "gemini-1.5-pro");
         if ingress == egress {
             strip_same_protocol_model_shim(&mut v, ingress);
         }

@@ -606,15 +606,28 @@ pub(crate) trait ProtocolWriter: Send + Sync {
         self.auth_headers(key)
     }
 
-    /// Rewrites the model field in the request body.
+    /// Rewrites the model field in the request body, returning whether the body actually CHANGED.
     ///
     /// The default inserts/overwrites a top-level `"model"` string — the shape every JSON-body
     /// protocol (Anthropic, Cohere, OpenAI, Gemini, Responses) needs. `BedrockWriter` overrides
-    /// this with a no-op because the target model is carried in the request URL, not the body.
-    fn rewrite_model(&self, body: &mut serde_json::Value, model: &str) {
+    /// this with a no-op (returns `false`) because the target model is carried in the request URL,
+    /// not the body.
+    ///
+    /// The return value is the structural coupling that drives request pristine-tracking (Change B):
+    /// it reports `true` ONLY when the value truly changes (the existing `model` differs from the
+    /// authoritative lane model, or no `model` was present), so a same-protocol passthrough whose
+    /// client already sent the canonical model name stays pristine and can short-circuit.
+    fn rewrite_model_if_needed(&self, body: &mut serde_json::Value, model: &str) -> bool {
         if let Some(obj) = body.as_object_mut() {
+            // Only an ACTUAL change counts: if the body already carries exactly this model string,
+            // the insert is a no-op and the body is unchanged (stays pristine).
+            if obj.get("model").and_then(|m| m.as_str()) == Some(model) {
+                return false;
+            }
             obj.insert("model".to_string(), serde_json::json!(model));
+            return true;
         }
+        false
     }
 
     /// Write an IR request to wire JSON.
@@ -945,7 +958,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
             extra: serde_json::Map::new(),
         };
         let mut body = self.write_request(&ir);
-        self.rewrite_model(&mut body, model);
+        let _ = self.rewrite_model_if_needed(&mut body, model);
         serde_json::to_vec(&body).unwrap_or_default()
     }
 
@@ -1342,6 +1355,21 @@ pub(crate) struct StreamTranslate {
     /// every other ingress ANY post-stop `MessageDelta` is dropped once the message has stopped
     /// (matching v1.0.0-rc.2, which did not read trailing usage at all).
     message_stopped: bool,
+    /// SAME-PROTOCOL universal-translate mode (Change B step 2): `true` when ingress == egress and
+    /// the translator was built via [`StreamTranslate::new_same_proto`]. In this mode `feed` re-emits
+    /// the ORIGINAL frame bytes verbatim (byte-exact passthrough) INSTEAD of re-serializing the IR —
+    /// every frame is structurally pristine (no cross-protocol mutation can fire), so the short-
+    /// circuit is unconditional. The IR pipeline still runs per frame, but purely as a side-channel:
+    /// it drives `last_usage` (the A-tap shadow value) and, for bedrock ingress, `tap_json`. The
+    /// serialized IR output it produces is DISCARDED — only the retained original bytes reach `out`.
+    same_proto: bool,
+    /// The terminal IR-derived usage for this stream (Change A "A-tap" value), accumulated from the
+    /// `MessageStart`/`MessageDelta`/`MessageStop` events `translate_event` processes — AFTER the
+    /// Anthropic start-usage backfill, so it reports the real prompt+completion token counts for every
+    /// protocol. In step 2 this is consumed only by the test-only SHADOW CHECK that proves it AGREES
+    /// with the live `UsageTap` byte-scanner before step 3 routes billing through it. `None` until the
+    /// first usage-bearing terminal event is seen.
+    last_usage: Option<crate::ir::IrUsage>,
 }
 
 /// The OpenAI stream-start identity replayed onto every `chat.completion.chunk` (see
@@ -1358,10 +1386,31 @@ struct OpenAiChunkIdentity {
 impl StreamTranslate {
     /// Build a translator for an ingress→egress pair. `None` if either protocol is unknown OR
     /// ingress == egress (no translation needed — the caller does native passthrough).
+    ///
+    /// This is the CROSS-protocol constructor and its same-proto guard is UNCHANGED: same-protocol
+    /// callers that want the universal-translate verbatim path use [`new_same_proto`] explicitly, so
+    /// the legacy `ingress == egress → None` contract (and every caller relying on it) is preserved.
     pub(crate) fn new(ingress: &str, egress: &str) -> Option<Self> {
         if ingress == egress {
             return None;
         }
+        Self::build(ingress, egress, false)
+    }
+
+    /// Build a SAME-PROTOCOL universal translator (Change B step 2). Unlike [`new`], this returns
+    /// `Some` when `ingress == egress` (the protocol must be known). The resulting translator runs the
+    /// full reader→IR pipeline per frame for usage extraction but re-emits the ORIGINAL frame bytes
+    /// verbatim (see the `same_proto` field) — a byte-exact passthrough with an IR side-channel. The
+    /// caller gates this behind the reversible universal-same-proto flag
+    /// (`forward::ENABLE_UNIVERSAL_SAME_PROTO_TRANSLATE`); when the flag is off the caller passes
+    /// `None` and falls back to the legacy raw-chunk passthrough.
+    pub(crate) fn new_same_proto(proto: &str) -> Option<Self> {
+        Self::build(proto, proto, true)
+    }
+
+    /// Shared constructor body for [`new`] and [`new_same_proto`]. `same_proto` selects the verbatim
+    /// re-emit path in `feed`.
+    fn build(ingress: &str, egress: &str, same_proto: bool) -> Option<Self> {
         let ingress_proto = protocol_for(ingress)?;
         let egress_proto = protocol_for(egress)?;
         // Derive the framing flags from the protocol vtable rather than re-comparing the name
@@ -1390,6 +1439,8 @@ impl StreamTranslate {
             tool_id_remap: ToolIdRemap::default(),
             start_usage: None,
             message_stopped: false,
+            same_proto,
+            last_usage: None,
         })
     }
 
@@ -1450,6 +1501,32 @@ impl StreamTranslate {
                     if usage.cache_read_input_tokens.is_none() {
                         usage.cache_read_input_tokens = start.cache_read_input_tokens;
                     }
+                }
+                // A-tap capture (Change A): accumulate the terminal IR usage AFTER the start-usage
+                // backfill, so `last_usage` reports the real prompt+completion counts for every
+                // protocol regardless of how it split start-vs-terminal usage. Merge per field (keep
+                // any non-zero / Some already seen) rather than blind-overwrite, so a backend that
+                // splits usage across two deltas (e.g. OpenAI `include_usage`: a finish delta with
+                // zero usage, then a usage-only delta) does not let the first zero clobber the second's
+                // real counts. The terminal counts are the live `UsageTap`'s exact input — the shadow
+                // check (step 2) asserts the two agree before step 3 routes billing through this.
+                let acc = self.last_usage.get_or_insert(crate::ir::IrUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                });
+                if usage.input_tokens != 0 {
+                    acc.input_tokens = usage.input_tokens;
+                }
+                if usage.output_tokens != 0 {
+                    acc.output_tokens = usage.output_tokens;
+                }
+                if usage.cache_creation_input_tokens.is_some() {
+                    acc.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+                }
+                if usage.cache_read_input_tokens.is_some() {
+                    acc.cache_read_input_tokens = usage.cache_read_input_tokens;
                 }
             }
             // Bedrock-INGRESS error path: a native AWS SDK dispatches mid-stream errors off the
@@ -1595,6 +1672,62 @@ impl StreamTranslate {
             }
 
             self.emit_ir_event(&ev, out);
+        }
+    }
+
+    /// SAME-PROTOCOL usage side-channel (Change B step 2). Runs ONLY the egress reader + the
+    /// start-usage/backfill/`last_usage` accumulation that `translate_event` does — and NOTHING ELSE
+    /// (no tool-id remap, no identity strip, no writer/fan-out/reframe). The same-proto path re-emits
+    /// the ORIGINAL frame bytes verbatim, so the writer half is pure waste; skipping it keeps the
+    /// short-circuit at-or-below the cost of NOT translating at all (the benchmark gate). The decode
+    /// state still advances (the reader owns it) so multi-frame streams parse correctly, and the A-tap
+    /// `last_usage` is populated identically to the full pipeline (the SHADOW CHECK pins that equality).
+    fn extract_usage_only(&mut self, event_type: &str, data: &serde_json::Value) {
+        for ev in self
+            .egress
+            .reader()
+            .read_response_events(event_type, data, &mut self.decode)
+        {
+            if let crate::ir::IrStreamEvent::MessageStart { usage: Some(u), .. } = &ev {
+                self.start_usage = Some(u.clone());
+            }
+            if let crate::ir::IrStreamEvent::MessageDelta { usage, .. } = &ev {
+                // Mirror translate_event's terminal-usage accumulation (post start-usage backfill).
+                let (mut input, output) = (usage.input_tokens, usage.output_tokens);
+                let (mut cache_creation, mut cache_read) = (
+                    usage.cache_creation_input_tokens,
+                    usage.cache_read_input_tokens,
+                );
+                if let Some(start) = &self.start_usage {
+                    if input == 0 {
+                        input = start.input_tokens;
+                    }
+                    if cache_creation.is_none() {
+                        cache_creation = start.cache_creation_input_tokens;
+                    }
+                    if cache_read.is_none() {
+                        cache_read = start.cache_read_input_tokens;
+                    }
+                }
+                let acc = self.last_usage.get_or_insert(crate::ir::IrUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                });
+                if input != 0 {
+                    acc.input_tokens = input;
+                }
+                if output != 0 {
+                    acc.output_tokens = output;
+                }
+                if cache_creation.is_some() {
+                    acc.cache_creation_input_tokens = cache_creation;
+                }
+                if cache_read.is_some() {
+                    acc.cache_read_input_tokens = cache_read;
+                }
+            }
         }
     }
 
@@ -1829,6 +1962,18 @@ impl StreamTranslate {
             // abort signal rather than being silently swallowed (the decoder clears the buffer and
             // stops, which a length-only check could not tell apart from a clean full drain, so the
             // stream would otherwise continue as if healthy and close with NO terminal exception).
+            // SAME-PROTOCOL bedrock→bedrock (HIGHEST RISK path #1): re-emit the ORIGINAL binary
+            // frame bytes verbatim — NEVER re-encode. `encode_frame` would recompute the
+            // length-prefix and CRC32, and any divergence (key ordering, float formatting,
+            // whitespace) from the upstream's exact bytes is an undecodable frame for a native AWS
+            // SDK. Snapshot the buffer BEFORE draining; `drain_frames_checked` removes only complete
+            // frames from the FRONT (adding nothing), so the consumed prefix
+            // `snapshot[..snapshot.len() - self.buf.len()]` is exactly those frames' original bytes.
+            let pre_drain = if self.same_proto {
+                Some(self.buf.clone())
+            } else {
+                None
+            };
             let (frames, status) = crate::eventstream::drain_frames_checked(&mut self.buf);
             for (event_type, payload) in frames {
                 let Ok(mut data) = serde_json::from_slice::<serde_json::Value>(&payload) else {
@@ -1840,7 +1985,19 @@ impl StreamTranslate {
                         serde_json::Value::String(event_type.clone()),
                     );
                 }
-                self.translate_event(&event_type, &data, &mut out);
+                if self.same_proto {
+                    // Same-proto: run ONLY the reader + usage accumulation (`extract_usage_only`) —
+                    // the writer/reframe half would be discarded, so skip it. The verbatim original
+                    // bytes are emitted below.
+                    self.extract_usage_only(&event_type, &data);
+                } else {
+                    self.translate_event(&event_type, &data, &mut out);
+                }
+            }
+            if let Some(snapshot) = pre_drain {
+                // Append exactly the bytes the drain consumed (the complete frames), verbatim.
+                let consumed = snapshot.len() - self.buf.len();
+                out.extend_from_slice(&snapshot[..consumed]);
             }
             // A malformed prelude is unrecoverable: abandon the stream exactly like the MAX_BUF
             // overflow path so the terminal exception frame is emitted by `finish()` (the `aborted`
@@ -1893,7 +2050,17 @@ impl StreamTranslate {
                     let Ok(data) = crate::json::parse_str::<serde_json::Value>(&data_str) else {
                         continue; // malformed data JSON — skip the frame rather than abort
                     };
-                    self.translate_event(&event_type, &data, &mut out);
+                    if self.same_proto {
+                        // Same-proto (HIGHEST RISK paths #2 gemini json-array & #3 openai bare
+                        // `data:`): run ONLY the reader + `last_usage` accumulation
+                        // (`extract_usage_only`) — the verbatim original frame bytes are emitted from
+                        // the consumed prefix below, so every frame (incl. comments, keepalives,
+                        // `[DONE]`, and the exact `event:`/`data:` line shape and terminator) reaches
+                        // the client byte-for-byte unchanged, and the writer/reframe work is skipped.
+                        self.extract_usage_only(&event_type, &data);
+                    } else {
+                        self.translate_event(&event_type, &data, &mut out);
+                    }
                 }
                 None => {
                     // No complete frame: everything currently buffered has been scanned.
@@ -1901,6 +2068,13 @@ impl StreamTranslate {
                     break;
                 }
             }
+        }
+        // SAME-PROTOCOL verbatim re-emit: append exactly the bytes the loop consumed (every complete
+        // frame, including the keepalive/`[DONE]`/non-`data:` frames the cross-proto path drops),
+        // BEFORE the consumed prefix is reclaimed below — so the client sees the upstream SSE stream
+        // byte-for-byte, with the IR pipeline acting purely as the usage side-channel above.
+        if self.same_proto && consumed > 0 {
+            out.extend_from_slice(&self.buf[..consumed]);
         }
         // Reclaim the consumed prefix in a single shift (linear), then rebase the cursors.
         if consumed > 0 {
@@ -1948,6 +2122,21 @@ impl StreamTranslate {
     /// surfaces a native error element instead of a bare close.
     pub(crate) fn aborted(&self) -> bool {
         self.aborted
+    }
+
+    /// The terminal IR-derived usage accumulated for this stream (the Change A "A-tap" value), or
+    /// `None` if no usage-bearing terminal event was seen. In step 2 the ONLY consumer is the SHADOW
+    /// CHECK that proves it AGREES with the live `UsageTap` — billing is NOT yet routed through it
+    /// (that is step 3). Marked `#[cfg(test)]` so it is not dead code in the production binary until
+    /// step 3 wires it into the billing arm. See the `last_usage` field.
+    #[cfg(test)]
+    pub(crate) fn usage(&self) -> Option<&crate::ir::IrUsage> {
+        self.last_usage.as_ref()
+    }
+
+    /// Whether this translator is in same-protocol verbatim mode (built via [`new_same_proto`]).
+    pub(crate) fn is_same_proto(&self) -> bool {
+        self.same_proto
     }
 
     /// Abandon the stream as unrecoverable: release the reassembly buffer, set `aborted` so every
@@ -2010,6 +2199,15 @@ impl StreamTranslate {
             if self.emit_done {
                 out.extend_from_slice(b"data: [DONE]\n\n");
             }
+            return out;
+        }
+        // SAME-PROTOCOL verbatim mode: the upstream's OWN native terminator (`[DONE]`, the final
+        // bedrock `metadata`/`messageStop` frame, etc.) already rode through `feed` byte-for-byte, so
+        // `finish` must add NOTHING on the happy path — appending a synthetic `[DONE]` or a deferred
+        // `metadata` frame here would duplicate the terminator and corrupt the verbatim stream. The
+        // abort branch above still fires (a truncated same-proto stream must surface an in-band error),
+        // and the IR pipeline never ran its terminator-emitting fan-out into `out` for same-proto.
+        if self.same_proto {
             return out;
         }
         // Bedrock-INGRESS: if a combined stop-delta deferred the `metadata` frame (zero usage,
@@ -7566,6 +7764,286 @@ mod stream_translate_tests {
             bedrock.writer().upstream_path_for("anthropic.claude-3"),
             "/model/anthropic.claude-3/converse"
         );
+    }
+}
+
+/// Change B step 2 — SAME-PROTOCOL FIDELITY PROOF. For each of the 6 protocols, replay captured
+/// native streaming frames through a `StreamTranslate::new_same_proto` translator and assert the
+/// concatenated `feed` + `finish` output is BYTE-FOR-BYTE identical to the input frames (the verbatim
+/// short-circuit must never re-serialize). Also asserts the IR-derived `usage()` (the A-tap shadow
+/// value) matches the token counts embedded in the captured frames. The three HIGHEST-RISK paths
+/// (bedrock binary eventstream, gemini non-`?alt=sse` JSON-array source frames, openai bare `data:`)
+/// get dedicated frame-for-frame assertions.
+#[cfg(test)]
+mod same_proto_fidelity_tests {
+    use super::StreamTranslate;
+
+    // Feed `input` (in one or more chunks) through a same-proto translator and return the
+    // concatenated `feed`+`finish` output. `chunks` lets a test prove cross-chunk reassembly is still
+    // verbatim (frames split across transport boundaries).
+    fn run_same_proto(proto: &str, chunks: &[&[u8]]) -> (Vec<u8>, StreamTranslate) {
+        let mut t = StreamTranslate::new_same_proto(proto).expect("same-proto translator");
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend_from_slice(&t.feed(c));
+        }
+        out.extend_from_slice(&t.finish());
+        (out, t)
+    }
+
+    fn concat(chunks: &[&[u8]]) -> Vec<u8> {
+        chunks.iter().flat_map(|c| c.iter().copied()).collect()
+    }
+
+    #[test]
+    fn anthropic_sse_round_trip_byte_exact() {
+        // Native Anthropic SSE: input on message_start, output on message_delta.
+        let frames: &[&[u8]] = &[
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n\n",
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n\n",
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+        let (out, t) = run_same_proto("anthropic", frames);
+        assert_eq!(
+            out,
+            concat(frames),
+            "anthropic same-proto SSE must be byte-exact"
+        );
+        let u = t.usage().expect("anthropic A-tap usage");
+        // Backfill: input from message_start (11), output from message_delta (7).
+        assert_eq!((u.input_tokens, u.output_tokens), (11, 7));
+    }
+
+    #[test]
+    fn openai_bare_data_round_trip_byte_exact() {
+        // HIGHEST RISK #3: OpenAI bare `data:` frames + `include_usage` trailing usage chunk + [DONE].
+        let frames: &[&[u8]] = &[
+            b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":9,\"total_tokens\":22}}\n\n",
+            b"data: [DONE]\n\n",
+        ];
+        let (out, t) = run_same_proto("openai", frames);
+        assert_eq!(
+            out,
+            concat(frames),
+            "openai bare data: same-proto must be byte-exact (incl [DONE])"
+        );
+        let u = t.usage().expect("openai A-tap usage");
+        assert_eq!((u.input_tokens, u.output_tokens), (13, 9));
+    }
+
+    #[test]
+    fn gemini_sse_round_trip_byte_exact() {
+        // Gemini SSE (`?alt=sse`): usageMetadata on the terminal chunk.
+        let frames: &[&[u8]] = &[
+            b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hi\"}]}}]}\n\n",
+            b"data: {\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"\"}]}}],\"usageMetadata\":{\"promptTokenCount\":15,\"candidatesTokenCount\":4,\"totalTokenCount\":19}}\n\n",
+        ];
+        let (out, t) = run_same_proto("gemini", frames);
+        assert_eq!(
+            out,
+            concat(frames),
+            "gemini same-proto SSE must be byte-exact"
+        );
+        let u = t.usage().expect("gemini A-tap usage");
+        assert_eq!((u.input_tokens, u.output_tokens), (15, 4));
+    }
+
+    #[test]
+    fn cohere_sse_round_trip_byte_exact() {
+        // Cohere v2 SSE: tokens.input_tokens / tokens.output_tokens on the message-end event.
+        let frames: &[&[u8]] = &[
+            b"event: message-start\ndata: {\"type\":\"message-start\",\"id\":\"co_1\"}\n\n",
+            b"event: content-delta\ndata: {\"type\":\"content-delta\",\"index\":0,\"delta\":{\"message\":{\"content\":{\"text\":\"hi\"}}}}\n\n",
+            b"event: message-end\ndata: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"tokens\":{\"input_tokens\":17,\"output_tokens\":6}}}}\n\n",
+        ];
+        let (out, t) = run_same_proto("cohere", frames);
+        assert_eq!(
+            out,
+            concat(frames),
+            "cohere same-proto SSE must be byte-exact"
+        );
+        let u = t.usage().expect("cohere A-tap usage");
+        assert_eq!((u.input_tokens, u.output_tokens), (17, 6));
+    }
+
+    #[test]
+    fn responses_sse_round_trip_byte_exact() {
+        // OpenAI Responses SSE: usage on response.completed's inner response.usage.
+        let frames: &[&[u8]] = &[
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":21,\"output_tokens\":8}}}\n\n",
+        ];
+        let (out, t) = run_same_proto("responses", frames);
+        assert_eq!(
+            out,
+            concat(frames),
+            "responses same-proto SSE must be byte-exact"
+        );
+        let u = t.usage().expect("responses A-tap usage");
+        assert_eq!((u.input_tokens, u.output_tokens), (21, 8));
+    }
+
+    #[test]
+    fn bedrock_binary_eventstream_round_trip_byte_exact() {
+        // HIGHEST RISK #1: binary application/vnd.amazon.eventstream — re-emit the ORIGINAL frame
+        // bytes, NEVER re-encode (any CRC32 / length-prefix divergence is an undecodable frame).
+        use crate::eventstream::encode_frame;
+        let mut input = Vec::new();
+        input.extend(encode_frame("messageStart", br#"{"role":"assistant"}"#));
+        input.extend(encode_frame(
+            "contentBlockDelta",
+            br#"{"contentBlockIndex":0,"delta":{"text":"hi"}}"#,
+        ));
+        input.extend(encode_frame("messageStop", br#"{"stopReason":"end_turn"}"#));
+        input.extend(encode_frame(
+            "metadata",
+            br#"{"usage":{"inputTokens":31,"outputTokens":12},"metrics":{"latencyMs":5}}"#,
+        ));
+
+        // Feed in two arbitrary chunks to prove cross-poll reassembly is still verbatim.
+        let mid = input.len() / 2;
+        let (out, t) = run_same_proto("bedrock", &[&input[..mid], &input[mid..]]);
+        assert_eq!(
+            out, input,
+            "bedrock same-proto binary eventstream must be re-emitted byte-for-byte (no re-encode)"
+        );
+        let u = t.usage().expect("bedrock A-tap usage");
+        assert_eq!((u.input_tokens, u.output_tokens), (31, 12));
+    }
+
+    #[test]
+    fn same_proto_cross_chunk_split_is_verbatim() {
+        // A frame split across the chunk boundary (partial first feed) must still re-emit verbatim.
+        let whole: &[u8] = b"data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n";
+        let split = whole.len() / 2;
+        let (out, _t) = run_same_proto("openai", &[&whole[..split], &whole[split..]]);
+        assert_eq!(
+            out, whole,
+            "a frame split across feeds must re-emit byte-exact once complete"
+        );
+    }
+
+    /// BENCHMARK (design §f): same-proto streaming per-feed latency / throughput. The short-circuit's
+    /// whole point is that it does NOT re-serialize the IR back to wire — it re-emits the retained
+    /// original bytes. So the meaningful no-regression baseline is the RE-SERIALIZING translator (the
+    /// cross-proto path that runs the egress reader → ingress writer → reframe pipeline for every
+    /// frame). This bench proves the same-proto SHORT-CIRCUIT is at least as fast as that full
+    /// re-serialize path (it must be: it skips the writer + reframe), AND reports the raw verbatim
+    /// memcpy floor for reference. Covers an SSE path AND the binary eventstream path explicitly.
+    /// In-crate `Instant` bench (pattern store.rs:4162); `#[ignore]` so it never runs in the normal
+    /// suite (timing is environment-sensitive). Run with:
+    ///   cargo test --release bench_same_proto_short_circuit -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_same_proto_short_circuit() {
+        use crate::eventstream::encode_frame;
+
+        // Build one realistic OpenAI SSE stream and one bedrock binary eventstream, each as a Vec of
+        // per-feed chunks (one frame per chunk — the per-feed latency unit).
+        let openai_frames: Vec<Vec<u8>> = (0..32)
+            .map(|i| {
+                format!(
+                    "data: {{\"id\":\"chatcmpl-b\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"tok{i} \"}},\"finish_reason\":null}}]}}\n\n"
+                )
+                .into_bytes()
+            })
+            .collect();
+        let bedrock_frames: Vec<Vec<u8>> = (0..32)
+            .map(|i| {
+                encode_frame(
+                    "contentBlockDelta",
+                    format!("{{\"contentBlockIndex\":0,\"delta\":{{\"text\":\"tok{i} \"}}}}")
+                        .as_bytes(),
+                )
+            })
+            .collect();
+
+        // Raw verbatim memcpy floor (what `FirstByteBody` did on the legacy `translate == None` path).
+        fn bench_memcpy(frames: &[Vec<u8>], iters: u64) -> f64 {
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                let mut out: Vec<u8> = Vec::new();
+                for f in frames {
+                    out.extend_from_slice(std::hint::black_box(f));
+                }
+                std::hint::black_box(out);
+            }
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        // Run a stream through a translator built by `ctor`. Used for both the same-proto short-circuit
+        // (no re-serialize) and the cross-proto re-serialize baseline, so the only difference measured
+        // is the re-serialize work the short-circuit avoids.
+        fn bench_translator(
+            ctor: &dyn Fn() -> StreamTranslate,
+            frames: &[Vec<u8>],
+            iters: u64,
+        ) -> f64 {
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                let mut t = ctor();
+                let mut out: Vec<u8> = Vec::new();
+                for f in frames {
+                    out.extend_from_slice(&t.feed(std::hint::black_box(f)));
+                }
+                out.extend_from_slice(&t.finish());
+                std::hint::black_box(out);
+            }
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        let iters = 50_000u64;
+        // (label, short-circuit ctor, RE-SERIALIZE baseline ctor, frames)
+        // The re-serialize baseline is a CROSS-proto translator over the SAME egress frames — it runs
+        // the full reader→writer→reframe pipeline, which is exactly the cost the short-circuit elides.
+        let openai_sc = || StreamTranslate::new_same_proto("openai").unwrap();
+        let openai_xproto = || StreamTranslate::new("openai", "anthropic").unwrap();
+        let bedrock_sc = || StreamTranslate::new_same_proto("bedrock").unwrap();
+        let bedrock_xproto = || StreamTranslate::new("anthropic", "bedrock").unwrap(); // bedrock EGRESS frames
+
+        // Warm up.
+        let _ = bench_memcpy(&openai_frames, 2_000);
+        let _ = bench_translator(&openai_sc, &openai_frames, 2_000);
+        let _ = bench_translator(&openai_xproto, &openai_frames, 2_000);
+
+        for (label, sc_ctor, xproto_ctor, frames) in [
+            (
+                "openai-sse",
+                &openai_sc as &dyn Fn() -> StreamTranslate,
+                &openai_xproto as &dyn Fn() -> StreamTranslate,
+                &openai_frames,
+            ),
+            (
+                "bedrock-eventstream",
+                &bedrock_sc as &dyn Fn() -> StreamTranslate,
+                &bedrock_xproto as &dyn Fn() -> StreamTranslate,
+                &bedrock_frames,
+            ),
+        ] {
+            let memcpy = bench_memcpy(frames, iters);
+            let sc = bench_translator(sc_ctor, frames, iters);
+            let reserialize = bench_translator(xproto_ctor, frames, iters);
+            println!(
+                "BENCH same_proto[{label}] ({} frames/stream, {iters} streams): memcpy floor \
+                 {memcpy:.0} ns/stream | short-circuit {sc:.0} ns/stream | re-serialize baseline \
+                 {reserialize:.0} ns/stream => short-circuit is {:.2}x the re-serialize cost",
+                frames.len(),
+                sc / reserialize.max(1.0)
+            );
+            // NO REGRESSION: the short-circuit skips the egress writer + reframe, so it must be at
+            // least as fast as the full re-serialize path (a generous 1.25x margin absorbs timing
+            // noise). A short-circuit that accidentally re-serialized would land AT or ABOVE the
+            // re-serialize baseline and fail this.
+            assert!(
+                sc <= reserialize * 1.25,
+                "same_proto[{label}] short-circuit {sc:.0} ns is NOT faster than the re-serialize \
+                 baseline {reserialize:.0} ns — the verbatim short-circuit regressed (did it \
+                 re-serialize the IR instead of re-emitting original bytes?)"
+            );
+        }
     }
 }
 
