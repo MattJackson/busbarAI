@@ -8,7 +8,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Json, Path, State};
+use axum::body::Bytes;
+use axum::extract::{Path, State};
 use axum::http::{header::CONTENT_TYPE, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Deserializer};
@@ -153,12 +154,21 @@ fn join_error(op: &str, e: &tokio::task::JoinError) -> Response {
 }
 
 /// POST /admin/keys — mint a virtual key. Returns the plaintext secret ONCE.
-pub(crate) async fn create_key(
-    State(app): State<Arc<App>>,
-    Json(req): Json<CreateKeyReq>,
-) -> Response {
+pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Response {
     let Some(gov) = &app.governance else {
         return disabled();
+    };
+    // Parse the body via the depth-guarded `crate::json` seam, NOT axum's stock `Json<T>` extractor,
+    // whose `JsonRejection` body echoes the raw serde `Display` — a fragment of the offending input.
+    // This body carries SECRETS (an AWS secret_access_key, the bearer being minted), so any parse
+    // failure maps to a GENERIC 400, logging only the byte length via `parse_err_log` (never the raw
+    // error, never an input fragment).
+    let req: CreateKeyReq = match crate::json::parse(&body) {
+        Ok(req) => req,
+        Err(_) => {
+            tracing::warn!("create_key: {}", crate::json::parse_err_log(body.len()));
+            return json_response(StatusCode::BAD_REQUEST, json!({"error": "invalid JSON"}));
+        }
     };
     // Default to the all-time `"total"` window when omitted; otherwise the value MUST be one
     // `governance::budget_window` enforces. Reject an unrecognized period with 400 rather than
@@ -306,10 +316,20 @@ pub(crate) struct UpdateKeyReq {
 pub(crate) async fn update_key(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
-    Json(req): Json<UpdateKeyReq>,
+    body: Bytes,
 ) -> Response {
     let Some(gov) = &app.governance else {
         return disabled();
+    };
+    // Parse via the depth-guarded `crate::json` seam, not axum's `Json<T>` (whose rejection body
+    // echoes the raw serde error / an input fragment). Any failure maps to a GENERIC 400, logging
+    // only the byte length via `parse_err_log` — no raw error, no input fragment.
+    let req: UpdateKeyReq = match crate::json::parse(&body) {
+        Ok(req) => req,
+        Err(_) => {
+            tracing::warn!("update_key: {}", crate::json::parse_err_log(body.len()));
+            return json_response(StatusCode::BAD_REQUEST, json!({"error": "invalid JSON"}));
+        }
     };
     // Create-parity validation (see create_key for the rationale on each): a negative budget is a
     // silent over-budget DoS; a zero rate cap is a permanently-unusable key. Reject both here so PATCH
@@ -730,6 +750,63 @@ mod tests {
         handle.abort();
     }
 
+    /// MED (no-raw-parse-error / secret-leak): a malformed admin create/update body must produce a
+    /// GENERIC 400 whose body contains NEITHER serde error prose NOR any fragment of the offending
+    /// input. The create-key body carries SECRETS (an AWS secret_access_key, the bearer being minted),
+    /// so axum's stock `Json<T>` rejection — which echoes the raw serde `Display` — must NOT be used.
+    #[tokio::test]
+    async fn test_admin_malformed_body_returns_generic_400_no_input_fragment() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (addr, handle) = serve_with_gov(gov).await;
+        let client = reqwest::Client::new();
+
+        // A SECRET-bearing fragment that must NEVER be echoed back in the error body.
+        let secret_fragment = "SUPER_SECRET_AWS_KEY_abc123";
+        let malformed = format!(r#"{{"name": "k", "secret_access_key": "{secret_fragment}" "#);
+
+        for path in ["/admin/keys", "/admin/keys/some-id"] {
+            let req = if path == "/admin/keys" {
+                client.post(format!("http://{addr}{path}"))
+            } else {
+                client.patch(format!("http://{addr}{path}"))
+            };
+            let resp = req
+                .header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+                .body(malformed.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                400,
+                "malformed body on {path} must be 400"
+            );
+            let text = resp.text().await.unwrap();
+            assert!(
+                !text.contains(secret_fragment),
+                "the 400 body on {path} must NOT echo any input fragment; got {text}"
+            );
+            // The generic envelope only — no serde prose (e.g. "expected", "column", "EOF").
+            assert!(
+                !text.contains("expected")
+                    && !text.contains("column")
+                    && !text.contains("EOF")
+                    && !text.contains("line"),
+                "the 400 body on {path} must NOT contain serde error text; got {text}"
+            );
+            let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                body["error"], "invalid JSON",
+                "the 400 body on {path} must be the generic envelope; got {text}"
+            );
+        }
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_create_key_rejects_negative_max_budget_cents() {
         // Regression (HIGH/correctness): a negative `max_budget_cents` is a signed-i64 value serde
@@ -1114,24 +1191,25 @@ mod tests {
         let (unknown_status, known_status) = tracing::subscriber::with_default(subscriber, || {
             rt.block_on(async {
                 // Request 1: references "smart" (configured, OK) AND "smrt" (typo, no such pool).
-                let req1: super::CreateKeyReq = serde_json::from_value(serde_json::json!({
-                    "name": "k-typo",
-                    "allowed_pools": ["smart", "smrt"]
-                }))
-                .unwrap();
-                let r1 =
-                    super::create_key(axum::extract::State(app.clone()), axum::extract::Json(req1))
-                        .await;
+                let body1 = axum::body::Bytes::from(
+                    serde_json::json!({
+                        "name": "k-typo",
+                        "allowed_pools": ["smart", "smrt"]
+                    })
+                    .to_string(),
+                );
+                let r1 = super::create_key(axum::extract::State(app.clone()), body1).await;
                 let s1 = r1.status().as_u16();
 
                 // Request 2: references ONLY the configured pool — no warning expected.
-                let req2: super::CreateKeyReq = serde_json::from_value(serde_json::json!({
-                    "name": "k-ok",
-                    "allowed_pools": ["smart"]
-                }))
-                .unwrap();
-                let r2 =
-                    super::create_key(axum::extract::State(app), axum::extract::Json(req2)).await;
+                let body2 = axum::body::Bytes::from(
+                    serde_json::json!({
+                        "name": "k-ok",
+                        "allowed_pools": ["smart"]
+                    })
+                    .to_string(),
+                );
+                let r2 = super::create_key(axum::extract::State(app), body2).await;
                 let s2 = r2.status().as_u16();
                 (s1, s2)
             })

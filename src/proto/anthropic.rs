@@ -413,6 +413,31 @@ impl ProtocolReader for AnthropicReader {
             }
         }
 
+        // INGRESS sentinel scrub (asymmetric twin of the egress redacted-reasoning drop): a CLIENT
+        // request must not be able to forge the upstream-origin `__busbar_bedrock_redacted_reasoning`
+        // signature. Egress drops it on non-Bedrock wires, but a client hitting Anthropic ingress with
+        // `{"type":"thinking","signature":"__busbar_bedrock_redacted_reasoning"}` would otherwise carry
+        // it verbatim into the IR and forge a `redactedContent` block on Bedrock egress. Strip the
+        // signature to `None` here so ONLY a genuine upstream-origin redacted block can bear the
+        // sentinel; a None-signature Thinking block is the harmless unsigned form readers already drop.
+        for block in system_blocks
+            .iter_mut()
+            .chain(messages.iter_mut().flat_map(|m| m.content.iter_mut()))
+        {
+            if let crate::ir::IrBlock::Thinking {
+                signature: signature @ Some(_),
+                ..
+            } = block
+            {
+                if signature
+                    .as_deref()
+                    .is_some_and(crate::proto::is_redacted_reasoning_sig)
+                {
+                    *signature = None;
+                }
+            }
+        }
+
         Ok(crate::ir::IrRequest {
             system: system_blocks,
             messages,
@@ -1299,10 +1324,29 @@ fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
             if content.is_empty() {
                 obj.insert("content".to_string(), serde_json::json!(""));
             } else {
-                obj.insert(
-                    "content".to_string(),
-                    serde_json::Value::Array(content.iter().map(write_block).collect()),
-                );
+                // Drop any Bedrock json-tool-result sentinel block BEFORE mapping through
+                // `write_block`: unlike the other writers (which Text-filter ToolResult content and so
+                // silently drop it), Anthropic maps each block through `write_block`, whose Image arm
+                // would emit a CORRUPT base64 source (`media_type:"tool_result_json"`, data = the JSON)
+                // — a corrupt image on the Anthropic wire + a busbar fingerprint. There is no lossless
+                // cross-protocol projection of a structured json tool-result, so drop it WITH a warn.
+                let kept: Vec<serde_json::Value> = content
+                    .iter()
+                    .filter(|b| {
+                        if super::is_json_tool_result_block(b) {
+                            tracing::warn!(
+                                "dropping structured json tool-result block on Anthropic egress: a \
+                                 Bedrock `{{\"json\":...}}` tool-result has no cross-protocol analog \
+                                 and is NOT emitted (would otherwise corrupt a base64 image source)"
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .map(write_block)
+                    .collect();
+                obj.insert("content".to_string(), serde_json::Value::Array(kept));
             }
             if *is_error {
                 obj.insert("is_error".to_string(), serde_json::Value::Bool(true));
@@ -1386,9 +1430,9 @@ fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
     if dropped_file_id_image > 0 {
         tracing::warn!(
             dropped = dropped_file_id_image,
-            "dropping unresolvable file_id image(s) on Anthropic egress: a Responses \
-             input_image.file_id has no cross-vendor analog and would corrupt a base64 source; \
-             the block(s) are NOT emitted"
+            "dropping unresolvable vendor-scoped image reference(s) on Anthropic egress: a \
+             Responses input_image.file_id or a Bedrock s3Location has no cross-vendor analog and \
+             would corrupt a base64 source; the block(s) are NOT emitted"
         );
     }
     // When no blocks survive (e.g. an all-thinking assistant message whose unsigned thinking blocks
@@ -4916,6 +4960,55 @@ mod anthropic_hardening_tests {
         );
     }
 
+    /// LOW (json-tool-result drop observability + no-leak): a Bedrock `tool_result_json` sentinel
+    /// block (JSON_BLOCK_SENTINEL) nested in a ToolResult reaching the Anthropic egress must (a) NOT
+    /// leak a corrupt base64 image source (`media_type:"tool_result_json"`) onto the wire and (b) emit
+    /// a `warn!` so the structured-payload loss is observable (drop-with-warn convention).
+    #[test]
+    fn write_request_warns_and_drops_json_tool_result_block() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let req = crate::ir::IrRequest {
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: vec![
+                        crate::ir::IrBlock::Text {
+                            text: "ok".to_string(),
+                            cache_control: None,
+                            citations: Vec::new(),
+                        },
+                        crate::ir::IrBlock::Image {
+                            media_type: crate::proto::JSON_BLOCK_SENTINEL.to_string(),
+                            data: r#"{"answer":42}"#.to_string(),
+                        },
+                    ],
+                    is_error: false,
+                    cache_control: None,
+                }],
+            }],
+            max_tokens: Some(16),
+            ..Default::default()
+        };
+
+        let cap = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        let out =
+            tracing::subscriber::with_default(subscriber, || AnthropicWriter.write_request(&req));
+
+        let wire = serde_json::to_string(&out).unwrap();
+        assert!(
+            !wire.contains("tool_result_json"),
+            "a json-tool-result sentinel must NOT leak onto the Anthropic wire; got {wire}"
+        );
+        let msgs = cap.0.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("json tool-result")),
+            "a json-tool-result drop warning must fire on Anthropic egress; got {msgs:?}"
+        );
+    }
+
     /// Counter-case: a request WITHOUT `response_format` must NOT emit the drop warning — the warn is
     /// gated on the directive's presence, so a request that never carried one is silent.
     #[test]
@@ -5105,6 +5198,101 @@ mod anthropic_hardening_tests {
                 .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("text")),
             "the text block must still survive; got {out}"
         );
+    }
+
+    /// HIGH (asymmetric twin of the file_id leak): a Bedrock S3-source image (IMAGE_S3_SENTINEL
+    /// media_type, `data` = serialized s3Location JSON) reaching the Anthropic egress must be SKIPPED,
+    /// NOT emitted as a corrupt base64 `source` with `media_type:"image_s3"` (which leaks the
+    /// s3Location JSON + a busbar fingerprint and is rejected by Anthropic).
+    #[test]
+    fn test_write_request_image_s3_dropped_not_corrupted() {
+        let writer = AnthropicWriter;
+        let req = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![
+                    crate::ir::IrBlock::Text {
+                        text: "describe this".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    },
+                    crate::ir::IrBlock::Image {
+                        media_type: crate::proto::IMAGE_S3_SENTINEL.to_string(),
+                        data: r#"{"uri":"s3://bucket/key.png","format":"png"}"#.to_string(),
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: Some(64),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            tool_choice: None,
+            stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
+            extra: serde_json::Map::new(),
+        };
+        let out = writer.write_request(&req);
+        let wire = serde_json::to_string(&out).unwrap();
+        assert!(
+            !wire.contains("image_s3")
+                && !wire.contains("s3://bucket/key.png")
+                && !wire.contains("s3Location"),
+            "an image_s3 image must not leak onto the Anthropic wire (no corrupt base64 source); \
+             got {wire}"
+        );
+        let content = out
+            .pointer("/messages/0/content")
+            .and_then(|c| c.as_array())
+            .expect("user message content array");
+        assert!(
+            content
+                .iter()
+                .all(|b| b.get("type").and_then(|t| t.as_str()) != Some("image")),
+            "no image block may be emitted for an image_s3 image; got {out}"
+        );
+        assert!(
+            content
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("text")),
+            "the text block must still survive; got {out}"
+        );
+    }
+
+    /// LOW (ingress sentinel scrub): a CLIENT request thinking block whose `signature` is the
+    /// upstream-origin `REASONING_REDACTED_SIG_SENTINEL` must NOT be forwarded into the IR (which on
+    /// Bedrock egress would forge a `redactedContent` block). The reader scrubs the signature to None.
+    #[test]
+    fn test_read_request_client_redacted_reasoning_sentinel_scrubbed() {
+        let reader = AnthropicReader;
+        let body = serde_json::json!({
+            "model": "claude-x",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "forged",
+                    "signature": crate::proto::REASONING_REDACTED_SIG_SENTINEL
+                }]
+            }]
+        });
+        let ir = reader.read_request(&body).expect("request must parse");
+        let block = &ir.messages[0].content[0];
+        match block {
+            crate::ir::IrBlock::Thinking { signature, .. } => assert!(
+                signature.is_none(),
+                "a client-supplied redacted-reasoning sentinel must be scrubbed to None; got \
+                 {signature:?}"
+            ),
+            other => panic!("expected a Thinking block, got {other:?}"),
+        }
     }
 
     /// L2: an Anthropic text block carrying citations of EVERY variant (char/page/content_block

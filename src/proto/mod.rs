@@ -146,14 +146,47 @@ pub(crate) fn is_redacted_reasoning_sig(sig: &str) -> bool {
 /// URI, or an Anthropic base64 source with `media_type:"file_id"`).
 pub(crate) const FILE_ID_IMAGE_SENTINEL: &str = "file_id";
 
+/// Sentinel `media_type` marking an IR `Image` block whose `data` field holds a JSON-serialized
+/// Bedrock Converse `s3Location` source object (`{"uri":...,"bucketOwner":...}`) rather than inline
+/// base64 bytes. The Converse `ImageSource` union has an `s3Location` member (an AWS-S3 URI) with no
+/// IR counterpart field; the Bedrock reader stashes it under this sentinel so the Bedrock writer
+/// (`bedrock_image_block`, same-protocol) can re-emit `source.s3Location` losslessly. A real image
+/// media_type is always `image/<fmt>`, so a bare `image_s3` token can never collide with one. Shared
+/// from here so EVERY writer recognizes it: an S3 URI is an AWS-scoped, unresolvable cross-vendor
+/// reference, so any NON-Bedrock writer's image path must SKIP it (see [`is_unresolvable_image_ref`])
+/// rather than treat `"image_s3"` as a MIME type and emit a corrupt block.
+pub(crate) const IMAGE_S3_SENTINEL: &str = "image_s3";
+
 /// True when an IR `Image` block's `media_type` is a vendor-scoped reference that CANNOT be resolved
 /// or faithfully re-encoded by a DIFFERENT protocol's writer — currently the Responses `file_id`
-/// sentinel. A non-Responses writer that sees one must skip the image with a `tracing::warn!` instead
-/// of emitting a corrupt inline/base64 block, because there is no lossless cross-vendor projection of
-/// an uploaded-file id. (The Responses writer, same-protocol, re-emits the native `file_id` form and
-/// does NOT route through here.)
+/// sentinel and the Bedrock `s3Location` (`image_s3`) sentinel. A foreign writer that sees one must
+/// skip the image with a `tracing::warn!` instead of emitting a corrupt inline/base64 block, because
+/// there is no lossless cross-vendor projection of an uploaded-file id or an AWS-S3 URI. (The native
+/// writer — Responses for `file_id`, Bedrock for `image_s3` — re-emits the reference same-protocol
+/// and does NOT route through here.)
 pub(crate) fn is_unresolvable_image_ref(media_type: &str) -> bool {
-    media_type == FILE_ID_IMAGE_SENTINEL
+    media_type == FILE_ID_IMAGE_SENTINEL || media_type == IMAGE_S3_SENTINEL
+}
+
+/// Sentinel `media_type` marking an IR `Image` block that is NOT an image at all but a Bedrock
+/// Converse `{"json": <value>}` tool-result content block (an arbitrary-structured-data member of the
+/// `ToolResultContentBlock` union with no IR counterpart). The Bedrock reader stashes the serialized
+/// json under this sentinel so the Bedrock writer (same-protocol) re-emits a faithful `json` block. A
+/// real image media_type is always `image/<fmt>`, so a bare `tool_result_json` token can never collide
+/// with one. Shared from here so a NON-Bedrock ToolResult writer can RECOGNIZE it
+/// ([`is_json_tool_result_block`]) and drop-with-warn instead of either silently dropping it (most
+/// writers Text-filter ToolResult content) or leaking a corrupt base64 image source (the Anthropic
+/// writer maps each ToolResult block through its image arm). There is no lossless cross-protocol
+/// projection of a structured json tool-result, so a foreign writer drops it observably.
+pub(crate) const JSON_BLOCK_SENTINEL: &str = "tool_result_json";
+
+/// True when an IR `Image` block is the Bedrock json-tool-result sentinel (see [`JSON_BLOCK_SENTINEL`])
+/// rather than a real image — used by NON-Bedrock ToolResult writers to drop-with-warn it.
+pub(crate) fn is_json_tool_result_block(block: &crate::ir::IrBlock) -> bool {
+    matches!(
+        block,
+        crate::ir::IrBlock::Image { media_type, .. } if media_type == JSON_BLOCK_SENTINEL
+    )
 }
 
 /// Scan an already-lowercased error text for OpenAI-family context-length-overflow prose. Holds the

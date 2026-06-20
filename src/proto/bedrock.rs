@@ -91,8 +91,10 @@ fn bedrock_stream_exception_for(err: &crate::proto::IrError) -> (&'static str, S
 /// IR counterpart field, so the Bedrock reader stashes it under this sentinel (mirroring the
 /// `image_url` sentinel for arbitrary URLs) and `bedrock_image_block` re-emits it on same-protocol
 /// egress instead of silently dropping the block. A real image media_type is always `image/<fmt>`,
-/// so a bare `image_s3` token can never collide with one.
-const IMAGE_S3_SENTINEL: &str = "image_s3";
+/// so a bare `image_s3` token can never collide with one. Promoted to [`super::IMAGE_S3_SENTINEL`]
+/// (a shared `pub(crate) const`) so [`super::is_unresolvable_image_ref`] can gate it on every foreign
+/// writer; re-exported here as a local alias to keep Bedrock's same-protocol read/write paths intact.
+const IMAGE_S3_SENTINEL: &str = super::IMAGE_S3_SENTINEL;
 
 /// `media_type` SENTINEL marking that an IR `Image` block is actually carrying a Bedrock Converse
 /// `{"json": <value>}` tool-result content block — NOT a real image. The Converse
@@ -107,7 +109,7 @@ const IMAGE_S3_SENTINEL: &str = "image_s3";
 /// `tool_result_json` token can never collide with one; the sentinel is a Bedrock-native marker with
 /// no cross-protocol meaning, so on the cross-protocol seam (where it cannot be re-emitted as a
 /// native `json` block) `bedrock_image_block` drops it rather than leaking a corrupt image.
-const JSON_BLOCK_SENTINEL: &str = "tool_result_json";
+const JSON_BLOCK_SENTINEL: &str = super::JSON_BLOCK_SENTINEL;
 
 /// `extra` key under which the Bedrock reader stashes the positions of native Converse `cachePoint`
 /// content blocks (the prompt-cache markers, `{"cachePoint": {"type": "default"}}`) that appear
@@ -1101,7 +1103,28 @@ impl ProtocolReader for BedrockReader {
                             // loss made the proxy diverge from a direct AWS call. `redactedContent` is
                             // carried via the redacted-signature sentinel so it re-emits faithfully.
                             // A future union member yields `None` (left undecoded, not mis-mapped).
-                            if let Some(block) = read_bedrock_reasoning_block(reasoning) {
+                            if let Some(mut block) = read_bedrock_reasoning_block(reasoning) {
+                                // INGRESS sentinel scrub: a CLIENT must not forge the upstream-origin
+                                // `REASONING_REDACTED_SIG_SENTINEL` via a `reasoningText.signature`
+                                // (which would re-emit an opaque `redactedContent` block on egress).
+                                // The sentinel may LEGITIMATELY arise here only from a native
+                                // `redactedContent` member (a genuine prior-turn redacted block on a
+                                // same-protocol passthrough); a sentinel reaching us through the
+                                // `reasoningText` arm is client-supplied and is scrubbed to None.
+                                if reasoning.get("redactedContent").is_none() {
+                                    if let crate::ir::IrBlock::Thinking {
+                                        signature: signature @ Some(_),
+                                        ..
+                                    } = &mut block
+                                    {
+                                        if signature
+                                            .as_deref()
+                                            .is_some_and(super::is_redacted_reasoning_sig)
+                                        {
+                                            *signature = None;
+                                        }
+                                    }
+                                }
                                 msg_content.push(block);
                             }
                         } else if let Some(cache_point) = content_val.get("cachePoint") {

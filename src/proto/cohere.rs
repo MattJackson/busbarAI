@@ -1409,14 +1409,16 @@ impl ProtocolWriter for CohereWriter {
                 .filter_map(|b| {
                     if let crate::ir::IrBlock::Image { media_type, data } = b {
                         if super::is_unresolvable_image_ref(media_type) {
-                            // A Responses `file_id` image (the FILE_ID_IMAGE_SENTINEL media_type) is
-                            // an unresolvable cross-vendor reference: emitting it as an `image_url`
-                            // would produce a corrupt `data:file_id;base64,<id>` URI. SKIP it (no
-                            // lossless cross-vendor projection of an uploaded-file id).
+                            // A Responses `file_id` (FILE_ID_IMAGE_SENTINEL) or Bedrock `s3Location`
+                            // (IMAGE_S3_SENTINEL) image is an unresolvable cross-vendor reference:
+                            // emitting it as an `image_url` would produce a corrupt
+                            // `data:<sentinel>;base64,<ref>` URI. SKIP it (no lossless cross-vendor
+                            // projection of an uploaded-file id or an AWS-S3 URI).
                             tracing::warn!(
-                                "dropping unresolvable file_id image on Cohere egress: a Responses \
-                                 input_image.file_id has no cross-vendor analog and would corrupt \
-                                 an image_url; the block is NOT emitted"
+                                "dropping unresolvable vendor-scoped image reference \
+                                 (media_type={media_type}) on Cohere egress: a Responses \
+                                 input_image.file_id or a Bedrock s3Location has no cross-vendor \
+                                 analog and would corrupt an image_url; the block is NOT emitted"
                             );
                             return None;
                         }
@@ -1478,6 +1480,16 @@ impl ProtocolWriter for CohereWriter {
                                 if let crate::ir::IrBlock::Text { text, .. } = b {
                                     Some(text.clone())
                                 } else {
+                                    // A non-Text ToolResult block is a Bedrock json-tool-result
+                                    // sentinel with no Cohere analog. Drop WITH a warn (drop-with-warn
+                                    // convention) instead of vanishing silently.
+                                    if super::is_json_tool_result_block(b) {
+                                        tracing::warn!(
+                                            "dropping structured json tool-result block on Cohere \
+                                             egress: a Bedrock `{{\"json\":...}}` tool-result has no \
+                                             cross-protocol analog and is NOT emitted"
+                                        );
+                                    }
                                     None
                                 }
                             })

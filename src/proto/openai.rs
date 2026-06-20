@@ -1239,9 +1239,11 @@ impl ProtocolWriter for OpenAiWriter {
                             // rather than corrupt the block (no lossless cross-vendor projection).
                             if super::is_unresolvable_image_ref(media_type) {
                                 tracing::warn!(
-                                    "dropping unresolvable file_id image on OpenAI egress: a \
-                                     Responses input_image.file_id has no cross-vendor analog and \
-                                     would corrupt an image_url; the block is NOT emitted"
+                                    "dropping unresolvable vendor-scoped image reference \
+                                     (media_type={media_type}) on OpenAI egress: a Responses \
+                                     input_image.file_id or a Bedrock s3Location has no \
+                                     cross-vendor analog and would corrupt an image_url; the block \
+                                     is NOT emitted"
                                 );
                                 continue;
                             }
@@ -1357,6 +1359,19 @@ impl ProtocolWriter for OpenAiWriter {
                                     if let crate::ir::IrBlock::Text { text, .. } = b {
                                         Some(text.clone())
                                     } else {
+                                        // A non-Text ToolResult block is a Bedrock json-tool-result
+                                        // sentinel (structured `{"json":...}` data) with no OpenAI
+                                        // analog. Drop it WITH a warn so the loss is observable
+                                        // (matches the drop-with-warn convention) rather than vanishing
+                                        // silently.
+                                        if super::is_json_tool_result_block(b) {
+                                            tracing::warn!(
+                                                "dropping structured json tool-result block on \
+                                                 OpenAI egress: a Bedrock `{{\"json\":...}}` \
+                                                 tool-result has no cross-protocol analog and is NOT \
+                                                 emitted"
+                                            );
+                                        }
                                         None
                                     }
                                 })
@@ -5481,6 +5496,70 @@ mod tests {
                 .iter()
                 .all(|p| p.get("type").and_then(|t| t.as_str()) != Some("image_url")),
             "no image_url part may be emitted for a file_id image; got {out}"
+        );
+        assert!(
+            content
+                .iter()
+                .any(|p| p.get("type").and_then(|t| t.as_str()) == Some("text")),
+            "the text part must still survive; got {out}"
+        );
+    }
+
+    /// HIGH (asymmetric twin of the file_id leak): a Bedrock S3-source image (the IMAGE_S3_SENTINEL
+    /// media_type, `data` = serialized s3Location JSON) reaching the OpenAI egress is an unresolvable
+    /// cross-vendor reference. It must be SKIPPED — NOT emitted as a corrupt `data:image_s3;base64,`
+    /// image_url that leaks the s3Location JSON + a busbar fingerprint onto the OpenAI wire.
+    #[test]
+    fn test_write_request_image_s3_dropped_not_corrupted() {
+        let writer = OpenAiWriter;
+        let req = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![
+                    crate::ir::IrBlock::Text {
+                        text: "describe this".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    },
+                    crate::ir::IrBlock::Image {
+                        media_type: crate::proto::IMAGE_S3_SENTINEL.to_string(),
+                        data: r#"{"uri":"s3://bucket/key.png","format":"png"}"#.to_string(),
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            tool_choice: None,
+            stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
+            extra: serde_json::Map::new(),
+        };
+        let out = writer.write_request(&req);
+        let wire = serde_json::to_string(&out).unwrap();
+        assert!(
+            !wire.contains("image_s3")
+                && !wire.contains("s3://bucket/key.png")
+                && !wire.contains("s3Location"),
+            "an image_s3 image must not leak onto the OpenAI wire (no corrupt image_url); got {wire}"
+        );
+        let content = out
+            .pointer("/messages/0/content")
+            .and_then(|c| c.as_array())
+            .expect("user message content array");
+        assert!(
+            content
+                .iter()
+                .all(|p| p.get("type").and_then(|t| t.as_str()) != Some("image_url")),
+            "no image_url part may be emitted for an image_s3 image; got {out}"
         );
         assert!(
             content

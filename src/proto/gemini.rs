@@ -328,6 +328,13 @@ impl ProtocolReader for GeminiReader {
                             let signature = part
                                 .get("thoughtSignature")
                                 .and_then(|s| s.as_str())
+                                // INGRESS sentinel scrub: a CLIENT must not be able to forge the
+                                // upstream-origin `__busbar_bedrock_redacted_reasoning` signature
+                                // (which forges a Bedrock `redactedContent` block on egress). Gemini
+                                // has no redacted-reasoning concept, so a sentinel here is always
+                                // client-supplied; drop it to None. Mirrors the Anthropic request
+                                // reader's scrub.
+                                .filter(|s| !crate::proto::is_redacted_reasoning_sig(s))
                                 .map(String::from);
                             msg_content.push(crate::ir::IrBlock::Thinking { text, signature });
                         }
@@ -1960,7 +1967,19 @@ impl ProtocolWriter for GeminiWriter {
                             .iter()
                             .filter_map(|b| match b {
                                 crate::ir::IrBlock::Text { text, .. } => Some(text.clone()),
-                                _ => None,
+                                // A non-Text ToolResult block is a Bedrock json-tool-result sentinel
+                                // with no Gemini analog. Drop WITH a warn (drop-with-warn convention)
+                                // instead of vanishing silently.
+                                other => {
+                                    if super::is_json_tool_result_block(other) {
+                                        tracing::warn!(
+                                            "dropping structured json tool-result block on Gemini \
+                                             egress: a Bedrock `{{\"json\":...}}` tool-result has no \
+                                             cross-protocol analog and is NOT emitted"
+                                        );
+                                    }
+                                    None
+                                }
                             })
                             .collect::<Vec<_>>()
                             .join(" ");
@@ -2001,14 +2020,17 @@ impl ProtocolWriter for GeminiWriter {
                         // sentinel there (URL natively, not base64). `mimeType` is omitted: it is
                         // unknown for a remote URL and is optional on `fileData`.
                         if super::is_unresolvable_image_ref(media_type) {
-                            // A Responses `file_id` image (the FILE_ID_IMAGE_SENTINEL media_type) is
-                            // an unresolvable cross-vendor reference: emitting it as inlineData/
-                            // fileData would corrupt the part (a file_id is not a URI or base64).
-                            // SKIP it (no lossless cross-vendor projection of an uploaded-file id).
+                            // A Responses `file_id` (FILE_ID_IMAGE_SENTINEL) or Bedrock `s3Location`
+                            // (IMAGE_S3_SENTINEL) image is an unresolvable cross-vendor reference:
+                            // emitting it as inlineData/fileData would corrupt the part (a file_id
+                            // or S3 URI is not inline base64). SKIP it (no lossless cross-vendor
+                            // projection of an uploaded-file id or an AWS-S3 URI).
                             tracing::warn!(
-                                "dropping unresolvable file_id image on Gemini egress: a Responses \
-                                 input_image.file_id has no cross-vendor analog and would corrupt \
-                                 an inlineData/fileData part; the block is NOT emitted"
+                                "dropping unresolvable vendor-scoped image reference \
+                                 (media_type={media_type}) on Gemini egress: a Responses \
+                                 input_image.file_id or a Bedrock s3Location has no cross-vendor \
+                                 analog and would corrupt an inlineData/fileData part; the block is \
+                                 NOT emitted"
                             );
                         } else if media_type == "image_url" {
                             parts_arr.push(serde_json::json!({
@@ -3341,6 +3363,63 @@ mod tests {
             block: IrBlockMeta::Text,
         };
         assert!(writer.write_response_event(&ev).is_none());
+    }
+
+    /// HIGH (asymmetric twin of the file_id leak): a Bedrock S3-source image (IMAGE_S3_SENTINEL
+    /// media_type, `data` = serialized s3Location JSON) reaching the Gemini egress must be SKIPPED,
+    /// NOT emitted as a corrupt `inlineData{mimeType:"image_s3"}` part that leaks the s3Location JSON
+    /// + a busbar fingerprint onto the Gemini wire.
+    #[test]
+    fn test_write_request_image_s3_dropped_not_corrupted() {
+        let writer = GeminiWriter;
+        let req = crate::ir::IrRequest {
+            system: vec![],
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![
+                    crate::ir::IrBlock::Text {
+                        text: "describe this".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    },
+                    crate::ir::IrBlock::Image {
+                        media_type: crate::proto::IMAGE_S3_SENTINEL.to_string(),
+                        data: r#"{"uri":"s3://bucket/key.png","format":"png"}"#.to_string(),
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop: vec![],
+            tool_choice: None,
+            stream: false,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            n: None,
+            response_format: None,
+            extra: serde_json::Map::new(),
+        };
+        let out = writer.write_request(&req);
+        let wire = serde_json::to_string(&out).unwrap();
+        assert!(
+            !wire.contains("image_s3")
+                && !wire.contains("s3://bucket/key.png")
+                && !wire.contains("s3Location"),
+            "an image_s3 image must not leak onto the Gemini wire (no corrupt inlineData part); \
+             got {wire}"
+        );
+        assert!(
+            !wire.contains("inlineData") && !wire.contains("fileData"),
+            "no inlineData/fileData part may be emitted for an image_s3 image; got {wire}"
+        );
+        assert!(
+            wire.contains("describe this"),
+            "the text part must still survive; got {wire}"
+        );
     }
 
     /// Helper: drive a sequence of IR events through ONE GeminiWriter (preserving its per-stream

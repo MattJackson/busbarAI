@@ -2338,6 +2338,18 @@ impl ProtocolWriter for ResponsesWriter {
                                         "type": "input_image",
                                         "file_id": data
                                     }));
+                                } else if super::is_unresolvable_image_ref(media_type) {
+                                    // A non-file_id unresolvable reference here is a Bedrock
+                                    // `s3Location` image (IMAGE_S3_SENTINEL) reaching Responses
+                                    // egress cross-protocol: an AWS-S3 URI has no Responses analog and
+                                    // wrapping it as a `data:image_s3;base64,<json>` URI would corrupt
+                                    // the input_image. SKIP it (no lossless cross-vendor projection).
+                                    tracing::warn!(
+                                        "dropping unresolvable vendor-scoped image reference \
+                                         (media_type={media_type}) on Responses egress: a Bedrock \
+                                         s3Location has no cross-vendor analog and would corrupt an \
+                                         input_image; the block is NOT emitted"
+                                    );
                                 } else {
                                     let image_url = super::image_url_from_ir(media_type, data);
                                     content_arr.push(serde_json::json!({
@@ -2371,7 +2383,20 @@ impl ProtocolWriter for ResponsesWriter {
                                     .iter()
                                     .filter_map(|b| match b {
                                         crate::ir::IrBlock::Text { text, .. } => Some(text.clone()),
-                                        _ => None,
+                                        // A non-Text ToolResult block is a Bedrock json-tool-result
+                                        // sentinel with no Responses analog. Drop WITH a warn
+                                        // (drop-with-warn convention) instead of vanishing silently.
+                                        other => {
+                                            if super::is_json_tool_result_block(other) {
+                                                tracing::warn!(
+                                                    "dropping structured json tool-result block on \
+                                                     Responses egress: a Bedrock `{{\"json\":...}}` \
+                                                     tool-result has no cross-protocol analog and is \
+                                                     NOT emitted"
+                                                );
+                                            }
+                                            None
+                                        }
                                     })
                                     .collect::<Vec<_>>()
                                     .concat();
@@ -2422,7 +2447,20 @@ impl ProtocolWriter for ResponsesWriter {
                                 .iter()
                                 .filter_map(|b| match b {
                                     crate::ir::IrBlock::Text { text, .. } => Some(text.clone()),
-                                    _ => None,
+                                    // A non-Text ToolResult block is a Bedrock json-tool-result
+                                    // sentinel with no Responses analog. Drop WITH a warn
+                                    // (drop-with-warn convention) instead of vanishing silently.
+                                    other => {
+                                        if super::is_json_tool_result_block(other) {
+                                            tracing::warn!(
+                                                "dropping structured json tool-result block on \
+                                                 Responses egress: a Bedrock `{{\"json\":...}}` \
+                                                 tool-result has no cross-protocol analog and is NOT \
+                                                 emitted"
+                                            );
+                                        }
+                                        None
+                                    }
                                 })
                                 .collect::<Vec<_>>()
                                 .concat();
