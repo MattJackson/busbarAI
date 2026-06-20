@@ -47,17 +47,6 @@ const HDR_ROUTE_TARGET: &str = "x-busbar-route-target";
 /// surfaces. Hoisted to one const so the literal isn't repeated across egress/health/observability.
 pub(crate) const APPLICATION_JSON: &str = "application/json";
 
-/// Universal same-protocol response-translate FLAG (Change B step 2). When `true`, a same-protocol
-/// streaming SSE / event-stream response is routed through a `StreamTranslate` built via
-/// `StreamTranslate::new_same_proto` — which runs the full reader→IR pipeline for usage extraction
-/// (the future A-tap) but re-emits the ORIGINAL frame bytes VERBATIM, so the client stream is
-/// byte-for-byte identical to today's raw-chunk passthrough. When `false`, the legacy
-/// `translate == None` raw-chunk passthrough is used instead. This is the reversible rollout switch:
-/// flipping it to `false` fully reverts step 2's response-path change with no other edits. It does
-/// NOT affect billing — step 2 keeps the live `UsageTap` authoritative and only SHADOW-checks the
-/// IR-derived usage against it (see the `shadow_check` test-only assertions).
-pub(crate) const ENABLE_UNIVERSAL_SAME_PROTO_TRANSLATE: bool = true;
-
 tokio::task_local! {
     /// Per-request slot the `server_timing` middleware reads to compute Busbar's INTERNAL
     /// processing time (= total request wall-clock − upstream round-trip), reported as a
@@ -512,13 +501,6 @@ fn max_upstream_buffered_bytes() -> usize {
     crate::limits::upstream_error_body_max_bytes()
 }
 
-/// Worst-case per-poll scan budget for the [`UsageTap`] stream scanners (`feed` and
-/// `feed_eventstream`). A single coalesced terminal flush is realistically far smaller than this;
-/// the cap bounds per-poll scan time on the Tokio worker. A chunk larger than this is skipped with
-/// a `warn!` so the resulting accounting gap is observable rather than silent. Shared by both
-/// scanners (and the non-stream test predicate) so the threshold is defined in exactly one place.
-const MAX_SCAN_BYTES: usize = 512 * 1024;
-
 /// Upper bound on a buffered cross-protocol non-stream SUCCESS (2xx) body that must be parsed and
 /// translated egress→IR→ingress. A real completion (large `max_tokens` output, big tool-call
 /// arguments, embedded content) can far exceed the tight error-body cap; truncating it would make
@@ -743,382 +725,10 @@ fn mid_stream_error_bytes(
     }
 }
 
-/// Non-buffering stream inspection tap for usage parsing.
-///
-/// Extracts the final usage object from a streaming response without buffering the body: it scans
-/// each chunk for complete JSON objects and keeps only the small parsed usage fields. A JSON object
-/// split across chunk boundaries is simply not parsed in that chunk (no unbounded state is kept).
-#[derive(Debug, Clone, Default)]
-pub(crate) struct UsageTap {
-    /// Extracted input tokens (from message_delta.usage.input_tokens or message_stop.usage.input_tokens)
-    pub(crate) input_tokens: Option<u64>,
-    /// Extracted output tokens (from message_delta.usage.output_tokens or message_stop.usage.output_tokens)
-    pub(crate) output_tokens: Option<u64>,
-    /// A genuine terminal ERROR frame seen mid-stream (an SSE `{"type":"error", ...}` event). This
-    /// is the signal that gates breaker failure recording at stream end: a clean stream ends with a
-    /// normal terminator (`message_stop` / `[DONE]`) and leaves this `None` (→ success, already
-    /// recorded synchronously), whereas a stream that carried an explicit error frame ended
-    /// abnormally (→ record one breaker failure). Holds the error message for observability.
-    pub(crate) terminal_error: Option<String>,
-    /// Cross-chunk reassembly buffer for the BINARY `application/vnd.amazon.eventstream` body of a
-    /// same-protocol bedrock→bedrock passthrough (`feed_eventstream`). The JSON `feed` path keeps no
-    /// cross-chunk state (it scans complete objects per chunk), but binary eventstream frames carry a
-    /// u32 length prefix + CRCs and routinely span chunk boundaries, so the terminal `metadata` /
-    /// `exception` frame must be reassembled across polls. Bounded by `drain_frames`' MAX_FRAME_BYTES.
-    eventstream_buf: Vec<u8>,
-}
-
-impl UsageTap {
-    /// Create a new empty tap
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Feed a COMPLETE, already-bounded buffered body (a non-stream cross-protocol success body,
-    /// capped upstream by `MAX_TRANSLATED_BODY_BYTES`) and extract its usage. This path is NOT inside
-    /// a stream `poll_next`, so the per-poll `MAX_SCAN_BYTES` latency guard in `feed` does not apply
-    /// — applying it would SILENTLY DROP usage for any completion whose body exceeds 512 KiB (large
-    /// outputs / big tool-call arguments), undercounting TPM/spend for exactly the large responses
-    /// `MAX_TRANSLATED_BODY_BYTES` exists to permit. A non-stream body is a single complete JSON
-    /// document with usage at the TOP LEVEL (and, for an LLM completion, conceptually at the tail), so
-    /// parse it whole first; only if that fails (e.g. a buffered SSE/`[DONE]` body) fall back to the
-    /// uncapped brace-scan over the whole slice so a trailing usage frame is still found.
-    pub(crate) fn feed_whole(&mut self, body: &[u8]) {
-        if let Ok(obj) = crate::json::parse::<Value>(body) {
-            self.extract_usage_from_message_start(&obj);
-            self.extract_usage_from_delta(&obj);
-            self.extract_usage_from_stop(&obj);
-            self.extract_usage_any(&obj);
-            self.extract_terminal_error(&obj);
-            return;
-        }
-        // Not a single JSON document (e.g. a buffered SSE body): scan all embedded objects with no
-        // front-scan cap. The body is already bounded, and this runs synchronously off the poll loop,
-        // so there is no per-poll latency to guard — the trailing usage frame is reliably reached.
-        self.scan_objects(body);
-    }
-
-    /// Scan a byte slice for every complete top-level JSON object and feed each to the usage/terminal
-    /// extractors. Shared by `feed` (per-poll, after the size guard) and `feed_whole` (uncapped).
-    fn scan_objects(&mut self, chunk: &[u8]) {
-        let mut pos = 0;
-        while pos < chunk.len() {
-            if let Some(delta_idx) = find_json_start(&chunk[pos..]) {
-                let start = pos + delta_idx;
-                if let Some(end) = find_matching_brace(&chunk[start..]) {
-                    let json_bytes = &chunk[start..start + end];
-                    if let Ok(obj) = crate::json::parse::<Value>(json_bytes) {
-                        self.extract_usage_from_message_start(&obj);
-                        self.extract_usage_from_delta(&obj);
-                        self.extract_usage_from_stop(&obj);
-                        self.extract_usage_any(&obj);
-                        self.extract_terminal_error(&obj);
-                    }
-                    pos = start + end;
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Feed a chunk to the tap and extract any usage fields. Bounded: it only scans complete JSON
-    /// objects within this chunk and keeps no cross-chunk buffer.
-    pub(crate) fn feed(&mut self, chunk: &Bytes) {
-        // Bound per-poll scan time: `feed` runs synchronously inside the stream `poll_next`, so an
-        // O(n) brace-scan over a pathological multi-MiB single chunk would block the Tokio worker for
-        // its duration. Most SSE backends send one small event per chunk, but a buffering reverse
-        // proxy or an aggregating backend can coalesce many events (incl. the terminal usage frame)
-        // into one larger chunk — so the cap is set high enough (512 KiB) to still scan a realistically
-        // coalesced terminal flush rather than silently drop its usage and undercharge the key's
-        // TPM/spend budget. A chunk still larger than this is skipped (the worst-case poll-latency
-        // guard), but now with a `warn!` so the accounting gap is OBSERVABLE in production instead of
-        // invisible — ops can raise the cap or investigate the upstream's chunking if it fires.
-        if chunk.len() > MAX_SCAN_BYTES {
-            tracing::warn!(
-                chunk_len = chunk.len(),
-                cap = MAX_SCAN_BYTES,
-                "usage tap skipped an oversized stream chunk; if it carried the terminal usage frame, \
-                 this request's tokens are undercounted (TPM/spend may be undercharged)"
-            );
-            return;
-        }
-        self.scan_objects(chunk);
-    }
-
-    /// Feed a chunk of a BINARY `application/vnd.amazon.eventstream` body (a same-protocol
-    /// bedrock→bedrock passthrough). The JSON `feed` scanner cannot be used here: the eventstream
-    /// frames carry u32 length prefixes, header blocks and CRC32 trailers, so a stray `{` byte inside
-    /// a prelude/CRC/payload would mislead the brace scanner into parsing garbage or a partial object
-    /// (wrong/zero token counts, non-deterministic terminal-error detection). Instead, reassemble
-    /// complete frames across chunk boundaries with `drain_frames` and inspect each by event type:
-    ///   - a `metadata` frame carries the native Converse `usage.{inputTokens,outputTokens}` — the
-    ///     only place per-request token usage appears on a ConverseStream — so TPM / spend budget can
-    ///     be charged for passthrough traffic (otherwise always zero);
-    ///   - an `*Exception` frame (`:message-type: exception`, surfaced by `event_type_for_frame` as a
-    ///     `…Exception` union-member token) is an in-band terminal error AWS delivers while the HTTP
-    ///     response stays 200 and closes cleanly — set `terminal_error` so the stream-end breaker arm
-    ///     records a failure (otherwise the lane looks healthy after every in-band bedrock error).
-    pub(crate) fn feed_eventstream(&mut self, chunk: &Bytes) {
-        // Same MAX_SCAN_BYTES guard as `feed`: `drain_frames` itself caps a single frame at
-        // MAX_FRAME_BYTES, but a chunk far larger than a realistically coalesced terminal flush is
-        // skipped to bound per-poll scan time on the Tokio worker, with a warn so the accounting gap
-        // is observable rather than silent.
-        if self.eventstream_buf.len().saturating_add(chunk.len()) > MAX_SCAN_BYTES {
-            tracing::warn!(
-                buffered = self.eventstream_buf.len(),
-                chunk_len = chunk.len(),
-                cap = MAX_SCAN_BYTES,
-                "usage tap skipped an oversized eventstream chunk; if it carried the terminal \
-                 metadata/exception frame, tokens are undercounted or an in-band error is missed"
-            );
-            // Drop the partial buffer too: it can no longer be completed within the cap.
-            self.eventstream_buf.clear();
-            return;
-        }
-        self.eventstream_buf.extend_from_slice(chunk);
-        for (event_type, payload) in crate::eventstream::drain_frames(&mut self.eventstream_buf) {
-            if event_type == "metadata" {
-                if let Ok(obj) = crate::json::parse::<Value>(&payload) {
-                    // Native Converse usage shape (inputTokens / outputTokens) — handled by the
-                    // protocol-agnostic extractor, which already recognizes the bedrock keys.
-                    self.extract_usage_any(&obj);
-                }
-            } else if event_type.ends_with("Exception") {
-                // In-band modeled exception (e.g. internalServerException, modelStreamErrorException,
-                // throttlingException). Record it as the terminal error so the stream-end breaker arm
-                // trips this lane. Lift the payload `message` for observability where present.
-                let msg = crate::json::parse::<Value>(&payload)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("message")
-                            .and_then(|m| m.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .unwrap_or_else(|| event_type.clone());
-                self.terminal_error = Some(msg);
-            }
-        }
-    }
-
-    /// Extract usage fields from a message_delta event object.
-    fn extract_usage_from_delta(&mut self, obj: &Value) {
-        if obj.get("type").and_then(|t| t.as_str()) != Some("message_delta") {
-            return;
-        }
-        if let Some(u) = obj.get("usage") {
-            if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
-                self.input_tokens = Some(v);
-            }
-            if let Some(v) = u.get("output_tokens").and_then(|v| v.as_u64()) {
-                self.output_tokens = Some(v);
-            }
-        }
-    }
-
-    /// Extract usage fields from a `message_start` event object (Anthropic SSE).
-    ///
-    /// Completeness fix (MED #3): Anthropic emits `input_tokens` ONLY on the opening
-    /// `message_start` frame — `{"type":"message_start","message":{"usage":{"input_tokens":N,…}}}`
-    /// — and then sends `output_tokens` (and any usage corrections) on the trailing
-    /// `message_delta`/`message_stop` frames, whose `usage` block omits `input_tokens`. The
-    /// cross-protocol path backfills the prompt count when translating egress→IR via
-    /// `StreamTranslate`, but the SAME-protocol Anthropic→Anthropic stream has no translate seam,
-    /// so without reading `message_start` here the tap reports `input_tokens = 0` for every native
-    /// Anthropic streamed completion and UNDERCOUNTS prompt tokens (TPM/spend undercharged).
-    ///
-    /// The usage is NESTED under `message.usage` (unlike the top-level `usage` on delta/stop), so
-    /// it is read from there. Fields are filled ONLY when still unset, so an authoritative later
-    /// frame (`message_delta`'s corrected `output_tokens`, or a backend that repeats `input_tokens`
-    /// on `message_delta`) always overrides this opening snapshot rather than the reverse.
-    fn extract_usage_from_message_start(&mut self, obj: &Value) {
-        if obj.get("type").and_then(|t| t.as_str()) != Some("message_start") {
-            return;
-        }
-        if let Some(u) = obj.get("message").and_then(|m| m.get("usage")) {
-            if self.input_tokens.is_none() {
-                if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
-                    self.input_tokens = Some(v);
-                }
-            }
-            if self.output_tokens.is_none() {
-                if let Some(v) = u.get("output_tokens").and_then(|v| v.as_u64()) {
-                    self.output_tokens = Some(v);
-                }
-            }
-        }
-    }
-
-    /// Extract usage fields from a message_stop event object (fallback).
-    fn extract_usage_from_stop(&mut self, obj: &Value) {
-        if obj.get("type").and_then(|t| t.as_str()) != Some("message_stop") {
-            return;
-        }
-        if let Some(u) = obj.get("usage") {
-            if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
-                self.input_tokens = Some(v);
-            }
-            if let Some(v) = u.get("output_tokens").and_then(|v| v.as_u64()) {
-                self.output_tokens = Some(v);
-            }
-        }
-    }
-
-    /// Detect a genuine terminal ERROR frame across the wire shapes a streamed mid-stream error can
-    /// take, so stream-end breaker recording can distinguish a clean close from an aborted one:
-    ///   - Anthropic SSE: a `{"type":"error", "error": {...}}` event. Also covers a CROSS-protocol
-    ///     stream reframed to Anthropic by `StreamTranslate` (the tap is fed the Anthropic-shaped
-    ///     output there).
-    ///   - OpenAI (and OpenAI-compatible) SAME-protocol passthrough: an in-band bare `data:` frame of
-    ///     the form `{"error":{...}}` with NO `type` discriminant. A native OpenAI stream never tags
-    ///     its in-band error with `"type":"error"` (that is the Anthropic shape), so the Anthropic
-    ///     branch above never fires for it; without this branch an OpenAI backend that emits an in-band
-    ///     `{"error":{...}}` terminal event and THEN closes the stream cleanly would not trip the
-    ///     breaker for that lane (the `Poll::Ready(None)` arm only records when `terminal_error` is
-    ///     set). This recognizes that shape so the per-lane breaker trip count is accurate for those
-    ///     backends too.
-    ///   - OpenAI **Responses** streaming terminal failure: `{"type":"response.failed","response":{…,
-    ///     "error":{…}}}`. This frame carries a `type` (so the OpenAI bare-`error` branch above
-    ///     rejects it on the no-`type` gate) AND nests its error under `response.error` (so the
-    ///     Anthropic branch, which reads top-level `error`, never fires). Without this arm a streaming
-    ///     Responses FAILURE closed the stream cleanly and was recorded as breaker SUCCESS — the lane
-    ///     never tripped. Match on `type == "response.failed"` and pull the message from
-    ///     `response.error.message`.
-    ///
-    /// Sets `terminal_error` to the error message (or a generic marker).
-    fn extract_terminal_error(&mut self, obj: &Value) {
-        let type_str = obj.get("type").and_then(|t| t.as_str());
-        let is_anthropic_error = type_str == Some("error");
-        // OpenAI-style in-band error: a top-level `error` object with no `type` discriminant. Gate on
-        // the ABSENCE of `type` so a normal typed OpenAI chunk that merely carries a nested `error:
-        // null` (or any non-error event that happens to include an `error` key) does not false-trip;
-        // a real terminal error frame is `{"error":{...}}` alone.
-        let is_openai_error =
-            obj.get("type").is_none() && obj.get("error").map(|e| !e.is_null()).unwrap_or(false);
-        // OpenAI Responses streaming terminal failure: a typed `response.failed` frame whose error is
-        // NESTED under `response.error` (neither branch above sees it).
-        let is_responses_failed = type_str == Some("response.failed");
-        if !is_anthropic_error && !is_openai_error && !is_responses_failed {
-            return;
-        }
-        // Pull the human message from the shape that matched: `response.error.message` for the nested
-        // Responses failure frame, top-level `error.message` for the Anthropic/OpenAI shapes.
-        let msg = if is_responses_failed {
-            obj.get("response")
-                .and_then(|r| r.get("error"))
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-        } else {
-            obj.get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-        }
-        .unwrap_or("upstream stream error");
-        self.terminal_error = Some(msg.to_string());
-    }
-
-    /// Protocol-agnostic usage extraction: recognizes the `usage` / `usageMetadata` shapes across
-    /// all wire protocols, in both streamed final frames and whole non-stream bodies. This is what
-    /// makes token-based budget accounting work for every protocol (not just Anthropic SSE).
-    ///   - Anthropic / OpenAI Responses: usage.input_tokens / output_tokens
-    ///   - OpenAI chat completions:       usage.prompt_tokens / completion_tokens
-    ///   - AWS Bedrock (Converse):        usage.inputTokens / outputTokens
-    ///   - Google Gemini:                 usageMetadata.promptTokenCount / candidatesTokenCount
-    fn extract_usage_any(&mut self, obj: &Value) {
-        if let Some(u) = obj.get("usage") {
-            for k in ["input_tokens", "prompt_tokens", "inputTokens"] {
-                if let Some(v) = u.get(k).and_then(|v| v.as_u64()) {
-                    self.input_tokens = Some(v);
-                    break;
-                }
-            }
-            for k in ["output_tokens", "completion_tokens", "outputTokens"] {
-                if let Some(v) = u.get(k).and_then(|v| v.as_u64()) {
-                    self.output_tokens = Some(v);
-                    break;
-                }
-            }
-        }
-        if let Some(u) = obj.get("usageMetadata") {
-            if let Some(v) = u.get("promptTokenCount").and_then(|v| v.as_u64()) {
-                self.input_tokens = Some(v);
-            }
-            if let Some(v) = u.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
-                self.output_tokens = Some(v);
-            }
-        }
-        // Cohere v2 native streaming terminal frame:
-        // `{"type":"message-end","delta":{"usage":{"tokens":{"input_tokens":N,"output_tokens":M}}}}`.
-        // The token counts are nested under `delta.usage.tokens`, NOT the top-level `usage` the loops
-        // above scan, so without this arm a same-protocol Cohere→Cohere streaming passthrough reports
-        // zero tokens and the virtual key's TPM/spend budget is silently undercharged. Descend the
-        // delta.usage.tokens path explicitly.
-        if let Some(tokens) = obj
-            .get("delta")
-            .and_then(|d| d.get("usage"))
-            .and_then(|u| u.get("tokens"))
-        {
-            if let Some(v) = tokens.get("input_tokens").and_then(|v| v.as_u64()) {
-                self.input_tokens = Some(v);
-            }
-            if let Some(v) = tokens.get("output_tokens").and_then(|v| v.as_u64()) {
-                self.output_tokens = Some(v);
-            }
-        }
-    }
-
-    /// Check if any usage data was extracted (test-only assertion helper).
-    #[cfg(test)]
-    pub(crate) fn has_usage(&self) -> bool {
-        self.input_tokens.is_some() || self.output_tokens.is_some()
-    }
-}
-
 /// Deterministic FNV-1a hash of a string — stable across processes/restarts (unlike the
 /// std `DefaultHasher`, whose seed is randomized), so session affinity pins consistently.
 fn stable_hash(s: &str) -> u64 {
     crate::store::fnv1a_u64(s)
-}
-
-/// Find the start of a JSON object (opening brace) in bytes.
-fn find_json_start(chunk: &[u8]) -> Option<usize> {
-    chunk.iter().position(|&b| b == b'{')
-}
-
-/// Find the matching closing brace for an opening brace, returning byte offset from start.
-/// Returns None if braces are unbalanced or not found.
-fn find_matching_brace(chunk: &[u8]) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escape = false;
-
-    for (i, &b) in chunk.iter().enumerate() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        match b {
-            b'\\' if in_string => escape = true,
-            b'"' => in_string = !in_string,
-            b'{' if !in_string => depth += 1,
-            b'}' if !in_string => {
-                // Guard against a closing brace with no matching opener (malformed/adversarial
-                // upstream bytes): `depth` is unsigned, so `depth -= 1` here would underflow.
-                if depth == 0 {
-                    return None;
-                }
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
-            }
-            // All other byte values don't affect brace matching
-            _other => {}
-        }
-    }
-    None
 }
 
 /// Body wrapper that implements the before-first-byte failover boundary.
@@ -1170,8 +780,6 @@ struct FirstByteBody<S, P> {
     /// Routing pool name, so a mid-stream failure trips this lane's per-pool breaker cell (empty on
     /// the degraded path → the lane-default cell).
     pool: Box<str>,
-    /// Usage tap for extracting Anthropic SSE usage without buffering full body
-    tap: UsageTap,
     /// when Some, translate each egress SSE chunk to the caller's ingress protocol.
     /// None = native passthrough (same-protocol or non-SSE).
     translate: Option<crate::proto::StreamTranslate>,
@@ -1193,16 +801,15 @@ struct FirstByteBody<S, P> {
     /// Set once the stream has fully ended (after any translation terminator), so a later poll
     /// returns None instead of re-polling a finished inner stream.
     ended: bool,
-    /// Bounded reassembly buffer for a SAME-PROTOCOL NON-STREAM (`!is_sse`, `translate == None`,
-    /// non-bedrock) `application/json` body that reqwest delivers across multiple transport frames.
-    /// The per-poll `tap.feed` scanner keeps NO cross-chunk state — it only parses complete JSON
-    /// objects within a single chunk — so a multi-chunk same-protocol non-stream body that splits the
-    /// top-level object before its trailing `usage` parses NO usage, leaving input/output tokens
-    /// `None` and undercounting the key's TPM/spend (MED #1). On that one path we therefore retain the
-    /// raw bytes here (capped at `MAX_TRANSLATED_BODY_BYTES`, dropping past the cap with a warn like
-    /// the buffered guards) and run `tap.feed_whole` ONCE over the reassembled body at stream end,
-    /// instead of feeding per-chunk. Bytes still stream to the client incrementally; only a bounded
-    /// copy is retained for usage parsing. The SSE / translation / bedrock paths never touch this.
+    /// Bounded reassembly buffer for a SAME-PROTOCOL NON-STREAM (`!is_sse`, `translate == None`)
+    /// `application/json` body that reqwest delivers across multiple transport frames. This is the
+    /// non-stream analog of Change B's read-for-IR-emit-verbatim: the body is relayed to the client
+    /// byte-for-byte (each chunk passes through unchanged), but a bounded copy is retained here so the
+    /// stream-end arm can run the EGRESS READER over the reassembled body and source `IrUsage` for
+    /// billing (Change A path #4). Same-proto means egress == ingress, so the body is in the ingress
+    /// protocol's native shape and `ingress_protocol`'s reader decodes it. Capped at
+    /// `MAX_TRANSLATED_BODY_BYTES` (dropping past the cap with a warn like the buffered guards). The
+    /// SSE / translation paths never touch this (they bill via `translate.usage()`).
     nonstream_buf: Vec<u8>,
 }
 
@@ -1242,7 +849,6 @@ where
             lane_idx,
             breaker_cfg,
             pool: Box::from(pool),
-            tap: UsageTap::new(),
             translate,
             json_array,
             usage_sink,
@@ -1274,46 +880,14 @@ where
                         this.first_byte_sent.store(true, Ordering::Relaxed);
                     }
                     // cross-protocol → translate egress SSE bytes to the ingress format. SAME-protocol
-                    // (Change B step 2) → `t.feed` returns the VERBATIM original frame bytes, and the
-                    // IR pipeline ran only as a usage side-channel (`t.usage()` shadow value).
+                    // (Change B) → `t.feed` returns the VERBATIM original frame bytes. Billing now reads
+                    // the IR-derived `t.usage()` at stream end (Change A) — there is no longer a byte-
+                    // scanner tap on this path, so `feed` is the single usage source for both modes.
                     if let Some(t) = this.translate.as_mut() {
-                        let same_proto = t.is_same_proto();
                         let out = t.feed(&chunk);
                         let out_bytes = Bytes::from(out);
-                        if same_proto {
-                            // SAME-PROTOCOL: keep the LIVE `UsageTap` behaving EXACTLY as the legacy
-                            // raw-chunk passthrough did — feed it the ORIGINAL `chunk` via the same
-                            // per-protocol mechanism (so token accounting AND in-band-error breaker
-                            // tripping are byte-for-byte unchanged from the `translate == None` path the
-                            // flag replaces). The translator's `take_tap_json`/`out_bytes` are NOT used
-                            // for the live tap here; the IR-derived `t.usage()` is the SHADOW value only.
-                            if this.ingress_eventstream {
-                                // Bedrock binary frames: scan natively (usage `metadata` + in-band
-                                // `*Exception` breaker signal) — the JSON `{`-scanner can't read binary.
-                                this.tap.feed_eventstream(&chunk);
-                            } else {
-                                this.tap.feed(&chunk);
-                            }
-                        } else if t.ingress_is_eventstream() {
-                            // Feed the tap with JSON TEXT, never binary frames. For the five SSE ingress
-                            // protocols the translated `out` IS the JSON-bearing SSE text the tap's
-                            // `{`-scanner is built for. But for BEDROCK ingress the translated `out` is
-                            // binary `application/vnd.amazon.eventstream` framing (u32 length prefixes,
-                            // CRC32s, header blocks whose stray `{` bytes would mislead the scanner into
-                            // parsing garbage or zeroing usage). On that path read the pre-encode JSON the
-                            // translator captured (`take_tap_json`) instead, so token accounting is
-                            // reliable. (A same-protocol passthrough — translate=None — feeds the raw chunk
-                            // below, already the right shape there.)
-                            let tap_json = t.take_tap_json();
-                            if !tap_json.is_empty() {
-                                this.tap.feed(&Bytes::from(tap_json));
-                            }
-                        } else {
-                            this.tap.feed(&out_bytes);
-                        }
                         // Gemini non-`alt=sse` ingress: reframe the (now gemini-SSE) bytes into the
-                        // JSON-array streaming shape. Run AFTER tap+translate so accounting is
-                        // unaffected.
+                        // JSON-array streaming shape. Run AFTER translate so accounting is unaffected.
                         if let Some(framer) = this.json_array.as_mut() {
                             let framed = framer.feed(&out_bytes);
                             if framed.is_empty() {
@@ -1326,34 +900,21 @@ where
                         }
                         return Poll::Ready(Some(Ok(out_bytes)));
                     }
-                    // Passthrough (same-protocol): the raw chunk is already in the client's shape.
-                    // BUT on a SAME-PROTOCOL bedrock→bedrock passthrough that chunk is binary
-                    // `application/vnd.amazon.eventstream` framing (u32 length prefixes, CRC32s, header
-                    // blocks) — feeding it to the tap's `{`-brace JSON scanner makes stray `{` bytes
-                    // inside CRCs/preludes/payloads mislead it into parsing garbage or a partial object,
-                    // so `extract_usage_*` lands on wrong/zero token counts and terminal-error detection
-                    // over binary frames is non-deterministic. This is the SAME hazard the cross-protocol
-                    // branch above guards by reading `take_tap_json()` instead of the binary bytes; mirror
-                    // that discipline here by NOT scanning the binary chunk. (Token accounting for a
-                    // native bedrock ConverseStream passthrough is best handled off the JSON tap.) Every
-                    // other same-protocol passthrough (the five SSE protocols) IS JSON-bearing text, so
-                    // it still feeds the tap as before.
-                    if this.ingress_eventstream {
-                        // Binary `application/vnd.amazon.eventstream` passthrough: scan the native
-                        // frames for the `metadata` usage frame and any in-band `*Exception` frame so
-                        // bedrock→bedrock streaming is token-accounted AND in-band errors trip the
-                        // breaker — neither of which the JSON `feed` scanner can do over binary frames.
-                        this.tap.feed_eventstream(&chunk);
-                    } else if !this.is_sse {
-                        // SAME-PROTOCOL NON-STREAM `application/json` passthrough (MED #1): the per-poll
-                        // `tap.feed` scanner keeps no cross-chunk state, so a body that reqwest splits
-                        // across transport frames before its trailing `usage` would parse NO usage and
-                        // undercount the key's TPM/spend. Retain the raw bytes (bounded) and run
-                        // `feed_whole` ONCE over the reassembled body in the `Poll::Ready(None)` arm
-                        // instead of feeding per-chunk. The SSE path keeps feeding per-chunk (it must
-                        // stay non-buffering). Cap at `MAX_TRANSLATED_BODY_BYTES`; past the cap, drop
-                        // the overflow with a warn (matching the buffered `read_capped` guards) — the
-                        // tail `usage` may then be missed, but the gap is observable, not a memory leak.
+                    // Passthrough: the raw chunk is already in the client's shape. This branch is reached
+                    // only for (a) a SAME-PROTOCOL NON-STREAM (`!is_sse`) `application/json` body — the
+                    // streaming SSE/eventstream same-proto path always builds a `Some(translate)` now —
+                    // and (b) the unknown-protocol fallback (`new_same_proto` returned `None`), which has
+                    // no reader to drive the IR and therefore no usage source. The bytes always stream to
+                    // the client unchanged; for (a) we retain a bounded copy for IR-based billing below.
+                    if !this.is_sse {
+                        // SAME-PROTOCOL NON-STREAM `application/json` passthrough (Change A path #4): the
+                        // non-stream analog of B's read-for-IR-emit-verbatim. The body relays verbatim,
+                        // but a bounded copy is retained so the stream-end arm can run the egress reader
+                        // (`ingress_protocol`'s reader — same-proto, so egress == ingress) over the
+                        // reassembled body and source `IrUsage` for billing. Cap at
+                        // `MAX_TRANSLATED_BODY_BYTES`; past the cap, drop the overflow with a warn
+                        // (matching the buffered `read_capped` guards) — the tail `usage` may then be
+                        // missed, but the gap is observable, not a memory leak.
                         if this.nonstream_buf.len() < max_translated_body_bytes() {
                             let remaining = max_translated_body_bytes() - this.nonstream_buf.len();
                             if chunk.len() <= remaining {
@@ -1369,12 +930,11 @@ where
                                 );
                             }
                         }
-                    } else {
-                        this.tap.feed(&chunk);
                     }
-                    // Gemini same-protocol passthrough WITHOUT `?alt=sse`: the upstream chunk is
-                    // gemini SSE (busbar always requests `?alt=sse` upstream); reframe it into the
-                    // JSON-array streaming shape the native client expects.
+                    // Gemini same-protocol passthrough WITHOUT `?alt=sse` on the unknown-protocol
+                    // fallback: the upstream chunk is gemini SSE (busbar always requests `?alt=sse`
+                    // upstream); reframe it into the JSON-array streaming shape the native client
+                    // expects. (The known-protocol gemini same-proto path runs through `translate`.)
                     if let Some(framer) = this.json_array.as_mut() {
                         let framed = framer.feed(&chunk);
                         if framed.is_empty() {
@@ -1536,21 +1096,26 @@ where
                         .as_ref()
                         .map(|t| t.aborted())
                         .unwrap_or(false);
-                    // A stream is FAILED for breaker purposes when EITHER an in-band terminal error
-                    // frame was tapped (as of this point in the arm) OR the cross-protocol translate
-                    // aborted mid-flight. The breaker gate has always evaluated `terminal_error` HERE
-                    // at the top of the arm (before the deferred bedrock `finish()` tap-feed below),
-                    // so keep that ordering; the billing gate re-evaluates the same predicate AFTER
-                    // the tap-feed (see below) since a bedrock deferred `metadata` frame can surface a
-                    // terminal error only at finish.
-                    let breaker_failed = this.tap.terminal_error.is_some() || translate_aborted;
+                    // A stream is FAILED for breaker purposes when EITHER a reader-emitted terminal ERROR
+                    // event was seen (the IR-sourced `translate.terminal_error()`, Change A — replacing
+                    // the deleted `UsageTap::terminal_error` byte-scan) OR the cross-protocol translate
+                    // aborted mid-flight. Every same-proto/cross-proto SSE+eventstream stream now flows
+                    // through `translate`, so the terminal error is observable at this point in the arm
+                    // for all of them; the billing gate re-evaluates the same predicate AFTER the bedrock
+                    // deferred `finish()` below (whose `metadata` frame can surface usage/error at end).
+                    let stream_terminal_error = this
+                        .translate
+                        .as_ref()
+                        .and_then(|t| t.terminal_error())
+                        .is_some();
+                    let breaker_failed = stream_terminal_error || translate_aborted;
                     if this.is_sse && this.first_byte_sent.load(Ordering::Relaxed) && breaker_failed
                     {
                         if let Some(app) = this.app.as_ref() {
                             // Distinguish the two failure lineages in the recorded reason so the
                             // R25 terminal-error path and this R26 translate-abort sibling remain
                             // separable in breaker telemetry.
-                            let reason = if this.tap.terminal_error.is_some() {
+                            let reason = if stream_terminal_error {
                                 "stream-terminal-error"
                             } else {
                                 // translate_aborted must hold here (breaker_failed && no
@@ -1600,60 +1165,69 @@ where
                             .unwrap_or_default()
                     };
                     // Bedrock ingress: `finish()` may emit a deferred terminal `metadata` frame (the
-                    // default-OpenAI-streaming case carries usage there). Tap its pre-encode JSON so
-                    // end-of-stream token usage is still captured — the binary `done` bytes would not
-                    // be scannable by the tap's `{`-scanner.
-                    if let Some(t) = this.translate.as_mut() {
-                        if t.ingress_is_eventstream() {
-                            let tap_json = t.take_tap_json();
-                            if !tap_json.is_empty() {
-                                this.tap.feed(&Bytes::from(tap_json));
-                            }
-                        }
-                    }
+                    // default-OpenAI-streaming case carries usage there). Its usage is folded into the
+                    // translator's `last_usage` A-tap by `finish()` itself, so `translate.usage()` below
+                    // already reflects it — no separate tap-feed of the binary `done` bytes is needed.
                     drop(this.permit.take());
                     this.ended = true;
-                    // SAME-PROTOCOL NON-STREAM (`!is_sse`) reassembly (MED #1): the body was buffered
-                    // across transport frames above instead of fed per-chunk (the per-poll scanner
-                    // keeps no cross-chunk state). Parse the usage ONCE over the reassembled body so a
-                    // multi-chunk body whose top-level object split before its trailing `usage` is
-                    // still token-counted. `feed_whole` runs the uncapped whole-document/brace-scan
-                    // (the buffer is already bounded by `MAX_TRANSLATED_BODY_BYTES`). The SSE path's
-                    // `nonstream_buf` is always empty, so this is a no-op there.
-                    if !this.is_sse && !this.nonstream_buf.is_empty() {
-                        let buf = std::mem::take(&mut this.nonstream_buf);
-                        this.tap.feed_whole(&buf);
-                    }
+                    // Token usage for billing, sourced from the IR (Change A):
+                    //   - STREAMING (SSE / eventstream, same- or cross-proto): `translate.usage()` — the
+                    //     terminal `IrUsage` the readers accumulated, post Anthropic start-usage backfill.
+                    //   - SAME-PROTOCOL NON-STREAM (`!is_sse`, `translate == None`): run the EGRESS reader
+                    //     (`ingress_protocol`'s reader — same-proto, egress == ingress) over the
+                    //     reassembled `nonstream_buf` body and read `ir.usage` (Change A path #4). The body
+                    //     was relayed verbatim; this is the read-for-IR side-channel for billing.
+                    // The unknown-protocol fallback passthrough has no reader and yields `None` (no usage
+                    // source — same as before; an unknown protocol cannot be metered).
+                    let ir_usage: Option<crate::ir::IrUsage> =
+                        if let Some(t) = this.translate.as_ref() {
+                            t.usage().cloned()
+                        } else if !this.is_sse && !this.nonstream_buf.is_empty() {
+                            let buf = std::mem::take(&mut this.nonstream_buf);
+                            crate::proto::protocol_for(&this.ingress_protocol)
+                                .zip(crate::json::parse::<Value>(&buf).ok())
+                                .and_then(|(p, v)| p.reader().read_response(&v).ok())
+                                .map(|ir| ir.usage)
+                        } else {
+                            None
+                        };
                     // Charge this request's token usage to the virtual key's budget (once) — but ONLY
-                    // for a cleanly-terminated stream. A stream that emitted a mid-stream terminal
-                    // ERROR frame (`tap.terminal_error` set) OR whose cross-protocol translate
-                    // aborted mid-flight (`translate_aborted`) delivered a partial/aborted response
-                    // the caller cannot use, and billing it contradicts the flat-fee-only-on-success
-                    // policy (the per-request fee is charged at admission by
+                    // for a cleanly-terminated stream. A stream that saw a reader-emitted terminal ERROR
+                    // event (`translate.terminal_error()`) OR whose cross-protocol translate aborted
+                    // mid-flight (`translate_aborted`) delivered a partial/aborted response the caller
+                    // cannot use, and billing it contradicts the flat-fee-only-on-success policy (the
+                    // per-request fee is charged at admission by
                     // `route::budget_check`→`try_charge_request_within_budget`, and `route::finish`
                     // REFUNDS it on a non-2xx, so the net flat fee lands only on a 2xx). Mirror that
                     // here with the SAME `failed` predicate the breaker gate above uses: a failed
                     // stream is not token-billed, covering BOTH the SSE-ingress and json-array close
                     // paths (the json-array path previously fell through and billed an aborted
-                    // stream's partial tokens).
+                    // stream's partial tokens). A same-proto non-stream body has no terminal-error/abort
+                    // path here (it is `!is_sse`), so `billing_failed` is false there.
                     if let Some(sink) = this.usage_sink.take() {
-                        // Re-evaluate the failed predicate AFTER the deferred bedrock `finish()`
-                        // tap-feed above (which can surface a terminal error only at stream end), OR'd
-                        // with the hoisted translate-abort flag — keeping the SAME failed semantics
-                        // the breaker gate used. An aborted translate's `feed` is a no-op, so the
-                        // `translate_aborted` snapshot taken at the top of the arm is still authoritative.
-                        let billing_failed = this.tap.terminal_error.is_some() || translate_aborted;
+                        // Re-read the terminal error AFTER the deferred bedrock `finish()` above (whose
+                        // `metadata`/exception frame can surface an error only at stream end), OR'd with
+                        // the hoisted translate-abort flag — keeping the SAME failed semantics the breaker
+                        // gate used. An aborted translate's `feed` is a no-op, so the `translate_aborted`
+                        // snapshot taken at the top of the arm is still authoritative.
+                        let billing_failed = this
+                            .translate
+                            .as_ref()
+                            .and_then(|t| t.terminal_error())
+                            .is_some()
+                            || translate_aborted;
                         if !billing_failed {
-                            // `saturating_add`: both operands are UPSTREAM-CONTROLLED token counts
-                            // (parsed from the provider's usage block), so an unchecked `+` could panic
-                            // on overflow in debug / silently wrap in release (#18). Saturate to
-                            // `u64::MAX` — matching `record_tokens` downstream, which is itself
+                            // billed tokens = input + output ONLY (cache fields are deliberately NOT
+                            // summed here — their cache-subset-vs-additive semantics differ by provider,
+                            // a correctness fix that lands in a separate later change). `saturating_add`:
+                            // both operands are UPSTREAM-CONTROLLED token counts, so an unchecked `+`
+                            // could panic on overflow in debug / silently wrap in release (#18). Saturate
+                            // to `u64::MAX` — matching `record_tokens` downstream, which is itself
                             // saturating — rather than risk a request-path panic.
-                            let tokens = this
-                                .tap
-                                .input_tokens
-                                .unwrap_or(0)
-                                .saturating_add(this.tap.output_tokens.unwrap_or(0));
+                            let tokens = ir_usage
+                                .as_ref()
+                                .map(|u| u.input_tokens.saturating_add(u.output_tokens))
+                                .unwrap_or(0);
                             // Attribute the token fee to the SAME window the flat per-request fee was
                             // charged in (`sink.charged_at`, the header-arrival epoch), not the
                             // stream-end clock — otherwise a stream that completes in a later window
@@ -2145,25 +1719,20 @@ pub(crate) fn egress_accept(egress_protocol: &str, wants_stream: bool) -> &'stat
         })
 }
 
-/// Charge a non-streaming response's token usage to the virtual key's budget. The streaming path
-/// taps tokens incrementally inside `FirstByteBody`; buffered (non-streaming) responses have no
-/// such wrapper, so without this the per-key token counter (and any TPM limit derived from it)
-/// silently stays at zero. Taps the raw upstream body, which carries the real usage in whatever
-/// protocol shape the backend speaks (the same protocol-agnostic extraction the stream tap uses).
-fn record_nonstream_usage(upstream_body: &[u8], usage_sink: &Option<UsageSink>) {
+/// Charge a non-streaming response's token usage to the virtual key's budget, sourced from the IR
+/// (Change A). The streaming path bills from `translate.usage()` inside `FirstByteBody`; buffered
+/// (non-streaming) cross-protocol responses already decode the egress body egress→IR→ingress, so the
+/// terminal `IrUsage` is available WITHOUT a separate byte-scan — bill straight from `ir.usage`.
+///
+/// Billed tokens = `input_tokens + output_tokens` ONLY (cache fields are deliberately NOT summed in;
+/// their cache-subset-vs-additive semantics differ by provider, a correctness fix for a separate
+/// later change). This matches the streaming billing arm and the prior byte-scanner for 5/6 protocols.
+fn record_ir_usage(usage: &crate::ir::IrUsage, usage_sink: &Option<UsageSink>) {
     if let Some(sink) = usage_sink {
-        let mut tap = UsageTap::new();
-        // Buffered body is complete and already bounded by `MAX_TRANSLATED_BODY_BYTES`; use the
-        // uncapped whole-body parse so usage in a >512 KiB completion is NOT silently dropped by the
-        // streaming-only per-poll `MAX_SCAN_BYTES` guard (which exists solely to bound poll latency).
-        tap.feed_whole(upstream_body);
         // `saturating_add`: both operands are UPSTREAM-CONTROLLED token counts, so an unchecked `+`
         // could panic on overflow in debug / wrap in release (#18). Saturate to `u64::MAX`, matching
         // the streaming path and the saturating `record_tokens` downstream.
-        let tokens = tap
-            .input_tokens
-            .unwrap_or(0)
-            .saturating_add(tap.output_tokens.unwrap_or(0));
+        let tokens = usage.input_tokens.saturating_add(usage.output_tokens);
         if tokens > 0 {
             // Same window as the flat per-request fee (`sink.charged_at`, header-arrival epoch), so
             // the buffered-path token fee and the per-request fee never split across windows (#29).
@@ -3397,8 +2966,9 @@ pub(crate) async fn forward_with_pool_parsed(
                             {
                                 // Token accounting: we are now committed to translating and
                                 // delivering this body (every exit from this block is a delivered
-                                // response). No FirstByteBody on this buffered path, so tap here.
-                                record_nonstream_usage(&bytes, &usage_sink);
+                                // response). No FirstByteBody on this buffered path, so bill here —
+                                // straight from the IR usage the egress reader just decoded (Change A).
+                                record_ir_usage(&ir.usage, &usage_sink);
                                 // Cross-protocol reframe: strip the backend's NATIVE-FORMAT identity
                                 // so the ingress writer mints values in the CLIENT's format. Without
                                 // this an OpenAI backend's `chatcmpl-...` id (or its opaque
@@ -3589,16 +3159,13 @@ pub(crate) async fn forward_with_pool_parsed(
                 let egress_name_for_translate = app.lanes[i].protocol.name();
                 let translate = if is_sse {
                     if ingress_protocol == egress_name_for_translate {
-                        // SAME-PROTOCOL SSE/event-stream (Change B step 2): when the universal-translate
-                        // flag is on, run the verbatim same-proto translator (byte-exact re-emit + IR
-                        // usage side-channel). When off, fall back to the legacy raw-chunk passthrough
-                        // (`None`). `new_same_proto` is `None` only for an unknown protocol, in which
-                        // case we also fall back to passthrough.
-                        if ENABLE_UNIVERSAL_SAME_PROTO_TRANSLATE {
-                            crate::proto::StreamTranslate::new_same_proto(ingress_protocol)
-                        } else {
-                            None
-                        }
+                        // SAME-PROTOCOL SSE/event-stream (Change B, now permanent): always run the
+                        // verbatim same-proto translator (byte-exact re-emit + IR usage A-tap). The
+                        // universal path is unconditional — billing now sources `translate.usage()`, so
+                        // there is no longer a passthrough that bypasses the IR. `new_same_proto` is
+                        // `None` only for an unknown protocol, where there is no reader to drive the IR;
+                        // that falls back to the legacy raw-chunk passthrough (`None`).
+                        crate::proto::StreamTranslate::new_same_proto(ingress_protocol)
                     } else {
                         crate::proto::StreamTranslate::new(
                             ingress_protocol,
@@ -4190,8 +3757,9 @@ async fn forward_once(
                         if let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) {
                             // Token accounting: committed to translating and delivering this body
                             // (every exit below is a delivered response). No FirstByteBody on this
-                            // buffered path, so tap the usage here (mirrors the main path).
-                            record_nonstream_usage(&bytes, &usage_sink);
+                            // buffered path, so bill from the IR usage just decoded (Change A,
+                            // mirrors the main path).
+                            record_ir_usage(&ir.usage, &usage_sink);
                             // Strip the backend's native-format identity so the ingress writer mints
                             // values in the CLIENT's format (see the main path for the rationale).
                             ir.id = None;
@@ -4299,10 +3867,10 @@ async fn forward_once(
             // selected against, never the unrelated default cell.
             let translate = if is_sse && cross_protocol {
                 crate::proto::StreamTranslate::new(ingress_protocol, egress_name)
-            } else if is_sse && !cross_protocol && ENABLE_UNIVERSAL_SAME_PROTO_TRANSLATE {
-                // SAME-PROTOCOL SSE/event-stream (Change B step 2) on the degraded path: mirror the
-                // main `forward_with_pool` wiring — the verbatim same-proto translator (byte-exact
-                // re-emit + IR usage side-channel). `None` for an unknown protocol → legacy passthrough.
+            } else if is_sse && !cross_protocol {
+                // SAME-PROTOCOL SSE/event-stream (Change B, now permanent) on the degraded path: mirror
+                // the main `forward_with_pool` wiring — the verbatim same-proto translator (byte-exact
+                // re-emit + IR usage A-tap). `None` for an unknown protocol → legacy passthrough.
                 crate::proto::StreamTranslate::new_same_proto(ingress_protocol)
             } else {
                 None
@@ -4540,11 +4108,8 @@ async fn handle_least_bad(
 
 #[cfg(test)]
 mod usage_tap_tests {
-    use super::{
-        find_matching_brace, record_nonstream_usage, stable_hash, UsageSink, UsageTap,
-        MAX_SCAN_BYTES,
-    };
-    use bytes::Bytes;
+    use super::{record_ir_usage, stable_hash, UsageSink};
+    use crate::ir::IrUsage;
     use std::sync::Arc;
 
     // Regression for #29: the token fee charged at response completion must be attributed to the
@@ -4593,9 +4158,15 @@ mod usage_tap_tests {
             charged_at,
         });
 
-        // A buffered Anthropic-style completion carrying 600 input + 400 output = 1000 tokens.
-        let body = br#"{"usage":{"input_tokens":600,"output_tokens":400}}"#;
-        record_nonstream_usage(body, &sink);
+        // A buffered completion carrying 600 input + 400 output = 1000 tokens, sourced from IrUsage
+        // (Change A: billing now reads the IR usage the egress reader decoded, not a byte-scan).
+        let usage = IrUsage {
+            input_tokens: 600,
+            output_tokens: 400,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        record_ir_usage(&usage, &sink);
 
         // The 100c token fee must be in the charged_at day's window...
         let in_window = gov
@@ -4623,7 +4194,7 @@ mod usage_tap_tests {
     /// `saturating_add` over the UPSTREAM-CONTROLLED `input_tokens`/`output_tokens`. A hostile/buggy
     /// upstream that reports counts summing past `u64::MAX` would, under the old unchecked `+`, PANIC
     /// on the request path in debug (and silently WRAP in release). With `saturating_add` the sum
-    /// clamps to `u64::MAX` and `record_nonstream_usage` returns without panicking.
+    /// clamps to `u64::MAX` and `record_ir_usage` returns without panicking.
     #[test]
     fn test_nonstream_token_sum_saturates_no_panic_on_overflow() {
         use crate::governance::{GovState, NewKeySpec, SqliteStore};
@@ -4652,26 +4223,14 @@ mod usage_tap_tests {
         });
 
         // input_tokens + output_tokens overflows u64: u64::MAX + 5 would panic under an unchecked `+`.
-        let body = format!(
-            r#"{{"usage":{{"input_tokens":{},"output_tokens":5}}}}"#,
-            u64::MAX
-        );
+        let usage = IrUsage {
+            input_tokens: u64::MAX,
+            output_tokens: 5,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
         // Must NOT panic (the assertion is reaching this line at all under a debug-overflow build).
-        record_nonstream_usage(body.as_bytes(), &sink);
-    }
-
-    #[test]
-    fn test_find_matching_brace_underflow_safe() {
-        // A closing brace with no opener must return None, not underflow/panic (hostile upstream).
-        assert_eq!(find_matching_brace(b"}"), None);
-        assert_eq!(find_matching_brace(b"}}}}"), None);
-        // Balanced object still parses to its end.
-        assert_eq!(find_matching_brace(br#"{"a":1}tail"#), Some(7));
-        // A `}` inside a string is ignored.
-        assert_eq!(find_matching_brace(br#"{"a":"}"}"#), Some(9));
-        // Feeding such bytes through the tap must not panic.
-        let mut t = UsageTap::new();
-        t.feed(&Bytes::from_static(b"}}} garbage {not json"));
+        record_ir_usage(&usage, &sink);
     }
 
     #[test]
@@ -4680,273 +4239,13 @@ mod usage_tap_tests {
         assert_eq!(stable_hash("session-abc"), stable_hash("session-abc"));
         assert_ne!(stable_hash("session-abc"), stable_hash("session-xyz"));
     }
-
-    #[test]
-    fn test_tap_extracts_usage_across_protocols() {
-        // OpenAI chat completions: prompt_tokens / completion_tokens.
-        let mut t = UsageTap::new();
-        t.feed(&Bytes::from(
-            r#"{"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
-        ));
-        assert_eq!(t.input_tokens, Some(10));
-        assert_eq!(t.output_tokens, Some(5));
-
-        // Anthropic / OpenAI Responses: input_tokens / output_tokens.
-        let mut t = UsageTap::new();
-        t.feed(&Bytes::from(
-            r#"{"usage":{"input_tokens":8,"output_tokens":4}}"#,
-        ));
-        assert_eq!(t.input_tokens, Some(8));
-        assert_eq!(t.output_tokens, Some(4));
-
-        // AWS Bedrock Converse: inputTokens / outputTokens.
-        let mut t = UsageTap::new();
-        t.feed(&Bytes::from(
-            r#"{"usage":{"inputTokens":6,"outputTokens":2}}"#,
-        ));
-        assert_eq!(t.input_tokens, Some(6));
-        assert_eq!(t.output_tokens, Some(2));
-
-        // Gemini: usageMetadata.promptTokenCount / candidatesTokenCount.
-        let mut t = UsageTap::new();
-        t.feed(&Bytes::from(
-            r#"{"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}"#,
-        ));
-        assert_eq!(t.input_tokens, Some(7));
-        assert_eq!(t.output_tokens, Some(3));
-
-        // Cohere v2 native streaming terminal frame: token counts nested under
-        // `delta.usage.tokens`, NOT the top-level `usage`. Before the dedicated arm this reported
-        // zero tokens on a same-protocol Cohere passthrough, silently undercharging the key's
-        // TPM/spend budget.
-        let mut t = UsageTap::new();
-        t.feed(&Bytes::from(
-            r#"{"type":"message-end","delta":{"usage":{"tokens":{"input_tokens":11,"output_tokens":9}}}}"#,
-        ));
-        assert_eq!(t.input_tokens, Some(11));
-        assert_eq!(t.output_tokens, Some(9));
-    }
-
-    /// REGRESSION (MED #3): a SAME-protocol Anthropic stream must count `input_tokens` from the
-    /// opening `message_start` frame. Anthropic emits `input_tokens` ONLY on `message_start`
-    /// (nested under `message.usage`) and then `output_tokens` on the trailing `message_delta`,
-    /// whose `usage` block OMITS `input_tokens`. The cross-protocol path backfills the prompt count
-    /// via `StreamTranslate`, but the same-protocol Anthropic→Anthropic stream has no translate, so
-    /// before the `message_start` extractor the tap reported `input_tokens = 0` for every native
-    /// Anthropic streamed completion — undercounting prompt tokens (TPM/spend undercharged).
-    #[test]
-    fn test_tap_counts_input_tokens_from_message_start() {
-        // Feed the frames in real wire order: message_start carries input_tokens (+ an initial
-        // output_tokens), message_delta carries the FINAL output_tokens but NO input_tokens.
-        let mut t = UsageTap::new();
-        t.feed(&Bytes::from(
-            r#"{"type":"message_start","message":{"id":"msg_x","role":"assistant","usage":{"input_tokens":57,"output_tokens":1}}}"#,
-        ));
-        // After message_start alone, the prompt count must already be captured (the bug: 0/None).
-        assert_eq!(
-            t.input_tokens,
-            Some(57),
-            "input_tokens must come from message_start (Anthropic puts it only there)"
-        );
-
-        // The trailing message_delta corrects output_tokens and carries NO input_tokens; the
-        // earlier input count must SURVIVE (delta does not clobber it back to zero/None).
-        t.feed(&Bytes::from(
-            r#"{"type":"message_delta","usage":{"output_tokens":42}}"#,
-        ));
-        assert_eq!(
-            t.input_tokens,
-            Some(57),
-            "input_tokens from message_start must persist through the message_delta frame"
-        );
-        assert_eq!(
-            t.output_tokens,
-            Some(42),
-            "the authoritative message_delta output_tokens must override the message_start initial"
-        );
-
-        // Independence: a backend that DOES repeat input_tokens on a later authoritative frame must
-        // override the message_start snapshot (the extractor only FILLS unset fields, so a real
-        // delta value wins).
-        let mut t2 = UsageTap::new();
-        t2.feed(&Bytes::from(
-            r#"{"type":"message_start","message":{"usage":{"input_tokens":10}}}"#,
-        ));
-        t2.feed(&Bytes::from(
-            r#"{"type":"message_delta","usage":{"input_tokens":99,"output_tokens":3}}"#,
-        ));
-        assert_eq!(
-            t2.input_tokens,
-            Some(99),
-            "an authoritative later input_tokens must override the message_start snapshot"
-        );
-        assert_eq!(t2.output_tokens, Some(3));
-    }
-
-    /// HIGH (forward.rs `record_nonstream_usage` / `UsageTap` MAX_SCAN_BYTES guard): a buffered
-    /// non-stream success body LARGER than the streaming per-poll `MAX_SCAN_BYTES` (512 KiB) cap must
-    /// still have its usage counted. The streaming `feed` HARD-SKIPS an oversized chunk (a poll-latency
-    /// guard), which would silently DROP the usage block on exactly the large completions that
-    /// `MAX_TRANSLATED_BODY_BYTES` (32 MiB) exists to allow — undercounting TPM/spend governance.
-    /// `feed_whole` (used by `record_nonstream_usage`) must NOT apply that cap.
-    #[test]
-    fn test_feed_whole_counts_usage_on_large_buffered_body_past_scan_cap() {
-        // An OpenAI chat.completion body whose CONTENT is > 512 KiB, with the LLM usage block at the
-        // TAIL (the real wire order). A single huge string field pushes the body well past the cap.
-        let big_content = "x".repeat(1024 * 1024); // 1 MiB — comfortably over the 512 KiB cap
-        let body = format!(
-            r#"{{"id":"chatcmpl-big","object":"chat.completion","choices":[{{"message":{{"role":"assistant","content":"{big_content}"}}}}],"usage":{{"prompt_tokens":4000,"completion_tokens":9000}}}}"#
-        );
-        assert!(
-            body.len() > MAX_SCAN_BYTES,
-            "test body must exceed the per-poll MAX_SCAN_BYTES to be meaningful"
-        );
-
-        // The streaming per-poll `feed` SKIPS this oversized chunk → usage dropped (the bug).
-        let mut streamed = UsageTap::new();
-        streamed.feed(&Bytes::from(body.clone()));
-        assert_eq!(
-            streamed.input_tokens, None,
-            "the streaming feed is expected to skip the oversized chunk (poll-latency guard)"
-        );
-
-        // `feed_whole` (the buffered, already-bounded path) MUST still count the trailing usage.
-        let mut whole = UsageTap::new();
-        whole.feed_whole(body.as_bytes());
-        assert_eq!(
-            whole.input_tokens,
-            Some(4000),
-            "buffered body usage must be counted regardless of size"
-        );
-        assert_eq!(whole.output_tokens, Some(9000));
-
-        // And it must remain robust on a buffered SSE-shaped body (multiple objects, trailing usage),
-        // which is not a single JSON document — the uncapped brace-scan fallback handles it.
-        let sse_like = format!(
-            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{big_content}\"}}}}]}}\n\ndata: {{\"usage\":{{\"prompt_tokens\":12,\"completion_tokens\":34}}}}\n\n"
-        );
-        let mut sse = UsageTap::new();
-        sse.feed_whole(sse_like.as_bytes());
-        assert_eq!(
-            sse.input_tokens,
-            Some(12),
-            "trailing SSE usage must be found"
-        );
-        assert_eq!(sse.output_tokens, Some(34));
-    }
-
-    #[test]
-    fn test_tap_detects_terminal_error_across_shapes() {
-        // Anthropic SSE error event: {"type":"error", "error":{...}}.
-        let mut t = UsageTap::new();
-        t.feed(&Bytes::from(
-            r#"{"type":"error","error":{"type":"overloaded_error","message":"boom"}}"#,
-        ));
-        assert_eq!(t.terminal_error.as_deref(), Some("boom"));
-
-        // OpenAI / OpenAI-compatible in-band terminal error: bare {"error":{...}} with NO `type`
-        // discriminant. Previously undetected on a SAME-protocol OpenAI passthrough, so a backend
-        // that emitted this then closed cleanly never tripped the breaker.
-        let mut t = UsageTap::new();
-        t.feed(&Bytes::from(
-            r#"{"error":{"message":"upstream exploded","type":"server_error"}}"#,
-        ));
-        assert_eq!(t.terminal_error.as_deref(), Some("upstream exploded"));
-
-        // A normal OpenAI chunk (no top-level `error`) must NOT be flagged as terminal.
-        let mut t = UsageTap::new();
-        t.feed(&Bytes::from(
-            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"delta":{"content":"hi"}}]}"#,
-        ));
-        assert_eq!(t.terminal_error, None);
-
-        // A chunk that merely carries `error: null` must NOT false-trip.
-        let mut t = UsageTap::new();
-        t.feed(&Bytes::from(r#"{"choices":[],"error":null}"#));
-        assert_eq!(t.terminal_error, None);
-
-        // REGRESSION (H2): OpenAI Responses streaming terminal FAILURE frame —
-        // {"type":"response.failed","response":{...,"error":{...}}}. The error is NESTED under
-        // `response.error` and the frame carries a `type`, so BOTH the Anthropic branch (top-level
-        // `type:"error"`) and the OpenAI branch (no `type` + top-level `error`) reject it. Before the
-        // fix this closed the stream cleanly and recorded breaker SUCCESS — the lane never tripped.
-        // It must now set `terminal_error` (pulled from `response.error.message`) so the stream-end
-        // breaker arm records a failure.
-        let mut t = UsageTap::new();
-        t.feed(&Bytes::from(
-            r#"{"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"server_error","message":"responses stream failed"}}}"#,
-        ));
-        assert_eq!(
-            t.terminal_error.as_deref(),
-            Some("responses stream failed"),
-            "a response.failed frame must set terminal_error from response.error.message (H2)"
-        );
-
-        // A successful Responses completion frame (`response.completed`) must NOT false-trip: it
-        // carries a `type` but no `response.error`, so neither the failure arm nor the OpenAI/Anthropic
-        // arms fire.
-        let mut t = UsageTap::new();
-        t.feed(&Bytes::from(
-            r#"{"type":"response.completed","response":{"id":"resp_2","status":"completed"}}"#,
-        ));
-        assert_eq!(
-            t.terminal_error, None,
-            "a clean response.completed frame must not be flagged terminal"
-        );
-    }
-
-    /// MEDIUM (forward.rs same-protocol bedrock passthrough): a bedrock→bedrock streaming passthrough
-    /// is BINARY `application/vnd.amazon.eventstream`, so the JSON `feed` scanner is skipped. The
-    /// bedrock-aware `feed_eventstream` must instead reassemble the native frames and (a) charge the
-    /// `metadata` frame's `usage.{inputTokens,outputTokens}` so TPM/spend governance is not silently
-    /// bypassed, and (b) flag an in-band `*Exception` frame as `terminal_error` so the stream-end
-    /// breaker arm trips the lane even though the HTTP response was a clean 200.
-    #[test]
-    fn test_eventstream_tap_counts_usage_and_detects_exception() {
-        use crate::eventstream::{encode_exception_frame, encode_frame};
-
-        // A `metadata` frame carrying the native Converse usage shape → tokens are counted.
-        let mut t = UsageTap::new();
-        let meta = encode_frame(
-            "metadata",
-            br#"{"usage":{"inputTokens":42,"outputTokens":13}}"#,
-        );
-        t.feed_eventstream(&Bytes::from(meta));
-        assert_eq!(t.input_tokens, Some(42));
-        assert_eq!(t.output_tokens, Some(13));
-        // A clean stream (no exception frame) leaves terminal_error unset → no breaker trip.
-        assert_eq!(t.terminal_error, None);
-
-        // An in-band modeled exception frame → terminal_error set (breaker trips at stream end).
-        let mut t = UsageTap::new();
-        let exc = encode_exception_frame(
-            "InternalServerException",
-            "An internal error occurred during request processing.",
-        );
-        t.feed_eventstream(&Bytes::from(exc));
-        assert_eq!(
-            t.terminal_error.as_deref(),
-            Some("An internal error occurred during request processing.")
-        );
-
-        // Frames split across chunk boundaries must still be reassembled: feed the metadata frame one
-        // byte at a time, then assert the usage was extracted only once the final byte completes it.
-        let mut t = UsageTap::new();
-        let meta = encode_frame(
-            "metadata",
-            br#"{"usage":{"inputTokens":5,"outputTokens":7}}"#,
-        );
-        let split = meta.len();
-        for (idx, b) in meta.iter().enumerate() {
-            t.feed_eventstream(&Bytes::copy_from_slice(&[*b]));
-            if idx + 1 < split {
-                assert_eq!(t.input_tokens, None, "must not parse a partial frame");
-            }
-        }
-        assert_eq!(t.input_tokens, Some(5));
-        assert_eq!(t.output_tokens, Some(7));
-    }
 }
+
+// Change A deleted the `UsageTap` byte-scanner and its unit tests (usage extraction across protocols,
+// message_start input-token counting, feed_whole past-cap, terminal-error detection, eventstream
+// metadata/exception). Their job was to prove the byte-scanner matched the wire usage shapes; billing
+// now sources `IrUsage` directly from the per-protocol IR readers, which carry their OWN per-reader
+// usage tests, plus the billing-parity tests cover all four {stream,non-stream}×{same,cross} combos.
 
 #[cfg(test)]
 mod cross_protocol_extra_tests {
@@ -5862,149 +5161,122 @@ mod request_short_circuit_tests {
     }
 }
 
-/// Change B step 2 — SHADOW CHECK. Proves the IR-derived A-tap usage (`StreamTranslate::usage()`,
-/// the value step 3 will route billing through) AGREES with the LIVE `UsageTap` byte-scanner for all
-/// 6 protocols, by feeding the SAME captured native frames to BOTH and asserting equal
-/// input_tokens/output_tokens. This is the evidence the A-tap is safe before step 3 deletes the
-/// byte-scanner. UsageTap stays authoritative for billing in step 2 — this is a parallel assertion
-/// only, not a billing change.
+/// Change A — BILLING PARITY GATE. Asserts the IR-derived A-tap usage (`StreamTranslate::usage()`,
+/// the value Change A routes billing through) produces EXACTLY the billed (input, output) tokens for
+/// every {streaming, non-stream} × {same-proto, cross-proto} path. The numbers asserted here are the
+/// SAME numbers the deleted `UsageTap` byte-scanner produced for 5/6 protocols; Responses STREAMING
+/// is the one CORRECTED case (the byte-scanner read a top-level `usage` that Responses nests under
+/// `response.usage`, so it reported 0 and under-billed — the IR reader reads it correctly, so the
+/// asserted number here is the new, higher, CORRECT value). The old shadow-check module that fed both
+/// the A-tap and the live byte-scanner and asserted agreement has been retired — its job (prove the
+/// A-tap matches the byte-scanner) is done, and the byte-scanner no longer exists.
 #[cfg(test)]
-mod same_proto_shadow_check_tests {
-    use super::UsageTap;
+mod billing_parity_tests {
     use crate::proto::StreamTranslate;
-    use bytes::Bytes;
 
-    // Drive both the same-proto translator (IR usage = A-tap) AND a UsageTap fed EXACTLY as
-    // `FirstByteBody` feeds it for a same-proto stream (`feed` for SSE, `feed_eventstream` for the
-    // bedrock binary path), then return both token pairs for comparison.
-    fn shadow(proto: &str, frames: &[&[u8]], eventstream: bool) -> ((u64, u64), (u64, u64)) {
+    /// Drive a SAME-PROTOCOL streaming translator with `frames` and return the IR A-tap (input, output)
+    /// tokens — the exact value the streaming billing arm reads via `translate.usage()`.
+    fn same_proto_usage(proto: &str, frames: &[&[u8]]) -> (u64, u64) {
         let mut t = StreamTranslate::new_same_proto(proto).expect("same-proto translator");
-        let mut tap = UsageTap::new();
         for f in frames {
             let _ = t.feed(f);
-            let chunk = Bytes::copy_from_slice(f);
-            if eventstream {
-                tap.feed_eventstream(&chunk);
-            } else {
-                tap.feed(&chunk);
-            }
         }
         let _ = t.finish();
-        let u = t.usage().cloned().unwrap_or(crate::ir::IrUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-        });
-        let ir = (u.input_tokens, u.output_tokens);
-        let tapped = (
-            tap.input_tokens.unwrap_or(0),
-            tap.output_tokens.unwrap_or(0),
-        );
-        (ir, tapped)
+        let u = t.usage().expect("A-tap captured terminal usage").clone();
+        (u.input_tokens, u.output_tokens)
     }
 
-    fn assert_agree(proto: &str, frames: &[&[u8]], eventstream: bool) {
-        let (ir, tapped) = shadow(proto, frames, eventstream);
-        assert_eq!(
-            ir, tapped,
-            "{proto}: IR A-tap usage {ir:?} must EQUAL UsageTap byte-scan {tapped:?} (shadow check)"
-        );
-        assert_ne!(
-            ir,
-            (0, 0),
-            "{proto}: shadow check must exercise non-zero usage"
-        );
+    /// Drive a CROSS-PROTOCOL streaming translator (egress → ingress) and return the IR A-tap tokens.
+    fn cross_proto_usage(ingress: &str, egress: &str, frames: &[&[u8]]) -> (u64, u64) {
+        let mut t = StreamTranslate::new(ingress, egress).expect("cross-proto translator");
+        for f in frames {
+            let _ = t.feed(f);
+        }
+        let _ = t.finish();
+        let u = t.usage().expect("A-tap captured terminal usage").clone();
+        (u.input_tokens, u.output_tokens)
     }
+
+    /// Decode a NON-STREAM body through `proto`'s reader (the same-proto non-stream billing path #4:
+    /// the body is relayed verbatim, billing reads `ir.usage`) and return the billed (input, output).
+    fn nonstream_usage(proto: &str, body: &[u8]) -> (u64, u64) {
+        let p = crate::proto::protocol_for(proto).expect("known proto");
+        let v: serde_json::Value = crate::json::parse(body).expect("json body");
+        let ir = p.reader().read_response(&v).expect("read_response");
+        (ir.usage.input_tokens, ir.usage.output_tokens)
+    }
+
+    // ---- STREAMING × SAME-PROTO (billing via translate.usage()) ----
 
     #[test]
-    fn shadow_anthropic_with_start_usage_backfill() {
+    fn stream_same_proto_anthropic_start_usage_backfill() {
         // Anthropic puts input on message_start, output on message_delta — exercises the start-usage
-        // backfill the A-tap reads AFTER (per design §d).
-        assert_agree(
-            "anthropic",
-            &[
-                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n\n",
-                b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n\n",
-                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-            ],
-            false,
-        );
-    }
-
-    #[test]
-    fn shadow_openai_include_usage_split() {
-        // OpenAI include_usage splits the finish chunk (no usage) from the trailing usage-only chunk
-        // (responses.rs:8910 convention) — exercises the A-tap merge that ignores the first zero.
-        assert_agree(
-            "openai",
-            &[
-                b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
-                b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-                b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":9,\"total_tokens\":22}}\n\n",
-                b"data: [DONE]\n\n",
-            ],
-            false,
-        );
-    }
-
-    #[test]
-    fn shadow_gemini() {
-        assert_agree(
-            "gemini",
-            &[
-                b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hi\"}]}}]}\n\n",
-                b"data: {\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"\"}]}}],\"usageMetadata\":{\"promptTokenCount\":15,\"candidatesTokenCount\":4,\"totalTokenCount\":19}}\n\n",
-            ],
-            false,
-        );
-    }
-
-    #[test]
-    fn shadow_cohere() {
-        assert_agree(
-            "cohere",
-            &[
-                b"event: message-start\ndata: {\"type\":\"message-start\",\"id\":\"co_1\"}\n\n",
-                b"event: message-end\ndata: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"tokens\":{\"input_tokens\":17,\"output_tokens\":6}}}}\n\n",
-            ],
-            false,
-        );
-    }
-
-    // KNOWN DIVERGENCE (safety-contract finding): OpenAI Responses streaming nests usage under
-    // `response.usage` on the `response.completed` frame, but the LIVE `UsageTap.extract_usage_any`
-    // only reads a TOP-LEVEL `usage` object — so it reports ZERO for a same-protocol Responses stream
-    // (a pre-existing UsageTap gap: that path is under-billed today). The IR A-tap reads the IR the
-    // ResponsesReader decodes and correctly reports the real tokens. This test pins the divergence so
-    // the gap is documented and tracked: the A-tap is MORE correct here, which is exactly why step 3
-    // (route billing through the A-tap) will FIX Responses streaming token accounting. This is NOT a
-    // regression introduced by Change B — the live tap behaves identically with or without the
-    // same-proto translator (the translator re-emits verbatim; the tap reads the same bytes).
-    #[test]
-    fn shadow_responses_known_divergence_a_tap_is_correct() {
-        let frames: &[&[u8]] = &[
-            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
-            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":21,\"output_tokens\":8}}}\n\n",
-        ];
-        let (ir, tapped) = shadow("responses", frames, false);
+        // backfill the A-tap reads AFTER. Prior UsageTap numbers: (11, 7).
         assert_eq!(
-            ir,
-            (21, 8),
-            "responses IR A-tap must capture the nested response.usage tokens"
-        );
-        assert_eq!(
-            tapped,
-            (0, 0),
-            "responses LIVE UsageTap currently MISSES nested response.usage (pre-existing gap; \
-             the A-tap fixes it in step 3)"
+            same_proto_usage(
+                "anthropic",
+                &[
+                    b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n\n",
+                    b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n\n",
+                    b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                ],
+            ),
+            (11, 7),
         );
     }
 
     #[test]
-    fn shadow_bedrock_binary_eventstream() {
-        // The bedrock binary path: the LIVE tap reads native frames via `feed_eventstream`, the A-tap
-        // reads the IR. Both must land on the same tokens.
+    fn stream_same_proto_openai_include_usage_split() {
+        // OpenAI include_usage splits the finish chunk (no usage) from the trailing usage-only chunk —
+        // exercises the A-tap merge that ignores the first zero. Prior UsageTap numbers: (13, 9).
+        assert_eq!(
+            same_proto_usage(
+                "openai",
+                &[
+                    b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+                    b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":9,\"total_tokens\":22}}\n\n",
+                    b"data: [DONE]\n\n",
+                ],
+            ),
+            (13, 9),
+        );
+    }
+
+    #[test]
+    fn stream_same_proto_gemini() {
+        // Prior UsageTap numbers: (15, 4).
+        assert_eq!(
+            same_proto_usage(
+                "gemini",
+                &[
+                    b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hi\"}]}}]}\n\n",
+                    b"data: {\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"\"}]}}],\"usageMetadata\":{\"promptTokenCount\":15,\"candidatesTokenCount\":4,\"totalTokenCount\":19}}\n\n",
+                ],
+            ),
+            (15, 4),
+        );
+    }
+
+    #[test]
+    fn stream_same_proto_cohere() {
+        // Prior UsageTap numbers: (17, 6).
+        assert_eq!(
+            same_proto_usage(
+                "cohere",
+                &[
+                    b"event: message-start\ndata: {\"type\":\"message-start\",\"id\":\"co_1\"}\n\n",
+                    b"event: message-end\ndata: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"tokens\":{\"input_tokens\":17,\"output_tokens\":6}}}}\n\n",
+                ],
+            ),
+            (17, 6),
+        );
+    }
+
+    #[test]
+    fn stream_same_proto_bedrock_binary_eventstream() {
+        // Bedrock binary eventstream same-proto: the A-tap reads the IR decoded from the binary frames.
+        // Prior UsageTap numbers (via feed_eventstream): (31, 12).
         use crate::eventstream::encode_frame;
         let mut start = Vec::new();
         start.extend(encode_frame("messageStart", br#"{"role":"assistant"}"#));
@@ -6015,7 +5287,85 @@ mod same_proto_shadow_check_tests {
             "metadata",
             br#"{"usage":{"inputTokens":31,"outputTokens":12},"metrics":{"latencyMs":5}}"#,
         ));
-        assert_agree("bedrock", &[&start, &stop, &meta], true);
+        assert_eq!(
+            same_proto_usage("bedrock", &[&start, &stop, &meta]),
+            (31, 12),
+        );
+    }
+
+    #[test]
+    fn stream_same_proto_responses_corrected_higher() {
+        // CORRECTED (expected behavior change): Responses STREAMING nests usage under `response.usage`
+        // on the `response.completed` frame. The deleted byte-scanner read only a TOP-LEVEL `usage`, so
+        // it reported (0, 0) and UNDER-BILLED. The IR reader reads the nested usage correctly, so the
+        // A-tap — and now billing — reports the real (21, 8). This is the one number that differs from
+        // the prior UsageTap value, and it is a FIX (Responses streaming was under-billed before).
+        assert_eq!(
+            same_proto_usage(
+                "responses",
+                &[
+                    b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+                    b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":21,\"output_tokens\":8}}}\n\n",
+                ],
+            ),
+            (21, 8),
+        );
+    }
+
+    // ---- STREAMING × CROSS-PROTO (billing via translate.usage()) ----
+
+    #[test]
+    fn stream_cross_proto_anthropic_egress_to_openai_ingress() {
+        // Cross-proto streaming still bills via the A-tap. Anthropic egress → OpenAI ingress: the
+        // start-usage input backfill survives the seam, so billing sees the full (11, 7).
+        assert_eq!(
+            cross_proto_usage(
+                "openai",
+                "anthropic",
+                &[
+                    b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n\n",
+                    b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n\n",
+                    b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                ],
+            ),
+            (11, 7),
+        );
+    }
+
+    // ---- NON-STREAM × SAME-PROTO (billing path #4: read_response → ir.usage) ----
+
+    #[test]
+    fn nonstream_same_proto_all_protocols() {
+        // The NEW non-stream same-proto billing path (#4): the body relays verbatim, billing reads the
+        // egress reader's `ir.usage`. Each asserts the prior UsageTap (input, output).
+        assert_eq!(
+            nonstream_usage(
+                "openai",
+                br#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":13,"completion_tokens":9}}"#,
+            ),
+            (13, 9),
+        );
+        assert_eq!(
+            nonstream_usage(
+                "anthropic",
+                br#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":11,"output_tokens":7}}"#,
+            ),
+            (11, 7),
+        );
+        assert_eq!(
+            nonstream_usage(
+                "gemini",
+                br#"{"candidates":[{"content":{"role":"model","parts":[{"text":"hi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":15,"candidatesTokenCount":4,"totalTokenCount":19}}"#,
+            ),
+            (15, 4),
+        );
+        assert_eq!(
+            nonstream_usage(
+                "responses",
+                br#"{"id":"resp_1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}],"usage":{"input_tokens":21,"output_tokens":8}}"#,
+            ),
+            (21, 8),
+        );
     }
 }
 
@@ -6939,21 +6289,14 @@ mod ingress_indistinguishability_tests {
 
         // An OpenAI chat.completion 2xx with 600 input + 400 output = 1000 tokens, with `usage` at the
         // TAIL (real wire order). Split the wire bytes into two chunks at a point BEFORE `"usage"`, so
-        // neither chunk contains a complete top-level object — the exact cross-frame split the old
-        // per-chunk scanner could not reassemble.
+        // neither chunk contains a complete top-level object — the exact cross-frame split that proves
+        // billing reassembles the whole body before running the IR reader (Change A path #4). The
+        // client still receives the bytes verbatim; only a bounded copy is retained for the IR read.
         let body = r#"{"id":"chatcmpl-split","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":600,"completion_tokens":400}}"#;
         let split = body.find(r#""usage""#).expect("usage marker present");
         assert!(split > 0 && split < body.len(), "split must be interior");
         let chunk1 = Bytes::from(body[..split].to_string());
         let chunk2 = Bytes::from(body[split..].to_string());
-        // Sanity: neither chunk is a parseable complete object, so the per-chunk scanner finds nothing.
-        let mut probe = super::UsageTap::new();
-        probe.feed(&chunk1);
-        probe.feed(&chunk2);
-        assert_eq!(
-            probe.input_tokens, None,
-            "precondition: the per-chunk scanner must NOT parse usage from the split body, or the bug is masked"
-        );
 
         // Minimal App for the lane/store the FirstByteBody refunds/breaker arms reference (unused on
         // this clean non-SSE drain, but required by the constructor).
@@ -6986,7 +6329,7 @@ mod ingress_indistinguishability_tests {
             false, // budget_spent
         );
 
-        // Drain the body fully (drives poll_next to Poll::Ready(None), firing feed_whole + record).
+        // Drain the body fully (drives poll_next to Poll::Ready(None), firing the IR read + record).
         let collected = fbb
             .into_body()
             .collect()

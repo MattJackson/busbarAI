@@ -2937,76 +2937,39 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// Stream inspection tap test for Anthropic SSE usage parsing.
+    /// Stream usage + terminal-error test for Anthropic SSE, sourced from the IR A-tap (Change A).
     ///
-    /// Tests that the tap:
-    /// (a) forwards byte-identical stream to client
-    /// (b) extracts parsed usage from message_delta/message_stop events
-    /// (c) maintains bounded memory via carry buffer cap
+    /// Tests that the same-proto `StreamTranslate`:
+    /// (a) extracts billed usage from message_start/message_delta events (`translate.usage()`)
+    /// (b) sets `terminal_error()` on a genuine SSE error frame (the breaker abnormal-end signal)
+    /// (c) forwards a byte-identical stream to the client through the real `forward()` path
     #[tokio::test]
     async fn test_stream_inspection_tap_usage_parsing() {
-        use crate::forward::UsageTap;
+        use crate::proto::StreamTranslate;
 
-        // Test 1: UsageTap extracts usage from Anthropic-style events
-        let mut tap = UsageTap::new();
-
-        // Feed a message_delta event with usage object
-        let delta_json = serde_json::json!({
-            "type": "message_delta",
-            "delta": {
-                "stop_reason": "end_turn"
-            },
-            "usage": {
-                "input_tokens": 10,
-                "output_tokens": 5
-            }
-        });
-        let delta_str = serde_json::to_string(&delta_json).unwrap();
-        tap.feed(&Bytes::from(delta_str));
-
-        // Assert: input/output token fields extracted correctly. A clean message_delta (normal
-        // stop_reason, no error frame) must NOT set terminal_error — that's the signal the
-        // stream-end arm uses to distinguish a clean close from an aborted one.
-        assert_eq!(tap.input_tokens, Some(10), "input_tokens should be 10");
-        assert_eq!(tap.output_tokens, Some(5), "output_tokens should be 5");
+        // Test 1: the A-tap extracts usage from Anthropic-style events (input on message_start, output
+        // on message_delta — the start-usage backfill the A-tap reads AFTER).
+        let mut t = StreamTranslate::new_same_proto("anthropic").expect("same-proto translator");
+        let _ = t.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n");
+        let _ = t.feed(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n");
+        let _ = t.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        let _ = t.finish();
+        let u = t.usage().expect("A-tap captured usage");
+        assert_eq!(u.input_tokens, 10, "input_tokens should be 10");
+        assert_eq!(u.output_tokens, 5, "output_tokens should be 5");
+        // A clean stream (no error frame) must leave terminal_error None — the signal the stream-end
+        // arm uses to distinguish a clean close from an aborted one.
         assert!(
-            tap.terminal_error.is_none(),
+            t.terminal_error().is_none(),
             "a clean stream (no error frame) must leave terminal_error None"
         );
-        assert!(tap.has_usage(), "tap should have usage data");
 
-        // A genuine SSE error frame DOES set terminal_error (the abnormal-end signal).
-        let mut err_tap = UsageTap::new();
-        err_tap.feed(&Bytes::from(
-            r#"{"type":"error","error":{"message":"boom","source":"upstream"}}"#,
-        ));
-        assert_eq!(
-            err_tap.terminal_error.as_deref(),
-            Some("boom"),
+        // Test 2: a genuine SSE error frame DOES set terminal_error (the abnormal-end signal).
+        let mut err_t = StreamTranslate::new_same_proto("anthropic").expect("translator");
+        let _ = err_t.feed(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"boom\"}}\n\n");
+        assert!(
+            err_t.terminal_error().is_some(),
             "an SSE error frame must populate terminal_error"
-        );
-
-        // Test 2: message_stop as fallback (when delta missing)
-        let mut tap2 = UsageTap::new();
-        let stop_json = serde_json::json!({
-            "type": "message_stop",
-            "usage": {
-                "input_tokens": 15,
-                "output_tokens": 8
-            }
-        });
-        let stop_str = serde_json::to_string(&stop_json).unwrap();
-        tap2.feed(&Bytes::from(stop_str));
-
-        assert_eq!(
-            tap2.input_tokens,
-            Some(15),
-            "input_tokens from message_stop should be 15"
-        );
-        assert_eq!(
-            tap2.output_tokens,
-            Some(8),
-            "output_tokens from message_stop should be 8"
         );
 
         // Test 3: Byte-identical stream forwarding (integration test with mock)

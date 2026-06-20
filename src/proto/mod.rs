@@ -1315,15 +1315,6 @@ pub(crate) struct StreamTranslate {
     /// flush a single best-effort (zero-usage) `metadata` frame at end-of-stream when the deferral was
     /// never resolved, so the stream is never missing its terminal metadata frame.
     bedrock_metadata_pending: bool,
-    /// ingress == "bedrock" → a side-channel carrying the JSON payload of EVERY frame emitted on this
-    /// stream, BEFORE it is packed into binary `application/vnd.amazon.eventstream` framing. The
-    /// forward-layer `UsageTap` extracts token usage by brace-scanning JSON text, which is correct for
-    /// the five SSE ingress protocols (whose `feed` output IS the JSON-bearing SSE text) but WRONG for
-    /// bedrock ingress (whose output is binary frames whose length-prefixes/CRC32s/`{`-containing
-    /// preludes mislead the scanner, so token accounting is unreliable or zeroed). The tap reads this
-    /// pre-encode JSON instead, decoupling its input from the `ingress_eventstream` framing. Empty for
-    /// non-bedrock ingress (the tap reads the SSE output directly there). Drained by `take_tap_json`.
-    tap_json: Vec<u8>,
     /// CROSS-PROTOCOL tool-id native remap (the streaming half of the §Finding-2 class fix). Reshapes
     /// each egress `tool_use` id (e.g. OpenAI `call_…`) to the INGRESS client's native shape (Anthropic
     /// `toolu_…`) before the ingress writer serializes it, so a foreign id never reaches the client. The
@@ -1370,6 +1361,13 @@ pub(crate) struct StreamTranslate {
     /// with the live `UsageTap` byte-scanner before step 3 routes billing through it. `None` until the
     /// first usage-bearing terminal event is seen.
     last_usage: Option<crate::ir::IrUsage>,
+    /// A genuine terminal ERROR seen mid-stream — the IR-sourced replacement for the byte-scanner's
+    /// `UsageTap::terminal_error` (Change A). Set when a reader emits an [`crate::ir::IrStreamEvent::Error`]
+    /// (an Anthropic `error` event, an OpenAI in-band `{"error":...}` frame, a Responses
+    /// `response.failed` frame, or a Bedrock in-band `*Exception` frame). This is the breaker-failure
+    /// signal the stream-end arm reads to distinguish a clean close from an aborted one. Holds the
+    /// human message (`provider_signal`) for observability; `None` on a clean stream.
+    terminal_error: Option<String>,
 }
 
 /// The OpenAI stream-start identity replayed onto every `chat.completion.chunk` (see
@@ -1435,12 +1433,12 @@ impl StreamTranslate {
             openai_chunk_identity: None,
             bedrock_metadata_emitted: false,
             bedrock_metadata_pending: false,
-            tap_json: Vec::new(),
             tool_id_remap: ToolIdRemap::default(),
             start_usage: None,
             message_stopped: false,
             same_proto,
             last_usage: None,
+            terminal_error: None,
         })
     }
 
@@ -1528,6 +1526,18 @@ impl StreamTranslate {
                 if usage.cache_read_input_tokens.is_some() {
                     acc.cache_read_input_tokens = usage.cache_read_input_tokens;
                 }
+            }
+            // A-tap terminal-error capture (Change A): a reader-emitted `Error` event is the IR-sourced
+            // breaker-failure signal that replaces the byte-scanner's `UsageTap::terminal_error`. Record
+            // its message so the stream-end breaker/billing arms treat the stream as failed (no token
+            // billing, record a breaker transient). Mirrors the byte-scanner's per-shape detection, but
+            // sourced from the reader's structured decode rather than a brace-scan of the output bytes.
+            if let crate::ir::IrStreamEvent::Error(err) = &ev {
+                self.terminal_error = Some(
+                    err.provider_signal
+                        .clone()
+                        .unwrap_or_else(|| "upstream stream error".to_string()),
+                );
             }
             // Bedrock-INGRESS error path: a native AWS SDK dispatches mid-stream errors off the
             // `:message-type: exception` / `:exception-type` headers, which ONLY
@@ -1691,6 +1701,17 @@ impl StreamTranslate {
             if let crate::ir::IrStreamEvent::MessageStart { usage: Some(u), .. } = &ev {
                 self.start_usage = Some(u.clone());
             }
+            // A-tap terminal-error capture (Change A) on the SAME-PROTOCOL path: a reader-emitted
+            // `Error` event is the IR-sourced breaker-failure signal replacing the byte-scanner's
+            // `UsageTap::terminal_error`. Same-proto streams re-emit the original error frame verbatim,
+            // but the breaker/billing arms still need to KNOW the stream ended abnormally, so record it.
+            if let crate::ir::IrStreamEvent::Error(err) = &ev {
+                self.terminal_error = Some(
+                    err.provider_signal
+                        .clone()
+                        .unwrap_or_else(|| "upstream stream error".to_string()),
+                );
+            }
             if let crate::ir::IrStreamEvent::MessageDelta { usage, .. } = &ev {
                 // Mirror translate_event's terminal-usage accumulation (post start-usage backfill).
                 let (mut input, output) = (usage.input_tokens, usage.output_tokens);
@@ -1761,37 +1782,10 @@ impl StreamTranslate {
                 }
             }
             let payload = serde_json::to_vec(&out_data).unwrap_or_default();
-            // Tap side-channel: record the pre-encode JSON payload (with its `type` event name folded
-            // in, so the tap's `message_delta`/`message_stop`/`metadata`-keyed extractors fire) so the
-            // forward-layer `UsageTap` can scan JSON text rather than the binary frame bytes below.
-            // This is the bedrock-ingress token-accounting fix: brace-scanning the encoded binary
-            // frame (length prefix / CRC32 / header block) mis-parses or zeroes usage.
-            // Splice the `type` key into the ALREADY-serialized `payload` bytes instead of deep-cloning
-            // the whole `out_data` Value (which can be kilobytes for a metadata/tool-result frame) just
-            // to insert one key. `payload` is the serialization of `out_data`; when `out_data` is a JSON
-            // object it begins with `{`, so `{"type":<enc>,` + payload[1..] yields the same object with
-            // `type` prepended — zero Value clone, one small format alloc. Every returning arm of the
-            // Bedrock `write_response_event` (the only writer that reaches this eventstream branch)
-            // yields a `serde_json::json!({...})` object, so `out_data` is ALWAYS an object here and this
-            // `is_object()` guard always fires. The guard is a defensive shape-check, not a real branch:
-            // a hypothetical non-object `out_data` (currently unreachable) is simply skipped — the tap
-            // just records no entry for it rather than being fed a malformed (non-`{`-leading) payload.
-            if out_data.is_object() {
-                if let Ok(enc_et) = serde_json::to_string(&out_et) {
-                    // payload is `{...}`; replace the leading `{` with `{"type":<enc_et>,` (or
-                    // `{"type":<enc_et>}` for the empty-object `{}` case, which has no trailing field).
-                    self.tap_json.extend_from_slice(b"{\"type\":");
-                    self.tap_json.extend_from_slice(enc_et.as_bytes());
-                    if payload.len() > 2 {
-                        // non-empty object: `{` + rest → `,` + rest-after-`{`
-                        self.tap_json.push(b',');
-                        self.tap_json.extend_from_slice(&payload[1..]);
-                    } else {
-                        // `{}` → close immediately
-                        self.tap_json.push(b'}');
-                    }
-                }
-            }
+            // Bedrock-INGRESS usage (Change A): the usage carried by this frame was already accumulated
+            // into `last_usage` by `translate_event`/`extract_usage_only` from the structured IR event,
+            // BEFORE this writer ran — so billing reads `usage()` and no longer needs the pre-encode
+            // JSON side-channel the deleted byte-scanner consumed. Just encode the binary frame.
             out.extend_from_slice(&crate::eventstream::encode_frame(&out_et, &payload));
         } else {
             if self.emit_done {
@@ -2087,21 +2081,6 @@ impl StreamTranslate {
         out
     }
 
-    /// Drain the pre-encode JSON the most recent `feed`/`finish` emitted for the forward-layer
-    /// `UsageTap` (bedrock ingress only — see `tap_json`). Returns the accumulated JSON-payload bytes
-    /// and clears the buffer so each chunk is tapped exactly once. Always empty for non-bedrock
-    /// ingress (there the tap reads the SSE output directly). The caller feeds this into the tap
-    /// INSTEAD of the binary frame output on the bedrock-ingress path.
-    pub(crate) fn take_tap_json(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.tap_json)
-    }
-
-    /// True when this translator's ingress is a binary event-stream client (bedrock), i.e. its
-    /// `feed`/`finish` OUTPUT is binary frames and the `UsageTap` must read `take_tap_json` instead.
-    pub(crate) fn ingress_is_eventstream(&self) -> bool {
-        self.ingress_eventstream
-    }
-
     /// True once this translator abandoned its stream — the reassembly buffer grew past
     /// [`Self::MAX_BUF`] without a frame terminator, or a malformed egress event-stream prelude was
     /// hit (`abort`), so the happy-path terminal events were never produced and every subsequent
@@ -2125,18 +2104,21 @@ impl StreamTranslate {
     }
 
     /// The terminal IR-derived usage accumulated for this stream (the Change A "A-tap" value), or
-    /// `None` if no usage-bearing terminal event was seen. In step 2 the ONLY consumer is the SHADOW
-    /// CHECK that proves it AGREES with the live `UsageTap` — billing is NOT yet routed through it
-    /// (that is step 3). Marked `#[cfg(test)]` so it is not dead code in the production binary until
-    /// step 3 wires it into the billing arm. See the `last_usage` field.
-    #[cfg(test)]
+    /// `None` if no usage-bearing terminal event was seen. PRODUCTION billing source (Change A step 3):
+    /// the `FirstByteBody` stream-end arm reads this for the per-request token fee instead of the
+    /// deleted `UsageTap` byte-scanner. Populated by `translate_event` / `extract_usage_only` AFTER the
+    /// Anthropic start-usage backfill, so it carries the TERMINAL prompt+completion counts. See the
+    /// `last_usage` field.
     pub(crate) fn usage(&self) -> Option<&crate::ir::IrUsage> {
         self.last_usage.as_ref()
     }
 
-    /// Whether this translator is in same-protocol verbatim mode (built via [`new_same_proto`]).
-    pub(crate) fn is_same_proto(&self) -> bool {
-        self.same_proto
+    /// The terminal stream ERROR message, or `None` for a clean stream (Change A). The IR-sourced
+    /// replacement for `UsageTap::terminal_error`: the `FirstByteBody` stream-end arm reads this to
+    /// decide breaker disposition (a non-`None` value records a breaker transient and suppresses token
+    /// billing). Set when a reader emits an [`crate::ir::IrStreamEvent::Error`]. See `terminal_error`.
+    pub(crate) fn terminal_error(&self) -> Option<&str> {
+        self.terminal_error.as_deref()
     }
 
     /// Abandon the stream as unrecoverable: release the reassembly buffer, set `aborted` so every
@@ -6926,10 +6908,7 @@ mod stream_translate_tests {
     fn test_bedrock_ingress_overflow_abort_emits_exception_frame() {
         // openai egress → bedrock ingress: ingress_eventstream == true.
         let mut t = StreamTranslate::new("bedrock", "openai").expect("translator");
-        assert!(
-            t.ingress_is_eventstream(),
-            "bedrock ingress must be eventstream"
-        );
+        assert!(t.ingress_eventstream, "bedrock ingress must be eventstream");
         let chunk = vec![b'x'; 1024 * 1024]; // garbage, no `\n\n`
         for _ in 0..18 {
             let _ = t.feed(&chunk);
@@ -6972,7 +6951,7 @@ mod stream_translate_tests {
         // `{"type":"error","error":{...}}` payload — NOT a binary frame, NOT an empty tail.
         let mut t = StreamTranslate::new("anthropic", "openai").expect("translator");
         assert!(
-            !t.ingress_is_eventstream(),
+            !t.ingress_eventstream,
             "anthropic ingress must be SSE, not eventstream"
         );
         for _ in 0..18 {
@@ -8721,49 +8700,38 @@ mod gemini_tests {
         );
     }
 
-    /// REGRESSION (R7 MEDIUM, forward.rs tap on bedrock ingress): on a BEDROCK-ingress cross-protocol
-    /// stream the translator's OUTPUT is binary eventstream framing, so the forward-layer `UsageTap`
-    /// (a JSON `{`-scanner) would mis-parse the length-prefixes/CRC32s and zero token accounting.
-    /// `take_tap_json` exposes the PRE-ENCODE JSON instead. This asserts that JSON (a) is text the tap
-    /// can parse, (b) carries the real usage, and (c) the tap reads `inputTokens`/`outputTokens` from
-    /// it — while the binary `feed`/`finish` OUTPUT does NOT (the bug it fixes).
+    /// Change A (was R7): on a BEDROCK-ingress cross-protocol stream the translator's OUTPUT is binary
+    /// eventstream framing, so the deleted JSON byte-scanner would have mis-parsed the
+    /// length-prefixes/CRC32s and zeroed token accounting. Billing now reads `translate.usage()` — the
+    /// IR A-tap accumulated from the structured IR events BEFORE the binary writer runs — so the usage
+    /// is correct regardless of the output framing. This asserts the A-tap carries the real
+    /// `input`/`output` tokens while the binary `feed`/`finish` OUTPUT is genuinely binary frames.
     #[test]
-    fn test_bedrock_ingress_tap_json_carries_usage_not_binary() {
+    fn test_bedrock_ingress_ir_usage_carries_real_tokens() {
         let mut t = StreamTranslate::new("bedrock", "openai").expect("bedrock ingress translator");
         let mut binary_out: Vec<u8> = Vec::new();
-        let mut tap_json: Vec<u8> = Vec::new();
         for frame in [
             "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}\n\n",
             "data: [DONE]\n\n",
         ] {
             binary_out.extend(t.feed(frame.as_bytes()));
-            tap_json.extend(t.take_tap_json());
         }
         binary_out.extend(t.finish());
-        tap_json.extend(t.take_tap_json());
 
-        assert!(t.ingress_is_eventstream(), "bedrock ingress is eventstream");
-
-        // The tap-JSON side-channel parses with the forward-layer UsageTap and yields the real usage.
-        let mut tap = crate::forward::UsageTap::new();
-        tap.feed(&bytes::Bytes::from(tap_json));
+        // The IR A-tap (billing source) carries the real usage, sourced from the structured IR.
+        let usage = t.usage().expect("A-tap captured terminal usage");
         assert_eq!(
-            tap.input_tokens,
-            Some(11),
-            "tap reads inputTokens from the pre-encode JSON"
+            usage.input_tokens, 11,
+            "A-tap reads input tokens from the IR"
         );
         assert_eq!(
-            tap.output_tokens,
-            Some(4),
-            "tap reads outputTokens from the pre-encode JSON"
+            usage.output_tokens, 4,
+            "A-tap reads output tokens from the IR"
         );
 
-        // The translator OUTPUT really is binary eventstream framing (NOT the JSON text the tap is
-        // built for): it carries the AWS frame prelude/CRC bytes, so it is not parseable as a whole
-        // JSON document. The point of the side-channel is that token accounting reads the clean JSON
-        // above instead of brace-scanning these binary frames (where stray `{` bytes in the
-        // prelude/CRC/length fields mislead the scanner — the unreliability the finding describes).
+        // The translator OUTPUT really is binary eventstream framing (NOT a JSON document): the usage
+        // is read from the IR above, never by brace-scanning these binary frames.
         assert!(!binary_out.is_empty(), "binary frames were emitted");
         assert!(
             serde_json::from_slice::<serde_json::Value>(&binary_out).is_err(),

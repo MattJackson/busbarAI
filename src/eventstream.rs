@@ -105,10 +105,12 @@ pub(crate) fn drain_frames_checked(buf: &mut Vec<u8>) -> (Vec<(String, Vec<u8>)>
 /// leaving any trailing partial frame buffered. A malformed prelude clears the buffer (the stream
 /// is unrecoverable) rather than looping.
 ///
-/// Thin wrapper over [`drain_frames_checked`] that DISCARDS the [`DrainStatus`], preserved for the
-/// many callers that only need the frames (the usage tap, the route tests). A caller that must
-/// distinguish a malformed-prelude abort from a clean full-drain (e.g. the egress reassembler) calls
-/// [`drain_frames_checked`] for the explicit signal instead of inferring it from buffer length.
+/// Thin wrapper over [`drain_frames_checked`] that DISCARDS the [`DrainStatus`], used by the route /
+/// proto tests that only need the decoded frames. Production code (the egress reassembler) calls
+/// [`drain_frames_checked`] directly for the explicit malformed-prelude signal; after Change A deleted
+/// the byte-scanner's `feed_eventstream`, this convenience wrapper has only test callers, so it is
+/// gated to test builds to avoid an unused-function warning in the 1.0 binary.
+#[cfg(test)]
 pub(crate) fn drain_frames(buf: &mut Vec<u8>) -> Vec<(String, Vec<u8>)> {
     drain_frames_checked(buf).0
 }
