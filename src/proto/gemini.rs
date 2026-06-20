@@ -1645,19 +1645,24 @@ fn is_uri_reference(data: &str) -> bool {
 /// instead of being dropped. `None` when absent (no cache hit / older response).
 fn gemini_usage(data: &serde_json::Value) -> crate::ir::IrUsage {
     let u = data.get("usageMetadata");
+    let prompt = u
+        .and_then(|u| u.get("promptTokenCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cached = u
+        .and_then(|u| u.get("cachedContentTokenCount"))
+        .and_then(|v| v.as_u64());
     crate::ir::IrUsage {
-        input_tokens: u
-            .and_then(|u| u.get("promptTokenCount"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
+        // NORMALIZE to the additive-cache convention: Gemini's `promptTokenCount` is a TOTAL that
+        // already INCLUDES `cachedContentTokenCount`, so subtract the cached tokens to leave only
+        // the uncached input. `saturating_sub` guards an odd upstream where cached > prompt.
+        input_tokens: prompt.saturating_sub(cached.unwrap_or(0)),
         output_tokens: u
             .and_then(|u| u.get("candidatesTokenCount"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
         cache_creation_input_tokens: None,
-        cache_read_input_tokens: u
-            .and_then(|u| u.get("cachedContentTokenCount"))
-            .and_then(|v| v.as_u64()),
+        cache_read_input_tokens: cached,
     }
 }
 
@@ -2634,18 +2639,33 @@ impl ProtocolWriter for GeminiWriter {
                 // never reach this writer), so emitting the total here cannot disturb a same-protocol
                 // round-trip. Saturating add avoids an overflow panic on the request path for
                 // pathological/garbage counts.
-                let total = usage.input_tokens.saturating_add(usage.output_tokens);
+                // RECONSTRUCT the native WIRE shape from the normalized IR: the IR stores UNCACHED
+                // input, but Gemini's `promptTokenCount` is a TOTAL that includes the cached prefix,
+                // so add `cache_read` back. Emit `cachedContentTokenCount` only when a cache read is
+                // present (native shape — no spurious field otherwise). `totalTokenCount` is the
+                // full prompt total + candidates.
+                let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+                // cache_creation is ALSO part of the TOTAL prompt count (cross-protocol ingress only).
+                let prompt_total = usage
+                    .input_tokens
+                    .saturating_add(cache_read)
+                    .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
+                let total = prompt_total.saturating_add(usage.output_tokens);
+                let mut usage_metadata = serde_json::json!({
+                    "promptTokenCount": prompt_total,
+                    "candidatesTokenCount": usage.output_tokens,
+                    "totalTokenCount": total
+                });
+                if usage.cache_read_input_tokens.is_some() {
+                    usage_metadata["cachedContentTokenCount"] = serde_json::json!(cache_read);
+                }
                 Some((
                     "".to_string(),
                     serde_json::json!({
                         "candidates": [{
                             "finishReason": finish_reason
                         }],
-                        "usageMetadata": {
-                            "promptTokenCount": usage.input_tokens,
-                            "candidatesTokenCount": usage.output_tokens,
-                            "totalTokenCount": total
-                        }
+                        "usageMetadata": usage_metadata
                     }),
                 ))
             }
@@ -2779,15 +2799,26 @@ impl ProtocolWriter for GeminiWriter {
         // BOTH `None` and no `totalTokenCount` is injected — the round-trip stays byte-identical.
         // (`write_response` only ever runs on cross-protocol egress in production — same-protocol
         // passthrough is byte-exact and bypasses the writer — so this gate is conservative there.)
+        // RECONSTRUCT the native WIRE shape from the normalized IR: the IR stores UNCACHED input,
+        // but Gemini's `promptTokenCount` is a TOTAL that includes the cached prefix, so add
+        // `cache_read` back. Emit `cachedContentTokenCount` only when a cache read is present (native
+        // shape — no spurious field on a no-cache roundtrip).
+        let cache_read = resp.usage.cache_read_input_tokens.unwrap_or(0);
+        // cache_creation is ALSO part of the TOTAL prompt count (cross-protocol ingress only).
+        let prompt_total = resp
+            .usage
+            .input_tokens
+            .saturating_add(cache_read)
+            .saturating_add(resp.usage.cache_creation_input_tokens.unwrap_or(0));
         let mut usage_metadata = serde_json::json!({
-            "promptTokenCount": resp.usage.input_tokens,
+            "promptTokenCount": prompt_total,
             "candidatesTokenCount": resp.usage.output_tokens
         });
+        if resp.usage.cache_read_input_tokens.is_some() {
+            usage_metadata["cachedContentTokenCount"] = serde_json::json!(cache_read);
+        }
         if resp.created.is_some() || resp.model.is_some() {
-            let total = resp
-                .usage
-                .input_tokens
-                .saturating_add(resp.usage.output_tokens);
+            let total = prompt_total.saturating_add(resp.usage.output_tokens);
             usage_metadata["totalTokenCount"] = serde_json::json!(total);
         }
         let mut candidate = serde_json::json!({

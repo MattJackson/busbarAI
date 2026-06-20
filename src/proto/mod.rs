@@ -5148,8 +5148,12 @@ mod stream_fanout_tests {
             usage.cache_creation_input_tokens, None,
             "OpenAI has no cache-creation split"
         );
-        assert_eq!(usage.input_tokens, 100);
+        // A2 normalization: input_tokens is UNCACHED (prompt_tokens 100 - cached 7 = 93).
+        assert_eq!(usage.input_tokens, 93);
         assert_eq!(usage.output_tokens, 50);
+        // Billing is unchanged for OpenAI-family: billable = uncached(93) + cache_read(7) + out(50)
+        // = 150 = the pre-A2 prompt_total(100) + output(50). No double-count, no regression.
+        assert_eq!(usage.billable_tokens(), 150);
     }
 
     #[test]
@@ -5348,6 +5352,475 @@ mod stream_translate_tests {
                 "{name}: non-streaming text must round-trip write_response→read_response; got {got:?}"
             );
         }
+    }
+
+    // ===================================================================================
+    // A2: cache-token billing-correctness — normalize IrUsage to ONE additive convention.
+    //
+    // Readers normalize `input_tokens` to UNCACHED input and keep the cache fields ADDITIVE;
+    // writers reconstruct the faithful native WIRE shape; billing sums `billable_tokens()`.
+    // Two safety nets below: (A) ROUND-TRIP FIDELITY — native usage read→IR→write re-emits the
+    // exact native usage shape (same field names/nesting/presence), proving reader/writer
+    // normalization is symmetric; (B) BILLING PARITY — OpenAI-family billable UNCHANGED vs pre-A2,
+    // Anthropic/Bedrock INCREASED by exactly the additive cache tokens (the fix).
+    // ===================================================================================
+
+    /// Build a minimal native assistant response body for `proto` carrying `usage` verbatim. Used to
+    /// drive read→IR→write and assert usage re-emission fidelity. Bodies mirror each provider's
+    /// native non-stream shape (the minimum the reader accepts + a text block).
+    fn native_response_with_usage(name: &str, usage: serde_json::Value) -> serde_json::Value {
+        use serde_json::json;
+        match name {
+            "anthropic" => json!({
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn", "model": "claude", "usage": usage
+            }),
+            "openai" => json!({
+                "id": "chatcmpl-1", "object": "chat.completion", "created": 1_700_000_000u64,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                "usage": usage
+            }),
+            "gemini" => json!({
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]}, "finishReason": "STOP"}],
+                "modelVersion": "gemini-pro",
+                "usageMetadata": usage
+            }),
+            "responses" => json!({
+                "id": "resp_1", "object": "response", "status": "completed", "model": "gpt-4o",
+                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}],
+                "usage": usage
+            }),
+            "bedrock" => json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+                "stopReason": "end_turn", "usage": usage
+            }),
+            "cohere" => json!({
+                "id": "co_1", "finish_reason": "COMPLETE",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+                "usage": usage
+            }),
+            other => panic!("unknown protocol {other}"),
+        }
+    }
+
+    /// (A) ROUND-TRIP FIDELITY with cache tokens: each protocol that carries cache fields, read a
+    /// native usage block WITH cache tokens → IR → write, and assert the re-emitted usage is
+    /// semantically identical to the native wire (same field names, numbers, nesting, presence).
+    /// Especially: OpenAI/Gemini/Responses reconstruct prompt_total = uncached + cached.
+    #[test]
+    fn a2_roundtrip_usage_fidelity_with_cache() {
+        use serde_json::json;
+        // OpenAI: prompt_tokens is a TOTAL (95 uncached + 5 cached); details.cached_tokens = 5.
+        {
+            let p = protocol_for("openai").unwrap();
+            let native = native_response_with_usage(
+                "openai",
+                json!({"prompt_tokens": 100, "completion_tokens": 10, "prompt_tokens_details": {"cached_tokens": 5}}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(ir.usage.input_tokens, 95, "openai: uncached input");
+            assert_eq!(ir.usage.cache_read_input_tokens, Some(5));
+            let out = p.writer().write_response(&ir);
+            assert_eq!(
+                out["usage"]["prompt_tokens"],
+                json!(100),
+                "openai: prompt_total reconstructed"
+            );
+            assert_eq!(out["usage"]["completion_tokens"], json!(10));
+            assert_eq!(
+                out["usage"]["prompt_tokens_details"]["cached_tokens"],
+                json!(5)
+            );
+        }
+        // Gemini: promptTokenCount is a TOTAL (120 uncached + 30 cached); cachedContentTokenCount = 30.
+        {
+            let p = protocol_for("gemini").unwrap();
+            let native = native_response_with_usage(
+                "gemini",
+                json!({"promptTokenCount": 150, "candidatesTokenCount": 20, "cachedContentTokenCount": 30, "totalTokenCount": 170}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(ir.usage.input_tokens, 120, "gemini: uncached input");
+            assert_eq!(ir.usage.cache_read_input_tokens, Some(30));
+            let out = p.writer().write_response(&ir);
+            assert_eq!(
+                out["usageMetadata"]["promptTokenCount"],
+                json!(150),
+                "gemini: prompt_total reconstructed"
+            );
+            assert_eq!(out["usageMetadata"]["candidatesTokenCount"], json!(20));
+            assert_eq!(out["usageMetadata"]["cachedContentTokenCount"], json!(30));
+            assert_eq!(out["usageMetadata"]["totalTokenCount"], json!(170));
+        }
+        // Responses: input_tokens is a TOTAL (36 uncached + 64 cached); details.cached_tokens = 64.
+        {
+            let p = protocol_for("responses").unwrap();
+            let native = native_response_with_usage(
+                "responses",
+                json!({"input_tokens": 100, "output_tokens": 10, "input_tokens_details": {"cached_tokens": 64}}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(ir.usage.input_tokens, 36, "responses: uncached input");
+            assert_eq!(ir.usage.cache_read_input_tokens, Some(64));
+            let out = p.writer().write_response(&ir);
+            assert_eq!(
+                out["usage"]["input_tokens"],
+                json!(100),
+                "responses: input_total reconstructed"
+            );
+            assert_eq!(out["usage"]["output_tokens"], json!(10));
+            assert_eq!(
+                out["usage"]["input_tokens_details"]["cached_tokens"],
+                json!(64)
+            );
+        }
+        // Anthropic: cache fields ADDITIVE — input_tokens unchanged, re-emitted verbatim.
+        {
+            let p = protocol_for("anthropic").unwrap();
+            let native = native_response_with_usage(
+                "anthropic",
+                json!({"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 5000, "cache_creation_input_tokens": 2000}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(
+                ir.usage.input_tokens, 100,
+                "anthropic: input stays uncached (additive)"
+            );
+            assert_eq!(ir.usage.cache_read_input_tokens, Some(5000));
+            assert_eq!(ir.usage.cache_creation_input_tokens, Some(2000));
+            let out = p.writer().write_response(&ir);
+            assert_eq!(
+                out["usage"]["input_tokens"],
+                json!(100),
+                "anthropic: input re-emitted verbatim"
+            );
+            assert_eq!(out["usage"]["cache_read_input_tokens"], json!(5000));
+            assert_eq!(out["usage"]["cache_creation_input_tokens"], json!(2000));
+        }
+        // Bedrock: cache fields ADDITIVE — inputTokens unchanged, re-emitted verbatim.
+        {
+            let p = protocol_for("bedrock").unwrap();
+            let native = native_response_with_usage(
+                "bedrock",
+                json!({"inputTokens": 100, "outputTokens": 50, "cacheReadInputTokens": 5000, "cacheWriteInputTokens": 2000}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(
+                ir.usage.input_tokens, 100,
+                "bedrock: input stays uncached (additive)"
+            );
+            assert_eq!(ir.usage.cache_read_input_tokens, Some(5000));
+            assert_eq!(ir.usage.cache_creation_input_tokens, Some(2000));
+            let out = p.writer().write_response(&ir);
+            assert_eq!(
+                out["usage"]["inputTokens"],
+                json!(100),
+                "bedrock: input re-emitted verbatim"
+            );
+            assert_eq!(out["usage"]["cacheReadInputTokens"], json!(5000));
+            assert_eq!(out["usage"]["cacheWriteInputTokens"], json!(2000));
+        }
+    }
+
+    /// (A) NO-CACHE fidelity: a response with NO cache fields must emit NO cache sub-object/field for
+    /// EVERY protocol (no spurious `prompt_tokens_details` / `cachedContentTokenCount` /
+    /// `input_tokens_details` / `cache_read_input_tokens`).
+    #[test]
+    fn a2_roundtrip_usage_fidelity_no_cache_emits_no_cache_object() {
+        use serde_json::json;
+        // OpenAI
+        {
+            let p = protocol_for("openai").unwrap();
+            let native = native_response_with_usage(
+                "openai",
+                json!({"prompt_tokens": 12, "completion_tokens": 4}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(ir.usage.input_tokens, 12);
+            assert_eq!(ir.usage.cache_read_input_tokens, None);
+            let out = p.writer().write_response(&ir);
+            assert_eq!(out["usage"]["prompt_tokens"], json!(12));
+            assert!(
+                out["usage"].get("prompt_tokens_details").is_none(),
+                "no spurious details: {out}"
+            );
+        }
+        // Gemini (model present so totalTokenCount is emitted, but no cachedContentTokenCount)
+        {
+            let p = protocol_for("gemini").unwrap();
+            let native = native_response_with_usage(
+                "gemini",
+                json!({"promptTokenCount": 12, "candidatesTokenCount": 4, "totalTokenCount": 16}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(ir.usage.cache_read_input_tokens, None);
+            let out = p.writer().write_response(&ir);
+            assert_eq!(out["usageMetadata"]["promptTokenCount"], json!(12));
+            assert!(
+                out["usageMetadata"]
+                    .get("cachedContentTokenCount")
+                    .is_none(),
+                "no spurious cache field: {out}"
+            );
+        }
+        // Responses
+        {
+            let p = protocol_for("responses").unwrap();
+            let native = native_response_with_usage(
+                "responses",
+                json!({"input_tokens": 12, "output_tokens": 4}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(ir.usage.cache_read_input_tokens, None);
+            let out = p.writer().write_response(&ir);
+            assert_eq!(out["usage"]["input_tokens"], json!(12));
+            assert!(
+                out["usage"].get("input_tokens_details").is_none(),
+                "no spurious details: {out}"
+            );
+        }
+        // Anthropic
+        {
+            let p = protocol_for("anthropic").unwrap();
+            let native = native_response_with_usage(
+                "anthropic",
+                json!({"input_tokens": 12, "output_tokens": 4}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            let out = p.writer().write_response(&ir);
+            assert_eq!(out["usage"]["input_tokens"], json!(12));
+            assert!(
+                out["usage"].get("cache_read_input_tokens").is_none(),
+                "no spurious cache field: {out}"
+            );
+            assert!(out["usage"].get("cache_creation_input_tokens").is_none());
+        }
+        // Bedrock
+        {
+            let p = protocol_for("bedrock").unwrap();
+            let native = native_response_with_usage(
+                "bedrock",
+                json!({"inputTokens": 12, "outputTokens": 4}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            let out = p.writer().write_response(&ir);
+            assert_eq!(out["usage"]["inputTokens"], json!(12));
+            assert!(
+                out["usage"].get("cacheReadInputTokens").is_none(),
+                "no spurious cache field: {out}"
+            );
+            assert!(out["usage"].get("cacheWriteInputTokens").is_none());
+        }
+        // Cohere (no cache fields ever)
+        {
+            let p = protocol_for("cohere").unwrap();
+            let native = native_response_with_usage(
+                "cohere",
+                json!({"tokens": {"input_tokens": 12, "output_tokens": 4}}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(ir.usage.input_tokens, 12);
+            assert_eq!(ir.usage.cache_read_input_tokens, None);
+            assert_eq!(ir.usage.billable_tokens(), 16);
+        }
+    }
+
+    /// (B) BILLING PARITY + FIX. OpenAI/Gemini/Responses/Cohere: billable UNCHANGED vs pre-A2
+    /// (prompt_total + output). Anthropic/Bedrock: INCREASED by exactly cache_read + cache_creation.
+    #[test]
+    fn a2_billing_parity_and_fix() {
+        use serde_json::json;
+        // OpenAI-family: a cached response still bills prompt_total + output (NOT uncached+output).
+        {
+            let p = protocol_for("openai").unwrap();
+            let native = native_response_with_usage(
+                "openai",
+                json!({"prompt_tokens": 100, "completion_tokens": 10, "prompt_tokens_details": {"cached_tokens": 5}}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            // pre-A2: prompt_tokens(100) + completion(10) = 110. Must stay 110.
+            assert_eq!(
+                ir.usage.billable_tokens(),
+                110,
+                "openai cached: billable unchanged"
+            );
+        }
+        {
+            let p = protocol_for("gemini").unwrap();
+            let native = native_response_with_usage(
+                "gemini",
+                json!({"promptTokenCount": 150, "candidatesTokenCount": 20, "cachedContentTokenCount": 30}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(
+                ir.usage.billable_tokens(),
+                170,
+                "gemini cached: billable unchanged (150+20)"
+            );
+        }
+        {
+            let p = protocol_for("responses").unwrap();
+            let native = native_response_with_usage(
+                "responses",
+                json!({"input_tokens": 100, "output_tokens": 10, "input_tokens_details": {"cached_tokens": 64}}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(
+                ir.usage.billable_tokens(),
+                110,
+                "responses cached: billable unchanged (100+10)"
+            );
+        }
+        // Anthropic: the explicit fix example. input=100, cache_read=5000, cache_creation=2000,
+        // output=50 → billable 7150 (pre-A2 was 150).
+        {
+            let p = protocol_for("anthropic").unwrap();
+            let native = native_response_with_usage(
+                "anthropic",
+                json!({"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 5000, "cache_creation_input_tokens": 2000}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(
+                ir.usage.billable_tokens(),
+                7150,
+                "anthropic: billable INCREASED by cache (was 150)"
+            );
+        }
+        // Bedrock: additive cache likewise increases billable by cache_read + cache_creation.
+        {
+            let p = protocol_for("bedrock").unwrap();
+            let native = native_response_with_usage(
+                "bedrock",
+                json!({"inputTokens": 100, "outputTokens": 50, "cacheReadInputTokens": 5000, "cacheWriteInputTokens": 2000}),
+            );
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(
+                ir.usage.billable_tokens(),
+                7150,
+                "bedrock: billable INCREASED by cache (was 150)"
+            );
+        }
+        // No-cache: billable unchanged for all 6 = input + output.
+        for (name, usage) in [
+            (
+                "anthropic",
+                json!({"input_tokens": 100, "output_tokens": 50}),
+            ),
+            (
+                "openai",
+                json!({"prompt_tokens": 100, "completion_tokens": 50}),
+            ),
+            (
+                "gemini",
+                json!({"promptTokenCount": 100, "candidatesTokenCount": 50}),
+            ),
+            (
+                "responses",
+                json!({"input_tokens": 100, "output_tokens": 50}),
+            ),
+            ("bedrock", json!({"inputTokens": 100, "outputTokens": 50})),
+            (
+                "cohere",
+                json!({"tokens": {"input_tokens": 100, "output_tokens": 50}}),
+            ),
+        ] {
+            let p = protocol_for(name).unwrap();
+            let native = native_response_with_usage(name, usage);
+            let ir = p.reader().read_response(&native).unwrap();
+            assert_eq!(
+                ir.usage.billable_tokens(),
+                150,
+                "{name}: no-cache billable = input + output"
+            );
+        }
+    }
+
+    /// CROSS-PROTOCOL cache_creation reconstruction: an Anthropic/Bedrock-ingress response carries
+    /// `cache_creation_input_tokens`, which is part of the OpenAI-family TOTAL prompt count. The
+    /// reconstructed prompt total must include it (input + cache_read + cache_creation), else a
+    /// cross-protocol client sees a low prompt/total. (None — hence unaffected — same-protocol.)
+    #[test]
+    fn a2_cross_protocol_cache_creation_included_in_prompt_total() {
+        use serde_json::json;
+        let anth = protocol_for("anthropic").unwrap();
+        let native = native_response_with_usage(
+            "anthropic",
+            json!({"input_tokens": 11, "output_tokens": 5, "cache_read_input_tokens": 20, "cache_creation_input_tokens": 40}),
+        );
+        let ir = anth.reader().read_response(&native).unwrap();
+        assert_eq!(ir.usage.input_tokens, 11);
+        assert_eq!(ir.usage.cache_read_input_tokens, Some(20));
+        assert_eq!(ir.usage.cache_creation_input_tokens, Some(40));
+        // OpenAI egress: prompt_tokens = 11 + 20 + 40 = 71; total_tokens = 76.
+        let o = protocol_for("openai").unwrap().writer().write_response(&ir);
+        assert_eq!(
+            o["usage"]["prompt_tokens"],
+            json!(71),
+            "openai prompt_total includes cache_creation"
+        );
+        assert_eq!(o["usage"]["total_tokens"], json!(76));
+        // Gemini egress: promptTokenCount = 71.
+        let g = protocol_for("gemini").unwrap().writer().write_response(&ir);
+        assert_eq!(
+            g["usageMetadata"]["promptTokenCount"],
+            json!(71),
+            "gemini prompt_total includes cache_creation"
+        );
+        // Responses egress: input_tokens = 71.
+        let r = protocol_for("responses")
+            .unwrap()
+            .writer()
+            .write_response(&ir);
+        assert_eq!(
+            r["usage"]["input_tokens"],
+            json!(71),
+            "responses input_total includes cache_creation"
+        );
+        // billable is summed straight from the IR and is unaffected by the writer fix: 11+20+40+5.
+        assert_eq!(ir.usage.billable_tokens(), 76);
+    }
+
+    /// (f) UNDERFLOW edge case: a hostile/odd upstream where cached > prompt must NOT underflow.
+    /// `saturating_sub` clamps uncached input to 0 (never panics, never wraps to u64::MAX).
+    #[test]
+    fn a2_cached_exceeds_prompt_saturates_to_zero() {
+        use serde_json::json;
+        // OpenAI: cached(50) > prompt(10) → uncached input clamps to 0; cache_read keeps 50.
+        let p = protocol_for("openai").unwrap();
+        let native = native_response_with_usage(
+            "openai",
+            json!({"prompt_tokens": 10, "completion_tokens": 4, "prompt_tokens_details": {"cached_tokens": 50}}),
+        );
+        let ir = p.reader().read_response(&native).unwrap();
+        assert_eq!(
+            ir.usage.input_tokens, 0,
+            "saturating_sub clamps to 0, no underflow"
+        );
+        assert_eq!(ir.usage.cache_read_input_tokens, Some(50));
+        // Gemini likewise.
+        let pg = protocol_for("gemini").unwrap();
+        let gnative = native_response_with_usage(
+            "gemini",
+            json!({"promptTokenCount": 10, "candidatesTokenCount": 4, "cachedContentTokenCount": 50}),
+        );
+        let irg = pg.reader().read_response(&gnative).unwrap();
+        assert_eq!(
+            irg.usage.input_tokens, 0,
+            "gemini saturating_sub clamps to 0"
+        );
+        // Responses likewise.
+        let pr = protocol_for("responses").unwrap();
+        let rnative = native_response_with_usage(
+            "responses",
+            json!({"input_tokens": 10, "output_tokens": 4, "input_tokens_details": {"cached_tokens": 50}}),
+        );
+        let irr = pr.reader().read_response(&rnative).unwrap();
+        assert_eq!(
+            irr.usage.input_tokens, 0,
+            "responses saturating_sub clamps to 0"
+        );
     }
 
     /// The gemini JSON-array framer turns gemini SSE `data:` frames into one streaming JSON array

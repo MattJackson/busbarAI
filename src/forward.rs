@@ -1217,17 +1217,15 @@ where
                             .is_some()
                             || translate_aborted;
                         if !billing_failed {
-                            // billed tokens = input + output ONLY (cache fields are deliberately NOT
-                            // summed here — their cache-subset-vs-additive semantics differ by provider,
-                            // a correctness fix that lands in a separate later change). `saturating_add`:
-                            // both operands are UPSTREAM-CONTROLLED token counts, so an unchecked `+`
-                            // could panic on overflow in debug / silently wrap in release (#18). Saturate
-                            // to `u64::MAX` — matching `record_tokens` downstream, which is itself
-                            // saturating — rather than risk a request-path panic.
-                            let tokens = ir_usage
-                                .as_ref()
-                                .map(|u| u.input_tokens.saturating_add(u.output_tokens))
-                                .unwrap_or(0);
+                            // billed tokens = the normalized billable total (A2): uncached input +
+                            // cache_read + cache_creation + output. Readers normalize `input_tokens`
+                            // to UNCACHED and keep the cache fields ADDITIVE, so this single sum is
+                            // correct provider-agnostically — OpenAI-family stay at prompt_total+output
+                            // (no double-count), Anthropic/Bedrock now correctly include their
+                            // additive cache reads/writes. `billable_tokens` saturates internally
+                            // (counts are UPSTREAM-CONTROLLED) rather than risking a request-path panic.
+                            let tokens =
+                                ir_usage.as_ref().map(|u| u.billable_tokens()).unwrap_or(0);
                             // Attribute the token fee to the SAME window the flat per-request fee was
                             // charged in (`sink.charged_at`, the header-arrival epoch), not the
                             // stream-end clock — otherwise a stream that completes in a later window
@@ -1724,15 +1722,16 @@ pub(crate) fn egress_accept(egress_protocol: &str, wants_stream: bool) -> &'stat
 /// (non-streaming) cross-protocol responses already decode the egress body egress→IR→ingress, so the
 /// terminal `IrUsage` is available WITHOUT a separate byte-scan — bill straight from `ir.usage`.
 ///
-/// Billed tokens = `input_tokens + output_tokens` ONLY (cache fields are deliberately NOT summed in;
-/// their cache-subset-vs-additive semantics differ by provider, a correctness fix for a separate
-/// later change). This matches the streaming billing arm and the prior byte-scanner for 5/6 protocols.
+/// Billed tokens = the normalized billable total (A2): `uncached_input + cache_read +
+/// cache_creation + output` (see [`crate::ir::IrUsage::billable_tokens`]). Readers normalize
+/// `input_tokens` to UNCACHED and keep the cache fields ADDITIVE, so this sum is correct
+/// provider-agnostically. This matches the streaming billing arm.
 fn record_ir_usage(usage: &crate::ir::IrUsage, usage_sink: &Option<UsageSink>) {
     if let Some(sink) = usage_sink {
-        // `saturating_add`: both operands are UPSTREAM-CONTROLLED token counts, so an unchecked `+`
-        // could panic on overflow in debug / wrap in release (#18). Saturate to `u64::MAX`, matching
-        // the streaming path and the saturating `record_tokens` downstream.
-        let tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+        // `billable_tokens` saturates internally — operands are UPSTREAM-CONTROLLED token counts, so
+        // an unchecked `+` could panic on overflow in debug / wrap in release (#18). Saturates to
+        // `u64::MAX`, matching the streaming path and the saturating `record_tokens` downstream.
+        let tokens = usage.billable_tokens();
         if tokens > 0 {
             // Same window as the flat per-request fee (`sink.charged_at`, header-arrival epoch), so
             // the buffered-path token fee and the per-request fee never split across windows (#29).
@@ -1869,10 +1868,9 @@ async fn decide_policy_order(
         Candidate, ResolvedPolicy, RoutingContext, RoutingDecision, RoutingRequest,
     };
 
-    // `Weighted` resolves to `None` at config load, so a `ResolvedPolicy::Weighted` never reaches the
-    // seam — but handle it defensively as "fall through to SWRR" rather than panicking.
+    // A weighted/default pool resolves to `None` at config load (no policy object is constructed), so
+    // the only `ResolvedPolicy` that can reach this seam is a constructed `Policy`.
     let (policy, on_error, timeout) = match resolved {
-        ResolvedPolicy::Weighted => return PolicyOutcome::Weighted,
         ResolvedPolicy::Policy {
             policy,
             on_error,

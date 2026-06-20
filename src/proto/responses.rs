@@ -1166,20 +1166,29 @@ impl ProtocolReader for ResponsesReader {
 
                     let usage = response_obj
                         .get("usage")
-                        .map(|u| crate::ir::IrUsage {
-                            input_tokens: u
-                                .get("input_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0),
-                            output_tokens: u
-                                .get("output_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0),
-                            cache_creation_input_tokens: None,
-                            // H6: carry the streamed prompt-cache hit count
-                            // (`usage.input_tokens_details.cached_tokens`) into the IR's read-side
-                            // cache field so a streaming Responses terminal preserves the cache saving.
-                            cache_read_input_tokens: read_cached_tokens(u),
+                        .map(|u| {
+                            let cached = read_cached_tokens(u);
+                            crate::ir::IrUsage {
+                                // NORMALIZE to the additive-cache convention: the Responses API's
+                                // `input_tokens` is a TOTAL that already INCLUDES the cached prefix,
+                                // so subtract the cached tokens to leave only the uncached input.
+                                // `saturating_sub` guards an odd upstream where cached > input.
+                                input_tokens: u
+                                    .get("input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0)
+                                    .saturating_sub(cached.unwrap_or(0)),
+                                output_tokens: u
+                                    .get("output_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                cache_creation_input_tokens: None,
+                                // H6: carry the streamed prompt-cache hit count
+                                // (`usage.input_tokens_details.cached_tokens`) into the IR's
+                                // read-side cache field so a streaming Responses terminal preserves
+                                // the cache saving.
+                                cache_read_input_tokens: cached,
+                            }
                         })
                         .unwrap_or(crate::ir::IrUsage {
                             input_tokens: 0,
@@ -1450,11 +1459,16 @@ impl ProtocolReader for ResponsesReader {
             retry_after: None,
         })?;
 
+        let cached = read_cached_tokens(usage_val);
         let usage = crate::ir::IrUsage {
+            // NORMALIZE to the additive-cache convention: the Responses API's `input_tokens` is a
+            // TOTAL that already INCLUDES the cached prefix, so subtract the cached tokens to leave
+            // only the uncached input. `saturating_sub` guards an odd upstream where cached > input.
             input_tokens: usage_val
                 .get("input_tokens")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+                .unwrap_or(0)
+                .saturating_sub(cached.unwrap_or(0)),
             output_tokens: usage_val
                 .get("output_tokens")
                 .and_then(|v| v.as_u64())
@@ -1464,7 +1478,7 @@ impl ProtocolReader for ResponsesReader {
             // `usage.input_tokens_details.cached_tokens`. Map it into the IR's
             // `cache_read_input_tokens` (the read-side cache field Bedrock already uses) so the cache
             // saving survives a cross-protocol hop instead of being dropped. No new IR field is added.
-            cache_read_input_tokens: read_cached_tokens(usage_val),
+            cache_read_input_tokens: cached,
         };
 
         let model = obj.get("model").and_then(|m| m.as_str()).map(String::from);
@@ -3006,11 +3020,15 @@ impl ProtocolWriter for ResponsesWriter {
                     );
                 }
 
+                // RECONSTRUCT the native WIRE shape from the normalized IR: the IR stores UNCACHED
+                // input, but the Responses API's `input_tokens` is a TOTAL that includes the cached
+                // prefix, so add `cache_read` back.
+                let input_total = usage
+                    .input_tokens
+                    .saturating_add(usage.cache_read_input_tokens.unwrap_or(0))
+                    .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
                 let mut usage_map = serde_json::Map::new();
-                usage_map.insert(
-                    "input_tokens".to_string(),
-                    serde_json::json!(usage.input_tokens),
-                );
+                usage_map.insert("input_tokens".to_string(), serde_json::json!(input_total));
                 usage_map.insert(
                     "output_tokens".to_string(),
                     serde_json::json!(usage.output_tokens),
@@ -3260,11 +3278,16 @@ impl ProtocolWriter for ResponsesWriter {
             }
         }
 
+        // RECONSTRUCT the native WIRE shape from the normalized IR: the IR stores UNCACHED input,
+        // but the Responses API's `input_tokens` is a TOTAL that includes the cached prefix, so add
+        // `cache_read` back.
+        let input_total = resp
+            .usage
+            .input_tokens
+            .saturating_add(resp.usage.cache_read_input_tokens.unwrap_or(0))
+            .saturating_add(resp.usage.cache_creation_input_tokens.unwrap_or(0));
         let mut usage_map = serde_json::Map::new();
-        usage_map.insert(
-            "input_tokens".to_string(),
-            serde_json::json!(resp.usage.input_tokens),
-        );
+        usage_map.insert("input_tokens".to_string(), serde_json::json!(input_total));
         usage_map.insert(
             "output_tokens".to_string(),
             serde_json::json!(resp.usage.output_tokens),

@@ -174,12 +174,10 @@ pub(crate) trait RoutingPolicy: Send + Sync + 'static {
 /// on `App` keyed by pool name; the hot path is `if let Some(p) = app.pool_policies.get(pool) { … }`.
 #[derive(Clone)]
 pub(crate) enum ResolvedPolicy {
-    /// Default SWRR. `resolve_policy` collapses every weighted form to `None` (the zero-cost path),
-    /// so this arm is never CONSTRUCTED — it exists only so the seam can handle a `Weighted`
-    /// defensively (matched at `forward::decide_policy_order`) instead of relying on it being absent.
-    #[allow(dead_code)] // never constructed by design; matched defensively at the seam.
-    Weighted,
     /// A constructed policy object (webhook / script / native non-weighted) plus its fallback config.
+    /// The default SWRR / weighted path is represented as `None` by `resolve_policy` (it constructs no
+    /// policy object), so there is no `Weighted` variant — a weighted pool simply has no resolved
+    /// policy and takes the inline SWRR branch.
     Policy {
         policy: Arc<dyn RoutingPolicy>,
         on_error: crate::config::PolicyOnError,

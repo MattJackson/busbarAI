@@ -344,10 +344,33 @@ pub(crate) struct IrTool {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IrUsage {
+    /// UNCACHED input tokens. Readers NORMALIZE to this convention: providers whose wire
+    /// `input/prompt` total already INCLUDES the cached prefix (OpenAI, Gemini, Responses) subtract
+    /// the cached count here; providers whose cache fields are already ADDITIVE (Anthropic, Bedrock)
+    /// store the wire value as-is. This makes `cache_read_input_tokens` and
+    /// `cache_creation_input_tokens` uniformly ADDITIVE across all protocols, so
+    /// [`IrUsage::billable_tokens`] can sum them provider-agnostically.
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) cache_creation_input_tokens: Option<u64>,
     pub(crate) cache_read_input_tokens: Option<u64>,
+}
+
+impl IrUsage {
+    /// Total billable tokens under the normalized additive-cache convention:
+    /// `input_tokens` (uncached) + `cache_read_input_tokens` + `cache_creation_input_tokens` +
+    /// `output_tokens`. Because every reader normalizes `input_tokens` to UNCACHED input and keeps
+    /// the cache fields ADDITIVE, this sum is correct and provider-agnostic — it neither
+    /// double-counts the OpenAI-family (whose wire prompt total includes the cache) nor under-counts
+    /// the Anthropic/Bedrock family (whose cache reads/writes are separate from input). All adds are
+    /// `saturating_add`: the operands are UPSTREAM-CONTROLLED counts, so an unchecked `+` could
+    /// panic in debug / wrap in release.
+    pub(crate) fn billable_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_input_tokens.unwrap_or(0))
+            .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
+            .saturating_add(self.output_tokens)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

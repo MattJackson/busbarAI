@@ -736,21 +736,26 @@ impl ProtocolReader for OpenAiReader {
         // so a naive `.map(...)` would synthesize `Some(IrUsage{0,0,..})` on every content chunk and
         // (via the trailing-usage branch below) emit a spurious mid-stream `MessageDelta` per chunk.
         // Filter to a real usage OBJECT so `usage: null` reads as `None`.
-        let chunk_usage = data
-            .get("usage")
-            .filter(|u| u.is_object())
-            .map(|u| IrUsage {
-                input_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+        let chunk_usage = data.get("usage").filter(|u| u.is_object()).map(|u| {
+            let prompt_tokens = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cached = u
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64());
+            IrUsage {
+                // NORMALIZE to the additive-cache convention: OpenAI's `prompt_tokens` is a
+                // TOTAL that already INCLUDES the cached prefix, so subtract the cached tokens
+                // to leave only the uncached input. `saturating_sub` guards a hostile/odd
+                // upstream where `cached_tokens > prompt_tokens` (would otherwise underflow).
+                input_tokens: prompt_tokens.saturating_sub(cached.unwrap_or(0)),
                 output_tokens: u
                     .get("completion_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
                 cache_creation_input_tokens: None,
-                cache_read_input_tokens: u
-                    .get("prompt_tokens_details")
-                    .and_then(|d| d.get("cached_tokens"))
-                    .and_then(|v| v.as_u64()),
-            });
+                cache_read_input_tokens: cached,
+            }
+        });
 
         // 5. finish_reason → close open blocks (text first, then tools ascending), MessageDelta, MessageStop.
         let finish_reason = choice0
@@ -986,10 +991,14 @@ impl ProtocolReader for OpenAiReader {
             .and_then(|v| v.as_u64());
 
         let usage = crate::ir::IrUsage {
+            // NORMALIZE to the additive-cache convention: OpenAI's `prompt_tokens` is a TOTAL that
+            // already INCLUDES the cached prefix, so subtract the cached tokens to leave only the
+            // uncached input. `saturating_sub` guards an odd upstream where cached > prompt_tokens.
             input_tokens: usage_val
                 .and_then(|u| u.get("prompt_tokens"))
                 .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+                .unwrap_or(0)
+                .saturating_sub(cache_read_input_tokens.unwrap_or(0)),
             output_tokens: usage_val
                 .and_then(|u| u.get("completion_tokens"))
                 .and_then(|v| v.as_u64())
@@ -1713,18 +1722,34 @@ impl ProtocolWriter for OpenAiWriter {
                 // nonzero (a same-protocol passthrough without include_usage carries zeroed usage in
                 // the IR; suppressing the field there avoids stamping a usage object onto a stream that
                 // never asked for one). `total_tokens` is the prompt+completion sum, the native shape.
-                let prompt_tokens = usage.input_tokens;
+                // RECONSTRUCT the native WIRE shape from the normalized IR: the IR stores UNCACHED
+                // input, but OpenAI's `prompt_tokens` is a TOTAL that includes the cached prefix, so
+                // add `cache_read` back. Emit `prompt_tokens_details.cached_tokens` only when a cache
+                // read is present (matching the native shape — no spurious details object otherwise).
+                let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+                // cache_creation is ALSO part of OpenAI's TOTAL prompt count (it is None on every
+                // same-protocol OpenAI path; present only on cross-protocol Anthropic/Bedrock ingress).
+                let prompt_tokens = usage
+                    .input_tokens
+                    .saturating_add(cache_read)
+                    .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
                 let completion_tokens = usage.output_tokens;
                 if prompt_tokens != 0 || completion_tokens != 0 {
                     if let Some(obj) = chunk_obj.as_object_mut() {
-                        obj.insert(
-                            "usage".to_string(),
-                            serde_json::json!({
-                                "prompt_tokens": prompt_tokens,
-                                "completion_tokens": completion_tokens,
-                                "total_tokens": prompt_tokens.saturating_add(completion_tokens),
-                            }),
-                        );
+                        let mut usage_obj = serde_json::json!({
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens.saturating_add(completion_tokens),
+                        });
+                        if usage.cache_read_input_tokens.is_some() {
+                            if let Some(uo) = usage_obj.as_object_mut() {
+                                uo.insert(
+                                    "prompt_tokens_details".to_string(),
+                                    serde_json::json!({ "cached_tokens": cache_read }),
+                                );
+                            }
+                        }
+                        obj.insert("usage".to_string(), usage_obj);
                     }
                 }
                 Some(("".to_string(), chunk_obj))
@@ -1967,10 +1992,22 @@ impl ProtocolWriter for OpenAiWriter {
         );
 
         // Build usage, including the `total_tokens` an SDK expects (prompt + completion).
+        // RECONSTRUCT the native WIRE shape from the normalized IR: the IR stores UNCACHED input,
+        // but OpenAI's `prompt_tokens` is a TOTAL that includes the cached prefix, so add
+        // `cache_read` back. Emit `prompt_tokens_details.cached_tokens` only when a cache read is
+        // present (matching the native shape — no spurious details object otherwise).
+        let cache_read = resp.usage.cache_read_input_tokens.unwrap_or(0);
+        // cache_creation is ALSO part of OpenAI's TOTAL prompt count (None on same-protocol OpenAI;
+        // present only on cross-protocol Anthropic/Bedrock ingress).
+        let prompt_tokens = resp
+            .usage
+            .input_tokens
+            .saturating_add(cache_read)
+            .saturating_add(resp.usage.cache_creation_input_tokens.unwrap_or(0));
         let mut usage_map = serde_json::Map::new();
         usage_map.insert(
             "prompt_tokens".to_string(),
-            serde_json::json!(resp.usage.input_tokens),
+            serde_json::json!(prompt_tokens),
         );
         usage_map.insert(
             "completion_tokens".to_string(),
@@ -1978,11 +2015,14 @@ impl ProtocolWriter for OpenAiWriter {
         );
         usage_map.insert(
             "total_tokens".to_string(),
-            serde_json::json!(resp
-                .usage
-                .input_tokens
-                .saturating_add(resp.usage.output_tokens)),
+            serde_json::json!(prompt_tokens.saturating_add(resp.usage.output_tokens)),
         );
+        if resp.usage.cache_read_input_tokens.is_some() {
+            usage_map.insert(
+                "prompt_tokens_details".to_string(),
+                serde_json::json!({ "cached_tokens": cache_read }),
+            );
+        }
         obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
 
         serde_json::Value::Object(obj)
@@ -3653,7 +3693,9 @@ mod tests {
                 // In-progress finish per the chunk shape (no finish_reason on a usage-only chunk).
                 assert_eq!(*stop_reason, None);
                 assert_eq!(*stop_sequence, None);
-                assert_eq!(usage.input_tokens, 11);
+                // A2 normalization: input_tokens is UNCACHED (prompt_tokens 11 - cached 3 = 8);
+                // cache_read carries the cached prefix additively.
+                assert_eq!(usage.input_tokens, 8);
                 assert_eq!(usage.output_tokens, 7);
                 assert_eq!(usage.cache_read_input_tokens, Some(3));
             }
