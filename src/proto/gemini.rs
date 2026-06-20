@@ -1055,6 +1055,23 @@ impl ProtocolReader for GeminiReader {
             }
         }
 
+        // L2: grounding/web-search citations. Gemini reports them at the CANDIDATE level
+        // (`candidates[].citationMetadata.citationSources[]`), not per content-part, whereas the IR
+        // carries citations ON a Text block. Attach the mapped citations to the FIRST Text block of
+        // the candidate so they survive the seam (cross-protocol Anthropic egress re-emits them, and
+        // a same-protocol Gemini path re-emits them at candidate level). If the candidate has no Text
+        // block (e.g. a tool-only turn) there is nothing to anchor them to — Gemini does not emit
+        // citations for such turns in practice, so dropping is faithful.
+        let gemini_citations = read_gemini_citations(candidate);
+        if !gemini_citations.is_empty() {
+            if let Some(crate::ir::IrBlock::Text { citations, .. }) = content
+                .iter_mut()
+                .find(|b| matches!(b, crate::ir::IrBlock::Text { .. }))
+            {
+                *citations = gemini_citations;
+            }
+        }
+
         // Parse finishReason → stop_reason (map Gemini→canonical)
         let stop_reason = candidate
             .get("finishReason")
@@ -1312,6 +1329,72 @@ fn coerce_tool_args(input: &serde_json::Value) -> serde_json::Value {
     } else {
         serde_json::json!({ "args": candidate })
     }
+}
+
+/// L2: map a Gemini candidate's `citationMetadata.citationSources[]` → neutral
+/// [`crate::ir::IrCitation`]s. A Gemini citation source is a grounding/web-search reference carrying
+/// `startIndex`/`endIndex` (character offsets into the response text), `uri`, `title`, and `license`.
+/// We project it onto the neutral fields (uri→url, indices→start/end, title→title) and stash the
+/// source object verbatim in `raw` so a same-protocol Gemini path could re-emit it. The neutral
+/// `kind` is `web_search_result_location` — a grounding source IS a URL reference, which is also the
+/// Anthropic variant a cross-protocol Anthropic egress synthesizes for it. Returns empty when the
+/// candidate has no citation metadata.
+fn read_gemini_citations(candidate: &serde_json::Value) -> Vec<crate::ir::IrCitation> {
+    let sources = candidate
+        .get("citationMetadata")
+        .and_then(|m| m.get("citationSources"))
+        .and_then(|s| s.as_array());
+    let Some(sources) = sources else {
+        return Vec::new();
+    };
+    sources
+        .iter()
+        .map(|src| crate::ir::IrCitation {
+            kind: Some("web_search_result_location".to_string()),
+            cited_text: None,
+            title: src
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            url: src.get("uri").and_then(|v| v.as_str()).map(str::to_string),
+            document_index: None,
+            start_index: src.get("startIndex").and_then(|v| v.as_i64()),
+            end_index: src.get("endIndex").and_then(|v| v.as_i64()),
+            encrypted_index: None,
+            raw: Some(src.clone()),
+        })
+        .collect()
+}
+
+/// L2: map a neutral [`crate::ir::IrCitation`] → a Gemini `citationSources[]` entry.
+///
+/// SAME-PROTOCOL FIDELITY: when `raw` is present AND it is a Gemini citation source (has a `uri` or
+/// the Gemini index fields), re-emit it verbatim so a Gemini→IR→Gemini path is byte-exact. A `raw`
+/// from a FOREIGN protocol (e.g. an Anthropic citation object on an Anthropic→Gemini hop) would not
+/// be a valid Gemini source, so we ignore it and BUILD a Gemini source from the neutral fields.
+fn write_gemini_citation(c: &crate::ir::IrCitation) -> serde_json::Value {
+    if let Some(raw) = &c.raw {
+        if raw.get("uri").is_some()
+            || raw.get("startIndex").is_some()
+            || raw.get("endIndex").is_some()
+        {
+            return raw.clone();
+        }
+    }
+    let mut obj = serde_json::Map::new();
+    if let Some(s) = c.start_index {
+        obj.insert("startIndex".to_string(), serde_json::json!(s));
+    }
+    if let Some(e) = c.end_index {
+        obj.insert("endIndex".to_string(), serde_json::json!(e));
+    }
+    if let Some(u) = &c.url {
+        obj.insert("uri".to_string(), serde_json::json!(u));
+    }
+    if let Some(t) = &c.title {
+        obj.insert("title".to_string(), serde_json::json!(t));
+    }
+    serde_json::Value::Object(obj)
 }
 
 /// True when a Gemini response/stream chunk carries NO usable `candidates` (absent, non-array, OR an
@@ -2512,9 +2595,19 @@ impl ProtocolWriter for GeminiWriter {
         // Build candidates array (Gemini whole-response format)
         let mut parts_arr: Vec<serde_json::Value> = Vec::new();
 
+        // L2: collect citations from every Text block to re-emit at the candidate level
+        // (`candidates[].citationMetadata.citationSources[]`) — Gemini carries citations there, not
+        // per content-part. The reader anchors them to a Text block; here we hoist them back out.
+        let mut citation_sources: Vec<serde_json::Value> = Vec::new();
+
         for block in &resp.content {
             match block {
-                crate::ir::IrBlock::Text { text, .. } => {
+                crate::ir::IrBlock::Text {
+                    text, citations, ..
+                } => {
+                    for c in citations {
+                        citation_sources.push(write_gemini_citation(c));
+                    }
                     if !text.is_empty() {
                         parts_arr.push(serde_json::json!({"text": text}));
                     }
@@ -2605,14 +2698,22 @@ impl ProtocolWriter for GeminiWriter {
                 .saturating_add(resp.usage.output_tokens);
             usage_metadata["totalTokenCount"] = serde_json::json!(total);
         }
+        let mut candidate = serde_json::json!({
+            "content": {
+                "role": "model",
+                "parts": parts_arr
+            },
+            "finishReason": finish_reason
+        });
+        // L2: re-emit candidate-level citationMetadata when the IR carried citations (grounding /
+        // web-search). Only emitted when non-empty so a normal response stays byte-identical.
+        if !citation_sources.is_empty() {
+            candidate["citationMetadata"] = serde_json::json!({
+                "citationSources": citation_sources
+            });
+        }
         let mut out = serde_json::json!({
-            "candidates": [{
-                "content": {
-                    "role": "model",
-                    "parts": parts_arr
-                },
-                "finishReason": finish_reason
-            }],
+            "candidates": [candidate],
             "usageMetadata": usage_metadata
         });
         // model that served the response (preserved across cross-protocol translation)
@@ -7218,6 +7319,129 @@ mod tests {
             sig_part.pointer("/thought"),
             Some(&serde_json::json!(true)),
             "streamed signature part must be flagged thought:true: {sig_part}"
+        );
+    }
+
+    /// L2: a Gemini response carrying `candidates[].citationMetadata.citationSources[]` must read
+    /// into IrCitation(s) on the answer's Text block (url/title/indices preserved), and a CROSS-
+    /// protocol Anthropic egress must re-emit them as `web_search_result_location` citations carrying
+    /// the url/title — closing the grounding-citation gap that previously dropped them entirely.
+    #[test]
+    fn gemini_citation_metadata_reads_and_projects_to_anthropic() {
+        let reader = GeminiReader;
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "The sky is blue."}]
+                },
+                "citationMetadata": {
+                    "citationSources": [
+                        {
+                            "startIndex": 0,
+                            "endIndex": 15,
+                            "uri": "https://example.com/sky",
+                            "title": "Why the sky is blue",
+                            "license": ""
+                        }
+                    ]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 4,
+                "totalTokenCount": 9
+            }
+        });
+        let ir = reader.read_response(&body).expect("read_response");
+        // Citations land on the Text block with neutral fields populated.
+        let citations = ir
+            .content
+            .iter()
+            .find_map(|b| match b {
+                crate::ir::IrBlock::Text { citations, .. } if !citations.is_empty() => {
+                    Some(citations)
+                }
+                _ => None,
+            })
+            .expect("citations must be attached to the Text block");
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].url.as_deref(), Some("https://example.com/sky"));
+        assert_eq!(citations[0].title.as_deref(), Some("Why the sky is blue"));
+        assert_eq!(citations[0].start_index, Some(0));
+        assert_eq!(citations[0].end_index, Some(15));
+
+        // Cross-protocol Anthropic egress carries url + title.
+        let aw = crate::proto::anthropic::AnthropicWriter;
+        let wire = aw.write_response(&ir);
+        let c = wire
+            .pointer("/content")
+            .and_then(|c| c.as_array())
+            .and_then(|blocks| blocks.iter().find_map(|b| b.pointer("/citations/0")))
+            .expect("Anthropic egress must carry the citation");
+        assert_eq!(
+            c.get("type").and_then(|v| v.as_str()),
+            Some("web_search_result_location")
+        );
+        assert_eq!(
+            c.get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/sky")
+        );
+        assert_eq!(
+            c.get("title").and_then(|v| v.as_str()),
+            Some("Why the sky is blue")
+        );
+    }
+
+    /// L2: same-protocol Gemini→IR→Gemini citation round-trip re-emits candidate-level
+    /// citationMetadata (verbatim source via `raw`), and a response WITHOUT citations stays free of a
+    /// `citationMetadata` key.
+    #[test]
+    fn gemini_citations_roundtrip_and_absent_unaffected() {
+        let reader = GeminiReader;
+        let writer = GeminiWriter;
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Answer."}]},
+                "citationMetadata": {
+                    "citationSources": [
+                        {"startIndex": 1, "endIndex": 7, "uri": "https://src/x", "title": "X"}
+                    ]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 1}
+        });
+        let mut ir = reader.read_response(&body).expect("read_response");
+        // Force the cross-protocol boundary signal so the Gemini writer runs the full egress path.
+        ir.created = Some(1);
+        let wire = writer.write_response(&ir);
+        let src = wire
+            .pointer("/candidates/0/citationMetadata/citationSources/0")
+            .expect("citationMetadata re-emitted at candidate level");
+        assert_eq!(
+            src.get("uri").and_then(|v| v.as_str()),
+            Some("https://src/x")
+        );
+        assert_eq!(src.get("startIndex").and_then(|v| v.as_i64()), Some(1));
+
+        // No citations → no citationMetadata key.
+        let plain_body = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Plain."}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 1}
+        });
+        let mut plain_ir = reader.read_response(&plain_body).expect("read_response");
+        plain_ir.created = Some(1);
+        let plain_wire = writer.write_response(&plain_ir);
+        assert!(
+            plain_wire
+                .pointer("/candidates/0/citationMetadata")
+                .is_none(),
+            "no citationMetadata for a citation-free response; got {plain_wire}"
         );
     }
 }

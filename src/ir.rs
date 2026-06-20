@@ -232,7 +232,7 @@ pub(crate) enum IrBlock {
     Text {
         text: String,
         cache_control: Option<CacheControl>,
-        citations: Vec<Value>,
+        citations: Vec<IrCitation>,
     },
     Thinking {
         text: String,
@@ -271,6 +271,63 @@ pub(crate) struct CacheControl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CacheKind {
     Ephemeral,
+}
+
+/// Neutral, cross-protocol citation IR for grounding / web-search CITATIONS carried on a `Text`
+/// block (L2). Before this type the field was `Vec<serde_json::Value>` holding RAW Anthropic-shaped
+/// citation objects: only Anthropic read/wrote them, Gemini's `citationMetadata` was never read, and
+/// every other protocol left the vec empty — so a citation was LOST the moment it crossed a protocol
+/// boundary. `IrCitation` captures the UNION of the protocol-native citation shapes so a citation can
+/// be projected both ways.
+///
+/// ANTHROPIC FIDELITY (the load-bearing invariant): an Anthropic citation must round-trip BYTE-EXACT
+/// on the same-protocol path. The Anthropic citation schema is a tagged union (`type` discriminator)
+/// — `char_location`, `page_location`, `content_block_location`, and the web-search
+/// `web_search_result_location` — each with its own field set, and the API may add fields/variants.
+/// Rather than risk a lossy field-by-field reconstruction, the Anthropic READER stashes the source
+/// object VERBATIM in [`IrCitation::raw`] (alongside the neutral fields it also fills), and the
+/// Anthropic WRITER, whenever `raw` is present, re-emits it UNCHANGED. So Anthropic→IR→Anthropic is
+/// guaranteed byte-exact regardless of how the neutral fields map. Only on a CROSS-protocol egress
+/// (where `raw` is a foreign shape or absent) does the writer synthesize an Anthropic object from the
+/// neutral fields — best-effort, never a regression to the same-protocol path.
+///
+/// Neutral fields are the intersection that travels cross-protocol: a human-readable `kind` tag plus
+/// the location/source coordinates both Anthropic and Gemini expose.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct IrCitation {
+    /// Citation-type discriminator. For Anthropic this is the `type` tag verbatim (`char_location`,
+    /// `page_location`, `content_block_location`, `web_search_result_location`); for a Gemini
+    /// `citationSources[]` entry it is `web_search_result_location` (a grounding source is a URL
+    /// reference). `None` only if a source carried no recognizable type.
+    pub(crate) kind: Option<String>,
+    /// The quoted span of source text the citation refers to (Anthropic `cited_text`). Gemini
+    /// `citationSources[]` carry no quoted text, so this is `None` for Gemini-sourced citations.
+    pub(crate) cited_text: Option<String>,
+    /// Human title of the cited document / web result (Anthropic `document_title` for the document
+    /// location variants, `title` for `web_search_result_location`; Gemini has no title field today —
+    /// reserved for forward compat).
+    pub(crate) title: Option<String>,
+    /// Source URL — Anthropic `web_search_result_location.url`, Gemini `citationSources[].uri`.
+    pub(crate) url: Option<String>,
+    /// Index of the cited document in the request's `documents` array (Anthropic
+    /// `document_index`, present on the three document-location variants). Gemini: `None`.
+    pub(crate) document_index: Option<i64>,
+    /// Inclusive/exclusive start offset, interpreted per `kind`: char index (`char_location`), page
+    /// number (`page_location`), or block index (`content_block_location`). For a Gemini
+    /// `citationSources[]` this carries `startIndex` (a character offset into the response text).
+    pub(crate) start_index: Option<i64>,
+    /// End offset, paired with `start_index` per `kind` (end char / end page / end block; Gemini
+    /// `endIndex`).
+    pub(crate) end_index: Option<i64>,
+    /// Anthropic web-search `encrypted_index` — an opaque cursor token. Carried so the web-search
+    /// citation variant round-trips even on a cross-protocol synthesize-from-neutral path.
+    pub(crate) encrypted_index: Option<String>,
+    /// VERBATIM source citation object, for byte-exact same-protocol re-emission. The Anthropic
+    /// reader stores the original Anthropic citation here; the Anthropic writer re-emits it unchanged
+    /// when present (the no-regression guarantee). The Gemini reader stores the original
+    /// `citationSources[]` entry here so a same-protocol Gemini path could re-emit it faithfully.
+    /// `None` for a citation synthesized purely from neutral fields.
+    pub(crate) raw: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
