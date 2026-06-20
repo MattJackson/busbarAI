@@ -7,6 +7,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.7] — 2026-06-20
+
+The 1.0 candidate. Two themes: an architectural unification so every request takes one code path
+(wire → IR → wire) with billing metered from that IR, and the config/surface cleanup that freezes a
+clean 1.0 contract. Same-protocol traffic stays byte-exact and just as fast via a verbatim serialize
+short-circuit, five of six protocols now forward same-protocol requests byte-exact (the prior path
+always re-serialized), and a provider cache-token billing gap is closed. Audited across a four-lens
+Sonnet pass and two deep Opus passes (zero HIGH/CRITICAL). The request path, wire protocols, and
+breaker FSM are unchanged.
+
+### Added
+
+- **All operational limits are now operator config (no hardcoded caps).** A new `limits:` block
+  surfaces the 17 previously-hardcoded limits — upstream request timeout, request body max, idle
+  connections per host, hard-down cooldown, upstream error-body cap, TLS handshake timeout, honored
+  `Retry-After` ceiling, default max_tokens — plus a new `max_inbound_concurrent` (0 = unlimited; >0
+  installs an outermost concurrency-limit layer). Extended `observability`, `metrics`, `governance`,
+  `health`, and `routing` blocks expose their own tunables. Every limit defaults to its current value,
+  so behavior is unchanged unless set.
+- **Cross-protocol grounding/web-search citations (streaming and non-stream).** A neutral `IrCitation`
+  (with a `raw` escape hatch for byte-exact Anthropic re-emit) carries Anthropic and Gemini citations
+  through the IR, including a streamed `citations_delta`, so citations survive a cross-protocol hop
+  instead of being silently dropped. Anthropic same-protocol output is unchanged (raw verbatim).
+- **`observability.emit_server_timing`** (default `true`): set `false` to suppress the
+  `Server-Timing: busbar` response header.
+
+### Changed
+
+- **Same-protocol traffic now flows through the IR path, like cross-protocol — one code path.** A
+  serialize short-circuit keeps it byte-exact and just as cheap: when the egress protocol equals the
+  ingress protocol and the value was not mutated, the original bytes are re-emitted verbatim instead
+  of re-serializing the IR. Net effect is a *fidelity improvement* — five of six protocols now forward
+  same-protocol requests byte-for-byte (the prior path always re-serialized, which reorders JSON keys).
+- **Billing is metered from the IR's usage on every path** (streaming and non-stream, same- and
+  cross-protocol), replacing a second usage parser that byte-scanned the response. Same numbers for
+  the supported cases, with the fixes below.
+- **Config keys renamed** for consistency (old names still accepted via alias; prefer the new ones):
+  `window_s`→`window_secs`, breaker `trip.n`→`consecutive_n`, `failover.cap`→`max_hops`,
+  `failover.deadline_secs`→`timeout_secs`.
+- **Closed-set config fields are now enums** (`auth.mode`, `affinity.mode`, per-provider `auth`):
+  invalid values are rejected at parse with a clear error. Every value accepted by rc.6 still parses.
+- **Admin API error responses** now use the same `{"error":{"message","type"}}` envelope as the proxy
+  endpoints (was `{"error":"<string>"}`). **Breaking for scripts parsing the old admin error shape.**
+
+### Fixed
+
+- **Provider cache tokens are now billed.** Cache-heavy Anthropic and Bedrock requests previously
+  under-billed because their additive `cache_read`/`cache_creation` tokens were not counted. IrUsage is
+  normalized (uncached input + additive cache) so billing counts all consumed tokens once, with no
+  double-count for OpenAI/Gemini/Responses (whose wire already folds cache into the input total).
+  **Operator note: cache-hit requests on Anthropic/Bedrock now bill more than in rc.6.**
+- **Responses streaming usage is now metered.** Streamed Responses requests reported zero tokens (the
+  old scanner read a top-level `usage`; Responses nests it under `response.usage`).
+- **`image_s3` leak (HIGH):** a Bedrock S3-source image translated to any other protocol leaked the
+  `s3Location` as a corrupt base64/`inlineData` payload; foreign writers now drop+warn before emit.
+- **Redacted-reasoning sentinel leak (HIGH):** the internal `__busbar_*` redacted-reasoning signature
+  no longer leaks onto Anthropic/Gemini/Responses wires, and a client can no longer inject it.
+- **Multi-citation streaming SSE framing (HIGH):** a Gemini chunk batching N citation sources is now
+  fanned out into N single-object Anthropic `citations_delta` events instead of one JSON-array event
+  that crashes native Anthropic SDKs.
+- **Same-protocol Bedrock malformed-prelude:** a corrupt eventstream prelude no longer splices raw
+  bytes into the client stream ahead of the native exception frame.
+- **Admin key endpoints** no longer surface a request-body fragment (which carries the key secret) in
+  a parse error, and the budget-period 400 no longer echoes the caller's value.
+- **Webhook delivery:** `observability.max_inflight_webhook_deliveries` is floored at 1 (a 0-permit
+  semaphore silently dropped every delivery).
+
+### Removed
+
+- **`auth.token`** (the deprecated single-token field) is removed. `auth:`, `governance:`, and
+  `security:` now reject unknown keys, so a stale `token:` or a typo'd security key is a loud startup
+  error instead of a silent default. (See migration notes.)
+- Internal: the duplicate usage byte-scanner, and the last `#[deprecated]` / dead-code shims — the 1.0
+  tree carries none.
+
+### Security
+
+- `#[serde(deny_unknown_fields)]` on `AuthCfg`, `GovernanceCfg`, `SecurityCfg`: a typo in a
+  security-relevant key (an auth token, the admin token, the SSRF override) can no longer be silently
+  ignored. The legacy-token removal fails closed (refuse to boot), never to an open relay.
+- Routing-policy webhook response bodies parse through the depth-guarded JSON path.
+
+### Migration (rc.6 → rc.7)
+
+- If `auth.token:` was your only credential, move its value into `auth.client_tokens: [...]` — the
+  gateway will otherwise refuse to boot (`unknown field 'token'`).
+- Fix any typo'd/stale key under `auth:`, `governance:`, or `security:` (now a hard boot error).
+- Prefer the renamed breaker/failover keys; the old names still work but don't set both spellings.
+- Update any script that parses the admin API error shape to `{"error":{"message","type"}}`.
+- Cache-hit requests on Anthropic/Bedrock backends will accrue more token spend (now counted).
+- No change for a default config: enum/casing acceptance, `default_max_tokens` precedence, and the
+  `Server-Timing` header (still on) are unchanged.
+
 ## [1.0.0-rc.6] — 2026-06-19
 
 Performance, observability, a security fix, and cross-protocol losslessness completeness. Busbar now

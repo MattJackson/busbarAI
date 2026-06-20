@@ -107,4 +107,4 @@ same pattern Bedrock established with SigV4:
 - Soak / load testing.
 - Security review (virtual-key issuance, budget accounting, Bedrock SigV4).
 
-APIs and config are stable at 1.0.0-rc.2. Changes before 1.0.0 will be limited to compatibility fixes discovered during RC validation.
+APIs and config are stable at 1.0.0-rc.7. Changes before 1.0.0 will be limited to compatibility fixes discovered during RC validation.

@@ -34,6 +34,7 @@ Both files support `${VAR}` environment interpolation before YAML is parsed. A m
     - [`on_exhausted`](#on_exhausted)
     - [`affinity`](#affinity)
     - [Context-length failover](#context-length-failover)
+  - [`limits`](#limits)
   - [`observability`](#observability)
   - [`governance`](#governance)
   - [`security`](#security)
@@ -570,6 +571,37 @@ When a member returns a context-length error, busbar:
 3. Records no breaker penalty against the smaller lane.
 
 Members without `context_max` set are always eligible for context-length failover (their capacity is unknown; Busbar treats unknown as potentially unlimited).
+
+---
+
+### `limits`
+
+Optional. Exposes the 17 previously-hardcoded operational limits so operators can tune them without rebuilding. All fields default to the historical hard-coded values, so omitting this block is a no-op.
+
+```yaml
+limits:
+  max_inbound_concurrent: 0       # 0 = unlimited; > 0 adds a global concurrency cap
+  request_body_max_bytes: 33554432  # 32 MiB
+  upstream_timeout_secs: 120
+  tls_handshake_timeout_secs: 10
+  idle_connections_per_host: 64
+  hard_down_cooldown_secs: 1800   # 30 min
+  upstream_error_body_cap_bytes: 65536
+  retry_after_ceiling_secs: 86400 # 24 h
+  default_max_tokens: 4096
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `max_inbound_concurrent` | integer | `0` | Global inbound concurrency cap. `0` = unlimited (no cap layer installed). Any positive value installs an outermost concurrency-limit middleware before routing. |
+| `request_body_max_bytes` | integer | `33554432` | Maximum inbound request body size (bytes). Exceeding this returns a protocol-native 413. |
+| `upstream_timeout_secs` | integer | `120` | Per-upstream-request wall-clock timeout. Applies to both the connect and the full response. |
+| `tls_handshake_timeout_secs` | integer | `10` | Wall-clock cap on each inbound TLS handshake; prevents slowloris / handshake-flood. Ignored when `tls:` is absent. |
+| `idle_connections_per_host` | integer | `64` | HTTP connection pool idle connection limit per upstream host. |
+| `hard_down_cooldown_secs` | integer | `1800` | Sticky cooldown for `auth`/`billing` breaker dispositions (hard-down). Recovering these lanes requires a successful health probe. |
+| `upstream_error_body_cap_bytes` | integer | `65536` | Maximum bytes buffered from a non-2xx upstream response body for error classification. |
+| `retry_after_ceiling_secs` | integer | `86400` | Maximum value honored from an upstream `Retry-After` header (to prevent overflow). |
+| `default_max_tokens` | integer | `4096` | Gateway-wide default injected on cross-protocol hops to Anthropic when the caller omitted `max_tokens`. Overridden by a per-model `default_max_tokens` when set. |
 
 ---
 

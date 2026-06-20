@@ -373,14 +373,18 @@ These fields survive a cross-protocol hop because they are first-class in the IR
 | `top_p`, `top_k` | `IrRequest.top_p`, `IrRequest.top_k` |
 | `stop` sequences | `IrRequest.stop: Vec<String>` |
 | `stream` flag | `IrRequest.stream` |
+| `frequency_penalty`, `presence_penalty`, `seed` | First-class IR fields as of rc.6; survive cross-protocol hops (dropped with `warn!` where the target protocol has no analog) |
+| Grounding/web-search citations | `IrCitation` (with `raw` escape hatch for byte-exact Anthropic re-emit); streaming `citations_delta` included — as of rc.7 |
 | Serving model name | `IrResponse.model` (so pooled cross-protocol responses report which model served) |
 | Token usage | `IrUsage` (input/output tokens, with input-usage backfill on streams that only report it at message start) |
+
+**Usage-token cross-protocol nuance (Anthropic/Bedrock → OpenAI/Gemini/Responses):** Anthropic and Bedrock responses carry a separate `cache_creation` token bucket that has no equivalent field in the OpenAI, Gemini, or Responses wire shapes. When such a response is translated to one of those protocols, the reported `prompt_tokens` / `input_tokens` total *includes* cache-creation tokens (so billing is complete), but the `cached_tokens` sub-field reflects only cache-read tokens — because the target wire shape has no cache-creation bucket to place them in. Billing is unaffected (all consumed tokens are counted); only the sub-field breakdown differs.
 
 ### Lost on a cross-protocol hop
 
 Fields that are not modeled in the IR do not survive a translated hop — they live only in the `extra` passthrough map, which is cleared at the cross-protocol seam. Examples:
 
-- **OpenAI-only:** `logprobs`, `n` (multiple completions), `frequency_penalty`, `presence_penalty`, `logit_bias`, `seed`. The source comment in `proto/openai.rs` confirms these flow through `extra` verbatim (so a same-protocol OpenAI passthrough reaches the upstream unchanged) and are therefore stripped on a cross-protocol hop.
+- **OpenAI-only (no IR analog):** `logprobs`, `n` (multiple completions), `logit_bias`. These flow through `extra` verbatim on same-protocol OpenAI passthrough and are stripped on a cross-protocol hop.
 - **Other source-protocol-specific fields** that no IR field models are likewise stored in `extra` and dropped at the seam.
 - **Protocol-specific identifiers:** The upstream's `id` field is stripped and replaced with an ingress-native minted ID on cross-protocol responses (so Anthropic `msg_...` IDs don't appear in OpenAI responses).
 

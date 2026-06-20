@@ -9,13 +9,13 @@
 [![CI](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/MattJackson/busbarAI?include_prereleases)](https://github.com/MattJackson/busbarAI/releases)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
-![Status](https://img.shields.io/badge/status-1.0.0--rc.5-blue)
+![Status](https://img.shields.io/badge/status-1.0.0--rc.7-blue)
 
 📖 **Docs:** [getbusbar.com](https://getbusbar.com)  
 ⚡ **Install:** `curl -fsSL https://getbusbar.com/install.sh | sh`  
 🤖 **Agent-readable:** [getbusbar.com/llms.txt](https://getbusbar.com/llms.txt)
 
-Busbar sits between your application and your LLM providers. Point any SDK — OpenAI, Anthropic, Gemini, Bedrock, Cohere — at one URL, and it routes, translates, and **keeps serving through provider failures**. It's a different class of tool than a proxy with a long model list.
+Busbar sits between your application and your LLM providers. Point any SDK — OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses — at one URL, and it routes, translates, and **keeps serving through provider failures**. It's a different class of tool than a proxy with a long model list.
 
 > **You define a model name and its backends. Busbar accepts _any_ input protocol — OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses — and routes and translates accordingly.** One model name, reachable by every client; you choose what runs behind it.
 
@@ -27,7 +27,7 @@ Busbar sits between your application and your LLM providers. Point any SDK — O
 
 A single static Rust binary — no Python sidecar, no interpreter, no GC in the request path. Linux, macOS, Windows (Intel and ARM). Your keys, your network, your data path.
 
-> **Status: 1.0.0-rc.5** — feature-complete, API-stable, hardened across a multi-round security and correctness audit. AGPL-3.0.
+> **Status: 1.0.0-rc.7** — feature-complete, API-stable, hardened across a multi-round security and correctness audit. AGPL-3.0.
 
 ---
 
