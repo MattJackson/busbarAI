@@ -230,19 +230,20 @@ pub(crate) fn refresh_scrape_gauges(app: &App) {
         };
         // Cap per-key gauge emission. Above this many keys, emitting one series per key per scrape
         // (×3 gauges) would blow up Prometheus cardinality AND walk the store once per key on every
-        // scrape. Bound BOTH by emitting at most `KEY_GAUGE_LIMIT` keys; warn when truncating so the
+        // scrape. Bound BOTH by emitting at most `key_gauge_limit` keys; warn when truncating so the
         // condition is visible. Generous default — normal deployments never reach it. (A configurable
         // limit / top-N-by-spend selection is a v1.x refinement.)
-        const KEY_GAUGE_LIMIT: usize = 2000;
-        if keys.len() > KEY_GAUGE_LIMIT {
+        // Operator-tunable via `metrics.key_gauge_limit` (default 2000).
+        let key_gauge_limit = crate::limits::key_gauge_limit();
+        if keys.len() > key_gauge_limit {
             tracing::warn!(
                 key_count = keys.len(),
-                limit = KEY_GAUGE_LIMIT,
+                limit = key_gauge_limit,
                 "metrics scrape: virtual-key count exceeds per-key gauge limit; emitting gauges for \
                  only the first `limit` keys to bound cardinality and scrape-path DB load",
             );
         }
-        for key in keys.iter().take(KEY_GAUGE_LIMIT) {
+        for key in keys.iter().take(key_gauge_limit) {
             // `usage_for` queries the SQLite store for the key's current-window counters.
             let usage = match gov.usage_for(&key.id, now) {
                 Ok(Some(u)) => u,
@@ -539,12 +540,12 @@ mod tests {
         );
     }
 
-    /// `refresh_scrape_gauges` must emit at most `KEY_GAUGE_LIMIT` (2000) distinct per-key series
+    /// `refresh_scrape_gauges` must emit at most `key_gauge_limit` (2000) distinct per-key series
     /// even when the governance store holds more than that many virtual keys.
     ///
-    /// The truncation logic (`keys.iter().take(KEY_GAUGE_LIMIT)`) is exercised by creating
-    /// KEY_GAUGE_LIMIT + 1 keys, running a scrape, and asserting the count of distinct `key=`
-    /// label values in the `busbar_key_spend_cents` lines is ≤ KEY_GAUGE_LIMIT.
+    /// The truncation logic (`keys.iter().take(key_gauge_limit)`) is exercised by creating
+    /// key_gauge_limit + 1 keys, running a scrape, and asserting the count of distinct `key=`
+    /// label values in the `busbar_key_spend_cents` lines is ≤ key_gauge_limit.
     ///
     /// Creating 2001 rows in an in-memory SQLite instance is fast (< 50 ms on any modern machine);
     /// using `put_key` directly on the store bypasses the `GovState` cache and is the simplest
@@ -552,9 +553,9 @@ mod tests {
     #[test]
     fn test_key_gauge_limit_truncation() {
         init();
-        // KEY_GAUGE_LIMIT is 2000 (a private const in `refresh_scrape_gauges`). We use the same
-        // value here to keep the test self-consistent.
-        const LIMIT: usize = 2000;
+        // The default key-gauge limit is 2000 (no limits installed in this test ⇒ the historical
+        // default). We use the same value here to keep the test self-consistent.
+        const LIMIT: usize = crate::config::DEFAULT_KEY_GAUGE_LIMIT;
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
 
         // Insert LIMIT + 1 keys so the truncation branch fires.
@@ -604,7 +605,7 @@ mod tests {
 
         assert!(
             spend_series_count <= LIMIT,
-            "refresh_scrape_gauges must emit at most KEY_GAUGE_LIMIT ({LIMIT}) per-key series; got {spend_series_count}"
+            "refresh_scrape_gauges must emit at most key_gauge_limit ({LIMIT}) per-key series; got {spend_series_count}"
         );
         // Also assert we got at least 1 series (sanity — something was emitted).
         assert!(

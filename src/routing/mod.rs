@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// time out. This belt-and-suspenders guard pairs with the desugar-site stamp in `config.rs`.
 fn policy_timeout(timeout_ms: u64) -> std::time::Duration {
     let ms = if timeout_ms == 0 {
-        crate::config::DEFAULT_POLICY_TIMEOUT_MS
+        crate::limits::default_policy_timeout_ms()
     } else {
         timeout_ms
     };
@@ -276,7 +276,7 @@ fn resolve_script(cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
             timeout: policy_timeout(
                 policy_cfg
                     .map(|p| p.timeout_ms)
-                    .unwrap_or(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
+                    .unwrap_or(crate::limits::default_policy_timeout_ms()),
             ),
         }),
         Err(e) => {
@@ -459,7 +459,7 @@ mod tests {
                 Some(ResolvedPolicy::Policy { timeout, .. }) => {
                     assert_eq!(
                         timeout,
-                        std::time::Duration::from_millis(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
+                        std::time::Duration::from_millis(crate::limits::default_policy_timeout_ms()),
                         "shorthand `route: {name}` must resolve to a 150ms deadline, not 0ms"
                     );
                 }
@@ -477,7 +477,7 @@ mod tests {
     fn policy_timeout_treats_zero_as_default() {
         assert_eq!(
             policy_timeout(0),
-            std::time::Duration::from_millis(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
+            std::time::Duration::from_millis(crate::limits::default_policy_timeout_ms()),
             "0ms must be coerced to the default policy timeout"
         );
         assert_eq!(

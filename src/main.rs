@@ -44,6 +44,7 @@ mod handlers;
 mod health;
 mod ir;
 mod json;
+mod limits;
 mod metrics;
 mod net_guard;
 mod observability;
@@ -69,18 +70,11 @@ use proto::ProtocolRegistry;
 use state::{App, Lane, WeightedLane};
 use store::{InMemoryStore, LaneData};
 
-/// Per-request timeout for upstream calls. Generous because it must cover long streamed
-/// completions, not just time-to-first-byte.
-const UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 300;
-/// Max idle keep-alive connections the shared HTTP client pools per upstream host.
-const POOL_MAX_IDLE_PER_HOST: usize = 64;
-/// Maximum accepted request body size. Caps memory per request (the body is buffered before
-/// handling) so a hostile/oversized payload can't exhaust memory — generous enough for long
-/// histories and multimodal/base64 image content, but bounded. (axum's default is only 2 MiB.)
-/// NOTE: `forward::MAX_TRANSLATED_BODY_BYTES` is deliberately kept equal to this (a completion the
-/// gateway accepts inbound must also be buffer-translatable on egress) — if you change this, move
-/// that one in lockstep or large upstream responses will 500 on the cross-protocol path.
-const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+// The upstream-request timeout, pool-idle, and request-body caps that used to live here as `const`s
+// are now operator-tunable (`limits.upstream_request_timeout_secs` / `pool_max_idle_per_host` /
+// `request_body_max_bytes`), each defaulting to its historical value at the config layer. They are
+// threaded from `cfg.limits` into the client builder and router below; the egress translate-body cap
+// is COUPLED to `request_body_max_bytes` via `crate::limits::translate_body_max_bytes`.
 
 /// Handle CLI flags before any environment or file access, so they work without a configured
 /// deployment. Returns `Some(exit_code)` when the process should exit (after printing), `None` to
@@ -294,6 +288,12 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // Install the resolved operational limits process-wide BEFORE any subsystem reads them. The
+    // values threaded explicitly (client/store/router/TLS) read `cfg.limits` directly; the deep
+    // call-stack sites (forward translate-body cap, metrics gauge limit, observability webhook
+    // timeout, governance sqlite/sweep, health probe fallbacks, routing policy timeout) read these.
+    limits::install(&cfg.limits);
+
     // Metadata-SSRF protection status (discoverability). When the nuclear `allow_all_metadata` is set
     // the guard is OFF — that is a security-relevant degradation, so WARN. Otherwise report the count
     // of blocked hosts (hardcoded denylist ∪ security.blocked_metadata_hosts) and point at the CLI
@@ -471,7 +471,13 @@ async fn main() {
     }
 
     let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg));
-    let store = Arc::new(InMemoryStore::new(lanes_data.clone()));
+    // Thread the operator-configured hard-down cooldown + honored-Retry-After ceiling into the store
+    // (both default to their historical const at the config layer).
+    let store = Arc::new(InMemoryStore::new_with_limits(
+        lanes_data.clone(),
+        cfg.limits.hard_down_cooldown_secs,
+        cfg.limits.max_honored_retry_after_secs,
+    ));
 
     // Global default failover config — the fallback for pools that don't set their own. A fixed
     // default (not "whatever pool HashMap iteration happens to yield first", which was
@@ -490,8 +496,10 @@ async fn main() {
     // webhook routing transport can reuse it (a clone shares the connection pool + the `redirect:none`
     // SSRF posture); the same client is then moved into `App` below.
     let upstream_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(UPSTREAM_REQUEST_TIMEOUT_SECS))
-        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+        .timeout(Duration::from_secs(
+            cfg.limits.upstream_request_timeout_secs,
+        ))
+        .pool_max_idle_per_host(cfg.limits.pool_max_idle_per_host)
         // SSRF guard: do NOT follow redirects. The startup SSRF blocklist (config_validate.rs
         // ssrf_blocked_host) only vets the configured base_url; it does not see redirect targets.
         // reqwest's default policy follows up to 10 redirects, so a compromised/malicious upstream
@@ -601,6 +609,7 @@ async fn main() {
         fallback_pools,
         on_exhausted_cfgs,
         governance,
+        default_max_tokens: cfg.limits.default_max_tokens,
     });
 
     // configure the request-log webhook (reusing the pooled client). No-op if unset.
@@ -613,7 +622,14 @@ async fn main() {
     // `mode: none` / has no `health:` block.
     health::spawn_probers(app.clone());
 
-    let router = build_router(app);
+    // Build the router with the operator-configured ingress body cap + optional inbound-concurrency
+    // layer (0 = unlimited / no layer, today's default). `cfg` is moved field-by-field below, so read
+    // the two values first.
+    let router = build_router_with_limits(
+        app,
+        cfg.limits.request_body_max_bytes,
+        cfg.limits.max_inbound_concurrent,
+    );
 
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
@@ -884,10 +900,33 @@ async fn reshape_oversized_413(
     )
 }
 
-/// Build the busbar HTTP router for a given `App` state. Factored out of `main` so the full
-/// route table + auth middleware can be exercised end-to-end in tests.
+/// Build the busbar HTTP router for a given `App` state with default limits. Factored out so the
+/// full route table + auth middleware can be exercised end-to-end in tests; production (`run`) calls
+/// [`build_router_with_limits`] with the operator-configured values, so this convenience wrapper is
+/// reached only from the test harness.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
-    Router::new()
+    // Convenience builder for tests / callers without an explicit limits handle: the historical 32
+    // MiB body cap (via the installed `limits`, falling back to the default when uninstalled) and NO
+    // inbound-concurrency layer (`0` = unlimited) — byte-for-byte today's behavior. Production goes
+    // through `build_router_with_limits` with the operator-configured values.
+    build_router_with_limits(
+        app,
+        limits::translate_body_max_bytes(),
+        crate::config::DEFAULT_MAX_INBOUND_CONCURRENT,
+    )
+}
+
+/// Router builder with EXPLICIT limits, so a test can assert the body-size and inbound-concurrency
+/// wiring without touching the process-wide install. `max_inbound_concurrent == 0` ⇒ NO concurrency
+/// layer is added (a true no-op, today's behavior); `> 0` wraps the whole router in a tower
+/// `GlobalConcurrencyLimitLayer` as the OUTERMOST layer.
+pub(crate) fn build_router_with_limits(
+    app: std::sync::Arc<state::App>,
+    request_body_max_bytes: usize,
+    max_inbound_concurrent: usize,
+) -> Router {
+    let router = Router::new()
         .route("/stats", get(handlers::stats))
         .route("/healthz", get(handlers::healthz))
         .route("/metrics", get(metrics::handler))
@@ -930,8 +969,11 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
             app.clone(),
             auth::auth_middleware,
         ))
-        // Cap request body size (buffered before the handler) to bound per-request memory.
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        // Cap request body size (buffered before the handler) to bound per-request memory. Driven by
+        // `limits.request_body_max_bytes` (default 32 MiB); COUPLED with the egress translate-body cap
+        // (`limits::translate_body_max_bytes`) — both read the SAME knob so an accepted request is
+        // always buffer-translatable on the cross-protocol path.
+        .layer(axum::extract::DefaultBodyLimit::max(request_body_max_bytes))
         // Outermost: reshape the body-limit layer's bare-text 413 into a protocol-native JSON
         // envelope. Must wrap the `DefaultBodyLimit` layer above, so it is applied LAST (the last
         // `.layer()` is the outermost on the response path) and therefore sees that layer's 413.
@@ -939,13 +981,110 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
         // Outermost: stamp the `Server-Timing: busbar;dur=<ms>` gateway-overhead header on every
         // response (times the full inner stack). Must be the LAST `.layer()` so it wraps everything.
         .layer(axum::middleware::from_fn(server_timing))
-        .with_state(app)
+        .with_state(app);
+
+    apply_inbound_concurrency_limit(router, max_inbound_concurrent)
+}
+
+/// OUTERMOST inbound-concurrency cap. `max_inbound_concurrent == 0` (the default) returns the router
+/// UNCHANGED — NO layer is added, a true no-op so nothing changes unless an operator opts in. When
+/// `> 0`, a tower `GlobalConcurrencyLimitLayer` (ONE shared semaphore across ALL requests) wraps the
+/// whole router: requests beyond the cap queue for a permit rather than overrunning. Applied as the
+/// last `.layer()` so it is outermost (it must admission-control before any inner work, including body
+/// buffering). Factored out so the add-only-when-`>0` rule is unit-testable in isolation.
+fn apply_inbound_concurrency_limit(router: Router, max_inbound_concurrent: usize) -> Router {
+    if max_inbound_concurrent > 0 {
+        router.layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+            max_inbound_concurrent,
+        ))
+    } else {
+        router
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{PoolCfg, PoolMember};
+
+    /// The inbound-concurrency cap is added as a layer ONLY when `max_inbound_concurrent > 0`. This
+    /// drives `apply_inbound_concurrency_limit` over a minimal router whose handler PARKS on a barrier
+    /// (held until we release it), so two requests are genuinely concurrent. With cap = 1 the second
+    /// request cannot complete until the first releases its permit (the layer is present); with cap =
+    /// 0 both complete immediately (NO layer — today's behavior).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_inbound_concurrency_layer_added_only_when_positive() {
+        use std::sync::Arc;
+        use tokio::sync::{Barrier, Notify};
+
+        async fn run_router(router: Router) -> std::time::Duration {
+            // Serve on an ephemeral port; fire two concurrent GETs to the parking handler.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            let url = format!("http://{addr}/park");
+            let client = reqwest::Client::new();
+            let start = std::time::Instant::now();
+            let (a, b) = tokio::join!(client.get(&url).send(), client.get(&url).send());
+            a.unwrap();
+            b.unwrap();
+            let elapsed = start.elapsed();
+            server.abort();
+            elapsed
+        }
+
+        // Handler that signals arrival then waits on a barrier; the barrier of size 2 only releases
+        // once BOTH requests have arrived — so if a layer serializes them to 1-at-a-time, the second
+        // never arrives, the barrier never releases, and the handler instead falls back to a short
+        // timeout. We detect the cap via that timeout path (capped run takes the timeout; uncapped run
+        // releases immediately).
+        fn make_router(barrier: Arc<Barrier>, _gate: Arc<Notify>) -> Router {
+            Router::new().route(
+                "/park",
+                axum::routing::get(move || {
+                    let barrier = barrier.clone();
+                    async move {
+                        // If both requests run concurrently the barrier releases at once. If a cap
+                        // serializes them, this wait blocks until the per-request timeout fires.
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_millis(300),
+                            barrier.wait(),
+                        )
+                        .await;
+                        "ok"
+                    }
+                }),
+            )
+        }
+
+        // Uncapped (cap = 0): NO layer, both requests reach the barrier concurrently → fast release.
+        let uncapped = apply_inbound_concurrency_limit(
+            make_router(Arc::new(Barrier::new(2)), Arc::new(Notify::new())),
+            0,
+        );
+        let uncapped_elapsed = run_router(uncapped).await;
+
+        // Capped (cap = 1): the layer serializes admission, so the two requests can NOT both reach the
+        // barrier at once → the first handler waits out its 300ms timeout before the second is admitted.
+        let capped = apply_inbound_concurrency_limit(
+            make_router(Arc::new(Barrier::new(2)), Arc::new(Notify::new())),
+            1,
+        );
+        let capped_elapsed = run_router(capped).await;
+
+        assert!(
+            uncapped_elapsed < std::time::Duration::from_millis(250),
+            "cap=0 must add NO layer: both requests reach the barrier concurrently and release fast, \
+             got {uncapped_elapsed:?}"
+        );
+        assert!(
+            capped_elapsed >= std::time::Duration::from_millis(300),
+            "cap=1 must serialize admission: the first request waits out its timeout before the \
+             second is admitted, got {capped_elapsed:?}"
+        );
+    }
 
     fn pool(members: Vec<PoolMember>) -> PoolCfg {
         PoolCfg {

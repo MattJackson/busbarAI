@@ -28,16 +28,30 @@ use tokio::sync::Semaphore;
 static WEBHOOK_URL: OnceLock<Arc<String>> = OnceLock::new();
 static CLIENT: OnceLock<Client> = OnceLock::new();
 
-/// Cap on in-flight request-log deliveries. The webhook is an explicitly best-effort telemetry
-/// sink: a slow or unreachable endpoint must NOT let delivery tasks (each holding a connection
-/// attempt + the serialized payload) accumulate up to `RPS * timeout` and compete with serving for
-/// memory, file descriptors, and connection-pool slots. When the cap is reached we drop the log.
-const MAX_INFLIGHT_WEBHOOK_DELIVERIES: usize = 64;
-/// Per-delivery timeout for the webhook POST, independent of the (much larger) upstream request
-/// timeout the shared client is built with — telemetry must give up quickly.
-const WEBHOOK_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
+// Cap on in-flight request-log deliveries. The webhook is an explicitly best-effort telemetry sink:
+// a slow or unreachable endpoint must NOT let delivery tasks (each holding a connection attempt + the
+// serialized payload) accumulate up to `RPS * timeout` and compete with serving for memory, file
+// descriptors, and connection-pool slots. When the cap is reached we drop the log. Operator-tunable
+// via `observability.max_inflight_webhook_deliveries` (default 64).
 
-static WEBHOOK_INFLIGHT: Semaphore = Semaphore::const_new(MAX_INFLIGHT_WEBHOOK_DELIVERIES);
+/// The in-flight delivery limiter, sized ONCE from config when the webhook is configured. A
+/// `OnceLock<Semaphore>` (not a compile-time `const_new`) so its permit count can be the operator's
+/// `observability.max_inflight_webhook_deliveries`. `webhook_inflight()` initializes it to the
+/// installed limit on first touch and falls back to the historical default (64) otherwise, preserving
+/// the `'static`-permit RAII design (`InflightGuard`).
+static WEBHOOK_INFLIGHT: OnceLock<Semaphore> = OnceLock::new();
+
+fn webhook_inflight() -> &'static Semaphore {
+    WEBHOOK_INFLIGHT
+        .get_or_init(|| Semaphore::new(crate::limits::max_inflight_webhook_deliveries()))
+}
+
+/// Per-delivery timeout for the webhook POST, independent of the (much larger) upstream request
+/// timeout the shared client is built with — telemetry must give up quickly. Operator-tunable via
+/// `observability.webhook_delivery_timeout_secs` (default 2).
+fn webhook_delivery_timeout() -> Duration {
+    Duration::from_secs(crate::limits::webhook_delivery_timeout_secs())
+}
 
 /// RAII release of one `WEBHOOK_INFLIGHT` slot. We acquire the permit synchronously WITHOUT awaiting
 /// (`try_acquire`) and `forget()` it so the slot is held across the spawned delivery without
@@ -50,7 +64,7 @@ struct InflightGuard;
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        WEBHOOK_INFLIGHT.add_permits(1);
+        webhook_inflight().add_permits(1);
     }
 }
 
@@ -433,7 +447,7 @@ pub(crate) fn fire_request_log(payload: Value) {
     };
     // Acquire a delivery slot WITHOUT awaiting. If the cap is reached the webhook is backed up;
     // drop this log rather than blocking the caller or accumulating an unbounded task backlog.
-    let Ok(permit) = WEBHOOK_INFLIGHT.try_acquire() else {
+    let Ok(permit) = webhook_inflight().try_acquire() else {
         return;
     };
     // The permit borrows the 'static semaphore; forget it and hand the slot to an `InflightGuard`
@@ -457,7 +471,7 @@ pub(crate) fn fire_request_log(payload: Value) {
                 crate::forward::APPLICATION_JSON,
             )
             .body(body)
-            .timeout(WEBHOOK_DELIVERY_TIMEOUT)
+            .timeout(webhook_delivery_timeout())
             .send()
             .await;
     });
@@ -1446,17 +1460,17 @@ mod tests {
     async fn test_inflight_guard_releases_slot_on_drop() {
         // The RAII guard returns its semaphore slot on Drop. Mirror the production acquire/forget
         // pattern, then drop the guard and confirm the slot is reusable (no leak).
-        let before = WEBHOOK_INFLIGHT.available_permits();
+        let before = webhook_inflight().available_permits();
         {
-            let permit = WEBHOOK_INFLIGHT
+            let permit = webhook_inflight()
                 .try_acquire()
                 .expect("a slot should be free");
             permit.forget();
-            assert_eq!(WEBHOOK_INFLIGHT.available_permits(), before - 1);
+            assert_eq!(webhook_inflight().available_permits(), before - 1);
             let _guard = InflightGuard; // drops at end of scope -> add_permits(1)
         }
         assert_eq!(
-            WEBHOOK_INFLIGHT.available_permits(),
+            webhook_inflight().available_permits(),
             before,
             "InflightGuard::drop must return the slot even though the permit was forgotten"
         );

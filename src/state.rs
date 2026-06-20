@@ -101,6 +101,10 @@ pub(crate) struct App {
     pub(crate) on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
     /// governance runtime (virtual keys + budgets/limits store). `None` = disabled.
     pub(crate) governance: Option<std::sync::Arc<crate::governance::GovState>>,
+    /// Global fallback for the translation-injected `max_tokens` (`limits.default_max_tokens`), used
+    /// at the cross-protocol seam when a lane has no per-lane `default_max_tokens`. Defaults to
+    /// `proto::DEFAULT_MAX_TOKENS` (4096). Read by `forward::apply_required_max_tokens`.
+    pub(crate) default_max_tokens: u32,
 }
 
 impl App {

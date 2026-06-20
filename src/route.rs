@@ -1350,6 +1350,7 @@ mod tests {
             fallback_pools: std::collections::HashMap::new(),
             on_exhausted_cfgs: std::collections::HashMap::new(),
             governance: None,
+            default_max_tokens: crate::config::DEFAULT_DEFAULT_MAX_TOKENS,
         })
     }
 

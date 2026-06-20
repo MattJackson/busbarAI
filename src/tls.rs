@@ -44,7 +44,12 @@ use std::time::Duration;
 /// connects then stalls (sends nothing / dribbles handshake bytes) must not park a task + FDs
 /// indefinitely — this caps the pre-auth slowloris / handshake-flood surface. The cost is incurred
 /// BEFORE mTLS client-cert verification, so this guards the unauthenticated edge.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Operator-tunable via `limits.tls_handshake_timeout_secs` (default 10s), read through the
+/// process-wide `crate::limits` install. A function (not a `const`) so the configured value is read
+/// per accepted connection; falls back to the historical 10s when limits aren't installed.
+fn handshake_timeout() -> Duration {
+    Duration::from_secs(crate::limits::tls_handshake_timeout_secs())
+}
 
 use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -232,7 +237,8 @@ async fn serve_one(
 
     // Bound the handshake (see HANDSHAKE_TIMEOUT): on elapse the `accept` future is dropped, which
     // closes the half-open connection and frees the task + FDs. Cancel-safe — no state escapes.
-    let tls_stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+    let tls_stream = match tokio::time::timeout(handshake_timeout(), acceptor.accept(stream)).await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             // Handshake failure (bad/missing client cert under mTLS, protocol mismatch, client gone).

@@ -699,6 +699,7 @@ impl TestApp {
             fallback_pools: self.fallback_pools,
             on_exhausted_cfgs: self.on_exhausted_cfgs,
             governance: self.governance,
+            default_max_tokens: crate::config::DEFAULT_DEFAULT_MAX_TOKENS,
         })
     }
 }
@@ -3706,6 +3707,7 @@ mod tests {
                     blocked_metadata_hosts: Vec::new(),
                     allow_metadata_hosts: Vec::new(),
                     allow_all_metadata: false,
+                    limits: crate::config::LimitsResolved::default(),
                 }
             };
 

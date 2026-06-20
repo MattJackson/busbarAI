@@ -32,10 +32,10 @@ use crate::store::{now, BreakerCfg};
 /// heap allocation just because a probe failed. 64 KiB is far more than any error envelope needs.
 const PROBE_ERROR_BODY_CAP: usize = 64 * 1024;
 
-/// Default seconds between probes when a `health:` block omits `interval_secs`.
-const DEFAULT_PROBE_INTERVAL_SECS: u64 = 30;
-/// Default per-probe request timeout when a `health:` block omits `timeout_secs`.
-const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 5;
+// Default probe interval / timeout (the PROCESS-WIDE fallback used when a per-lane `health:` block
+// omits `interval_secs` / `timeout_secs`). Operator-tunable via `health.default_probe_interval_secs`
+// / `health.default_probe_timeout_secs` (defaults 30 / 5), read through `crate::limits`. The per-lane
+// override still wins (see `unwrap_or` below).
 
 /// Spawn one background prober task per lane that has a probing mode configured. A no-op for lanes
 /// with `mode: none` (or no `health:` block). Tasks live for the process lifetime.
@@ -49,11 +49,14 @@ pub(crate) fn spawn_probers(app: Arc<App>) {
         }
         let interval = Duration::from_secs(
             h.interval_secs
-                .unwrap_or(DEFAULT_PROBE_INTERVAL_SECS)
+                .unwrap_or_else(crate::limits::default_probe_interval_secs)
                 .max(1),
         );
-        let timeout =
-            Duration::from_secs(h.timeout_secs.unwrap_or(DEFAULT_PROBE_TIMEOUT_SECS).max(1));
+        let timeout = Duration::from_secs(
+            h.timeout_secs
+                .unwrap_or_else(crate::limits::default_probe_timeout_secs)
+                .max(1),
+        );
         let mode = h.mode;
         let app = app.clone();
         let model = app.lanes[i].model.clone();

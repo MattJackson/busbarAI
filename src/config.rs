@@ -113,6 +113,12 @@ pub(crate) struct RootCfg {
     /// DISABLED — every cloud-metadata endpoint is reachable by every provider. Logs a startup WARN.
     /// Default false.
     pub(crate) allow_all_metadata: bool,
+    /// Fully-resolved operational limits ("NEVER CODED CAPS"), projected from the `limits:` /
+    /// `observability:` / `governance:` / `metrics:` / `health:` / `routing:` config sections. Every
+    /// value defaults to its historical hardcoded const, so an all-default config is unchanged. Read
+    /// by `config_validate::validate`, threaded into the store/client/TLS/App at startup, and
+    /// installed into the process-wide `crate::limits` statics for the deep call-stack use sites.
+    pub(crate) limits: LimitsResolved,
 }
 
 /// Native inbound TLS configuration for the client↔Busbar hop. Absent (`Config.tls == None`) ⇒
@@ -836,6 +842,19 @@ pub(crate) struct DeployCfg {
     /// applies.
     #[serde(default)]
     pub(crate) security: Option<SecurityCfg>,
+    /// Operator-tunable global operational limits ("NEVER CODED CAPS"). Whole block optional; each
+    /// field defaults to its historical hardcoded value (absent = today's behavior).
+    #[serde(default)]
+    pub(crate) limits: LimitsCfg,
+    /// Process-wide metrics tunables.
+    #[serde(default)]
+    pub(crate) metrics: MetricsCfg,
+    /// Process-wide active-probe fallbacks (per-lane overrides still win).
+    #[serde(default)]
+    pub(crate) health: HealthDefaultsCfg,
+    /// Routing global default policy timeout (per-policy override still wins).
+    #[serde(default)]
+    pub(crate) routing: RoutingCfg,
 }
 
 /// Operator-owned security controls (config.yaml `security:` block).
@@ -863,7 +882,7 @@ pub(crate) struct SecurityCfg {
 
 /// Governance config. When present + enabled, callers authenticate with virtual keys
 /// (not the static auth token) and are subject to per-key allowed-pools / budgets / rate limits.
-#[derive(Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone)]
 pub(crate) struct GovernanceCfg {
     #[serde(default)]
     pub(crate) enabled: bool,
@@ -887,6 +906,30 @@ pub(crate) struct GovernanceCfg {
     /// ERROR path is affected; a definitive over-budget result always rejects regardless.
     #[serde(default)]
     pub(crate) budget_on_store_error: BudgetOnStoreError,
+    /// SQLite `busy_timeout` (ms) applied to each governance connection (default 5000).
+    #[serde(default = "default_sqlite_busy_timeout_ms")]
+    pub(crate) sqlite_busy_timeout_ms: i64,
+    /// Amortization interval for the rate-limiter stale-entry sweep: every Nth `check_rate` pays the
+    /// full retain (default 256).
+    #[serde(default = "default_rate_sweep_interval")]
+    pub(crate) rate_sweep_interval: u32,
+}
+
+impl Default for GovernanceCfg {
+    fn default() -> Self {
+        // Route the limit fields through the serde-default fns; the non-limit fields keep their
+        // historical zero/disabled defaults (governance is off unless `enabled` is set).
+        Self {
+            enabled: false,
+            db_path: default_gov_db_path(),
+            price_per_request_cents: default_price_per_request_cents(),
+            price_per_1k_tokens_cents: 0,
+            admin_token: None,
+            budget_on_store_error: BudgetOnStoreError::default(),
+            sqlite_busy_timeout_ms: default_sqlite_busy_timeout_ms(),
+            rate_sweep_interval: default_rate_sweep_interval(),
+        }
+    }
 }
 
 /// Fail-mode for the budget check on a store error (fix 2b). Default `allow` (fail-open) preserves
@@ -933,7 +976,7 @@ fn default_price_per_request_cents() -> i64 {
 }
 
 /// Observability sinks. All fields optional; absent = that sink is disabled.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub(crate) struct ObservabilityCfg {
     /// OTLP/HTTP traces endpoint (e.g. `http://localhost:4318/v1/traces`). When set, busbar
     /// installs an OpenTelemetry tracer + exports spans.
@@ -943,6 +986,289 @@ pub(crate) struct ObservabilityCfg {
     /// to this URL.
     #[serde(default)]
     pub(crate) request_log_webhook_url: Option<String>,
+    /// Max concurrent webhook deliveries (default 64). Bounds the fan-out of a slow webhook sink.
+    #[serde(default = "default_max_inflight_webhook_deliveries")]
+    pub(crate) max_inflight_webhook_deliveries: usize,
+    /// Per-delivery webhook timeout (seconds, default 2).
+    #[serde(default = "default_webhook_delivery_timeout_secs")]
+    pub(crate) webhook_delivery_timeout_secs: u64,
+}
+
+impl Default for ObservabilityCfg {
+    fn default() -> Self {
+        // Route the limit fields through the serde-default fns so the omitted-block path and the
+        // omitted-field path share one source of truth (the URL sinks stay disabled by default).
+        Self {
+            otlp_endpoint: None,
+            request_log_webhook_url: None,
+            max_inflight_webhook_deliveries: default_max_inflight_webhook_deliveries(),
+            webhook_delivery_timeout_secs: default_webhook_delivery_timeout_secs(),
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// Operator-tunable operational limits ("NEVER CODED CAPS"). Every field defaults — via a
+// `default = "fn"` whose body is the historical hardcoded const — to today's behavior, so an absent
+// key (the common case) is byte-for-byte unchanged. Each section struct is itself `#[serde(default)]`
+// at its `DeployCfg` field, so omitting the whole block is valid. The resolved values are projected
+// onto `LimitsResolved` (on `RootCfg`) and threaded/installed at startup (see `crate::limits`).
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Default upstream per-request timeout (seconds). Single source of truth for both serde's
+/// `default = "..."` and the resolved-default fallback. Mirrors the historical `main.rs` const.
+pub(crate) const DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 300;
+/// Default maximum accepted request body size (bytes). Couples to the egress translate-body cap
+/// (`crate::limits::translate_body_max_bytes`): a body the gateway accepts inbound must also be
+/// buffer-translatable on egress, so ONE knob (`limits.request_body_max_bytes`) drives both.
+pub(crate) const DEFAULT_REQUEST_BODY_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// Hard floor on `request_body_max_bytes` — a too-small cap would reject legitimate multi-turn /
+/// multimodal requests with no recourse. 64 KiB comfortably holds a minimal request.
+pub(crate) const REQUEST_BODY_MAX_BYTES_FLOOR: usize = 64 * 1024;
+/// Hard ceiling on `request_body_max_bytes` — the body is buffered per request, so an absurd value
+/// is a memory-exhaustion foot-gun. 1 GiB is far above any legitimate completion payload.
+pub(crate) const REQUEST_BODY_MAX_BYTES_CEIL: usize = 1024 * 1024 * 1024;
+/// Default max idle keep-alive connections the upstream client pools per host. Mirrors `main.rs`.
+pub(crate) const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 64;
+/// Default inbound concurrency limit. `0` = unlimited (today's behavior — NO layer added).
+pub(crate) const DEFAULT_MAX_INBOUND_CONCURRENT: usize = 0;
+/// Default hard-down sticky cooldown (seconds). Mirrors `store.rs`.
+pub(crate) const DEFAULT_HARD_DOWN_COOLDOWN_SECS: u64 = 1800;
+/// Default ceiling on a honored upstream `Retry-After` (seconds). Mirrors `store.rs` (24h).
+pub(crate) const DEFAULT_MAX_HONORED_RETRY_AFTER_SECS: u64 = 86_400;
+/// Default cap on a buffered upstream ERROR / verbatim-relay body (bytes). Mirrors `forward.rs`.
+pub(crate) const DEFAULT_UPSTREAM_ERROR_BODY_MAX_BYTES: usize = 256 * 1024;
+/// Default TLS handshake wall-clock bound (seconds). Mirrors `tls.rs`.
+pub(crate) const DEFAULT_TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+/// Default global fallback for the translation-injected `max_tokens` (mirrors `proto::DEFAULT_MAX_TOKENS`).
+pub(crate) const DEFAULT_DEFAULT_MAX_TOKENS: u32 = 4096;
+/// Default max concurrent webhook deliveries. Mirrors `observability.rs`.
+pub(crate) const DEFAULT_MAX_INFLIGHT_WEBHOOK_DELIVERIES: usize = 64;
+/// Default per-webhook delivery timeout (seconds). Mirrors `observability.rs`.
+pub(crate) const DEFAULT_WEBHOOK_DELIVERY_TIMEOUT_SECS: u64 = 2;
+/// Default max per-key gauge series emitted per scrape. Mirrors `metrics.rs`.
+pub(crate) const DEFAULT_KEY_GAUGE_LIMIT: usize = 2000;
+/// Default SQLite `busy_timeout` (ms) for the governance store. Mirrors `governance.rs`.
+pub(crate) const DEFAULT_SQLITE_BUSY_TIMEOUT_MS: i64 = 5_000;
+/// Default rate-sweep amortization interval. Mirrors `governance.rs`.
+pub(crate) const DEFAULT_RATE_SWEEP_INTERVAL: u32 = 256;
+/// Default active-probe interval (seconds) — the process-wide fallback for the per-lane override.
+pub(crate) const DEFAULT_PROBE_INTERVAL_SECS: u64 = 30;
+/// Default active-probe timeout (seconds) — the process-wide fallback for the per-lane override.
+pub(crate) const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 5;
+
+fn default_upstream_request_timeout_secs() -> u64 {
+    DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECS
+}
+fn default_request_body_max_bytes() -> usize {
+    DEFAULT_REQUEST_BODY_MAX_BYTES
+}
+fn default_pool_max_idle_per_host() -> usize {
+    DEFAULT_POOL_MAX_IDLE_PER_HOST
+}
+fn default_max_inbound_concurrent() -> usize {
+    DEFAULT_MAX_INBOUND_CONCURRENT
+}
+fn default_hard_down_cooldown_secs() -> u64 {
+    DEFAULT_HARD_DOWN_COOLDOWN_SECS
+}
+fn default_max_honored_retry_after_secs() -> u64 {
+    DEFAULT_MAX_HONORED_RETRY_AFTER_SECS
+}
+fn default_upstream_error_body_max_bytes() -> usize {
+    DEFAULT_UPSTREAM_ERROR_BODY_MAX_BYTES
+}
+fn default_tls_handshake_timeout_secs() -> u64 {
+    DEFAULT_TLS_HANDSHAKE_TIMEOUT_SECS
+}
+fn default_default_max_tokens() -> u32 {
+    DEFAULT_DEFAULT_MAX_TOKENS
+}
+fn default_max_inflight_webhook_deliveries() -> usize {
+    DEFAULT_MAX_INFLIGHT_WEBHOOK_DELIVERIES
+}
+fn default_webhook_delivery_timeout_secs() -> u64 {
+    DEFAULT_WEBHOOK_DELIVERY_TIMEOUT_SECS
+}
+fn default_key_gauge_limit() -> usize {
+    DEFAULT_KEY_GAUGE_LIMIT
+}
+fn default_sqlite_busy_timeout_ms() -> i64 {
+    DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+}
+fn default_rate_sweep_interval() -> u32 {
+    DEFAULT_RATE_SWEEP_INTERVAL
+}
+fn default_probe_interval_secs() -> u64 {
+    DEFAULT_PROBE_INTERVAL_SECS
+}
+fn default_probe_timeout_secs() -> u64 {
+    DEFAULT_PROBE_TIMEOUT_SECS
+}
+
+/// The `limits:` block — global operational caps. Each field defaults to its historical hardcoded
+/// value, so an absent field (or an absent block) is today's behavior.
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct LimitsCfg {
+    #[serde(default = "default_upstream_request_timeout_secs")]
+    pub(crate) upstream_request_timeout_secs: u64,
+    /// Max accepted inbound body (bytes). COUPLED: also drives the egress translate-body cap
+    /// (`crate::limits::translate_body_max_bytes`) — one knob feeds both so an accepted request is
+    /// always buffer-translatable on egress.
+    #[serde(default = "default_request_body_max_bytes")]
+    pub(crate) request_body_max_bytes: usize,
+    #[serde(default = "default_pool_max_idle_per_host")]
+    pub(crate) pool_max_idle_per_host: usize,
+    /// Inbound concurrency cap. `0` (default) = unlimited: NO layer is added (a true no-op). When
+    /// `>0`, a `tower` global concurrency limit wraps the router as the outermost layer.
+    #[serde(default = "default_max_inbound_concurrent")]
+    pub(crate) max_inbound_concurrent: usize,
+    #[serde(default = "default_hard_down_cooldown_secs")]
+    pub(crate) hard_down_cooldown_secs: u64,
+    #[serde(default = "default_upstream_error_body_max_bytes")]
+    pub(crate) upstream_error_body_max_bytes: usize,
+    #[serde(default = "default_tls_handshake_timeout_secs")]
+    pub(crate) tls_handshake_timeout_secs: u64,
+    #[serde(default = "default_max_honored_retry_after_secs")]
+    pub(crate) max_honored_retry_after_secs: u64,
+    #[serde(default = "default_default_max_tokens")]
+    pub(crate) default_max_tokens: u32,
+}
+
+impl Default for LimitsCfg {
+    fn default() -> Self {
+        // Route every field through the serde-default fn so the omitted-block path (this `Default`)
+        // and the omitted-field path share one source of truth and cannot drift.
+        Self {
+            upstream_request_timeout_secs: default_upstream_request_timeout_secs(),
+            request_body_max_bytes: default_request_body_max_bytes(),
+            pool_max_idle_per_host: default_pool_max_idle_per_host(),
+            max_inbound_concurrent: default_max_inbound_concurrent(),
+            hard_down_cooldown_secs: default_hard_down_cooldown_secs(),
+            upstream_error_body_max_bytes: default_upstream_error_body_max_bytes(),
+            tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
+            max_honored_retry_after_secs: default_max_honored_retry_after_secs(),
+            default_max_tokens: default_default_max_tokens(),
+        }
+    }
+}
+
+/// The `metrics:` block.
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct MetricsCfg {
+    #[serde(default = "default_key_gauge_limit")]
+    pub(crate) key_gauge_limit: usize,
+}
+
+impl Default for MetricsCfg {
+    fn default() -> Self {
+        Self {
+            key_gauge_limit: default_key_gauge_limit(),
+        }
+    }
+}
+
+/// The `health:` block — process-wide active-probe fallbacks (per-lane `health.interval_secs` /
+/// `timeout_secs` still override these).
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct HealthDefaultsCfg {
+    #[serde(default = "default_probe_interval_secs")]
+    pub(crate) default_probe_interval_secs: u64,
+    #[serde(default = "default_probe_timeout_secs")]
+    pub(crate) default_probe_timeout_secs: u64,
+}
+
+impl Default for HealthDefaultsCfg {
+    fn default() -> Self {
+        Self {
+            default_probe_interval_secs: default_probe_interval_secs(),
+            default_probe_timeout_secs: default_probe_timeout_secs(),
+        }
+    }
+}
+
+/// The `routing:` block — the global default policy timeout (per-policy `policy.timeout_ms` still
+/// overrides).
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct RoutingCfg {
+    #[serde(default = "default_policy_timeout_ms")]
+    pub(crate) default_policy_timeout_ms: u64,
+}
+
+impl Default for RoutingCfg {
+    fn default() -> Self {
+        Self {
+            default_policy_timeout_ms: default_policy_timeout_ms(),
+        }
+    }
+}
+
+/// Fully-resolved operational limits, projected onto `RootCfg` by `resolve`. Grouped here so the
+/// startup wiring (`crate::limits::install` + the explicit main.rs/store threading) reads a flat
+/// struct rather than re-walking optional config sections.
+#[derive(Debug, Clone)]
+pub(crate) struct LimitsResolved {
+    pub(crate) upstream_request_timeout_secs: u64,
+    pub(crate) request_body_max_bytes: usize,
+    pub(crate) pool_max_idle_per_host: usize,
+    pub(crate) max_inbound_concurrent: usize,
+    pub(crate) hard_down_cooldown_secs: u64,
+    pub(crate) upstream_error_body_max_bytes: usize,
+    pub(crate) tls_handshake_timeout_secs: u64,
+    pub(crate) max_honored_retry_after_secs: u64,
+    pub(crate) default_max_tokens: u32,
+    pub(crate) max_inflight_webhook_deliveries: usize,
+    pub(crate) webhook_delivery_timeout_secs: u64,
+    pub(crate) key_gauge_limit: usize,
+    pub(crate) sqlite_busy_timeout_ms: i64,
+    pub(crate) rate_sweep_interval: u32,
+    pub(crate) default_probe_interval_secs: u64,
+    pub(crate) default_probe_timeout_secs: u64,
+    pub(crate) default_policy_timeout_ms: u64,
+}
+
+impl Default for LimitsResolved {
+    fn default() -> Self {
+        Self::from_sections(
+            &LimitsCfg::default(),
+            &ObservabilityCfg::default(),
+            &GovernanceCfg::default(),
+            &MetricsCfg::default(),
+            &HealthDefaultsCfg::default(),
+            &RoutingCfg::default(),
+        )
+    }
+}
+
+impl LimitsResolved {
+    fn from_sections(
+        limits: &LimitsCfg,
+        obs: &ObservabilityCfg,
+        gov: &GovernanceCfg,
+        metrics: &MetricsCfg,
+        health: &HealthDefaultsCfg,
+        routing: &RoutingCfg,
+    ) -> Self {
+        Self {
+            upstream_request_timeout_secs: limits.upstream_request_timeout_secs,
+            request_body_max_bytes: limits.request_body_max_bytes,
+            pool_max_idle_per_host: limits.pool_max_idle_per_host,
+            max_inbound_concurrent: limits.max_inbound_concurrent,
+            hard_down_cooldown_secs: limits.hard_down_cooldown_secs,
+            upstream_error_body_max_bytes: limits.upstream_error_body_max_bytes,
+            tls_handshake_timeout_secs: limits.tls_handshake_timeout_secs,
+            max_honored_retry_after_secs: limits.max_honored_retry_after_secs,
+            default_max_tokens: limits.default_max_tokens,
+            max_inflight_webhook_deliveries: obs.max_inflight_webhook_deliveries,
+            webhook_delivery_timeout_secs: obs.webhook_delivery_timeout_secs,
+            key_gauge_limit: metrics.key_gauge_limit,
+            sqlite_busy_timeout_ms: gov.sqlite_busy_timeout_ms,
+            rate_sweep_interval: gov.rate_sweep_interval,
+            default_probe_interval_secs: health.default_probe_interval_secs,
+            default_probe_timeout_secs: health.default_probe_timeout_secs,
+            default_policy_timeout_ms: routing.default_policy_timeout_ms,
+        }
+    }
 }
 
 /// Resolve DeployCfg + ProviderDef map into resolved RootCfg.
@@ -1055,6 +1381,17 @@ pub(crate) fn resolve(
                 .as_ref()
                 .map(|s| s.allow_all_metadata)
                 .unwrap_or(false),
+            // Project the operational-limit sections onto a flat resolved struct. The `observability:`
+            // and `governance:` blocks are optional; absent ⇒ their section defaults (which are the
+            // historical hardcoded values, via the manual `Default` impls).
+            limits: LimitsResolved::from_sections(
+                &deploy.limits,
+                &deploy.observability.clone().unwrap_or_default(),
+                &deploy.governance.clone().unwrap_or_default(),
+                &deploy.metrics,
+                &deploy.health,
+                &deploy.routing,
+            ),
         })
     } else {
         Err(errors)
@@ -1230,6 +1567,10 @@ models:
             observability: None,
             governance: None,
             security: None,
+            limits: LimitsCfg::default(),
+            metrics: MetricsCfg::default(),
+            health: HealthDefaultsCfg::default(),
+            routing: RoutingCfg::default(),
         };
         let cfg = resolve(&deploy, &defs).expect("resolve");
         assert_eq!(
@@ -1679,6 +2020,10 @@ models:
             observability: None,
             governance: None,
             security: None,
+            limits: LimitsCfg::default(),
+            metrics: MetricsCfg::default(),
+            health: HealthDefaultsCfg::default(),
+            routing: RoutingCfg::default(),
         };
 
         let result = resolve(&deploy, &defs).expect("resolve should succeed");
@@ -1765,8 +2110,14 @@ models: {}
                 price_per_1k_tokens_cents: 0,
                 admin_token: None,
                 budget_on_store_error: Default::default(),
+                sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+                rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             }),
             security: None,
+            limits: LimitsCfg::default(),
+            metrics: MetricsCfg::default(),
+            health: HealthDefaultsCfg::default(),
+            routing: RoutingCfg::default(),
         };
         let errs = resolve(&deploy, &defs)
             .expect_err("enabled governance without admin_token must fail resolution");
@@ -1794,8 +2145,14 @@ models: {}
                 price_per_1k_tokens_cents: 0,
                 admin_token: Some("operator-secret".to_string()),
                 budget_on_store_error: Default::default(),
+                sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+                rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             }),
             security: None,
+            limits: LimitsCfg::default(),
+            metrics: MetricsCfg::default(),
+            health: HealthDefaultsCfg::default(),
+            routing: RoutingCfg::default(),
         };
         assert!(
             resolve(&deploy, &defs).is_ok(),
@@ -1834,6 +2191,10 @@ models: {}
             observability: None,
             governance: None,
             security: None,
+            limits: LimitsCfg::default(),
+            metrics: MetricsCfg::default(),
+            health: HealthDefaultsCfg::default(),
+            routing: RoutingCfg::default(),
         };
 
         let result = resolve(&deploy, &defs);
@@ -1892,6 +2253,10 @@ models: {}
             observability: None,
             governance: None,
             security: None,
+            limits: LimitsCfg::default(),
+            metrics: MetricsCfg::default(),
+            health: HealthDefaultsCfg::default(),
+            routing: RoutingCfg::default(),
         };
 
         let result = resolve(&deploy, &defs).expect("resolve should succeed");
@@ -1958,6 +2323,10 @@ models: {}
             observability: None,
             governance: None,
             security: None,
+            limits: LimitsCfg::default(),
+            metrics: MetricsCfg::default(),
+            health: HealthDefaultsCfg::default(),
+            routing: RoutingCfg::default(),
         };
 
         let result = resolve(&deploy, &defs).expect("resolve should succeed");
@@ -2099,6 +2468,8 @@ models: {}
             price_per_1k_tokens_cents: 0,
             admin_token: Some("SECRET-admin-bearer-token-qqq".to_string()),
             budget_on_store_error: Default::default(),
+            sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+            rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         };
         let dbg = format!("{gov:?}");
         assert!(
@@ -2184,8 +2555,14 @@ models: {}
                 price_per_1k_tokens_cents: 0,
                 admin_token: Some("SECRET-embedded-admin-token".to_string()),
                 budget_on_store_error: Default::default(),
+                sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+                rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             }),
             security: None,
+            limits: LimitsCfg::default(),
+            metrics: MetricsCfg::default(),
+            health: HealthDefaultsCfg::default(),
+            routing: RoutingCfg::default(),
         };
         let dbg = format!("{deploy:?}");
         for secret in [
@@ -2199,5 +2576,179 @@ models: {}
                 "DeployCfg Debug leaked a nested secret ({secret}): {dbg}"
             );
         }
+    }
+
+    // ── operational limits ("NEVER CODED CAPS") ──────────────────────────────────────────────────
+
+    /// A config that OMITS the whole `limits:` block (and every other limit section) must resolve to
+    /// the HISTORICAL hardcoded defaults — the common case, and the guarantee that nothing changes
+    /// for existing deployments. Asserts every resolved limit equals its `DEFAULT_*` const.
+    #[test]
+    fn test_limits_absent_block_yields_historical_defaults() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+providers:
+  anthropic:
+    api_key_env: ANTHROPIC_KEY
+models:
+  claude:
+    provider: anthropic
+    max_concurrent: 10
+"#;
+        let deploy: DeployCfg =
+            serde_yaml::from_str(yaml).expect("config without a limits block must parse");
+        let l = LimitsResolved::from_sections(
+            &deploy.limits,
+            &deploy.observability.clone().unwrap_or_default(),
+            &deploy.governance.clone().unwrap_or_default(),
+            &deploy.metrics,
+            &deploy.health,
+            &deploy.routing,
+        );
+        assert_eq!(
+            l.upstream_request_timeout_secs,
+            DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECS
+        );
+        assert_eq!(l.request_body_max_bytes, DEFAULT_REQUEST_BODY_MAX_BYTES);
+        assert_eq!(l.pool_max_idle_per_host, DEFAULT_POOL_MAX_IDLE_PER_HOST);
+        assert_eq!(l.max_inbound_concurrent, DEFAULT_MAX_INBOUND_CONCURRENT);
+        assert_eq!(
+            l.max_inbound_concurrent, 0,
+            "default must be the unlimited no-op"
+        );
+        assert_eq!(l.hard_down_cooldown_secs, DEFAULT_HARD_DOWN_COOLDOWN_SECS);
+        assert_eq!(
+            l.upstream_error_body_max_bytes,
+            DEFAULT_UPSTREAM_ERROR_BODY_MAX_BYTES
+        );
+        assert_eq!(
+            l.tls_handshake_timeout_secs,
+            DEFAULT_TLS_HANDSHAKE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            l.max_honored_retry_after_secs,
+            DEFAULT_MAX_HONORED_RETRY_AFTER_SECS
+        );
+        assert_eq!(l.default_max_tokens, DEFAULT_DEFAULT_MAX_TOKENS);
+        assert_eq!(l.default_max_tokens, crate::proto::DEFAULT_MAX_TOKENS);
+        assert_eq!(
+            l.max_inflight_webhook_deliveries,
+            DEFAULT_MAX_INFLIGHT_WEBHOOK_DELIVERIES
+        );
+        assert_eq!(
+            l.webhook_delivery_timeout_secs,
+            DEFAULT_WEBHOOK_DELIVERY_TIMEOUT_SECS
+        );
+        assert_eq!(l.key_gauge_limit, DEFAULT_KEY_GAUGE_LIMIT);
+        assert_eq!(l.sqlite_busy_timeout_ms, DEFAULT_SQLITE_BUSY_TIMEOUT_MS);
+        assert_eq!(l.rate_sweep_interval, DEFAULT_RATE_SWEEP_INTERVAL);
+        assert_eq!(l.default_probe_interval_secs, DEFAULT_PROBE_INTERVAL_SECS);
+        assert_eq!(l.default_probe_timeout_secs, DEFAULT_PROBE_TIMEOUT_SECS);
+        assert_eq!(l.default_policy_timeout_ms, DEFAULT_POLICY_TIMEOUT_MS);
+    }
+
+    /// `LimitsResolved::default()` (the omitted-everything path) must equal the per-field defaults —
+    /// the two ways of getting "today's behavior" cannot drift.
+    #[test]
+    fn test_limits_resolved_default_matches_from_sections_defaults() {
+        let a = LimitsResolved::default();
+        let b = LimitsResolved::from_sections(
+            &LimitsCfg::default(),
+            &ObservabilityCfg::default(),
+            &GovernanceCfg::default(),
+            &MetricsCfg::default(),
+            &HealthDefaultsCfg::default(),
+            &RoutingCfg::default(),
+        );
+        assert_eq!(a.request_body_max_bytes, b.request_body_max_bytes);
+        assert_eq!(
+            a.upstream_request_timeout_secs,
+            b.upstream_request_timeout_secs
+        );
+        assert_eq!(a.sqlite_busy_timeout_ms, b.sqlite_busy_timeout_ms);
+        assert_eq!(a.default_policy_timeout_ms, b.default_policy_timeout_ms);
+        assert_eq!(a.key_gauge_limit, b.key_gauge_limit);
+    }
+
+    /// A SET limit value (across several sections) OVERRIDES the default; an unset SIBLING field in
+    /// the same block still defaults. Exercises the per-field `#[serde(default = "...")]` wiring.
+    #[test]
+    fn test_limits_set_value_overrides_default() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+providers:
+  anthropic:
+    api_key_env: ANTHROPIC_KEY
+models:
+  claude:
+    provider: anthropic
+    max_concurrent: 10
+limits:
+  upstream_request_timeout_secs: 42
+  max_inbound_concurrent: 256
+  request_body_max_bytes: 1048576
+metrics:
+  key_gauge_limit: 9
+governance:
+  sqlite_busy_timeout_ms: 1234
+health:
+  default_probe_interval_secs: 7
+routing:
+  default_policy_timeout_ms: 99
+"#;
+        let deploy: DeployCfg = serde_yaml::from_str(yaml).expect("limits override must parse");
+        let l = LimitsResolved::from_sections(
+            &deploy.limits,
+            &deploy.observability.clone().unwrap_or_default(),
+            &deploy.governance.clone().unwrap_or_default(),
+            &deploy.metrics,
+            &deploy.health,
+            &deploy.routing,
+        );
+        assert_eq!(l.upstream_request_timeout_secs, 42);
+        assert_eq!(l.max_inbound_concurrent, 256);
+        assert_eq!(l.request_body_max_bytes, 1_048_576);
+        assert_eq!(l.key_gauge_limit, 9);
+        assert_eq!(l.sqlite_busy_timeout_ms, 1234);
+        assert_eq!(l.default_probe_interval_secs, 7);
+        assert_eq!(l.default_policy_timeout_ms, 99);
+        // Unset SIBLING fields still default (pool_max_idle in the same `limits:` block, probe
+        // TIMEOUT in the same `health:` block):
+        assert_eq!(l.pool_max_idle_per_host, DEFAULT_POOL_MAX_IDLE_PER_HOST);
+        assert_eq!(l.default_probe_timeout_secs, DEFAULT_PROBE_TIMEOUT_SECS);
+        assert_eq!(l.hard_down_cooldown_secs, DEFAULT_HARD_DOWN_COOLDOWN_SECS);
+    }
+
+    /// The body-size COUPLING: `limits.request_body_max_bytes` is the SINGLE knob; the resolved value
+    /// the inbound `DefaultBodyLimit` uses IS the same value the egress translate-body cap reads
+    /// (`crate::limits::translate_body_max_bytes` returns `request_body_max_bytes`). So an accepted
+    /// request is always buffer-translatable on egress.
+    #[test]
+    fn test_request_body_size_couples_ingress_and_translate() {
+        let d = LimitsResolved::default();
+        assert_eq!(d.request_body_max_bytes, DEFAULT_REQUEST_BODY_MAX_BYTES);
+
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+providers:
+  anthropic:
+    api_key_env: ANTHROPIC_KEY
+models:
+  claude:
+    provider: anthropic
+    max_concurrent: 10
+limits:
+  request_body_max_bytes: 5242880
+"#;
+        let deploy: DeployCfg = serde_yaml::from_str(yaml).expect("parse");
+        let l = LimitsResolved::from_sections(
+            &deploy.limits,
+            &ObservabilityCfg::default(),
+            &GovernanceCfg::default(),
+            &MetricsCfg::default(),
+            &HealthDefaultsCfg::default(),
+            &RoutingCfg::default(),
+        );
+        assert_eq!(l.request_body_max_bytes, 5 * 1024 * 1024);
     }
 }

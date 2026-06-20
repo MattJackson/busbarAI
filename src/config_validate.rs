@@ -658,11 +658,119 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
+    // Operational-limit sanity checks (NEVER CODED CAPS). A 0 or absurd value here would break the
+    // gateway rather than tune it; reject loudly at boot. Deliberately permissive — only the few
+    // values where 0/absurd is a foot-gun are constrained (e.g. `max_inbound_concurrent` accepts ANY
+    // usize incl. 0, the unlimited default).
+    validate_limits(&cfg.limits, &mut errors);
+
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
     }
+}
+
+/// Range-check the resolved operational limits. Pushes a message per violation (collect-all, like the
+/// rest of `validate`). The bounds are intentionally loose: each defaults to today's working value,
+/// so we only reject values that would make a subsystem non-functional.
+fn validate_limits(limits: &crate::config::LimitsResolved, errors: &mut Vec<String>) {
+    use crate::config::{REQUEST_BODY_MAX_BYTES_CEIL, REQUEST_BODY_MAX_BYTES_FLOOR};
+
+    // Timeouts must be >= 1s — a 0s timeout fires instantly and breaks the path it guards.
+    if limits.upstream_request_timeout_secs < 1 {
+        errors.push(
+            "limits.upstream_request_timeout_secs must be >= 1 (0 would time out every upstream call \
+             instantly)"
+                .to_string(),
+        );
+    }
+    if limits.tls_handshake_timeout_secs < 1 {
+        errors.push(
+            "limits.tls_handshake_timeout_secs must be >= 1 (0 would abort every TLS handshake)"
+                .to_string(),
+        );
+    }
+    if limits.webhook_delivery_timeout_secs < 1 {
+        errors.push(
+            "observability.webhook_delivery_timeout_secs must be >= 1 (0 would abort every webhook \
+             delivery)"
+                .to_string(),
+        );
+    }
+    // The honored-Retry-After ceiling and hard-down cooldown must be >= 1s to be meaningful.
+    if limits.max_honored_retry_after_secs < 1 {
+        errors.push(
+            "limits.max_honored_retry_after_secs must be >= 1 (a 0 ceiling would clamp every honored \
+             Retry-After to 0)"
+                .to_string(),
+        );
+    }
+    if limits.hard_down_cooldown_secs < 1 {
+        errors.push(
+            "limits.hard_down_cooldown_secs must be >= 1 (a 0 sticky cooldown would re-ready a \
+             hard-down lane immediately)"
+                .to_string(),
+        );
+    }
+    // Request-body cap: too small rejects legitimate requests; absurdly large is a memory foot-gun
+    // (the body is buffered per request). Bound it to a sane window.
+    if limits.request_body_max_bytes < REQUEST_BODY_MAX_BYTES_FLOOR {
+        errors.push(format!(
+            "limits.request_body_max_bytes ({}) is below the {REQUEST_BODY_MAX_BYTES_FLOOR}-byte floor \
+             — too small to admit a minimal request",
+            limits.request_body_max_bytes
+        ));
+    }
+    if limits.request_body_max_bytes > REQUEST_BODY_MAX_BYTES_CEIL {
+        errors.push(format!(
+            "limits.request_body_max_bytes ({}) exceeds the {REQUEST_BODY_MAX_BYTES_CEIL}-byte ceiling \
+             — the body is buffered per request, so this risks memory exhaustion",
+            limits.request_body_max_bytes
+        ));
+    }
+    // The error-body buffer cap must be >= 1 byte (0 would buffer nothing, losing every upstream
+    // error body). The pool-idle, gauge-limit, sweep-interval, and probe defaults are all safe at any
+    // value (0 pool-idle = no keep-alive; 0 gauge limit = emit none; the sweep interval is masked).
+    if limits.upstream_error_body_max_bytes < 1 {
+        errors.push(
+            "limits.upstream_error_body_max_bytes must be >= 1 (0 would buffer no upstream error body)"
+                .to_string(),
+        );
+    }
+    // The translation-injected max_tokens fallback must be > 0 (a 0 is rejected upstream). This is the
+    // GLOBAL fallback; the per-model `default_max_tokens: 0` case is already rejected in the model loop.
+    if limits.default_max_tokens < 1 {
+        errors.push(
+            "limits.default_max_tokens must be >= 1 (0 would be injected verbatim and rejected upstream)"
+                .to_string(),
+        );
+    }
+    // SQLite busy_timeout must be >= 0 (rusqlite rejects negative). 0 means "fail immediately on lock"
+    // — degraded but not broken, so only reject a negative value.
+    if limits.sqlite_busy_timeout_ms < 0 {
+        errors.push(format!(
+            "governance.sqlite_busy_timeout_ms ({}) must be >= 0",
+            limits.sqlite_busy_timeout_ms
+        ));
+    }
+    // Probe fallbacks: the prober floors them at 1 at use, but a 0 here signals operator confusion;
+    // reject so the config is honest about what runs.
+    if limits.default_probe_interval_secs < 1 {
+        errors.push("health.default_probe_interval_secs must be >= 1".to_string());
+    }
+    if limits.default_probe_timeout_secs < 1 {
+        errors.push("health.default_probe_timeout_secs must be >= 1".to_string());
+    }
+    if limits.default_policy_timeout_ms < 1 {
+        errors.push(
+            "routing.default_policy_timeout_ms must be >= 1 (0 would make every policy decision time \
+             out instantly)"
+                .to_string(),
+        );
+    }
+    // NOTE: `max_inbound_concurrent` is intentionally UNCONSTRAINED — any usize including 0 (the
+    // unlimited default) is valid.
 }
 
 /// Validate the optional governance block (read separately from the resolved `RootCfg`, so it
@@ -1257,6 +1365,7 @@ mod tests {
             blocked_metadata_hosts: Vec::new(),
             allow_metadata_hosts: Vec::new(),
             allow_all_metadata: false,
+            limits: config::LimitsResolved::default(),
         }
     }
 
@@ -2325,6 +2434,8 @@ mod tests {
                 price_per_1k_tokens_cents: 0,
                 admin_token: missing.clone(),
                 budget_on_store_error: Default::default(),
+                sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+                rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             };
             let errs = validate_governance(&gov, None)
                 .expect_err("enabled governance without admin_token must fail");
@@ -2352,6 +2463,8 @@ mod tests {
                 price_per_1k_tokens_cents: 0,
                 admin_token: Some(blank.to_string()),
                 budget_on_store_error: Default::default(),
+                sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+                rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             };
             let errs = validate_governance(&gov, None).unwrap_err_or_default(format!(
                 "a whitespace-only admin_token {blank:?} must fail validation"
@@ -2372,6 +2485,8 @@ mod tests {
             price_per_1k_tokens_cents: 0,
             admin_token: Some("  real-secret  ".to_string()),
             budget_on_store_error: Default::default(),
+            sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+            rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         };
         assert!(
             validate_governance(&gov, None).is_ok(),
@@ -2388,6 +2503,8 @@ mod tests {
             price_per_1k_tokens_cents: 0,
             admin_token: Some("an-operator-secret".to_string()),
             budget_on_store_error: Default::default(),
+            sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+            rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         };
         assert!(
             validate_governance(&gov, None).is_ok(),
@@ -2405,6 +2522,8 @@ mod tests {
             price_per_1k_tokens_cents: 0,
             admin_token: None,
             budget_on_store_error: Default::default(),
+            sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+            rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         };
         assert!(
             validate_governance(&gov, None).is_ok(),
@@ -2436,6 +2555,8 @@ mod tests {
                 price_per_1k_tokens_cents: 0,
                 admin_token: Some("an-operator-secret".to_string()),
                 budget_on_store_error: Default::default(),
+                sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+                rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             };
             let errs = validate_governance(&gov, Some(&auth_cfg(mode)))
                 .expect_err("governance + passthrough must be rejected at boot");
@@ -2459,6 +2580,8 @@ mod tests {
                 price_per_1k_tokens_cents: 0,
                 admin_token: Some("an-operator-secret".to_string()),
                 budget_on_store_error: Default::default(),
+                sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+                rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             };
             assert!(
                 validate_governance(&gov, Some(&auth_cfg(mode))).is_ok(),
@@ -2478,6 +2601,8 @@ mod tests {
             price_per_1k_tokens_cents: 0,
             admin_token: None,
             budget_on_store_error: Default::default(),
+            sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+            rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         };
         assert!(
             validate_governance(&gov, Some(&auth_cfg("passthrough"))).is_ok(),

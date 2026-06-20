@@ -22,16 +22,20 @@ const RATE_WINDOW_SECS: u64 = 60;
 /// when its `window_start` is stale — so the sweep is purely to bound the map's memory by evicting
 /// keys that have gone silent. Running it occasionally keeps the per-request cost off the hot path
 /// while still guaranteeing the map cannot grow unboundedly across windows.
-const RATE_SWEEP_INTERVAL: u32 = 256;
+/// Operator-tunable via `governance.rate_sweep_interval` (default 256). Read in production through
+/// `crate::limits::rate_sweep_interval()`; this const is retained (as the config DEFAULT) only for
+/// the tests that exercise the default-configured sweep cadence.
+#[cfg(test)]
+const RATE_SWEEP_INTERVAL: u32 = crate::config::DEFAULT_RATE_SWEEP_INTERVAL;
 /// `price_per_1k_tokens_cents` is priced per this many tokens.
 const TOKENS_PER_PRICE_UNIT: u64 = 1_000;
 /// Seconds in a UTC day, for `budget_window`'s day/month arithmetic. `pub(crate)` so sibling
 /// modules (which need the same constant for their own window math) reference it as
 /// `crate::governance::SECS_PER_DAY` rather than re-hardcoding `86_400`.
 pub(crate) const SECS_PER_DAY: u64 = 86_400;
-/// SQLite `busy_timeout` for the on-disk DB: a transient lock contention retries for this many
-/// milliseconds (5s) before failing, rather than erroring instantly with `SQLITE_BUSY`.
-const SQLITE_BUSY_TIMEOUT_MS: i64 = 5_000;
+// SQLite `busy_timeout` for the on-disk DB: a transient lock contention retries for this many
+// milliseconds before failing, rather than erroring instantly with `SQLITE_BUSY`. Operator-tunable
+// via `governance.sqlite_busy_timeout_ms` (default 5000); read through `crate::limits`.
 
 /// Per-key rate-limit state for the current 60s window. Ephemeral (in-memory, not persisted):
 /// rate windows are single-node; cross-node distributed limits would be a future concern.
@@ -513,7 +517,7 @@ impl GovState {
             .rate_sweep_ticker
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1)
-            .is_multiple_of(RATE_SWEEP_INTERVAL);
+            .is_multiple_of(crate::limits::rate_sweep_interval());
         let mut map = self.rate_write();
         if sweep_needed {
             map.retain(|_, st| st.window_start == window);
@@ -1304,7 +1308,11 @@ impl SqliteStore {
             // than `execute` (which rejects a statement that yields rows). `busy_timeout` is a plain
             // setter and is safe via `execute_batch`.
             conn.pragma_update(None, "journal_mode", "WAL")?;
-            conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)?;
+            conn.pragma_update(
+                None,
+                "busy_timeout",
+                crate::limits::sqlite_busy_timeout_ms(),
+            )?;
         }
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),

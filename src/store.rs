@@ -11,15 +11,20 @@ use tokio::sync::Semaphore;
 const COOLDOWN_TRANSIENT_SECS: u64 = 10;
 // A hard-down fault (bad key / billing / hard quota) gets a long sticky cooldown and recovers via
 // the half-open probe — NOT a permanent `dead` kill. A human likely has to fix the key, so fast
-// re-probes are pointless; default 30 min.
-const HARD_DOWN_COOLDOWN_SECS: u64 = 1800;
+// re-probes are pointless; default 30 min. Now operator-tunable via `limits.hard_down_cooldown_secs`
+// (threaded onto `InMemoryStore`); this const is the DEFAULT (== the config default) and is retained
+// only as the expected value in tests that exercise the default-configured store.
+#[cfg(test)]
+const HARD_DOWN_COOLDOWN_SECS: u64 = crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS;
 
 // Absolute ceiling on an UPSTREAM-supplied `Retry-After` we will honor as a cooldown floor. A
 // server's hint can legitimately exceed the configured `max_cooldown_secs`, so we honor past the
-// cap — but never past this ceiling (24h), so a hostile/buggy upstream sending a near-`u64::MAX`
-// `Retry-After` cannot overflow `now + duration` (breaker bypass in release / panic in debug) or
-// bench a lane for millennia.
-const MAX_HONORED_RETRY_AFTER_SECS: u64 = 86_400; // 24h
+// cap — but never past this ceiling (default 24h), so a hostile/buggy upstream sending a near-
+// `u64::MAX` `Retry-After` cannot overflow `now + duration` (breaker bypass in release / panic in
+// debug) or bench a lane for millennia. Now operator-tunable via `limits.max_honored_retry_after_secs`
+// (threaded onto `InMemoryStore`); this const is the DEFAULT, retained only for default-config tests.
+#[cfg(test)]
+const MAX_HONORED_RETRY_AFTER_SECS: u64 = crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS;
 
 // Breaker-state encoding for the per-cell `AtomicU64` (stored as u64 so it can be CAS'd).
 const ST_CLOSED: u64 = 0;
@@ -625,6 +630,15 @@ pub(crate) struct InMemoryStore {
     /// whose pool hashes to the same shard, so concurrent selections for disjoint pools run in
     /// parallel. Boxed slice so the struct stays movable without a const-generic array literal.
     swrr_shards: Box<[std::sync::Mutex<()>]>,
+    /// Operator-configured hard-down sticky cooldown (seconds). Replaces the historical
+    /// `HARD_DOWN_COOLDOWN_SECS` const at every hard-down trip; defaults to 1800 when the operator
+    /// omits `limits.hard_down_cooldown_secs`.
+    hard_down_cooldown_secs: u64,
+    /// Operator-configured ceiling (seconds) on a honored upstream `Retry-After`. Replaces the
+    /// historical `MAX_HONORED_RETRY_AFTER_SECS` const in `compute_cooldown_with_retry_after`;
+    /// defaults to 86_400 (24h). Bounds a hostile/buggy `Retry-After` so it cannot park a lane for
+    /// millennia or overflow the cooldown arithmetic.
+    max_honored_retry_after_secs: u64,
     /// Memoized pool-name → shard-index map. `swrr_shard` ran FNV-1a over the pool NAME on EVERY
     /// selection (the hot dispatch path); the index is a pure function of the (small, stable) set of
     /// pool names, so cache it on first touch and reuse thereafter. An append-only `Vec` scanned by
@@ -681,7 +695,25 @@ impl InMemoryStore {
         self.cell(pool, lane).err().load(Ordering::Relaxed)
     }
 
+    /// Construct with the historical hardcoded operational limits. Used by tests and any caller that
+    /// does not thread operator config; production goes through [`new_with_limits`].
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(lanes: Vec<LaneData>) -> Self {
+        Self::new_with_limits(
+            lanes,
+            crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS,
+            crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS,
+        )
+    }
+
+    /// Construct with operator-configured hard-down cooldown + honored-`Retry-After` ceiling
+    /// (`limits.hard_down_cooldown_secs` / `limits.max_honored_retry_after_secs`). Each defaults to
+    /// its historical const at the config layer, so `new` and this share one source of truth.
+    pub(crate) fn new_with_limits(
+        lanes: Vec<LaneData>,
+        hard_down_cooldown_secs: u64,
+        max_honored_retry_after_secs: u64,
+    ) -> Self {
         let lane_states: Vec<Arc<LaneState>> = lanes
             .into_iter()
             .map(|ld| {
@@ -714,6 +746,8 @@ impl InMemoryStore {
         Self {
             lanes: lane_states,
             pool_cells: std::sync::RwLock::new(std::collections::HashMap::new()),
+            hard_down_cooldown_secs,
+            max_honored_retry_after_secs,
             swrr_shards: (0..SWRR_SHARDS)
                 .map(|_| std::sync::Mutex::new(()))
                 .collect(),
@@ -841,11 +875,16 @@ impl InMemoryStore {
     /// Compute escalating cooldown duration with optional Retry-After floor.
     /// If retry_after is Some and honor_retry_after is true, the cooldown is max(computed_backoff, retry_after).
     /// The server's explicit Retry-After is always respected even if it exceeds max_cooldown_secs.
+    // NOTE: the honored-`Retry-After` CEILING is threaded in as a parameter (rather than read from
+    // `&self`) because this and the `cell_*` helpers below are STATIC (`c: &dyn BreakerCellAccess`,
+    // not `&self`) so they can run under the per-cell transition lock without re-borrowing the store.
+    // Every caller is an `&self` method that passes `self.max_honored_retry_after_secs`.
     fn compute_cooldown_with_retry_after(
         c: &dyn BreakerCellAccess,
         _now: u64,
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
+        max_honored_retry_after_secs: u64,
     ) -> u64 {
         let streak = c.streak().load(Ordering::Relaxed);
 
@@ -929,7 +968,7 @@ impl InMemoryStore {
         // honoring, the server value is ignored entirely and the computed backoff stands (returning
         // `ra` verbatim there could SHORTEN the cooldown below the backoff floor).
         match (cfg.honor_retry_after, retry_after) {
-            (true, Some(ra)) => duration.max(ra.min(MAX_HONORED_RETRY_AFTER_SECS)),
+            (true, Some(ra)) => duration.max(ra.min(max_honored_retry_after_secs)),
             (false, Some(_)) => duration,
             (true, None) | (false, None) => duration,
         }
@@ -946,9 +985,10 @@ impl InMemoryStore {
         now_time: u64,
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
+        max_honored_retry_after_secs: u64,
     ) {
         let _tx = lock_recover(c.transition_lock());
-        Self::cell_open_locked(c, now_time, cfg, retry_after);
+        Self::cell_open_locked(c, now_time, cfg, retry_after, max_honored_retry_after_secs);
     }
 
     /// `cell_open` body, assuming the caller already holds `c.transition_lock()`. Used by the record
@@ -959,8 +999,15 @@ impl InMemoryStore {
         now_time: u64,
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
+        max_honored_retry_after_secs: u64,
     ) {
-        let duration = Self::compute_cooldown_with_retry_after(c, now_time, cfg, retry_after);
+        let duration = Self::compute_cooldown_with_retry_after(
+            c,
+            now_time,
+            cfg,
+            retry_after,
+            max_honored_retry_after_secs,
+        );
         // saturating_add: `duration` can be a server-supplied Retry-After (clamped in
         // compute_cooldown_with_retry_after, but defense-in-depth) — never wrap `now + duration`,
         // which in release would land `cooldown_until` in the past and instantly re-ready a tripped
@@ -1216,6 +1263,7 @@ impl InMemoryStore {
         now_time: u64,
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
+        max_honored_retry_after_secs: u64,
     ) -> bool {
         lock_recover(c.outcome_window()).push(now_time, true); // error outcome
         c.err().fetch_add(1, Ordering::Relaxed);
@@ -1241,12 +1289,23 @@ impl InMemoryStore {
         match c.breaker_state().load(Ordering::Acquire) {
             ST_CLOSED => {
                 if Self::should_trip(c, now_time, cfg) {
-                    Self::cell_open_locked(c, now_time, cfg, retry_after);
+                    Self::cell_open_locked(
+                        c,
+                        now_time,
+                        cfg,
+                        retry_after,
+                        max_honored_retry_after_secs,
+                    );
                     // A genuine Closed→Open trip — the only path that should mint a BREAKER_TRIPS_TOTAL.
                     true
                 } else {
-                    let duration =
-                        Self::compute_cooldown_with_retry_after(c, now_time, cfg, retry_after);
+                    let duration = Self::compute_cooldown_with_retry_after(
+                        c,
+                        now_time,
+                        cfg,
+                        retry_after,
+                        max_honored_retry_after_secs,
+                    );
                     // saturating_add: see cell_open — never wrap `now + duration` (breaker-bypass /
                     // debug-panic on a hostile upstream's unbounded Retry-After).
                     c.cooldown_until()
@@ -1257,7 +1316,7 @@ impl InMemoryStore {
             // probe failed → reopen: the lane was already tripped (Open) and won the half-open probe;
             // reopening it re-arms the cooldown but is NOT a fresh Closed→Open trip, so do NOT count it.
             ST_HALF_OPEN => {
-                Self::cell_open_locked(c, now_time, cfg, retry_after);
+                Self::cell_open_locked(c, now_time, cfg, retry_after, max_honored_retry_after_secs);
                 false
             }
             // Already Open: a failure while Open is an intentional no-op (the cooldown is already
@@ -1352,7 +1411,13 @@ impl InMemoryStore {
     /// Transition to Open state with escalated cooldown.
     #[cfg(test)]
     pub(crate) fn open_state(&self, lane: usize, now_time: u64, cfg: &BreakerCfg) {
-        Self::cell_open(self.get_lane(lane).as_ref(), now_time, cfg, None);
+        Self::cell_open(
+            self.get_lane(lane).as_ref(),
+            now_time,
+            cfg,
+            None,
+            self.max_honored_retry_after_secs,
+        );
     }
 
     /// Transition to Open state with escalated cooldown and optional Retry-After floor.
@@ -1364,7 +1429,13 @@ impl InMemoryStore {
         cfg: &BreakerCfg,
         retry_after: Option<u64>,
     ) {
-        Self::cell_open(self.get_lane(lane).as_ref(), now_time, cfg, retry_after);
+        Self::cell_open(
+            self.get_lane(lane).as_ref(),
+            now_time,
+            cfg,
+            retry_after,
+            self.max_honored_retry_after_secs,
+        );
     }
 
     /// Transition to Closed state (probe success). Mirrors the production recovery path: close the
@@ -1627,8 +1698,13 @@ impl InMemoryStore {
         if self.get_lane(lane).dead.load(Ordering::Relaxed) {
             return false; // administratively down — ignore
         }
-        let tripped =
-            Self::cell_record_failure(self.cell(pool, lane).as_ref(), now_time, cfg, retry_after);
+        let tripped = Self::cell_record_failure(
+            self.cell(pool, lane).as_ref(),
+            now_time,
+            cfg,
+            retry_after,
+            self.max_honored_retry_after_secs,
+        );
         // Bump the lane-GLOBAL error counter as well — but ONLY for a NAMED pool. `cell_record_failure`
         // bumps the cell's own `err()`; for a named pool that is the per-pool `BreakerCell.err` (a
         // per-pool diagnostic, distinct from `LaneState.err`), so the `/stats` `LaneState.err` snapshot
@@ -1678,7 +1754,7 @@ impl InMemoryStore {
         tracing::warn!(
             model = %ls.model,
             reason,
-            cooldown_secs = HARD_DOWN_COOLDOWN_SECS,
+            cooldown_secs = self.hard_down_cooldown_secs,
             "lane hard-down; sticky cooldown (recovers via half-open probe)"
         );
         let cell = self.cell(pool, lane);
@@ -1689,7 +1765,7 @@ impl InMemoryStore {
         // dropped) or Closed with the stale sticky cooldown.
         let _tx = lock_recover(cell.transition_lock());
         cell.cooldown_until().store(
-            Self::now_secs().saturating_add(HARD_DOWN_COOLDOWN_SECS),
+            Self::now_secs().saturating_add(self.hard_down_cooldown_secs),
             Ordering::Release,
         );
         cell.breaker_state().store(ST_OPEN, Ordering::Release);
@@ -2008,10 +2084,11 @@ impl StateStore for InMemoryStore {
         // Hard-down is RECOVERABLE: a sticky cooldown + Open, recovered via the half-open probe; do
         // NOT set `dead` (that would block recovery). Record the reason once, lane-wide.
         *lock_recover(&ls.dead_reason) = reason.to_string();
+        let hard_down_cooldown_secs = self.hard_down_cooldown_secs;
         tracing::warn!(
             model = %ls.model,
             reason,
-            cooldown_secs = HARD_DOWN_COOLDOWN_SECS,
+            cooldown_secs = hard_down_cooldown_secs,
             "lane hard-down (all cells); sticky cooldown (recovers via half-open probe)"
         );
         let now = Self::now_secs();
@@ -2023,7 +2100,7 @@ impl StateStore for InMemoryStore {
             // strictly-outer lock (transition fns never reach back to `pool_cells`).
             let _tx = lock_recover(c.transition_lock());
             c.cooldown_until().store(
-                now.saturating_add(HARD_DOWN_COOLDOWN_SECS),
+                now.saturating_add(hard_down_cooldown_secs),
                 Ordering::Release,
             );
             c.breaker_state().store(ST_OPEN, Ordering::Release);
@@ -2114,8 +2191,14 @@ impl StateStore for InMemoryStore {
         // (the probe's server-requested cooldown floor) is forwarded so a 429/Retry-After probe honors
         // the upstream's backoff; `cell_record_failure` applies it only when `honor_retry_after` is set.
         let default_cfg = resolve_cfg("");
-        let _ =
-            Self::cell_record_failure(self.get_lane(lane).as_ref(), now, &default_cfg, retry_after);
+        let max_honored_retry_after_secs = self.max_honored_retry_after_secs;
+        let _ = Self::cell_record_failure(
+            self.get_lane(lane).as_ref(),
+            now,
+            &default_cfg,
+            retry_after,
+            max_honored_retry_after_secs,
+        );
         // Every existing per-pool cell for this lane — the cells organic traffic is selected against,
         // each evaluated against ITS OWN pool's resolved breaker config (trip thresholds + cooldown
         // backoff), not a one-size default. (A cell not yet created inherits health lazily on first
@@ -2123,7 +2206,13 @@ impl StateStore for InMemoryStore {
         let cells = read_recover(&self.pool_cells);
         for (pool_name, cell) in cells.get(&lane).into_iter().flatten() {
             let cfg = resolve_cfg(pool_name);
-            let _ = Self::cell_record_failure(cell.as_ref(), now, &cfg, retry_after);
+            let _ = Self::cell_record_failure(
+                cell.as_ref(),
+                now,
+                &cfg,
+                retry_after,
+                max_honored_retry_after_secs,
+            );
         }
     }
 

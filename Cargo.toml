@@ -16,6 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.7"
+# Already present transitively (axum's middleware stack). Pulled in directly ONLY for
+# `GlobalConcurrencyLimitLayer` — the OUTERMOST inbound-concurrency cap applied when the operator
+# sets `limits.max_inbound_concurrent > 0` (the `0` default adds NO layer). `limit` is the sole
+# feature needed.
+tower = { version = "0.5", features = ["limit"] }
 # Only the subsystems busbar actually touches: the multi-thread runtime (#[tokio::main],
 # spawn/JoinHandle), macros (main/test), net (TcpListener), time (sleep/interval), sync
 # (Semaphore/OwnedSemaphorePermit), and signal (graceful-shutdown ctrl_c/SIGTERM, so OTLP spans

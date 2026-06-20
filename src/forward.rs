@@ -28,12 +28,12 @@ use crate::store::{now, Permit};
 /// Without this the upstream 400s with `max_tokens: Field required`. Uses the lane's configured
 /// `default_max_tokens`, falling back to `crate::proto::DEFAULT_MAX_TOKENS`. No-op when the IR
 /// already carries a value or the egress protocol treats `max_tokens` as optional.
-fn apply_required_max_tokens(ir: &mut crate::ir::IrRequest, lane: &Lane) {
+fn apply_required_max_tokens(ir: &mut crate::ir::IrRequest, lane: &Lane, default_max_tokens: u32) {
     if ir.max_tokens.is_none() && lane.protocol.writer().requires_max_tokens() {
-        ir.max_tokens = Some(
-            lane.default_max_tokens
-                .unwrap_or(crate::proto::DEFAULT_MAX_TOKENS),
-        );
+        // Per-lane `default_max_tokens` wins; otherwise the operator-configured GLOBAL fallback
+        // (`limits.default_max_tokens`, threaded via `App`), which defaults to
+        // `proto::DEFAULT_MAX_TOKENS` (4096).
+        ir.max_tokens = Some(lane.default_max_tokens.unwrap_or(default_max_tokens));
     }
 }
 
@@ -371,7 +371,7 @@ pub(crate) fn translate_request_cross_protocol(
         };
         match ingress_proto.reader().read_request(&body) {
             Ok(mut ir) => {
-                apply_required_max_tokens(&mut ir, &app.lanes[i]);
+                apply_required_max_tokens(&mut ir, &app.lanes[i], app.default_max_tokens);
                 // CROSS-PROTOCOL tool-id reverse remap (the request half of the §Finding-2 class fix).
                 // On the prior cross-protocol RESPONSE we reshaped each egress `tool_use` id to the
                 // ingress client's native shape (e.g. OpenAI `call_…` → Anthropic `toolu_bb1<hex>`). The
@@ -443,8 +443,14 @@ pub(crate) fn translate_request_cross_protocol(
 /// smaller than this; the cap stops a hostile or misconfigured upstream from forcing an unbounded
 /// heap allocation per in-flight non-2xx response (the inbound request body is already capped
 /// separately). This is the TIGHT cap — it is deliberately NOT reused for buffering a legitimate
-/// cross-protocol 2xx completion (see [`MAX_TRANSLATED_BODY_BYTES`]).
-const MAX_UPSTREAM_BUFFERED_BYTES: usize = 256 * 1024;
+/// cross-protocol 2xx completion (see [`max_translated_body_bytes`]).
+///
+/// Operator-tunable via `limits.upstream_error_body_max_bytes` (defaults to 256 KiB). A function (not
+/// a `const`) so the process-wide installed value is read at each use site; falls back to the
+/// historical default when the limits aren't installed (e.g. unit tests).
+fn max_upstream_buffered_bytes() -> usize {
+    crate::limits::upstream_error_body_max_bytes()
+}
 
 /// Worst-case per-poll scan budget for the [`UsageTap`] stream scanners (`feed` and
 /// `feed_eventstream`). A single coalesced terminal flush is realistically far smaller than this;
@@ -458,9 +464,15 @@ const MAX_SCAN_BYTES: usize = 512 * 1024;
 /// arguments, embedded content) can far exceed the tight error-body cap; truncating it would make
 /// `serde_json` parsing fail and the request would be reported to the client as a spurious 500 for
 /// what was actually an upstream success (the caller may even have been token-charged). This cap is
-/// aligned with the inbound request-body limit (32 MiB) so any completion the gateway would accept
-/// inbound can also be buffered for translation, while still bounding the per-response allocation.
-const MAX_TRANSLATED_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// COUPLED with the inbound request-body limit so any completion the gateway would accept inbound
+/// can also be buffered for translation, while still bounding the per-response allocation. ONE knob
+/// (`limits.request_body_max_bytes`) drives BOTH the inbound `DefaultBodyLimit` and this egress cap
+/// (`crate::limits::translate_body_max_bytes` returns the same value), so they can never diverge.
+/// A function (not a `const`) so the installed value is read at each use site; falls back to the
+/// historical 32 MiB default when the limits aren't installed (e.g. unit tests).
+fn max_translated_body_bytes() -> usize {
+    crate::limits::translate_body_max_bytes()
+}
 
 /// Read an upstream response body, buffering at most `cap` bytes. Streams chunks with a running byte
 /// counter rather than `r.bytes()` (which would buffer the entire — possibly multi-gigabyte — body
@@ -531,7 +543,7 @@ async fn read_capped(r: reqwest::Response, cap: usize) -> (Bytes, ReadEnd) {
 /// A truncated error body still classifies/relays correctly (error envelopes are well under the cap,
 /// and a body that overruns it can only be malformed/hostile), so the truncation flag is discarded.
 async fn read_capped_body(r: reqwest::Response) -> Bytes {
-    read_capped(r, MAX_UPSTREAM_BUFFERED_BYTES).await.0
+    read_capped(r, max_upstream_buffered_bytes()).await.0
 }
 
 /// Map the classified `StatusClass` of a CLIENT-fault upstream 4xx to a protocol-agnostic error
@@ -1265,15 +1277,15 @@ where
                         // stay non-buffering). Cap at `MAX_TRANSLATED_BODY_BYTES`; past the cap, drop
                         // the overflow with a warn (matching the buffered `read_capped` guards) — the
                         // tail `usage` may then be missed, but the gap is observable, not a memory leak.
-                        if this.nonstream_buf.len() < MAX_TRANSLATED_BODY_BYTES {
-                            let remaining = MAX_TRANSLATED_BODY_BYTES - this.nonstream_buf.len();
+                        if this.nonstream_buf.len() < max_translated_body_bytes() {
+                            let remaining = max_translated_body_bytes() - this.nonstream_buf.len();
                             if chunk.len() <= remaining {
                                 this.nonstream_buf.extend_from_slice(&chunk);
                             } else {
                                 this.nonstream_buf.extend_from_slice(&chunk[..remaining]);
                                 tracing::warn!(
                                     buffered = this.nonstream_buf.len(),
-                                    cap = MAX_TRANSLATED_BODY_BYTES,
+                                    cap = max_translated_body_bytes(),
                                     "same-protocol non-stream body exceeded the usage-tap reassembly \
                                      cap; if the tail usage frame fell past the cap, this request's \
                                      tokens are undercounted (TPM/spend may be undercharged)"
@@ -3213,7 +3225,7 @@ pub(crate) async fn forward_with_pool_parsed(
                     // legitimate 2xx completion can far exceed 256 KiB and must be buffered WHOLE to
                     // parse+translate. `truncated` distinguishes "too large to translate" from
                     // "genuinely unparseable" so a too-large success is not mis-reported as a 500.
-                    let (bytes, read_end) = read_capped(r, MAX_TRANSLATED_BODY_BYTES).await;
+                    let (bytes, read_end) = read_capped(r, max_translated_body_bytes()).await;
                     // Re-record the upstream RTT now that the WHOLE body has arrived. On this buffered
                     // cross-protocol path Busbar awaits the entire upstream response before it can
                     // parse+translate, so the body-download time is part of the upstream cost, not
@@ -3280,7 +3292,7 @@ pub(crate) async fn forward_with_pool_parsed(
                         tracing::warn!(
                             ingress = %ingress_protocol,
                             egress = %app.lanes[i].protocol.name(),
-                            cap = MAX_TRANSLATED_BODY_BYTES,
+                            cap = max_translated_body_bytes(),
                             "cross-protocol non-stream success body exceeded the translation cap; \
                              cannot translate, not charging tokens, returning ingress-native error"
                         );
@@ -4011,7 +4023,7 @@ async fn forward_once(
                 // COMPLETION cap (not the tight error-body cap): a legitimate 2xx can far exceed
                 // 256 KiB and must be buffered whole to translate; `truncated` lets us return a
                 // clear error instead of mis-reporting a too-large success as untranslatable.
-                let (bytes, read_end) = read_capped(r, MAX_TRANSLATED_BODY_BYTES).await;
+                let (bytes, read_end) = read_capped(r, max_translated_body_bytes()).await;
                 // Re-record the upstream RTT through full-body receipt (see the main forward path):
                 // on the buffered cross-protocol path the body-download is upstream cost, not Busbar's,
                 // so the `Server-Timing` figure must exclude it.
@@ -4065,7 +4077,7 @@ async fn forward_once(
                     tracing::warn!(
                         ingress = %ingress_protocol,
                         egress = %egress_name,
-                        cap = MAX_TRANSLATED_BODY_BYTES,
+                        cap = max_translated_body_bytes(),
                         "cross-protocol non-stream success body exceeded the translation cap; \
                          cannot translate, not charging tokens, returning ingress-native error"
                     );
@@ -7529,7 +7541,7 @@ data: {"type":"message_stop"}"#
         let state = Arc::new(MockServerState::new());
         // An OpenAI chat.completion whose `content` alone is > 32 MiB, so the whole body overruns
         // MAX_TRANSLATED_BODY_BYTES and `read_capped` reports ReadEnd::Truncated.
-        let huge = "x".repeat(super::MAX_TRANSLATED_BODY_BYTES + 1024);
+        let huge = "x".repeat(super::max_translated_body_bytes() + 1024);
         state.push(MockResponse::Ok {
             status: StatusCode::OK,
             body: json!({
