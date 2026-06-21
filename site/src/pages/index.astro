@@ -10,6 +10,22 @@ import glyphPrimary from '../assets/busbar-primary.svg';
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
 const DOCS = '/why-busbar/';
 
+// GitHub star count, fetched at build time (refreshes on each deploy); the inline script
+// near the end of the page keeps it live for visitors. Falls back to no count if the API
+// is unreachable when the site is built.
+let starsLabel = '';
+try {
+  const ghHeaders = { Accept: 'application/vnd.github+json', 'User-Agent': 'busbar-site' };
+  // CI passes GITHUB_TOKEN (5000 req/hr) so the deployed baseline is always populated even on a
+  // shared runner IP; local builds fall back to the 60/hr unauthenticated limit.
+  if (process.env.GITHUB_TOKEN) ghHeaders.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  const res = await fetch('https://api.github.com/repos/MattJackson/busbarAI', { headers: ghHeaders });
+  if (res.ok) {
+    const n = (await res.json()).stargazers_count;
+    if (typeof n === 'number') starsLabel = n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+  }
+} catch { /* offline build — render the button without a count */ }
+
 const protocols = ['OpenAI', 'Anthropic', 'Gemini', 'Bedrock', 'Cohere', 'Responses'];
 
 const features = [
@@ -117,7 +133,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           <a href={DOCS}>Docs</a>
           <a href="/benchmark/">Benchmark</a>
           <a href="/download/">Download</a>
-          <a href={GITHUB} class="ghost">GitHub</a>
+          <a href={GITHUB} class="star-link" target="_blank" rel="noopener"><span data-star-count>{starsLabel}</span>★ GitHub</a>
         </nav>
       </div>
     </header>
@@ -383,6 +399,9 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       .btn-ghost:hover { border-color: #cbd5e1; box-shadow: 0 6px 16px rgba(15,23,42,0.07); }
       .btn-text { background: transparent; border-color: transparent; color: var(--charcoal); padding-left: 6px; padding-right: 6px; }
       .btn-text:hover { transform: none; box-shadow: none; color: var(--slate); }
+      .nav-links a.star-link { color: #ca8a04; font-weight: 700; }
+      .nav-links a.star-link:hover { color: #a16207; }
+      .nav-links a.star-link [data-star-count] { font-weight: 600; }
 
       /* HERO */
       .hero {
@@ -597,5 +616,22 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         .diagram { padding: 24px 16px 24px; }
       }
     </style>
+    <script is:inline>
+      // Live GitHub star count on each page load; the build-time value renders instantly so
+      // there is no layout shift, then this refreshes it to the current number.
+      fetch('https://api.github.com/repos/MattJackson/busbarAI', {
+        headers: { Accept: 'application/vnd.github+json' },
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          if (!d || typeof d.stargazers_count !== 'number') return;
+          const n = d.stargazers_count;
+          const label = n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+          document.querySelectorAll('.star-link [data-star-count]').forEach((el) => {
+            el.textContent = label;
+          });
+        })
+        .catch(() => {});
+    </script>
   </body>
 </html>

@@ -37,6 +37,10 @@ jobs:
           cache-dependency-path: site/package-lock.json
       - run: npm ci
       - run: npm run build   # runs sync-docs (../docs -> content) then astro build
+        env:
+          # Lifts the star-count fetch in the landing page off the 60/hr unauthenticated limit
+          # (shared runner IP) so the deployed baseline count is always populated.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site/dist
