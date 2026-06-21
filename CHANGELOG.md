@@ -5,12 +5,10 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
 ## [1.0.0] — 2026-06-21
 
 First stable release. 1.0.0 keeps the `1.0.0-rc.7` architecture (all traffic through the superset IR
-with a verbatim serialize short-circuit, IR-metered billing) and ships an extensive convergence-
+with a verbatim serialize short-circuit, IR-metered billing) and ships an extensive
 hardening pass on top of it. The HTTP API, configuration schema, and the six wire-protocol contracts
 are stable under Semantic Versioning: no breaking change without a major-version bump.
 
@@ -203,8 +201,8 @@ breaker FSM, and governance contract are unchanged.
 
 Three independent features land together: pluggable routing policies, deeper Prometheus
 observability, and native inbound TLS/mTLS. The request path, wire protocols, breaker FSM,
-and governance contract are unchanged. This release also folds in a multi-round security
-and correctness audit and an internal provider-containment refactor.
+and governance contract are unchanged. This release also folds in a security and correctness
+hardening pass and an internal provider-containment refactor.
 
 ### Added
 
@@ -306,7 +304,7 @@ and correctness audit and an internal provider-containment refactor.
 - **SSRF guard covers the Oracle Cloud metadata address.** The trusted-upstream net guard
   now blocks `192.0.0.192` alongside the other link-local / cloud-metadata ranges.
 - Additional cross-cutting correctness fixes (streaming-translation
-  vtable flag propagation, request-id header constant) and the multi-round security and
+  vtable flag propagation, request-id header constant) from the security and
   correctness review.
 
 ### Changed
@@ -318,14 +316,9 @@ and correctness audit and an internal provider-containment refactor.
 
 ## [1.0.0-rc.4] — 2026-06-16
 
-A continuation of the rc.3 hardening campaign: continued independent
-security/correctness auditing over the rc.3 tree, with adversarial triage and
-class-level fixes. No API changes vs rc.3.
-
-The severity gate — **0 critical / 0 high / 0 medium-security / 0 medium-correctness**
-— is met; the remaining items are documented low/medium-completeness notes. The
-test suite grew from 267 (rc.2) to **1334** passing; `fmt`, `build`, `clippy
--D warnings`, and `test` all green.
+A continued security and correctness hardening pass over the rc.3 tree, with class-level
+fixes. No API changes vs rc.3. The test suite grew from 267 (rc.2) to **1334** passing;
+`fmt`, `build`, `clippy -D warnings`, and `test` all green.
 
 ### Fixed
 - **Circuit-breaker / streaming / FSM cluster** — clean SSE stream-end no longer
@@ -343,14 +336,13 @@ test suite grew from 267 (rc.2) to **1334** passing; `fmt`, `build`, `clippy
 - **Same-protocol non-stream large-body token undercount** — `FirstByteBody`
   now buffers and feeds the whole body once, so usage is no longer dropped past
   the per-chunk scan cap.
-- A long tail of medium/low conformance, governance, admin-validation, and
-  protocol-translation findings across all six wire protocols (see the private
-  audit residuals for the per-finding ledger).
+- A long tail of conformance, governance, admin-validation, and protocol-translation
+  fixes across all six wire protocols.
 
 ## [1.0.0-rc.3] — 2026-06-10
 
-This is a hardening release: a multi-round security/correctness audit campaign over the rc.2 code,
-plus the universal-ingress feature. No API changes vs rc.2 beyond the new ingress routes.
+A security and correctness hardening release, plus the universal-ingress feature. No API changes
+vs rc.2 beyond the new ingress routes.
 
 ### Added
 - **Universal ingress — all six protocols are now first-class ingress.** Previously
@@ -575,8 +567,8 @@ source for correctness, robustness, and security.
     longer holds. `/metrics` now goes through the same auth check as any other route
     — only `/healthz` stays unauthenticated for liveness probes — though under
     `none`/`passthrough` mode the check still admits unconditionally. See the
-    Unreleased *Security* entry above and `src/auth.rs` (`auth_middleware`). The
-    original line is kept as-written to preserve the historical record.
+    **Security** notes in the 1.0.0-rc releases above and `src/auth.rs` (`auth_middleware`)
+    for the current behavior. The original line is kept as-written to preserve the historical record.
 
 ## [0.16.1] — 2026-05-31
 
@@ -689,5 +681,3 @@ source for correctness, robustness, and security.
 ### Changed
 - Licensed the project under **AGPL-3.0-or-later** (previously MIT) — the AGPL's
   network-use clause is the appropriate copyleft for a gateway run as a service.
-
-[Unreleased]: https://github.com/MattJackson/busbarAI/commits/main
