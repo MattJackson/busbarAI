@@ -143,7 +143,7 @@ futures = "0.3"
 bytes = "1"
 # Generates self-signed server certs + a CA/leaf pair at test runtime so the TLS/mTLS integration
 # tests exercise a real rustls handshake without checked-in key material.
-rcgen = "0.13"
+rcgen = "0.14"
 
 [profile.release]
 # Tuned for the shipped "deploy-and-done" binary: max optimization and smallest size,
