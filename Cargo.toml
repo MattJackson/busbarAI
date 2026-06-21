@@ -15,7 +15,7 @@ name = "busbar"
 path = "src/main.rs"
 
 [dependencies]
-axum = "0.7"
+axum = "0.8"
 # Already present transitively (axum's middleware stack). Pulled in directly ONLY for
 # `GlobalConcurrencyLimitLayer` — the OUTERMOST inbound-concurrency cap applied when the operator
 # sets `limits.max_inbound_concurrent > 0` (the `0` default adds NO layer). `limit` is the sole
@@ -137,7 +137,7 @@ script-policy = ["dep:rhai"]
 [dev-dependencies]
 # In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
-axum = { version = "0.7", features = ["http1"] }
+axum = { version = "0.8", features = ["http1"] }
 http-body-util = "0.1"
 futures = "0.3"
 bytes = "1"
