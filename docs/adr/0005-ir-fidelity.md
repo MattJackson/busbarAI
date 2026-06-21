@@ -34,8 +34,10 @@ protocols can represent, not the intersection:
 - `IrResponse` carries `model` (the upstream-reported serving model) so a pooled
   cross-protocol response still names the member that served it, matching a direct
   route.
-- Same-protocol requests skip the IR entirely and pass through byte-for-byte
-  (`forward_with_pool` only translates when `ingress_protocol != egress_name`).
+- Same-protocol requests are never cross-protocol-translated: the IR read→write
+  translation only runs when `ingress_protocol != egress_name`. A same-protocol hop
+  that triggers no body mutation re-emits its original bytes verbatim (byte-for-byte),
+  so passthrough stays lossless.
 
 Translation rides the `ProtocolReader` / `ProtocolWriter` seam (referenced as
 ADR-0006 in `src/proto/mod.rs`; that seam is the *mechanism*, while this ADR is

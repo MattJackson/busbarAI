@@ -12,8 +12,8 @@
 //! ## Dependency discipline
 //! The whole module is behind the `script-policy` cargo feature (`rhai` is `optional`). The DEFAULT
 //! build pulls NO Rhai — Busbar's small static binary stays small. When an operator configures a
-//! `route: script` pool WITHOUT the feature, [`build_policy`] returns a clear "feature not enabled"
-//! error so it degrades loudly (the seam still falls back to the pool default, never a hang).
+//! `route: script` pool WITHOUT the feature, the policy resolver (`resolve_script`) returns a clear
+//! "feature not enabled" error so it degrades loudly (the seam still falls back to the pool default, never a hang).
 //!
 //! ## Sandbox
 //! The engine is locked down HARD: a max-operations cap (so a runaway/`while true {}` script
@@ -23,7 +23,7 @@
 //! module resolver unset and never exposing any host fn that can do I/O.
 //!
 //! ## Compile once
-//! The script is parsed into an `AST` ONCE in [`build_policy`] (at config load), not per request.
+//! The script is parsed into an `AST` ONCE in `ScriptPolicy::compile` (at config load), not per request.
 //! With Rhai's `sync` feature both `Engine` and `AST` are `Send + Sync`, so the compiled
 //! [`ScriptPolicy`] drops straight into `Arc<dyn RoutingPolicy>`. `decide` runs the synchronous eval
 //! on the blocking pool (so a hostile script can't pin an async worker) under a hard wall-clock budget

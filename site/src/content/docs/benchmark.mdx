@@ -7,7 +7,7 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 "How much latency does Busbar add?" has one honest answer — its **added latency**: the microseconds
 Busbar itself spends parsing your request, translating it, and serializing the response, *not* the
-network and *not* the model. Busbar measures exactly that and reports it in-band on every response, in a
+network and *not* the model. Busbar measures exactly that and reports it in-band on every response (when enabled — see below), in a
 standard header:
 
 ```http
@@ -33,7 +33,7 @@ its numbers mean anything — so we don't.
     - **p50 / p99 / p99.9** — percentiles. p50 is the median (half are faster); p99 means 1 in 100 is slower; p99.9 is the tail, 1 in 1,000.
 
     One AWS **`c7g.2xlarge`** (8 vCPU, Graviton3) in **us-east-1**, Amazon Linux 2023, running the
-    released **`v1.0.0-rc.6`** `aarch64` binary. Busbar is `taskset`-pinned to **2 dedicated cores**; the
+    released **`v1.0.0`** `aarch64` binary. Busbar is `taskset`-pinned to **2 dedicated cores**; the
     load generator and the mock get *different* cores. The headline metric is Busbar's own
     `Server-Timing: busbar;dur=` value, captured per request; Busbar's CPU is logged from `/proc`. Each
     cell is thousands of requests at concurrency 1 (the per-request floor).
@@ -157,3 +157,6 @@ its numbers mean anything — so we don't.
 **Why a standard header.** `Server-Timing` is W3C-standard — you can read `busbar;dur` in browser
 DevTools or any APM tool, on your own production traffic, with no special tooling. The overhead number
 isn't a one-time lab claim; it's something you can verify continuously, on your own requests.
+
+**Enabling it.** The `Server-Timing` header is opt-in (default off) to avoid fingerprinting Busbar on
+unauthenticated responses. Set `observability.emit_server_timing: true` in `config.yaml` to turn it on.

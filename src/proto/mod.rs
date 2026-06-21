@@ -19,42 +19,24 @@ pub(crate) use crate::breaker::StatusClass;
 // Import types needed for response/stream IR
 use crate::ir::{IrBlockMeta, IrDelta, IrStreamEvent, IrUsage};
 
+/// Busbar-internal `provider_signal` label for an IR-parse failure (the LANE label the breaker/metrics
+/// layer reads to classify a translation/parse error). A busbar-internal signal, NOT a wire shape, so
+/// it lives in the agnostic proto layer; the per-protocol readers reference it rather than re-spelling
+/// the literal.
+pub(crate) const SIGNAL_IR_PARSE: &str = "ir_parse";
+
+/// The OpenAI-style SSE stream terminator sentinel (`data: [DONE]`). The bare token is matched by the
+/// cross-protocol streaming core and several readers; the full framed bytes are emitted on egress.
+/// Shared here so no reader/writer re-spells either form.
+pub(crate) const SSE_DONE_SENTINEL: &str = "[DONE]";
+pub(crate) const SSE_DONE_FRAME: &[u8] = b"data: [DONE]\n\n";
+
+/// The HTTP `Authorization` header name (lowercase, canonical). Emitted by the bearer/SigV4 auth-header
+/// builders across protocols; named once so no builder re-spells it.
+pub(crate) const HDR_AUTHORIZATION: &str = "authorization";
+
 /// An IR-level error, currently an alias for `CanonicalSignal` (the normalized error signal).
 pub(crate) type IrError = crate::breaker::CanonicalSignal;
-
-/// Map an OpenAI-family error `type` string onto its canonical machine-readable `code`, shared by
-/// the OpenAI Chat Completions and `/v1/responses` writers (both emit the identical OpenAI error
-/// envelope). A real bad-key 401 returns `{"type":"authentication_error", ..., "code":"invalid_api_key"}`
-/// and the official SDKs surface `error.code` to callers, so emitting `code: null` on an auth (or
-/// over-quota) failure is a deterministic proxy tell that contradicts the total-indistinguishability
-/// promise — we mirror the native pairing for those two types. Every other modeled type, plus any
-/// caller-supplied passthrough type, keeps `null`: the shape OpenAI uses when no machine-readable
-/// code applies. There is no `_ =>` catch-all hiding an unhandled case; the final arm binds `other`
-/// explicitly and emits `null`, the correct native value for those types.
-pub(crate) fn bearer_error_code(error_type: &str) -> serde_json::Value {
-    match error_type {
-        "authentication_error" => serde_json::Value::String("invalid_api_key".to_string()),
-        // Real OpenAI quota-exhaustion errors carry BOTH `type` and `code` set to
-        // `insufficient_quota` (HTTP 429). The over-budget governance path
-        // (route.rs `ingress_error(..., "insufficient_quota", ...)`) reaches these writers with that
-        // type; emitting `code: null` for it is an SDK-visible mismatch (the official client surfaces
-        // `error.code == "insufficient_quota"`) and a proxy tell, so we mirror the native pairing.
-        "insufficient_quota" => serde_json::Value::String("insufficient_quota".to_string()),
-        "invalid_request_error"
-        | "permission_error"
-        | "not_found_error"
-        | "rate_limit_error"
-        | "server_error"
-        | "api_error" => serde_json::Value::Null,
-        other => {
-            // A caller-supplied passthrough type we model no code for: OpenAI carries no
-            // machine-readable code for these, so `null` matches the native shape. Named binding
-            // (not `_`) keeps the arm explicit per the no-catch-all rule.
-            let _ = other;
-            serde_json::Value::Null
-        }
-    }
-}
 
 /// Build the `Authorization: Bearer <key>` header pair for the pure-Bearer protocol writers
 /// (OpenAI, `/v1/responses`, Gemini's `x-goog`… aside, Cohere). Shared so the warn+OMIT policy lives
@@ -71,7 +53,7 @@ pub(crate) fn bearer_error_code(error_type: &str) -> serde_json::Value {
 /// secret); only the protocol name and the fact that the bytes are malformed.
 pub(crate) fn bearer_auth_headers(proto: &str, key: &str) -> Vec<(HeaderName, HeaderValue)> {
     match HeaderValue::from_str(&format!("Bearer {key}")) {
-        Ok(value) => vec![(HeaderName::from_static("authorization"), value)],
+        Ok(value) => vec![(HeaderName::from_static(HDR_AUTHORIZATION), value)],
         Err(_) => {
             tracing::warn!(
                 protocol = proto,
@@ -84,197 +66,59 @@ pub(crate) fn bearer_auth_headers(proto: &str, key: &str) -> Vec<(HeaderName, He
 }
 
 /// Decompose an OpenAI/Responses `image_url` string into the IR `(media_type, data)` pair. Shared
-/// verbatim by `openai.rs` and `responses.rs` (both surfaces use the same `image_url` wire shape).
+/// verbatim by `openai_chat.rs` and `openai_responses.rs` (both surfaces use the same `image_url` wire shape).
 ///
 /// A `data:<mime>;base64,<payload>` URI is decomposed into its real MIME type ("image/png") and raw
 /// base64 payload, matching the IR contract the Anthropic reader/writer use for base64 images. Any
 /// other URL (an https reference, or a data URI we cannot confidently split) is preserved verbatim in
 /// `data` with an "image_url" media_type sentinel so the writer can reconstruct the exact original
 /// `image_url` on a same-protocol round-trip rather than mangling it.
-pub(crate) fn parse_image_url(url: &str) -> (String, String) {
+pub(crate) fn parse_image_url(url: &str) -> crate::ir::IrImageSource {
     if let Some(rest) = url.strip_prefix("data:") {
         if let Some((meta, payload)) = rest.split_once(',') {
             // meta is e.g. "image/png;base64" or "image/png" — keep only the MIME type.
             let media_type = meta.split(';').next().unwrap_or("").to_string();
             if meta.contains("base64") && !media_type.is_empty() {
-                return (media_type, payload.to_string());
+                return crate::ir::IrImageSource::Base64 {
+                    media_type,
+                    data: payload.to_string(),
+                };
             }
         }
     }
-    // Non-data URL (https://...) or an unrecognized data URI: keep it verbatim under the
-    // `image_url` sentinel so the writer round-trips it as-is rather than mangling it.
-    ("image_url".to_string(), url.to_string())
+    // Non-data URL (https://...) or an unrecognized data URI: keep it verbatim as a URL reference so
+    // the writer round-trips it as-is rather than mangling it.
+    crate::ir::IrImageSource::Url(url.to_string())
 }
 
-/// Reconstruct an OpenAI/Responses `image_url` string from the IR `Image` (media_type, data) pair —
-/// the inverse of [`parse_image_url`]. A URL-sentinel image is emitted verbatim; a base64 image is
-/// re-wrapped into a `data:<mime>;base64,<payload>` URI. Shared verbatim by `openai.rs` and
-/// `responses.rs`.
-pub(crate) fn image_url_from_ir(media_type: &str, data: &str) -> String {
-    if media_type == "image_url" {
-        data.to_string()
-    } else {
-        format!("data:{media_type};base64,{data}")
+/// Reconstruct an OpenAI/Responses `image_url` string from an [`crate::ir::IrImageSource`] — the
+/// inverse of [`parse_image_url`]. A `Url` is emitted verbatim; a `Base64` is re-wrapped into a
+/// `data:<mime>;base64,<payload>` URI. A `Vendor` reference has no `image_url` projection, so
+/// returns `None` and the caller drops the block with a warn. Shared by `openai_chat.rs` and `openai_responses.rs`.
+pub(crate) fn image_url_from_ir(source: &crate::ir::IrImageSource) -> Option<String> {
+    match source {
+        crate::ir::IrImageSource::Url(url) => Some(url.clone()),
+        crate::ir::IrImageSource::Base64 { media_type, data } => {
+            Some(format!("data:{media_type};base64,{data}"))
+        }
+        // An opaque vendor reference has no neutral `image_url` projection.
+        crate::ir::IrImageSource::Vendor { .. } => None,
     }
 }
 
-/// SENTINEL value placed in an IR `Thinking { signature }` to mark that the block is actually a
-/// Bedrock Converse `reasoningContent.redactedContent` block (encrypted/redacted reasoning bytes),
-/// NOT a plaintext `reasoningText`. Promoted to this shared module (wire-correctness, HIGH-2) so
-/// EVERY writer can recognize it: the Bedrock writer re-emits `redactedContent` from it, but the
-/// NON-Bedrock writers (Anthropic / Gemini / Responses) MUST NOT emit this `__busbar`-prefixed
-/// marker as a signature on the wire — doing so leaks a busbar fingerprint AND an invalid signature
-/// to a native SDK. The streaming form APPENDS the redacted bytes (`{SENTINEL}{base64}`), so a
-/// PREFIX match (see [`is_redacted_reasoning_sig`]) is required, not equality.
-pub(crate) const REASONING_REDACTED_SIG_SENTINEL: &str = "__busbar_bedrock_redacted_reasoning";
-
-/// True when `sig` is a redacted-reasoning sentinel signature — either the bare sentinel (the
-/// non-stream form) or the sentinel with the redacted bytes appended (the stream form,
-/// `{SENTINEL}{base64}`). Every non-Bedrock signature-emission site must DROP a signature for which
-/// this returns true rather than write the `__busbar` marker onto the wire.
-pub(crate) fn is_redacted_reasoning_sig(sig: &str) -> bool {
-    sig.starts_with(REASONING_REDACTED_SIG_SENTINEL)
+/// True when an image source is a vendor-scoped reference with no neutral form — a foreign writer
+/// that sees one must skip the image with a `tracing::warn!` instead of emitting a corrupt block. The
+/// PRODUCING protocol re-emits its own `Vendor` reference same-protocol and does NOT route through
+/// here (it matches its own `vendor` tag first).
+pub(crate) fn is_unresolvable_image_ref(source: &crate::ir::IrImageSource) -> bool {
+    matches!(source, crate::ir::IrImageSource::Vendor { .. })
 }
 
-/// Sentinel `media_type` marking an IR `Image` block that carries a Responses `input_image.file_id`
-/// reference (an uploaded-file id), NOT inline bytes. The Responses reader stores it as
-/// `Image { media_type: FILE_ID_IMAGE_SENTINEL, data: <file_id> }`; the Responses writer decodes it
-/// back to the native `{type:"input_image","file_id":<id>}` form. Shared from here so EVERY writer
-/// can recognize it: a file_id is an OpenAI-Responses-scoped, unresolvable cross-vendor reference, so
-/// any OTHER protocol's image-emission path must SKIP it (see [`is_unresolvable_image_ref`]) rather
-/// than treat `"file_id"` as a real MIME type and emit a corrupt block (e.g. a `data:file_id;base64,`
-/// URI, or an Anthropic base64 source with `media_type:"file_id"`).
-pub(crate) const FILE_ID_IMAGE_SENTINEL: &str = "file_id";
-
-/// Sentinel `media_type` marking an IR `Image` block whose `data` field holds a JSON-serialized
-/// Bedrock Converse `s3Location` source object (`{"uri":...,"bucketOwner":...}`) rather than inline
-/// base64 bytes. The Converse `ImageSource` union has an `s3Location` member (an AWS-S3 URI) with no
-/// IR counterpart field; the Bedrock reader stashes it under this sentinel so the Bedrock writer
-/// (`bedrock_image_block`, same-protocol) can re-emit `source.s3Location` losslessly. A real image
-/// media_type is always `image/<fmt>`, so a bare `image_s3` token can never collide with one. Shared
-/// from here so EVERY writer recognizes it: an S3 URI is an AWS-scoped, unresolvable cross-vendor
-/// reference, so any NON-Bedrock writer's image path must SKIP it (see [`is_unresolvable_image_ref`])
-/// rather than treat `"image_s3"` as a MIME type and emit a corrupt block.
-pub(crate) const IMAGE_S3_SENTINEL: &str = "image_s3";
-
-/// True when an IR `Image` block's `media_type` is a vendor-scoped reference that CANNOT be resolved
-/// or faithfully re-encoded by a DIFFERENT protocol's writer — currently the Responses `file_id`
-/// sentinel and the Bedrock `s3Location` (`image_s3`) sentinel. A foreign writer that sees one must
-/// skip the image with a `tracing::warn!` instead of emitting a corrupt inline/base64 block, because
-/// there is no lossless cross-vendor projection of an uploaded-file id or an AWS-S3 URI. (The native
-/// writer — Responses for `file_id`, Bedrock for `image_s3` — re-emits the reference same-protocol
-/// and does NOT route through here.)
-pub(crate) fn is_unresolvable_image_ref(media_type: &str) -> bool {
-    media_type == FILE_ID_IMAGE_SENTINEL || media_type == IMAGE_S3_SENTINEL
-}
-
-/// Sentinel `media_type` marking an IR `Image` block that is NOT an image at all but a Bedrock
-/// Converse `{"json": <value>}` tool-result content block (an arbitrary-structured-data member of the
-/// `ToolResultContentBlock` union with no IR counterpart). The Bedrock reader stashes the serialized
-/// json under this sentinel so the Bedrock writer (same-protocol) re-emits a faithful `json` block. A
-/// real image media_type is always `image/<fmt>`, so a bare `tool_result_json` token can never collide
-/// with one. Shared from here so a NON-Bedrock ToolResult writer can RECOGNIZE it
-/// ([`is_json_tool_result_block`]) and drop-with-warn instead of either silently dropping it (most
-/// writers Text-filter ToolResult content) or leaking a corrupt base64 image source (the Anthropic
-/// writer maps each ToolResult block through its image arm). There is no lossless cross-protocol
-/// projection of a structured json tool-result, so a foreign writer drops it observably.
-pub(crate) const JSON_BLOCK_SENTINEL: &str = "tool_result_json";
-
-/// True when an IR `Image` block is the Bedrock json-tool-result sentinel (see [`JSON_BLOCK_SENTINEL`])
-/// rather than a real image — used by NON-Bedrock ToolResult writers to drop-with-warn it.
+/// True when an IR block is a structured-json tool-result content block ([`crate::ir::IrBlock::Json`])
+/// rather than text/image — used by NON-Bedrock ToolResult writers to drop-with-warn it (there is no
+/// lossless cross-protocol projection of a Bedrock `{"json":…}` tool-result).
 pub(crate) fn is_json_tool_result_block(block: &crate::ir::IrBlock) -> bool {
-    matches!(
-        block,
-        crate::ir::IrBlock::Image { media_type, .. } if media_type == JSON_BLOCK_SENTINEL
-    )
-}
-
-/// Scan an already-lowercased error text for OpenAI-family context-length-overflow prose. Holds the
-/// four phrases shared verbatim by `OpenAiReader::extract_error` and `ResponsesReader::extract_error`
-/// (the message scan was duplicated). The scan must be PRECISE: a naive OR of weak tokens
-/// (`token`/`maximum`) misclassifies unrelated errors (e.g. a quota body like "maximum number of
-/// tokens allowed per day" — a rate-limit, not oversized). Require a CO-LOCATED context-length
-/// phrase: a self-contained canonical phrase, or `exceeds` paired specifically with `context`/`token
-/// limit`. The caller supplies its own lowercased source (openai scans `error.message`; responses
-/// scans the whole body) and applies the `oversized_status` (400/413) GATE itself — that gate is NOT
-/// part of this helper.
-pub(crate) fn openai_context_length_prose_scan(text: &str) -> bool {
-    text.contains("maximum context length")
-        || text.contains("context length exceeded")
-        || text.contains("reduce the length")
-        || (text.contains("exceeds") && (text.contains("context") || text.contains("token limit")))
-}
-
-/// Canonical OpenAI-family error classification, shared verbatim by `OpenAiReader::classify` and
-/// `ResponsesReader::classify` (the two were word-for-word identical). Both surfaces emit the same
-/// OpenAI error envelope, so the mapping — context-length-exceeded (fail over without penalty) first,
-/// then 429→RateLimit, 401/403→Auth, 5xx→ServerError, other 4xx→ClientError — is single-sourced here.
-#[cfg(test)]
-pub(crate) fn openai_classify(status: StatusCode, body: &[u8]) -> CanonicalSignal {
-    // context-length-exceeded — the lane is healthy; this must fail over (to a larger-context
-    // model), not penalize the breaker. Detect by OpenAI code/message first.
-    let code_is_context = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|j| {
-            j.get("error")
-                .and_then(|e| e.get("code"))
-                .and_then(|c| c.as_str())
-                .map(|s| s.to_string())
-        })
-        .as_deref()
-        == Some("context_length_exceeded");
-    // Mirror production `extract_error`: the prose message scan is GATED to the HTTP statuses an
-    // oversized request actually uses (400 invalid_request_error; 413 payload-too-large). Without the
-    // gate a 401/429/5xx whose prose happens to contain "maximum context length" would reclassify as
-    // ContextLength — letting a genuine auth/rate-limit/server failure escape fault attribution. The
-    // structured `code: "context_length_exceeded"` path is NOT gated (it is unambiguous).
-    let oversized = status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE;
-    let body_lower = String::from_utf8_lossy(body).to_lowercase();
-    if code_is_context || (oversized && body_lower.contains("maximum context length")) {
-        return CanonicalSignal {
-            class: StatusClass::ContextLength,
-            provider_signal: Some("context_length".to_string()),
-            retry_after: None,
-        };
-    }
-
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        return CanonicalSignal {
-            class: StatusClass::RateLimit,
-            provider_signal: Some("429".to_string()),
-            retry_after: None,
-        };
-    }
-
-    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-        return CanonicalSignal {
-            class: StatusClass::Auth,
-            provider_signal: Some("auth".to_string()),
-            retry_after: None,
-        };
-    }
-
-    if status.is_server_error() {
-        return CanonicalSignal {
-            class: StatusClass::ServerError,
-            provider_signal: Some("5xx".to_string()),
-            retry_after: None,
-        };
-    }
-
-    if status.is_client_error() {
-        return CanonicalSignal {
-            class: StatusClass::ClientError,
-            provider_signal: Some(format!("{}", status.as_u16())),
-            retry_after: None,
-        };
-    }
-
-    CanonicalSignal {
-        class: StatusClass::ClientError,
-        provider_signal: None,
-        retry_after: None,
-    }
+    matches!(block, crate::ir::IrBlock::Json(_))
 }
 
 /// Conservative fallback for the `max_tokens` injected at a translation boundary when the source
@@ -283,20 +127,6 @@ pub(crate) fn openai_classify(status: StatusCode, body: &[u8]) -> CanonicalSigna
 /// `default_max_tokens`. 4096 is a safe output ceiling across current chat models — large enough
 /// not to truncate typical completions, small enough not to be refused.
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 4096;
-
-/// The two response headers a native AWS Bedrock endpoint ALWAYS emits (lowercase on the wire):
-/// the per-request id the AWS SDK surfaces via `*Output::request_id()`, and the error-type header
-/// the SDK reads BEFORE the body `__type` for typed-exception dispatch. Hoisted to consts so the
-/// ~13 production sites across `forward.rs`/`main.rs`/`proto/mod.rs` that capture, forward, or
-/// synthesize these headers cannot drift on spelling.
-pub(crate) const HDR_AMZN_REQUEST_ID: &str = "x-amzn-requestid";
-pub(crate) const HDR_AMZN_ERROR_TYPE: &str = "x-amzn-errortype";
-
-/// The response-header name a native Anthropic endpoint always carries (the SDK reads it into
-/// `APIError.request_id` / `Message._request_id`). Hoisted to a const — like the `HDR_AMZN_*`
-/// siblings — so the sites that attach it (forward.rs success path) and capture it from upstream
-/// cannot drift on spelling.
-pub(crate) const HDR_REQUEST_ID: &str = "request-id";
 
 /// Mixed-case base62 alphabet (digits + lowercase + uppercase, no `-`/`_`) and the rejection-sampling
 /// threshold used when synthesizing opaque ids for protocols whose native ids are flat random tokens
@@ -308,84 +138,12 @@ pub(crate) const BASE62_ALPHABET: &[u8; 62] =
     b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 pub(crate) const BASE62_REJECT_THRESHOLD: u8 = 248;
 
-/// OpenAI-family shared constants. The Chat-Completions (`openai.rs`) and Responses (`responses.rs`)
-/// writers are two wire formats of the SAME provider family, so these values are deliberately
-/// identical and MUST stay in lockstep — hoisted here as the single source of truth instead of being
-/// copy-pasted with "// Mirrors openai.rs" comments. If the two protocols ever genuinely diverge on
-/// one of these, split it back out at that point.
-/// Fallback model name when a cross-protocol request carries none.
-pub(crate) const OPENAI_FAMILY_DEFAULT_MODEL: &str = "gpt-4o";
-/// DoS cap on concurrently-tracked open tool-call accumulators per stream.
-pub(crate) const OPENAI_FAMILY_MAX_OPEN_TOOLS: usize = 128;
-
 /// Client-visible detail string for a mid-stream abort (the upstream connection dropped or a
 /// translate step failed after first byte). Lives in the proto layer — the lowest common ancestor —
 /// because BOTH `forward.rs` (SSE/forward abort path) and the Bedrock-eventstream reassembler in this
 /// module emit it, and `forward.rs → proto` is the only legal dependency direction. Single source of
 /// truth so the abort text a client sees is identical on every framing.
 pub(crate) const STREAM_ABORT_DETAIL: &str = "The response stream was interrupted.";
-
-/// Mint a UUID-v4-shaped request id (`8-4-4-4-12` lowercase hex) for the `x-amzn-RequestId` header a
-/// native AWS Bedrock response always carries — on EVERY response, success and error, stream and
-/// non-stream (the AWS SDK exposes it via `*Output::request_id()`; an absent header makes that return
-/// `None`, which is impossible with a real endpoint and a deterministic proxy tell). Uses the OS
-/// CSPRNG; returns `None` (so the caller simply OMITS the header) if entropy is unavailable — this is
-/// on the request path and must never panic. Single source of truth: every path — success
-/// (`forward.rs` via `wrap_buffered_as_stream` / `maybe_attach_bedrock_amzn_id`) and error
-/// (`forward::ingress_error` and the `main.rs` fallback, both via `attach_bedrock_error_headers`) —
-/// reaches this through the writer vtable, so there are no private copies.
-pub(crate) fn synth_amzn_request_id() -> Option<String> {
-    let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).ok()?;
-    // RFC 4122 v4 layout (version + variant bits) so the value is a well-formed UUID.
-    buf[6] = (buf[6] & 0x0f) | 0x40;
-    buf[8] = (buf[8] & 0x3f) | 0x80;
-    // One allocation for the 32-char lowercase hex string (was 17+ via per-byte `format!`).
-    let s = hex::encode(buf);
-    Some(format!(
-        "{}-{}-{}-{}-{}",
-        &s[0..8],
-        &s[8..12],
-        &s[12..16],
-        &s[16..20],
-        &s[20..32]
-    ))
-}
-
-/// Mint a protocol-correct Anthropic request id (`req_01<token>`) for the `request-id` RESPONSE HEADER
-/// a native Anthropic response always carries. The official SDK reads this header into
-/// `APIError.request_id` / `Message._request_id` (NOT the body), so a busbar anthropic response that
-/// omitted it left `request_id == None` — impossible against the real API and a deterministic proxy
-/// tell. Used by `forward.rs` on anthropic-ingress success/relay 2xx responses that have NO upstream
-/// `request-id` to forward (the error path mirrors the writer's own body `request_id` into the header
-/// instead; the same-protocol passthrough forwards the UPSTREAM `request-id` verbatim and never calls
-/// this). The shape mirrors a native id EXACTLY: the `req_` prefix, the `01` version marker, then a
-/// fixed-width 24-char mixed-case base62 token from the OS CSPRNG — `req_01` + 24 = 30 chars
-/// total, matching `anthropic.rs::synth_id_with_prefix("req_")` (used for the body `request_id`) so
-/// the response-header length is not a fingerprint tell (a 22-char value would be 8 chars short of
-/// native). Returns `None` (caller OMITS the header) only if entropy is unavailable — on the request
-/// path, must never panic.
-pub(crate) fn synth_anthropic_request_id() -> Option<String> {
-    const ALPHABET: &[u8; 62] = BASE62_ALPHABET;
-    // 24 base62 chars (≈143 bits) of CSPRNG entropy. A u128 holds at most 12 base62 digits worth of
-    // headroom safely (62^12 < 2^128), so build the 24-char token from two independent 9-byte (72-bit)
-    // draws, each emitting 12 base62 digits — collision-free in practice and matching the native
-    // `req_01` + 24 = 30-char shape.
-    let mut token = [0u8; 24];
-    for half in 0..2 {
-        let mut buf = [0u8; 9];
-        getrandom::getrandom(&mut buf).ok()?;
-        // 72 bits → 12 base62 digits (62^12 > 2^71, so 9 bytes fit in 12 digits).
-        let mut n = buf.iter().fold(0u128, |acc, &b| (acc << 8) | b as u128);
-        for slot in token[half * 12..half * 12 + 12].iter_mut().rev() {
-            *slot = ALPHABET[(n % 62) as usize];
-            n /= 62;
-        }
-    }
-    // token is ASCII base62, always valid UTF-8.
-    let token = std::str::from_utf8(&token).unwrap_or("000000000000000000000000");
-    Some(format!("req_01{token}"))
-}
 
 /// The CANONICAL ingress-protocol classifier: infer the wire protocol a request targets from its
 /// path prefix. This is the single source of truth shared by every site that must shape an error
@@ -456,35 +214,14 @@ pub(crate) fn proto_for_path(path: &str) -> &'static str {
 ///   anthropic → "invalid x-api-key"; openai/responses → "Incorrect API key provided.";
 ///   gemini → "API key not valid. Please pass a valid API key."; cohere → "invalid api token";
 ///   bedrock → "" (AWS conveys AccessDenied via __type / x-amzn-errortype, not message prose).
+///
+/// Thin wrapper: dispatches through `ProtocolWriter::auth_failure_message` so the per-vendor copy
+/// lives in the writer vtable, not in this agnostic function. An unknown future proto falls back to
+/// the default generic copy.
 pub(crate) fn vendor_auth_failure_message(proto: &str) -> &'static str {
-    match proto {
-        "anthropic" => "invalid x-api-key",
-        "gemini" => "API key not valid. Please pass a valid API key.",
-        "cohere" => "invalid api token",
-        "bedrock" => "",
-        "openai" | "responses" => "Incorrect API key provided.",
-        _ => "authentication failed",
-    }
-}
-
-/// Attach the `x-amzn-RequestId` and `x-amzn-errortype` headers a native AWS Bedrock error response
-/// ALWAYS carries to an already-built response. `x-amzn-errortype` mirrors the body `__type` (via
-/// `error_kind_to_bedrock_type`, the single source of truth) so header and body agree; the request
-/// id is the only request-id surface the AWS SDK exposes via `*Output::request_id()`. This is the
-/// canonical helper so `forward.rs::ingress_error`, `route.rs`, and `auth.rs` cannot drift on which
-/// headers a Bedrock error must carry. Best-effort: if entropy or header encoding fails we skip that
-/// header rather than panic — this runs on the request path. No-op caller responsibility: only call
-/// when the ingress protocol is bedrock.
-pub(crate) fn attach_bedrock_error_headers(headers: &mut axum::http::HeaderMap, kind: &str) {
-    if let Some(id) = synth_amzn_request_id() {
-        if let Ok(hv) = HeaderValue::from_str(&id) {
-            headers.insert(HeaderName::from_static(HDR_AMZN_REQUEST_ID), hv);
-        }
-    }
-    let errortype = error_kind_to_bedrock_type(kind);
-    if let Ok(hv) = HeaderValue::from_str(errortype) {
-        headers.insert(HeaderName::from_static(HDR_AMZN_ERROR_TYPE), hv);
-    }
+    protocol_for(proto)
+        .map(|p| p.writer().auth_failure_message())
+        .unwrap_or("authentication failed")
 }
 
 /// ProtocolReader extracts signals from wire responses (Stage 1a + 1b).
@@ -743,6 +480,18 @@ pub(crate) trait ProtocolWriter: Send + Sync {
         false
     }
 
+    /// The MAXIMUM number of citations this protocol's streamed `citations_delta`-equivalent wire
+    /// event may carry, or `None` for no limit. Anthropic frames EXACTLY ONE `citation` per
+    /// `citations_delta` SSE event (a native SDK `JSON.parse`s one object per `data:` line and crashes
+    /// on an array), so `AnthropicWriter` overrides → `Some(1)`; `StreamTranslate` then fans a multi-
+    /// citation `CitationsDelta` into N single-citation deltas at the framing seam. Default `None`
+    /// (Gemini legitimately coalesces N sources into one candidate-level `citationMetadata` chunk; the
+    /// others have no per-event citation limit). Consulted via the vtable so the translator carries no
+    /// `ingress == "anthropic"` name-branch for this wire constraint.
+    fn max_citations_per_delta(&self) -> Option<usize> {
+        None
+    }
+
     /// The streaming `Content-Type` this protocol's INGRESS client expects when receiving a
     /// cross-protocol reframed stream. On a cross-protocol reframe the streamed body is re-encoded
     /// into the client's framing, so the response header must describe the CLIENT's wire format —
@@ -753,7 +502,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// overrides to `"application/vnd.amazon.eventstream"`. The agnostic forward path calls this
     /// through the writer vtable so `ingress_stream_content_type` carries no `"bedrock"` branch.
     fn streaming_content_type(&self) -> &'static str {
-        "text/event-stream"
+        crate::forward::TEXT_EVENT_STREAM
     }
 
     /// Plausible native-SDK `User-Agent` for THIS EGRESS protocol. reqwest sends NO default
@@ -766,7 +515,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     ///
     /// Default: `EGRESS_UA_DEFAULT` from forward.rs — a generic-but-present UA for unknown egress
     /// (better than none). Each registered writer overrides with its own pinned SDK UA string (see
-    /// `EGRESS_UA_*` in forward.rs for the release-time audit obligation).
+    /// `EGRESS_UA_*` in forward.rs for the per-protocol UA strings that must be kept current).
     fn egress_user_agent(&self) -> &'static str {
         crate::forward::EGRESS_UA_DEFAULT
     }
@@ -782,7 +531,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// streaming, `application/json` otherwise.
     fn egress_accept(&self, wants_stream: bool) -> &'static str {
         if wants_stream {
-            "text/event-stream"
+            crate::forward::TEXT_EVENT_STREAM
         } else {
             crate::forward::APPLICATION_JSON
         }
@@ -826,7 +575,10 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// Default: `(StatusCode::UNAUTHORIZED, "authentication_error")` (openai/responses/anthropic/
     /// cohere/unknown).
     fn auth_failure_status_and_kind(&self) -> (StatusCode, &'static str) {
-        (StatusCode::UNAUTHORIZED, "authentication_error")
+        (
+            StatusCode::UNAUTHORIZED,
+            crate::forward::KIND_AUTHENTICATION,
+        )
     }
 
     /// When a Bedrock-ingress client requested a STREAMING response (`wants_stream`) but the upstream
@@ -881,21 +633,48 @@ pub(crate) trait ProtocolWriter: Send + Sync {
         false
     }
 
-    /// True when this protocol's INGRESS client expects a `request-id` RESPONSE HEADER on every
-    /// response (2xx SUCCESS paths and relay paths). A real Anthropic endpoint always sends
-    /// `request-id`; the official Anthropic SDK reads it into `APIError.request_id` /
-    /// `Message._request_id` (NOT the body `request_id`), so omitting it leaves the SDK's
-    /// `request_id == None` on every busbar response — a deterministic proxy tell.
+    /// The request-id RESPONSE HEADER (name + value) to ATTACH to a 2xx/relay response on THIS
+    /// protocol's INGRESS path, or `None` when no header is attached. This is the SUCCESS-path analog
+    /// of `attach_error_response_headers`, dispatched through the writer vtable so the agnostic forward
+    /// path (`maybe_attach_response_request_id`) names no protocol module for request-id synthesis.
     ///
-    /// Used as the predicate in `maybe_attach_anthropic_request_id` in `forward.rs` (the SUCCESS /
-    /// 2xx analog of `attach_error_response_headers`'s Anthropic branch). The header-attach body
-    /// remains inline; only the name-branch `if ingress_protocol != "anthropic"` is replaced with
-    /// a vtable dispatch so the agnostic core carries no Anthropic name string.
+    /// Both bedrock and anthropic do `upstream_request_id.map(String::from).or_else(synth)`: the
+    /// captured UPSTREAM id is preferred (so a same-protocol passthrough forwards the real native id),
+    /// else a shape-correct one is synthesized (the cross-protocol case, where the caller passes `None`).
+    /// - `BedrockWriter` → `(HDR_AMZN_REQUEST_ID, upstream-or-synth UUID)` — a real ConverseStream
+    ///   always carries `x-amzn-RequestId`.
+    /// - `AnthropicWriter` → `(HDR_REQUEST_ID, upstream-or-synth req_…)` — a real Anthropic response
+    ///   always carries `request-id` (the SDK reads it into `APIError.request_id`).
     ///
-    /// Default: `false` (no other protocol emits `request-id`).
-    /// `AnthropicWriter` overrides: `true`.
-    fn ingress_relays_request_id_header(&self) -> bool {
-        false
+    /// Default: `None` (no other protocol attaches a request-id header on the success path).
+    fn ingress_response_request_id(
+        &self,
+        _upstream_request_id: Option<&str>,
+    ) -> Option<(&'static str, String)> {
+        None
+    }
+
+    /// The UPSTREAM response header NAMES this protocol's same-protocol passthrough forwards VERBATIM
+    /// on a relay (read from the upstream response, re-emitted on the client response). Exposed through
+    /// the vtable so the agnostic forward path reads/forwards them by iterating this list, naming no
+    /// protocol module.
+    ///
+    /// - `BedrockWriter` → `["x-amzn-requestid", "x-amzn-errortype"]` (a native Bedrock response carries
+    ///   both; AWS SDKs dispatch the typed exception from `x-amzn-errortype` BEFORE the body `__type`).
+    /// - `AnthropicWriter` → `["request-id"]`.
+    ///
+    /// Default: `&[]` (no relayed headers).
+    fn ingress_relayed_response_header_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// The vendor-plausible auth-failure wire MESSAGE for THIS protocol — the per-vendor prose that
+    /// lands verbatim in the native error body on a bad/missing credential. Dispatched through the
+    /// vtable so `auth.rs` names no protocol string for this decision. Strings sampled from real
+    /// 401/403 bodies (see the former `vendor_auth_failure_message` doc). Default: a generic
+    /// `"authentication failed"`; each vendor writer overrides with its sampled copy.
+    fn auth_failure_message(&self) -> &'static str {
+        "authentication failed"
     }
 
     /// True when this protocol's INGRESS client expects a STREAMING response body in the JSON-array
@@ -962,9 +741,184 @@ pub(crate) trait ProtocolWriter: Send + Sync {
         serde_json::to_vec(&body).unwrap_or_default()
     }
 
+    /// Build the per-stream framing state for THIS protocol as an INGRESS (client-facing) writer.
+    ///
+    /// `StreamTranslate` calls this ONCE per stream on its ingress writer and holds the result as a
+    /// `Box<dyn StreamFraming>`, then routes every protocol-specific stream-shape decision through it
+    /// — so the translator names NO protocol's wire quirk. The framing is keyed to the
+    /// INGRESS writer because it is what produces the client-facing bytes: the OpenAI per-chunk
+    /// identity replay + include_usage trailing-usage un-fold is OpenAI-INGRESS only; the Bedrock
+    /// messageStop/metadata two-frame deferral (and its finish-time flush) is Bedrock-INGRESS only.
+    ///
+    /// Default: a no-op [`PassthroughFraming`] (every SSE-framed protocol with no per-stream framing
+    /// quirk). `OpenAiWriter` and `BedrockWriter` override it with their stateful impls (defined in
+    /// their own modules), so deleting `proto/openai_chat.rs` or `proto/bedrock.rs` needs ZERO changes to
+    /// the translator here.
+    fn new_stream_framing(&self) -> Box<dyn StreamFraming> {
+        Box::new(PassthroughFraming)
+    }
+
+    /// Build this protocol's array-stream framer (the JSON-array reframer engaged for a streaming
+    /// response that must be delivered as a `[{...},{...}]` document instead of SSE), as a
+    /// `Box<dyn JsonArrayFramer>`, or `None` when this protocol has no such framing. The agnostic
+    /// forward path constructs the framer through this vtable method — gated by `uses_array_stream_shim()`
+    /// — so it never names the gemini framer type. Default `None`; `GeminiWriter` overrides → `Some`.
+    fn make_array_stream_framer(&self) -> Option<Box<dyn JsonArrayFramer>> {
+        None
+    }
+
+    /// True when THIS ingress writer's client wants its streamed response reframed as a JSON array
+    /// (rather than SSE) for the given request `body`. The forward path consults this — together with
+    /// `uses_array_stream_shim()` — instead of reading any protocol-specific body key itself, so the
+    /// core names no shim key. Default `false`; `GeminiWriter` overrides to read its router shim key
+    /// from the body.
+    fn wants_array_stream(&self, _body: &serde_json::Value) -> bool {
+        false
+    }
+
+    /// The router-internal array-stream shim key this protocol injects into a request body (the key
+    /// `wants_array_stream` reads), or `None` for protocols with no such shim. It is never native to
+    /// any backend wire, so the forward path strips it from every outbound body; iterating the registry
+    /// and removing each protocol's key lets the agnostic strip name no shim-key literal. Default
+    /// `None`; `GeminiWriter` overrides → `Some(GEMINI_JSON_ARRAY_SHIM_KEY)`.
+    fn array_stream_shim_key(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Clone this writer as a trait object.
     fn clone_box(&self) -> Box<dyn ProtocolWriter>;
 }
+
+/// A streaming JSON-array reframer: consumes a protocol's SSE response bytes and re-emits them as one
+/// streaming JSON array (`[{...},{...}]`), the body shape a non-SSE streaming request expects. The
+/// agnostic forward path holds one `Box<dyn JsonArrayFramer>` (built via
+/// [`ProtocolWriter::make_array_stream_framer`]) and drives it, so it names no protocol's framer type.
+/// The sole implementor is `gemini::GeminiJsonArrayFramer` (Gemini `:streamGenerateContent` without
+/// `?alt=sse`). The trait exposes only the SUBSET of that type's API the agnostic core needs (`feed`,
+/// `finish_for_translate`, `finish_with_server_error`); the type's raw `finish` and its low-level
+/// `finish_with_error(code, status, …)` are absent, since the core never passes a wire status code.
+pub(crate) trait JsonArrayFramer: Send {
+    /// Feed a chunk of SSE bytes; return JSON-array bytes for whatever complete frames are now
+    /// available (empty if only a partial frame is buffered).
+    fn feed(&mut self, chunk: &[u8]) -> Vec<u8>;
+
+    /// Close the array at end-of-stream when this framer sits DOWNSTREAM of a cross-protocol
+    /// `StreamTranslate`; pass `translate_aborted = StreamTranslate::aborted()` so a translate-side
+    /// abort surfaces as a trailing error element instead of a silent truncation. Idempotent.
+    fn finish_for_translate(&mut self, translate_aborted: bool) -> Vec<u8>;
+
+    /// Terminate the array with a trailing protocol-shaped SERVER-ERROR element, then the closing `]`.
+    /// Used on a mid-stream upstream transport failure (and on internal abort). The agnostic caller
+    /// supplies only the human-readable `message`; the implementor owns the wire status/code shape (e.g.
+    /// Gemini emits a `google.rpc.Status` with HTTP 500 / gRPC `INTERNAL`), so the core names no
+    /// protocol wire value. Idempotent.
+    fn finish_with_server_error(&mut self, message: &str) -> Vec<u8>;
+}
+
+/// Per-stream, INGRESS-keyed framing state for the shared [`StreamTranslate`] translator. This is the
+/// vtable seam that keeps the agnostic-core translator from naming any protocol's wire shape:
+/// every protocol-specific streaming decision the translator used to make inline — the OpenAI per-chunk
+/// identity replay + include_usage trailing-usage un-fold, and the Bedrock messageStop/metadata
+/// two-frame deferral with its finish-time flush — lives BEHIND this trait, implemented in the owning
+/// protocol's module. The translator holds ONE `Box<dyn StreamFraming>` (built via
+/// [`ProtocolWriter::new_stream_framing`] from the ingress writer) and consults it; it never branches
+/// on a protocol name. The default [`PassthroughFraming`] impl is inert, so a protocol with no
+/// per-stream framing quirk needs no override.
+///
+/// The translator keeps `emit_ir_event` as the emission primitive: the framing methods return WHAT to
+/// emit (mutating a chunk in place, or returning the IR events / trailing chunk to frame), and the
+/// translator does the actual framing. This preserves the exact byte-level emission order.
+pub(crate) trait StreamFraming: Send {
+    /// EGRESS-CHUNK seam (OpenAI ingress). Called for every reframed SSE `chat.completion.chunk` body
+    /// the ingress writer produced, just before it is framed. Does two things, BOTH byte-shape-critical:
+    /// (a) replays the latched stream identity (`id`/`created`/`model`) onto `chunk` in place — the
+    /// opening chunk latches them, every later chunk (which the writer emits without them) gets them
+    /// injected, so the whole stream shares ONE id like a genuine OpenAI stream; and (b) returns
+    /// `Some(trailing)` when `chunk` is a usage-bearing finish chunk, having REMOVED the folded `usage`
+    /// from `chunk` and re-homed it onto a separate trailing usage-only chunk (the include_usage
+    /// un-fold). The translator then frames `chunk` and, if `Some`, the trailing chunk after it.
+    ///
+    /// Default ([`PassthroughFraming`]): no mutation, returns `None`.
+    fn on_egress_chunk(&mut self, _chunk: &mut serde_json::Value) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// COMBINED-STOP-DELTA seam (Bedrock ingress). Called when the translator sees a combined
+    /// `MessageDelta{stop_reason: Some, usage}`. Returns the IR events the translator must emit (via
+    /// `emit_ir_event`) IN ORDER to reproduce a native ConverseStream's two-frame stop/metadata split,
+    /// while updating internal state so EXACTLY ONE `metadata` frame is ever emitted for the stream. The
+    /// returned vec is: always a stop-only delta (→ `messageStop`); plus a usage-only delta (→
+    /// `metadata`) IFF real usage rode with the stop (else the metadata is DEFERRED to a trailing
+    /// usage-only delta, or to `on_finish`). When this returns `Some`, the translator emits each event
+    /// and consumes the original event (the inline path `continue`s).
+    ///
+    /// Default ([`PassthroughFraming`]): `None` — the translator falls through to its normal path.
+    fn on_combined_stop_delta(
+        &mut self,
+        _stop_reason: crate::ir::IrStopReason,
+        _stop_sequence: Option<String>,
+        _usage: &crate::ir::IrUsage,
+    ) -> Option<Vec<crate::ir::IrStreamEvent>> {
+        None
+    }
+
+    /// USAGE-ONLY-DELTA seam (Bedrock ingress). Called for a trailing `MessageDelta{stop_reason: None}`
+    /// (the OpenAI include_usage usage chunk, or a native usage frame). Returns `true` if the translator
+    /// should EMIT this delta as the stream's single `metadata` frame, or `false` to SUPPRESS it (a
+    /// `metadata` already rode with the stop). Updates internal state so the one-metadata invariant
+    /// holds and resolves any pending deferral.
+    ///
+    /// Default ([`PassthroughFraming`]): returns `None` — the translator falls through to its normal
+    /// path (this delta is not special-cased).
+    fn on_usage_only_delta(&mut self) -> Option<bool> {
+        None
+    }
+
+    /// FINISH seam (Bedrock ingress). Called once at end-of-stream. Returns `Some(event)` when a
+    /// `metadata` frame was DEFERRED (a zero-usage stop with no trailing usage delta — the default
+    /// OpenAI streaming case) and never resolved, so the translator must flush a single best-effort
+    /// zero-usage `metadata` frame to honor the always-one-metadata invariant. Returns `None` when no
+    /// flush is owed.
+    ///
+    /// Default ([`PassthroughFraming`]): `None`.
+    fn on_finish(&mut self) -> Option<crate::ir::IrStreamEvent> {
+        None
+    }
+
+    /// METADATA-METRICS seam (Bedrock ingress). Called in the eventstream-framing branch for each
+    /// emitted frame with the frame's event-type, its just-built data object, and the stream's start
+    /// instant. A native ConverseStream `metadata` frame carries `metrics.latencyMs`; the Bedrock impl
+    /// injects the elapsed wall-clock into that one frame (omitting `metrics` entirely if timing is
+    /// unavailable, rather than emitting a tell-tale `0`), mutating `data` in place. Keeps the wire
+    /// event-type literal and the latency shape in the Bedrock module, out of the agnostic translator.
+    ///
+    /// Default ([`PassthroughFraming`]): no-op (no event-type is special).
+    fn inject_streaming_metrics(
+        &self,
+        _event_type: &str,
+        _data: &mut serde_json::Value,
+        _started_at: Option<std::time::Instant>,
+    ) {
+    }
+
+    /// STREAM-ABORT seam (eventstream ingress). The protocol-shaped error TYPE NAME this ingress emits
+    /// as the terminal frame on an ABORTED stream (reassembly-buffer overflow / malformed prelude).
+    /// `Some(name)` means "this ingress frames aborts as an eventstream exception of this type"
+    /// (Bedrock → `InternalServerException`); the agnostic translator then emits a well-formed
+    /// exception frame WITHOUT naming the wire type itself. `None` (default / every SSE protocol) →
+    /// the translator takes its SSE-abort path instead. Keeps the wire exception name in the owning
+    /// protocol module, out of the agnostic translator.
+    fn abort_exception_type(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// Inert default [`StreamFraming`]: every method takes the trait's no-op default. Used by every
+/// protocol whose INGRESS stream carries no per-stream framing quirk (Anthropic/Gemini/Cohere/
+/// Responses). Holds no state.
+struct PassthroughFraming;
+
+impl StreamFraming for PassthroughFraming {}
 
 /// Bundled Protocol with name + reader + writer.
 pub(crate) struct Protocol {
@@ -1054,7 +1008,15 @@ impl Protocol {
     }
 }
 
-/// Resolve a built-in Protocol by name (for ingress translation). Cheap (unit structs).
+/// Resolve a built-in Protocol by name (for ingress translation). Each call allocates two vtable
+/// boxes (`Box<dyn ProtocolReader>` + `Box<dyn ProtocolWriter>`). Most reader/writer structs are
+/// zero-sized, but a fresh instance is REQUIRED per request regardless: `GeminiWriter`,
+/// `CohereWriter`, and `ResponsesWriter` carry per-STREAM mutable state (e.g. `Mutex<Vec<…>>`,
+/// `AtomicU64`) seeded from their const constructors, so they must not be shared/cached across
+/// concurrent requests. The allocations are small (empty collections) and confined to per-request
+/// setup paths — never per-chunk loops. Registry SWEEPS that only need pure-by-name vtable facts
+/// (`streaming_content_types`, `array_stream_shim_keys`) memoize their results to avoid repeating
+/// these allocations on the hot path.
 pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
     match name {
         "anthropic" => Some(Protocol::anthropic()),
@@ -1065,6 +1027,63 @@ pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
         "responses" => Some(Protocol::responses()),
         _ => None,
     }
+}
+
+/// The set of streaming `Content-Type` values across all registered protocols' writers, cached once.
+///
+/// Sweeps `KNOWN_PROTOCOLS`, reading each writer's `streaming_content_type()` from the vtable (this is
+/// the registry layer aggregating the writers — it names no MIME literal of its own), then sorts and
+/// dedups into a stable `&'static [&'static str]`. The one-time `OnceLock` init pays the
+/// `protocol_for` Box allocations; callers (e.g. `forward::is_streaming_content_type`) then read the
+/// cached slice with zero per-request allocation. The aggregated set is IDENTICAL to what the
+/// per-request sweep produced — the cache only memoizes it.
+pub(crate) fn streaming_content_types() -> &'static [&'static str] {
+    static CACHE: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mut v: Vec<&'static str> = KNOWN_PROTOCOLS
+                .iter()
+                .filter_map(|n| protocol_for(n).map(|p| p.writer().streaming_content_type()))
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        })
+        .as_slice()
+}
+
+/// The set of array-stream shim keys across all registered protocols' writers, cached once.
+///
+/// Sweeps `KNOWN_PROTOCOLS`, reading each writer's `array_stream_shim_key()` (most return `None`;
+/// only Gemini overrides → `GEMINI_JSON_ARRAY_SHIM_KEY`). Like `streaming_content_types`, the
+/// `OnceLock` init pays the one-time `protocol_for` allocations so callers (e.g.
+/// `forward::strip_router_shim_keys`) iterate the cached slice with zero per-request allocation, and
+/// the collected slice is sorted + deduped (mirroring `streaming_content_types`) so the set is stable
+/// and unique regardless of registry order even if a second protocol ever overrides this key. The
+/// collected set is IDENTICAL to the per-request sweep — the cache only memoizes it.
+pub(crate) fn array_stream_shim_keys() -> &'static [&'static str] {
+    static CACHE: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mut v: Vec<&'static str> = KNOWN_PROTOCOLS
+                .iter()
+                .filter_map(|n| protocol_for(n).and_then(|p| p.writer().array_stream_shim_key()))
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        })
+        .as_slice()
+}
+
+/// The array-stream shim key for the NAMED protocol's writer, or `None` if that protocol has no
+/// shim key (most don't) or is not registered. Routes through the writer vtable so the INJECTION
+/// site (`route::ingress_path_model`, which sets the marker on a non-`alt=sse` Gemini request body)
+/// names no protocol submodule — preserving "delete proto/X → app is X-free": if `proto/gemini.rs`
+/// were removed, this returns `None` and the marker is simply never injected, with no compile-time
+/// dependency on the submodule. Dispatch by protocol NAME string is the sanctioned registry boundary.
+pub(crate) fn array_stream_shim_key_for(protocol_name: &str) -> Option<&'static str> {
+    protocol_for(protocol_name).and_then(|p| p.writer().array_stream_shim_key())
 }
 
 /// The INGRESS protocol's NATIVE tool-call id prefix, used by [`ToolIdRemap`] to reshape a foreign
@@ -1150,11 +1169,7 @@ impl ToolIdRemap {
     }
 
     /// Rewrite every tool id in a streaming `IrStreamEvent` to the ingress-native form (in place).
-    pub(crate) fn remap_event(
-        &mut self,
-        ingress_protocol: &str,
-        event: &mut crate::ir::IrStreamEvent,
-    ) {
+    fn remap_event(&mut self, ingress_protocol: &str, event: &mut crate::ir::IrStreamEvent) {
         if let crate::ir::IrStreamEvent::BlockStart {
             block: crate::ir::IrBlockMeta::ToolUse { id, .. },
             ..
@@ -1181,7 +1196,8 @@ impl ToolIdRemap {
             }
             crate::ir::IrBlock::Text { .. }
             | crate::ir::IrBlock::Thinking { .. }
-            | crate::ir::IrBlock::Image { .. } => {}
+            | crate::ir::IrBlock::Image { .. }
+            | crate::ir::IrBlock::Json(_) => {}
         }
     }
 }
@@ -1199,7 +1215,7 @@ impl ToolIdRemap {
 /// that turn. Restricting to the ingress's own prefix makes this the precise inverse of the encode.
 /// A prefix-less ingress (Cohere, Gemini) returns `None` here, so its ids are never decoded — the
 /// matching no-op for a protocol whose ids are never reshaped on the response.
-pub(crate) fn decode_native_tool_id(ingress_protocol: &str, id: &str) -> Option<String> {
+fn decode_native_tool_id(ingress_protocol: &str, id: &str) -> Option<String> {
     // The ingress protocol's own native prefix — exactly what `native_for` prepended on encode.
     // Gemini (and any protocol without a prefix) never has ids reshaped, so nothing to decode.
     let prefix = native_tool_id_prefix(ingress_protocol)?;
@@ -1247,7 +1263,8 @@ pub(crate) fn decode_request_tool_ids(
             }
             crate::ir::IrBlock::Text { .. }
             | crate::ir::IrBlock::Thinking { .. }
-            | crate::ir::IrBlock::Image { .. } => {}
+            | crate::ir::IrBlock::Image { .. }
+            | crate::ir::IrBlock::Json(_) => {}
         }
     }
     for msg in messages {
@@ -1289,39 +1306,21 @@ pub(crate) struct StreamTranslate {
     /// hard-coded `0` was a detectable tell). Set lazily on the first `feed`. `None` until then (and
     /// for non-Bedrock ingress, where it is never read).
     started_at: Option<std::time::Instant>,
-    /// ingress == "openai" → the stream-start identity (`id`/`created`/`model`) captured from the
-    /// first translated `MessageStart`, replayed onto EVERY subsequent `chat.completion.chunk`. The
-    /// real OpenAI API repeats these top-level fields on every chunk; the writer emits them only on
-    /// the opening (role) chunk, so without this replay the later content/finish chunks omit them — a
-    /// shape divergence from a genuine OpenAI stream. Reuses the stream's id (never mints a fresh one
-    /// per chunk). `None` until the first MessageStart is translated.
-    openai_chunk_identity: Option<OpenAiChunkIdentity>,
-    /// ingress == "bedrock" → whether a `metadata` (usage) frame has ALREADY been emitted for this
-    /// stream. A native ConverseStream emits EXACTLY ONE `metadata` frame. But an OpenAI backend
-    /// using `stream_options.include_usage` splits its terminal information across TWO chunks: a
-    /// `finish_reason` chunk that carries NO usage (→ IR `MessageDelta{stop_reason:Some, usage=0}`)
-    /// followed by a usage-only chunk (→ `MessageDelta{stop_reason:None, usage=real}`). Without this
-    /// guard the fan-out emitted a zero-usage `metadata` for the first AND a real `metadata` for the
-    /// second — TWO metadata frames (one reporting 0 tokens), a deterministic tell and corrupt token
-    /// accounting. This flag lets us emit the metadata exactly once: defer it when the stop chunk
-    /// carries no usage, and suppress a duplicate if usage already rode with the stop.
-    bedrock_metadata_emitted: bool,
-    /// ingress == "bedrock" → set when a combined stop-delta arrived with all-zero usage and the
-    /// `metadata` frame was therefore DEFERRED (awaiting a trailing usage-only delta). In the OpenAI
-    /// `include_usage` case that trailing delta arrives and emits the metadata; but in the DEFAULT
-    /// OpenAI streaming case (no `include_usage`) there is NO trailing usage delta, so the metadata
-    /// would never be emitted and the ConverseStream would end with messageStop but NO `metadata`
-    /// frame — a genuine Bedrock ConverseStream ALWAYS terminates with one. This flag lets `finish()`
-    /// flush a single best-effort (zero-usage) `metadata` frame at end-of-stream when the deferral was
-    /// never resolved, so the stream is never missing its terminal metadata frame.
-    bedrock_metadata_pending: bool,
+    /// Per-stream, INGRESS-keyed protocol framing state. All protocol-specific stream-shape
+    /// decisions the translator used to make inline — the OpenAI per-chunk identity replay +
+    /// include_usage trailing-usage un-fold, and the Bedrock messageStop/metadata two-frame deferral
+    /// with its finish-time flush — live BEHIND this vtable, implemented in the owning protocol's
+    /// module (see [`StreamFraming`]). Built once from `ingress.writer().new_stream_framing()`; the
+    /// translator consults it and never names a protocol's wire quirk. A protocol with no per-stream
+    /// quirk gets the inert [`PassthroughFraming`] default.
+    framing: Box<dyn StreamFraming>,
     /// CROSS-PROTOCOL tool-id native remap (the streaming half of the §Finding-2 class fix). Reshapes
     /// each egress `tool_use` id (e.g. OpenAI `call_…`) to the INGRESS client's native shape (Anthropic
     /// `toolu_…`) before the ingress writer serializes it, so a foreign id never reaches the client. The
     /// map is stream-scoped: a tool id seen on `BlockStart` maps stably for the life of this stream (and
     /// the transform is deterministic, so the matching `tool_result` the client sends back next round
-    /// decodes to the original egress id). A `StreamTranslate` only exists cross-protocol, so this never
-    /// touches a same-protocol byte-exact passthrough.
+    /// decodes to the original egress id). The same-protocol path re-emits frames verbatim and bypasses
+    /// `translate_event` entirely, so this remap only ever runs on a cross-protocol hop.
     tool_id_remap: ToolIdRemap,
     /// Input-token usage captured at stream start (`MessageStart.usage`), carried forward so the
     /// terminal `MessageDelta` reports the prompt-token count.
@@ -1330,7 +1329,7 @@ pub(crate) struct StreamTranslate {
     /// its `message_delta` carries `output_tokens` alone. Every other protocol bundles input+output
     /// into the terminal usage event. So on a cross-protocol hop OUT of an Anthropic backend the IR's
     /// terminal `MessageDelta.usage.input_tokens` is 0 and the prompt-token count is lost — the ingress
-    /// writer (and the forward-layer `UsageTap` scanning its output) under-reports usage. Latch the
+    /// writer under-reports usage (and the IR-derived `last_usage` that billing reads inherits the gap). Latch the
     /// start-usage input/cache fields here and backfill them onto the terminal delta when the delta
     /// itself carries none, so input tokens survive the seam regardless of how the egress protocol
     /// split start-vs-terminal usage. `None` until the first `MessageStart` carrying usage is seen.
@@ -1351,15 +1350,16 @@ pub(crate) struct StreamTranslate {
     /// the ORIGINAL frame bytes verbatim (byte-exact passthrough) INSTEAD of re-serializing the IR —
     /// every frame is structurally pristine (no cross-protocol mutation can fire), so the short-
     /// circuit is unconditional. The IR pipeline still runs per frame, but purely as a side-channel:
-    /// it drives `last_usage` (the A-tap shadow value) and, for bedrock ingress, `tap_json`. The
+    /// it drives `last_usage` (the A-tap billing value). The
     /// serialized IR output it produces is DISCARDED — only the retained original bytes reach `out`.
     same_proto: bool,
     /// The terminal IR-derived usage for this stream (Change A "A-tap" value), accumulated from the
     /// `MessageStart`/`MessageDelta`/`MessageStop` events `translate_event` processes — AFTER the
     /// Anthropic start-usage backfill, so it reports the real prompt+completion token counts for every
-    /// protocol. In step 2 this is consumed only by the test-only SHADOW CHECK that proves it AGREES
-    /// with the live `UsageTap` byte-scanner before step 3 routes billing through it. `None` until the
-    /// first usage-bearing terminal event is seen.
+    /// protocol. PRODUCTION billing source (Change A step 3, now permanent): `FirstByteBody`'s
+    /// stream-end arm reads this via `usage()` for the per-request token fee (the old `UsageTap`
+    /// byte-scanner and the shadow-check that proved this value matched it have both been retired).
+    /// `None` until the first usage-bearing terminal event is seen.
     last_usage: Option<crate::ir::IrUsage>,
     /// A genuine terminal ERROR seen mid-stream — the IR-sourced replacement for the byte-scanner's
     /// `UsageTap::terminal_error` (Change A). Set when a reader emits an [`crate::ir::IrStreamEvent::Error`]
@@ -1368,17 +1368,6 @@ pub(crate) struct StreamTranslate {
     /// signal the stream-end arm reads to distinguish a clean close from an aborted one. Holds the
     /// human message (`provider_signal`) for observability; `None` on a clean stream.
     terminal_error: Option<String>,
-}
-
-/// The OpenAI stream-start identity replayed onto every `chat.completion.chunk` (see
-/// `StreamTranslate::openai_chunk_identity`). Captured from the opening chunk the OpenAI writer
-/// emits for the IR `MessageStart` (which already synthesizes a stable `id`/`created` when the
-/// cross-protocol backend supplied none), so the whole stream shares ONE identity.
-#[derive(Clone)]
-struct OpenAiChunkIdentity {
-    id: serde_json::Value,
-    created: serde_json::Value,
-    model: Option<serde_json::Value>,
 }
 
 impl StreamTranslate {
@@ -1419,6 +1408,9 @@ impl StreamTranslate {
         let emit_done = ingress_proto.writer().emits_sse_done_terminator();
         let ingress_eventstream = ingress_proto.writer().ingress_is_eventstream();
         let egress_eventstream = egress_proto.writer().ingress_is_eventstream();
+        // The per-stream framing is keyed to the INGRESS writer — it produces the client-facing wire.
+        // A protocol with no per-stream framing quirk yields the inert PassthroughFraming.
+        let framing = ingress_proto.writer().new_stream_framing();
         Some(Self {
             ingress: ingress_proto,
             egress: egress_proto,
@@ -1430,9 +1422,7 @@ impl StreamTranslate {
             egress_eventstream,
             ingress_eventstream,
             started_at: None,
-            openai_chunk_identity: None,
-            bedrock_metadata_emitted: false,
-            bedrock_metadata_pending: false,
+            framing,
             tool_id_remap: ToolIdRemap::default(),
             start_usage: None,
             message_stopped: false,
@@ -1445,8 +1435,10 @@ impl StreamTranslate {
     /// Translate one egress event `(event_type, payload)` into ingress wire bytes, advancing the
     /// decode state. Shared by the SSE and event-stream feed paths.
     fn translate_event(&mut self, event_type: &str, data: &serde_json::Value, out: &mut Vec<u8>) {
-        // Ingress protocol name for the tool-id remap below. Captured up front because reshaping
-        // borrows `self.tool_id_remap` mutably while `self.ingress` is borrowed immutably for its name.
+        // Ingress protocol name for the tool-id remap below. Captured up front (owned) because
+        // `Protocol::name(&self) -> &str` returns a reference with `self`'s lifetime (elided), not
+        // `&'static`, so holding it would conflict with the mutable `self.tool_id_remap` borrow in
+        // `remap_event` below. The copy of a short static name is cheap and breaks the borrow.
         let ingress_name = self.ingress.name().to_string();
         for mut ev in self
             .egress
@@ -1485,7 +1477,7 @@ impl StreamTranslate {
             // Backfill the terminal usage: if the egress protocol reported input/cache tokens only at
             // stream start (Anthropic), the `MessageDelta` arrives with `input_tokens == 0` and no cache
             // splits. Restore them from the latched start-usage so the ingress writer emits — and the
-            // forward-layer UsageTap reads — the real prompt-token count. Only fills fields the delta
+            // billing-source `last_usage` reflects — the real prompt-token count. Only fills fields the delta
             // itself left empty, so a protocol that DOES carry input on its terminal delta (OpenAI
             // include_usage, Gemini, Bedrock, Cohere) is never overwritten.
             if let crate::ir::IrStreamEvent::MessageDelta { usage, .. } = &mut ev {
@@ -1506,8 +1498,8 @@ impl StreamTranslate {
                 // any non-zero / Some already seen) rather than blind-overwrite, so a backend that
                 // splits usage across two deltas (e.g. OpenAI `include_usage`: a finish delta with
                 // zero usage, then a usage-only delta) does not let the first zero clobber the second's
-                // real counts. The terminal counts are the live `UsageTap`'s exact input — the shadow
-                // check (step 2) asserts the two agree before step 3 routes billing through this.
+                // real counts. `last_usage` is the production billing source the stream-end arm reads
+                // for the per-request token fee (Change A step 3, now permanent).
                 let acc = self.last_usage.get_or_insert(crate::ir::IrUsage {
                     input_tokens: 0,
                     output_tokens: 0,
@@ -1569,65 +1561,35 @@ impl StreamTranslate {
             // and inject the real `metrics.latencyMs` onto the metadata frame (see below). This
             // reproduces exactly what `BedrockReader::read_response_events` consumed, so a
             // bedrock->bedrock stream still round-trips frame-for-frame.
-            if self.ingress_eventstream {
-                if let crate::ir::IrStreamEvent::MessageDelta {
-                    stop_reason: Some(reason),
-                    usage,
-                    stop_sequence,
-                } = &ev
+            // Bedrock-INGRESS messageStop/metadata two-frame deferral — entirely behind the
+            // framing vtable. The framing decides WHAT to emit and tracks the
+            // exactly-one-metadata invariant; the translator stays the emission primitive and names no
+            // Bedrock wire shape. PassthroughFraming returns `None` for both seams, so non-Bedrock
+            // ingress falls through unchanged.
+            if let crate::ir::IrStreamEvent::MessageDelta {
+                stop_reason: Some(reason),
+                usage,
+                stop_sequence,
+            } = &ev
+            {
+                if let Some(events) =
+                    self.framing
+                        .on_combined_stop_delta(*reason, stop_sequence.clone(), usage)
                 {
-                    // Frame 1: stop-only delta → `messageStop` (usage, if any, rides frame 2).
-                    let stop_only = crate::ir::IrStreamEvent::MessageDelta {
-                        stop_reason: Some(reason.clone()),
-                        stop_sequence: stop_sequence.clone(),
-                        usage: crate::ir::IrUsage {
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            cache_creation_input_tokens: None,
-                            cache_read_input_tokens: None,
-                        },
-                    };
-                    self.emit_ir_event(&stop_only, out);
-                    // Frame 2: `metadata` carrying the token usage — but a native ConverseStream emits
-                    // EXACTLY ONE `metadata`. Emit it here ONLY if real usage rode WITH the stop (the
-                    // native Bedrock→Bedrock case AND any egress that bundles usage into the stop
-                    // delta). If usage is all-zero, this is an OpenAI `include_usage` stop chunk whose
-                    // tokens arrive in a SEPARATE trailing usage-only delta — DEFER the metadata to
-                    // that delta so we emit it once with the REAL tokens, never a zero-usage frame.
-                    let has_usage = usage.input_tokens != 0 || usage.output_tokens != 0;
-                    if has_usage {
-                        let usage_only = crate::ir::IrStreamEvent::MessageDelta {
-                            stop_reason: None,
-                            stop_sequence: stop_sequence.clone(),
-                            usage: usage.clone(),
-                        };
-                        self.emit_ir_event(&usage_only, out);
-                        self.bedrock_metadata_emitted = true;
-                    } else {
-                        // Deferred: the stop carried no usage. The trailing usage-only delta (OpenAI
-                        // `include_usage`) will emit the metadata if it arrives — but in DEFAULT
-                        // OpenAI streaming (no `include_usage`) it never does, so mark the metadata
-                        // pending and let `finish()` flush a single zero-usage `metadata` frame at
-                        // end-of-stream. A native ConverseStream ALWAYS ends with a metadata frame;
-                        // its total absence is a proxy tell and loses token accounting.
-                        self.bedrock_metadata_pending = true;
+                    for emit in &events {
+                        self.emit_ir_event(emit, out);
                     }
                     continue;
                 }
-                // A usage-only delta (`stop_reason: None`) → a `metadata` frame. This is the trailing
-                // OpenAI `include_usage` chunk (or a native usage frame). Emit at most once: suppress
-                // it if a `metadata` already rode with the stop above, so the stream carries exactly
-                // one metadata frame regardless of how the egress backend split stop vs usage.
-                if let crate::ir::IrStreamEvent::MessageDelta {
-                    stop_reason: None, ..
-                } = &ev
-                {
-                    if self.bedrock_metadata_emitted {
-                        continue;
+            }
+            if let crate::ir::IrStreamEvent::MessageDelta {
+                stop_reason: None, ..
+            } = &ev
+            {
+                if let Some(should_emit) = self.framing.on_usage_only_delta() {
+                    if should_emit {
+                        self.emit_ir_event(&ev, out);
                     }
-                    self.bedrock_metadata_emitted = true;
-                    self.bedrock_metadata_pending = false; // the deferral is now resolved
-                    self.emit_ir_event(&ev, out);
                     continue;
                 }
             }
@@ -1649,30 +1611,30 @@ impl StreamTranslate {
                 self.message_stopped = true;
             }
 
-            // Anthropic-INGRESS multi-citation fan-out (wire-correctness, HIGH-1): a single
+            // Multi-citation fan-out (wire-correctness, HIGH-1): a single
             // `BlockDelta{CitationsDelta(vec of N)}` (e.g. ONE Gemini chunk batches 3–10
             // `citationSources[]` → ONE delta carrying N citations) MUST NOT serialize to a single
-            // Anthropic `content_block_delta` whose body is a JSON ARRAY of N citation frames — a
-            // native Anthropic SDK `JSON.parse`s ONE object per `data:` line and crashes on an array.
-            // The native wire carries EXACTLY ONE `citation` per `citations_delta` event. The
-            // single-`(String,Value)`-return writer trait cannot emit N frames from one event, so —
-            // mirroring the Bedrock combined-delta fan-out above — split the multi-citation delta into
-            // N single-citation `BlockDelta`s here at the framing seam and frame each separately, so
-            // the wire carries N distinct single-object `citations_delta` events. ONLY for Anthropic
-            // ingress: the Gemini writer legitimately coalesces N sources into one candidate-level
-            // `citationMetadata` chunk (valid Gemini), so its batched delta is left intact. A
-            // single-citation delta (the common case) takes the untouched fall-through below.
-            if ingress_name == "anthropic" {
+            // wire event whose body is a JSON ARRAY of N citation frames when the ingress protocol
+            // frames exactly one citation per event — a native Anthropic SDK `JSON.parse`s ONE object
+            // per `data:` line and crashes on an array. The single-`(String,Value)`-return writer trait
+            // cannot emit N frames from one event, so — mirroring the Bedrock combined-delta fan-out
+            // above — split the multi-citation delta into N single-citation `BlockDelta`s here at the
+            // framing seam. The per-event citation limit is a per-protocol WIRE constraint, read via the
+            // `max_citations_per_delta()` vtable (Anthropic → Some(1)) rather than an `ingress ==
+            // "anthropic"` name-branch: Gemini legitimately coalesces N sources into one candidate-level
+            // `citationMetadata` chunk (None → no fan-out). A single-citation delta (the common case)
+            // is within any limit and takes the untouched fall-through below.
+            if let Some(max_per_event) = self.ingress.writer().max_citations_per_delta() {
                 if let crate::ir::IrStreamEvent::BlockDelta {
                     index,
                     delta: crate::ir::IrDelta::CitationsDelta(citations),
                 } = &ev
                 {
-                    if citations.len() > 1 {
-                        for c in citations {
+                    if citations.len() > max_per_event {
+                        for chunk in citations.chunks(max_per_event) {
                             let single = crate::ir::IrStreamEvent::BlockDelta {
                                 index: *index,
-                                delta: crate::ir::IrDelta::CitationsDelta(vec![c.clone()]),
+                                delta: crate::ir::IrDelta::CitationsDelta(chunk.to_vec()),
                             };
                             self.emit_ir_event(&single, out);
                         }
@@ -1691,7 +1653,7 @@ impl StreamTranslate {
     /// the ORIGINAL frame bytes verbatim, so the writer half is pure waste; skipping it keeps the
     /// short-circuit at-or-below the cost of NOT translating at all (the benchmark gate). The decode
     /// state still advances (the reader owns it) so multi-frame streams parse correctly, and the A-tap
-    /// `last_usage` is populated identically to the full pipeline (the SHADOW CHECK pins that equality).
+    /// `last_usage` is populated by the SAME A-tap accumulation as the cross-protocol `translate_event`.
     fn extract_usage_only(&mut self, event_type: &str, data: &serde_json::Value) {
         for ev in self
             .egress
@@ -1753,34 +1715,22 @@ impl StreamTranslate {
     }
 
     /// Write a single IR event through the ingress writer and append its framed bytes to `out`.
-    /// Handles the eventstream-vs-SSE framing split, the Bedrock-INGRESS `metadata`-frame
-    /// `metrics.latencyMs` injection (finding: a native ConverseStream reports real latency), and the
-    /// OpenAI-INGRESS per-chunk identity replay (finding: the real OpenAI API repeats
-    /// `id`/`created`/`model` on EVERY `chat.completion.chunk`, not just the opening one).
+    /// Handles the eventstream-vs-SSE framing split and routes every protocol-specific per-frame
+    /// decision through the [`StreamFraming`] vtable — the ingress writer's framing injects any
+    /// per-frame metrics (a native eventstream usage frame's real latency) and replays per-chunk SSE
+    /// identity — so this emitter branches only on transport (binary frame vs SSE), never on a wire
+    /// event-type or protocol name.
     fn emit_ir_event(&mut self, ev: &crate::ir::IrStreamEvent, out: &mut Vec<u8>) {
         let Some((out_et, mut out_data)) = self.ingress.writer().write_response_event(ev) else {
             return;
         };
         if self.ingress_eventstream {
-            // ingress is a native AWS SDK Bedrock client: pack the logical event into a
-            // binary `application/vnd.amazon.eventstream` frame with valid CRC32.
-            if out_et == "metadata" {
-                // A native ConverseStream `metadata` frame carries a `metrics` object with the
-                // stream's real `latencyMs`. Inject the elapsed wall-clock since the first byte was
-                // fed; if timing is somehow unavailable, OMIT `metrics` entirely rather than emit a
-                // tell-tale `0`. The writer leaves `metrics` off so this is the single source of it.
-                if let Some(start) = self.started_at {
-                    let elapsed_ms = start.elapsed().as_millis();
-                    // u128 → u64 for JSON; saturate (elapsed never realistically exceeds u64 ms).
-                    let elapsed_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
-                    if let Some(obj) = out_data.as_object_mut() {
-                        obj.insert(
-                            "metrics".to_string(),
-                            serde_json::json!({ "latencyMs": elapsed_ms }),
-                        );
-                    }
-                }
-            }
+            // ingress is a native AWS SDK Bedrock client: pack the logical event into a binary
+            // `application/vnd.amazon.eventstream` frame with valid CRC32. Per-frame protocol metrics
+            // (a native usage frame's real latency) are injected through the framing vtable, so this
+            // agnostic emitter names no wire event-type of its own.
+            self.framing
+                .inject_streaming_metrics(&out_et, &mut out_data, self.started_at);
             let payload = serde_json::to_vec(&out_data).unwrap_or_default();
             // Bedrock-INGRESS usage (Change A): the usage carried by this frame was already accumulated
             // into `last_usage` by `translate_event`/`extract_usage_only` from the structured IR event,
@@ -1788,134 +1738,20 @@ impl StreamTranslate {
             // JSON side-channel the deleted byte-scanner consumed. Just encode the binary frame.
             out.extend_from_slice(&crate::eventstream::encode_frame(&out_et, &payload));
         } else {
-            if self.emit_done {
-                // ingress == "openai" (the only ingress that emits a `[DONE]` terminator): every
-                // `chat.completion.chunk` repeats the stream's top-level `id`/`created`/`model`.
-                // Capture them from the opening chunk (the MessageStart the writer rendered, which
-                // already synthesized stable values when the cross-protocol backend supplied none)
-                // and replay them onto every later chunk so the stream is shape-faithful to a genuine
-                // OpenAI stream (and the chunks share ONE id — never a freshly minted per-chunk id).
-                self.apply_openai_chunk_identity(&mut out_data);
-                // PF-M5 (streaming-usage fidelity): the native OpenAI `include_usage` convention emits
-                // token usage on a SEPARATE trailing chunk (`{choices:[], usage:{...}}`) AFTER the
-                // finish_reason chunk — never folded onto the finish chunk. The OpenAI writer's 1:1
-                // `write_response_event` cannot return two events, so it FOLDS `usage` onto the finish
-                // chunk; left as-is that is a detectable proxy tell (a native stream never carries both
-                // a non-null finish_reason AND usage on one chunk). Here at the framing seam — which
-                // CAN append multiple frames — we UN-fold it: if a finish chunk (non-null
-                // finish_reason) also carries a folded `usage`, lift the usage off, frame the finish
-                // chunk alone, then frame a second trailing usage-only chunk that mirrors the latched
-                // stream identity. Result is byte-shape-faithful to a genuine include_usage stream. A
-                // chunk without a folded usage (the common case, and every non-finish chunk) is
-                // untouched. Only reached on OpenAI ingress (`emit_done`), which is always
-                // cross-protocol (a `StreamTranslate` only exists cross-protocol); same-protocol
-                // OpenAI->OpenAI passes the native trailing usage chunk through verbatim.
-                if let Some(trailing) = Self::split_openai_trailing_usage(&mut out_data) {
-                    out.extend_from_slice(reframe_sse(&out_et, &out_data).as_bytes());
-                    out.extend_from_slice(reframe_sse(&out_et, &trailing).as_bytes());
-                    return;
-                }
+            // EGRESS-CHUNK framing seam: the OpenAI per-chunk identity replay AND the
+            // include_usage trailing-usage un-fold now live behind the framing vtable. The framing
+            // mutates the chunk in place (latch/replay id/created/model) and, when it is a usage-bearing
+            // finish chunk, returns a separate trailing usage-only chunk to frame after it — preserving
+            // the exact two-frame order. PassthroughFraming is inert (no mutation, returns `None`), so
+            // every non-OpenAI ingress is untouched. The `[DONE]` terminator stays a separate `finish()`
+            // literal — only the chunk-identity + trailing-usage logic moved here.
+            if let Some(trailing) = self.framing.on_egress_chunk(&mut out_data) {
+                out.extend_from_slice(reframe_sse(&out_et, &out_data).as_bytes());
+                out.extend_from_slice(reframe_sse(&out_et, &trailing).as_bytes());
+                return;
             }
             out.extend_from_slice(reframe_sse(&out_et, &out_data).as_bytes());
         }
-    }
-
-    /// Capture-or-replay the OpenAI stream identity on a `chat.completion.chunk` body. On the first
-    /// chunk that carries an `id` (the opening role chunk), latch `id`/`created`/`model`; on every
-    /// subsequent chunk (which the writer emits WITHOUT them), inject the latched values. Only called
-    /// for OpenAI ingress. The `[DONE]` sentinel is a separate `finish()` literal, not routed here.
-    fn apply_openai_chunk_identity(&mut self, chunk: &mut serde_json::Value) {
-        let Some(obj) = chunk.as_object_mut() else {
-            return;
-        };
-        // Only `chat.completion.chunk` bodies carry stream identity. An in-band error envelope
-        // (`{"error":{...}}`) the writer may emit has no `object` field — leave it untouched.
-        if obj.get("object").and_then(|v| v.as_str()) != Some("chat.completion.chunk") {
-            return;
-        }
-        match &self.openai_chunk_identity {
-            None => {
-                // First chunk: latch its identity (the writer put id/created on the role chunk, and
-                // model when the lane supplied one).
-                if obj.contains_key("id") {
-                    self.openai_chunk_identity = Some(OpenAiChunkIdentity {
-                        id: obj.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                        created: obj
-                            .get("created")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        model: obj.get("model").cloned(),
-                    });
-                }
-            }
-            Some(identity) => {
-                // Subsequent chunk: replay the latched identity (the writer omitted it).
-                obj.entry("id".to_string())
-                    .or_insert_with(|| identity.id.clone());
-                obj.entry("created".to_string())
-                    .or_insert_with(|| identity.created.clone());
-                if let Some(model) = &identity.model {
-                    obj.entry("model".to_string())
-                        .or_insert_with(|| model.clone());
-                }
-            }
-        }
-    }
-
-    /// PF-M5: split a folded-usage OpenAI finish chunk into (finish-chunk-without-usage, trailing
-    /// usage-only chunk). Returns `Some(trailing_chunk)` when `chunk` is a `chat.completion.chunk` that
-    /// carries BOTH a folded top-level `usage` object AND a terminal `finish_reason` (the shape the
-    /// OpenAI writer produces when it cannot emit two events); in that case the folded `usage` is
-    /// REMOVED from `chunk` in place and re-homed onto a fresh trailing chunk shaped exactly like a
-    /// native include_usage trailer: same `id`/`created`/`model`/`object`, an EMPTY `choices` array,
-    /// and the `usage` object. Returns `None` (leaving `chunk` untouched) for any chunk that is not a
-    /// usage-bearing finish chunk — non-finish chunks, finish chunks without usage, or non-chunk
-    /// bodies (e.g. an in-band error envelope) — so the common path is a no-op. The trailing chunk's
-    /// identity is read off `chunk` itself (which `apply_openai_chunk_identity` has already populated
-    /// with the latched id/created/model), so both frames share ONE stream identity.
-    fn split_openai_trailing_usage(chunk: &mut serde_json::Value) -> Option<serde_json::Value> {
-        let obj = chunk.as_object_mut()?;
-        if obj.get("object").and_then(|v| v.as_str()) != Some("chat.completion.chunk") {
-            return None;
-        }
-        // A native include_usage trailer carries usage ONLY on a chunk with no active choice; the
-        // writer folds it onto the FINISH chunk, which has a non-null `finish_reason`. Require both a
-        // present `usage` object and a terminal finish_reason so a non-finish chunk that somehow
-        // carried usage is left alone (defensive — the writer only folds onto the finish chunk).
-        if !obj.contains_key("usage") {
-            return None;
-        }
-        let has_finish = obj
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|c0| c0.get("finish_reason"))
-            .map(|fr| !fr.is_null())
-            .unwrap_or(false);
-        if !has_finish {
-            return None;
-        }
-        let usage = obj.remove("usage")?;
-        // Build the trailing usage-only chunk mirroring the finish chunk's stream identity. `choices`
-        // is an EMPTY array — the native include_usage trailer carries no choice. Fields absent on the
-        // source chunk are simply omitted (kept faithful to what the stream already carries).
-        let mut trailing = serde_json::Map::new();
-        if let Some(id) = obj.get("id") {
-            trailing.insert("id".to_string(), id.clone());
-        }
-        trailing.insert(
-            "object".to_string(),
-            serde_json::Value::String("chat.completion.chunk".to_string()),
-        );
-        if let Some(created) = obj.get("created") {
-            trailing.insert("created".to_string(), created.clone());
-        }
-        if let Some(model) = obj.get("model") {
-            trailing.insert("model".to_string(), model.clone());
-        }
-        trailing.insert("choices".to_string(), serde_json::Value::Array(Vec::new()));
-        trailing.insert("usage".to_string(), usage);
-        Some(serde_json::Value::Object(trailing))
     }
 
     /// Hard cap on the reassembly buffer. An upstream that streams bytes without ever emitting a
@@ -1956,22 +1792,26 @@ impl StreamTranslate {
             // abort signal rather than being silently swallowed (the decoder clears the buffer and
             // stops, which a length-only check could not tell apart from a clean full drain, so the
             // stream would otherwise continue as if healthy and close with NO terminal exception).
-            // SAME-PROTOCOL bedrock→bedrock (HIGHEST RISK path #1): re-emit the ORIGINAL binary
+            // SAME-PROTOCOL bedrock→bedrock: re-emit the ORIGINAL binary
             // frame bytes verbatim — NEVER re-encode. `encode_frame` would recompute the
             // length-prefix and CRC32, and any divergence (key ordering, float formatting,
             // whitespace) from the upstream's exact bytes is an undecodable frame for a native AWS
-            // SDK. Snapshot the buffer BEFORE draining; `drain_frames_checked` removes only complete
-            // frames from the FRONT (adding nothing). Use the drain's reported VALID-consumed length
-            // (NOT `snapshot.len() - self.buf.len()`): on a MalformedPrelude the drain CLEARS the
-            // buffer, so the length delta would inflate to the whole snapshot and splice the malformed
-            // garbage tail into the client stream ahead of the synthesized exception frame.
-            let pre_drain = if self.same_proto {
-                Some(self.buf.clone())
-            } else {
-                None
-            };
-            let (frames, status, valid_consumed) =
-                crate::eventstream::drain_frames_checked(&mut self.buf);
+            // SDK. `drain_frames_checked` collects the verbatim bytes of each COMPLETE valid frame
+            // DIRECTLY into `out` via the `consumed_sink` (in frame order) as it drains them — so the
+            // re-emit costs only the consumed bytes, NOT a per-chunk clone of the whole reassembly
+            // buffer (which was O(buf) every feed → a memory-pressure DoS for a large frame split into
+            // many small chunks). The sink never receives a cleared malformed-prelude remainder (the
+            // malformed branch breaks before the push), so the client never gets undecodable garbage
+            // ahead of the synthesized exception frame. On the cross-proto path the sink is `None`
+            // (the bytes are re-encoded by `translate_event`).
+            let (frames, status, _valid_consumed) = crate::eventstream::drain_frames_checked(
+                &mut self.buf,
+                if self.same_proto {
+                    Some(&mut out)
+                } else {
+                    None
+                },
+            );
             for (event_type, payload) in frames {
                 let Ok(mut data) = serde_json::from_slice::<serde_json::Value>(&payload) else {
                     continue; // non-JSON payload — skip the frame
@@ -1985,17 +1825,11 @@ impl StreamTranslate {
                 if self.same_proto {
                     // Same-proto: run ONLY the reader + usage accumulation (`extract_usage_only`) —
                     // the writer/reframe half would be discarded, so skip it. The verbatim original
-                    // bytes are emitted below.
+                    // bytes were already written to `out` by the drain's `consumed_sink` above.
                     self.extract_usage_only(&event_type, &data);
                 } else {
                     self.translate_event(&event_type, &data, &mut out);
                 }
-            }
-            if let Some(snapshot) = pre_drain {
-                // Append exactly the bytes the drain consumed as COMPLETE, VALID frames, verbatim.
-                // `valid_consumed` excludes a cleared malformed-prelude remainder (see above), so the
-                // client never receives undecodable garbage ahead of the synthesized exception frame.
-                out.extend_from_slice(&snapshot[..valid_consumed]);
             }
             // A malformed prelude is unrecoverable: abandon the stream exactly like the MAX_BUF
             // overflow path so the terminal exception frame is emitted by `finish()` (the `aborted`
@@ -2042,7 +1876,7 @@ impl StreamTranslate {
                     let Some((event_type, data_str)) = parsed else {
                         continue; // no data: line, or non-utf8 — skip
                     };
-                    if data_str.is_empty() || data_str == "[DONE]" {
+                    if data_str.is_empty() || data_str == SSE_DONE_SENTINEL {
                         // egress terminator/keepalive — ingress terminator is finish()'s. Carries no
                         // usage on any current protocol; a future protocol that embeds usage in a
                         // terminator/keepalive frame MUST extract it here (the A-tap is skipped for
@@ -2053,7 +1887,7 @@ impl StreamTranslate {
                         continue; // malformed data JSON — skip the frame rather than abort
                     };
                     if self.same_proto {
-                        // Same-proto (HIGHEST RISK paths #2 gemini json-array & #3 openai bare
+                        // Same-proto (gemini json-array & openai bare
                         // `data:`): run ONLY the reader + `last_usage` accumulation
                         // (`extract_usage_only`) — the verbatim original frame bytes are emitted from
                         // the consumed prefix below, so every frame (incl. comments, keepalives,
@@ -2160,9 +1994,13 @@ impl StreamTranslate {
             // The shared abort detail (see `STREAM_ABORT_DETAIL`) so the text a client sees is
             // identical across this Bedrock-eventstream path and forward.rs's SSE/forward abort path.
             const ABORT_DETAIL: &str = STREAM_ABORT_DETAIL;
-            if self.ingress_eventstream {
+            if let Some(exc_type) = self.framing.abort_exception_type() {
+                // The ingress framing owns the wire exception TYPE name (Bedrock →
+                // `InternalServerException`); this agnostic translator names none. `Some` here is the
+                // eventstream-ingress abort signal (equivalent to the prior `ingress_eventstream` gate,
+                // which only Bedrock sets).
                 out.extend_from_slice(&crate::eventstream::encode_exception_frame(
-                    "InternalServerException",
+                    exc_type,
                     ABORT_DETAIL,
                 ));
                 return out;
@@ -2187,7 +2025,7 @@ impl StreamTranslate {
             // OpenAI ingress still terminates with `data: [DONE]\n\n` after the error frame, matching a
             // genuine OpenAI stream (the error event is an in-band `data:` chunk, not the terminator).
             if self.emit_done {
-                out.extend_from_slice(b"data: [DONE]\n\n");
+                out.extend_from_slice(SSE_DONE_FRAME);
             }
             return out;
         }
@@ -2200,32 +2038,18 @@ impl StreamTranslate {
         if self.same_proto {
             return out;
         }
-        // Bedrock-INGRESS: if a combined stop-delta deferred the `metadata` frame (zero usage,
-        // expecting a trailing usage-only delta) and that delta never arrived — the DEFAULT OpenAI
-        // streaming case (no `stream_options.include_usage`) — flush a single best-effort zero-usage
-        // `metadata` frame now. A genuine Bedrock ConverseStream ALWAYS ends with a `metadata` frame;
-        // emitting a zero-usage one is far closer to native than omitting it entirely (which loses
-        // the AWS SDK's `ConverseStreamMetadataEvent` callback and is a deterministic proxy tell).
-        if self.ingress_eventstream
-            && self.bedrock_metadata_pending
-            && !self.bedrock_metadata_emitted
-        {
-            self.bedrock_metadata_emitted = true;
-            self.bedrock_metadata_pending = false;
-            let usage_only = crate::ir::IrStreamEvent::MessageDelta {
-                stop_reason: None,
-                stop_sequence: None,
-                usage: crate::ir::IrUsage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_creation_input_tokens: None,
-                    cache_read_input_tokens: None,
-                },
-            };
-            self.emit_ir_event(&usage_only, &mut out);
+        // FINISH framing seam: if the ingress framing deferred a `metadata` frame that was
+        // never resolved (the Bedrock-ingress zero-usage stop with no trailing usage delta — the
+        // default OpenAI streaming case), it returns the single best-effort zero-usage event to flush
+        // here. A genuine Bedrock ConverseStream ALWAYS ends with a `metadata` frame; emitting a
+        // zero-usage one is far closer to native than omitting it (which loses the AWS SDK's
+        // `ConverseStreamMetadataEvent` callback and is a deterministic proxy tell). PassthroughFraming
+        // returns `None`, so non-Bedrock ingress flushes nothing.
+        if let Some(trailing) = self.framing.on_finish() {
+            self.emit_ir_event(&trailing, &mut out);
         }
         if self.emit_done {
-            out.extend_from_slice(b"data: [DONE]\n\n");
+            out.extend_from_slice(SSE_DONE_FRAME);
         }
         out
     }
@@ -2296,225 +2120,34 @@ fn reframe_sse(event_type: &str, data: &serde_json::Value) -> String {
     }
 }
 
-/// Re-frame a Gemini SSE response stream as the JSON-ARRAY streaming format a native
-/// `:streamGenerateContent` request WITHOUT `?alt=sse` expects: a leading `[`, the per-chunk
-/// `GenerateContentResponse` JSON objects separated by `,`, and a trailing `]`. (The SSE variant —
-/// `?alt=sse` — emits `data:`-framed chunks instead; busbar always requests `?alt=sse` UPSTREAM, so
-/// the bytes reaching this framer are Gemini SSE frames either way, whether the egress is gemini
-/// same-protocol passthrough or a cross-protocol `StreamTranslate` whose ingress writer is gemini.)
-///
-/// This framer is the JSON-array sibling of [`StreamTranslate`]'s SSE path: it consumes the SSE
-/// bytes (already in the gemini ingress wire shape), strips the `data:` framing, and re-emits the
-/// payloads as one streaming JSON array. The output is ALWAYS a syntactically valid JSON array
-/// (`finish` emits `]`, or `[]` when no chunk was seen) so a client that buffers and `JSON.parse`s
-/// the whole body still succeeds.
-/// Router-internal shim key the gemini ingress route injects into the request body when the client
-/// sent a streaming `:streamGenerateContent` request WITHOUT `?alt=sse` (so the response must be the
-/// JSON-array streaming format, not SSE). It rides alongside the `model`/`stream` shims. Single
-/// source of truth shared by the route injection (`route.rs`), the forward-layer strip
-/// (`forward::strip_router_shim_keys`), and the Gemini reader's `modeled_keys` exclusion so it never
-/// reaches a backend on any path. A leading `__busbar` makes a collision with a real provider field
-/// impossible.
-pub(crate) const GEMINI_JSON_ARRAY_SHIM_KEY: &str = "__busbar_gemini_json_array";
-
-pub(crate) struct GeminiJsonArrayFramer {
-    buf: Vec<u8>,
-    /// How far into `buf` the SSE terminator scan has already advanced (keeps `feed` linear; mirrors
-    /// `StreamTranslate::scanned`).
-    scanned: usize,
-    /// Whether the opening `[` (and, for every object after the first, the separating `,`) has been
-    /// emitted yet.
-    started: bool,
-    /// Set once `finish` has emitted the closing `]`, so a second `finish` is a no-op.
-    finished: bool,
-    /// Abandon the stream if the reassembly buffer grows past the cap with no complete frame.
-    aborted: bool,
-}
-
-impl GeminiJsonArrayFramer {
-    const MAX_BUF: usize = crate::eventstream::MAX_FRAME_BYTES;
-
-    pub(crate) fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            scanned: 0,
-            started: false,
-            finished: false,
-            aborted: false,
-        }
-    }
-
-    /// Feed a chunk of GEMINI SSE bytes; return JSON-array bytes for whatever complete SSE frames are
-    /// now available (empty if only a partial frame is buffered, or if the buffered frames carried no
-    /// data payload yet). Each emitted object is preceded by `[` (first) or `,` (subsequent).
-    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
-        if self.aborted || self.finished {
-            return Vec::new();
-        }
-        self.buf.extend_from_slice(chunk);
-        let mut out: Vec<u8> = Vec::new();
-        // FRONT cursor (mirrors `StreamTranslate::feed`): advance `consumed` per complete frame and
-        // reclaim the prefix in ONE shift after the loop, instead of `drain(..end)` per frame (which
-        // shifted the whole tail once per frame → O(n^2) on a buffer of many small frames). The search
-        // floor is `consumed` — never below it, or the just-consumed terminator is re-found (infinite
-        // loop); the 3-byte straddle backup and the `scanned` skip apply only above that floor.
-        let mut consumed = 0usize;
-        loop {
-            let search_from = self
-                .scanned
-                .saturating_sub(3)
-                .max(consumed)
-                .min(self.buf.len());
-            match find_frame_terminator(&self.buf[search_from..]) {
-                Some((rel, term_len)) => {
-                    let end = search_from + rel + term_len;
-                    let frame = &self.buf[consumed..end];
-                    consumed = end;
-                    self.scanned = end;
-                    let Some((_event_type, data_str)) = parse_sse_frame(frame) else {
-                        continue; // no data: line — keepalive/comment frame
-                    };
-                    if data_str.is_empty() || data_str == "[DONE]" {
-                        continue; // egress terminator/keepalive — the array close is finish()'s job
-                    }
-                    // Validate the payload is JSON before forwarding so a malformed frame cannot
-                    // corrupt the array; re-serialize from the parsed Value to normalize whitespace.
-                    let Ok(data) = crate::json::parse_str::<serde_json::Value>(&data_str) else {
-                        continue;
-                    };
-                    if self.started {
-                        out.push(b',');
-                    } else {
-                        out.push(b'[');
-                        self.started = true;
-                    }
-                    out.extend_from_slice(data.to_string().as_bytes());
-                }
-                None => {
-                    self.scanned = self.buf.len();
-                    break;
-                }
-            }
-        }
-        if consumed > 0 {
-            self.buf.drain(..consumed);
-            self.scanned = self.buf.len();
-        }
-        if self.buf.len() > Self::MAX_BUF {
-            self.aborted = true;
-            self.buf.clear();
-            self.buf.shrink_to_fit();
-            self.scanned = 0;
-        }
-        out
-    }
-
-    /// Call once at end-of-stream. Emits the closing `]` (and the opening `[` too, as `[]`, when the
-    /// stream carried no chunk) so the body is always a complete, parseable JSON array. When the
-    /// framer ABORTED (the reassembly buffer overran `MAX_BUF` without a frame terminator), the
-    /// stream was silently truncated — so instead of a bare `]` that would make the partial array
-    /// look complete, append a Gemini-shaped `google.rpc.Status` error element so a parsing client
-    /// can see the stream ended abnormally (then close the array).
-    pub(crate) fn finish(&mut self) -> Vec<u8> {
-        if self.finished {
-            return Vec::new();
-        }
-        if self.aborted {
-            return self.finish_with_error(
-                500,
-                "INTERNAL",
-                // Client-facing wire body: must carry NO product/internal vocabulary (the
-                // protocol-indistinguishability promise). "upstream" is busbar-internal routing
-                // vocabulary no real Gemini API ever emits — a fingerprintable tell. Mirror Gemini's
-                // own canonical 500 status message text instead (the `google.rpc.Status.message` a
-                // real Generative Language API 500 carries), so substring-matching clients can't
-                // distinguish the proxy.
-                "Internal error encountered.",
-            );
-        }
-        self.finished = true;
-        if self.started {
-            b"]".to_vec()
-        } else {
-            b"[]".to_vec()
-        }
-    }
-
-    /// Close the array at end-of-stream when this framer sits DOWNSTREAM of a cross-protocol
-    /// [`StreamTranslate`] (gemini ingress, non-gemini egress). Identical to [`finish`] except it ALSO
-    /// surfaces an abort that happened on the TRANSLATE side: when the translate's reassembly buffer
-    /// overflowed `MAX_BUF` it stopped feeding this framer and its SSE terminal-error frame is
-    /// discarded by the caller (an SSE error cannot ride inside a JSON-array body), so this framer's
-    /// own `aborted` flag stays clear and a plain [`finish`] would emit a bare `]` — a SILENT
-    /// truncation indistinguishable from a successful short completion. Pass
-    /// `translate_aborted = StreamTranslate::aborted()`; when EITHER side aborted, emit the
-    /// Gemini-shaped error element + `]` (mirroring the SSE-ingress terminal-error path in
-    /// `StreamTranslate::finish`) instead of the bare close. Idempotent via the shared `finished` flag.
-    ///
-    /// [`finish`]: Self::finish
-    ///
-    /// Production wiring lives in `forward.rs`: the `FirstByteBody` `Poll::Ready(None)` JSON-array
-    /// close arm calls this with `translate.aborted()` (captured before draining the translate's SSE
-    /// terminator) instead of discarding `translate.finish()` then calling plain `framer.finish()`.
-    pub(crate) fn finish_for_translate(&mut self, translate_aborted: bool) -> Vec<u8> {
-        if self.finished {
-            return Vec::new();
-        }
-        if translate_aborted || self.aborted {
-            return self.finish_with_error(
-                500,
-                "INTERNAL",
-                // Same client-facing wire body as the framer-side abort in `finish`: a native
-                // Gemini 500 `google.rpc.Status.message`, carrying no busbar-internal vocabulary
-                // (the protocol-indistinguishability promise).
-                "Internal error encountered.",
-            );
-        }
-        self.finish()
-    }
-
-    /// Terminate the array with a trailing Gemini-shaped error element, then the closing `]`. Used on
-    /// a mid-stream upstream transport failure (and on internal abort): a native Gemini JSON-array
-    /// body is `application/json`, so the in-band error MUST itself be a valid array element — a
-    /// `{"error":{"code","message","status"}}` object matching Gemini's `google.rpc.Status` envelope
-    /// (the same shape `GeminiWriter::write_error` emits). Emitting raw SSE `event:`/`data:` text here
-    /// (the bug this replaces) spliced non-JSON into the array, yielding an unparseable body and a
-    /// protocol tell (a native Gemini JSON-array stream never contains SSE framing). Idempotent.
-    pub(crate) fn finish_with_error(&mut self, code: u16, status: &str, message: &str) -> Vec<u8> {
-        if self.finished {
-            return Vec::new();
-        }
-        self.finished = true;
-        let err = serde_json::json!({
-            "error": { "code": code, "message": message, "status": status }
-        });
-        let mut out: Vec<u8> = Vec::new();
-        if self.started {
-            out.push(b',');
-        } else {
-            out.push(b'[');
-            self.started = true;
-        }
-        out.extend_from_slice(err.to_string().as_bytes());
-        out.push(b']');
-        out
-    }
-}
-
 /// Anthropic reader implementation.
-mod anthropic;
+pub(crate) mod anthropic;
 pub(crate) mod bedrock;
-mod cohere;
-mod gemini;
-mod openai;
-mod responses;
+pub(crate) mod cohere;
+pub(crate) mod gemini;
+pub(crate) mod openai_chat;
+pub(crate) mod openai_family;
+pub(crate) mod openai_responses;
 
-pub(crate) use anthropic::{AnthropicReader, AnthropicWriter};
-pub(crate) use bedrock::{error_kind_to_bedrock_type, BedrockReader, BedrockWriter};
-pub(crate) use cohere::{CohereReader, CohereWriter};
-pub(crate) use gemini::{GeminiReader, GeminiWriter};
-pub(crate) use openai::{OpenAiReader, OpenAiWriter};
-pub(crate) use responses::{ResponsesReader, ResponsesWriter};
+// Private imports (NOT re-exports) for the symbols mod.rs references by bare name: the registry
+// constructs each Reader/Writer below, and a test synthesizes an Anthropic request id. Every other
+// caller references these at their owning module path (e.g. `crate::proto::bedrock::...`).
+use anthropic::{AnthropicReader, AnthropicWriter};
+// `synth_anthropic_request_id` lives in `anthropic.rs`; mod.rs references it only from its own test
+// module (production callers use `crate::proto::anthropic::synth_anthropic_request_id`). Private,
+// test-gated import — NOT a re-export.
+#[cfg(test)]
+use anthropic::synth_anthropic_request_id;
+use bedrock::{BedrockReader, BedrockWriter};
+use cohere::{CohereReader, CohereWriter};
+use gemini::{GeminiReader, GeminiWriter};
+// `GeminiJsonArrayFramer` lives in `gemini.rs`; mod.rs references it only from its own test module
+// (production callers use `crate::proto::gemini::GeminiJsonArrayFramer`). Private, test-gated import
+// — NOT a re-export.
+#[cfg(test)]
+use gemini::GeminiJsonArrayFramer;
+use openai_chat::{OpenAiReader, OpenAiWriter};
+use openai_responses::{ResponsesReader, ResponsesWriter};
 
 /// Every protocol name busbar ships a built-in `Protocol` for. SINGLE SOURCE OF TRUTH shared by
 /// `ProtocolRegistry::with_builtins` (which builds its map from these names) and the config validator
@@ -2600,84 +2233,27 @@ pub(crate) fn convert_headers(
 mod tests {
     use super::*;
 
-    /// PF-M5: the streaming `include_usage` trailer must be its OWN chunk, not folded onto the finish
-    /// chunk. `split_openai_trailing_usage` lifts a folded `usage` off a finish chunk and re-homes it
-    /// onto a native-shape trailing usage-only chunk (`{choices:[], usage}`) that mirrors the stream
-    /// identity, leaving the finish chunk usage-free.
+    /// The cached streaming-CT set aggregated from the writer vtable must be exactly the SSE +
+    /// AWS-event-stream pair the per-request sweep produced — the `OnceLock` only memoizes it.
     #[test]
-    fn test_split_openai_trailing_usage_unfolds_finish_chunk() {
-        // A finish chunk as the OpenAI writer folds it: non-null finish_reason AND a top-level usage.
-        let mut finish = serde_json::json!({
-            "id": "chatcmpl-abc",
-            "object": "chat.completion.chunk",
-            "created": 1234,
-            "model": "gpt-4o",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
-        });
-        let trailing = StreamTranslate::split_openai_trailing_usage(&mut finish)
-            .expect("a usage-bearing finish chunk must split");
-
-        // The finish chunk no longer carries usage but keeps its finish_reason.
-        assert!(
-            finish.get("usage").is_none(),
-            "usage must be lifted OFF the finish chunk: {finish}"
-        );
+    fn test_streaming_content_types_cached_set() {
+        let got = streaming_content_types();
+        let mut want = ["text/event-stream", "application/vnd.amazon.eventstream"]; // golden wire-contract literal (kept bare on purpose)
+        want.sort_unstable();
         assert_eq!(
-            finish.pointer("/choices/0/finish_reason"),
-            Some(&serde_json::json!("stop")),
-            "finish chunk keeps its finish_reason"
-        );
-
-        // The trailing chunk is native-shape: same identity, EMPTY choices, the usage object.
-        assert_eq!(trailing.get("id"), Some(&serde_json::json!("chatcmpl-abc")));
-        assert_eq!(trailing.get("created"), Some(&serde_json::json!(1234)));
-        assert_eq!(trailing.get("model"), Some(&serde_json::json!("gpt-4o")));
-        assert_eq!(
-            trailing.get("object"),
-            Some(&serde_json::json!("chat.completion.chunk"))
-        );
-        assert_eq!(
-            trailing.get("choices"),
-            Some(&serde_json::json!([])),
-            "trailing usage chunk carries an EMPTY choices array (native shape)"
-        );
-        assert_eq!(
-            trailing.get("usage"),
-            Some(
-                &serde_json::json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10})
-            )
+            got, want,
+            "cached streaming CT set must be exactly the SSE + amazon-eventstream pair"
         );
     }
 
-    /// PF-M5: a chunk WITHOUT a folded usage (every non-finish chunk, and a finish chunk that never
-    /// folded one) is left untouched — the split is a no-op on the common path.
+    /// The cached array-stream shim-key set must be exactly Gemini's `GEMINI_JSON_ARRAY_SHIM_KEY`
+    /// (the only writer that overrides `array_stream_shim_key`).
     #[test]
-    fn test_split_openai_trailing_usage_noop_without_usage() {
-        // A finish chunk with no usage.
-        let mut finish = serde_json::json!({
-            "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-        });
-        assert!(
-            StreamTranslate::split_openai_trailing_usage(&mut finish).is_none(),
-            "no usage → no split"
-        );
-
-        // A mid-stream content chunk that somehow carries usage but no terminal finish_reason is also
-        // left alone (defensive: the writer only folds onto the finish chunk).
-        let mut mid = serde_json::json!({
-            "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-        });
-        assert!(
-            StreamTranslate::split_openai_trailing_usage(&mut mid).is_none(),
-            "usage on a non-finish chunk is not split (defensive)"
-        );
-        assert!(
-            mid.get("usage").is_some(),
-            "non-finish chunk left untouched"
+    fn test_array_stream_shim_keys_cached_set() {
+        assert_eq!(
+            array_stream_shim_keys(),
+            [crate::proto::gemini::GEMINI_JSON_ARRAY_SHIM_KEY],
+            "cached shim-key set must be exactly the gemini json-array key"
         );
     }
 
@@ -2850,54 +2426,6 @@ mod tests {
             body.contains("Internal error encountered."),
             "the truncation error must mirror Gemini's own 500 body text: {body}"
         );
-    }
-
-    /// A fresh `IrResponse` constructed with the new identity fields left at their documented
-    /// default (`None`) must read back as `None` — guards the foundation that later waves populate.
-    #[test]
-    fn test_ir_response_identity_fields_default_none() {
-        let resp = crate::ir::IrResponse {
-            role: crate::ir::IrRole::Assistant,
-            content: vec![],
-            stop_reason: None,
-            usage: crate::ir::IrUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
-            },
-            model: None,
-            id: None,
-            created: None,
-            system_fingerprint: None,
-            stop_sequence: None,
-        };
-        assert_eq!(resp.id, None);
-        assert_eq!(resp.created, None);
-        assert_eq!(resp.system_fingerprint, None);
-        assert_eq!(resp.stop_sequence, None);
-    }
-
-    /// The streaming-start IR event carries the new identity metadata, defaulting to `None`.
-    #[test]
-    fn test_ir_message_start_identity_fields_default_none() {
-        let ev = crate::ir::IrStreamEvent::MessageStart {
-            role: crate::ir::IrRole::Assistant,
-            usage: None,
-            id: None,
-            created: None,
-            model: None,
-        };
-        match ev {
-            crate::ir::IrStreamEvent::MessageStart {
-                id, created, model, ..
-            } => {
-                assert_eq!(id, None);
-                assert_eq!(created, None);
-                assert_eq!(model, None);
-            }
-            _ => panic!("constructed a MessageStart"),
-        }
     }
 
     /// Every protocol's writer must produce a non-empty, valid-JSON probe body that carries the
@@ -3163,7 +2691,10 @@ mod tests {
         for msg in &ir.messages {
             if msg.role == crate::ir::IrRole::Assistant {
                 for block in &msg.content {
-                    if let crate::ir::IrBlock::Thinking { text: _, signature } = block {
+                    if let crate::ir::IrBlock::Thinking {
+                        text: _, signature, ..
+                    } = block
+                    {
                         found_thinking = true;
                         assert_eq!(signature.as_deref(), Some("sig_abc123xyz"));
                     }
@@ -3375,14 +2906,19 @@ mod tests {
 
     #[test]
     fn test_irerror_bridge() {
-        // IrError IS CanonicalSignal - construct and verify
+        // `IrError` is a type alias for the breaker's `CanonicalSignal`; verify the bridge by routing
+        // it through the classifier rather than re-asserting the field we just set.
         let ir_error: IrError = IrError {
             class: StatusClass::Billing,
             provider_signal: Some("test".to_string()),
             retry_after: None,
         };
 
-        assert_eq!(ir_error.class, StatusClass::Billing);
+        // Billing is a hard, non-retryable failure for the breaker.
+        assert_eq!(
+            crate::breaker::classify(&ir_error),
+            crate::breaker::Disposition::HardDown
+        );
     }
 
     #[test]
@@ -3611,7 +3147,7 @@ mod tests {
         }
 
         let roundtrip = writer.write_response_event(&crate::ir::IrStreamEvent::MessageDelta {
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 100,
@@ -3888,21 +3424,19 @@ mod tests {
         let openai_proto = Protocol::openai();
         let cloned_openai = openai_proto.clone();
 
-        assert_eq!(openai_proto.name(), cloned_openai.name());
+        // Clone must PRESERVE the protocol identity (golden values), not merely equal itself.
+        assert_eq!(cloned_openai.name(), "openai");
         assert_eq!(
-            openai_proto.writer().upstream_path(),
-            cloned_openai.writer().upstream_path()
+            cloned_openai.writer().upstream_path(),
+            "/v1/chat/completions"
         );
 
         // Test Anthropic protocol clone doesn't panic
         let anthropic_proto = Protocol::anthropic();
         let cloned_anthropic = anthropic_proto.clone();
 
-        assert_eq!(anthropic_proto.name(), cloned_anthropic.name());
-        assert_eq!(
-            anthropic_proto.writer().upstream_path(),
-            cloned_anthropic.writer().upstream_path()
-        );
+        assert_eq!(cloned_anthropic.name(), "anthropic");
+        assert_eq!(cloned_anthropic.writer().upstream_path(), "/v1/messages");
 
         // Verify clone_box works for trait objects (just check it doesn't panic and returns same type)
         let openai_reader: Box<dyn ProtocolReader> = Box::new(OpenAiReader);
@@ -3912,30 +3446,7 @@ mod tests {
         let _cloned_writer = openai_writer.clone();
     }
 
-    #[test]
-    fn test_openai_classify() {
-        let registry = ProtocolRegistry::with_builtins();
-        let protocol = registry.get("openai").expect("openai should exist");
-        let reader = protocol.reader();
-
-        // Test 429 → RateLimit
-        let signal = reader.classify(StatusCode::TOO_MANY_REQUESTS, b"{}");
-        assert_eq!(signal.class, StatusClass::RateLimit);
-
-        // Test 401 → Auth
-        let signal = reader.classify(StatusCode::UNAUTHORIZED, b"{}");
-        assert_eq!(signal.class, StatusClass::Auth);
-
-        // Test 503 → ServerError
-        let signal = reader.classify(StatusCode::SERVICE_UNAVAILABLE, b"{}");
-        assert_eq!(signal.class, StatusClass::ServerError);
-
-        // Test 403 → Auth
-        let signal = reader.classify(StatusCode::FORBIDDEN, b"{}");
-        assert_eq!(signal.class, StatusClass::Auth);
-    }
-
-    /// REGRESSION (R15 MEDIUM, proto/mod.rs:native_tool_id_prefix): Cohere is a free-form-tool-id
+    /// Regression: Cohere is a free-form-tool-id
     /// ingress with NO canonical prefix, so `native_tool_id_prefix("cohere")` must be `None` (like
     /// Gemini). An empty prefix would make the bare `bb1` marker the only distinguishing signal and
     /// silently hex-decode a legitimate client-authored id of shape `bb1<even-len-hex-UTF8>`,
@@ -4040,7 +3551,7 @@ mod tests {
         #[test]
         fn test_anthropic_request_decode_assertions() {
             // DECODE assertions on rich canonical fixture - exact field values that a doctored
-            // fixture cannot fake (anti-fab / + #10)
+            // fixture cannot fake
             let registry = ProtocolRegistry::with_builtins();
             let protocol = registry.get("anthropic").expect("anthropic should exist");
             let reader = protocol.reader();
@@ -4078,6 +3589,7 @@ mod tests {
                         if let crate::ir::IrBlock::Thinking {
                             text: _,
                             ref signature,
+                            ..
                         } = block
                         {
                             found_thinking = true;
@@ -4122,8 +3634,8 @@ mod tests {
                 if msg.role == crate::ir::IrRole::User {
                     for block in &msg.content {
                         if let crate::ir::IrBlock::Image {
-                            ref media_type,
-                            ref data,
+                            source: crate::ir::IrImageSource::Base64 { media_type, data },
+                            ..
                         } = block
                         {
                             found_image = true;
@@ -4171,7 +3683,7 @@ mod tests {
             // Round-trip identity: semantic equivalence via decoded IR (NOT byte-identical) because
             // serializer adds is_error:false for tool_result blocks that had no is_error field in input.
             // This is documented semantic equivalence per anti-fab spec - assert on DECODED IR directly
-            // which is the ground truth that a doctored fixture cannot fake (+ #10).
+            // which is the ground truth that a doctored fixture cannot fake.
             let registry = ProtocolRegistry::with_builtins();
             let protocol = registry.get("anthropic").expect("anthropic should exist");
             let reader = protocol.reader();
@@ -4287,7 +3799,7 @@ mod tests {
         #[test]
         fn test_openai_request_decode_assertions() {
             // DECODE assertions on canonical OpenAI fixture - exact field values that a doctored
-            // fixture cannot fake (anti-fab / + #10)
+            // fixture cannot fake
             let registry = ProtocolRegistry::with_builtins();
             let protocol = registry.get("openai").expect("openai should exist");
             let reader = protocol.reader();
@@ -4346,8 +3858,8 @@ mod tests {
                 if msg.role == crate::ir::IrRole::User {
                     for block in &msg.content {
                         if let crate::ir::IrBlock::Image {
-                            media_type: _,
-                            ref data,
+                            source: crate::ir::IrImageSource::Url(data),
+                            ..
                         } = block
                         {
                             found_image = true;
@@ -4875,7 +4387,7 @@ mod tests {
 
             // end_turn -> stop
             let ev1 = crate::ir::IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: crate::ir::IrUsage {
                     input_tokens: 0,
@@ -4895,7 +4407,7 @@ mod tests {
 
             // max_tokens -> length
             let ev2 = crate::ir::IrStreamEvent::MessageDelta {
-                stop_reason: Some("max_tokens".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::MaxTokens),
                 stop_sequence: None,
                 usage: crate::ir::IrUsage {
                     input_tokens: 0,
@@ -4915,7 +4427,7 @@ mod tests {
 
             // tool_use -> tool_calls
             let ev3 = crate::ir::IrStreamEvent::MessageDelta {
-                stop_reason: Some("tool_use".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::ToolUse),
                 stop_sequence: None,
                 usage: crate::ir::IrUsage {
                     input_tokens: 0,
@@ -5056,7 +4568,7 @@ mod stream_fanout_tests {
                 },
                 IrStreamEvent::BlockStop { index: 0 },
                 IrStreamEvent::MessageDelta {
-                    stop_reason: Some("end_turn".to_string()),
+                    stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                     stop_sequence: None,
                     usage: IrUsage {
                         input_tokens: 10,
@@ -5092,7 +4604,7 @@ mod stream_fanout_tests {
                     created: None,
                     model: None
                 },
-                // R26 (MED #5): tool-only stream (no text) is 0-based — text reserves index 0 ONLY
+                // Tool-only stream (no text) is 0-based — text reserves index 0 ONLY
                 // when text actually appears. Previously asserted the buggy 1-based index.
                 IrStreamEvent::BlockStart {
                     index: 0,
@@ -5111,7 +4623,7 @@ mod stream_fanout_tests {
                 },
                 IrStreamEvent::BlockStop { index: 0 },
                 IrStreamEvent::MessageDelta {
-                    stop_reason: Some("tool_use".to_string()),
+                    stop_reason: Some(crate::ir::IrStopReason::ToolUse),
                     stop_sequence: None,
                     usage: IrUsage {
                         input_tokens: 0,
@@ -5216,7 +4728,7 @@ mod stream_translate_tests {
             },
             crate::ir::IrStreamEvent::BlockStop { index: 0 },
             crate::ir::IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: crate::ir::IrUsage {
                     input_tokens: 7,
@@ -5330,7 +4842,7 @@ mod stream_translate_tests {
                     cache_control: None,
                     citations: Vec::new(),
                 }],
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: crate::ir::IrUsage {
                     input_tokens: 7,
@@ -5863,7 +5375,24 @@ mod stream_translate_tests {
         assert_eq!(out, b"[]", "empty stream → empty JSON array");
     }
 
-    /// Round-4: `finish_with_error` after real chunks appends a gemini-shaped error element + `]`, so
+    /// The agnostic `finish_with_server_error` seam (forward.rs:`poll_next`) reaches the framer through
+    /// a `Box<dyn JsonArrayFramer>` — exercise THAT dispatch path: the trait method must produce the
+    /// native Gemini server-error element (HTTP 500 / gRPC `INTERNAL`) carrying the supplied message,
+    /// closed into a valid JSON array. The core passes only the message; the impl owns 500/`INTERNAL`.
+    #[test]
+    fn test_finish_with_server_error_through_trait_object_is_gemini_500_internal() {
+        let mut framer: Box<dyn JsonArrayFramer> = Box::new(gemini::GeminiJsonArrayFramer::new());
+        let out = framer.finish_with_server_error("boom");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&out).expect("server-error body must parse as a JSON array");
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 1, "empty stream → single trailing error element");
+        assert_eq!(arr[0]["error"]["code"], 500);
+        assert_eq!(arr[0]["error"]["status"], "INTERNAL");
+        assert_eq!(arr[0]["error"]["message"], "boom");
+    }
+
+    /// `finish_with_error` after real chunks appends a gemini-shaped error element + `]`, so
     /// the body stays a valid JSON array (used on a mid-stream transport failure).
     #[test]
     fn test_gemini_json_array_framer_finish_with_error_closes_array() {
@@ -5883,7 +5412,7 @@ mod stream_translate_tests {
         assert_eq!(pv.as_array().expect("array").len(), 1);
     }
 
-    /// Round-4: when the framer ABORTS (reassembly buffer overran `MAX_BUF` without a terminator),
+    /// When the framer ABORTS (reassembly buffer overran `MAX_BUF` without a terminator),
     /// `finish` must emit a gemini error element instead of a bare `]` that would make the silently
     /// truncated stream look complete.
     #[test]
@@ -5904,7 +5433,7 @@ mod stream_translate_tests {
         );
     }
 
-    /// MED #6 regression: on the GEMINI JSON-ARRAY ingress path the buffer-overflow abort of the
+    /// Regression: on the GEMINI JSON-ARRAY ingress path the buffer-overflow abort of the
     /// UPSTREAM `StreamTranslate` must surface as a trailing error element, NOT a silently truncated
     /// bare `]`. The framer's OWN `aborted` flag stays clear (the translate simply stops feeding it),
     /// and the caller discards the translate's SSE `finish()` bytes (an SSE error can't ride inside a
@@ -5962,7 +5491,7 @@ mod stream_translate_tests {
         );
     }
 
-    /// REGRESSION (MED #6, StreamTranslate::feed egress_eventstream): a MALFORMED Bedrock EGRESS
+    /// Regression (`StreamTranslate::feed` egress eventstream path): a MALFORMED Bedrock EGRESS
     /// prelude (an out-of-range `total_len`) must ABORT the stream — surfacing the ingress protocol's
     /// native terminal error from `finish()` — not be silently swallowed. Before the wiring `feed`
     /// used the discarding `drain_frames` wrapper, which cleared the buffer on a malformed prelude with
@@ -6005,11 +5534,12 @@ mod stream_translate_tests {
         );
     }
 
-    /// REGRESSION (MED, Opus rc.7 audit / same-proto verbatim emit): on a SAME-PROTOCOL
+    /// Regression (same-proto verbatim emit): on a SAME-PROTOCOL
     /// bedrock→bedrock stream, a malformed prelude must NOT splice the cleared garbage tail into the
     /// client stream ahead of the synthesized exception frame. The verbatim emit uses
-    /// `drain_frames_checked`'s VALID-consumed length, so only the complete valid frame(s) BEFORE the
-    /// malformed prelude are re-emitted; the cleared malformed remainder is discarded.
+    /// `drain_frames_checked`'s `consumed_sink` (which collects exactly the complete valid frame
+    /// bytes), so only the complete valid frame(s) BEFORE the malformed prelude are re-emitted; the
+    /// cleared malformed remainder is discarded.
     #[test]
     fn same_proto_bedrock_malformed_prelude_emits_only_valid_frames_not_garbage() {
         let mut st = StreamTranslate::new_same_proto("bedrock").expect("same-proto translator");
@@ -6143,79 +5673,61 @@ mod stream_translate_tests {
         }
     }
 
-    /// HIGH-2 (wire-correctness): a Bedrock `redactedContent` reasoning block is carried in the IR as
-    /// `Thinking { signature: Some(REASONING_REDACTED_SIG_SENTINEL…) }`. The NON-Bedrock writers
-    /// (Anthropic / Gemini / Responses) MUST NOT emit that `__busbar` sentinel onto the wire — doing
-    /// so is a busbar fingerprint AND an invalid signature token a native SDK would reject. The block
-    /// degrades to plain thinking text with NO signature on every non-Bedrock egress.
+    /// A REDACTED reasoning block (`Thinking { redacted: true }`) holds opaque encrypted bytes. On a
+    /// NON-Bedrock egress (Anthropic re-emits its own `redacted_thinking`; the others have no analog),
+    /// Gemini/Responses/OpenAI/Cohere MUST DROP it — the opaque bytes must never reach the wire as
+    /// visible text, and no busbar marker exists to leak. Streamed redacted deltas drop likewise.
     #[test]
-    fn redacted_reasoning_sentinel_never_leaks_to_non_bedrock_wires() {
-        // Both forms: the bare non-stream sentinel and the stream form with bytes appended.
-        for sig in [
-            REASONING_REDACTED_SIG_SENTINEL.to_string(),
-            format!("{REASONING_REDACTED_SIG_SENTINEL}RVhBTVBMRQ=="),
+    fn redacted_reasoning_drops_on_writers_without_a_native_form() {
+        let ir = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Thinking {
+                text: "OPAQUEENCRYPTEDBYTES".to_string(),
+                signature: None,
+                redacted: true,
+                cache_control: None,
+            }],
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
+            usage: crate::ir::IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+
+        // Bind each writer to a local (interior-mutable per-stream state).
+        let (gw, rw, cw) = (GeminiWriter, ResponsesWriter, CohereWriter);
+        let gemini = gw.write_response(&ir).to_string();
+        let responses = rw.write_response(&ir).to_string();
+        let openai = OpenAiWriter.write_response(&ir).to_string();
+        let cohere = cw.write_response(&ir).to_string();
+        for (name, wire) in [
+            ("gemini", &gemini),
+            ("responses", &responses),
+            ("openai", &openai),
+            ("cohere", &cohere),
         ] {
             assert!(
-                is_redacted_reasoning_sig(&sig),
-                "both sentinel forms must be recognized (prefix match): {sig}"
-            );
-            let ir = crate::ir::IrResponse {
-                role: crate::ir::IrRole::Assistant,
-                content: vec![crate::ir::IrBlock::Thinking {
-                    text: "private reasoning".to_string(),
-                    signature: Some(sig.clone()),
-                }],
-                stop_reason: Some("end_turn".to_string()),
-                usage: crate::ir::IrUsage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_creation_input_tokens: None,
-                    cache_read_input_tokens: None,
-                },
-                model: None,
-                id: None,
-                created: None,
-                system_fingerprint: None,
-                stop_sequence: None,
-            };
-
-            // The serialized wire output of each non-Bedrock writer must NOT contain the sentinel.
-            // Bind each writer to a local (these unit structs carry interior-mutable per-stream
-            // state, so borrowing the bare value trips `borrow_interior_mutable_const`).
-            let (aw, gw, rw) = (AnthropicWriter, GeminiWriter, ResponsesWriter);
-            let anthropic = aw.write_response(&ir).to_string();
-            let gemini = gw.write_response(&ir).to_string();
-            let responses = rw.write_response(&ir).to_string();
-            for (name, wire) in [
-                ("anthropic", &anthropic),
-                ("gemini", &gemini),
-                ("responses", &responses),
-            ] {
-                assert!(
-                    !wire.contains(REASONING_REDACTED_SIG_SENTINEL),
-                    "{name} wire output leaked the redacted-reasoning sentinel: {wire}"
-                );
-            }
-            // The thinking TEXT must still survive (we drop only the signature, not the block).
-            assert!(
-                anthropic.contains("private reasoning"),
-                "anthropic must keep the thinking text: {anthropic}"
-            );
-
-            // Streaming signature delta carrying the sentinel emits NOTHING on Anthropic/Gemini.
-            let sig_delta = crate::ir::IrStreamEvent::BlockDelta {
-                index: 0,
-                delta: crate::ir::IrDelta::SignatureDelta(sig.clone()),
-            };
-            assert!(
-                aw.write_response_event(&sig_delta).is_none(),
-                "anthropic stream must drop a redacted-sentinel signature_delta"
-            );
-            assert!(
-                gw.write_response_event(&sig_delta).is_none(),
-                "gemini stream must drop a redacted-sentinel signature_delta"
+                !wire.contains("OPAQUEENCRYPTEDBYTES"),
+                "{name} must DROP a redacted block — the opaque bytes must never reach the wire: {wire}"
             );
         }
+
+        // A streamed redacted-reasoning delta emits NOTHING on Gemini.
+        let redacted_delta = crate::ir::IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::RedactedReasoningDelta("OPAQUEENCRYPTEDBYTES".to_string()),
+        };
+        assert!(
+            gw.write_response_event(&redacted_delta).is_none(),
+            "gemini stream must drop a redacted-reasoning delta"
+        );
     }
 
     /// Encode one AWS event-stream frame (`:event-type` string header + JSON payload) for tests.
@@ -6237,7 +5749,7 @@ mod stream_translate_tests {
         f
     }
 
-    /// HIGH/conformance regression (eventstream.rs:64): a Bedrock EGRESS that sends a mid-stream
+    /// HIGH/conformance regression (eventstream.rs): a Bedrock EGRESS that sends a mid-stream
     /// MODELED-EXCEPTION frame (`:message-type: exception` + `:exception-type`, NO `:event-type`)
     /// must surface as a translated ERROR event on the ingress stream, not be silently dropped. Before
     /// the fix, `drain_frames` returned `("", payload)` for the exception frame, the folded `type:""`
@@ -6375,7 +5887,7 @@ mod stream_translate_tests {
         );
     }
 
-    /// LOW #6 regression: the post-`MessageStop` ordering guard must drop a DUPLICATE terminal
+    /// Regression: the post-`MessageStop` ordering guard must drop a DUPLICATE terminal
     /// `MessageDelta` (one carrying a `stop_reason`), not only the usage-only
     /// `MessageDelta{stop_reason: None}` flavour. A misbehaving / re-emitting egress backend can
     /// repeat its finish event after the stop; writing the second `message_delta` AFTER
@@ -6409,6 +5921,137 @@ mod stream_translate_tests {
         assert_eq!(
             finishes, 1,
             "exactly one terminal finish_reason chunk; the duplicate terminal delta must be dropped; got:\n{out}"
+        );
+    }
+
+    /// BYTE-IDENTITY GUARD: locks the wire shape of the OpenAI chunk-identity replay +
+    /// include_usage trailing-usage split. This logic now lives behind the writer vtable in
+    /// `proto::openai_chat`'s `StreamFraming` impl (the protocol-named `openai_chunk_identity` field is gone
+    /// from `StreamTranslate`); this guard proves the vtable relocation stayed byte-identical and
+    /// catches any future regression. ingress=openai (client), egress=anthropic (backend): the translator
+    /// writes OpenAI chunks, replaying ONE latched id/created across every chunk and un-folding the
+    /// usage off the finish chunk into a separate trailing chunk.
+    #[test]
+    fn openai_egress_chunk_identity_and_trailing_usage_byte_shape() {
+        let mut st = StreamTranslate::new("openai", "anthropic").expect("translator");
+        let mut raw: Vec<u8> = Vec::new();
+        for frame in [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"role\":\"assistant\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            raw.extend(st.feed(frame.as_bytes()));
+        }
+        raw.extend(st.finish());
+        let out = String::from_utf8(raw).expect("utf8 SSE");
+
+        // (a) Every chat.completion.chunk shares ONE latched stream id — never a per-chunk id, never
+        // the backend's `msg_x`.
+        let ids: std::collections::BTreeSet<String> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|d| d.contains("chat.completion.chunk"))
+            .filter_map(|d| {
+                let start = d.find("\"id\":\"")? + 6;
+                let rest = &d[start..];
+                Some(rest[..rest.find('"')?].to_string())
+            })
+            .collect();
+        assert_eq!(
+            ids.len(),
+            1,
+            "all openai chunks must share ONE stream id; got {ids:?} in\n{out}"
+        );
+        assert!(
+            !out.contains("msg_x"),
+            "the anthropic backend id must not leak; got\n{out}"
+        );
+
+        // (b) include_usage un-fold: a terminal finish chunk AND a separate trailing usage chunk —
+        // never one chunk carrying both a non-null finish_reason and usage.
+        assert!(
+            out.contains("\"finish_reason\":\"stop\""),
+            "a terminal finish chunk; got\n{out}"
+        );
+        assert!(
+            out.contains("\"usage\""),
+            "a trailing usage chunk; got\n{out}"
+        );
+        for line in out.lines().filter_map(|l| l.strip_prefix("data: ")) {
+            let has_finish = line.contains("\"finish_reason\":\"stop\"");
+            let has_usage = line.contains("\"usage\":{");
+            assert!(
+                !(has_finish && has_usage),
+                "no single chunk may carry BOTH finish_reason=stop AND usage (un-fold); got:\n{line}"
+            );
+        }
+    }
+
+    /// BYTE-IDENTITY GUARD: locks the wire shape of the Bedrock messageStop/metadata two-frame
+    /// deferral. This logic now lives behind the writer vtable in `proto::bedrock`'s `StreamFraming`
+    /// impl (the protocol-named `bedrock_metadata_emitted`/`bedrock_metadata_pending` fields are gone
+    /// from `StreamTranslate`). A native ConverseStream ends with EXACTLY ONE `metadata` frame, however
+    /// the egress backend splits stop vs usage; this guard proves the vtable relocation stayed
+    /// byte-identical. Two cases: usage-bundled-with-stop, and the deferred (no-usage-on-stop)
+    /// case that `finish()` must flush.
+    #[test]
+    fn bedrock_egress_emits_exactly_one_metadata_frame() {
+        // Case A — usage rides WITH the stop (Anthropic backend bundles usage on message_delta):
+        // exactly one metadata frame, after messageStop.
+        let mut a = StreamTranslate::new("bedrock", "anthropic").expect("translator");
+        let mut raw_a: Vec<u8> = Vec::new();
+        for frame in [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            raw_a.extend(a.feed(frame.as_bytes()));
+        }
+        raw_a.extend(a.finish());
+        let mut buf_a = raw_a;
+        let frames_a = crate::eventstream::drain_frames(&mut buf_a);
+        assert!(
+            buf_a.is_empty(),
+            "case A frames must decode cleanly; {} left",
+            buf_a.len()
+        );
+        let meta_a = frames_a.iter().filter(|(et, _)| et == "metadata").count();
+        assert_eq!(
+            meta_a, 1,
+            "case A must emit exactly ONE metadata frame; got {meta_a}"
+        );
+
+        // Case B — deferred: an OpenAI backend's finish chunk carries NO usage, no trailing usage chunk
+        // follows (no include_usage). finish() must flush ONE zero-usage metadata so the native
+        // always-one-metadata invariant holds.
+        let mut b = StreamTranslate::new("bedrock", "openai").expect("translator");
+        let mut raw_b: Vec<u8> = Vec::new();
+        for frame in [
+            "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            raw_b.extend(b.feed(frame.as_bytes()));
+        }
+        raw_b.extend(b.finish());
+        let mut buf_b = raw_b;
+        let frames_b = crate::eventstream::drain_frames(&mut buf_b);
+        assert!(
+            buf_b.is_empty(),
+            "case B frames must decode cleanly; {} left",
+            buf_b.len()
+        );
+        let meta_b = frames_b.iter().filter(|(et, _)| et == "metadata").count();
+        assert_eq!(
+            meta_b, 1,
+            "case B (deferred) must flush exactly ONE metadata frame via finish(); got {meta_b}"
         );
     }
 
@@ -6622,7 +6265,7 @@ mod stream_translate_tests {
         let mut t =
             StreamTranslate::new("bedrock", "anthropic").expect("bedrock ingress translator");
         // Anthropic native mid-stream error envelope → IrStreamEvent::Error. The Anthropic reader now
-        // derives the breaker class from the error `type` (LOW #34): `overloaded_error` → Overloaded,
+        // derives the breaker class from the error `type`: `overloaded_error` → Overloaded,
         // which the bedrock-ingress writer frames as `ServiceUnavailableException` (the transient
         // overload exception), NOT the generic `ValidationException` a client fault would yield.
         let err_frame = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream is overloaded\"}}\n\n";
@@ -6688,7 +6331,7 @@ mod stream_translate_tests {
         );
     }
 
-    /// Round-10 HIGH/conformance regression: a CROSS-PROTOCOL tool call streamed to a Gemini client
+    /// Regression: a CROSS-PROTOCOL tool call streamed to a Gemini client
     /// must surface as a SINGLE native `functionCall` part `{name, args}` — not a `{name, args:{}}`
     /// opening frame followed by a separate nameless `{args}` part. An OpenAI backend emits the tool
     /// NAME on the first tool-call chunk and the arguments as later `arguments` fragments; the IR
@@ -6969,7 +6612,7 @@ mod stream_translate_tests {
         );
     }
 
-    // HIGH/test-coverage (proto/mod.rs:368): StreamTranslate with COHERE as the ingress side. Cohere
+    // HIGH/test-coverage (proto/mod.rs): StreamTranslate with COHERE as the ingress side. Cohere
     // uses a bare `data:` envelope keyed on `type` and must NEVER emit a `[DONE]` sentinel
     // (`emit_done` is false for cohere). Exercises CohereWriter::write_delta/write_stop through the
     // translator end-to-end.
@@ -7015,7 +6658,7 @@ mod stream_translate_tests {
         );
     }
 
-    // HIGH/test-coverage (proto/mod.rs:368): StreamTranslate with RESPONSES as the ingress side.
+    // HIGH/test-coverage (proto/mod.rs): StreamTranslate with RESPONSES as the ingress side.
     // The Responses API uses NAMED SSE events (`event: response.created` ... `response.completed`),
     // not bare `data:` frames, and never a `[DONE]`. Exercises ResponsesWriter::write_delta/write_stop
     // through the translator end-to-end.
@@ -7051,7 +6694,7 @@ mod stream_translate_tests {
         );
     }
 
-    // MEDIUM/conformance (proto/mod.rs:441 fan-out): OpenAI egress with `stream_options.include_usage`
+    // MEDIUM/conformance (proto/mod.rs fan-out): OpenAI egress with `stream_options.include_usage`
     // splits its terminal info across TWO chunks — a finish_reason chunk with NO usage, then a
     // usage-only chunk. A native ConverseStream emits EXACTLY ONE `metadata` frame; the pre-fix
     // fan-out emitted a zero-usage metadata for the first AND a real metadata for the second. Assert
@@ -7103,7 +6746,7 @@ mod stream_translate_tests {
         assert_eq!(stops, 1, "exactly one messageStop frame");
     }
 
-    // Regression (MEDIUM, release-gate file-by-file audit): for NON-eventstream (SSE) ingress, the
+    // Regression: for NON-eventstream (SSE) ingress, the
     // trailing OpenAI `include_usage` usage-only chunk arrives AFTER the finish chunk that already
     // produced the terminal frame. Translating it would put a `message_delta` AFTER `message_stop` on
     // an Anthropic-ingress wire — invalid stream framing and a proxy tell. `StreamTranslate` must
@@ -7453,7 +7096,7 @@ mod stream_translate_tests {
         // protocol's NATIVE streaming error frame, not a silent bare close (see below).
     }
 
-    /// LOW/completeness (#15): an SSE-INGRESS stream aborted by reassembly-buffer overflow must NOT
+    /// Regression: an SSE-INGRESS stream aborted by reassembly-buffer overflow must NOT
     /// end with a silently-truncated body. Before this fix `finish()` returned an empty tail for SSE
     /// ingress (only bedrock ingress emitted a terminal frame), so an SSE/native SDK client saw a
     /// short stream indistinguishable from a successful completion. `finish()` must now emit the
@@ -7599,7 +7242,7 @@ mod stream_translate_tests {
         } else {
             panic!("expected Text block");
         }
-        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(resp.stop_reason, Some(crate::ir::IrStopReason::EndTurn));
         assert_eq!(resp.usage.input_tokens, 5);
     }
 
@@ -7627,7 +7270,7 @@ mod stream_translate_tests {
         } else {
             panic!("expected Text block");
         }
-        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn")); // mapped from "stop"
+        assert_eq!(resp.stop_reason, Some(crate::ir::IrStopReason::EndTurn)); // mapped from "stop"
         assert_eq!(resp.usage.input_tokens, 5);
     }
 
@@ -8074,7 +7717,11 @@ mod stream_translate_tests {
         } else {
             panic!("expected Text block in first message");
         }
-        if let crate::ir::IrBlock::Image { media_type, data } = &ir.messages[0].content[1] {
+        if let crate::ir::IrBlock::Image {
+            source: crate::ir::IrImageSource::Base64 { media_type, data },
+            ..
+        } = &ir.messages[0].content[1]
+        {
             assert_eq!(media_type, "image/png");
             assert_eq!(data, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ");
         } else {
@@ -8265,7 +7912,7 @@ mod stream_translate_tests {
 /// Change B step 2 — SAME-PROTOCOL FIDELITY PROOF. For each of the 6 protocols, replay captured
 /// native streaming frames through a `StreamTranslate::new_same_proto` translator and assert the
 /// concatenated `feed` + `finish` output is BYTE-FOR-BYTE identical to the input frames (the verbatim
-/// short-circuit must never re-serialize). Also asserts the IR-derived `usage()` (the A-tap shadow
+/// short-circuit must never re-serialize). Also asserts the IR-derived `usage()` (the A-tap billing
 /// value) matches the token counts embedded in the captured frames. The three HIGHEST-RISK paths
 /// (bedrock binary eventstream, gemini non-`?alt=sse` JSON-array source frames, openai bare `data:`)
 /// get dedicated frame-for-frame assertions.
@@ -8312,7 +7959,7 @@ mod same_proto_fidelity_tests {
 
     #[test]
     fn openai_bare_data_round_trip_byte_exact() {
-        // HIGHEST RISK #3: OpenAI bare `data:` frames + `include_usage` trailing usage chunk + [DONE].
+        // OpenAI bare `data:` frames + `include_usage` trailing usage chunk + [DONE].
         let frames: &[&[u8]] = &[
             b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
             b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
@@ -8383,7 +8030,7 @@ mod same_proto_fidelity_tests {
 
     #[test]
     fn bedrock_binary_eventstream_round_trip_byte_exact() {
-        // HIGHEST RISK #1: binary application/vnd.amazon.eventstream — re-emit the ORIGINAL frame
+        // Binary application/vnd.amazon.eventstream — re-emit the ORIGINAL frame
         // bytes, NEVER re-encode (any CRC32 / length-prefix divergence is an undecodable frame).
         use crate::eventstream::encode_frame;
         let mut input = Vec::new();
@@ -8428,7 +8075,7 @@ mod same_proto_fidelity_tests {
     /// frame). This bench proves the same-proto SHORT-CIRCUIT is at least as fast as that full
     /// re-serialize path (it must be: it skips the writer + reframe), AND reports the raw verbatim
     /// memcpy floor for reference. Covers an SSE path AND the binary eventstream path explicitly.
-    /// In-crate `Instant` bench (pattern store.rs:4162); `#[ignore]` so it never runs in the normal
+    /// In-crate `Instant` bench (pattern store.rs); `#[ignore]` so it never runs in the normal
     /// suite (timing is environment-sensitive). Run with:
     ///   cargo test --release bench_same_proto_short_circuit -- --ignored --nocapture
     #[test]
@@ -8602,7 +8249,7 @@ mod gemini_tests {
         // the canonical `tool_use` (matching every other protocol's reader and keeping cross-protocol
         // egress correct). The Gemini writer maps `tool_use` back to STOP, so same-protocol stays
         // lossless.
-        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(resp.stop_reason, Some(crate::ir::IrStopReason::ToolUse));
 
         // Assert usage: promptTokenCount→input_tokens, candidatesTokenCount→output_tokens
         assert_eq!(resp.usage.input_tokens, 15);
@@ -8813,7 +8460,7 @@ mod gemini_tests {
             stop_reason, usage, ..
         } = &events[5]
         {
-            assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+            assert_eq!(stop_reason, &Some(crate::ir::IrStopReason::EndTurn));
             assert_eq!(usage.input_tokens, 10);
             assert_eq!(usage.output_tokens, 5);
         } else {
@@ -8860,7 +8507,7 @@ mod gemini_tests {
         let writer = GeminiWriter;
 
         let ev = IrStreamEvent::MessageDelta {
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 10,
@@ -9069,7 +8716,8 @@ mod gemini_tests {
         );
     }
 
-    /// MEDIUM/test-coverage (proto/mod.rs:754-763): the `apply_openai_chunk_identity` guard skips any
+    /// MEDIUM/test-coverage: the OpenAI ingress chunk-identity replay (now behind the `StreamFraming`
+    /// vtable, in `proto/openai_chat.rs`) skips any
     /// frame that is not a `chat.completion.chunk` (no `object` field). The in-band ERROR envelope the
     /// OpenAI writer emits mid-stream (`{"error":{...}}`, no `object`) must therefore pass through
     /// UNCHANGED — no synthetic `id`/`created` injected, which would corrupt the error JSON shape a
@@ -9081,7 +8729,7 @@ mod gemini_tests {
         let mut t = StreamTranslate::new("openai", "anthropic").expect("openai ingress translator");
         let mut raw: Vec<u8> = Vec::new();
         for frame in [
-            // Opening chunk: latches id/created/model in apply_openai_chunk_identity.
+            // Opening chunk: latches id/created/model in the OpenAI stream framing.
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"role\":\"assistant\",\"model\":\"claude-x\"}}\n\n",
             "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
@@ -9267,6 +8915,7 @@ mod gemini_tests {
 mod context_length_tests {
     use super::*;
     use crate::breaker::{classify, Disposition};
+    use crate::proto::openai_family::PROVIDER_SIGNAL_CONTEXT_LENGTH;
     use axum::http::StatusCode;
 
     #[test]
@@ -9309,7 +8958,7 @@ mod context_length_tests {
     fn test_context_length_disposition() {
         let sig = CanonicalSignal {
             class: StatusClass::ContextLength,
-            provider_signal: Some("context_length".to_string()),
+            provider_signal: Some(PROVIDER_SIGNAL_CONTEXT_LENGTH.to_string()),
             retry_after: None,
         };
         assert_eq!(classify(&sig), Disposition::ContextLength);
@@ -9352,5 +9001,329 @@ mod gemini_integration_tests {
         // x-goog-api-key auth header.
         let headers = g.writer().auth_headers("k");
         assert!(headers.iter().any(|(n, _)| n.as_str() == "x-goog-api-key"));
+    }
+}
+
+#[cfg(test)]
+mod response_format_matrix_tests {
+    //! THE REGRESSION NET for the `response_format` bug class. Before the typed `IrResponseFormat`
+    //! layer, the same "writer echoes a foreign shape cross-protocol → backend 400" bug surfaced once
+    //! per writer (openai → cohere → gemini → responses). Now the IR is typed, so a writer physically
+    //! cannot hold or echo a foreign shape — and this matrix proves every projection lands native.
+    use super::*;
+    use crate::ir::{IrBlock, IrMessage, IrResponseFormat, IrRole};
+
+    fn req_with_format(rf: IrResponseFormat) -> crate::ir::IrRequest {
+        crate::ir::IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            response_format: Some(rf),
+            ..Default::default()
+        }
+    }
+
+    /// ONE typed directive, projected by EVERY native-structured-output writer, must land in THAT
+    /// writer's own wire shape — never a foreign one — with the schema preserved.
+    #[test]
+    fn every_writer_emits_its_native_shape() {
+        let schema = serde_json::json!({"type":"object","properties":{"x":{"type":"string"}}});
+        let req = req_with_format(IrResponseFormat {
+            json: true,
+            schema: Some(schema),
+            name: Some("out".to_string()),
+            strict: None,
+            description: None,
+        });
+
+        // OpenAI: {type:"json_schema", json_schema:{name, schema}} — schema NESTED under .schema.
+        let o = OpenAiWriter.write_request(&req);
+        assert_eq!(
+            o.pointer("/response_format/type"),
+            Some(&serde_json::json!("json_schema"))
+        );
+        assert_eq!(
+            o.pointer("/response_format/json_schema/schema/properties/x/type"),
+            Some(&serde_json::json!("string"))
+        );
+        assert!(o.pointer("/response_format/json_schema/name").is_some());
+        assert!(
+            o.pointer("/response_format/responseMimeType").is_none(),
+            "no Gemini-shaped key may leak into OpenAI: {o}"
+        );
+
+        // Cohere: {type:"json_object", json_schema:<schema DIRECTLY>}.
+        let cohere_writer = CohereWriter;
+        let c = cohere_writer.write_request(&req);
+        assert_eq!(
+            c.pointer("/response_format/type"),
+            Some(&serde_json::json!("json_object"))
+        );
+        assert_eq!(
+            c.pointer("/response_format/json_schema/properties/x/type"),
+            Some(&serde_json::json!("string"))
+        );
+        assert!(
+            c.pointer("/response_format/json_schema/schema").is_none(),
+            "Cohere does NOT nest under .schema (that's OpenAI's shape): {c}"
+        );
+
+        // Gemini: generationConfig.responseMimeType + responseSchema; no top-level response_format.
+        let gemini_writer = GeminiWriter;
+        let g = gemini_writer.write_request(&req);
+        assert_eq!(
+            g.pointer("/generationConfig/responseMimeType"),
+            Some(&serde_json::json!("application/json"))
+        );
+        assert_eq!(
+            g.pointer("/generationConfig/responseSchema/properties/x/type"),
+            Some(&serde_json::json!("string"))
+        );
+        assert!(
+            g.pointer("/response_format").is_none(),
+            "Gemini has no top-level response_format: {g}"
+        );
+
+        // Responses: text.format FLAT json_schema (name/schema beside type, not nested).
+        let responses_writer = ResponsesWriter;
+        let r = responses_writer.write_request(&req);
+        assert_eq!(
+            r.pointer("/text/format/type"),
+            Some(&serde_json::json!("json_schema"))
+        );
+        assert_eq!(
+            r.pointer("/text/format/schema/properties/x/type"),
+            Some(&serde_json::json!("string"))
+        );
+        assert!(
+            r.pointer("/text/format/json_schema").is_none(),
+            "Responses text.format is FLAT, not nested under json_schema: {r}"
+        );
+    }
+
+    /// And the read side: each protocol's NATIVE structured-output request canonicalizes into the
+    /// same typed directive — proving readers feed the agnostic IR, not a protocol-shaped blob.
+    #[test]
+    fn every_reader_canonicalizes_to_typed_ir() {
+        let oi = OpenAiReader
+            .read_request(&serde_json::json!({
+                "messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"name":"out","schema":{"type":"object"}}}
+            }))
+            .unwrap();
+        let rf = oi.response_format.unwrap();
+        assert!(rf.json && rf.name.as_deref() == Some("out") && rf.schema.is_some());
+
+        let co = CohereReader
+            .read_request(&serde_json::json!({
+                "model":"command-r",
+                "messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object","json_schema":{"type":"object"}}
+            }))
+            .unwrap();
+        let rf = co.response_format.unwrap();
+        assert!(rf.json && rf.schema.is_some());
+
+        let ge = GeminiReader
+            .read_request(&serde_json::json!({
+                "contents":[{"role":"user","parts":[{"text":"hi"}]}],
+                "generationConfig":{"responseMimeType":"application/json","responseSchema":{"type":"object"}}
+            }))
+            .unwrap();
+        let rf = ge.response_format.unwrap();
+        assert!(rf.json && rf.schema.is_some());
+
+        let re = ResponsesReader
+            .read_request(&serde_json::json!({
+                "input":"hi",
+                "text":{"format":{"type":"json_schema","name":"out","schema":{"type":"object"}}}
+            }))
+            .unwrap();
+        let rf = re.response_format.unwrap();
+        assert!(rf.json && rf.name.as_deref() == Some("out") && rf.schema.is_some());
+    }
+}
+
+#[cfg(test)]
+mod stop_reason_matrix_tests {
+    //! Regression net for the stop_reason bug class (closed by the typed `IrStopReason`). EVERY
+    //! variant, projected by EVERY writer, must land on a value VALID in that protocol's finish enum —
+    //! never an off-spec token. A writer physically cannot leak a foreign value (it matches a typed
+    //! enum exhaustively); this guards the projections.
+    use super::*;
+    use crate::ir::{IrBlock, IrResponse, IrRole, IrStopReason, IrUsage};
+
+    fn resp(reason: IrStopReason) -> IrResponse {
+        IrResponse {
+            role: IrRole::Assistant,
+            content: vec![IrBlock::Text {
+                text: "x".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some(reason),
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        }
+    }
+
+    const ALL: [IrStopReason; 9] = [
+        IrStopReason::EndTurn,
+        IrStopReason::StopSequence,
+        IrStopReason::MaxTokens,
+        IrStopReason::ToolUse,
+        IrStopReason::Safety,
+        IrStopReason::Refusal,
+        IrStopReason::PauseTurn,
+        IrStopReason::Error,
+        IrStopReason::Other,
+    ];
+
+    #[test]
+    fn every_writer_emits_only_valid_native_finish_tokens() {
+        let openai_ok = ["stop", "length", "tool_calls", "content_filter"];
+        let anthropic_ok = [
+            "end_turn",
+            "max_tokens",
+            "stop_sequence",
+            "tool_use",
+            "pause_turn",
+            "refusal",
+        ];
+        let gemini_ok = ["STOP", "MAX_TOKENS", "SAFETY", "OTHER"];
+        let bedrock_ok = [
+            "end_turn",
+            "tool_use",
+            "max_tokens",
+            "stop_sequence",
+            "content_filtered",
+        ];
+        let cohere_ok = [
+            "COMPLETE",
+            "STOP_SEQUENCE",
+            "MAX_TOKENS",
+            "TOOL_CALL",
+            "ERROR_TOXIC",
+            "ERROR",
+        ];
+        let responses_ok = ["completed", "incomplete"];
+        let cohere_writer = CohereWriter;
+        let gemini_writer = GeminiWriter;
+        let responses_writer = ResponsesWriter;
+        for r in ALL {
+            let o = OpenAiWriter.write_response(&resp(r));
+            let fr = o["choices"][0]["finish_reason"].as_str().unwrap();
+            assert!(openai_ok.contains(&fr), "openai leaked {fr:?} for {r:?}");
+
+            let a = AnthropicWriter.write_response(&resp(r));
+            let sr = a["stop_reason"].as_str().unwrap();
+            assert!(
+                anthropic_ok.contains(&sr),
+                "anthropic leaked {sr:?} for {r:?}"
+            );
+
+            let g = gemini_writer.write_response(&resp(r));
+            let gr = g["candidates"][0]["finishReason"].as_str().unwrap();
+            assert!(gemini_ok.contains(&gr), "gemini leaked {gr:?} for {r:?}");
+
+            let b = BedrockWriter.write_response(&resp(r));
+            let br = b["stopReason"].as_str().unwrap();
+            assert!(bedrock_ok.contains(&br), "bedrock leaked {br:?} for {r:?}");
+
+            let c = cohere_writer.write_response(&resp(r));
+            let cr = c["finish_reason"].as_str().unwrap();
+            assert!(cohere_ok.contains(&cr), "cohere leaked {cr:?} for {r:?}");
+
+            let re = responses_writer.write_response(&resp(r));
+            let rs = re["status"].as_str().unwrap();
+            assert!(
+                responses_ok.contains(&rs),
+                "responses leaked {rs:?} for {r:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod image_source_matrix_tests {
+    //! Regression net for the image-source bug class (closed by the typed `IrImageSource`). The key
+    //! invariant: a writer can NEVER emit a corrupt block from a misread sentinel — a `Vendor`
+    //! reference it doesn't own is dropped, a neutral `Base64`/`Url` is projected natively.
+    use super::*;
+    use crate::ir::{IrBlock, IrImageSource, IrMessage, IrRole};
+
+    fn req_with_image(source: IrImageSource) -> crate::ir::IrRequest {
+        crate::ir::IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::Image {
+                    source,
+                    cache_control: None,
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A FOREIGN vendor reference (one the writer doesn't own) must never reach the wire as a corrupt
+    /// block — every writer drops it. (The OWNING protocol re-emits its own; covered per-protocol.)
+    #[test]
+    fn foreign_vendor_image_ref_never_corrupts_any_writer() {
+        // A Responses file_id reference projected by every NON-Responses writer must be dropped.
+        let foreign = IrImageSource::Vendor {
+            vendor: "responses",
+            value: serde_json::json!({ "file_id": "file-x" }),
+        };
+        let req = req_with_image(foreign);
+        let cohere = CohereWriter;
+        let gemini = GeminiWriter;
+        let o = serde_json::to_string(&OpenAiWriter.write_request(&req)).unwrap();
+        let a = serde_json::to_string(&AnthropicWriter.write_request(&req)).unwrap();
+        let g = serde_json::to_string(&gemini.write_request(&req)).unwrap();
+        let b = serde_json::to_string(&BedrockWriter.write_request(&req)).unwrap();
+        let c = serde_json::to_string(&cohere.write_request(&req)).unwrap();
+        for (name, wire) in [
+            ("openai", o),
+            ("anthropic", a),
+            ("gemini", g),
+            ("bedrock", b),
+            ("cohere", c),
+        ] {
+            assert!(
+                !wire.contains("file-x"),
+                "{name} writer must DROP a foreign vendor image ref, not leak it: {wire}"
+            );
+        }
+    }
+
+    /// A neutral base64 image projects to a real inline-image shape on every writer that supports
+    /// images (no writer corrupts it).
+    #[test]
+    fn base64_image_projects_or_drops_cleanly() {
+        let req = req_with_image(IrImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: "QUJD".to_string(),
+        });
+        // OpenAI emits a data URI carrying the base64 payload.
+        let o = OpenAiWriter.write_request(&req);
+        let s = serde_json::to_string(&o).unwrap();
+        assert!(
+            s.contains("QUJD"),
+            "base64 payload must survive to the OpenAI wire: {s}"
+        );
     }
 }

@@ -49,8 +49,8 @@ pub(crate) struct WeightedLane {
 
 /// Operator-declared per-member routing metadata (config), projected into the routing `Candidate`
 /// at the seam. Lives on `PoolRuntime` keyed by lane idx (NOT on the shared `Lane`, since the same
-/// lane can be a member of several pools with different tier/cost/tags). Built ONLY for pools that
-/// declare a non-default `route:` is NOT required — it is cheap to populate for every pool, but it is
+/// lane can be a member of several pools with different tier/cost/tags). Building this ONLY for pools
+/// that declare a non-default `route:` is NOT required — it is cheap to populate for every pool, but it is
 /// READ only inside the policy arm of the seam, so the zero-cost default path never touches it.
 #[derive(Clone, Default)]
 pub(crate) struct MemberMeta {
@@ -87,7 +87,7 @@ pub(crate) struct App {
     pub(crate) lanes: Vec<Lane>,
     pub(crate) store: Arc<dyn StateStore>,
     pub(crate) by_model: HashMap<String, usize>,
-    /// Pools now carry weights alongside lane indices.
+    /// Pool members, each carrying a lane index and its configured weight.
     pub(crate) pools: HashMap<String, Vec<WeightedLane>>,
     pub(crate) client: Client,
     pub(crate) auth: Arc<crate::auth::AuthMiddleware>,

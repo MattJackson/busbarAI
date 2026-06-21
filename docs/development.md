@@ -27,7 +27,7 @@ and the two common extension tasks.
 | `store.rs` | The breaker FSM + lane state: `StateStore` trait, `InMemoryStore`, `LaneState`, `BreakerCell` / `BreakerCellAccess`, `OutcomeWindow`, SWRR `select_weighted`, the lane-default vs `_in(pool, …)` method split, `BreakerCfg`/`TripConfig`, test time injection (`set_now_for_test`/`now_for_test`). |
 | `ir.rs` | The superset IR (ADR-0005): `IrRequest`, `IrResponse`, `IrMessage`, `IrBlock`, `IrTool`, `IrUsage`, `IrStreamEvent`, `IrDelta`, `StreamDecodeState`. |
 | `proto/mod.rs` | The protocol seam: `ProtocolReader` / `ProtocolWriter` traits, `Protocol`, `ProtocolRegistry`, `SigningContext`, `StreamTranslate` (cross-protocol stream translator), SSE frame parse/reframe, `probe_body` default. |
-| `proto/{anthropic,openai,gemini,bedrock,responses,cohere}.rs` | Each protocol's Reader (wire→IR + error extraction) and Writer (IR→wire + auth + paths). Bedrock's writer overrides `sign_request` for SigV4. |
+| `proto/{anthropic,openai_chat,openai_responses,openai_family,gemini,bedrock,cohere}.rs` | Each protocol's Reader (wire→IR + error extraction) and Writer (IR→wire + auth + paths). Bedrock's writer overrides `sign_request` for SigV4. |
 | `sigv4.rs` | Hand-rolled AWS SigV4 (RustCrypto sha2 + hmac, no AWS SDK): `sign_v4`, `signing_key`, `uri_encode_path`, `format_amz_time`, `sha256_hex`. |
 | `governance.rs` | Virtual keys + budgets + rate limits (ADR-0009): `GovState`, `VirtualKey`, the `Store` trait + `SqliteStore`, budget/rate windows, key hashing. |
 | `admin.rs` | The `/admin/keys` management handlers (create/list/delete/usage). |

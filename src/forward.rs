@@ -47,11 +47,56 @@ const HDR_ROUTE_TARGET: &str = "x-busbar-route-target";
 /// surfaces. Hoisted to one const so the literal isn't repeated across egress/health/observability.
 pub(crate) const APPLICATION_JSON: &str = "application/json";
 
+/// Streaming MIME type for SSE (Server-Sent Events) responses — the `Content-Type` value that
+/// signals an open event-stream to the client. Placed next to `APPLICATION_JSON` so all
+/// protocol-boundary content-types are declared in one spot.
+pub(crate) const TEXT_EVENT_STREAM: &str = "text/event-stream";
+
+/// Canonical error-KIND tokens: produced by `cross_protocol_error_kind` / passed to
+/// `ingress_error` as the `kind` argument. Each string is the protocol-agnostic discriminant that
+/// the per-protocol writer maps to its native error category (e.g. Bedrock `__type`, Gemini
+/// `error.status`).
+pub(crate) const KIND_AUTHENTICATION: &str = "authentication_error";
+pub(crate) const KIND_PERMISSION: &str = "permission_error";
+pub(crate) const KIND_RATE_LIMIT: &str = "rate_limit_error";
+pub(crate) const KIND_API_ERROR: &str = "api_error";
+pub(crate) const KIND_INVALID_REQUEST: &str = "invalid_request_error";
+pub(crate) const KIND_NOT_FOUND: &str = "not_found_error";
+pub(crate) const KIND_OVERLOADED: &str = "overloaded";
+pub(crate) const KIND_TIMEOUT: &str = "timeout";
+pub(crate) const KIND_INSUFFICIENT_QUOTA: &str = "insufficient_quota";
+pub(crate) const KIND_SERVER_ERROR: &str = "server_error";
+pub(crate) const KIND_REQUEST_TOO_LARGE: &str = "request_too_large";
+
+/// Network-transient `err_type` values passed to `record_transient_in`.  These are distinct from
+/// the error-KIND tokens above: they label the *category* of network failure recorded in the
+/// breaker store, not the protocol-level error kind surfaced to the caller.
+const ERR_NET_CONNECT: &str = "connect";
+const ERR_NET_TIMEOUT: &str = "timeout";
+const ERR_NET_TRANSPORT: &str = "transport";
+/// `err_type` recorded when a HalfOpen probe's degraded forward returns a non-2xx (bumps cooldown).
+const ERR_DEGRADED_NON2XX: &str = "degraded-non2xx";
+
+/// Metric-label values for the `disposition` dimension on `UPSTREAM_FAILURES_TOTAL` and the
+/// `reason` dimension on `FAILOVERS_TOTAL`.
+const DISPOSITION_TRANSIENT: &str = "transient_upstream";
+const DISPOSITION_HARD_DOWN: &str = "hard_down";
+const DISPOSITION_CONTEXT_LENGTH: &str = "context_length";
+
+/// Bounded `pool` metric-label sentinel used for every pre-routing failure (malformed body,
+/// unresolved model, governance rejection) so the label space stays finite (metrics.rs).
+pub(crate) const POOL_LABEL_UNRESOLVED: &str = "unresolved";
+
+/// Provider error-code token emitted when a request exceeds the model's context-window limit.
+/// Returned by `client_fault_kind` for `StatusClass::ContextLength` and drives the per-protocol
+/// writer to emit the native context-length error category.
+pub(crate) const PROVIDER_CODE_CONTEXT_LENGTH: &str = "context_length_exceeded";
+
 tokio::task_local! {
     /// Per-request slot the `server_timing` middleware reads to compute Busbar's INTERNAL
     /// processing time (= total request wall-clock − upstream round-trip), reported as a
     /// `Server-Timing: busbar;dur=<ms>` response header. Set via `.scope()` by the middleware;
-    /// written by [`record_upstream_rtt`] when an upstream call returns. Microseconds; the
+    /// written by `record_upstream_rtt` when an upstream call returns. Microseconds; the
     /// `u64::MAX` sentinel means "no upstream hop on this request" (admin/health/early error),
     /// in which case the middleware reports the full request time.
     pub(crate) static UPSTREAM_RTT_US: std::sync::Arc<std::sync::atomic::AtomicU64>;
@@ -64,58 +109,30 @@ tokio::task_local! {
 /// last failed hop's (typically short) RTT is what remains, which can mildly inflate the reported
 /// `busbar;dur` on that error response. Telemetry only; never affects translation. No-op outside the
 /// unit tests and the admin/health routes that never dispatch upstream simply don't record one.
-pub(crate) fn record_upstream_rtt(rtt: std::time::Duration) {
+fn record_upstream_rtt(rtt: std::time::Duration) {
     let us = u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX);
     let _ = UPSTREAM_RTT_US.try_with(|slot| slot.store(us, std::sync::atomic::Ordering::Relaxed));
 }
 
-/// Attach the `x-amzn-RequestId` header to a SUCCESS response builder when the ingress client is a
-/// native AWS Bedrock SDK. A genuine Bedrock `Converse`/`ConverseStream` 2xx ALWAYS carries this
-/// header (the SDK surfaces it via `*Output::request_id()`); omitting it on the proxied success path
-/// makes `request_id()` return `None`, which is impossible with a real endpoint and a deterministic
-/// proxy tell. The error path already synthesizes it (`route::attach_bedrock_error_headers`,
-/// `auth::unauthorized_response`); this closes the SUCCESS gap so every bedrock-ingress response —
-/// success and error, stream and non-stream — carries the id. No-op for non-bedrock ingress (those
-/// protocols never emit an `x-amzn-*` header). Best-effort: if entropy or header encoding fails the
-/// header is simply omitted (never panics on the request path).
-fn maybe_attach_bedrock_amzn_id(
-    rb: axum::http::response::Builder,
-    ingress_protocol: &str,
-) -> axum::http::response::Builder {
-    if !ingress_relays_amzn_headers(ingress_protocol) {
-        return rb;
-    }
-    match crate::proto::synth_amzn_request_id() {
-        Some(id) => rb.header(crate::proto::HDR_AMZN_REQUEST_ID, id),
-        None => rb,
-    }
-}
-
-/// Attach the `request-id` RESPONSE HEADER to an anthropic-ingress 2xx/relay response. A real
-/// Anthropic endpoint ALWAYS sends `request-id`, and the official SDK reads it into
-/// `APIError.request_id` / `Message._request_id` (the body `request_id` is NOT what the SDK uses on
-/// the read path), so omitting it left the SDK's `request_id == None` on every busbar anthropic
-/// response — impossible against the real API and a deterministic proxy tell. No-op for non-anthropic
-/// ingress (mirroring `maybe_attach_bedrock_amzn_id`'s proto guard, so other protocols never get a
-/// spurious anthropic header). Forwards the captured UPSTREAM id verbatim on a same-protocol
-/// passthrough; synthesizes a shape-correct `req_…` id otherwise. Synthesis failure (no entropy)
-/// simply OMITS the header rather than panicking on the request path.
-fn maybe_attach_anthropic_request_id(
+/// Attach the protocol's request-id RESPONSE HEADER to a SUCCESS / relay response builder, dispatched
+/// through `ProtocolWriter::ingress_response_request_id` so the agnostic forward path names no
+/// protocol module for request-id synthesis. A genuine Bedrock 2xx ALWAYS carries `x-amzn-RequestId`
+/// (the SDK surfaces it via `*Output::request_id()`); a genuine Anthropic response ALWAYS carries
+/// `request-id` (the official SDK reads it into `APIError.request_id` / `Message._request_id`, NOT the
+/// body). Omitting either makes the SDK's id `None` — impossible against the real API and a
+/// deterministic proxy tell. The writer forwards the captured UPSTREAM id verbatim on a same-protocol
+/// passthrough and synthesizes otherwise; protocols that emit no such header return `None` (no-op).
+/// Best-effort: if synthesis (entropy) fails the header is simply omitted (never panics on the request
+/// path).
+fn maybe_attach_response_request_id(
     rb: axum::http::response::Builder,
     ingress_protocol: &str,
     upstream_request_id: Option<&str>,
 ) -> axum::http::response::Builder {
-    if !crate::proto::protocol_for(ingress_protocol)
-        .map(|p| p.writer().ingress_relays_request_id_header())
-        .unwrap_or(false)
+    match crate::proto::protocol_for(ingress_protocol)
+        .and_then(|p| p.writer().ingress_response_request_id(upstream_request_id))
     {
-        return rb;
-    }
-    match upstream_request_id
-        .map(|s| s.to_string())
-        .or_else(crate::proto::synth_anthropic_request_id)
-    {
-        Some(id) => rb.header(crate::proto::HDR_REQUEST_ID, id),
+        Some((name, id)) => rb.header(name, id),
         None => rb,
     }
 }
@@ -129,6 +146,17 @@ fn ingress_relays_amzn_headers(ingress_protocol: &str) -> bool {
     crate::proto::protocol_for(ingress_protocol)
         .map(|p| p.writer().ingress_relays_amzn_headers())
         .unwrap_or(false)
+}
+
+/// The UPSTREAM response header NAMES this ingress protocol forwards VERBATIM on a same-protocol
+/// passthrough — read from the upstream response and re-emitted on the client response (Bedrock's
+/// `x-amzn-requestid` + `x-amzn-errortype`; Anthropic's `request-id`). Dispatched through the
+/// `ProtocolWriter::ingress_relayed_response_header_names()` vtable so the agnostic forward path reads
+/// and forwards these by NAME without naming any protocol module. Unknown protocols: `&[]`.
+fn ingress_relayed_response_header_names(ingress_protocol: &str) -> &'static [&'static str] {
+    crate::proto::protocol_for(ingress_protocol)
+        .map(|p| p.writer().ingress_relayed_response_header_names())
+        .unwrap_or(&[])
 }
 
 /// TRANSPARENCY: stamp which routing POLICY chose which TARGET onto a successful response, mirroring
@@ -162,9 +190,9 @@ fn maybe_attach_route_policy(
 /// which is itself a 400 the caller still needs shaped).
 ///
 /// `pub(crate)` and the single source of truth for native error shaping: it attaches the
-/// protocol-appropriate headers (Bedrock `x-amzn-RequestId` / `x-amzn-errortype` via the shared
-/// `proto::attach_bedrock_error_headers`; Gemini code/status ride the body envelope the writer
-/// builds). `route.rs::ingress_error` and `auth.rs::unauthorized_response` now both DELEGATE to THIS
+/// protocol-appropriate headers (Bedrock `x-amzn-RequestId` / `x-amzn-errortype` via the
+/// `ProtocolWriter::attach_error_response_headers` vtable method (BedrockWriter delegates to its
+/// private helper); Gemini code/status ride the body envelope the writer builds). `route.rs::ingress_error` and `auth.rs::unauthorized_response` now both DELEGATE to THIS
 /// function (the migration is complete — they hold no private copies), so the degraded path, the main
 /// path, and the auth/route paths cannot diverge on error shape or headers.
 pub(crate) fn ingress_error(ingress: &str, status: StatusCode, kind: &str, msg: &str) -> Response {
@@ -206,25 +234,25 @@ pub(crate) fn ingress_error(ingress: &str, status: StatusCode, kind: &str, msg: 
 /// each status.
 fn cross_protocol_error_kind(status: StatusCode) -> &'static str {
     if status == StatusCode::UNAUTHORIZED {
-        "authentication_error"
+        KIND_AUTHENTICATION
     } else if status == StatusCode::FORBIDDEN {
-        "permission_error"
+        KIND_PERMISSION
     } else if status == StatusCode::TOO_MANY_REQUESTS {
-        "rate_limit_error"
+        KIND_RATE_LIMIT
     } else if status == StatusCode::SERVICE_UNAVAILABLE {
         // A genuine upstream 503 carries the unavailable/overloaded distinction — collapsing it into
         // `api_error` would emit, on a bedrock ingress, the status(503)/InternalServerException
         // pairing the real AWS runtime NEVER produces (503 pairs with ServiceUnavailableException).
         // Use `overloaded` — the SAME kind busbar already uses for its OWN 503s, mapping to
         // ServiceUnavailableException (bedrock) / UNAVAILABLE (gemini).
-        "overloaded"
+        KIND_OVERLOADED
     } else if status == StatusCode::GATEWAY_TIMEOUT {
         // 504 maps to the timeout class (bedrock ModelTimeoutException), not a generic server error.
-        "timeout"
+        KIND_TIMEOUT
     } else if status.is_server_error() {
-        "api_error"
+        KIND_API_ERROR
     } else {
-        "invalid_request_error"
+        KIND_INVALID_REQUEST
     }
 }
 
@@ -276,11 +304,15 @@ fn shape_cross_protocol_error(
 fn strip_router_shim_keys(v: &mut Value, egress_protocol: &str) -> bool {
     let mut changed = false;
     if let Some(obj) = v.as_object_mut() {
-        // The gemini JSON-array key is never native to ANY protocol → strip unconditionally (also
-        // closes the leak where a body-model client smuggles the key in its own controlled body).
-        // `remove` returns the previous value iff the key was present → that is a real mutation (#1).
-        if obj.remove(GEMINI_JSON_ARRAY_SHIM_KEY).is_some() {
-            changed = true;
+        // A protocol's array-stream shim key is never native to ANY backend wire → strip every
+        // registered protocol's key unconditionally (also closes the leak where a body-model client
+        // smuggles a key in its own controlled body). Iterating the cached registry set keeps this
+        // strip from naming any shim-key literal (and from re-sweeping `protocol_for` per request).
+        // `remove` returns the previous value iff the key was present → a real mutation (#1).
+        for &key in crate::proto::array_stream_shim_keys() {
+            if obj.remove(key).is_some() {
+                changed = true;
+            }
         }
         // `stream` is a path-model shim for the EGRESS protocols gemini/bedrock (stream intent and
         // model both ride the URL there; `has_model_in_url()` covers both). For body-model egress
@@ -326,20 +358,6 @@ fn strip_same_protocol_model_shim(v: &mut Value, ingress_protocol: &str) -> bool
     false
 }
 
-/// Router-internal shim key the gemini ingress route injects into the request body when the client
-/// sent a streaming `:streamGenerateContent` request WITHOUT `?alt=sse` (so the response must be the
-/// JSON-array streaming format, not SSE). Defined once in `proto` and re-exported here so the route
-/// injection, this strip, and the Gemini reader's `modeled_keys` exclusion all share one literal.
-use crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY;
-
-/// True when the body carries the gemini JSON-array shim key set to `true` (see
-/// [`GEMINI_JSON_ARRAY_SHIM_KEY`]).
-fn wants_gemini_json_array(v: &Value) -> bool {
-    v.get(GEMINI_JSON_ARRAY_SHIM_KEY)
-        .and_then(|b| b.as_bool())
-        .unwrap_or(false)
-}
-
 /// The SINGLE source of truth for shaping an ingress request body into the bytes sent to one egress
 /// lane. Both the hot path ([`forward_with_pool`], per failover hop) and the degraded last-resort
 /// path ([`forward_once`], FallbackPool/LeastBad) call THIS function so the two cannot drift apart on
@@ -365,7 +383,7 @@ fn wants_gemini_json_array(v: &Value) -> bool {
 /// Returns `Err(Response)` — an ingress-native error envelope with the right status — on the only two
 /// shaping failures (unknown ingress protocol, request translation error) and on the effectively
 /// infallible re-serialization, so neither caller can panic on the request path.
-pub(crate) fn translate_request_cross_protocol(
+fn translate_request_cross_protocol(
     app: &Arc<App>,
     i: usize,
     ingress_protocol: &str,
@@ -397,7 +415,7 @@ pub(crate) fn translate_request_cross_protocol(
             return Err(Box::new(ingress_error(
                 ingress_protocol,
                 StatusCode::BAD_REQUEST,
-                "invalid_request_error",
+                KIND_INVALID_REQUEST,
                 "We received an unexpected internal error. Please try again.",
             )));
         };
@@ -439,7 +457,7 @@ pub(crate) fn translate_request_cross_protocol(
                 return Err(Box::new(ingress_error(
                     ingress_protocol,
                     StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
+                    KIND_INVALID_REQUEST,
                     "We could not process the content of your request.",
                 )));
             }
@@ -482,7 +500,7 @@ pub(crate) fn translate_request_cross_protocol(
         Err(_) => Err(Box::new(ingress_error(
             ingress_protocol,
             StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
+            KIND_API_ERROR,
             "We received an unexpected internal error. Please try again.",
         ))),
     }
@@ -581,7 +599,7 @@ async fn read_capped(r: reqwest::Response, cap: usize) -> (Bytes, ReadEnd) {
     (Bytes::from(buf), end)
 }
 
-/// Read an upstream ERROR / verbatim-relay body under the tight [`MAX_UPSTREAM_BUFFERED_BYTES`] cap.
+/// Read an upstream ERROR / verbatim-relay body under the tight [`max_upstream_buffered_bytes()`] cap.
 /// A truncated error body still classifies/relays correctly (error envelopes are well under the cap,
 /// and a body that overruns it can only be malformed/hostile), so the truncation flag is discarded.
 async fn read_capped_body(r: reqwest::Response) -> Bytes {
@@ -593,8 +611,8 @@ async fn read_capped_body(r: reqwest::Response) -> Bytes {
 /// Exhaustive over `StatusClass` — no `_` wildcard (the no-catch-all rule for disposition matches).
 fn client_fault_kind(class: StatusClass) -> &'static str {
     match class {
-        StatusClass::ContextLength => "context_length_exceeded",
-        StatusClass::ClientError => "invalid_request_error",
+        StatusClass::ContextLength => PROVIDER_CODE_CONTEXT_LENGTH,
+        StatusClass::ClientError => KIND_INVALID_REQUEST,
         // The other classes are not reached on the ClientFault arm (they classify as
         // TransientUpstream / HardDown / ContextLength), but the match must be exhaustive; treat
         // them as a generic invalid-request shape rather than panicking on the request path.
@@ -604,7 +622,7 @@ fn client_fault_kind(class: StatusClass) -> &'static str {
         | StatusClass::Timeout
         | StatusClass::Network
         | StatusClass::Auth
-        | StatusClass::Billing => "invalid_request_error",
+        | StatusClass::Billing => KIND_INVALID_REQUEST,
     }
 }
 
@@ -634,20 +652,20 @@ fn extract_error_message(bytes: &[u8]) -> Option<String> {
 /// SSE `error` event, or a Gemini `google.rpc.Status` element carries generic service phrasing, never
 /// the word "upstream" — leaking it is a protocol-indistinguishability tell on the most-exercised
 /// cross-protocol error path. Keep this generic and free of any intermediary/translation vocabulary.
-pub(crate) const MID_STREAM_GENERIC_DETAIL: &str = crate::proto::STREAM_ABORT_DETAIL;
+const MID_STREAM_GENERIC_DETAIL: &str = crate::proto::STREAM_ABORT_DETAIL;
 
 /// Vendor-neutral fallback `error.message` for a NON-2xx response whose body carried no extractable
 /// human message. Rendered into the CLIENT's native error envelope via `ingress_error`, so it must
 /// read like copy a real single-vendor API would emit — NOT reverse-proxy vocabulary like "upstream".
 /// The real status/cause is logged server-side; only this generic string reaches the client.
-pub(crate) const GENERIC_REJECTED_DETAIL: &str = "The request could not be processed.";
+const GENERIC_REJECTED_DETAIL: &str = "The request could not be processed.";
 
 /// Vendor-neutral fallback detail for a cross-protocol response that could not be relayed (a body
 /// transfer failure mid-read, an over-cap body, or an untranslatable shape). Rendered into the
 /// client's native error envelope, so it must NOT disclose the existence of a translating
 /// intermediary ("translate"/"untranslatable") or proxy vocabulary ("upstream"); a native vendor
 /// returns a generic internal-error message here. The precise cause is logged server-side.
-pub(crate) const GENERIC_RESPONSE_ERROR_DETAIL: &str =
+const GENERIC_RESPONSE_ERROR_DETAIL: &str =
     "An internal error occurred while processing the response.";
 
 /// Build the bytes for a mid-stream error to send to the CLIENT, framed in the INGRESS protocol.
@@ -670,11 +688,24 @@ fn mid_stream_error_bytes(
     ingress_eventstream: bool,
     message: &str,
 ) -> Vec<u8> {
+    // The error is a mid-stream transport failure ≈ internal/5xx. Resolve the ingress protocol once;
+    // an unknown ingress falls back to the OpenAI writer (mirrors `ingress_error`).
+    let err = crate::proto::IrError {
+        class: crate::breaker::StatusClass::ServerError,
+        provider_signal: Some(message.to_string()),
+        retry_after: None,
+    };
+    let proto =
+        crate::proto::protocol_for(ingress_protocol).unwrap_or_else(crate::proto::Protocol::openai);
     if ingress_eventstream {
-        // Bedrock binary eventstream client: a transient mid-stream upstream failure maps to the
-        // generic internal-server exception (a real AWS Converse exception name).
-        let exc = crate::proto::error_kind_to_bedrock_type("api_error");
-        return crate::eventstream::encode_exception_frame(exc, message);
+        // Binary eventstream client (a native AWS SDK): a mid-stream failure is a MODELED-EXCEPTION
+        // frame, not an SSE event. The exception NAME comes from the ingress writer's vtable
+        // (`write_response_exception`) — so forward.rs names no protocol's wire shape;
+        // `encode_exception_frame` is the generic binary framer. A protocol that reports
+        // `ingress_is_eventstream` but declines an exception mapping (a contradiction) falls through.
+        if let Some((exc_name, msg)) = proto.writer().write_response_exception(&err) {
+            return crate::eventstream::encode_exception_frame(&exc_name, &msg);
+        }
     }
     // SSE client: build the terminal error frame through the ingress protocol writer's STREAMING
     // error path (`write_response_event(&IrStreamEvent::Error(..))`), NOT the non-stream
@@ -692,23 +723,14 @@ fn mid_stream_error_bytes(
     // ingress protocol uses for every other event. The error carries `StatusClass::ServerError`
     // (mid-stream transport failure ≈ internal/5xx) with the human detail as `provider_signal`, which
     // each writer maps to its native error `type`/`message`.
-    let err = crate::proto::IrError {
-        class: crate::breaker::StatusClass::ServerError,
-        provider_signal: Some(message.to_string()),
-        retry_after: None,
-    };
     let ev = crate::ir::IrStreamEvent::Error(err);
-    // Bind the Protocol so the writer borrow outlives the call (an unknown ingress falls back to the
-    // OpenAI writer, mirroring `ingress_error`).
-    let proto =
-        crate::proto::protocol_for(ingress_protocol).unwrap_or_else(crate::proto::Protocol::openai);
     // Every SSE-framed writer (openai/anthropic/gemini/cohere/responses) returns `Some` for an
     // `Error` event; the `None` fallback only guards a hypothetical future writer that declines to
     // frame errors in-band, in which case we still emit a decodable bare `data:` error.
     match proto.writer().write_response_event(&ev) {
         Some((event_type, data)) => {
             let data = crate::json::to_string(&data).unwrap_or_else(|_| {
-                serde_json::json!({ "error": { "message": message, "type": "api_error" } })
+                serde_json::json!({ "error": { "message": message, "type": KIND_API_ERROR } })
                     .to_string()
             });
             if event_type.is_empty() {
@@ -718,8 +740,9 @@ fn mid_stream_error_bytes(
             }
         }
         None => {
-            let data = serde_json::json!({ "error": { "message": message, "type": "api_error" } })
-                .to_string();
+            let data =
+                serde_json::json!({ "error": { "message": message, "type": KIND_API_ERROR } })
+                    .to_string();
             format!("data: {data}\n\n").into_bytes()
         }
     }
@@ -731,10 +754,6 @@ fn stable_hash(s: &str) -> u64 {
     crate::store::fnv1a_u64(s)
 }
 
-/// Body wrapper that implements the before-first-byte failover boundary.
-/// Tracks when the first byte is sent and handles mid-stream errors by emitting
-/// SSE error events instead of allowing failover. Also holds the permit until stream ends.
-///
 /// Where to charge a request's token usage when its response stream completes (the resolved virtual
 /// key + its budget period + the governance store). `None` when governance is off or no key resolved.
 #[derive(Clone)]
@@ -752,7 +771,8 @@ pub(crate) struct UsageSink {
     pub(crate) charged_at: u64,
 }
 
-/// Integrated UsageTap for non-buffering usage extraction from streaming responses.
+/// Body wrapper that drives IR-based usage extraction, billing, and mid-stream error handling for
+/// streaming responses.
 struct FirstByteBody<S, P> {
     inner: S,
     first_byte_sent: Arc<AtomicBool>,
@@ -787,7 +807,7 @@ struct FirstByteBody<S, P> {
     /// same-protocol passthrough or the cross-protocol `translate` stage above, both of which are
     /// gemini SSE here — are reframed into the JSON-array streaming format the native non-`alt=sse`
     /// `:streamGenerateContent` request expects (`[{...},{...}]`). Runs AFTER `translate`.
-    json_array: Option<crate::proto::GeminiJsonArrayFramer>,
+    json_array: Option<Box<dyn crate::proto::JsonArrayFramer>>,
     /// When set, the token usage tapped from this response is charged to a virtual key's budget at
     /// stream end (token-accurate accounting). Taken (fired) exactly once when the stream completes.
     usage_sink: Option<UsageSink>,
@@ -828,7 +848,7 @@ where
         breaker_cfg: Arc<crate::store::BreakerCfg>,
         pool: &str,
         translate: Option<crate::proto::StreamTranslate>,
-        json_array: Option<crate::proto::GeminiJsonArrayFramer>,
+        json_array: Option<Box<dyn crate::proto::JsonArrayFramer>>,
         usage_sink: Option<UsageSink>,
         budget_spent: bool,
     ) -> Self {
@@ -921,6 +941,11 @@ where
                                 this.nonstream_buf.extend_from_slice(&chunk);
                             } else {
                                 this.nonstream_buf.extend_from_slice(&chunk[..remaining]);
+                                // Fires once per response (the next chunk sees buf == cap and skips
+                                // this arm). Count it so the undercount is alertable on a dashboard,
+                                // not just visible in a log line an operator has to be watching for.
+                                metrics::counter!(crate::metrics::BILLING_TRUNCATED_TOTAL)
+                                    .increment(1);
                                 tracing::warn!(
                                     buffered = this.nonstream_buf.len(),
                                     cap = max_translated_body_bytes(),
@@ -989,11 +1014,10 @@ where
                         // Route the error through the framer instead: a Gemini `google.rpc.Status`
                         // element + `]`.
                         if let Some(framer) = this.json_array.as_mut() {
-                            let err_bytes = framer.finish_with_error(
-                                500,
-                                "INTERNAL",
-                                MID_STREAM_GENERIC_DETAIL,
-                            );
+                            // The framer owns the wire status/code shape (Gemini → 500/`INTERNAL`); the
+                            // agnostic core supplies only the generic message.
+                            let err_bytes =
+                                framer.finish_with_server_error(MID_STREAM_GENERIC_DETAIL);
                             return Poll::Ready(Some(Ok(Bytes::from(err_bytes))));
                         }
                         // Emit the error in the INGRESS protocol's framing, NOT a hard-coded SSE
@@ -1021,9 +1045,9 @@ where
                         // Mid-BODY transport failure AFTER the first byte on a NON-SSE same-protocol
                         // passthrough (e.g. OpenAI→OpenAI /chat/completions, content-type
                         // application/json): the 2xx headers already recorded an optimistic breaker
-                        // SUCCESS (record_success_in, ~2705), but the body never arrived intact, so that
+                        // SUCCESS (via `record_success_in`), but the body never arrived intact, so that
                         // success is wrong — exactly the case the SSE if-branch above and BOTH buffered
-                        // `ReadEnd::TransportError` paths (forward.rs:2769, 3478) compensate. The SSE
+                        // `ReadEnd::TransportError` paths compensate. The SSE
                         // branch couldn't fire here (this path is reached only when `!this.is_sse`), and
                         // without this the optimistic success is NEVER reversed → repeated mid-body
                         // failures accumulate as successes and the lane never trips. Record a compensating
@@ -1250,6 +1274,47 @@ where
     }
 }
 
+impl<S, P> Drop for FirstByteBody<S, P> {
+    fn drop(&mut self) {
+        // Token-fee billing normally fires in `Poll::Ready(None)` (natural stream end), which TAKES
+        // `usage_sink`. So a `None` here means "already billed" and this Drop is a no-op — no
+        // double-charge. A `Some` means the body was DROPPED MID-STREAM (client disconnect /
+        // cancellation) before the natural end, so the token-fee site never ran and the tokens already
+        // generated + delivered would go unbilled (the under-billing the audit flagged). Bill the
+        // tokens the readers accumulated up to the drop point instead.
+        //
+        // Best-effort: the provider's terminal usage frame may not have arrived before the cancel, so
+        // `translate.usage()` may be partial or absent — partial/zero usage bills partial/zero
+        // (`record_tokens` no-ops on 0 tokens). Only the streaming `translate.usage()` source is
+        // consulted; a partially-buffered same-proto non-stream body cannot be reliably parsed for
+        // usage, so it is not billed on a mid-buffer drop.
+        let Some(sink) = self.usage_sink.take() else {
+            return;
+        };
+        // Mirror the `Poll::Ready(None)` failed-gate EXACTLY: do not bill a stream that surfaced a
+        // terminal reader error OR whose cross-protocol translate aborted mid-flight (buffer overflow
+        // etc.) — both delivered a partial/aborted response the caller cannot use, and billing either
+        // contradicts the no-bill-on-failure policy (asserted by
+        // `test_streaming_translate_abort_trips_breaker_and_skips_billing`).
+        let translate = self.translate.as_ref();
+        if translate.and_then(|t| t.terminal_error()).is_some()
+            || translate.map(|t| t.aborted()).unwrap_or(false)
+        {
+            return;
+        }
+        let tokens = self
+            .translate
+            .as_ref()
+            .and_then(|t| t.usage())
+            .map(|u| u.billable_tokens())
+            .unwrap_or(0);
+        if tokens > 0 {
+            sink.gov
+                .record_tokens(&sink.key_id, &sink.period, sink.charged_at, tokens);
+        }
+    }
+}
+
 impl<S, P> FirstByteBody<S, P> {
     fn into_body(self) -> Body
     where
@@ -1296,12 +1361,10 @@ impl RequestCtx {
         self.excluded.insert(idx);
     }
 
-    /// Get candidate indices minus exclusions.
-    fn filter_candidates<'a>(&self, cands: &'a [WeightedLane]) -> Vec<&'a WeightedLane> {
-        cands
-            .iter()
-            .filter(|wl| !self.excluded.contains(&wl.idx))
-            .collect()
+    /// Fill `out` with candidates minus exclusions (clears `out` first).
+    fn fill_candidates<'a>(&self, cands: &'a [WeightedLane], out: &mut Vec<&'a WeightedLane>) {
+        out.clear();
+        out.extend(cands.iter().filter(|wl| !self.excluded.contains(&wl.idx)));
     }
 
     /// Mark a pool as visited for loop prevention.
@@ -1315,16 +1378,43 @@ impl RequestCtx {
     }
 }
 
+/// RAII release for a WON-but-UNDISPATCHED single-flight recovery probe.
+///
+/// Once `acquire_for_dispatch_in` wins the probe the cell is HalfOpen + `probe_in_flight == true`; the
+/// flag is normally cleared only when a request records an outcome. Every path between winning the
+/// probe and actually dispatching a request must release it, INCLUDING the implicit path where the
+/// `pick_among` future is DROPPED (client disconnect) while parked at the `timeout(sem.acquire_owned())`
+/// await — no early-return runs on drop, so without this guard the cell stays HalfOpen+probe_in_flight
+/// and the lane is benched until the slow out-of-band prober resets it (the HIGH this fixes).
+///
+/// `Drop` calls the idempotent `release_probe_in` (CAS HalfOpen→Open + clear flag) while `armed`. The
+/// two paths that hand a LIVE permit to a dispatched request DISARM the guard first, because the
+/// dispatched request now owns the probe and releases it via its recorded outcome.
+struct ProbeGuard<'a> {
+    store: &'a dyn crate::store::StateStore,
+    pool: &'a str,
+    lane: usize,
+    armed: bool,
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.store.release_probe_in(self.pool, self.lane);
+        }
+    }
+}
+
 /// Pick a lane from `cands` using session affinity (if any) then weighted selection (SWRR) over
 /// the healthy subset, returning the chosen lane index and its acquired concurrency permit.
-/// `cands` is now Vec<WeightedLane> where each lane has its weight from config.
+/// `cands` is a `&[WeightedLane]` slice where each lane carries its configured weight.
 /// `request_ctx` provides accumulated exclusions to avoid retrying failed lanes.
-/// `_affinity_key` enables sticky routing as a preference (not a hard constraint).
+/// `affinity_key` enables sticky routing as a preference (not a hard constraint).
 async fn pick_among(
     app: &Arc<App>,
     cands: &[WeightedLane],
     request_ctx: &mut RequestCtx,
-    _affinity_key: Option<&str>,
+    affinity_key: Option<&str>,
     pool_name: &str,
     // The routing policy's ranked preference for this request, resolved ONCE before the failover loop
     // (see the ROUTING-POLICY SEAM in `forward_with_pool`). `None` is the ZERO-COST default: pure
@@ -1337,7 +1427,7 @@ async fn pick_among(
     // Session affinity preference - try sticky lane first if usable (in this pool's breaker view).
     // Uses a stable hash (NOT DefaultHasher, whose seed is randomized per process) so a session
     // pins to the same lane across restarts.
-    if let Some(k) = _affinity_key {
+    if let Some(k) = affinity_key {
         if !cands.is_empty() {
             let pos = (stable_hash(k) as usize) % cands.len();
             let sticky = cands[pos].idx;
@@ -1375,31 +1465,31 @@ async fn pick_among(
     // without mutating the caller's RequestCtx for what is a within-pick retry.
     let mut local_excluded: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // Hoisted out of the retry loop and pre-sized to the candidate count: the loop body re-runs on
+    // every within-pick retry hop (HalfOpen-probe race), so reusing these buffers (`.clear()` +
+    // re-`.extend()` each iteration) avoids both per-iteration allocation AND growth reallocation.
+    // The filter can only DROP entries, so `cands.len()` is an upper bound (capacity, not fill);
+    // selection semantics are unchanged. `filtered_cands` borrows `cands`, which outlives the loop.
+    let mut filtered_cands: Vec<&WeightedLane> = Vec::with_capacity(cands.len());
+    let mut candidates: Vec<usize> = Vec::with_capacity(cands.len());
+    let mut weights: Vec<u32> = Vec::with_capacity(cands.len());
+
     loop {
         // Deadline guard: never spin or re-select past the request deadline.
         if request_ctx.expired(now()) {
             return None;
         }
 
-        // Pre-size to the candidate count: this loop body re-runs on every within-pick retry hop, so
-        // avoiding per-iteration Vec growth reallocations matters on the hot path. The filter can only
-        // DROP entries, so `cands.len()` is an upper bound (capacity, not fill); selection semantics
-        // are unchanged.
-        let mut filtered_cands: Vec<&WeightedLane> = Vec::with_capacity(cands.len());
-        filtered_cands.extend(
-            request_ctx
-                .filter_candidates(cands)
-                .into_iter()
-                .filter(|wl| !local_excluded.contains(&wl.idx)),
-        );
+        request_ctx.fill_candidates(cands, &mut filtered_cands);
+        filtered_cands.retain(|wl| !local_excluded.contains(&wl.idx));
         if filtered_cands.is_empty() {
             return None;
         }
 
         // Extract lane indices and weights for select_weighted call
-        let mut candidates: Vec<usize> = Vec::with_capacity(filtered_cands.len());
+        candidates.clear();
         candidates.extend(filtered_cands.iter().map(|wl| wl.idx));
-        let mut weights: Vec<u32> = Vec::with_capacity(filtered_cands.len());
+        weights.clear();
         weights.extend(filtered_cands.iter().map(|wl| wl.weight));
 
         // SELECTION. Two paths, and ONLY two:
@@ -1484,15 +1574,25 @@ async fn pick_among(
         // CLASS GUARD (single-flight recovery probe): from here on we have WON the probe
         // (`acquire_for_dispatch_in` returned true, leaving the cell HalfOpen + `probe_in_flight ==
         // true`). The probe is normally released only when an outcome is recorded (`record_success`
-        // → cell_closed, or a failure → cell_open). EVERY early return below this point abandons the
-        // probe WITHOUT recording an outcome, so each one MUST release it — otherwise the flag stays
-        // `true`, the cell stays HalfOpen, and `usable_for` benches the lane until the slow
-        // out-of-band prober resets it (the HIGH this fixes). The only paths that legitimately keep
-        // the probe are the two that actually DISPATCH a request: the immediate `try_acquire`
-        // success and the `Ok(Ok(permit))` permit-wait success below.
+        // → cell_closed, or a failure → cell_open). EVERY abandon of the probe below — explicit early
+        // return OR an IMPLICIT future-drop while parked on the permit await — must release it, else
+        // the flag stays `true`, the cell stays HalfOpen, and `usable_for` benches the lane until the
+        // slow out-of-band prober resets it (the HIGH this fixes). `ProbeGuard` enforces that on Drop;
+        // the only paths that legitimately keep the probe are the two that actually DISPATCH a request
+        // (the immediate `try_acquire` hit and the `Ok(Ok(permit))` permit-wait success), which DISARM
+        // the guard before returning the live permit — the dispatched request then owns the probe and
+        // releases it via its recorded outcome.
+        let mut probe_guard = ProbeGuard {
+            store: app.store.as_ref(),
+            pool: pool_name,
+            lane: picked_lane_idx,
+            armed: true,
+        };
 
         // Try to acquire the concurrency permit immediately.
         if let Some(p) = app.store.try_acquire(picked_lane_idx) {
+            // Live permit → dispatched request owns the probe; disarm so Drop is a no-op.
+            probe_guard.armed = false;
             return Some((picked_lane_idx, p));
         }
 
@@ -1501,43 +1601,48 @@ async fn pick_among(
         // the request deadline (unbounded spinning here was a head-of-line-blocking DoS surface).
         let remaining = request_ctx.remaining(now());
         if remaining == 0 {
-            // Deadline already passed before we could even park — release the won-but-undispatched
-            // probe so the lane stays re-probeable.
-            app.store.release_probe_in(pool_name, picked_lane_idx);
+            // Deadline already passed before we could even park — `probe_guard` drops here and
+            // releases the won-but-undispatched probe so the lane stays re-probeable.
             return None;
         }
         let sem = app.store.lane_semaphore(picked_lane_idx);
+        // If this future is DROPPED while parked on the await below (client disconnect), `probe_guard`
+        // drops with it and releases the probe — the leak A1 fixes.
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(remaining),
             sem.acquire_owned(),
         )
         .await
         {
-            // Got a permit before the deadline — this is a genuine dispatch; keep the probe (the
-            // request itself will record the success/failure that releases it).
-            Ok(Ok(permit)) => return Some((picked_lane_idx, permit)),
-            // Semaphore closed (shutdown) — no request dispatched; release the probe before bailing.
-            Ok(Err(_)) => {
-                app.store.release_probe_in(pool_name, picked_lane_idx);
-                return None;
+            // Got a permit before the deadline — a genuine dispatch; disarm the guard (the request
+            // itself will record the success/failure that releases the probe).
+            Ok(Ok(permit)) => {
+                probe_guard.armed = false;
+                return Some((picked_lane_idx, permit));
             }
-            // Deadline hit while waiting for a permit — no request dispatched; release the probe so
-            // the recovered lane isn't permanently benched, then give up so the caller can
+            // Semaphore closed (shutdown) — no request dispatched; `probe_guard` drops and releases.
+            Ok(Err(_)) => return None,
+            // Deadline hit while waiting for a permit — no request dispatched; `probe_guard` drops and
+            // releases so the recovered lane isn't permanently benched, then give up so the caller can
             // 503/failover.
-            Err(_) => {
-                app.store.release_probe_in(pool_name, picked_lane_idx);
-                return None;
-            }
+            Err(_) => return None,
         }
     }
 }
 
-/// Original forward function without pool context - uses default Status503 mode.
 /// True for content types that carry an incremental streamed response: SSE (text/event-stream,
-/// used by Anthropic/OpenAI/Gemini-SSE) and AWS event-stream (Bedrock ConverseStream,). Both
+/// used by Anthropic/OpenAI/Gemini-SSE) and AWS event-stream (Bedrock ConverseStream). Both
 /// must engage the streaming body path rather than being buffered.
 fn is_streaming_content_type(ct: &str) -> bool {
-    ct.starts_with("text/event-stream") || ct.starts_with("application/vnd.amazon.eventstream")
+    // Read the cached streaming-CT set instead of re-sweeping the registry per request: a CT is
+    // "streaming" iff it is the streaming `Content-Type` of SOME registered protocol's writer (SSE
+    // protocols → `text/event-stream`; Bedrock → `application/vnd.amazon.eventstream`). The cache
+    // (`proto::streaming_content_types`) reads those MIMEs from the writer vtable, so naming no
+    // protocol/MIME literal here keeps the agnostic core clean. The detected set is unchanged:
+    // `text/event-stream` + `application/vnd.amazon.eventstream`.
+    crate::proto::streaming_content_types()
+        .iter()
+        .any(|p| ct.starts_with(p))
 }
 
 /// The streaming `Content-Type` the INGRESS client expects, by ingress protocol. On a cross-protocol
@@ -1613,7 +1718,7 @@ pub(crate) fn sign_and_wire_path(url_path: &str) -> String {
 /// `String` for the canonical URI. On the common no-query path the encoded path IS the canonical URI,
 /// so it is reused for both fields and only the wire path is (cheaply) cloned; with a query the wire
 /// path is `canonical?query`. Output is byte-identical to the previous split-and-`to_string` form.
-pub(crate) fn sign_and_wire_path_parts(url_path: &str) -> (String, String) {
+fn sign_and_wire_path_parts(url_path: &str) -> (String, String) {
     match url_path.split_once('?') {
         Some((path, query)) => {
             let canonical = crate::sigv4::uri_encode_path(path);
@@ -1711,7 +1816,7 @@ pub(crate) fn egress_accept(egress_protocol: &str, wants_stream: bool) -> &'stat
     crate::proto::protocol_for(egress_protocol)
         .map(|p| p.writer().egress_accept(wants_stream))
         .unwrap_or(if wants_stream {
-            "text/event-stream"
+            TEXT_EVENT_STREAM
         } else {
             APPLICATION_JSON
         })
@@ -1739,32 +1844,6 @@ fn record_ir_usage(usage: &crate::ir::IrUsage, usage_sink: &Option<UsageSink>) {
                 .record_tokens(&sink.key_id, &sink.period, sink.charged_at, tokens);
         }
     }
-}
-
-/// Anthropic-ingress convenience entry point. Binds `ingress_protocol = "anthropic"` and delegates
-/// to `forward_with_pool`; its only callers are `route::named` and `route::adhoc`, both Anthropic
-/// `/v1/messages` routes. The literal `"anthropic"` here is NOT a name-branch — it is the
-/// route→protocol binding for this specific ingress entry point.
-pub(crate) async fn forward(
-    app: Arc<App>,
-    cands: Vec<WeightedLane>,
-    body: Bytes,
-    caller_token: Option<&str>,
-    usage_sink: Option<UsageSink>,
-) -> Response {
-    // Empty pool name → the lane-default breaker cell (shared by all direct/ad-hoc routes and
-    // surfaced by /stats and /healthz). Named pools route via forward_with_pool with their own cells.
-    forward_with_pool(
-        app,
-        cands,
-        body,
-        caller_token,
-        "",
-        None,
-        "anthropic",
-        usage_sink,
-    )
-    .await
 }
 
 /// The bounded `pool` LABEL for an UPSTREAM/breaker metric (LOW #25).
@@ -1880,7 +1959,9 @@ async fn decide_policy_order(
 
     // The candidate set the policy ranks over = this pool's members MINUS the already-excluded ones
     // (configured exclusions). `idx` is the stable lane handle the ordered walk speaks.
-    let live: Vec<&WeightedLane> = request_ctx.filter_candidates(cands);
+    let mut live_buf: Vec<&WeightedLane> = Vec::with_capacity(cands.len());
+    request_ctx.fill_candidates(cands, &mut live_buf);
+    let live = &live_buf;
     if live.is_empty() {
         // Nothing to rank — let the loop's exhaustion handling take over (SWRR will also find none).
         return PolicyOutcome::Weighted;
@@ -2015,6 +2096,43 @@ fn coerce_on_error(
     }
 }
 
+#[cfg(test)]
+mod coerce_on_error_tests {
+    use super::{coerce_on_error, PolicyOutcome};
+    use crate::config::PolicyOnError;
+
+    /// Each `on_error` disposition maps to its own distinct `PolicyOutcome` — this is the sole path
+    /// that turns a policy error/timeout into the caller's fallback. `Reject` (→ 503-to-client) and
+    /// `First` (→ deterministic config-order dispatch) each carry real availability behavior a
+    /// regression could silently flip, so pin all three arms. An empty candidate slice suffices:
+    /// `Weighted`/`Reject` ignore the candidates and `First` simply maps each `.idx`.
+    #[test]
+    fn coerce_on_error_maps_each_disposition() {
+        let cands: &[crate::routing::Candidate] = &[];
+        assert!(matches!(
+            coerce_on_error(&PolicyOnError::Weighted, cands, "p"),
+            PolicyOutcome::Weighted
+        ));
+        assert!(matches!(
+            coerce_on_error(&PolicyOnError::Reject, cands, "p"),
+            PolicyOutcome::Reject
+        ));
+        match coerce_on_error(&PolicyOnError::First, cands, "testpolicy") {
+            PolicyOutcome::Order { order, name } => {
+                assert!(
+                    order.is_empty(),
+                    "empty candidate set yields an empty order"
+                );
+                assert_eq!(
+                    name, "testpolicy",
+                    "First preserves the policy name verbatim"
+                );
+            }
+            _ => panic!("First must produce a config-order Order outcome"),
+        }
+    }
+}
+
 /// Forward with pool name context for on_exhausted config lookup.
 /// Thin wrapper: parse the body ONCE for callers that only hold bytes (tests, ad-hoc routes), then
 /// delegate. The ingress hot path (`route::forward_resolved`) instead calls
@@ -2038,7 +2156,7 @@ pub(crate) async fn forward_with_pool(
             return ingress_error(
                 ingress_protocol,
                 StatusCode::BAD_REQUEST,
-                "invalid_request_error",
+                KIND_INVALID_REQUEST,
                 "We could not parse the JSON body of your request.",
             );
         }
@@ -2101,9 +2219,8 @@ pub(crate) async fn forward_with_pool_parsed(
     // under `Content-Type: application/json` — undecodable by the official SDK and a router behavior
     // no native backend exhibits. False for every other protocol and for the `?alt=sse` gemini variant.
     let gemini_json_array = crate::proto::protocol_for(ingress_protocol)
-        .map(|p| p.writer().uses_array_stream_shim())
-        .unwrap_or(false)
-        && wants_gemini_json_array(&v);
+        .map(|p| p.writer().uses_array_stream_shim() && p.writer().wants_array_stream(&v))
+        .unwrap_or(false);
 
     // Derive affinity key early (before any mutations to v)
     let affinity_key_str: Option<String> = if let Some(k) = affinity_key {
@@ -2219,7 +2336,7 @@ pub(crate) async fn forward_with_pool_parsed(
                     return ingress_error(
                         ingress_protocol,
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "overloaded",
+                        KIND_OVERLOADED,
                         "The routing policy could not select an upstream. Please retry shortly.",
                     );
                 }
@@ -2238,7 +2355,7 @@ pub(crate) async fn forward_with_pool_parsed(
             return ingress_error(
                 ingress_protocol,
                 StatusCode::SERVICE_UNAVAILABLE,
-                "overloaded",
+                KIND_OVERLOADED,
                 "The request timed out. Please retry shortly.",
             );
         }
@@ -2260,7 +2377,7 @@ pub(crate) async fn forward_with_pool_parsed(
                     return ingress_error(
                         ingress_protocol,
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "overloaded",
+                        KIND_OVERLOADED,
                         "The service is temporarily overloaded. Please retry shortly.",
                     );
                 }
@@ -2327,7 +2444,7 @@ pub(crate) async fn forward_with_pool_parsed(
                     return ingress_error(
                         ingress_protocol,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "api_error",
+                        KIND_API_ERROR,
                         "We received an unexpected internal error. Please try again.",
                     );
                 }
@@ -2426,7 +2543,11 @@ pub(crate) async fn forward_with_pool_parsed(
         match res {
             Err(e) => {
                 // Pre-response error: classify and potentially failover
-                let err_type = if e.is_timeout() { "timeout" } else { "connect" };
+                let err_type = if e.is_timeout() {
+                    ERR_NET_TIMEOUT
+                } else {
+                    ERR_NET_CONNECT
+                };
                 let tripped =
                     app.store
                         .record_transient_in(pool_name, i, err_type, &breaker_cfg, None);
@@ -2441,7 +2562,7 @@ pub(crate) async fn forward_with_pool_parsed(
                     crate::metrics::UPSTREAM_FAILURES_TOTAL,
                     "pool" => metric_pool.to_owned(),
                     "lane" => app.lanes[i].model.clone(),
-                    "disposition" => "transient_upstream"
+                    "disposition" => DISPOSITION_TRANSIENT
                 )
                 .increment(1);
                 metrics::counter!(
@@ -2484,20 +2605,27 @@ pub(crate) async fn forward_with_pool_parsed(
                         axum::http::HeaderName,
                         axum::http::HeaderValue,
                     )> = if ingress_relays_amzn_headers(ingress_protocol) {
-                        [
-                            crate::proto::HDR_AMZN_REQUEST_ID,
-                            crate::proto::HDR_AMZN_ERROR_TYPE,
-                        ]
-                        .iter()
-                        .filter_map(|name| {
-                            let v = r.headers().get(*name)?.clone();
-                            let n = axum::http::HeaderName::from_static(name);
-                            Some((n, v))
-                        })
-                        .collect()
+                        ingress_relayed_response_header_names(ingress_protocol)
+                            .iter()
+                            .filter_map(|name| {
+                                let v = r.headers().get(*name)?.clone();
+                                let n = axum::http::HeaderName::from_static(name);
+                                Some((n, v))
+                            })
+                            .collect()
                     } else {
                         Vec::new()
                     };
+                    // For a NON-amzn same-protocol error relay (anthropic), capture the upstream's
+                    // PRIMARY relayed id (`request-id`) so it can be forwarded verbatim — or synthesized
+                    // if the upstream omitted it — mirroring `forward_once`'s same-proto error relay.
+                    // Empty for protocols with no relayed header name.
+                    let upstream_error_relay_id: Option<String> =
+                        ingress_relayed_response_header_names(ingress_protocol)
+                            .first()
+                            .and_then(|name| r.headers().get(*name))
+                            .and_then(|h| h.to_str().ok())
+                            .map(|s| s.to_string());
                     // Size-capped read: a hostile/misconfigured upstream must not force an unbounded
                     // heap allocation for a non-2xx body before the breaker classification runs.
                     let bytes = read_capped_body(r).await;
@@ -2533,11 +2661,20 @@ pub(crate) async fn forward_with_pool_parsed(
                         if let Some(ct) = ct {
                             rb = rb.header(CONTENT_TYPE, ct);
                         }
-                        // Forward the upstream's `x-amzn-requestid` / `x-amzn-errortype` on a
-                        // bedrock-ingress same-protocol relay so the SDK's header-first typed-exception
-                        // dispatch and `request_id()` match a native Bedrock 4xx (empty for non-bedrock).
-                        for (name, value) in &upstream_amzn_headers {
-                            rb = rb.header(name, value);
+                        // Forward the native response request-id header(s) on a same-protocol relay so
+                        // the SDK's `request_id()` matches a real endpoint. Bedrock: both
+                        // `x-amzn-requestid` + `x-amzn-errortype` VERBATIM. Anthropic: `request-id`
+                        // upstream-or-synth (a native Anthropic 4xx always carries it). Mirrors forward_once.
+                        if ingress_relays_amzn_headers(ingress_protocol) {
+                            for (name, value) in &upstream_amzn_headers {
+                                rb = rb.header(name, value);
+                            }
+                        } else {
+                            rb = maybe_attach_response_request_id(
+                                rb,
+                                ingress_protocol,
+                                upstream_error_relay_id.as_deref(),
+                            );
                         }
                         // Re-create response from bytes for same-protocol passthrough relay
                         return rb
@@ -2589,10 +2726,19 @@ pub(crate) async fn forward_with_pool_parsed(
                             if let Some(ct) = ct {
                                 rb = rb.header(CONTENT_TYPE, ct);
                             }
-                            // Same as the passthrough-40x branch: preserve the native Bedrock error
-                            // headers on a bedrock same-protocol client-fault relay (empty otherwise).
-                            for (name, value) in &upstream_amzn_headers {
-                                rb = rb.header(name, value);
+                            // Same as the passthrough-40x branch: preserve the native response
+                            // request-id header on a same-protocol client-fault relay — bedrock's
+                            // `x-amzn-*` verbatim, anthropic's `request-id` upstream-or-synth.
+                            if ingress_relays_amzn_headers(ingress_protocol) {
+                                for (name, value) in &upstream_amzn_headers {
+                                    rb = rb.header(name, value);
+                                }
+                            } else {
+                                rb = maybe_attach_response_request_id(
+                                    rb,
+                                    ingress_protocol,
+                                    upstream_error_relay_id.as_deref(),
+                                );
                             }
                             return rb
                                 .body(Body::from(bytes))
@@ -2612,9 +2758,9 @@ pub(crate) async fn forward_with_pool_parsed(
                             } else {
                                 let what = match sig.class {
                                     StatusClass::ServerError => "5xx",
-                                    StatusClass::Timeout => "timeout",
+                                    StatusClass::Timeout => ERR_NET_TIMEOUT,
                                     StatusClass::Network => "network",
-                                    StatusClass::Overloaded => "overloaded",
+                                    StatusClass::Overloaded => KIND_OVERLOADED,
                                     StatusClass::RateLimit => {
                                         // Should have been handled above but Rust needs exhaustive match
                                         "rate_limit"
@@ -2648,13 +2794,13 @@ pub(crate) async fn forward_with_pool_parsed(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
                                 "pool" => metric_pool.to_owned(),
                                 "lane" => app.lanes[i].model.clone(),
-                                "disposition" => "transient_upstream"
+                                "disposition" => DISPOSITION_TRANSIENT
                             )
                             .increment(1);
                             metrics::counter!(
                                 crate::metrics::FAILOVERS_TOTAL,
                                 "pool" => metric_pool.to_owned(),
-                                "reason" => "transient_upstream"
+                                "reason" => DISPOSITION_TRANSIENT
                             )
                             .increment(1);
                             drop(permit);
@@ -2711,7 +2857,7 @@ pub(crate) async fn forward_with_pool_parsed(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
                                 "pool" => metric_pool.to_owned(),
                                 "lane" => app.lanes[i].model.clone(),
-                                "disposition" => "hard_down"
+                                "disposition" => DISPOSITION_HARD_DOWN
                             )
                             .increment(1);
                             drop(permit);
@@ -2758,7 +2904,7 @@ pub(crate) async fn forward_with_pool_parsed(
                             metrics::counter!(
                                 crate::metrics::FAILOVERS_TOTAL,
                                 "pool" => metric_pool.to_owned(),
-                                "reason" => "hard_down"
+                                "reason" => DISPOSITION_HARD_DOWN
                             )
                             .increment(1);
                             continue;
@@ -2789,13 +2935,13 @@ pub(crate) async fn forward_with_pool_parsed(
                                 crate::metrics::UPSTREAM_FAILURES_TOTAL,
                                 "pool" => metric_pool.to_owned(),
                                 "lane" => app.lanes[i].model.clone(),
-                                "disposition" => "context_length"
+                                "disposition" => DISPOSITION_CONTEXT_LENGTH
                             )
                             .increment(1);
                             metrics::counter!(
                                 crate::metrics::FAILOVERS_TOTAL,
                                 "pool" => metric_pool.to_owned(),
-                                "reason" => "context_length"
+                                "reason" => DISPOSITION_CONTEXT_LENGTH
                             )
                             .increment(1);
                             // Probe class guard: ContextLength is a client-fault variant (the request
@@ -2839,22 +2985,17 @@ pub(crate) async fn forward_with_pool_parsed(
 
                 // stream the response body incrementally with first-byte boundary tracking
                 let ct = r.headers().get(CONTENT_TYPE).cloned();
-                // Capture the upstream's `x-amzn-RequestId` (if any) BEFORE consuming `r` into the
-                // body stream. On a SAME-PROTOCOL bedrock streaming passthrough we forward the real
-                // upstream id verbatim (a native ConverseStream response carries it); on a
-                // CROSS-PROTOCOL bedrock-ingress stream the backend supplied none, so we synthesize
-                // one below. Either way a bedrock-ingress stream must carry the header (matching a
-                // real endpoint and the error path).
-                let upstream_amzn_id = r
-                    .headers()
-                    .get(crate::proto::HDR_AMZN_REQUEST_ID)
-                    .and_then(|h| h.to_str().ok())
-                    .map(|s| s.to_string());
-                // Anthropic-ingress: capture the upstream `request-id` so a same-protocol passthrough
-                // forwards it verbatim; cross-protocol/synthetic cases mint one in the attach helper.
-                let upstream_request_id = r
-                    .headers()
-                    .get(crate::proto::HDR_REQUEST_ID)
+                // Capture the upstream PRIMARY relayed id (if any) BEFORE consuming `r` into the body
+                // stream, keyed off the ingress writer's `ingress_relayed_response_header_names` (so
+                // this names no protocol module). On a SAME-PROTOCOL streaming passthrough we forward
+                // the real upstream id verbatim — `x-amzn-RequestId` for bedrock (a native
+                // ConverseStream response carries it), `request-id` for anthropic; on a CROSS-PROTOCOL
+                // stream the backend supplied none, so the attach helper synthesizes one below. Either
+                // way a bedrock/anthropic-ingress stream must carry the header (matching a real
+                // endpoint and the error path).
+                let upstream_relay_id = ingress_relayed_response_header_names(ingress_protocol)
+                    .first()
+                    .and_then(|name| r.headers().get(*name))
                     .and_then(|h| h.to_str().ok())
                     .map(|s| s.to_string());
                 let is_sse = ct
@@ -2902,7 +3043,7 @@ pub(crate) async fn forward_with_pool_parsed(
                         let tripped = app.store.record_transient_in(
                             pool_name,
                             i,
-                            "transport",
+                            ERR_NET_TRANSPORT,
                             &breaker_cfg,
                             None,
                         );
@@ -2919,7 +3060,7 @@ pub(crate) async fn forward_with_pool_parsed(
                         return ingress_error(
                             ingress_protocol,
                             StatusCode::BAD_GATEWAY,
-                            "api_error",
+                            KIND_API_ERROR,
                             GENERIC_RESPONSE_ERROR_DETAIL,
                         );
                     }
@@ -2944,7 +3085,7 @@ pub(crate) async fn forward_with_pool_parsed(
                         return ingress_error(
                             ingress_protocol,
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            "api_error",
+                            KIND_API_ERROR,
                             GENERIC_RESPONSE_ERROR_DETAIL,
                         );
                     }
@@ -3050,7 +3191,11 @@ pub(crate) async fn forward_with_pool_parsed(
                                             CONTENT_TYPE,
                                             ingress_proto.writer().streaming_content_type(),
                                         );
-                                        let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
+                                        let rb = maybe_attach_response_request_id(
+                                            rb,
+                                            ingress_protocol,
+                                            None,
+                                        );
                                         let rb = maybe_attach_route_policy(
                                             rb,
                                             chosen_policy_name,
@@ -3107,12 +3252,14 @@ pub(crate) async fn forward_with_pool_parsed(
                                 let rb = Response::builder()
                                     .status(status)
                                     .header(CONTENT_TYPE, APPLICATION_JSON);
-                                let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
-                                // Anthropic-ingress 2xx carries `request-id`. This is the
-                                // CROSS-protocol translate path (ingress != egress), so there is no
-                                // upstream anthropic id to forward — synthesize one.
+                                // The ingress writer's vtable attaches its native response request-id
+                                // header (bedrock `x-amzn-RequestId`, anthropic `request-id`). This is
+                                // the CROSS-protocol translate path (ingress != egress), so there is no
+                                // upstream id to forward — `None` makes the writer synthesize one. ONE
+                                // call dispatches per protocol; a second call would APPEND a duplicate
+                                // header (axum `header()` appends, not replaces).
                                 let rb =
-                                    maybe_attach_anthropic_request_id(rb, ingress_protocol, None);
+                                    maybe_attach_response_request_id(rb, ingress_protocol, None);
                                 let rb = maybe_attach_route_policy(
                                     rb,
                                     chosen_policy_name,
@@ -3147,7 +3294,7 @@ pub(crate) async fn forward_with_pool_parsed(
                     return ingress_error(
                         ingress_protocol,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "api_error",
+                        KIND_API_ERROR,
                         GENERIC_RESPONSE_ERROR_DETAIL,
                     );
                 }
@@ -3176,8 +3323,12 @@ pub(crate) async fn forward_with_pool_parsed(
                 // Gemini non-`alt=sse` ingress: engage the JSON-array framer (only when this is in
                 // fact a streamed SSE response — a same-protocol non-stream gemini response never
                 // reaches the streaming builder).
-                let json_array =
-                    (gemini_json_array && is_sse).then(crate::proto::GeminiJsonArrayFramer::new);
+                let json_array = (gemini_json_array && is_sse)
+                    .then(|| {
+                        crate::proto::protocol_for(ingress_protocol)
+                            .and_then(|p| p.writer().make_array_stream_framer())
+                    })
+                    .flatten();
                 let upstream_stream = r.bytes_stream();
                 let guarded_body = FirstByteBody::new(
                     upstream_stream,
@@ -3219,20 +3370,14 @@ pub(crate) async fn forward_with_pool_parsed(
                     }
                 }
                 // Bedrock-ingress streaming 2xx must carry `x-amzn-RequestId` (a real ConverseStream
-                // always does). Prefer the upstream's real id when this is a same-protocol bedrock
-                // passthrough (it captured one); otherwise synthesize. Non-bedrock ingress: omit.
-                if ingress_relays_amzn_headers(ingress_protocol) {
-                    if let Some(id) = upstream_amzn_id.or_else(crate::proto::synth_amzn_request_id)
-                    {
-                        rb = rb.header(crate::proto::HDR_AMZN_REQUEST_ID, id);
-                    }
-                }
-                // Anthropic-ingress streaming 2xx must carry `request-id` (a real Anthropic stream
-                // always does; the SDK reads it into `Message._request_id`).
-                rb = maybe_attach_anthropic_request_id(
+                // always does, preferring the captured same-protocol upstream id else synthesizing);
+                // anthropic-ingress streaming 2xx must carry `request-id` (the SDK reads it into
+                // `Message._request_id`). The writer vtable selects the correct header+value per
+                // protocol from the captured upstream id; non-relaying ingress: omit.
+                rb = maybe_attach_response_request_id(
                     rb,
                     ingress_protocol,
-                    upstream_request_id.as_deref(),
+                    upstream_relay_id.as_deref(),
                 );
                 // TRANSPARENCY: stamp which routing policy chose this target (no-op on the default
                 // path / when the policy Abstained). Covers same-protocol passthrough + all streaming.
@@ -3359,7 +3504,7 @@ fn handle_status_503(
     let mut resp = ingress_error(
         ingress_protocol,
         StatusCode::SERVICE_UNAVAILABLE,
-        "overloaded",
+        KIND_OVERLOADED,
         "The service is temporarily overloaded. Please retry shortly.",
     );
     if let Ok(v) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
@@ -3418,7 +3563,7 @@ async fn forward_once(
             return Ok(ingress_error(
                 ingress_protocol,
                 StatusCode::BAD_REQUEST,
-                "invalid_request_error",
+                KIND_INVALID_REQUEST,
                 "We could not parse the JSON body of your request.",
             ));
         }
@@ -3430,9 +3575,8 @@ async fn forward_once(
     // on `uses_array_stream_shim()` (true only for GeminiWriter) so a body-model client cannot
     // smuggle the shim key to force JSON-array reframing of its SSE stream.
     let gemini_json_array = crate::proto::protocol_for(ingress_protocol)
-        .map(|p| p.writer().uses_array_stream_shim())
-        .unwrap_or(false)
-        && wants_gemini_json_array(&v);
+        .map(|p| p.writer().uses_array_stream_shim() && p.writer().wants_array_stream(&v))
+        .unwrap_or(false);
     let egress_name = app.lanes[i].protocol.name();
 
     // Breaker config for THIS degraded attempt's routing pool cell — resolved the same way the main
@@ -3486,15 +3630,13 @@ async fn forward_once(
         Some(p) => p.clone(),
         None => writer.upstream_path_for_stream(&app.lanes[i].model, wants_stream),
     };
-    // Sign and send the SAME path encoding — see `sign_and_wire_path` (mirrors the main forward path).
-    let wire_path = sign_and_wire_path(&url_path);
+    // Sign and send the SAME path encoding — see `sign_and_wire_path_parts` (mirrors the main forward
+    // path): it returns the SigV4 canonical_uri (query stripped) alongside the wire path, so the
+    // degraded path no longer re-splits and allocates a second String for the canonical URI.
+    let (wire_path, canonical_uri) = sign_and_wire_path_parts(&url_path);
     let signing_ctx = crate::proto::SigningContext {
         host: host_from_base(base),
-        canonical_uri: wire_path
-            .split('?')
-            .next()
-            .unwrap_or(&wire_path)
-            .to_string(),
+        canonical_uri,
         body: &payload,
         timestamp_epoch: now(),
         auth_mode: app.auth_mode(),
@@ -3530,30 +3672,27 @@ async fn forward_once(
         Ok(r) => {
             let status = r.status();
             let ct = r.headers().get(CONTENT_TYPE).cloned();
-            // Capture the upstream `x-amzn-RequestId` before `r` is consumed (same-protocol bedrock
-            // passthrough forwards the real one; cross-protocol bedrock ingress synthesizes below).
-            let upstream_amzn_id = r
-                .headers()
-                .get(crate::proto::HDR_AMZN_REQUEST_ID)
-                .and_then(|h| h.to_str().ok())
-                .map(|s| s.to_string());
-            // The upstream Bedrock `x-amzn-errortype` (a native ConverseStream/Converse error always
-            // carries it; AWS SDKs dispatch the typed exception from this header FIRST, before the
-            // body `__type`). Captured here so the same-protocol degraded error relay below can
-            // forward it verbatim — its absence makes an SDK fall back to body-based dispatch and is a
-            // detectable proxy tell against a native Bedrock endpoint.
-            let upstream_amzn_errortype = r
-                .headers()
-                .get(crate::proto::HDR_AMZN_ERROR_TYPE)
-                .and_then(|h| h.to_str().ok())
-                .map(|s| s.to_string());
-            // Anthropic-ingress `request-id` (same-protocol degraded relay forwards it verbatim;
-            // cross-protocol synthesizes). See `maybe_attach_anthropic_request_id`.
-            let upstream_request_id = r
-                .headers()
-                .get(crate::proto::HDR_REQUEST_ID)
-                .and_then(|h| h.to_str().ok())
-                .map(|s| s.to_string());
+            // Capture the upstream relayed request-id-class headers before `r` is consumed, keyed off
+            // the ingress writer's `ingress_relayed_response_header_names` so this names no protocol
+            // module. For a bedrock ingress this captures `x-amzn-requestid` (the PRIMARY id —
+            // forwarded verbatim on a same-protocol passthrough, or replaced by a synthesized id
+            // cross-protocol below) followed by `x-amzn-errortype` (a native ConverseStream/Converse
+            // error always carries it; AWS SDKs dispatch the typed exception from this header FIRST,
+            // before the body `__type`; its absence is a detectable proxy tell). For an anthropic
+            // ingress it captures `request-id` (the primary id). Empty for non-relaying ingress.
+            let bedrock_relay_headers: Vec<(&'static str, String)> =
+                ingress_relayed_response_header_names(ingress_protocol)
+                    .iter()
+                    .filter_map(|name| {
+                        let v = r.headers().get(*name)?.to_str().ok()?.to_string();
+                        Some((*name, v))
+                    })
+                    .collect();
+            // The PRIMARY relayed id is the FIRST relayed header (x-amzn-requestid for bedrock,
+            // request-id for anthropic); the writer vtable picks the correct response header to attach
+            // it under on the 2xx success path. The bedrock-only second header (`x-amzn-errortype`) is
+            // forwarded verbatim alongside it from `bedrock_relay_headers` on the error relay below.
+            let upstream_relay_id = bedrock_relay_headers.first().map(|(_, v)| v.clone());
             let cross_protocol = ingress_protocol != egress_name;
 
             if !status.is_success() {
@@ -3584,7 +3723,7 @@ async fn forward_once(
                     let tripped = app.store.record_transient_in(
                         pool,
                         i,
-                        "degraded-non2xx",
+                        ERR_DEGRADED_NON2XX,
                         forward_once_cfg.as_ref(),
                         None,
                     );
@@ -3599,27 +3738,27 @@ async fn forward_once(
                 if let Some(ct) = ct {
                     rb = rb.header(CONTENT_TYPE, ct);
                 }
-                // Anthropic-ingress same-protocol error relay: forward the upstream `request-id`
-                // verbatim (a native Anthropic error always carries it; the SDK reads it into
-                // `APIError.request_id`).
-                rb = maybe_attach_anthropic_request_id(
-                    rb,
-                    ingress_protocol,
-                    upstream_request_id.as_deref(),
-                );
-                // Bedrock-ingress same-protocol error relay: forward BOTH `x-amzn-requestid` and
-                // `x-amzn-errortype` verbatim, mirroring the main `forward_with_pool` path. Without
-                // them a native AWS SDK's `request_id()` returns None and the typed-exception dispatch
-                // falls back from header-first to body `__type` — both detectable tells. (The main
-                // path forwards these on its same-protocol error branches; this degraded route
-                // previously captured the id but never attached it, and dropped the errortype.)
                 if ingress_relays_amzn_headers(ingress_protocol) {
-                    if let Some(id) = upstream_amzn_id.as_deref() {
-                        rb = rb.header(crate::proto::HDR_AMZN_REQUEST_ID, id);
+                    // Bedrock-ingress same-protocol error relay: forward BOTH `x-amzn-requestid` and
+                    // `x-amzn-errortype` VERBATIM (no synth), mirroring the main `forward_with_pool`
+                    // path. Without them a native AWS SDK's `request_id()` returns None and the
+                    // typed-exception dispatch falls back from header-first to body `__type` — both
+                    // detectable tells. (This degraded route previously captured the id but never
+                    // attached it, and dropped the errortype.) The header NAMES + VALUES come from the
+                    // vtable-keyed `bedrock_relay_headers` capture, so this names no protocol module.
+                    for (name, value) in &bedrock_relay_headers {
+                        rb = rb.header(*name, value);
                     }
-                    if let Some(et) = upstream_amzn_errortype.as_deref() {
-                        rb = rb.header(crate::proto::HDR_AMZN_ERROR_TYPE, et);
-                    }
+                } else {
+                    // Anthropic-ingress same-protocol error relay: forward the upstream `request-id`
+                    // (a native Anthropic error always carries it; the SDK reads it into
+                    // `APIError.request_id`), synthesizing one if the upstream omitted it. The writer
+                    // vtable selects the `request-id` header name and the upstream-or-synth value.
+                    rb = maybe_attach_response_request_id(
+                        rb,
+                        ingress_protocol,
+                        upstream_relay_id.as_deref(),
+                    );
                 }
                 // Probe-leak guard (HIGH #1): same as the cross-protocol non-2xx branch above —
                 // a verbatim same-protocol error relay records no breaker outcome, so release the
@@ -3636,7 +3775,7 @@ async fn forward_once(
                 let tripped = app.store.record_transient_in(
                     pool,
                     i,
-                    "degraded-non2xx",
+                    ERR_DEGRADED_NON2XX,
                     forward_once_cfg.as_ref(),
                     None,
                 );
@@ -3705,7 +3844,7 @@ async fn forward_once(
                     let tripped = app.store.record_transient_in(
                         pool,
                         i,
-                        "transport",
+                        ERR_NET_TRANSPORT,
                         forward_once_cfg.as_ref(),
                         None,
                     );
@@ -3721,7 +3860,7 @@ async fn forward_once(
                     return Ok(ingress_error(
                         ingress_protocol,
                         StatusCode::BAD_GATEWAY,
-                        "api_error",
+                        KIND_API_ERROR,
                         GENERIC_RESPONSE_ERROR_DETAIL,
                     ));
                 }
@@ -3741,7 +3880,7 @@ async fn forward_once(
                     return Ok(ingress_error(
                         ingress_protocol,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "api_error",
+                        KIND_API_ERROR,
                         GENERIC_RESPONSE_ERROR_DETAIL,
                     ));
                 }
@@ -3796,7 +3935,11 @@ async fn forward_once(
                                         CONTENT_TYPE,
                                         ingress_proto.writer().streaming_content_type(),
                                     );
-                                    let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
+                                    let rb = maybe_attach_response_request_id(
+                                        rb,
+                                        ingress_protocol,
+                                        None,
+                                    );
                                     return Ok(rb
                                         .body(Body::from(frames))
                                         .unwrap_or_else(|_| status.into_response()));
@@ -3825,15 +3968,15 @@ async fn forward_once(
                                     ))
                                     .unwrap_or_else(|_| status.into_response()));
                             }
-                            // Bedrock-ingress 2xx carries `x-amzn-RequestId` (matching a real
-                            // Converse response and the error path).
+                            // The ingress writer's vtable attaches its native response request-id
+                            // header (bedrock `x-amzn-RequestId`, anthropic `request-id`). Cross-protocol
+                            // degraded translate (ingress != egress): no upstream id to forward, so
+                            // `None` synthesizes one. ONE call per protocol — a second would APPEND a
+                            // duplicate header.
                             let rb = Response::builder()
                                 .status(status)
                                 .header(CONTENT_TYPE, APPLICATION_JSON);
-                            let rb = maybe_attach_bedrock_amzn_id(rb, ingress_protocol);
-                            // Cross-protocol degraded translate (ingress != egress): no upstream
-                            // anthropic id to forward — synthesize the `request-id` header.
-                            let rb = maybe_attach_anthropic_request_id(rb, ingress_protocol, None);
+                            let rb = maybe_attach_response_request_id(rb, ingress_protocol, None);
                             let body_bytes = crate::json::to_vec(&translated)
                                 .unwrap_or_else(|_| translated.to_string().into_bytes());
                             return Ok(rb
@@ -3852,7 +3995,7 @@ async fn forward_once(
                 return Ok(ingress_error(
                     ingress_protocol,
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
+                    KIND_API_ERROR,
                     GENERIC_RESPONSE_ERROR_DETAIL,
                 ));
             }
@@ -3873,8 +4016,12 @@ async fn forward_once(
             } else {
                 None
             };
-            let json_array =
-                (gemini_json_array && is_sse).then(crate::proto::GeminiJsonArrayFramer::new);
+            let json_array = (gemini_json_array && is_sse)
+                .then(|| {
+                    crate::proto::protocol_for(ingress_protocol)
+                        .and_then(|p| p.writer().make_array_stream_framer())
+                })
+                .flatten();
             let upstream_stream = r.bytes_stream();
             let guarded_body = FirstByteBody::new(
                 upstream_stream,
@@ -3911,19 +4058,14 @@ async fn forward_once(
                     }
                 }
             }
-            // Bedrock-ingress streaming 2xx carries `x-amzn-RequestId`: forward the upstream's real
-            // id on same-protocol passthrough, else synthesize. Non-bedrock ingress: omit.
-            if ingress_relays_amzn_headers(ingress_protocol) {
-                if let Some(id) = upstream_amzn_id.or_else(crate::proto::synth_amzn_request_id) {
-                    rb = rb.header(crate::proto::HDR_AMZN_REQUEST_ID, id);
-                }
-            }
-            // Anthropic-ingress 2xx carries `request-id`: forward the upstream's verbatim on a
-            // same-protocol passthrough, else synthesize. Non-anthropic ingress: omit.
-            rb = maybe_attach_anthropic_request_id(
+            // Bedrock-ingress 2xx carries `x-amzn-RequestId`; anthropic-ingress 2xx carries
+            // `request-id`: forward the captured upstream id verbatim on a same-protocol passthrough,
+            // else synthesize. The writer vtable selects the correct header name + upstream-or-synth
+            // value per protocol; non-relaying ingress: omit.
+            rb = maybe_attach_response_request_id(
                 rb,
                 ingress_protocol,
-                upstream_request_id.as_deref(),
+                upstream_relay_id.as_deref(),
             );
             Ok(rb
                 .body(guarded_body.into_body())
@@ -3939,7 +4081,11 @@ async fn forward_once(
             // Closed→Open trip is counted exactly once regardless of which degraded failure shape hit
             // it. (`tripped` is false for a HalfOpen reopen / already-Open no-op, so it is not
             // inflated.) Closes the cross-arm counter asymmetry the audit flagged.
-            let err_type = if e.is_timeout() { "timeout" } else { "connect" };
+            let err_type = if e.is_timeout() {
+                ERR_NET_TIMEOUT
+            } else {
+                ERR_NET_CONNECT
+            };
             let tripped =
                 app.store
                     .record_transient_in(pool, i, err_type, forward_once_cfg.as_ref(), None);
@@ -3972,7 +4118,7 @@ async fn handle_fallback_pool(
         return ingress_error(
             ingress_protocol,
             StatusCode::SERVICE_UNAVAILABLE,
-            "overloaded",
+            KIND_OVERLOADED,
             "The request timed out. Please retry shortly.",
         );
     }
@@ -3996,7 +4142,7 @@ async fn handle_fallback_pool(
             return ingress_error(
                 ingress_protocol,
                 StatusCode::SERVICE_UNAVAILABLE,
-                "overloaded",
+                KIND_OVERLOADED,
                 "The request timed out. Please retry shortly.",
             );
         }
@@ -4233,8 +4379,10 @@ mod usage_tap_tests {
 
     #[test]
     fn test_stable_hash_is_deterministic() {
-        // Stable across calls (unlike DefaultHasher) so session affinity survives restarts.
-        assert_eq!(stable_hash("session-abc"), stable_hash("session-abc"));
+        // Stable across calls AND processes (unlike DefaultHasher) so session affinity survives
+        // restarts. Pin the FNV-1a output to a precomputed golden so an algorithm or
+        // FNV1A_OFFSET_BASIS/PRIME swap is caught directly, not merely via the indirect routing test.
+        assert_eq!(stable_hash("session-abc"), 0xe909_c864_ab05_9bea);
         assert_ne!(stable_hash("session-abc"), stable_hash("session-xyz"));
     }
 }
@@ -4326,7 +4474,7 @@ mod bedrock_eventstream_tests {
                 cache_control: None,
                 citations: Vec::new(),
             }],
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: IrUsage {
                 input_tokens: 11,
                 output_tokens: 7,
@@ -4370,7 +4518,7 @@ mod bedrock_eventstream_tests {
         );
     }
 
-    /// MEDIUM (R9, forward.rs:429-448): the `IrBlock::ToolUse` arm of `bedrock_response_to_eventstream`
+    /// MEDIUM (R9, forward.rs): the `IrBlock::ToolUse` arm of `bedrock_response_to_eventstream`
     /// must synthesize native ConverseStream tool-use framing — a `contentBlockStart` carrying
     /// `start.toolUse.{toolUseId,name}` and a `contentBlockDelta` carrying `delta.toolUse.input` — so a
     /// native AWS SDK ConverseStream client receiving a buffered cross-protocol tool-call completion can
@@ -4385,7 +4533,7 @@ mod bedrock_eventstream_tests {
                 input: serde_json::json!({"city": "Paris"}),
                 cache_control: None,
             }],
-            stop_reason: Some("tool_use".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::ToolUse),
             usage: IrUsage {
                 input_tokens: 5,
                 output_tokens: 9,
@@ -4464,7 +4612,7 @@ mod bedrock_eventstream_tests {
                     citations: Vec::new(),
                 },
             ],
-            stop_reason: Some("tool_use".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::ToolUse),
             usage: IrUsage {
                 input_tokens: 12,
                 output_tokens: 20,
@@ -4638,7 +4786,7 @@ mod bedrock_eventstream_tests {
                 input: serde_json::json!({"city": "Paris"}),
                 cache_control: None,
             }],
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: IrUsage {
                 input_tokens: 5,
                 output_tokens: 9,
@@ -4807,6 +4955,25 @@ mod auth_style_tests {
     }
 
     #[test]
+    fn test_sign_and_wire_path_parts_strips_query_from_canonical() {
+        use super::sign_and_wire_path_parts;
+        // The SigV4 canonical_uri MUST exclude the query string while the wire path retains it. This
+        // guards the operator `path:`-override branch (Bedrock's own paths are query-free, so the
+        // single-return wrapper test never reaches the `?` split).
+        let (wire, canonical) =
+            sign_and_wire_path_parts("/model/foo/converse?api-version=2024-05-01");
+        assert_eq!(
+            canonical, "/model/foo/converse",
+            "canonical uri excludes the query"
+        );
+        assert_eq!(
+            wire, "/model/foo/converse?api-version=2024-05-01",
+            "wire path keeps the query"
+        );
+        assert_ne!(wire, canonical);
+    }
+
+    #[test]
     fn test_sign_and_wire_path_signed_equals_sent_for_reserved_chars() {
         use super::sign_and_wire_path;
         // A Bedrock modelId carrying reserved chars (`:` for a cross-region inference profile /
@@ -4960,7 +5127,7 @@ mod on_exhausted_tests {
 #[cfg(test)]
 mod request_short_circuit_tests {
     use super::translate_request_cross_protocol;
-    use super::GEMINI_JSON_ARRAY_SHIM_KEY;
+    use crate::proto::gemini::GEMINI_JSON_ARRAY_SHIM_KEY;
     use crate::proto::Protocol;
     use crate::test_support::{LaneSpec, TestApp};
     use serde_json::json;
@@ -5234,7 +5401,7 @@ mod billing_parity_tests {
                     b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
                     b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
                     b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":9,\"total_tokens\":22}}\n\n",
-                    b"data: [DONE]\n\n",
+                    crate::proto::SSE_DONE_FRAME,
                 ],
             ),
             (13, 9),
@@ -5274,7 +5441,7 @@ mod billing_parity_tests {
     #[test]
     fn stream_same_proto_bedrock_binary_eventstream() {
         // Bedrock binary eventstream same-proto: the A-tap reads the IR decoded from the binary frames.
-        // Prior UsageTap numbers (via feed_eventstream): (31, 12).
+        // Prior byte-scanner numbers: (31, 12).
         use crate::eventstream::encode_frame;
         let mut start = Vec::new();
         start.extend(encode_frame("messageStart", br#"{"role":"assistant"}"#));
@@ -5370,13 +5537,15 @@ mod billing_parity_tests {
 #[cfg(test)]
 mod mid_stream_error_tests {
     use super::{
-        client_fault_kind, extract_error_message, mid_stream_error_bytes, strip_router_shim_keys,
-        strip_same_protocol_model_shim, GEMINI_JSON_ARRAY_SHIM_KEY, MID_STREAM_GENERIC_DETAIL,
+        client_fault_kind, extract_error_message, is_streaming_content_type,
+        mid_stream_error_bytes, strip_router_shim_keys, strip_same_protocol_model_shim,
+        MID_STREAM_GENERIC_DETAIL,
     };
+    use crate::proto::gemini::GEMINI_JSON_ARRAY_SHIM_KEY;
     use crate::proto::StatusClass;
     use serde_json::{json, Value};
 
-    /// HIGH (forward.rs:~1108 gemini JSON-array path, + the SSE/eventstream + pre-first-byte twins):
+    /// HIGH (forward.rs gemini JSON-array path, + the SSE/eventstream + pre-first-byte twins):
     /// the client-facing mid-stream transport-error detail MUST be a static, vendor-neutral string —
     /// NEVER the raw `reqwest::Error` Display, which embeds hyper/reqwest internals and the egress
     /// backend URL (a protocol tell + infrastructure leak). All three call sites pass the single
@@ -5421,9 +5590,9 @@ mod mid_stream_error_tests {
                 );
             }
         }
-        // The Gemini JSON-array path (the HIGH finding): a `google.rpc.Status` element whose message
+        // The Gemini JSON-array path: a `google.rpc.Status` element whose message
         // is exactly the generic detail, with no transport/URL markers spliced in.
-        let mut framer = crate::proto::GeminiJsonArrayFramer::new();
+        let mut framer = crate::proto::gemini::GeminiJsonArrayFramer::new();
         let arr = framer.finish_with_error(500, "INTERNAL", MID_STREAM_GENERIC_DETAIL);
         let arr_text = String::from_utf8_lossy(&arr);
         assert!(arr_text.contains(MID_STREAM_GENERIC_DETAIL));
@@ -5458,7 +5627,7 @@ mod mid_stream_error_tests {
         );
     }
 
-    /// HIGH (forward.rs:353-380 / 372-380): a mid-stream upstream failure on a BEDROCK-ingress stream
+    /// HIGH (forward.rs / 372-380): a mid-stream upstream failure on a BEDROCK-ingress stream
     /// (the client decodes binary `application/vnd.amazon.eventstream`) MUST be emitted as a valid
     /// binary exception frame — never an SSE `event: error` text frame, which would inject ASCII into
     /// a binary body and produce an undecodable prelude/CRC for the AWS SDK's eventstream decoder.
@@ -5503,7 +5672,7 @@ mod mid_stream_error_tests {
         assert_eq!(v["message"], "connection reset by peer");
     }
 
-    /// HIGH/conformance (forward.rs:~190): the SSE mid-stream error frame must be the ingress
+    /// HIGH/conformance (forward.rs): the SSE mid-stream error frame must be the ingress
     /// writer's OWN STREAMING error event (`write_response_event(&Error)`), framed exactly as the
     /// happy path — NOT the non-stream `write_error()` HTTP envelope. Bare-`data:` protocols
     /// (openai/cohere/gemini, whose native streams emit `data:`-only frames) get NO `event:` line;
@@ -5600,11 +5769,11 @@ mod mid_stream_error_tests {
     fn test_client_fault_kind_mapping() {
         assert_eq!(
             client_fault_kind(StatusClass::ContextLength),
-            "context_length_exceeded"
+            "context_length_exceeded" // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(
             client_fault_kind(StatusClass::ClientError),
-            "invalid_request_error"
+            "invalid_request_error" // golden wire-contract literal (kept bare on purpose)
         );
     }
 
@@ -5622,6 +5791,22 @@ mod mid_stream_error_tests {
         );
         assert_eq!(extract_error_message(b"not json"), None);
         assert_eq!(extract_error_message(br#"{"foo":1}"#), None);
+    }
+
+    /// `is_streaming_content_type` recognizes exactly the registry's streaming CTs (SSE +
+    /// AWS-event-stream) via prefix match, so a parameterized SSE CT (`; charset=utf-8`) still
+    /// engages the streaming path, while non-streaming/empty CTs do not.
+    #[test]
+    fn test_is_streaming_content_type() {
+        assert!(is_streaming_content_type("text/event-stream")); // golden wire-contract literal (kept bare on purpose)
+        assert!(is_streaming_content_type(
+            "application/vnd.amazon.eventstream"
+        ));
+        assert!(is_streaming_content_type(
+            "text/event-stream; charset=utf-8"
+        ));
+        assert!(!is_streaming_content_type("application/json"));
+        assert!(!is_streaming_content_type(""));
     }
 
     /// `strip_router_shim_keys` removes the NEVER-NATIVE shim keys on every branch: the gemini
@@ -5747,7 +5932,8 @@ mod ingress_indistinguishability_tests {
     use super::{
         cross_protocol_error_kind, egress_accept, egress_user_agent, forward_with_pool,
         ingress_error, ingress_stream_content_type, read_capped, shape_cross_protocol_error,
-        ReadEnd, UsageSink,
+        ReadEnd, UsageSink, KIND_AUTHENTICATION, KIND_INVALID_REQUEST, KIND_OVERLOADED,
+        KIND_RATE_LIMIT,
     };
     use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
     use reqwest::StatusCode;
@@ -5768,11 +5954,11 @@ mod ingress_indistinguishability_tests {
         assert_eq!(egress_accept("bedrock", false), "application/json");
         // REST/SSE backends: SSE on stream, json on unary.
         for p in ["anthropic", "openai", "responses", "gemini", "cohere"] {
-            assert_eq!(egress_accept(p, true), "text/event-stream", "{p} stream");
+            assert_eq!(egress_accept(p, true), "text/event-stream", "{p} stream"); // golden wire-contract literal (kept bare on purpose)
             assert_eq!(egress_accept(p, false), "application/json", "{p} unary");
         }
         // Unknown egress still gets a present, plausible Accept (never absent).
-        assert_eq!(egress_accept("mystery", true), "text/event-stream");
+        assert_eq!(egress_accept("mystery", true), "text/event-stream"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(egress_accept("mystery", false), "application/json");
     }
 
@@ -5814,7 +6000,7 @@ mod ingress_indistinguishability_tests {
                 "{p} egress UA must carry a version number: {ua}"
             );
         }
-        // D-FIND-1: the Stainless-generated Python SDKs (OpenAI + Anthropic) emit the SAME
+        // The Stainless-generated Python SDKs (OpenAI + Anthropic) emit the SAME
         // `<Title>/Python <ver>` grammar. Emitting a different shape for one (the old
         // `anthropic-sdk-python/<ver>`) was a wire tell distinguishing proxied from native traffic.
         // Assert BOTH match the shared grammar so the anthropic UA can never silently drift back.
@@ -5839,23 +6025,23 @@ mod ingress_indistinguishability_tests {
     fn test_cross_protocol_error_kind_mapping() {
         assert_eq!(
             cross_protocol_error_kind(StatusCode::UNAUTHORIZED),
-            "authentication_error"
+            "authentication_error" // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(
             cross_protocol_error_kind(StatusCode::FORBIDDEN),
-            "permission_error"
+            "permission_error" // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(
             cross_protocol_error_kind(StatusCode::TOO_MANY_REQUESTS),
-            "rate_limit_error"
+            "rate_limit_error" // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(
             cross_protocol_error_kind(StatusCode::INTERNAL_SERVER_ERROR),
-            "api_error"
+            "api_error" // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(
             cross_protocol_error_kind(StatusCode::BAD_GATEWAY),
-            "api_error"
+            "api_error" // golden wire-contract literal (kept bare on purpose)
         );
         // REGRESSION (R15 MEDIUM): a genuine upstream 503 must map to `overloaded`, NOT `api_error`.
         // Collapsing it into `api_error` would emit, on a bedrock ingress, the
@@ -5863,20 +6049,20 @@ mod ingress_indistinguishability_tests {
         // ServiceUnavailableException). `overloaded` is the kind busbar already uses for its own 503s.
         assert_eq!(
             cross_protocol_error_kind(StatusCode::SERVICE_UNAVAILABLE),
-            "overloaded"
+            "overloaded" // golden wire-contract literal (kept bare on purpose)
         );
         // 504 maps to the timeout class, distinct from the generic 5xx `api_error`.
         assert_eq!(
             cross_protocol_error_kind(StatusCode::GATEWAY_TIMEOUT),
-            "timeout"
+            "timeout" // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(
             cross_protocol_error_kind(StatusCode::BAD_REQUEST),
-            "invalid_request_error"
+            "invalid_request_error" // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(
             cross_protocol_error_kind(StatusCode::NOT_FOUND),
-            "invalid_request_error"
+            "invalid_request_error" // golden wire-contract literal (kept bare on purpose)
         );
     }
 
@@ -5889,8 +6075,8 @@ mod ingress_indistinguishability_tests {
     async fn test_shape_cross_protocol_error_auth_kinds() {
         use http_body_util::BodyExt as _;
         for (status, want_kind) in [
-            (StatusCode::UNAUTHORIZED, "authentication_error"),
-            (StatusCode::FORBIDDEN, "permission_error"),
+            (StatusCode::UNAUTHORIZED, "authentication_error"), // golden wire-contract literal (kept bare on purpose)
+            (StatusCode::FORBIDDEN, "permission_error"), // golden wire-contract literal (kept bare on purpose)
         ] {
             let resp =
                 shape_cross_protocol_error("anthropic", status, br#"{"error":{"message":"nope"}}"#);
@@ -5917,7 +6103,7 @@ mod ingress_indistinguishability_tests {
         let resp = ingress_error(
             "bedrock",
             StatusCode::TOO_MANY_REQUESTS,
-            "rate_limit_error",
+            KIND_RATE_LIMIT,
             "slow down",
         );
         assert!(
@@ -5930,17 +6116,14 @@ mod ingress_indistinguishability_tests {
             .and_then(|h| h.to_str().ok());
         assert_eq!(
             errtype,
-            Some(crate::proto::error_kind_to_bedrock_type("rate_limit_error")),
+            Some(crate::proto::bedrock::error_kind_to_bedrock_type(
+                KIND_RATE_LIMIT
+            )),
             "x-amzn-errortype mirrors the body __type"
         );
 
         // Non-bedrock ingress: no amzn headers.
-        let oai = ingress_error(
-            "openai",
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "x",
-        );
+        let oai = ingress_error("openai", StatusCode::BAD_REQUEST, KIND_INVALID_REQUEST, "x");
         assert!(
             oai.headers().get("x-amzn-requestid").is_none()
                 && oai.headers().get("x-amzn-errortype").is_none(),
@@ -5958,7 +6141,7 @@ mod ingress_indistinguishability_tests {
         let resp = ingress_error(
             "anthropic",
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            KIND_INVALID_REQUEST,
             "router: bad json: trailing comma",
         );
         assert_eq!(resp.status().as_u16(), 400, "status code is preserved");
@@ -5966,7 +6149,7 @@ mod ingress_indistinguishability_tests {
             resp.headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok()),
-            Some("application/json"),
+            Some("application/json"), // golden wire-contract literal (kept bare on purpose)
             "native error envelope is served as application/json, never text/plain"
         );
         // Body is the Anthropic-native error shape.
@@ -5977,7 +6160,8 @@ mod ingress_indistinguishability_tests {
             "Anthropic error envelope: top-level type"
         );
         assert_eq!(
-            v["error"]["type"], "invalid_request_error",
+            v["error"]["type"],
+            "invalid_request_error", // golden wire-contract literal (kept bare on purpose)
             "Anthropic typed error kind"
         );
         assert!(
@@ -5992,7 +6176,7 @@ mod ingress_indistinguishability_tests {
         let oai = ingress_error(
             "openai",
             StatusCode::SERVICE_UNAVAILABLE,
-            "overloaded",
+            KIND_OVERLOADED,
             "router: all lanes exhausted; retry after 3s",
         );
         assert_eq!(oai.status().as_u16(), 503);
@@ -6000,7 +6184,7 @@ mod ingress_indistinguishability_tests {
             oai.headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok()),
-            Some("application/json")
+            Some("application/json") // golden wire-contract literal (kept bare on purpose)
         );
         // OpenAI ingress must NOT receive the anthropic-only `request-id` header.
         assert!(
@@ -6009,7 +6193,7 @@ mod ingress_indistinguishability_tests {
         );
     }
 
-    /// MEDIUM/conformance (forward.rs:73-101): the anthropic-ingress error `request-id` HEADER equals
+    /// MEDIUM/conformance (forward.rs): the anthropic-ingress error `request-id` HEADER equals
     /// the body `request_id`, and non-anthropic ingress carries no such header.
     #[tokio::test]
     async fn test_anthropic_ingress_error_request_id_header_matches_body() {
@@ -6017,7 +6201,7 @@ mod ingress_indistinguishability_tests {
         let resp = ingress_error(
             "anthropic",
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            KIND_INVALID_REQUEST,
             "bad json",
         );
         let header_rid = resp
@@ -6045,6 +6229,7 @@ mod ingress_indistinguishability_tests {
     fn test_ingress_stream_content_type_by_protocol() {
         for p in ["openai", "anthropic", "gemini", "cohere", "responses"] {
             assert_eq!(ingress_stream_content_type(p), Some("text/event-stream"));
+            // golden wire-contract literal (kept bare on purpose)
         }
         assert_eq!(
             ingress_stream_content_type("bedrock"),
@@ -6540,7 +6725,7 @@ mod ingress_indistinguishability_tests {
         server.shutdown().await;
     }
 
-    /// HIGH/conformance (forward.rs:1539): a Bedrock-INGRESS 2xx (non-stream, cross-protocol) must
+    /// HIGH/conformance (the cross-protocol 2xx request-id attach): a Bedrock-INGRESS 2xx (non-stream, cross-protocol) must
     /// carry `x-amzn-RequestId` — a real Converse response always does (the AWS SDK reads it via
     /// `request_id()`); the error path already synthesizes it, this closes the SUCCESS gap.
     #[tokio::test]
@@ -6599,10 +6784,19 @@ mod ingress_indistinguishability_tests {
         );
         // UUID-v4 shaped: 36 chars, 8-4-4-4-12.
         assert_eq!(amzn.len(), 36, "x-amzn-RequestId is a UUID; got {amzn}");
+        // Regression (duplicate-header): the header must appear EXACTLY ONCE. The collapsed
+        // maybe_attach_response_request_id was briefly called twice at this cross-protocol site,
+        // appending two distinct x-amzn-RequestId values (axum `header()` appends). `.get()` masks it;
+        // count all values.
+        assert_eq!(
+            resp.headers().get_all("x-amzn-requestid").iter().count(),
+            1,
+            "exactly ONE x-amzn-RequestId header (no duplicate from a double attach)"
+        );
         server.shutdown().await;
     }
 
-    /// MEDIUM/conformance (forward.rs:73-101, relay paths): an anthropic-INGRESS 2xx must carry a
+    /// MEDIUM/conformance (forward.rs, relay paths): an anthropic-INGRESS 2xx must carry a
     /// `request-id` RESPONSE HEADER — a real Anthropic response always does (the SDK reads it into
     /// `Message._request_id`). On this CROSS-protocol hop (OpenAI backend → Anthropic client) there is
     /// no upstream anthropic id to forward, so busbar must SYNTHESIZE a shape-correct `req_…` one.
@@ -6659,10 +6853,16 @@ mod ingress_indistinguishability_tests {
             "anthropic-ingress 2xx MUST carry a synthesized `request-id` header in the native req_ \
              shape; got {rid:?}"
         );
+        // Regression (duplicate-header): exactly ONE `request-id` (no duplicate from a double attach).
+        assert_eq!(
+            resp.headers().get_all("request-id").iter().count(),
+            1,
+            "exactly ONE request-id header (no duplicate from a double attach)"
+        );
         server.shutdown().await;
     }
 
-    /// MEDIUM/test-coverage (forward.rs:66-81, STREAMING branch at forward.rs:2377): an anthropic-
+    /// MEDIUM/test-coverage (forward.rs, STREAMING branch at forward.rs): an anthropic-
     /// INGRESS STREAMING 2xx must ALSO carry the `request-id` response header. The non-streaming test
     /// above exercises only the buffered builder; the streaming builder is a separate code path, so a
     /// regression on the stream branch alone would otherwise pass CI. The official SDK reads
@@ -6724,12 +6924,12 @@ data: {"type":"message_stop"}"#
         assert!(
             rid.starts_with("req_"),
             "anthropic-ingress STREAMING 2xx MUST carry a `request-id` header in the native req_ \
-             shape (forward.rs:2377 path); got {rid:?}"
+             shape (forward.rs maybe_attach_response_request_id path); got {rid:?}"
         );
         server.shutdown().await;
     }
 
-    /// HIGH (forward.rs:987-996): a cross-protocol CLIENT-fault 4xx must be RESHAPED into the ingress
+    /// HIGH (forward.rs): a cross-protocol CLIENT-fault 4xx must be RESHAPED into the ingress
     /// protocol's native error envelope, not relayed with the EGRESS protocol's foreign error body.
     /// An OpenAI backend returning a 400 with an OpenAI-shaped error must reach an Anthropic client as
     /// the Anthropic error shape (`{"type":"error","error":{...}}`), with no OpenAI fields leaking.
@@ -6743,7 +6943,7 @@ data: {"type":"message_stop"}"#
             body: json!({
                 "error": {
                     "message": "Invalid 'max_tokens': must be positive",
-                    "type": "invalid_request_error",
+                    "type": KIND_INVALID_REQUEST,
                     "param": "max_tokens",
                     "code": "invalid_value"
                 }
@@ -6789,7 +6989,7 @@ data: {"type":"message_stop"}"#
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         // Anthropic-native error envelope, NOT the OpenAI shape.
         assert_eq!(v["type"], "error", "Anthropic top-level error type");
-        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["type"], "invalid_request_error"); // golden wire-contract literal (kept bare on purpose)
         let raw = String::from_utf8_lossy(&bytes);
         assert!(
             !raw.contains("\"param\"") && !raw.contains("\"code\""),
@@ -6936,7 +7136,7 @@ data: {"type":"message_stop"}"#
         server.shutdown().await;
     }
 
-    /// Regression (MEDIUM, release-gate file-by-file audit): the `forward_once` degraded
+    /// Regression (MEDIUM, conformance): the `forward_once` degraded
     /// (LeastBad/FallbackPool) cross-protocol path must apply the SAME tool-id native remap the main
     /// forward path does. Before the fix it stripped identity + stamped `created` but omitted
     /// `ToolIdRemap::remap_response`, so a tool-call response emitted the egress backend's RAW native
@@ -7029,7 +7229,7 @@ data: {"type":"message_stop"}"#
         server.shutdown().await;
     }
 
-    /// Regression (MEDIUM/indistinguishability, final audit): the `forward_once` degraded
+    /// Regression (indistinguishability): the `forward_once` degraded
     /// (LeastBad/FallbackPool) SAME-protocol Bedrock error relay must forward BOTH `x-amzn-requestid`
     /// and `x-amzn-errortype` verbatim, mirroring the main path. Before the fix it captured neither on
     /// this path — a native AWS SDK's `request_id()` would return None and typed-exception dispatch
@@ -7112,6 +7312,157 @@ data: {"type":"message_stop"}"#
         server.shutdown().await;
     }
 
+    /// Same-protocol (anthropic ingress → anthropic backend) error relay must forward the upstream's
+    /// `request-id` response header VERBATIM — not synthesize a fresh `req_…` — and attach it EXACTLY
+    /// ONCE. Guards `forward_with_pool`'s same-proto error relay (the
+    /// `maybe_attach_response_request_id(upstream)` branch): the SDK reads this into `APIError.request_id`,
+    /// so a synthesized id (or a duplicated header from a double-attach) is a proxy tell. The exact-once
+    /// assertion guards the axum `header()`-APPENDS double-attach failure mode.
+    #[tokio::test]
+    async fn test_anthropic_same_proto_error_relays_upstream_request_id_verbatim_once() {
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // A native Anthropic 4xx carries a `request-id` response header; the same-proto relay must
+        // forward it verbatim.
+        state.push(MockResponse::ServerErrorWithHeaders {
+            status: StatusCode::BAD_REQUEST,
+            body: json!({
+                "type": "error",
+                "error": {"type": KIND_INVALID_REQUEST, "message": "bad request"}
+            }),
+            headers: vec![("request-id", "upstream-anthropic-rid-0001")],
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        // Anthropic lane, same-protocol anthropic ingress (no cross-protocol reshape).
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "claude-3",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .provider("anthropic"),
+            )
+            .pool("pa", &[(0, 1)])
+            .build();
+
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            serde_json::to_vec(
+                &json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50}),
+            )
+            .unwrap()
+            .into(),
+            None,
+            "pa",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status().as_u16(), 400, "upstream 400 relayed");
+        // The upstream request-id is forwarded VERBATIM (not a synthesized `req_…`).
+        let ids: Vec<&str> = resp
+            .headers()
+            .get_all("request-id")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            1,
+            "request-id must be attached EXACTLY once (axum header() APPENDS), got {ids:?}"
+        );
+        assert_eq!(
+            ids[0], "upstream-anthropic-rid-0001",
+            "the upstream request-id must be relayed verbatim, not synthesized"
+        );
+        server.shutdown().await;
+    }
+
+    /// Same-protocol PASSTHROUGH-mode 401/403 relay (the `is_passthrough_40x` branch of
+    /// `forward_with_pool`) must forward the upstream's `request-id` response header VERBATIM — not
+    /// synthesize a fresh `req_…` — and attach it EXACTLY ONCE. This is the passthrough-auth sibling
+    /// of `test_anthropic_same_proto_error_relays_upstream_request_id_verbatim_once` (which exercises
+    /// the ClientFault 400 path): a caller-key 401 carries no breaker penalty and is relayed via the
+    /// `maybe_attach_response_request_id(upstream)` call, so a synthesized id (or a duplicated header
+    /// from a double-attach) is a proxy tell the SDK's `APIError.request_id` would surface.
+    #[tokio::test]
+    async fn test_anthropic_same_proto_passthrough_401_relays_request_id_verbatim_once() {
+        use crate::auth::AuthMiddleware;
+        use crate::config::AuthCfg;
+        crate::metrics::init();
+        let state = Arc::new(MockServerState::new());
+        // A native Anthropic 401 carries a `request-id` response header; the same-proto passthrough
+        // relay must forward it verbatim.
+        state.push(MockResponse::ServerErrorWithHeaders {
+            status: StatusCode::UNAUTHORIZED,
+            body: json!({
+                "type": "error",
+                "error": {"type": KIND_AUTHENTICATION, "message": "invalid x-api-key"}
+            }),
+            headers: vec![("request-id", "upstream-rid-passthrough")],
+        });
+        let server = MockServer::new(state.clone()).await;
+
+        // Passthrough auth mode + anthropic lane, same-protocol anthropic ingress.
+        let passthrough = AuthCfg {
+            mode: crate::auth::AuthMode::Passthrough,
+            ..AuthCfg::default_none()
+        };
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "claude-3",
+                    crate::proto::Protocol::anthropic(),
+                    &server.base_url(),
+                )
+                .provider("anthropic"),
+            )
+            .pool("pa", &[(0, 1)])
+            .auth(Arc::new(AuthMiddleware::new(&passthrough)))
+            .build();
+
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            serde_json::to_vec(
+                &json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50}),
+            )
+            .unwrap()
+            .into(),
+            None,
+            "pa",
+            None,
+            "anthropic",
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            resp.status().as_u16(),
+            401,
+            "passthrough upstream 401 relayed verbatim"
+        );
+        // The upstream request-id is forwarded VERBATIM (not a synthesized `req_…`), exactly once.
+        assert_eq!(
+            resp.headers().get_all("request-id").iter().count(),
+            1,
+            "request-id must be attached EXACTLY once (axum header() APPENDS)"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("upstream-rid-passthrough"),
+            "the upstream request-id must be relayed verbatim, not synthesized"
+        );
+        server.shutdown().await;
+    }
+
     /// HIGH/conformance (R9, forward.rs error sites): no forward-layer error body returned to a client
     /// may begin with the wire-visible internal `router:` prefix — a deterministic proxy tell no native
     /// endpoint emits. The route-layer regression test never reaches the forward layer; this drives the
@@ -7156,7 +7507,7 @@ data: {"type":"message_stop"}"#
         }
     }
 
-    /// HIGH/test-coverage (R9, forward.rs:2004 area): a native AWS SDK ConverseStream request answered
+    /// HIGH/test-coverage (R9, forward.rs area): a native AWS SDK ConverseStream request answered
     /// by a buffered (non-SSE) `application/json` 2xx from a CROSS-protocol OpenAI lane must be emitted
     /// at the HTTP boundary as `application/vnd.amazon.eventstream`, decode into the native frame
     /// sequence, AND carry a UUID `x-amzn-RequestId`. The existing coverage tests only the synthesis
@@ -7279,7 +7630,7 @@ data: {"type":"message_stop"}"#
             "model": "pg",
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
             "stream": true,
-            crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY: true
+            crate::proto::gemini::GEMINI_JSON_ARRAY_SHIM_KEY: true
         }))
         .unwrap();
         let resp = forward_with_pool(
@@ -7365,7 +7716,7 @@ data: {"type":"message_stop"}"#
             "model": "leastbad-g",
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
             "stream": true,
-            crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY: true
+            crate::proto::gemini::GEMINI_JSON_ARRAY_SHIM_KEY: true
         }))
         .unwrap();
         let resp = forward_with_pool(
@@ -7902,11 +8253,212 @@ data: {"type":"message_stop"}"#
              (record_tokens must not be called) — R26 LOW #7"
         );
     }
+
+    /// Regression (cancel-Drop billing): a client that disconnects MID-STREAM (drops the body before
+    /// the natural `Poll::Ready(None)` end) must still have the tokens generated+delivered so far
+    /// billed — via `impl Drop for FirstByteBody`. Drives a CLEAN cross-protocol stream (no abort, no
+    /// terminal error), polls it ONCE so the usage chunk is consumed (usage tapped, `usage_sink` still
+    /// `Some`), then DROPS the body without draining to `None`. The Drop path must charge the captured
+    /// tokens. (The no-bill-on-abort/terminal-error branch shares the SAME predicate as the tested
+    /// `Poll::Ready(None)` gate; the no-double-bill on clean completion is guaranteed by `usage_sink.take()`.)
+    #[tokio::test]
+    async fn test_cancel_drop_bills_partial_tokens() {
+        use super::FirstByteBody;
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        use crate::store::BreakerCfg;
+        use bytes::Bytes;
+        use futures::StreamExt as _;
+
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m",
+                crate::proto::Protocol::openai(),
+                "http://127.0.0.1:1",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+
+        let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+        let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov")); // 100c per 1k tokens
+        let charged_at: u64 = 1_700_000_000;
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(1_000_000),
+                    budget_period: "daily".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                charged_at,
+            )
+            .expect("create key");
+        let sink = Some(UsageSink {
+            gov: gov.clone(),
+            key_id: key.id.clone(),
+            period: key.budget_period.clone(),
+            charged_at,
+        });
+
+        let translate = crate::proto::StreamTranslate::new("anthropic", "openai")
+            .expect("anthropic<-openai translate");
+        // A single OpenAI trailing usage-only chunk → translated anthropic message_delta whose usage
+        // the tap reads (1000 billable tokens). NO overflow (no abort), NO error frame.
+        let usage_chunk =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":600,\"completion_tokens\":400}}\n\n"
+                .to_vec();
+        let inner = Box::pin(futures::stream::iter(vec![Ok::<Bytes, reqwest::Error>(
+            Bytes::from(usage_chunk),
+        )]));
+
+        // Build, poll ONCE (consumes the usage chunk; usage_sink stays Some because Poll::Ready(None)
+        // is never reached), then drop the body inside this block → Drop fires on the mid-stream cancel.
+        {
+            let body = FirstByteBody::new(
+                inner,
+                true,
+                "anthropic",
+                (),
+                app.clone(),
+                0,
+                Arc::new(BreakerCfg::default()),
+                "p",
+                Some(translate),
+                None,
+                sink,
+                false,
+            );
+            futures::pin_mut!(body);
+            let _ = body.next().await; // poll once: feed the usage chunk, accumulate IrUsage
+                                       // body dropped here (cancel before stream end) → Drop bills the captured tokens.
+        }
+
+        // The Drop's record_tokens offloads the store write; drain it with a bounded poll.
+        let mut spent = 0;
+        for _ in 0..200 {
+            spent = gov
+                .usage_for(&key.id, charged_at)
+                .expect("usage read")
+                .map(|u| u.spend_cents)
+                .unwrap_or(0);
+            if spent > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            spent, 100,
+            "a mid-stream-cancelled stream must bill the captured tokens via Drop \
+             (1000 tokens * 100c/1k = 100c)"
+        );
+    }
+
+    /// INVERSE of `test_cancel_drop_bills_partial_tokens`: the Drop path must SKIP billing when the
+    /// cross-protocol translate ABORTED (e.g. a reassembly-buffer overflow) before the drop, even
+    /// though usage was captured. Feed a usage chunk (usage accumulates) THEN an overflow chunk
+    /// (`> MAX_FRAME_BYTES`, no SSE terminator → `translate.aborted()` trips), poll those two chunks
+    /// but NOT to `Poll::Ready(None)` (so `usage_sink` stays `Some`), then DROP the body. The Drop's
+    /// `aborted()` guard (mirroring the `Poll::Ready(None)` no-bill-on-failure gate) must suppress
+    /// the charge → the key's spend stays 0.
+    #[tokio::test]
+    async fn test_cancel_drop_skips_billing_on_aborted_translate() {
+        use super::FirstByteBody;
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        use crate::store::BreakerCfg;
+        use bytes::Bytes;
+        use futures::StreamExt as _;
+
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m",
+                crate::proto::Protocol::openai(),
+                "http://127.0.0.1:1",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+
+        let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+        let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov")); // 100c per 1k tokens
+        let charged_at: u64 = 1_700_000_000;
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: Some(1_000_000),
+                    budget_period: "daily".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                charged_at,
+            )
+            .expect("create key");
+        let sink = Some(UsageSink {
+            gov: gov.clone(),
+            key_id: key.id.clone(),
+            period: key.budget_period.clone(),
+            charged_at,
+        });
+
+        let translate = crate::proto::StreamTranslate::new("anthropic", "openai")
+            .expect("anthropic<-openai translate");
+        // chunk 1: usage-only OpenAI chunk → translated anthropic usage the tap captures (nonzero).
+        // chunk 2: a >MAX_FRAME_BYTES run with NO SSE terminator → translate buffer overflows and
+        //          `abort()` fires (`aborted() == true`). NO terminal-error frame.
+        let usage_chunk =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":600,\"completion_tokens\":400}}\n\n"
+                .to_vec();
+        let overflow = vec![b'x'; crate::eventstream::MAX_FRAME_BYTES + 16];
+        let inner = Box::pin(futures::stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::from(usage_chunk)),
+            Ok::<Bytes, reqwest::Error>(Bytes::from(overflow)),
+        ]));
+
+        // Build, poll the TWO chunks (usage accumulates, then the overflow trips `aborted()`) but do
+        // NOT poll to `None` — so `usage_sink` stays `Some` and the drop exercises the Drop path with
+        // an aborted translate.
+        {
+            let body = FirstByteBody::new(
+                inner,
+                true,
+                "anthropic",
+                (),
+                app.clone(),
+                0,
+                Arc::new(BreakerCfg::default()),
+                "p",
+                Some(translate),
+                None,
+                sink,
+                false,
+            );
+            futures::pin_mut!(body);
+            let _ = body.next().await; // usage chunk → accumulate IrUsage
+            let _ = body.next().await; // overflow chunk → translate.abort() trips aborted()
+                                       // body dropped here → Drop's aborted() guard must skip billing.
+        }
+
+        // Give any (erroneous) offloaded store write a chance to land, then confirm spend is still 0.
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        let spent = gov
+            .usage_for(&key.id, charged_at)
+            .expect("usage read")
+            .map(|u| u.spend_cents)
+            .unwrap_or(0);
+        assert_eq!(
+            spent, 0,
+            "a mid-stream drop after a translate ABORT must NOT bill (the Drop's aborted() guard \
+             suppresses the charge), inverse of test_cancel_drop_bills_partial_tokens"
+        );
+    }
 }
 
 #[cfg(test)]
 mod forward_once_pool_cell_tests {
-    use super::forward_with_pool;
+    use super::{forward_with_pool, KIND_INVALID_REQUEST};
     use crate::store::{now as store_now, BreakerState};
     use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
     use reqwest::StatusCode;
@@ -8086,7 +8638,7 @@ mod forward_once_pool_cell_tests {
         let state = Arc::new(MockServerState::new());
         state.push(MockResponse::ServerError {
             status: StatusCode::BAD_REQUEST,
-            body: json!({ "type": "error", "error": { "type": "invalid_request_error", "message": "bad" } }),
+            body: json!({ "type": "error", "error": { "type": KIND_INVALID_REQUEST, "message": "bad" } }),
         });
         let server = MockServer::new(state.clone()).await;
         let t0 = store_now();
@@ -8333,13 +8885,12 @@ mod ordered_walk_tests {
         ]
     }
 
-    /// DRAIN (D-FIND-2): a `weight: 0` member must NOT be selected via the session-affinity sticky
+    /// DRAIN: a `weight: 0` member must NOT be selected via the session-affinity sticky
     /// fast-path — mirroring SWRR (`select_weighted_for`) and the routing-policy walk, which both
     /// already exclude weight 0. Before the fix the sticky path consulted only dead/budget/breaker
     /// (never weight), so a session whose hash landed on a drained-but-breaker-healthy member kept
-    /// pinning to it on the NORMAL path, silently defeating the operator's drain. Found by the
-    /// Phase-D Opus adversarial pass; missed by single-dimension audits because no test paired a
-    /// non-None affinity key with a weight-0 candidate.
+    /// pinning to it on the NORMAL path, silently defeating the operator's drain. Missed initially
+    /// because no prior test paired a non-None affinity key with a weight-0 candidate.
     #[tokio::test]
     async fn sticky_affinity_never_selects_zero_weight_drained_member() {
         let app = three_lane_app();
@@ -8498,6 +9049,96 @@ mod ordered_walk_tests {
             picked.is_none(),
             "a fully-drained candidate set must select no lane, got {:?}",
             picked.map(|(i, _)| i)
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_guard_tests {
+    //! REGRESSION (A1): the WON-but-undispatched single-flight recovery probe must be released when
+    //! the `pick_among` future is dropped (client disconnect) while parked on the permit await — none
+    //! of the explicit early-returns run on drop. `ProbeGuard`'s `Drop` enforces that. These unit
+    //! tests construct the guard directly: dropping an ARMED guard must clear `probe_in_flight` (the
+    //! cell reverts HalfOpen→Open and is re-probeable); DISARMING it (the live-permit dispatch paths)
+    //! must LEAVE the probe held for the owning request.
+    use super::ProbeGuard;
+    use crate::store::{BreakerState, InMemoryStore, LaneData, StateStore};
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    fn lane(max: usize) -> LaneData {
+        LaneData {
+            model: "m0".into(),
+            provider: "p0".into(),
+            max,
+            sem: Arc::new(Semaphore::new(max)),
+            limited: false,
+            budget: -1,
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+        }
+    }
+
+    /// Park the default ("") cell as a WON probe (HalfOpen + probe_in_flight), exactly the state
+    /// `acquire_for_dispatch_in` leaves after winning the single-flight race.
+    fn win_probe(store: &Arc<InMemoryStore>) {
+        // Expired-Open → the mutating acquisition transitions Open→HalfOpen and CAS-wins the probe.
+        store.force_open_in("", 0, 0);
+        assert!(
+            store.acquire_for_dispatch_in("", 0, crate::store::now().saturating_add(86_400)),
+            "precondition: this caller must WIN the single-flight probe"
+        );
+        assert!(
+            matches!(store.breaker_state_in("", 0), BreakerState::HalfOpen),
+            "precondition: the won probe leaves the cell HalfOpen"
+        );
+    }
+
+    /// Dropping an ARMED guard releases the probe (cell reverts HalfOpen→Open) — the leak A1 fixes
+    /// (the implicit future-drop-while-parked path).
+    #[test]
+    fn dropping_armed_guard_releases_probe() {
+        let store = Arc::new(InMemoryStore::new(vec![lane(1)]));
+        win_probe(&store);
+        {
+            let _guard = ProbeGuard {
+                store: store.as_ref(),
+                pool: "",
+                lane: 0,
+                armed: true,
+            };
+            // guard drops here (simulating the dropped `pick_among` future).
+        }
+        assert!(
+            matches!(store.breaker_state_in("", 0), BreakerState::Open { .. }),
+            "an armed guard's Drop must release the probe (HalfOpen→Open), un-benching the lane"
+        );
+    }
+
+    /// A DISARMED guard (the live-permit dispatch paths) leaves the probe HELD — the dispatched
+    /// request now owns it and will release it via its recorded outcome.
+    #[test]
+    fn disarmed_guard_leaves_probe_held() {
+        let store = Arc::new(InMemoryStore::new(vec![lane(1)]));
+        win_probe(&store);
+        {
+            let mut guard = ProbeGuard {
+                store: store.as_ref(),
+                pool: "",
+                lane: 0,
+                armed: true,
+            };
+            guard.armed = false; // the try_acquire / Ok(Ok(permit)) dispatch paths disarm before return.
+                                 // guard drops here as a no-op.
+        }
+        assert!(
+            matches!(store.breaker_state_in("", 0), BreakerState::HalfOpen),
+            "a disarmed guard must NOT release the probe — the owning dispatched request holds it"
         );
     }
 }

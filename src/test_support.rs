@@ -322,7 +322,12 @@ async fn mock_handler(
                     .into_iter()
                     .map(|d| format!("data: {d}\n\n"))
                     .collect();
-                result.push("data: [DONE]\n\n".to_string());
+                // Safety: SSE_DONE_FRAME is a valid UTF-8 literal.
+                result.push(
+                    std::str::from_utf8(crate::proto::SSE_DONE_FRAME)
+                        .unwrap()
+                        .to_owned(),
+                );
                 result
             };
 
@@ -720,11 +725,34 @@ mod tests {
     use super::*;
     use crate::auth::AuthMiddleware;
     use crate::config::AuthCfg;
-    use crate::forward::{forward, forward_with_pool};
+    use crate::forward::forward_with_pool;
     use crate::state::now;
 
     use reqwest::Client;
     use serde_json::json;
+
+    /// Test-only anthropic-ingress convenience wrapper (the former `forward::forward`, kept here so
+    /// the production entry point is a single `forward_with_pool`). Binds anthropic ingress, the
+    /// lane-default breaker cell (empty pool name), and no affinity.
+    async fn forward(
+        app: std::sync::Arc<crate::state::App>,
+        cands: Vec<crate::state::WeightedLane>,
+        body: bytes::Bytes,
+        caller_token: Option<&str>,
+        usage_sink: Option<crate::forward::UsageSink>,
+    ) -> axum::response::Response {
+        forward_with_pool(
+            app,
+            cands,
+            body,
+            caller_token,
+            "",
+            None,
+            "anthropic",
+            usage_sink,
+        )
+        .await
+    }
     use std::sync::Arc;
 
     #[tokio::test]
@@ -1016,8 +1044,9 @@ mod tests {
     /// Regression: token usage from a cross-protocol STREAMING response must be charged to the
     /// virtual key, so TPM limits enforce on streams too. The streaming path records tokens through
     /// a completely separate code path from the non-stream test above: `FirstByteBody`'s stream-end
-    /// handler taps `UsageTap` and calls `UsageSink`'s `gov.record_tokens` on clean 2xx completion
-    /// (forward.rs:1341-1344), NOT the buffered `record_nonstream_usage`. A regression that broke the
+    /// handler reads IR-derived usage via `translate.usage()` and calls `gov.record_tokens` via the
+    /// `UsageSink` on clean 2xx completion (forward.rs), NOT the buffered `record_nonstream_usage`.
+    /// A regression that broke the
     /// stream-end charge (the drop/poll handler not firing, the sink not wired into the streaming
     /// branch) would leave streaming token usage uncharged and TPM would silently stop enforcing for
     /// streams — the non-stream test gives no coverage because the paths are disjoint. After the first
@@ -1029,7 +1058,7 @@ mod tests {
 
         // OpenAI-protocol SSE stream whose final chunk carries usage totalling 160 tokens
         // (prompt 100 + completion 60). The OpenAI reader decodes bare `data:`-framed chunks the
-        // mock emits; the trailing-usage chunk is where `UsageTap` reads prompt/completion tokens.
+        // mock emits; the trailing-usage chunk is where the IR reader captures prompt/completion tokens into `last_usage`.
         let stream_events = || -> Vec<String> {
             vec![
                 r#"{"choices":[{"delta":{"role":"assistant"}}]}"#.to_string(),
@@ -1319,7 +1348,7 @@ mod tests {
     /// GET /metrics through the REAL router (route table + auth middleware) in `auth.mode=none`
     /// (open relay) returns the Prometheus exposition without a bearer token — `/metrics` is NOT
     /// auth-exempt; it is admitted here only because the mode is None, where `validate_token`
-    /// returns `true` unconditionally. The sole always-open route is `/healthz` (auth.rs:331-333).
+    /// returns `true` unconditionally. The sole always-open route is `/healthz` (auth.rs).
     /// The companion test `test_metrics_requires_auth_in_token_mode` asserts that a missing-token
     /// request to `/metrics` at `auth.mode=token` is rejected (401), covering the security fix that
     /// supersedes the 0.16.2 note describing `/metrics` as intentionally open.
@@ -1363,7 +1392,7 @@ mod tests {
     /// /metrics with NO bearer token is rejected with 401 — `/metrics` is auth-gated, NOT exempt
     /// like `/healthz`. This guards the [Unreleased] security fix that made `/metrics` auth-gated
     /// (superseding the 0.16.2 review note that described it as intentionally open): a regression
-    /// that re-added `/metrics` to the always-open allowlist alongside `/healthz` (auth.rs:331-333)
+    /// that re-added `/metrics` to the always-open allowlist alongside `/healthz` (auth.rs)
     /// would let this unauthenticated scrape through and fail here. The same request WITH the
     /// configured token is admitted (200), proving the gate is token-based, not a blanket block.
     #[tokio::test]
@@ -2203,7 +2232,7 @@ mod tests {
         let text = String::from_utf8_lossy(&collected_bytes);
         let mut events_found = 0;
         for line in text.lines() {
-            if line.starts_with("data: event-") && !line.contains("[DONE]") {
+            if line.starts_with("data: event-") && !line.contains(crate::proto::SSE_DONE_SENTINEL) {
                 events_found += 1;
             }
         }
@@ -2250,12 +2279,12 @@ mod tests {
         let text = String::from_utf8_lossy(&collected_bytes);
 
         assert!(
-            text.contains("data: [DONE]\n\n"),
+            text.contains("data: [DONE]\n\n"), // golden wire-contract literal (kept bare on purpose)
             "SSE terminator must carry the `data: ` prefix, got: {text}"
         );
         // The terminator must not appear in the bare, prefix-less form.
         assert!(
-            !text.contains("\n\n[DONE]\n\n") && !text.starts_with("[DONE]"),
+            !text.contains("\n\n[DONE]\n\n") && !text.starts_with("[DONE]"), // golden wire-contract literals (kept bare on purpose)
             "SSE terminator must not be emitted as a bare `[DONE]` frame, got: {text}"
         );
         server.shutdown().await;
@@ -2991,7 +3020,7 @@ mod tests {
             .iter()
             .map(|e| format!("data: {}\n\n", e))
             .collect();
-        expected_text.push_str("data: [DONE]\n\n");
+        expected_text.push_str("data: [DONE]\n\n"); // golden wire-contract literal (kept bare on purpose)
 
         // Push events in reverse order (LIFO means last pushed comes out first)
         state.push(MockResponse::Sse {

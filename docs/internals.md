@@ -135,7 +135,7 @@ InMemoryStore {
 - **`should_trip`**: `ErrorRate` mode trips when the windowed failure fraction
   `>= threshold` but only once `min_requests` outcomes have accrued in `window_s`
   (the `err` count is capped at the windowed outcome count so a stale cumulative
-  error can't dominate). `Consecutive` mode trips when `streak >= n`.
+  error can't dominate). `Consecutive` mode trips when `streak >= consecutive_n`.
 - **`compute_cooldown_with_retry_after`**: exponential backoff doubling from
   `base_cooldown_secs` to `max_cooldown_secs`, indexed by `streak`, with ±10%
   jitter once `streak > 0`. A server `Retry-After` is honored as a **floor** —

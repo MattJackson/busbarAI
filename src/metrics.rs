@@ -10,7 +10,7 @@
 //!
 //! ## Scrape-time gauges
 //!
-//! Three families of gauges are REFRESHED AT SCRAPE TIME (in `handler()`) from already-available
+//! Four families of gauges are REFRESHED AT SCRAPE TIME (in `handler()`) from already-available
 //! in-process reads. They are NOT emitted on the request hot path:
 //!
 //! * **`busbar_key_spend_cents`** — per-virtual-key accumulated spend in the current budget window
@@ -84,6 +84,19 @@ pub(crate) const TRANSLATIONS_TOTAL: &str = "busbar_translations_total"; // labe
 // configured pool name (bounded at startup) — both safe, bounded labels (no request-derived data).
 pub(crate) const ROUTE_POLICY_SELECTIONS_TOTAL: &str = "busbar_route_policy_selections_total"; // labels: policy, pool
 
+// Request-log webhook deliveries DROPPED because the in-flight delivery semaphore was saturated (the
+// webhook endpoint is slow/unreachable and the bounded delivery pool is full). Incremented once per
+// dropped log. Unlabeled — the drop is a global backpressure condition, not per-request. An operator
+// alerts on a non-zero rate to detect "the webhook is overwhelmed and logs are being shed silently."
+pub(crate) const WEBHOOK_LOGS_DROPPED_TOTAL: &str = "busbar_webhook_logs_dropped_total"; // no labels
+
+// Same-protocol non-stream responses whose billing-side buffer hit the translate-body cap before the
+// terminal `usage` block, so token usage could not be parsed and the request billed zero despite a
+// full 2xx reaching the client. Incremented once per truncated response. Unlabeled. An operator
+// alerts on a non-zero rate to detect an over-cap billing gap. (The client response is unaffected —
+// it streams verbatim; only the billing side-channel is capped.)
+pub(crate) const BILLING_TRUNCATED_TOTAL: &str = "busbar_billing_truncated_total"; // no labels
+
 // ── Scrape-time gauges (new in feat/observability-depth) ────────────────────────────────────────
 //
 // These are REFRESHED each scrape from in-process reads (governance SQLite + breaker state).
@@ -104,23 +117,27 @@ pub(crate) const ROUTE_POLICY_SELECTIONS_TOTAL: &str = "busbar_route_policy_sele
 
 /// Per-virtual-key spend in cents for the current budget window. Scrape-time gauge.
 /// Label: `key` = virtual-key id (operator-bounded). Only emitted when governance is enabled.
-pub(crate) const KEY_SPEND_CENTS: &str = "busbar_key_spend_cents";
+const KEY_SPEND_CENTS: &str = "busbar_key_spend_cents";
 
 /// Max budget minus current spend for keys that carry a `max_budget_cents` cap. Scrape-time gauge.
 /// Enables Prometheus burn-rate alerting against a bounded, operator-controlled label set.
 /// Label: `key` = virtual-key id. Only emitted for keys with a budget cap.
-pub(crate) const KEY_BUDGET_REMAINING_CENTS: &str = "busbar_key_budget_remaining_cents";
+const KEY_BUDGET_REMAINING_CENTS: &str = "busbar_key_budget_remaining_cents";
 
 /// Accumulated tokens consumed by each virtual key in the current budget window. Scrape-time gauge.
 /// Label: `key` = virtual-key id. Only emitted when governance is enabled.
-pub(crate) const KEY_TOKENS_TOTAL: &str = "busbar_key_tokens_total";
+const KEY_TOKENS_TOTAL: &str = "busbar_key_tokens_total";
 
 /// Per-(pool, lane-model) circuit-breaker health gauge.
 /// Values: 0 = healthy (Closed), 1 = half-open (cooling but probe admitted), 2 = tripped (Open /
 /// hard-down). Scrape-time gauge; side-effect-free (does not trigger Open→HalfOpen transitions).
 /// Labels: `pool` (configured pool name, bounded) and `lane` (the lane's MODEL string, bounded —
 /// matches the forward.rs counter sites so the gauge and counters can be PromQL-joined on `lane`).
-pub(crate) const LANE_STATE: &str = "busbar_lane_state";
+const LANE_STATE: &str = "busbar_lane_state";
+
+/// Prometheus text exposition format content-type (version 0.0.4), returned by the `/metrics`
+/// scrape handler. Defined as a constant so the string is not duplicated across handler and tests.
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 
 /// Install the global Prometheus recorder. Idempotent: safe to call once at startup and
 /// repeatedly from tests (the global recorder can only be installed once per process, so the
@@ -129,7 +146,7 @@ pub(crate) fn init() {
     // The global recorder can only be installed once per process, so the `OnceLock` runs this
     // initializer exactly once and serializes concurrent callers (startup + tests). On install
     // FAILURE — typically because another library already installed a global recorder — we log and
-    // store `None` rather than panicking: `init()` runs on a background thread (main.rs:134) where a
+    // store `None` rather than panicking: `init()` runs on a background thread (main.rs) where a
     // panic would be silent, leaving `/metrics` empty with no operator-visible cause. Storing `None`
     // degrades gracefully (empty exposition) AND emits an error log so the cause is discoverable.
     HANDLE.get_or_init(|| match PrometheusBuilder::new().install_recorder() {
@@ -219,7 +236,7 @@ pub(crate) fn render() -> String {
 /// No-op when governance is disabled (the governance arc is `None`). Pool and lane label spaces
 /// are bounded by the operator's configuration; virtual-key ids are bounded by the set of
 /// keys the admin has created. No client-supplied label values are ever emitted.
-pub(crate) fn refresh_scrape_gauges(app: &App) {
+fn refresh_scrape_gauges(app: &App) {
     let now = crate::state::now();
 
     // ── Governance: per-key spend, budget-remaining, tokens ────────────────────────────────────
@@ -330,7 +347,7 @@ pub(crate) async fn handler(State(app): State<Arc<App>>) -> Response {
     }
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
         render(),
     )
         .into_response()

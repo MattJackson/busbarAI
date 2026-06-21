@@ -22,7 +22,7 @@
 /// and a ~10k-deep body (well under the 32 MiB body cap) overflows the worker stack and ABORTS the
 /// process (uncatchable; kills every in-flight request). The pre-scan below rejects such input before
 /// any `Value` is built, so it can neither be re-serialized nor dropped.
-pub(crate) const MAX_JSON_DEPTH: usize = 128;
+const MAX_JSON_DEPTH: usize = 128;
 
 /// Single-pass, string-aware scan for the maximum `{`/`[` nesting depth in `bytes`. Brackets inside
 /// JSON string literals (and `\`-escaped quotes) do not count. Returns `true` as soon as `max` is
@@ -90,8 +90,10 @@ pub(crate) fn to_vec<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, sonic_rs
     sonic_rs::to_vec(value)
 }
 
-/// Serialize a document to a `String` (error envelopes, SSE-event data). JSON output is always valid
-/// UTF-8, so the `from_utf8_lossy` is a no-op fast path, not a correctness concern.
+/// Serialize a document to a `String` (error envelopes, SSE-event data). sonic-rs always emits valid
+/// UTF-8, so `from_utf8_lossy` never substitutes a replacement char (that path never fires here) — it
+/// scans the bytes and returns the borrowed `&str`, then `into_owned()` allocates the `String`. This is
+/// a cold path (error envelopes and SSE data, not the per-chunk hot loop), so the extra copy is fine.
 #[inline]
 pub(crate) fn to_string<T: serde::Serialize>(value: &T) -> Result<String, sonic_rs::Error> {
     sonic_rs::to_vec(value).map(|v| String::from_utf8_lossy(&v).into_owned())

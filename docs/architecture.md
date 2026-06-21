@@ -252,7 +252,7 @@ Bedrock-ingress (AWS eventstream) clients.
 
 ## Circuit-breaker state
 
-Breaker state is **per-lane**, stored in `src/store.rs`. The FSM is Closed →
+Breaker state is **per-(pool, lane)**, stored in `src/store.rs`. The FSM is Closed →
 Open → HalfOpen → Closed, with exponential cooldown backoff and single-flight
 half-open probing. See [operations.md](operations.md) for the full state machine,
 trip modes, and recovery behavior.

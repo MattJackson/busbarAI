@@ -4,6 +4,11 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::config::RootCfg;
+
+/// Maximum byte-length of an `affinity.header_name`. HTTP header field-names must be ASCII; an
+/// over-long name is rejected at boot so a bad value cannot silently disable affinity at header
+/// construction time (the `http` crate rejects non-ASCII/over-long names as an error).
+const MAX_AFFINITY_HEADER_NAME_LEN: usize = 64;
 // SSRF obfuscation-defense primitives shared with the observability/OTLP webhook guard — the
 // byte-identical atoms live in one tested leaf so the two SSRF guards can never drift apart.
 use crate::net_guard::{
@@ -161,6 +166,25 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             ));
         }
 
+        // Per-provider active-health-probe settings. `interval_secs`/`timeout_secs` are floored at 1
+        // by the prober at use, but a literal 0 in config signals operator confusion (a 0 interval/
+        // timeout is never what's intended); reject it at boot so the config is honest about what
+        // runs — mirroring the global health.default_probe_* checks in validate_limits.
+        if let Some(health) = &provider_cfg.health {
+            if health.interval_secs == Some(0) {
+                errors.push(format!(
+                    "provider '{}' health.interval_secs must be >= 1 (got 0)",
+                    provider_name
+                ));
+            }
+            if health.timeout_secs == Some(0) {
+                errors.push(format!(
+                    "provider '{}' health.timeout_secs must be >= 1 (got 0)",
+                    provider_name
+                ));
+            }
+        }
+
         for (code, mapped_class) in &provider_cfg.error_map {
             if crate::config::status_class_from_str(mapped_class).is_none() {
                 errors.push(format!(
@@ -308,6 +332,19 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     "pool '{}' member '{}' weight must be >= 1 (got 0)",
                     pool_name, member.target
                 ));
+            }
+            // `cost_per_mtok` drives the native `cheapest` policy's ascending sort. A NaN value makes
+            // that sort's comparator non-total (NaN compares unordered, so the ordering is undefined
+            // and a member can be silently mis-ranked), and a NEGATIVE cost is nonsensical and would
+            // sort ahead of every legitimate member. Reject both at boot rather than ship a broken
+            // ranking. (An UNSET cost is fine — it's inert and only the `cheapest` policy reads it.)
+            if let Some(cost) = member.cost_per_mtok {
+                if !cost.is_finite() || cost < 0.0 {
+                    errors.push(format!(
+                        "pool '{}' member '{}' cost_per_mtok must be a finite, non-negative number (got {}); it drives the 'cheapest' policy's sort, which a NaN or negative value corrupts",
+                        pool_name, member.target, cost
+                    ));
+                }
             }
             // Resolve the member target. `model_protocols` only holds models whose provider
             // resolved (the model loop above skips a model whose provider is unknown), so a bare
@@ -492,7 +529,29 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
 
         // Rule 8: `affinity.mode` is now an `AffinityMode` enum (`session` is the only variant), so an
-        // unrecognized spelling is rejected at deserialize time — no hand-check needed here.
+        // unrecognized spelling is rejected at deserialize time — no hand-check needed there.
+        // `affinity.header_name`, however, becomes an outbound/inbound HTTP HEADER NAME: a non-ASCII
+        // or over-long value can't be a valid header field-name (the `http` crate rejects it at
+        // header construction), so a bad value would either panic the build or silently disable
+        // affinity. Validate it at boot: ASCII only, non-empty, and a sane <= 64-char bound.
+        if let Some(affinity) = &pool_cfg.affinity {
+            if let Some(header_name) = &affinity.header_name {
+                if !header_name.is_ascii() {
+                    errors.push(format!(
+                        "pool '{}' affinity.header_name '{}' must be ASCII (an HTTP header field-name cannot contain non-ASCII bytes)",
+                        pool_name, header_name
+                    ));
+                }
+                if header_name.len() > MAX_AFFINITY_HEADER_NAME_LEN {
+                    errors.push(format!(
+                        "pool '{}' affinity.header_name is {} chars; must be <= {}",
+                        pool_name,
+                        header_name.len(),
+                        MAX_AFFINITY_HEADER_NAME_LEN
+                    ));
+                }
+            }
+        }
     }
 
     // Rule 7b: Multi-hop fallback cycle (A -> B -> A, or any longer ring). The per-pool self-ref
@@ -580,12 +639,13 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     );
                 }
             }
-            // Passthrough carries no token-allowlist requirement, but it has a credential-LEAK
-            // foot-gun: forward.rs selects the upstream key as `caller_token.unwrap_or(lane.api_key)`,
-            // so an UNAUTHENTICATED caller (no token) in passthrough mode gets busbar's OWN configured
-            // lane key (resolved from the provider's `api_key_env`) substituted upstream. A passthrough
-            // deployment is meant to forward the CALLER's credential, never a configured one — so a
-            // provider whose `api_key_env` resolves to a NON-EMPTY value is the leak signal.
+            // Passthrough carries no token-allowlist requirement, but a configured upstream key on a
+            // passthrough provider is a MISCONFIGURATION worth flagging. forward.rs selects the upstream
+            // key as `caller_token.unwrap_or("")`: an UNAUTHENTICATED caller in passthrough mode
+            // forwards an EMPTY credential (the provider returns 401/403 attributed to the caller), NOT
+            // busbar's configured lane key. A passthrough deployment is meant to forward the CALLER's
+            // credential, never a configured one — so a provider whose `api_key_env` resolves to a
+            // NON-EMPTY value is a config smell (a key busbar will never use on this provider).
             //
             // We WARN (not hard-reject): a legit Bedrock-ingress passthrough provider authenticates
             // per-request with SigV4 from the AWS credential chain, so its `api_key_env` normally
@@ -648,8 +708,8 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
 }
 
 /// Range-check the resolved operational limits. Pushes a message per violation (collect-all, like the
-/// rest of `validate`). The bounds are intentionally loose: each defaults to today's working value,
-/// so we only reject values that would make a subsystem non-functional.
+/// rest of `validate`). The bounds are intentionally loose: each default is the production working
+/// value, so we only reject values that would make a subsystem non-functional.
 fn validate_limits(limits: &crate::config::LimitsResolved, errors: &mut Vec<String>) {
     use crate::config::{REQUEST_BODY_MAX_BYTES_CEIL, REQUEST_BODY_MAX_BYTES_FLOOR};
 
@@ -713,8 +773,10 @@ fn validate_limits(limits: &crate::config::LimitsResolved, errors: &mut Vec<Stri
         ));
     }
     // The error-body buffer cap must be >= 1 byte (0 would buffer nothing, losing every upstream
-    // error body). The pool-idle, gauge-limit, sweep-interval, and probe defaults are all safe at any
-    // value (0 pool-idle = no keep-alive; 0 gauge limit = emit none; the sweep interval is masked).
+    // error body). The pool-idle, gauge-limit, and probe defaults are all safe at any value (0
+    // pool-idle = no keep-alive; 0 gauge limit = emit none). `governance.rate_sweep_interval == 0` is
+    // rejected separately in `validate_governance` — a 0 there would disable the rate-map eviction
+    // sweep, so it is a hard error rather than a silently-accepted default.
     if limits.upstream_error_body_max_bytes < 1 {
         errors.push(
             "limits.upstream_error_body_max_bytes must be >= 1 (0 would buffer no upstream error body)"
@@ -760,7 +822,7 @@ fn validate_limits(limits: &crate::config::LimitsResolved, errors: &mut Vec<Stri
 /// cannot ride along in `validate(&RootCfg)`). Called from `config::resolve`, whose `Err(Vec<String>)`
 /// is surfaced as a fail-loud boot error — the same channel `validate` uses.
 ///
-/// When `governance.enabled` is true but `admin_token` is unset, `GovState::admin_token()` returns
+/// When `governance.enabled` is true but `admin_token` is unset, `GovState::admin_token_hash()` returns
 /// `None`, so the `/admin` auth branch's `authorized` is permanently `false`: the admin API is
 /// SILENTLY locked (every admin call 401s) with no startup diagnostic. An operator who enabled
 /// governance to manage virtual keys discovers this only at runtime. Mirror the `token` mode with no
@@ -795,9 +857,34 @@ pub(crate) fn validate_governance(
             "governance.enabled is true but no governance.admin_token is configured; the /admin management API is unreachable (every admin call returns 401). Set governance.admin_token (e.g. admin_token: ${BUSBAR_ADMIN_TOKEN})".to_string(),
         );
     }
+    // WARN (not a hard error): with `price_per_request_cents == 0`, a request that consumes no
+    // tokens (or a key priced solely on a flat fee) accrues a ZERO charge, so the per-request
+    // budget admission gate never closes — a key with `max_budget_cents` set is admitted without
+    // bound on request COUNT (only token-priced spend counts). Request-count admission control
+    // therefore requires a non-zero flat fee when a budget is in play. This is a deliberate
+    // configuration (a deployment may price purely by tokens), so we warn rather than reject.
+    if governance.enabled && governance.price_per_request_cents == 0 {
+        tracing::warn!(
+            "governance.price_per_request_cents is 0: a zero flat fee means a request can accrue a \
+             zero charge, so per-request COUNT-based budget admission never closes — a virtual key \
+             with max_budget_cents set is not bounded on request count (only token-priced spend is \
+             counted). If you rely on a budget to cap request volume, set a non-zero \
+             price_per_request_cents."
+        );
+    }
     if governance.enabled && auth.is_some_and(|a| a.mode == crate::auth::AuthMode::Passthrough) {
         errors.push(
             "governance.enabled is true together with auth.mode=passthrough; governance supersedes passthrough (every request must resolve to an enabled virtual key), so passthrough's accept-and-forward-caller-credential semantics are NOT honoured and every caller without a virtual key is silently rejected. This combination is unsupported; set auth.mode=token (or omit the auth block) alongside governance.".to_string(),
+        );
+    }
+    // A 0 sweep interval would disable the rate-map's idle-entry eviction sweep entirely — it rides on
+    // the non-obvious `u32::is_multiple_of(0) == false`, so the sweep never fires and entries for silent
+    // keys stay resident until restart. Rate limiting itself stays correct (`check_rate`'s per-key
+    // stale-reset is independent of the sweep), but the surprising "0 == disabled" semantics are a
+    // footgun. Reject it fail-loud, consistent with every other "must be >= 1" cadence in this validator.
+    if governance.rate_sweep_interval == 0 {
+        errors.push(
+            "governance.rate_sweep_interval is 0; must be >= 1. A value of 0 disables the rate-map idle-entry sweep, leaking entries for silent keys until restart. The default is 256 (sweep every 256 admissions); use a larger value to make sweeps rarer.".to_string(),
         );
     }
     if errors.is_empty() {
@@ -1001,15 +1088,6 @@ fn host_is_private_or_loopback(host: &str) -> bool {
     }
 }
 
-/// True when the already-normalized `host` (as produced by [`extract_normalized_host`]) matches any
-/// entry in `entries`, using the EXACT canonicalization the denylist block check uses for operator-
-/// supplied `blocked_metadata_hosts`. This is shared by the allow-override path so an allow entry
-/// unblocks every spelling of an IP the same way a block entry blocks every spelling:
-///   * a hostname entry matches case-insensitively, trailing dot stripped;
-///   * an IP-literal entry matches the parsed connect-host AND its IPv4-mapped/compatible-IPv6 and
-///     alternate-encoding (decimal-int / hex / octal / short-dotted) spellings.
-///
-/// Empty / whitespace-only entries never match.
 /// Push an error for every entry in a metadata host-list config key that contains a `/` (CIDR /
 /// slash). These lists (`security.blocked_metadata_hosts`, `security.allow_metadata_hosts`, and each
 /// provider's `allow_metadata_hosts`) are matched by EXACT IP/hostname via `host_matches_any` — a
@@ -1027,6 +1105,15 @@ fn reject_cidr_metadata_entries(key: &str, entries: &[String], errors: &mut Vec<
     }
 }
 
+/// True when the already-normalized `host` (as produced by [`extract_normalized_host`]) matches any
+/// entry in `entries`, using the EXACT canonicalization the denylist block check uses for operator-
+/// supplied `blocked_metadata_hosts`. This is shared by the allow-override path so an allow entry
+/// unblocks every spelling of an IP the same way a block entry blocks every spelling:
+///   * a hostname entry matches case-insensitively, trailing dot stripped;
+///   * an IP-literal entry matches the parsed connect-host AND its IPv4-mapped/compatible-IPv6 and
+///     alternate-encoding (decimal-int / hex / octal / short-dotted) spellings.
+///
+/// Empty / whitespace-only entries never match.
 fn host_matches_any(host: &str, entries: &[String]) -> bool {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -1333,7 +1420,7 @@ mod tests {
         pools: HashMap<String, config::PoolCfg>,
     ) -> RootCfg {
         config::RootCfg {
-            listen: "0.0.0.0:8080".into(),
+            listen: crate::config::DEFAULT_LISTEN_ADDR.into(),
             tls: None,
             auth: None,
             providers,
@@ -2084,7 +2171,7 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_model_named_admin() {
-        // Regression (MEDIUM, final audit): a MODEL named `admin` is reached at `/admin/v1/messages`,
+        // Regression: a MODEL named `admin` is reached at `/admin/v1/messages`,
         // which the auth middleware intercepts as the operator admin surface — unreachable to clients
         // and (in governance mode) a per-model `allowed_pools` bypass via the GovCtx::default() admin
         // branch. The model loop previously skipped the reserved-name check the pool/provider loops
@@ -2481,6 +2568,28 @@ mod tests {
         assert!(
             validate_governance(&gov, None).is_ok(),
             "enabled governance WITH an admin_token must validate"
+        );
+    }
+
+    #[test]
+    fn test_validate_governance_rejects_zero_rate_sweep_interval() {
+        // `rate_sweep_interval: 0` is rejected fail-loud rather than silently disabling the rate-map
+        // eviction sweep (which would ride on the non-obvious `u32::is_multiple_of(0) == false`).
+        let gov = config::GovernanceCfg {
+            enabled: true,
+            db_path: "busbar-governance.db".to_string(),
+            price_per_request_cents: 1,
+            price_per_1k_tokens_cents: 0,
+            admin_token: Some("an-operator-secret".to_string()),
+            budget_on_store_error: Default::default(),
+            sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+            rate_sweep_interval: 0,
+        };
+        let err = validate_governance(&gov, None)
+            .expect_err("rate_sweep_interval: 0 must be rejected at validation");
+        assert!(
+            err.iter().any(|e| e.contains("rate_sweep_interval")),
+            "the error must name the offending key, got: {err:?}"
         );
     }
 

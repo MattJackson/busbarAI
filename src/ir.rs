@@ -50,11 +50,10 @@ pub(crate) struct IrRequest {
     /// Cohere reader/writer correctly omit `n` (like Anthropic/Bedrock/Responses). `u32`: a
     /// non-negative count. `None` == absent — never emitted.
     pub(crate) n: Option<u32>,
-    /// Structured-output / response-format directive (`response_format`). A cross-protocol-preserved
-    /// output control carrying the raw response_format / structured-output object verbatim; mapped
-    /// per-protocol later. Written only by protocols that natively model it. `None` == absent —
-    /// never emitted.
-    pub(crate) response_format: Option<serde_json::Value>,
+    /// Structured-output / response-format directive — canonicalized into the typed
+    /// [`IrResponseFormat`] on read (NOT a raw protocol-shaped `Value`), so a writer can only project
+    /// it into its OWN native shape and can never echo a foreign one. `None` == absent, never emitted.
+    pub(crate) response_format: Option<IrResponseFormat>,
     /// Stop sequences (`stop`). First-class because every protocol models it (OpenAI `stop` —
     /// string OR array; Anthropic `stop_sequences`; Gemini `generationConfig.stopSequences`; Bedrock
     /// `inferenceConfig.stopSequences`; Cohere `stop_sequences`). Normalized to a `Vec<String>` (the
@@ -170,7 +169,7 @@ pub(crate) enum IrStreamEvent {
         index: usize,
     },
     MessageDelta {
-        stop_reason: Option<String>,
+        stop_reason: Option<IrStopReason>,
         /// Anthropic's streaming `message_delta.delta.stop_sequence` — the matched stop string, or
         /// `None` when no stop sequence matched (or the source protocol has no analog). Only the
         /// Anthropic reader populates it and only the Anthropic writer emits it (and only when the
@@ -183,11 +182,45 @@ pub(crate) enum IrStreamEvent {
     Error(crate::proto::IrError),
 }
 
+/// Canonical, protocol-neutral stop/finish reason — the typed IR carrier (closing the `stop_reason`
+/// hole, the same way [`IrResponseFormat`] / [`IrToolChoice`] close theirs).
+///
+/// Previously `stop_reason` was a raw `String`. Each protocol READER lower-folded its native finish
+/// token into a canonical string, and each WRITER matched those strings — but an unrecognized token
+/// fell through and could be EMITTED VERBATIM into a different protocol's closed `finish_reason` enum,
+/// which a strict client SDK rejects (the recurring "off-spec finish_reason" bug, fixed once per
+/// writer). Typing it removes the bug class: a reader maps any unknown native token to [`Self::Other`]
+/// (NO String payload — nothing foreign can be carried), and every writer's match is EXHAUSTIVE, so a
+/// new protocol is FORCED by the compiler to map every variant to a value valid in its own enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IrStopReason {
+    /// Natural end of turn.
+    EndTurn,
+    /// A provided stop sequence was generated.
+    StopSequence,
+    /// The output token cap (or model max) was reached.
+    MaxTokens,
+    /// The model wants to call one or more tools.
+    ToolUse,
+    /// Content moderation / safety filter stopped generation.
+    Safety,
+    /// The model refused to continue (Anthropic `refusal`, Responses `incomplete_details:refusal`).
+    Refusal,
+    /// A long-running turn was paused (Anthropic `pause_turn`).
+    PauseTurn,
+    /// An upstream/server error terminated generation (Cohere `ERROR`).
+    Error,
+    /// An unrecognized or future native reason. Readers map any token they don't model here; every
+    /// writer projects it to ITS natural-stop default. The absence of a `String` payload is what makes
+    /// the bug class impossible — there is no foreign value to echo.
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IrResponse {
     pub(crate) role: IrRole,
     pub(crate) content: Vec<IrBlock>,
-    pub(crate) stop_reason: Option<String>,
+    pub(crate) stop_reason: Option<IrStopReason>,
     pub(crate) usage: IrUsage,
     /// The model that actually served the response, as reported by the upstream. Preserved across
     /// cross-protocol translation so a pool route's response still names the member that served it
@@ -237,6 +270,20 @@ pub(crate) enum IrBlock {
     Thinking {
         text: String,
         signature: Option<String>,
+        /// `true` when this is an opaque REDACTED/encrypted reasoning block (Anthropic
+        /// `redacted_thinking`, Bedrock `redactedContent`) — `text` holds the opaque bytes, NOT
+        /// plaintext. A TYPED flag rather than the old hack of marking it with a
+        /// `__busbar_bedrock_redacted_reasoning` sentinel in `signature` (which leaked a
+        /// protocol-specific marker into the agnostic IR and risked a foreign writer emitting it on
+        /// the wire). Only the Anthropic/Bedrock readers set it; only those writers re-emit the
+        /// redacted form; other writers drop a redacted block (no plaintext analog).
+        redacted: bool,
+        /// Anthropic cache breakpoint (`cache_control`) placed on a `thinking` block. First-class so
+        /// an Anthropic breakpoint on a thinking block survives the seam instead of silently
+        /// vanishing (a cache-hit cost/latency regression and a same-protocol byte difference). Only
+        /// the Anthropic reader populates it and only the Anthropic writer emits it; other protocols
+        /// have no native analog and leave it `None`.
+        cache_control: Option<CacheControl>,
     },
     ToolUse {
         id: String,
@@ -258,9 +305,73 @@ pub(crate) enum IrBlock {
         cache_control: Option<CacheControl>,
     },
     Image {
-        media_type: String,
-        data: String,
+        /// The image source, typed (NOT a `media_type` String overloaded with magic sentinels). A
+        /// writer can only project the variant it can represent and DROPS-with-warn the rest — it can
+        /// never emit a corrupt block from a misread sentinel.
+        source: IrImageSource,
+        /// Anthropic cache breakpoint (`cache_control`) placed on an `image` block. First-class so an
+        /// Anthropic breakpoint on a (often large) image block survives the seam instead of silently
+        /// vanishing — the dominant cache-on-image use case. Only the Anthropic reader populates it
+        /// and only the Anthropic writer emits it; other protocols leave it `None`.
+        cache_control: Option<CacheControl>,
     },
+    /// Structured JSON content — a Bedrock Converse `{"json": <value>}` tool-result content block (an
+    /// arbitrary-structured-data member of the `ToolResultContentBlock` union). It is NOT an image;
+    /// it previously rode inside an `Image` behind a `tool_result_json` media_type sentinel (the
+    /// stringly-typed smell). Bedrock re-emits it natively; protocols whose tool-result content is
+    /// text/image-only drop it with a warn (there is no lossless cross-protocol projection).
+    Json(Value),
+}
+
+/// Typed source for an [`IrBlock::Image`] — replaces a `media_type: String` overloaded with the
+/// `image_url` / `image_s3` / `file_id` magic sentinels (the stringly-typed smell).
+///
+/// `Base64` and `Url` are PROTOCOL-NEUTRAL (any protocol can carry inline bytes or a URL). A
+/// vendor-scoped reference that has NO neutral form (a Bedrock `s3Location`, a Responses
+/// `input_image.file_id`) does NOT get a protocol-named variant here — that would leak a specific
+/// vendor's concept into the agnostic IR. Instead it rides the opaque [`Self::Vendor`] escape: the
+/// agnostic core never interprets it (like `IrRequest.extra`), the PRODUCING protocol recognizes its
+/// own `vendor` tag and re-emits `value` on a same-protocol egress, and any OTHER protocol's writer
+/// cannot represent it and drops it with a warn. So `ir.rs` names no vendor wire concept.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum IrImageSource {
+    /// Inline base64 image bytes with a real `image/<fmt>` media type.
+    Base64 { media_type: String, data: String },
+    /// A remote image URL reference (an `https://…` the OpenAI/Responses/Anthropic-url forms carry).
+    Url(String),
+    /// An opaque vendor-scoped image reference with no neutral (base64/url) form — same-protocol-only.
+    /// `vendor` is the producing protocol's name; `value` is its native reference object, opaque to
+    /// the agnostic core. Only the matching protocol's writer re-emits it; others drop it.
+    Vendor { vendor: &'static str, value: Value },
+}
+
+/// Canonical, protocol-neutral structured-output directive — the typed IR carrier for
+/// `response_format`.
+///
+/// THE SMELL THIS REMOVES: `IrRequest.response_format` used to be an opaque `serde_json::Value`
+/// holding WHATEVER shape the source reader read — OpenAI `{type,json_schema:{name,schema,strict}}`,
+/// Cohere `{type:"json_object",json_schema:<schema>}`, Gemini `{responseMimeType,responseSchema}`, the
+/// flat Responses `text.format`. Each writer then re-sniffed that blob and the lazy default was to
+/// ECHO it; correct same-protocol, but cross-protocol that emits a FOREIGN shape the backend 400s. The
+/// identical bug surfaced once per writer (openai → cohere → gemini → responses) because the field was
+/// never canonicalized on the way IN.
+///
+/// This type is PROTOCOL-AGNOSTIC — it names no wire shape. Each protocol module owns the ONLY code
+/// that knows its own `response_format` shape: a reader fn (native → this) and a writer fn (this →
+/// native). The agnostic core never sees a foreign shape, so a writer cannot echo one — it has only
+/// typed fields to project. (Same reason [`IrToolChoice`], a typed enum, never had this bug.)
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct IrResponseFormat {
+    /// `false` ⇒ plain text (no structured-output constraint). `true` ⇒ the model must emit JSON.
+    pub(crate) json: bool,
+    /// The JSON Schema the JSON output must conform to, if one was supplied (`None` ⇒ free-form JSON).
+    pub(crate) schema: Option<Value>,
+    /// Schema name (OpenAI/Responses `json_schema.name`), preserved when the source supplied it.
+    pub(crate) name: Option<String>,
+    /// Strict-schema flag (OpenAI/Responses `strict`), preserved when the source supplied it.
+    pub(crate) strict: Option<bool>,
+    /// Schema description (OpenAI/Responses `json_schema.description`), preserved when supplied.
+    pub(crate) description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -392,6 +503,13 @@ pub(crate) enum IrDelta {
     ThinkingDelta(String),
     InputJsonDelta(String),
     SignatureDelta(String),
+    /// Streamed opaque REDACTED-reasoning bytes (an Anthropic `redacted_thinking` / Bedrock
+    /// `redactedContent` block arriving mid-stream). A TYPED variant rather than the old hack of
+    /// stuffing a `__busbar_bedrock_redacted_reasoning` sentinel into a `SignatureDelta` String — the
+    /// agnostic IR no longer carries a protocol-specific marker. The producing protocol's reader emits
+    /// it; a writer that models redacted reasoning (Bedrock `redactedContent`) re-emits it, others drop
+    /// it (the bytes are encrypted/opaque and have no plaintext analog).
+    RedactedReasoningDelta(String),
     /// L2-5 STREAMING grounding/web-search citations. ADDITIVE variant (no existing variant changed
     /// — 1.0-freeze-safe): a streamed citation that arrives mid-block is carried as a
     /// [`crate::ir::IrCitation`] (neutral fields + the byte-exact `raw` escape hatch) rather than
@@ -432,7 +550,7 @@ pub(crate) struct StreamDecodeState {
     /// single `message_delta`/usage event a native non-Bedrock stream carries, not two) the Bedrock
     /// reader stashes the `messageStop` stop_reason here and pairs it with the usage when `metadata`
     /// arrives. Used by the Bedrock reader only; other protocols leave it `None`.
-    pub(crate) pending_stop_reason: Option<String>,
+    pub(crate) pending_stop_reason: Option<IrStopReason>,
     /// OpenAI-only: maps each opened OpenAI tool_call `index` (the `oai_idx`) to the IR block index
     /// its `BlockStart` was emitted with. The OpenAI flat stream lets text arrive AFTER tool calls,
     /// and the text block's presence shifts the tool index base — so the IR index a tool's BlockStart
@@ -450,19 +568,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ir_usage_default_is_zero() {
-        // IrUsage has no derived Default; construct the documented zero baseline explicitly and
-        // assert the token fields read as zero / None, so a future field addition is caught here.
+    fn test_ir_usage_zero_baseline_bills_zero() {
+        // The documented all-zero baseline must bill zero — asserting through billable_tokens()
+        // exercises the saturating sum, not the field literals themselves (which would be tautological).
         let u = IrUsage {
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
         };
-        assert_eq!(u.input_tokens, 0);
-        assert_eq!(u.output_tokens, 0);
-        assert_eq!(u.cache_creation_input_tokens, None);
-        assert_eq!(u.cache_read_input_tokens, None);
+        assert_eq!(u.billable_tokens(), 0);
+    }
+
+    /// `billable_tokens` sums all four token fields with `saturating_add` (the operands are
+    /// upstream-controlled). Assert at the definition site: the basic sum, the all-zero/None case,
+    /// and that an overflow across the addends SATURATES rather than panicking (debug) / wrapping.
+    #[test]
+    fn test_billable_tokens_sum_and_saturation() {
+        // Basic provider-agnostic sum: uncached input + cache_read + cache_creation + output.
+        let u = IrUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_input_tokens: Some(3),
+            cache_creation_input_tokens: Some(2),
+        };
+        assert_eq!(u.billable_tokens(), 20);
+
+        // All-zero / None → 0 (the common no-cache OpenAI-family case is input+output only).
+        let z = IrUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        assert_eq!(z.billable_tokens(), 0);
+
+        // Overflow across the cache addends must SATURATE at u64::MAX, never panic/wrap.
+        let big = IrUsage {
+            input_tokens: u64::MAX,
+            output_tokens: 1,
+            cache_read_input_tokens: Some(1),
+            cache_creation_input_tokens: Some(1),
+        };
+        assert_eq!(big.billable_tokens(), u64::MAX);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use axum::{
 };
 
 use crate::config::AuthCfg;
+use crate::sigv4::{SIGV4_ALGORITHM, X_AMZ_CONTENT_SHA256, X_AMZ_DATE};
 use crate::state::App;
 
 /// The two non-`Authorization` headers that native vendor SDKs use to carry their API key:
@@ -23,7 +24,25 @@ use crate::state::App;
 const X_API_KEY: &str = "x-api-key";
 const X_GOOG_API_KEY: &str = "x-goog-api-key";
 
-/// AuthMode is an exhaustive enum for runtime authentication behavior.
+/// The header name for the operator admin token carrier (busbar-proprietary surface).
+const X_ADMIN_TOKEN: &str = "x-admin-token";
+/// The Bearer auth-scheme token (case-insensitive match in `extract_bearer_token`).
+const AUTH_SCHEME_BEARER: &str = "bearer";
+/// The liveness-probe path that bypasses auth entirely.
+const HEALTHZ_PATH: &str = "/healthz";
+/// The exact `/admin` path (the admin surface root, e.g. GET /admin/keys redirects).
+const ADMIN_PATH: &str = "/admin";
+/// The `/admin/` prefix that all registered admin sub-routes share. A path must match
+/// ADMIN_PATH exactly OR start with ADMIN_PATH_PREFIX to be treated as an admin request —
+/// preventing sibling paths like `/adminx/…` from being mis-classified.
+const ADMIN_PATH_PREFIX: &str = "/admin/";
+/// Fixed dummy secret used when an inbound SigV4 AccessKeyId is unknown: we still run the
+/// full HMAC verification so the timing is indistinguishable from a bad-signature rejection
+/// (no AccessKeyId-enumeration oracle). The `crate::sigv4` test module references this via
+/// `crate::auth::DUMMY_SECRET` rather than maintaining a separate copy.
+pub(crate) const DUMMY_SECRET: &str = "AWS4-DUMMY-SECRET-FOR-CONSTANT-TIME-REJECT-PATH";
+
+/// Runtime authentication mode — exhaustive enum over the three supported behaviors.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum AuthMode {
     /// Require a client token matching the allowlist in Authorization: Bearer <token>.
@@ -102,6 +121,13 @@ impl fmt::Debug for CallerToken {
 pub(crate) struct AuthMiddleware {
     pub(crate) mode: AuthMode,
     pub(crate) client_tokens: Vec<String>,
+    /// SHA-256 digests (64-hex-char) of each `client_tokens` entry, pre-computed once at
+    /// construction so `validate_token` can fold over FIXED-LENGTH digests on every request
+    /// instead of re-hashing the allowlist N times per call. The security property is identical:
+    /// the candidate is still hashed exactly once per request, and the fold still runs ALL N
+    /// comparisons unconditionally with bitwise-OR (no short-circuit). Length-uniformity
+    /// (64-hex-char) is preserved — `constant_time_eq` still always compares equal-length strings.
+    hashed_client_tokens: Vec<String>,
 }
 
 // MANUAL Debug that REDACTS the allowlist. A derived `Debug` would print every entry of
@@ -154,9 +180,15 @@ impl AuthMiddleware {
             }
         }
 
+        let hashed_client_tokens: Vec<String> = tokens
+            .iter()
+            .map(|t| crate::sigv4::sha256_hex(t.as_bytes()))
+            .collect();
+
         Self {
             mode,
             client_tokens: tokens,
+            hashed_client_tokens,
         }
     }
 
@@ -187,7 +219,7 @@ impl AuthMiddleware {
     /// with a multibyte character in the scheme position can't panic on a UTF-8 boundary.
     fn extract_bearer_token(auth_header: &str) -> Option<String> {
         let (scheme, token) = auth_header.split_once(' ')?;
-        if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() {
+        if scheme.eq_ignore_ascii_case(AUTH_SCHEME_BEARER) && !token.is_empty() {
             Some(token.to_string())
         } else {
             None
@@ -248,6 +280,16 @@ impl AuthMiddleware {
                     return false;
                 }
 
+                // Length-independent compare: `constant_time_eq` early-returns on a length
+                // mismatch, which would leak each configured client token's LENGTH via timing (a
+                // candidate of the right length runs the full byte loop; a wrong-length one returns
+                // immediately). Remove that oracle by hashing BOTH the presented candidate and each
+                // configured token with SHA-256 (the same `sha256_hex` facility used for virtual
+                // keys and the admin token above) and constant-time-comparing the fixed-length
+                // (64-hex-char) digests — every candidate now does identical work regardless of its
+                // length, and a wrong-length token still fails the digest compare (so correctness is
+                // preserved: a valid token authenticates, an invalid/wrong-length one is rejected).
+                //
                 // Constant-time compare against EVERY allowed token. `.any()` would short-circuit
                 // on the first match, making the number of `constant_time_eq` calls depend on the
                 // matched token's position in the allowlist (a match at index 0 returns after one
@@ -256,9 +298,13 @@ impl AuthMiddleware {
                 // with bitwise-OR (`|`, NOT `||`) so all N comparisons always run regardless of
                 // where (or whether) a match occurs; `black_box` keeps the optimizer from
                 // reintroducing an early exit.
-                let found = self.client_tokens.iter().fold(0u8, |acc, allowed| {
-                    acc | u8::from(Self::constant_time_eq(token, allowed))
-                });
+                let candidate_hash = crate::sigv4::sha256_hex(token.as_bytes());
+                let found = self
+                    .hashed_client_tokens
+                    .iter()
+                    .fold(0u8, |acc, allowed_hash| {
+                        acc | u8::from(Self::constant_time_eq(&candidate_hash, allowed_hash))
+                    });
                 std::hint::black_box(found) != 0
             }
             AuthMode::Passthrough | AuthMode::None => true,
@@ -309,7 +355,7 @@ fn vendor_auth_failure_message(proto: &str) -> &'static str {
 ///     `AuthenticationError.code`. Emitting `code: null` is a deterministic proxy tell a native SDK
 ///     keys its typed-exception comparison off. The openai/responses writers pair
 ///     `code: "invalid_api_key"` ONLY with `error.type: "authentication_error"` (see
-///     `proto::bearer_error_code`); the alternate `invalid_request_error` type maps
+///     `proto::openai_family::bearer_error_code`); the alternate `invalid_request_error` type maps
 ///     to `code: null`. We therefore pass `authentication_error` here so the wire body carries the
 ///     real `code: "invalid_api_key"` pairing — matching the modern OpenAI bad-key shape the writers
 ///     document — rather than the `code: null` tell.
@@ -326,14 +372,17 @@ fn vendor_auth_failure_message(proto: &str) -> &'static str {
 pub(crate) fn auth_failure_status_and_kind(proto: &str) -> (StatusCode, &'static str) {
     crate::proto::protocol_for(proto)
         .map(|p| p.writer().auth_failure_status_and_kind())
-        .unwrap_or((StatusCode::UNAUTHORIZED, "authentication_error"))
+        .unwrap_or((
+            StatusCode::UNAUTHORIZED,
+            crate::forward::KIND_AUTHENTICATION,
+        ))
 }
 
-/// Build an auth-failure response carrying the inferred ingress protocol's NATIVE error envelope
-/// (design §8 BLOCKER #1). Auth runs before routing, so the protocol is inferred from the request
-/// path. A native vendor SDK hitting busbar in `token`/governance mode with a bad credential then
-/// gets the vendor's JSON error shape (`application/json`) instead of a bare `text/plain` 401 —
-/// removing a deterministic proxy tell. Falls back to the generic envelope for an unknown path.
+/// Build an auth-failure response carrying the inferred ingress protocol's NATIVE error envelope.
+/// Auth runs before routing, so the protocol is inferred from the request path. A native vendor SDK
+/// hitting busbar in `token`/governance mode with a bad credential gets the vendor's JSON error
+/// shape (`application/json`) instead of a bare `text/plain` 401 — removing a deterministic proxy
+/// tell. Falls back to the generic envelope for an unknown path.
 ///
 /// The wire `message` comes from `vendor_auth_failure_message(proto)` — vendor-plausible copy keyed
 /// solely off the inferred protocol — NOT from the call site. Callers must never thread a
@@ -352,15 +401,14 @@ pub(crate) fn auth_failure_status_and_kind(proto: &str) -> (StatusCode, &'static
 /// No unwrap / expect / panic on this request path: `ingress_error` degrades a serialization failure
 /// to a generic JSON object internally.
 ///
-/// The envelope is built by the CANONICAL `crate::forward::ingress_error` (CORE made it
-/// `pub(crate)`), the single source of truth for native error shaping: it selects the protocol
-/// writer, sets `application/json`, and attaches the Bedrock `x-amzn-RequestId` / `x-amzn-errortype`
-/// headers via the shared `proto::attach_bedrock_error_headers` helper. Migrating here means the
-/// auth path, the forward path, and the route/fallback path CANNOT diverge on error shape or headers
-/// — converging the three error builders the design called out. Bedrock's auth-failure modeled
-/// exception is `AccessDeniedException`; `ingress_error`'s header attach derives the same
-/// `x-amzn-errortype` from the `kind` we pass (`auth` → `AccessDeniedException`), so the wire body
-/// `__type` and the header agree.
+/// The envelope is built by `crate::forward::ingress_error`, the single source of truth for native
+/// error shaping: it selects the protocol writer, sets `application/json`, and attaches the Bedrock
+/// `x-amzn-RequestId` / `x-amzn-errortype` headers via the
+/// `ProtocolWriter::attach_error_response_headers` vtable method. Using the shared builder means the
+/// auth path, the forward path, and the route/fallback path CANNOT diverge on error shape or
+/// headers. Bedrock's auth-failure modeled exception is `AccessDeniedException`;
+/// `ingress_error`'s header attach derives the same `x-amzn-errortype` from the `kind` we pass
+/// (`auth` → `AccessDeniedException`), so the wire body `__type` and the header agree.
 fn unauthorized_response(path: &str) -> Response {
     let proto = proto_for_path(path);
     let message = vendor_auth_failure_message(proto);
@@ -378,7 +426,7 @@ fn unauthorized_response(path: &str) -> Response {
 /// non-UTF-8, or blank.
 fn extract_admin_header_token(req: &Request<Body>) -> Option<String> {
     req.headers()
-        .get("x-admin-token")
+        .get(X_ADMIN_TOKEN)
         .and_then(|v| v.to_str().ok())
         .filter(|t| !t.is_empty())
         .map(String::from)
@@ -397,7 +445,7 @@ pub(crate) async fn auth_middleware(
     // `none`/`passthrough` mode, where `validate_token` admits unconditionally). Clone the path so
     // no immutable borrow of `req` is held while we later mutate its extensions.
     let path = req.uri().path().to_owned();
-    if path == "/healthz" {
+    if path == HEALTHZ_PATH {
         return Ok(next.run(req).await);
     }
 
@@ -411,7 +459,7 @@ pub(crate) async fn auth_middleware(
     // 500 MissingExtension and leaking that the path was treated as admin-protected. Require either
     // the exact `/admin` segment or a `/admin/` delimiter so only the four registered admin routes
     // (`/admin/keys`, `/admin/keys/:id`, `/admin/keys/:id/usage`) match.
-    let is_admin = path == "/admin" || path.starts_with("/admin/");
+    let is_admin = path == ADMIN_PATH || path.starts_with(ADMIN_PATH_PREFIX);
     let admin_header_token = extract_admin_header_token(&req);
     // The busbar client token, taken from whichever carrier the SDK used (Authorization: Bearer,
     // then x-api-key, then x-goog-api-key). This single value drives BOTH the static-allowlist
@@ -439,8 +487,11 @@ pub(crate) async fn auth_middleware(
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(AuthMiddleware::extract_bearer_token);
-        let configured = app.governance.as_ref().and_then(|g| g.admin_token());
-        let authorized = match configured {
+        // The admin token's SHA-256 is pre-computed once at `GovState` construction
+        // (`GovState::admin_token_hash`) and is present exactly when an admin token is configured.
+        // Match on it directly: the configured-token compare needs no per-request SHA-256, and there
+        // is no parallel `Option` to unwrap on this auth path.
+        let authorized = match app.governance.as_ref().and_then(|g| g.admin_token_hash()) {
             // Constant-time compare so the admin token can't be recovered byte-by-byte via a timing
             // side channel. BOTH carrier comparisons run UNCONDITIONALLY and are combined with a
             // bitwise-OR fold (`|`, NOT `||`): a `||` short-circuits, so a request presenting BOTH a
@@ -450,7 +501,7 @@ pub(crate) async fn auth_middleware(
             // the Bearer value. Mirror the client-token allowlist fold: compute each compare into a
             // `u8`, OR them, and `black_box` the result so the optimizer can't reintroduce an early
             // exit. A missing carrier contributes 0 (no compare to a secret leaks via its absence).
-            Some(t) => {
+            Some(configured_hash) => {
                 // Length-independent compare: `constant_time_eq` early-returns on a length mismatch,
                 // which leaks the admin token's LENGTH via timing (a candidate of the right length runs
                 // the full byte loop; a wrong-length one returns immediately). Remove that oracle by
@@ -460,14 +511,16 @@ pub(crate) async fn auth_middleware(
                 // regardless of its length. A missing carrier contributes 0 (no compare against a
                 // secret-derived digest, so its absence leaks nothing). The compares run
                 // UNCONDITIONALLY and fold with bitwise-OR (see the no-short-circuit rationale above).
-                let configured_hash = crate::sigv4::sha256_hex(t.as_bytes());
+                // `configured_hash` is bound from the match above — pre-computed once at `GovState`
+                // construction, so there is no per-request SHA-256 of the configured token and no
+                // unwrap/expect on this auth path.
                 let bearer_match = u8::from(
                     admin_bearer
                         .as_deref()
                         .map(|b| {
                             AuthMiddleware::constant_time_eq(
                                 &crate::sigv4::sha256_hex(b.as_bytes()),
-                                &configured_hash,
+                                configured_hash,
                             )
                         })
                         .unwrap_or(false),
@@ -478,7 +531,7 @@ pub(crate) async fn auth_middleware(
                         .map(|h| {
                             AuthMiddleware::constant_time_eq(
                                 &crate::sigv4::sha256_hex(h.as_bytes()),
-                                &configured_hash,
+                                configured_hash,
                             )
                         })
                         .unwrap_or(false),
@@ -587,15 +640,23 @@ pub(crate) async fn auth_middleware(
             // BODY INTEGRITY: a SigV4 signature only binds the payload if we re-hash the actual bytes
             // and confirm they match the signed `x-amz-content-sha256` (which the signature covers).
             // Verifying the signature alone leaves a MitM free to tamper the body in transit while the
-            // request still authenticates. Buffer the body HERE (Bedrock ingress is bounded JSON; the
-            // 32 MiB `DefaultBodyLimit` layer already caps it, so `to_bytes(usize::MAX)` cannot be used
-            // to exhaust memory) so the verifier can compare `sha256_hex(body)` to the declared hash,
-            // then reconstruct the request from the SAME bytes so the downstream handler receives the
-            // payload intact (no consumption bug). A buffering failure (e.g. a truncated/aborted body)
-            // is itself a failed request — collapse it to the same opaque auth error so it leaks
-            // nothing about why it failed.
+            // request still authenticates. Buffer the body HERE so the verifier can compare
+            // `sha256_hex(body)` to the declared hash, then reconstruct the request from the SAME bytes
+            // so the downstream handler receives the payload intact (no consumption bug). A buffering
+            // failure (e.g. a truncated/aborted body) is itself a failed request — collapse it to the
+            // same opaque auth error so it leaks nothing about why it failed.
+            //
+            // CAP the buffer at the SAME knob (`limits.request_body_max_bytes`) that drives the inbound
+            // `DefaultBodyLimit` layer, rather than `usize::MAX`. This auth middleware runs BEFORE
+            // authentication is confirmed and the SigV4 branch is reachable from attacker-controlled
+            // headers alone (a fabricated AccessKeyId still reaches here), so relying on the body-limit
+            // layer being present and ordered ahead of us is a stack assumption, not enforcement. An
+            // in-code cap means a never-terminating / oversized body cannot exhaust the heap even if
+            // the layer is absent or misconfigured (defense-in-depth).
             let (parts, body) = req.into_parts();
-            let Ok(body_bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+            let Ok(body_bytes) =
+                axum::body::to_bytes(body, crate::limits::translate_body_max_bytes()).await
+            else {
                 return Err(unauthorized_response(&path));
             };
             let mut req = Request::from_parts(parts, Body::from(body_bytes.clone()));
@@ -633,7 +694,7 @@ pub(crate) async fn auth_middleware(
             Some(_) | None => return Err(unauthorized_response(&path)),
         }
     } else {
-        // /stats requires auth by default (per spec decision).
+        // Governance disabled: enforce the static-allowlist token check on every non-admin path.
         if !token_valid {
             return Err(unauthorized_response(&path));
         }
@@ -652,7 +713,7 @@ fn has_sigv4_authorization(req: &Request<Body>) -> bool {
     req.headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim_start().starts_with("AWS4-HMAC-SHA256"))
+        .map(|v| v.trim_start().starts_with(SIGV4_ALGORITHM))
         .unwrap_or(false)
 }
 
@@ -750,7 +811,7 @@ fn verify_bedrock_sigv4(
     // canonical request.
     let Some(payload_hash) = headers
         .iter()
-        .find(|(k, _)| k == "x-amz-content-sha256")
+        .find(|(k, _)| k == X_AMZ_CONTENT_SHA256)
         .map(|(_, v)| v.clone())
     else {
         tracing::debug!("inbound SigV4 rejected: missing x-amz-content-sha256");
@@ -784,7 +845,7 @@ fn verify_bedrock_sigv4(
     };
     let Some(amzdate) = headers
         .iter()
-        .find(|(k, _)| k == "x-amz-date")
+        .find(|(k, _)| k == X_AMZ_DATE)
         .map(|(_, v)| v.clone())
     else {
         tracing::debug!("inbound SigV4 rejected: missing x-amz-date");
@@ -807,7 +868,6 @@ fn verify_bedrock_sigv4(
     // Resolve the AccessKeyId to (key, secret). On an UNKNOWN AccessKeyId, verify against a fixed dummy
     // secret so the work — and the timing/response — is indistinguishable from a wrong-signature
     // rejection (no AccessKeyId-enumeration oracle). The dummy is a constant, never a real secret.
-    const DUMMY_SECRET: &str = "AWS4-DUMMY-SECRET-FOR-CONSTANT-TIME-REJECT-PATH";
     let now = crate::store::now();
     let (secret, resolved): (String, Option<crate::governance::VirtualKey>) =
         match gov.lookup_by_access_key_id(&parsed.access_key_id) {
@@ -877,14 +937,14 @@ mod tests {
     fn test_synth_amzn_request_id_is_uuid_v4() {
         // Regression for the flat-32-hex-no-dashes format: a Bedrock x-amzn-RequestId must be a
         // CSPRNG UUID-v4, matching real AWS. The auth path now mints this id through the CANONICAL
-        // `crate::proto::synth_amzn_request_id` (via `forward::ingress_error` →
+        // `crate::proto::bedrock::synth_amzn_request_id` (via `forward::ingress_error` →
         // `attach_bedrock_error_headers`), not a private copy — assert the canonical fn's shape so the
         // bedrock auth-failure header contract stays covered. Two consecutive ids must differ
         // (entropy-sourced, not a predictable timestamp||counter).
-        let a =
-            crate::proto::synth_amzn_request_id().expect("entropy must be available under test");
-        let b =
-            crate::proto::synth_amzn_request_id().expect("entropy must be available under test");
+        let a = crate::proto::bedrock::synth_amzn_request_id()
+            .expect("entropy must be available under test");
+        let b = crate::proto::bedrock::synth_amzn_request_id()
+            .expect("entropy must be available under test");
         assert_uuid_v4_shaped(&a);
         assert_uuid_v4_shaped(&b);
         assert_ne!(a, b, "consecutive synthetic request ids must differ");
@@ -976,6 +1036,49 @@ mod tests {
         assert!(mw.validate_token(Some("middle-token")), "match at index 1");
         assert!(mw.validate_token(Some("last-token")), "match at last index");
         assert!(!mw.validate_token(Some("absent-token")), "no match");
+    }
+
+    #[test]
+    fn test_validate_token_length_independent_compare() {
+        // Regression for the client-token timing-LENGTH leak: the configured token's length must not
+        // be observable via `constant_time_eq`'s early length-mismatch return. Both sides are now
+        // SHA-256-hashed to a fixed 64-hex-char digest before the constant-time compare, so a
+        // wrong-length candidate runs the same work as a right-length one AND still fails.
+        let cfg = AuthCfg {
+            mode: crate::auth::AuthMode::Token,
+            client_tokens: vec!["the-real-token".to_string()],
+        };
+        let mw = AuthMiddleware::new(&cfg);
+
+        // Correctness preserved: the valid token still authenticates.
+        assert!(
+            mw.validate_token(Some("the-real-token")),
+            "valid token must authenticate"
+        );
+
+        // Wrong tokens are rejected regardless of length — shorter, longer, and equal-length.
+        assert!(
+            !mw.validate_token(Some("x")),
+            "much shorter wrong token rejected"
+        );
+        assert!(
+            !mw.validate_token(Some("a-very-much-longer-wrong-token-value")),
+            "much longer wrong token rejected"
+        );
+        assert!(
+            !mw.validate_token(Some("the-real-tokeX")),
+            "equal-length wrong token rejected"
+        );
+
+        // Structural guarantee: both the candidate and the stored token are hashed to equal length
+        // (32 bytes / 64 hex chars) before the compare, so the compare's runtime no longer depends
+        // on the relationship between the candidate length and the stored-token length.
+        let stored_hash = crate::sigv4::sha256_hex(mw.client_tokens[0].as_bytes());
+        let cand_short = crate::sigv4::sha256_hex(b"x");
+        let cand_long = crate::sigv4::sha256_hex(b"a-very-much-longer-wrong-token-value");
+        assert_eq!(stored_hash.len(), 64);
+        assert_eq!(cand_short.len(), 64);
+        assert_eq!(cand_long.len(), 64);
     }
 
     #[test]
@@ -1472,7 +1575,7 @@ mod tests {
         );
         assert_eq!(
             vendor_auth_failure_message("gemini"),
-            "API key not valid. Please pass a valid API key."
+            crate::proto::gemini::GEMINI_BAD_KEY_MESSAGE
         );
         assert_eq!(vendor_auth_failure_message("cohere"), "invalid api token");
         // AWS conveys AccessDenied via __type / x-amzn-errortype, not a message string.
@@ -1499,7 +1602,7 @@ mod tests {
             ("/v2/chat", "cohere"),
             ("/v1/responses", "responses"),
             ("/v1beta/models/gemini-1.5:generateContent", "gemini"),
-            // BOTH Gemini ingress prefixes the router registers (main.rs:700-701) must resolve to a
+            // BOTH Gemini ingress prefixes the router registers (main.rs) must resolve to a
             // non-fallback proto. The stable `v1` alias was previously omitted here, masking the
             // missing `/v1/models/` arm in proto_for_path (a `:`-action path mis-shaped as openai).
             ("/v1/models/gemini-pro:generateContent", "gemini"),
@@ -2518,7 +2621,7 @@ mod tests {
         // ABSENT, mirroring the empty-filter `extract_client_token` applies to the vendor carriers.
         // The OLD code mapped a blank header to `Some("")` (no `.filter(|t| !t.is_empty())`), so this
         // unit test fails against it; the filtered helper now yields `None`.
-        let blank = req_with("x-admin-token", "");
+        let blank = req_with(X_ADMIN_TOKEN, "");
         assert_eq!(
             extract_admin_header_token(&blank),
             None,
@@ -2528,7 +2631,7 @@ mod tests {
         // A whitespace-only value is NOT blank (it is a non-empty string); it is preserved verbatim
         // and will simply fail the constant-time compare downstream — the filter is empty-only, not a
         // trim, matching extract_client_token's carrier filter exactly.
-        let present = req_with("x-admin-token", "admintok");
+        let present = req_with(X_ADMIN_TOKEN, "admintok");
         assert_eq!(
             extract_admin_header_token(&present),
             Some("admintok".to_string()),
@@ -2568,7 +2671,7 @@ mod tests {
         // Blank x-admin-token (and no Bearer) → 401: a blank header is treated as absent.
         let r_blank = client
             .get(&url)
-            .header("x-admin-token", "")
+            .header(X_ADMIN_TOKEN, "")
             .send()
             .await
             .unwrap();
@@ -2582,7 +2685,7 @@ mod tests {
         // Correct x-admin-token → authorized, proving the reject above is the empty-filter.
         let r_ok = client
             .get(&url)
-            .header("x-admin-token", "admintok")
+            .header(X_ADMIN_TOKEN, "admintok")
             .send()
             .await
             .unwrap();
@@ -2628,7 +2731,7 @@ mod tests {
         let r = client
             .get(&url)
             .bearer_auth("admintok")
-            .header("x-admin-token", "wrong")
+            .header(X_ADMIN_TOKEN, "wrong")
             .send()
             .await
             .unwrap();
@@ -2645,7 +2748,7 @@ mod tests {
         let r = client
             .get(&url)
             .bearer_auth("wrong")
-            .header("x-admin-token", "admintok")
+            .header(X_ADMIN_TOKEN, "admintok")
             .send()
             .await
             .unwrap();
@@ -2660,7 +2763,7 @@ mod tests {
         let r = client
             .get(&url)
             .bearer_auth("wrong")
-            .header("x-admin-token", "also-wrong")
+            .header(X_ADMIN_TOKEN, "also-wrong")
             .send()
             .await
             .unwrap();
@@ -2748,7 +2851,7 @@ mod tests {
         );
         let r_hdr = client
             .get(&url)
-            .header("x-admin-token", "admintok")
+            .header(X_ADMIN_TOKEN, "admintok")
             .send()
             .await
             .unwrap();
@@ -2891,7 +2994,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// Regression for the empty-token governance bypass (finding auth.rs:420): the governance branch
+    /// Regression for the empty-token governance bypass (finding auth.rs): the governance branch
     /// must reject a request that presents NO credential BEFORE calling `gov.lookup`, rather than
     /// looking up `sha256("")`. We deliberately seed a virtual key whose `key_hash == sha256("")` —
     /// the exact pathological state (reachable via direct DB writes / a future seeding path that
@@ -3059,8 +3162,8 @@ mod tests {
                 "host".to_string(),
                 "bedrock-runtime.us-east-1.amazonaws.com".to_string(),
             ),
-            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
-            ("x-amz-date".to_string(), amzdate.to_string()),
+            (X_AMZ_CONTENT_SHA256.to_string(), payload_hash.clone()),
+            (X_AMZ_DATE.to_string(), amzdate.to_string()),
         ];
         let canonical_uri = crate::sigv4::uri_encode_path(path);
         let (sig, signed_headers) = crate::sigv4::sign_v4(
@@ -3321,7 +3424,7 @@ mod tests {
         let (auth, mut headers) =
             sign_bedrock_request(&secret, &akid, "us-east-1", "bedrock", path, body, &a);
         for (k, v) in headers.iter_mut() {
-            if k == "x-amz-content-sha256" {
+            if k == X_AMZ_CONTENT_SHA256 {
                 *v = "UNSIGNED-PAYLOAD".to_string();
             }
         }

@@ -33,7 +33,11 @@ static INSTALLED: OnceLock<LimitsResolved> = OnceLock::new();
 /// any router/store/prober is built. A second call is ignored (the first install wins) so the
 /// startup ordering can never panic here.
 pub(crate) fn install(resolved: &LimitsResolved) {
-    let _ = INSTALLED.set(resolved.clone());
+    // First install wins (so startup ordering can never panic here), but a SECOND install is a bug
+    // in the call sequence — surface it instead of silently dropping the new limits.
+    if INSTALLED.set(resolved.clone()).is_err() {
+        tracing::warn!("limits already installed; second install ignored");
+    }
 }
 
 /// The egress translate-body cap (bytes). COUPLED to ingress `request_body_max_bytes`: one knob
@@ -138,21 +142,24 @@ mod tests {
     /// process-wide `OnceLock` cannot be reset between tests, and `main` is the only real installer).
     #[test]
     fn uninstalled_accessors_return_historical_defaults() {
-        // Guarded: if some other test in this binary installed already, the values would be the
-        // installed ones. The limits unit tests are the only `install`-free readers here, and no
-        // test in this module installs, so the OnceLock stays empty and the defaults hold.
-        if INSTALLED.get().is_none() {
-            assert_eq!(translate_body_max_bytes(), DEFAULT_REQUEST_BODY_MAX_BYTES);
-            assert_eq!(key_gauge_limit(), DEFAULT_KEY_GAUGE_LIMIT);
-            assert_eq!(sqlite_busy_timeout_ms(), DEFAULT_SQLITE_BUSY_TIMEOUT_MS);
-            assert_eq!(rate_sweep_interval(), DEFAULT_RATE_SWEEP_INTERVAL);
-            assert_eq!(default_probe_interval_secs(), DEFAULT_PROBE_INTERVAL_SECS);
-            assert_eq!(default_probe_timeout_secs(), DEFAULT_PROBE_TIMEOUT_SECS);
-            assert_eq!(default_policy_timeout_ms(), DEFAULT_POLICY_TIMEOUT_MS);
-            assert_eq!(
-                webhook_delivery_timeout_secs(),
-                DEFAULT_WEBHOOK_DELIVERY_TIMEOUT_SECS
-            );
-        }
+        // This test MUST run uninstalled so the fallback path is actually covered. A silent `if`
+        // skip would let the accessors' default branch go untested whenever another test installed
+        // first; assert the precondition LOUDLY instead (no test in this binary installs — install()
+        // is main-only — so this holds, and a future test that breaks it fails here, not silently).
+        assert!(
+            INSTALLED.get().is_none(),
+            "limits already installed by another test; uninstalled-default coverage was skipped"
+        );
+        assert_eq!(translate_body_max_bytes(), DEFAULT_REQUEST_BODY_MAX_BYTES);
+        assert_eq!(key_gauge_limit(), DEFAULT_KEY_GAUGE_LIMIT);
+        assert_eq!(sqlite_busy_timeout_ms(), DEFAULT_SQLITE_BUSY_TIMEOUT_MS);
+        assert_eq!(rate_sweep_interval(), DEFAULT_RATE_SWEEP_INTERVAL);
+        assert_eq!(default_probe_interval_secs(), DEFAULT_PROBE_INTERVAL_SECS);
+        assert_eq!(default_probe_timeout_secs(), DEFAULT_PROBE_TIMEOUT_SECS);
+        assert_eq!(default_policy_timeout_ms(), DEFAULT_POLICY_TIMEOUT_MS);
+        assert_eq!(
+            webhook_delivery_timeout_secs(),
+            DEFAULT_WEBHOOK_DELIVERY_TIMEOUT_SECS
+        );
     }
 }

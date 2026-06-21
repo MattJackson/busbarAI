@@ -25,7 +25,7 @@ const features = [
   },
   {
     title: 'A programmable request path',
-    body: 'Routing is the first hook: a policy — built-in (<strong>weighted, cheapest, fastest, least-busy, usage</strong>), a webhook in any language, or a sandboxed Rhai script — inspects each request and decides who serves it, from per-member cost, latency, live concurrency, budget, and rate headroom. A slow or broken hook falls back, never blocks a request.',
+    body: 'Routing is the first hook: a policy — built-in (<strong>weighted, cheapest, fastest, least_busy, usage</strong>), a webhook in any language, or a sandboxed Rhai script — inspects each request and decides who serves it, from per-member cost, latency, live concurrency, budget, and rate headroom. A slow or broken hook falls back, never blocks a request.',
     enables: 'The same fail-safe machinery is built to carry <strong>PII-steering, audit, caching, and guardrails</strong> — your own logic on the request path, in any language.',
   },
   {
@@ -76,7 +76,7 @@ models:
     provider: anthropic
     max_concurrent: 10`;
 const qsRun = `export ANTHROPIC_KEY=sk-ant-...
-BUSBAR_CONFIG=./config.yaml busbar   <span class="cm"># serving on :8080</span>`;
+BUSBAR_PROVIDERS=./providers.yaml BUSBAR_CONFIG=./config.yaml busbar   <span class="cm"># serving on :8080</span>`;
 const qsRequest = `curl localhost:8080/v1/chat/completions \\
   -d '{"model":"claude-sonnet",
        "messages":[{"role":"user","content":"hi"}]}'`;
@@ -508,12 +508,15 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       /* QUICKSTART */
       .quickstart { background: var(--slate); color: #fff; padding: 88px 0; }
       .qs-grid { display: grid; grid-template-columns: 0.85fr 1.15fr; gap: 56px; align-items: start; }
+      /* Grid items must be allowed to shrink below their content's min-content width; otherwise the
+         unwrappable `curl … | sh` line stretches the column past the viewport on mobile (h-overflow). */
+      .qs-grid > * { min-width: 0; }
       .qs-copy h2 { font-size: clamp(26px, 3.2vw, 36px); font-weight: 800; color: #fff; }
       .qs-copy p { color: #94a3b8; font-size: 16.5px; margin: 18px 0 26px; }
       .qs-copy .btn { background: var(--lime); color: var(--slate); border-color: var(--lime); }
       .qs-copy .btn:hover { box-shadow: 0 8px 24px rgba(163,230,53,0.3); }
       .qs-steps { display: flex; flex-direction: column; gap: 16px; }
-      .qs-block { background: #0b1220; border: 1px solid rgba(148,163,184,0.16); border-radius: 12px; overflow: hidden; }
+      .qs-block { background: #0b1220; border: 1px solid rgba(148,163,184,0.16); border-radius: 12px; overflow: hidden; min-width: 0; max-width: 100%; }
       .qs-tag {
         display: block; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
         color: var(--lime); padding: 10px 16px 0; font-family: ui-monospace, monospace;

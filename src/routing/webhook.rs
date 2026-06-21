@@ -160,7 +160,10 @@ impl RoutingPolicy for WebhookPolicy {
         let resp = self
             .client
             .post(&self.url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                crate::forward::APPLICATION_JSON,
+            )
             .body(payload)
             .timeout(budget)
             .send()
@@ -225,7 +228,10 @@ mod tests {
             }
             (
                 axum::http::StatusCode::from_u16(status).unwrap(),
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    crate::forward::APPLICATION_JSON,
+                )],
                 body,
             )
         };
@@ -366,10 +372,10 @@ mod tests {
         );
     }
 
-    /// MED (wire-correctness): the sidecar RESPONSE body is parsed through the `crate::json`
-    /// depth-guard seam (MAX_JSON_DEPTH=128). A pathologically nested response (~150 deep) must be
-    /// rejected as `Err` (→ `on_error` fallback) BEFORE a recursive deserialize can blow the stack —
-    /// not parsed. The body stays well under the 64 KiB cap, so depth (not size) is what rejects it.
+    /// The sidecar response body is parsed through the `crate::json` depth-guard seam
+    /// (MAX_JSON_DEPTH=128). A pathologically nested response (~150 deep) must be rejected as `Err`
+    /// (→ `on_error` fallback) BEFORE a recursive deserialize can blow the stack — not parsed. The
+    /// body stays well under the 64 KiB cap, so depth (not size) is what rejects it.
     #[tokio::test]
     async fn deeply_nested_response_body_is_rejected() {
         // 150 levels of nested arrays: `{"order":[[[...]]]}` — past MAX_JSON_DEPTH=128, well under 64 KiB.
@@ -453,7 +459,10 @@ mod tests {
             async move {
                 Response::builder()
                     .status(status)
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        crate::forward::APPLICATION_JSON,
+                    )
                     .body(Body::from(body))
                     .unwrap()
             }
@@ -481,7 +490,10 @@ mod tests {
                 *sink.lock().unwrap() = Some(body.to_vec());
                 (
                     axum::http::StatusCode::OK,
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        crate::forward::APPLICATION_JSON,
+                    )],
                     r#"{"order":[0]}"#,
                 )
             }

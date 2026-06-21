@@ -92,7 +92,7 @@ There is no Python environment to manage, no Node runtime, no database to provis
 
 **Observability is built in.** Prometheus metrics are exposed at `/metrics` with bounded cardinality — metric labels use configured pool names and fixed enumerations, never raw model strings from client requests. OTLP trace export and a request-log webhook are both optional and configurable. The `/healthz` endpoint is side-effect-free (it never steals a recovery probe) and safe for high-frequency load balancer probing. Note that `/metrics` and `/stats` are not auth-exempt — they go through the same auth check as request traffic, since telemetry is itself a fingerprinting surface.
 
-**Security defaults are strict.** The SSRF guard on `base_url` and observability sink URLs blocks loopback, link-local, RFC-1918, CGNAT, and cloud metadata endpoints, including alternate IP encodings and `localhost`/`*.localhost` variants. Resolved `base_url` values must use `https://`. Auth failures return native-protocol error envelopes with no Busbar vocabulary — an Anthropic SDK sees an Anthropic 401, an OpenAI SDK sees `invalid_api_key`, a Gemini SDK sees a 400 `INVALID_ARGUMENT`, and a Bedrock SDK sees a 403 `AccessDeniedException`. Admin endpoints are separately guarded by an admin token and disabled entirely if none is configured.
+**Security defaults are strict.** Provider `base_url` values are guarded against cloud-metadata/IMDS endpoints (including alternate IP encodings). Loopback, RFC-1918, and CGNAT addresses are permitted for local-model upstreams (e.g. Ollama/vLLM); plain `http://` is only allowed for those private/loopback hosts — public hosts must use `https://`. Observability sink URLs (OTLP endpoint, request-log webhook) apply a stricter guard that additionally blocks loopback, link-local, RFC-1918, and broadcast addresses. Auth failures return native-protocol error envelopes with no Busbar vocabulary — an Anthropic SDK sees an Anthropic 401, an OpenAI SDK sees `invalid_api_key`, a Gemini SDK sees a 400 `INVALID_ARGUMENT`, and a Bedrock SDK sees a 403 `AccessDeniedException`. Admin endpoints are separately guarded by an admin token and disabled entirely if none is configured.
 
 **The request body cap is 32 MiB** (`DefaultBodyLimit`), enforced before handler code runs, with protocol-native 413 responses (not bare text).
 
@@ -121,6 +121,6 @@ One auth note for Bedrock: Busbar signs outbound Bedrock requests with AWS SigV4
 
 ## Current status
 
-Busbar is at **1.0.0-rc.7**, licensed AGPL-3.0-or-later. The wire protocol translation, circuit breaker model, governance layer, and admin API are stable at this release candidate. The test suite covers over 1,500 test cases across the protocol translators, breaker FSM, auth middleware, governance enforcement, and config validation.
+Busbar is at **1.0.0**, licensed AGPL-3.0-or-later. The wire protocol translation, circuit breaker model, governance layer, and admin API are stable under Semantic Versioning. The test suite covers over 1,600 test cases across the protocol translators, breaker FSM, auth middleware, governance enforcement, and config validation.
 
 The AGPL license means that if you modify Busbar and run it as a networked service, you must make the modified source available. Read the LICENSE file before deploying in a commercial context.

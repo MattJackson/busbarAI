@@ -4,7 +4,7 @@
 //! Protocol-agnostic classifier for breaker dispositions.
 //!
 //! Stage 2 of the two-stage disposition pipeline:
-//! - Stage 1 (src/proto.rs): per-protocol normalizer → CanonicalSignal with typed StatusClass
+//! - Stage 1 (src/proto/): per-protocol normalizer → CanonicalSignal with typed StatusClass
 //! - Stage 2 (this module): protocol-agnostic classifier → Disposition
 //!
 //! Mapping (+ ADR-0002):
@@ -12,8 +12,12 @@
 //!   Auth|Billing → HardDown
 //!   ClientError → ClientFault
 
+/// Anthropic non-standard 529 overload status — not in the IANA registry but
+/// documented by Anthropic as their server-overloaded signal (distinct from 503).
+const HTTP_OVERLOADED: u16 = 529;
+
 /// Protocol-neutral, dialect-normalized status class.
-/// Emitted by Stage 1 normalizer (Protocol::classify) in src/proto.rs.
+/// Emitted by Stage 1 normalizer (the per-protocol classifier) in src/proto/.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatusClass {
     /// Rate limit / slow down — transient, may recover with retry-after
@@ -64,6 +68,28 @@ pub(crate) fn status_class_from_str(s: &str) -> Option<StatusClass> {
         "client_error" => Some(StatusClass::ClientError),
         "context_length" => Some(StatusClass::ContextLength),
         _ => None,
+    }
+}
+
+/// Warn (once per distinct value) that an operator `error_map` entry maps to a string that is not a
+/// recognized StatusClass. Such a value is silently ignored by `normalize_raw_error` — the error
+/// then falls through to HTTP-status classification — so without this signal a typo'd mapping (e.g.
+/// `rate_limt`) would never take effect and the operator would have no indication why. Deduped via a
+/// process-wide set so a misconfiguration on a hot error path logs once, not per request.
+fn warn_unrecognized_error_map_value(value: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    // Poisoning is harmless here (the set only dedupes warnings); recover the guard either way.
+    let mut guard = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.insert(value.to_string()) {
+        tracing::warn!(
+            error_map_value = value,
+            "error_map maps an error to an unrecognized status class; the mapping is IGNORED and \
+             classification falls through to HTTP status. Valid classes: rate_limit, overloaded, \
+             server_error, timeout, network, auth, billing, client_error, context_length"
+        );
     }
 }
 
@@ -122,6 +148,11 @@ pub(crate) fn normalize_raw_error(
                         retry_after: raw.retry_after_secs,
                     };
                 }
+            } else {
+                // The operator mapped this code to a string that is not a recognized status class
+                // (typo such as `rate_limt`). It is silently ignored below; warn so the misconfig
+                // is visible instead of a mapping that never takes effect.
+                warn_unrecognized_error_map_value(mapped_class);
             }
         }
         // built-in recognition of the canonical context-length code (the operator
@@ -138,7 +169,9 @@ pub(crate) fn normalize_raw_error(
         // The previous `!(500..600)` guard let any non-5xx (e.g. a 200/3xx/auth) carrying a
         // `context_length_exceeded` code masquerade as ContextLength; restrict to the precise
         // request-size set so it can never mask a non-request-size status.
-        if code == "context_length_exceeded" && (raw.http_status == 400 || raw.http_status == 413) {
+        if code == crate::forward::PROVIDER_CODE_CONTEXT_LENGTH
+            && (raw.http_status == 400 || raw.http_status == 413)
+        {
             return CanonicalSignal {
                 class: StatusClass::ContextLength,
                 provider_signal: Some(code.clone()),
@@ -155,7 +188,16 @@ pub(crate) fn normalize_raw_error(
     // can map it in error_map just like a code (useful when a provider has no numeric code but a
     // typed `error.type`). The explicit code (above) wins; this refines when the code didn't match.
     if let Some(ref ty) = raw.structured_type {
-        if let Some(class) = error_map.get(ty).and_then(|m| status_class_from_str(m)) {
+        // Resolve the mapped class, warning (once) if the operator mapped this type to an
+        // unrecognized status-class string — otherwise it is silently ignored and falls through.
+        let mapped = error_map.get(ty).and_then(|m| {
+            let class = status_class_from_str(m);
+            if class.is_none() {
+                warn_unrecognized_error_map_value(m);
+            }
+            class
+        });
+        if let Some(class) = mapped {
             // Same CLASS guard as the code path above: a structured-type signal mapped to
             // `context_length` on a 5xx must not mask the upstream outage — fall through to
             // HTTP-status classification so the lane is penalized.
@@ -177,7 +219,7 @@ pub(crate) fn normalize_raw_error(
         StatusClass::RateLimit
     } else if http_status == 408 {
         StatusClass::Timeout
-    } else if http_status == 529 {
+    } else if http_status == HTTP_OVERLOADED {
         StatusClass::Overloaded
     } else if (500..600).contains(&http_status) {
         StatusClass::ServerError
@@ -256,7 +298,7 @@ mod tests {
         // healthy, fail over without penalizing the breaker.
         let raw = RawUpstreamError {
             http_status: 400,
-            provider_code: Some("context_length_exceeded".to_string()),
+            provider_code: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
             structured_type: None,
             retry_after_secs: None,
         };
@@ -264,7 +306,7 @@ mod tests {
         assert_eq!(sig.class, StatusClass::ContextLength);
         assert_eq!(
             sig.provider_signal.as_deref(),
-            Some("context_length_exceeded")
+            Some("context_length_exceeded") // golden wire-contract literal (kept bare on purpose)
         );
     }
 
@@ -275,7 +317,7 @@ mod tests {
         // TransientUpstream) so the breaker is penalized — NOT ContextLength.
         let raw = RawUpstreamError {
             http_status: 503,
-            provider_code: Some("context_length_exceeded".to_string()),
+            provider_code: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
             structured_type: None,
             retry_after_secs: None,
         };
@@ -289,11 +331,11 @@ mod tests {
         // built-in context-length recognition even for the canonical code on a 400.
         let raw = RawUpstreamError {
             http_status: 400,
-            provider_code: Some("context_length_exceeded".to_string()),
+            provider_code: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
             structured_type: None,
             retry_after_secs: None,
         };
-        let map = err_map(&[("context_length_exceeded", "client_error")]);
+        let map = err_map(&[(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH, "client_error")]);
         let sig = normalize_raw_error(&raw, &map);
         assert_eq!(sig.class, StatusClass::ClientError);
     }
@@ -358,7 +400,7 @@ mod tests {
         // (Fails against pre-R27 code, whose `!(500..600)` guard accepted any non-5xx.)
         let raw = RawUpstreamError {
             http_status: 403,
-            provider_code: Some("context_length_exceeded".to_string()),
+            provider_code: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
             structured_type: None,
             retry_after_secs: None,
         };
@@ -372,7 +414,7 @@ mod tests {
         // accepts for the built-in context_length code.
         let raw = RawUpstreamError {
             http_status: 413,
-            provider_code: Some("context_length_exceeded".to_string()),
+            provider_code: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
             structured_type: None,
             retry_after_secs: None,
         };

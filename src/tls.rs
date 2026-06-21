@@ -186,7 +186,7 @@ pub(crate) async fn serve(
 ) -> io::Result<()> {
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
     let graceful = GracefulShutdown::new();
-    let conn_builder = Arc::new(ConnBuilder::new(TokioExecutor::new()));
+    let conn_builder = Arc::new(hardened_conn_builder());
 
     let mut shutdown = std::pin::pin!(shutdown);
 
@@ -221,6 +221,86 @@ pub(crate) async fn serve(
     Ok(())
 }
 
+/// Build the hyper auto connection builder shared by BOTH the plain-HTTP and TLS serve loops.
+///
+/// Bounds the HTTP/1 HEADER-read phase (slow-loris defense): a client that opens a connection and
+/// then trickles request headers one byte at a time would otherwise hold the connection task + FD
+/// indefinitely — `DefaultBodyLimit` only applies AFTER headers are fully received, so it does not
+/// help here. `header_read_timeout` bounds ONLY the header phase, so it never truncates a
+/// legitimately long response stream (an LLM completion can stream for minutes). 30s is far longer
+/// than any real client needs to send its request line + headers, so it cannot false-positive on a
+/// healthy connection. `header_read_timeout` requires a `Timer` (hyper panics otherwise), so the
+/// Tokio timer is wired to drive it from the runtime clock.
+fn hardened_conn_builder() -> ConnBuilder<TokioExecutor> {
+    let mut builder = ConnBuilder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(std::time::Duration::from_secs(30));
+    builder
+}
+
+/// Plain-HTTP serve loop — the no-`tls`-block default path. Mirrors `serve` (and the historical
+/// `axum::serve(listener, router).with_graceful_shutdown(shutdown)`) but over the bare TCP stream
+/// (no TLS handshake). Routed through the SAME `hardened_conn_builder` so the plain listener gets the
+/// identical slow-loris header-read bound the TLS listener has — the previous `axum::serve` path
+/// exposed no such timeout, leaving a plain-HTTP edge deployment open to header-trickle clients.
+pub(crate) async fn serve_plain(
+    listener: TcpListener,
+    router: Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> io::Result<()> {
+    let graceful = GracefulShutdown::new();
+    let conn_builder = Arc::new(hardened_conn_builder());
+    let mut shutdown = std::pin::pin!(shutdown);
+
+    loop {
+        let (stream, peer) = tokio::select! {
+            biased;
+            () = &mut shutdown => break,
+            accepted = listener.accept() => match accepted {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::debug!(error = %e, "http: accept error; continuing");
+                    continue;
+                }
+            },
+        };
+
+        let router = router.clone();
+        let conn_builder = conn_builder.clone();
+        let watcher = graceful.watcher();
+
+        tokio::spawn(async move {
+            serve_one_plain(conn_builder, watcher, stream, peer, router).await;
+        });
+    }
+
+    graceful.shutdown().await;
+    Ok(())
+}
+
+/// Serve a single accepted plain-TCP connection. Any failure is contained to this connection.
+async fn serve_one_plain(
+    conn_builder: Arc<ConnBuilder<TokioExecutor>>,
+    watcher: hyper_util::server::graceful::Watcher,
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    router: Router,
+) {
+    // TCP_NODELAY parity with axum::serve (which sets it by default on accepted streams).
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!(error = %e, %peer, "http: set_nodelay failed; continuing");
+    }
+    let service = TowerToHyperService::new(router);
+    let io = TokioIo::new(stream);
+    let conn = conn_builder.serve_connection_with_upgrades(io, service);
+    let conn = watcher.watch(conn);
+    if let Err(e) = conn.await {
+        tracing::debug!(error = %e, %peer, "http: connection error");
+    }
+}
+
 /// Handshake + serve a single accepted TCP connection. Any failure is contained to this connection.
 async fn serve_one(
     acceptor: TlsAcceptor,
@@ -235,7 +315,7 @@ async fn serve_one(
         tracing::debug!(error = %e, %peer, "tls: set_nodelay failed; continuing");
     }
 
-    // Bound the handshake (see HANDSHAKE_TIMEOUT): on elapse the `accept` future is dropped, which
+    // Bound the handshake (see `handshake_timeout()`): on elapse the `accept` future is dropped, which
     // closes the half-open connection and frees the task + FDs. Cancel-safe — no state escapes.
     let tls_stream = match tokio::time::timeout(handshake_timeout(), acceptor.accept(stream)).await
     {

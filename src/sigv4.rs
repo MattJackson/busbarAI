@@ -18,6 +18,22 @@ type HmacSha256 = Hmac<Sha256>;
 const SECS_PER_DAY: u64 = 86_400;
 const SECS_PER_HOUR: u64 = 3_600;
 
+/// The SigV4 algorithm token that appears in the `Authorization` header and the string-to-sign.
+pub(crate) const SIGV4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
+/// The terminating scope component appended to every Credential scope and fed to the HMAC chain.
+/// Used as `SIGV4_TERMINATION` (&str) or `SIGV4_TERMINATION.as_bytes()` (byte slice) so the
+/// value is single-sourced even when a byte literal is required.
+pub(crate) const SIGV4_TERMINATION: &str = "aws4_request";
+/// The key-derivation prefix prepended to the secret access key before the first HMAC: `"AWS4"`.
+/// Always used via `format!("{SIGV4_KEY_PREFIX}{secret}")`, not mixed into `SIGV4_ALGORITHM`.
+const SIGV4_KEY_PREFIX: &str = "AWS4";
+/// The canonical lowercase name of the `x-amz-date` header.
+pub(crate) const X_AMZ_DATE: &str = "x-amz-date";
+/// The canonical lowercase name of the `x-amz-content-sha256` header.
+pub(crate) const X_AMZ_CONTENT_SHA256: &str = "x-amz-content-sha256";
+/// The canonical lowercase name of the `x-amz-security-token` header (STS session credentials).
+pub(crate) const X_AMZ_SECURITY_TOKEN: &str = "x-amz-security-token";
+
 /// Lowercase hex SHA-256 of `data`.
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
@@ -49,10 +65,13 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// Derive the SigV4 signing key: HMAC chain over date → region → service → "aws4_request".
 /// File-private: the only caller is `sign_request` below.
 fn signing_key(secret: &str, datestamp: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_date = hmac(format!("AWS4{secret}").as_bytes(), datestamp.as_bytes());
+    let k_date = hmac(
+        format!("{SIGV4_KEY_PREFIX}{secret}").as_bytes(),
+        datestamp.as_bytes(),
+    );
     let k_region = hmac(&k_date, region.as_bytes());
     let k_service = hmac(&k_region, service.as_bytes());
-    hmac(&k_service, b"aws4_request")
+    hmac(&k_service, SIGV4_TERMINATION.as_bytes())
 }
 
 /// AWS URI-encode a path, preserving `/`. Unreserved chars (A-Za-z0-9-_.~) pass through; everything
@@ -191,9 +210,9 @@ pub(crate) fn sign_v4(
     let canonical_request = format!(
         "{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     );
-    let scope = format!("{datestamp}/{region}/{service}/aws4_request");
+    let scope = format!("{datestamp}/{region}/{service}/{SIGV4_TERMINATION}");
     let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amzdate}\n{scope}\n{}",
+        "{SIGV4_ALGORITHM}\n{amzdate}\n{scope}\n{}",
         sha256_hex(canonical_request.as_bytes())
     );
     let key = signing_key(secret, datestamp, region, service);
@@ -275,7 +294,7 @@ pub(crate) fn parse_authorization_header(value: &str) -> Result<ParsedAuthHeader
     let Some((algo, rest)) = value.split_once(' ') else {
         return Err(VerifyError::MissingAuthorization);
     };
-    if algo != "AWS4-HMAC-SHA256" {
+    if algo != SIGV4_ALGORITHM {
         return Err(VerifyError::MissingAuthorization);
     }
 
@@ -312,7 +331,7 @@ pub(crate) fn parse_authorization_header(value: &str) -> Result<ParsedAuthHeader
 
     // Credential = AccessKeyId/datestamp/region/service/aws4_request (exactly five parts).
     let parts: Vec<&str> = credential.split('/').collect();
-    if parts.len() != 5 || parts[4] != "aws4_request" {
+    if parts.len() != 5 || parts[4] != SIGV4_TERMINATION {
         return Err(VerifyError::MalformedAuthorization);
     }
     let access_key_id = parts[0].to_string();
@@ -336,7 +355,7 @@ pub(crate) fn parse_authorization_header(value: &str) -> Result<ParsedAuthHeader
 /// Parse an `x-amz-date` value (`YYYYMMDDTHHMMSSZ`, basic ISO-8601 UTC) into a Unix epoch (seconds).
 /// Returns `None` on any format deviation. Self-contained (a civil-date computation, the inverse of
 /// `format_amz_time`); no external date crate. Used to bound the signature's age (clock-skew check).
-pub(crate) fn parse_amz_date(amzdate: &str) -> Option<u64> {
+fn parse_amz_date(amzdate: &str) -> Option<u64> {
     // Exact shape: 8 digits, 'T', 6 digits, 'Z' — 16 chars total. Reject anything else.
     let b = amzdate.as_bytes();
     if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
@@ -562,7 +581,7 @@ mod tests {
                 "",
                 &[
                     ("host".to_string(), "iam.amazonaws.com".to_string()),
-                    ("x-amz-date".to_string(), "20150830T123600Z".to_string()),
+                    (X_AMZ_DATE.to_string(), "20150830T123600Z".to_string()),
                     ("x-custom".to_string(), v.to_string()),
                 ],
                 &payload_hash,
@@ -602,7 +621,7 @@ mod tests {
                 "",
                 &[
                     ("host".to_string(), "iam.amazonaws.com".to_string()),
-                    ("x-amz-date".to_string(), "20150830T123600Z".to_string()),
+                    (X_AMZ_DATE.to_string(), "20150830T123600Z".to_string()),
                     ("x-custom".to_string(), v.to_string()),
                 ],
                 &payload_hash,
@@ -641,8 +660,8 @@ mod tests {
                 "host".to_string(),
                 "bedrock-runtime.amazonaws.com".to_string(),
             ),
-            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
-            ("x-amz-date".to_string(), amzdate.to_string()),
+            (X_AMZ_CONTENT_SHA256.to_string(), payload_hash.clone()),
+            (X_AMZ_DATE.to_string(), amzdate.to_string()),
         ];
         let (sig, signed_headers) = sign_v4(
             secret,
@@ -691,7 +710,7 @@ mod tests {
         assert_eq!(p.datestamp, "20150830");
         assert_eq!(p.region, "us-east-1");
         assert_eq!(p.service, "bedrock");
-        assert_eq!(p.signed_headers, "host;x-amz-content-sha256;x-amz-date");
+        assert_eq!(p.signed_headers, "host;x-amz-content-sha256;x-amz-date"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(p.signature, "abc123");
     }
 
@@ -798,7 +817,7 @@ mod tests {
         // Tamper the content-sha256 header (and the payload_hash input) to a DIFFERENT body's hash.
         let tampered = sha256_hex(b"{\"evil\":true}");
         for h in headers.iter_mut() {
-            if h.0 == "x-amz-content-sha256" {
+            if h.0 == X_AMZ_CONTENT_SHA256 {
                 h.1 = tampered.clone();
             }
         }
@@ -844,7 +863,7 @@ mod tests {
         // Drop x-amz-date from the request's headers — it is in SignedHeaders, so reconstruction fails.
         let pruned: Vec<(String, String)> = headers
             .into_iter()
-            .filter(|(k, _)| k != "x-amz-date")
+            .filter(|(k, _)| k != X_AMZ_DATE)
             .collect();
         let req = inbound(&pruned, &ph, amzdate);
         assert_eq!(
@@ -861,8 +880,8 @@ mod tests {
         let now = parse_amz_date(amzdate).unwrap();
         let payload_hash = sha256_hex(b"");
         let headers = vec![
-            ("x-amz-date".to_string(), amzdate.to_string()),
-            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+            (X_AMZ_DATE.to_string(), amzdate.to_string()),
+            (X_AMZ_CONTENT_SHA256.to_string(), payload_hash.clone()),
         ];
         // Sign WITHOUT host (so the signature is self-consistent for these headers), but host-less.
         let (sig, signed_headers) = sign_v4(
@@ -934,7 +953,7 @@ mod tests {
                 "application/x-www-form-urlencoded; charset=utf-8".to_string(),
             ),
             ("host".to_string(), "iam.amazonaws.com".to_string()),
-            ("x-amz-date".to_string(), "20150830T123600Z".to_string()),
+            (X_AMZ_DATE.to_string(), "20150830T123600Z".to_string()),
         ];
         let payload_hash = sha256_hex(b"");
         let (sig, signed) = sign_v4(
@@ -949,17 +968,17 @@ mod tests {
             "20150830T123600Z",
             "20150830",
         );
-        assert_eq!(signed, "content-type;host;x-amz-date");
+        assert_eq!(signed, "content-type;host;x-amz-date"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(
             sig,
-            "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"
+            "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7" // golden wire-contract literal (kept bare on purpose)
         );
     }
 
-    // A copy of the canonical dummy secret the auth layer (`verify_bedrock_sigv4`) verifies against
-    // for an UNKNOWN AccessKeyId (must match the `DUMMY_SECRET` constant there) — used to prove the
-    // unknown-key path produces an ordinary SignatureMismatch, not a distinct variant.
-    const DUMMY_SECRET: &str = "AWS4-DUMMY-SECRET-FOR-CONSTANT-TIME-REJECT-PATH";
+    // Reference the canonical dummy secret from `crate::auth` (the single source of truth) rather
+    // than maintaining a separate copy that could drift. Used to prove the unknown-key path produces
+    // an ordinary SignatureMismatch, not a distinct variant.
+    use crate::auth::DUMMY_SECRET;
 
     #[test]
     fn test_verify_inbound_sigv4_unknown_key_dummy_secret_is_signature_mismatch() {
@@ -998,7 +1017,7 @@ mod tests {
         let p =
             parse_authorization_header(v).expect("unknown section must be skipped, not rejected");
         assert_eq!(p.access_key_id, "AKID");
-        assert_eq!(p.signed_headers, "host;x-amz-date");
+        assert_eq!(p.signed_headers, "host;x-amz-date"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(p.signature, "abc123");
         // But a MISSING mandatory section (Signature) with an unknown one present still fails.
         let missing_sig =

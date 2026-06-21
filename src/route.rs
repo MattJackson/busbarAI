@@ -28,7 +28,7 @@ fn pool_authorized(gov: &crate::governance::GovCtx, pool: &str, proto: &str) -> 
             return Some(ingress_error(
                 proto,
                 StatusCode::FORBIDDEN,
-                "permission_error",
+                crate::forward::KIND_PERMISSION,
                 "Your API key does not have permission to access this resource.",
             ));
         }
@@ -108,6 +108,11 @@ fn usage_sink(
     }
 }
 
+/// The default affinity header name used when a pool's `affinity` config does not specify a custom
+/// header. Both the `Some`-arm fallback and the `None`-arm of `affinity_header_for` must agree on
+/// this spelling; a single const prevents them from silently diverging.
+const DEFAULT_AFFINITY_HEADER: &str = "x-session-id";
+
 /// The request header that pins a session to a lane for a pool. Defaults to `x-session-id`; a
 /// pool's `affinity` config (mode `session`) may name a different header (e.g. `x-user-id`).
 fn affinity_header_for<'a>(app: &'a Arc<App>, pool: &str) -> &'a str {
@@ -115,10 +120,10 @@ fn affinity_header_for<'a>(app: &'a Arc<App>, pool: &str) -> &'a str {
         // `mode` is `AffinityMode::Session` (the only variant); honour the configured header name.
         Some(a) => match a.mode {
             crate::config::AffinityMode::Session => {
-                a.header_name.as_deref().unwrap_or("x-session-id")
+                a.header_name.as_deref().unwrap_or(DEFAULT_AFFINITY_HEADER)
             }
         },
-        None => "x-session-id",
+        None => DEFAULT_AFFINITY_HEADER,
     }
 }
 
@@ -170,7 +175,7 @@ async fn budget_check(
                 return Some(ingress_error(
                     proto,
                     status,
-                    "insufficient_quota",
+                    crate::forward::KIND_INSUFFICIENT_QUOTA,
                     "You have exceeded your current quota. Please check your plan and billing details.",
                 ));
             }
@@ -192,7 +197,7 @@ async fn budget_check(
                         return Some(ingress_error(
                             proto,
                             status,
-                            "insufficient_quota",
+                            crate::forward::KIND_INSUFFICIENT_QUOTA,
                             "You have exceeded your current quota. Please check your plan and billing details.",
                         ));
                     }
@@ -210,9 +215,10 @@ async fn budget_check(
 /// and rate-limited maps to 429 + `Retry-After`. busbar never emits 402 here — a blanket 402 was a
 /// vendor-agnostic tell, since no real provider returns 402 for these conditions. Routing through
 /// `finish_rejected` means a governance-rejected request still emits `REQUESTS_TOTAL`, the
-/// `REQUEST_DURATION_SECONDS` histogram, and the request-log webhook. Returns `None` when every guard passes and the caller should proceed to
-/// resolve+forward. Without this, the early returns from `forward_resolved`/`named`/`adhoc` made
-/// every governance-rejected request invisible to Prometheus and the webhook (Round-3 finding).
+/// `REQUEST_DURATION_SECONDS` histogram, and the request-log webhook. Returns `None` when every
+/// guard passes and the caller should proceed to resolve+forward. Without this, the early returns
+/// from `forward_resolved`/`named`/`adhoc` made every governance-rejected request invisible to
+/// Prometheus and the webhook.
 async fn governance_guard(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
@@ -222,7 +228,7 @@ async fn governance_guard(
     charged_at: u64,
 ) -> Option<Response> {
     // A governance rejection fires BEFORE the model is resolved to a configured pool, so the raw
-    // client-supplied `pool` string must be mapped to the bounded metric label (metrics.rs:24-38)
+    // client-supplied `pool` string must be mapped to the bounded metric label (metrics.rs)
     // before it reaches `finish` (which stamps it onto REQUESTS_TOTAL / the duration histogram /
     // the request-log webhook). Passing it raw was an unbounded-cardinality DoS vector.
     let label = pool_label(app, pool);
@@ -283,7 +289,7 @@ fn rate_check(
             let mut resp = ingress_error(
                 proto,
                 StatusCode::TOO_MANY_REQUESTS,
-                "rate_limit_error",
+                crate::forward::KIND_RATE_LIMIT,
                 "Rate limit exceeded. Please retry after the indicated time.",
             );
             if let Ok(hv) = axum::http::HeaderValue::from_str(&retry.to_string()) {
@@ -296,7 +302,7 @@ fn rate_check(
     None
 }
 
-/// Map a client-supplied model/name string to a BOUNDED `pool` metric label (metrics.rs:24-38).
+/// Map a client-supplied model/name string to a BOUNDED `pool` metric label (metrics.rs).
 /// Returns the string verbatim ONLY when it names a configured pool (`app.pools`) or a configured
 /// by-model lane (`app.by_model`) — i.e. a value drawn from the finite, operator-controlled label
 /// space. For anything else (an unknown model, a governance-rejected request whose model was never
@@ -312,7 +318,7 @@ fn pool_label<'a>(app: &Arc<App>, model: &'a str) -> &'a str {
     if app.pools.contains_key(model) || app.by_model.contains_key(model) {
         model
     } else {
-        "unresolved"
+        crate::forward::POOL_LABEL_UNRESOLVED
     }
 }
 
@@ -441,9 +447,9 @@ fn finish_inner(
 /// names the ingress protocol of the route that failed; `status` is the HTTP status; `kind` is a
 /// protocol-appropriate error category; `message` is the human-readable detail.
 ///
-/// Thin delegation to the CANONICAL `crate::forward::ingress_error` (Round-7 CORE made it the
-/// single source of truth for native error shaping + per-protocol headers — Bedrock
-/// `x-amzn-RequestId`/`x-amzn-errortype` via `proto::attach_bedrock_error_headers`, the generic
+/// Thin delegation to the CANONICAL `crate::forward::ingress_error` (the single
+/// source of truth for native error shaping + per-protocol headers — Bedrock
+/// `x-amzn-RequestId`/`x-amzn-errortype` via the `ProtocolWriter::attach_error_response_headers` vtable method (BedrockWriter delegates to its private helper), the generic
 /// fallback envelope, etc.). Keeping route.rs on this one function rather than a private copy means
 /// route/forward error shaping cannot drift. The route call sites (and the in-module tests) keep
 /// the short `proto`/`message` parameter names; the canonical fn names them `ingress`/`msg`.
@@ -484,18 +490,18 @@ async fn ingress_body_model(
             // observability invariant the governance rejections and the model-miss 404s enforce. A
             // raw early-return made every malformed-body request invisible to Prometheus and the
             // webhook. The model is unresolved here, so stamp the bounded `"unresolved"` sentinel as
-            // the `pool` label (metrics.rs:24-38), never a raw client string.
+            // the `pool` label (metrics.rs), never a raw client string.
             return finish_rejected(
                 app,
                 gov,
                 proto,
-                "unresolved",
+                crate::forward::POOL_LABEL_UNRESOLVED,
                 started,
                 charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
+                    crate::forward::KIND_INVALID_REQUEST,
                     "We could not parse the JSON body of your request.",
                 ),
             );
@@ -511,13 +517,13 @@ async fn ingress_body_model(
                 app,
                 gov,
                 proto,
-                "unresolved",
+                crate::forward::POOL_LABEL_UNRESOLVED,
                 started,
                 charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
+                    crate::forward::KIND_INVALID_REQUEST,
                     "Missing required parameter: 'model'.",
                 ),
             );
@@ -585,13 +591,13 @@ async fn ingress_path_model(
                 app,
                 gov,
                 proto,
-                "unresolved",
+                crate::forward::POOL_LABEL_UNRESOLVED,
                 started,
                 charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
+                    crate::forward::KIND_INVALID_REQUEST,
                     "We could not parse the JSON body of your request.",
                 ),
             );
@@ -605,14 +611,16 @@ async fn ingress_path_model(
         Some(obj) => {
             obj.insert("model".to_string(), Value::String(model.to_string()));
             obj.insert("stream".to_string(), Value::Bool(stream));
-            // Gemini-only: signal a non-`alt=sse` streaming request so the response is framed as a
-            // JSON array rather than SSE. The shim is stripped before the upstream call
-            // (`forward::strip_router_shim_keys`); cross-protocol egress drops it via the IR.
+            // Signal a non-`alt=sse` streaming request so the response is framed as a JSON array
+            // rather than SSE (only Gemini's writer carries such a key today). The marker key is
+            // resolved through the writer vtable by protocol NAME — route.rs names no protocol
+            // submodule, so "delete proto/gemini → app is gemini-free" holds. The shim is stripped
+            // before the upstream call (`forward::strip_router_shim_keys`); cross-protocol egress
+            // drops it via the IR.
             if gemini_json_array {
-                obj.insert(
-                    crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY.to_string(),
-                    Value::Bool(true),
-                );
+                if let Some(shim_key) = crate::proto::array_stream_shim_key_for(proto) {
+                    obj.insert(shim_key.to_string(), Value::Bool(true));
+                }
             }
         }
         None => {
@@ -623,13 +631,13 @@ async fn ingress_path_model(
                 app,
                 gov,
                 proto,
-                "unresolved",
+                crate::forward::POOL_LABEL_UNRESOLVED,
                 started,
                 charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
+                    crate::forward::KIND_INVALID_REQUEST,
                     "Request body must be a JSON object.",
                 ),
             );
@@ -658,13 +666,13 @@ async fn ingress_path_model(
                 app,
                 gov,
                 proto,
-                "unresolved",
+                crate::forward::POOL_LABEL_UNRESOLVED,
                 started,
                 charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
+                    crate::forward::KIND_INVALID_REQUEST,
                     "The request body could not be processed.",
                 ),
             );
@@ -773,7 +781,7 @@ async fn forward_resolved(
     // made every unknown-model miss on the universal-ingress routes (openai/cohere/responses/
     // gemini/bedrock) invisible to Prometheus and the webhook.
     // Both maps missed, so `model` is an unresolved, client-supplied string — stamp the bounded
-    // sentinel as the `pool` label (metrics.rs:24-38), never the raw model (unbounded-cardinality
+    // sentinel as the `pool` label (metrics.rs), never the raw model (unbounded-cardinality
     // DoS). `pool_label` returns `"unresolved"` here by construction.
     finish(
         app,
@@ -785,7 +793,7 @@ async fn forward_resolved(
         ingress_error(
             proto,
             StatusCode::NOT_FOUND,
-            "not_found_error",
+            crate::forward::KIND_NOT_FOUND,
             &not_found_message(model, gemini_api_version),
         ),
     )
@@ -898,13 +906,13 @@ pub(crate) async fn gemini_ingress(
                     &app,
                     &gov,
                     envelope_proto,
-                    "unresolved",
+                    crate::forward::POOL_LABEL_UNRESOLVED,
                     started,
                     charged_at,
                     ingress_error(
                         envelope_proto,
                         StatusCode::NOT_FOUND,
-                        "NOT_FOUND",
+                        crate::forward::KIND_NOT_FOUND,
                         &format!(
                 "Invalid resource path: models/{rest} is not found for API version {api_version}."
             ),
@@ -919,13 +927,13 @@ pub(crate) async fn gemini_ingress(
                 &app,
                 &gov,
                 envelope_proto,
-                "unresolved",
+                crate::forward::POOL_LABEL_UNRESOLVED,
                 started,
                 charged_at,
                 ingress_error(
                     envelope_proto,
                     StatusCode::NOT_FOUND,
-                    "not_found_error",
+                    crate::forward::KIND_NOT_FOUND,
                     "the requested resource was not found",
                 ),
             );
@@ -963,13 +971,13 @@ pub(crate) async fn gemini_ingress(
                     &app,
                     &gov,
                     envelope_proto,
-                    "unresolved",
+                    crate::forward::POOL_LABEL_UNRESOLVED,
                     started,
                     charged_at,
                     ingress_error(
                         envelope_proto,
                         StatusCode::NOT_FOUND,
-                        "NOT_FOUND",
+                        crate::forward::KIND_NOT_FOUND,
                         &format!(
                             "models/{model} is not found for API version {api_version}, \
                              or is not supported for {other}."
@@ -981,13 +989,13 @@ pub(crate) async fn gemini_ingress(
                 &app,
                 &gov,
                 envelope_proto,
-                "unresolved",
+                crate::forward::POOL_LABEL_UNRESOLVED,
                 started,
                 charged_at,
                 ingress_error(
                     envelope_proto,
                     StatusCode::NOT_FOUND,
-                    "not_found_error",
+                    crate::forward::KIND_NOT_FOUND,
                     "the requested resource was not found",
                 ),
             );
@@ -1155,7 +1163,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-// POST /<name>/v1/messages   — name resolves to a pool (round-robin) or a single model
+// POST /<name>/v1/messages   — name resolves to a pool (weighted) or a single model
 #[tracing::instrument(name = "named", skip_all, fields(pool = %name))]
 pub(crate) async fn named(
     State(app): State<Arc<App>>,
@@ -1198,12 +1206,16 @@ pub(crate) async fn named(
         return finish(&app, &gov, "anthropic", &name, started, charged_at, resp);
     }
     if let Some(&i) = app.by_model.get(&name) {
-        // Use forward for model-based routing (no pool name context needed)
-        let resp = crate::forward::forward(
+        // Model-based routing: anthropic ingress, lane-default breaker cell (empty pool name → the
+        // cell shared by all direct/ad-hoc routes, surfaced by /stats and /healthz), no affinity.
+        let resp = crate::forward::forward_with_pool(
             app.clone(),
             vec![WeightedLane { idx: i, weight: 1 }],
             body,
             caller_token,
+            "",
+            None,
+            "anthropic",
             usage_sink(&app, &gov, charged_at),
         )
         .await;
@@ -1214,7 +1226,7 @@ pub(crate) async fn named(
     // REQUEST_DURATION_SECONDS and fires the request-log webhook — the same observability invariant
     // already enforced for governance rejections (a raw early-return made the miss invisible).
     // Both maps missed, so `name` is an unresolved, client-supplied URL segment — stamp the bounded
-    // sentinel as the `pool` label (metrics.rs:24-38), never the raw segment (unbounded-cardinality
+    // sentinel as the `pool` label (metrics.rs), never the raw segment (unbounded-cardinality
     // DoS). `pool_label` returns `"unresolved"` here by construction.
     finish(
         &app,
@@ -1226,7 +1238,7 @@ pub(crate) async fn named(
         ingress_error(
             "anthropic",
             StatusCode::NOT_FOUND,
-            "not_found_error",
+            crate::forward::KIND_NOT_FOUND,
             // Anthropic ingress: canonical (non-gemini) model-not-found copy.
             &not_found_message(&name, None),
         ),
@@ -1256,12 +1268,16 @@ pub(crate) async fn adhoc(
 
     match app.by_model.get(&model) {
         Some(&i) if app.lanes[i].provider == provider => {
-            // Single lane with weight=1 (default for ad-hoc routing) - use forward, not forward_with_pool
-            let resp = crate::forward::forward(
+            // Single lane with weight=1 (default for ad-hoc routing): anthropic ingress, lane-default
+            // breaker cell (empty pool name), no affinity.
+            let resp = crate::forward::forward_with_pool(
                 app.clone(),
                 vec![WeightedLane { idx: i, weight: 1 }],
                 body,
                 caller_token,
+                "",
+                None,
+                "anthropic",
                 usage_sink(&app, &gov, charged_at),
             )
             .await;
@@ -1291,14 +1307,14 @@ pub(crate) async fn adhoc(
                 ingress_error(
                     "anthropic",
                     StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
+                    crate::forward::KIND_INVALID_REQUEST,
                     // Anthropic ingress: canonical (non-gemini) model-not-found copy.
                     &not_found_message(&model, None),
                 ),
             )
         }
         // Model miss: `model` is an unresolved, client-supplied string — stamp the bounded sentinel
-        // as the `pool` label (metrics.rs:24-38). `pool_label` returns `"unresolved"` here.
+        // as the `pool` label (metrics.rs). `pool_label` returns `"unresolved"` here.
         None => finish(
             &app,
             &gov,
@@ -1309,7 +1325,7 @@ pub(crate) async fn adhoc(
             ingress_error(
                 "anthropic",
                 StatusCode::NOT_FOUND,
-                "not_found_error",
+                crate::forward::KIND_NOT_FOUND,
                 // Anthropic ingress: canonical (non-gemini) model-not-found copy.
                 &not_found_message(&model, None),
             ),
@@ -2178,7 +2194,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "gemini error envelope is JSON; got {ct}"
         );
         handle.abort();
@@ -2230,12 +2246,12 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "non-stream bedrock returns JSON; got {ct}"
         );
         // HIGH/test-coverage: a real AWS Bedrock Converse (non-stream) result ALWAYS exposes a
         // request id via `*Output::request_id()`, which the AWS SDK reads from the `x-amzn-RequestId`
-        // response header. busbar synthesizes one on the success path (maybe_attach_bedrock_amzn_id);
+        // response header. busbar synthesizes one on the success path (maybe_attach_response_request_id);
         // an absent or malformed header makes the SDK's `request_id()` return None — an impossibility
         // for a native endpoint and a deterministic proxy tell. Assert the header is present AND
         // UUID-v4 shaped (8-4-4-4-12 lowercase hex), mirroring the streaming-case assertion in
@@ -2541,7 +2557,7 @@ mod tests {
         let upstream = axum::Router::new().fallback(axum::routing::any(|| async {
             axum::response::Response::builder()
                 .status(StatusCode::OK)
-                .header("content-type", "application/json")
+                .header("content-type", crate::forward::APPLICATION_JSON)
                 .header("x-amzn-requestid", UPSTREAM_REQ_ID)
                 .body(axum::body::Body::from(
                     json!({
@@ -2604,7 +2620,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "same-protocol non-stream bedrock preserves the upstream JSON CT; got {ct}"
         );
 
@@ -2714,8 +2730,8 @@ mod tests {
             !frames.is_empty(),
             "at least the first real frame decodes before the drop"
         );
-        // A trailing BINARY exception frame is present (drain_frames yields an empty event type for
-        // it; re-scan the raw bytes to confirm the modeled-exception headers/name).
+        // A trailing BINARY exception frame is present (drain_frames normalizes its `:exception-type`
+        // to "internalServerException"); re-scan the raw bytes to confirm the modeled-exception headers/name.
         let raw_str = String::from_utf8_lossy(&body);
         assert!(
             raw_str.contains(":exception-type"),
@@ -2730,7 +2746,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// HIGH/test-coverage (forward.rs:496-526): a TRUE mid-stream transport failure on a
+    /// HIGH/test-coverage (forward.rs): a TRUE mid-stream transport failure on a
     /// bedrock-ingress cross-protocol stream must terminate the body with a CRC-valid BINARY
     /// `:message-type: exception` frame appended AFTER the real frames — never SSE `event:`/`data:`
     /// ASCII (which yields an undecodable prelude/CRC for the AWS SDK). `SseTransportError` drops the
@@ -2778,8 +2794,9 @@ mod tests {
             buf.len()
         );
         assert!(!frames.is_empty(), "at least the first real frame decodes");
-        // The trailing exception frame carries no `:event-type` (drain_frames yields an empty event
-        // type for it); re-scan the raw bytes to confirm an exception frame is present.
+        // The trailing exception frame carries `:exception-type` instead of `:event-type`
+        // (drain_frames normalizes it to the lowercased "internalServerException"); re-scan the raw
+        // bytes to confirm an exception frame is present.
         let raw = body.to_vec();
         let raw_str = String::from_utf8_lossy(&raw);
         assert!(
@@ -2794,7 +2811,7 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// HIGH/test-coverage twin (forward.rs:186): the SSE-ingress (openai) mid-stream transport-failure
+    /// HIGH/test-coverage twin (forward.rs): the SSE-ingress (openai) mid-stream transport-failure
     /// path must append a BARE `data:` error frame (NO `event:` line — openai native streams never
     /// emit one mid-stream) whose `data:` is the native OpenAI error envelope.
     #[tokio::test]
@@ -3036,7 +3053,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("text/event-stream"),
+            ct.starts_with("text/event-stream"), // golden wire-contract literal (kept bare on purpose)
             "gemini streaming ingress WITH ?alt=sse is SSE-framed; got {ct}"
         );
         // MEDIUM/test-coverage: text/event-stream alone does not prove the SSE FRAMES carry the
@@ -3052,7 +3069,7 @@ mod tests {
             .lines()
             .filter_map(|line| line.strip_prefix("data:"))
             .map(str::trim)
-            .filter(|data| !data.is_empty() && *data != "[DONE]")
+            .filter(|data| !data.is_empty() && *data != crate::proto::SSE_DONE_SENTINEL)
             .filter_map(|data| serde_json::from_str(data).ok())
             .collect();
         assert!(
@@ -3117,7 +3134,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("text/event-stream"),
+            ct.starts_with("text/event-stream"), // golden wire-contract literal (kept bare on purpose)
             "alt=sse mid-stream error stays SSE-framed; got {ct}"
         );
         let body = resp.text().await.unwrap();
@@ -3131,7 +3148,7 @@ mod tests {
             .lines()
             .filter_map(|line| line.strip_prefix("data:"))
             .map(str::trim)
-            .filter(|data| !data.is_empty() && *data != "[DONE]")
+            .filter(|data| !data.is_empty() && *data != crate::proto::SSE_DONE_SENTINEL)
             .filter_map(|data| serde_json::from_str(data).ok())
             .collect();
         assert!(
@@ -3162,7 +3179,7 @@ mod tests {
 
     /// Round-13 MEDIUM/security: an UNRESOLVED model on a body-model ingress (openai) must NOT stamp
     /// the raw client-supplied model string as the Prometheus `pool` label — the bounded-cardinality
-    /// contract (metrics.rs:24-38) requires the fixed sentinel `"unresolved"`. A regression that
+    /// contract (metrics.rs) requires the fixed sentinel `"unresolved"`. A regression that
     /// passed the raw model through `finish` would let a single credential mint unbounded time
     /// series (a memory-exhaustion DoS) and leak the attacker string into `/metrics`. Drives the
     /// 404 (both-maps-miss) path through the real router and scrapes the registry.
@@ -3256,7 +3273,7 @@ mod tests {
             .build();
         let (addr, handle) = serve(app).await;
 
-        let before = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+        let before = requests_total_for(&crate::metrics::render(), "unresolved", "client_error"); // golden wire-contract literal (kept bare on purpose)
 
         let resp = reqwest::Client::new()
             .post(format!("http://{addr}/v1/chat/completions"))
@@ -3267,7 +3284,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 400, "malformed body is a 400");
 
-        let after = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+        let after = requests_total_for(&crate::metrics::render(), "unresolved", "client_error"); // golden wire-contract literal (kept bare on purpose)
         assert!(
             after > before,
             "a parse-error pre-routing failure must increment REQUESTS_TOTAL \
@@ -3295,7 +3312,7 @@ mod tests {
             .build();
         let (addr, handle) = serve(app).await;
 
-        let before = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+        let before = requests_total_for(&crate::metrics::render(), "unresolved", "client_error"); // golden wire-contract literal (kept bare on purpose)
 
         let resp = reqwest::Client::new()
             .post(format!("http://{addr}/v1/chat/completions"))
@@ -3307,7 +3324,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 400, "missing model is a 400");
 
-        let after = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+        let after = requests_total_for(&crate::metrics::render(), "unresolved", "client_error"); // golden wire-contract literal (kept bare on purpose)
         assert!(
             after > before,
             "a missing-model pre-routing failure must increment REQUESTS_TOTAL \
@@ -3336,7 +3353,7 @@ mod tests {
             .build();
         let (addr, handle) = serve(app).await;
 
-        let before = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+        let before = requests_total_for(&crate::metrics::render(), "unresolved", "client_error"); // golden wire-contract literal (kept bare on purpose)
 
         // Valid JSON, but a top-level ARRAY (not an object) — `as_object_mut` returns `None`.
         let resp = reqwest::Client::new()
@@ -3348,7 +3365,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 400, "non-object body is a 400");
 
-        let after = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+        let after = requests_total_for(&crate::metrics::render(), "unresolved", "client_error"); // golden wire-contract literal (kept bare on purpose)
         assert!(
             after > before,
             "a non-object-body pre-routing failure must increment REQUESTS_TOTAL \
@@ -3378,7 +3395,7 @@ mod tests {
             .build();
         let (addr, handle) = serve(app).await;
 
-        let before = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+        let before = requests_total_for(&crate::metrics::render(), "unresolved", "client_error"); // golden wire-contract literal (kept bare on purpose)
 
         // `:countTokens` is a genuine Gemini action suffix (so the path stays gemini-classified) but
         // is NOT one of the two proxied generate actions → unsupported-action 404 in gemini_ingress.
@@ -3395,7 +3412,7 @@ mod tests {
             "unsupported gemini action is a 404"
         );
 
-        let after = requests_total_for(&crate::metrics::render(), "unresolved", "client_error");
+        let after = requests_total_for(&crate::metrics::render(), "unresolved", "client_error"); // golden wire-contract literal (kept bare on purpose)
         assert!(
             after > before,
             "an unsupported-action pre-routing failure must increment REQUESTS_TOTAL \
@@ -3423,8 +3440,8 @@ mod tests {
         // Configured by-model lane → verbatim.
         assert_eq!(pool_label(&app, "mymodel"), "mymodel");
         // Unknown / attacker-controlled string → bounded sentinel.
-        assert_eq!(pool_label(&app, "anything-else"), "unresolved");
-        assert_eq!(pool_label(&app, ""), "unresolved");
+        assert_eq!(pool_label(&app, "anything-else"), "unresolved"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(pool_label(&app, ""), "unresolved"); // golden wire-contract literal (kept bare on purpose)
     }
 
     /// HIGH/conformance: a native gemini `:streamGenerateContent` request WITHOUT `?alt=sse` must
@@ -3473,7 +3490,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "gemini streaming ingress WITHOUT ?alt=sse is JSON-array framed; got {ct}"
         );
         let body = resp.text().await.unwrap();
@@ -3538,7 +3555,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "JSON-array framed; got {ct}"
         );
         let body = resp.text().await.unwrap();
@@ -3570,7 +3587,7 @@ mod tests {
     /// key (the bug: the gemini reader swept it into IR `extra` and the egress writer re-emitted the
     /// router fingerprint onto the foreign backend).
     ///
-    /// R9 HIGH (forward.rs:1491) correction: the egress `stream` field is NOT a router fingerprint
+    /// R9 HIGH (forward.rs) correction: the egress `stream` field is NOT a router fingerprint
     /// for a BODY-MODEL backend — the OpenAI writer AUTHORS `"stream": ir.stream` and the backend
     /// reads it to decide whether to stream. The client called `:streamGenerateContent`, so it
     /// genuinely wants streaming; `stream: true` MUST reach the OpenAI backend, otherwise the backend
@@ -3619,7 +3636,7 @@ mod tests {
             upstream_v.get("__busbar_gemini_json_array").is_none(),
             "router shim key must not leak to a foreign backend; got {upstream_v}"
         );
-        // R9 HIGH (forward.rs:1491): the writer-authored `stream` MUST reach a body-model (OpenAI)
+        // R9 HIGH (forward.rs): the writer-authored `stream` MUST reach a body-model (OpenAI)
         // backend so it actually streams — the client called `:streamGenerateContent`. Stripping it
         // here was the bug that made the backend answer non-streaming.
         assert_eq!(
@@ -3749,7 +3766,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|v| v.as_str()),
-            Some("authentication_error"),
+            Some("authentication_error"), // golden wire-contract literal (kept bare on purpose)
             "401 maps to authentication_error in the ingress envelope; got {body}"
         );
         handle.abort();
@@ -3782,7 +3799,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "gemini error envelope is JSON; got {ct}"
         );
         handle.abort();
@@ -3865,7 +3882,7 @@ mod tests {
                 .get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("not_found_error"),
+            Some("not_found_error"), // golden wire-contract literal (kept bare on purpose)
             "colon-less /v1/models/{{id}} returns the canonical OpenAI not_found_error envelope, \
              not a Gemini NOT_FOUND; got {body2}"
         );
@@ -3937,7 +3954,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "OpenAI not-found envelope is JSON; got {ct}"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -3945,7 +3962,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("not_found_error"),
+            Some("not_found_error"), // golden wire-contract literal (kept bare on purpose)
             "colon-less /v1/models/{{id}} returns the OpenAI not_found_error envelope; got {body}"
         );
         // A Gemini NOT_FOUND would carry a `status: NOT_FOUND` field; the OpenAI envelope does not.
@@ -3976,7 +3993,7 @@ mod tests {
                 .get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("not_found_error"),
+            Some("not_found_error"), // golden wire-contract literal (kept bare on purpose)
             "colon-bearing OpenAI fine-tune id (no Gemini action) ⇒ OpenAI not_found_error; got {body_ft}"
         );
 
@@ -4133,7 +4150,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("not_found_error"),
+            Some("not_found_error"), // golden wire-contract literal (kept bare on purpose)
             "404 carries the canonical OpenAI not_found_error type; got {body}"
         );
         handle.abort();
@@ -4400,7 +4417,7 @@ mod tests {
         let resp = ingress_error(
             "bedrock",
             StatusCode::NOT_FOUND,
-            "not_found_error",
+            crate::forward::KIND_NOT_FOUND,
             "The model 'x' does not exist or you do not have access to it.",
         );
         let req_id = resp
@@ -4440,22 +4457,22 @@ mod tests {
     fn test_bedrock_errortype_header_matches_body_and_others_omit() {
         for (kind, status, expected) in [
             (
-                "invalid_request_error",
+                crate::forward::KIND_INVALID_REQUEST,
                 StatusCode::BAD_REQUEST,
                 "ValidationException",
             ),
             (
-                "rate_limit_error",
+                crate::forward::KIND_RATE_LIMIT,
                 StatusCode::TOO_MANY_REQUESTS,
                 "ThrottlingException",
             ),
             (
-                "permission_error",
+                crate::forward::KIND_PERMISSION,
                 StatusCode::FORBIDDEN,
                 "AccessDeniedException",
             ),
             (
-                "insufficient_quota",
+                crate::forward::KIND_INSUFFICIENT_QUOTA,
                 StatusCode::BAD_REQUEST,
                 "ServiceQuotaExceededException",
             ),
@@ -4468,13 +4485,18 @@ mod tests {
                 .unwrap_or("");
             assert_eq!(hdr, expected, "x-amzn-errortype for kind {kind}");
             assert_eq!(
-                crate::proto::error_kind_to_bedrock_type(kind),
+                crate::proto::bedrock::error_kind_to_bedrock_type(kind),
                 expected,
                 "header mapping for {kind}"
             );
         }
         // An OpenAI-ingress error must not carry the Bedrock-only headers.
-        let openai = ingress_error("openai", StatusCode::NOT_FOUND, "not_found_error", "m");
+        let openai = ingress_error(
+            "openai",
+            StatusCode::NOT_FOUND,
+            crate::forward::KIND_NOT_FOUND,
+            "m",
+        );
         assert!(
             openai.headers().get("x-amzn-requestid").is_none(),
             "non-bedrock protocol does not emit x-amzn-RequestId"
@@ -4509,7 +4531,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "cohere error is JSON; got {ct}"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -4563,7 +4585,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("invalid_request_error"),
+            Some("invalid_request_error"), // golden wire-contract literal (kept bare on purpose)
             "missing-model 400 carries the OpenAI invalid_request_error type; got {body}"
         );
         handle.abort();
@@ -4593,7 +4615,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("invalid_request_error"),
+            Some("invalid_request_error"), // golden wire-contract literal (kept bare on purpose)
             "openai empty-model 400 carries invalid_request_error; got {body}"
         );
         handle.abort();
@@ -4646,7 +4668,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("invalid_request_error"),
+            Some("invalid_request_error"), // golden wire-contract literal (kept bare on purpose)
             "responses empty-model 400 carries invalid_request_error; got {body}"
         );
         handle.abort();
@@ -4684,7 +4706,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("invalid_request_error"),
+            Some("invalid_request_error"), // golden wire-contract literal (kept bare on purpose)
             "openai numeric-model 400 carries invalid_request_error; got {body}"
         );
         handle.abort();
@@ -4747,7 +4769,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("invalid_request_error"),
+            Some("invalid_request_error"), // golden wire-contract literal (kept bare on purpose)
             "responses non-string-model 400 carries invalid_request_error; got {body}"
         );
         handle.abort();
@@ -4780,7 +4802,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "gemini error is JSON; got {ct}"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -4927,7 +4949,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("not_found_error"),
+            Some("not_found_error"), // golden wire-contract literal (kept bare on purpose)
             "responses 404 carries not_found_error type; got {body}"
         );
         handle.abort();
@@ -4953,7 +4975,7 @@ mod tests {
                 }
             }
             if let Some(d) = data {
-                if d == "[DONE]" {
+                if d == crate::proto::SSE_DONE_SENTINEL {
                     continue;
                 }
                 out.push((event_name, d));
@@ -5029,7 +5051,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("text/event-stream"),
+            ct.starts_with("text/event-stream"), // golden wire-contract literal (kept bare on purpose)
             "openai streaming ingress is SSE; got {ct}"
         );
         let text = resp.text().await.unwrap();
@@ -5043,7 +5065,7 @@ mod tests {
 
         // The stream must terminate with the native `[DONE]` sentinel.
         assert!(
-            text.contains("[DONE]"),
+            text.contains("[DONE]"), // golden wire-contract literal (kept bare on purpose)
             "openai stream must terminate with the native [DONE] sentinel; got:\n{text}"
         );
 
@@ -5117,7 +5139,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("text/event-stream"),
+            ct.starts_with("text/event-stream"), // golden wire-contract literal (kept bare on purpose)
             "cohere streaming ingress is SSE; got {ct}"
         );
         let text = resp.text().await.unwrap();
@@ -5205,7 +5227,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("text/event-stream"),
+            ct.starts_with("text/event-stream"), // golden wire-contract literal (kept bare on purpose)
             "responses streaming ingress is SSE; got {ct}"
         );
         let text = resp.text().await.unwrap();
@@ -5628,7 +5650,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "cohere 403 envelope is JSON; got {ct}"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -5661,7 +5683,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "responses 403 envelope is JSON; got {ct}"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -5669,7 +5691,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("permission_error"),
+            Some("permission_error"), // golden wire-contract literal (kept bare on purpose)
             "responses 403 carries the permission_error type; got {body}"
         );
         handle.abort();
@@ -5704,7 +5726,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "openai 403 envelope is JSON; got {ct}"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -5712,7 +5734,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("permission_error"),
+            Some("permission_error"), // golden wire-contract literal (kept bare on purpose)
             "openai 403 carries the permission_error type; got {body}"
         );
         handle.abort();
@@ -5740,7 +5762,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "gemini 403 envelope is JSON; got {ct}"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -5784,7 +5806,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "bedrock 403 envelope is JSON; got {ct}"
         );
         assert_eq!(
@@ -5902,7 +5924,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("permission_error"),
+            Some("permission_error"), // golden wire-contract literal (kept bare on purpose)
             "fallback-pool ACL 403 carries the SAME permission_error envelope as the initial check; got {body}"
         );
         handle.abort();
@@ -6071,7 +6093,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "adhoc 400 envelope is JSON; got {ct}"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -6084,7 +6106,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("invalid_request_error"),
+            Some("invalid_request_error"), // golden wire-contract literal (kept bare on purpose)
             "adhoc provider-mismatch 400 carries invalid_request_error; got {body}"
         );
         handle.abort();
@@ -6151,7 +6173,7 @@ mod tests {
             body.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("permission_error"),
+            Some("permission_error"), // golden wire-contract literal (kept bare on purpose)
             "adhoc governance 403 carries permission_error; got {body}"
         );
         handle.abort();
@@ -6289,7 +6311,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("text/event-stream"),
+            ct.starts_with("text/event-stream"), // golden wire-contract literal (kept bare on purpose)
             "stable v1 gemini streaming WITH ?alt=sse is SSE-framed; got {ct}"
         );
         let body = resp.text().await.unwrap();
@@ -6297,7 +6319,7 @@ mod tests {
             .lines()
             .filter_map(|line| line.strip_prefix("data:"))
             .map(str::trim)
-            .filter(|data| !data.is_empty() && *data != "[DONE]")
+            .filter(|data| !data.is_empty() && *data != crate::proto::SSE_DONE_SENTINEL)
             .filter_map(|data| serde_json::from_str(data).ok())
             .collect();
         assert!(
@@ -6364,7 +6386,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         assert!(
-            ct.starts_with("application/json"),
+            ct.starts_with("application/json"), // golden wire-contract literal (kept bare on purpose)
             "stable v1 gemini streaming WITHOUT ?alt=sse is JSON-array framed; got {ct}"
         );
         let body = resp.text().await.unwrap();
@@ -6571,16 +6593,16 @@ mod tests {
     // ---- MEDIUM/test-coverage: the `named` handler's `by_model` fallback branch ----
     //
     // `named` (`POST /<name>/v1/messages`) resolves `name` against `app.pools` first, then falls
-    // back to `app.by_model` (the line-853 arm). The pool path is covered by
+    // back to `app.by_model` (the by_model arm). The pool path is covered by
     // `test_adhoc_success_round_trip_via_router` and the governance pool-ACL set; the by_model
     // fallback — where `name` is a configured single-model lane with NO pool entry, routed via
-    // `crate::forward::forward` — had no test. A refactor that dropped the fallback, or fed the
+    // `crate::forward::forward_with_pool` — had no test. A refactor that dropped the fallback, or fed the
     // wrong model string, would go undetected. This wires ONLY a by_model lane (no `.pool(...)`),
     // POSTs an Anthropic body to `/<model>/v1/messages`, and asserts the 2xx plus that the upstream
     // received the (translated) forwarded request.
 
     /// `named` by_model fallback: a single-model lane (no pool) reached via `/<model>/v1/messages`
-    /// round-trips through `forward` to its backend and returns 2xx; the upstream sees the request.
+    /// round-trips through `forward_with_pool` to its backend and returns 2xx; the upstream sees the request.
     #[tokio::test]
     async fn test_named_by_model_fallback_round_trip_via_router() {
         crate::metrics::init();
@@ -6592,7 +6614,7 @@ mod tests {
         let server = MockServer::new(state.clone()).await;
 
         // Lane registered in by_model only — no `.pool(...)`, so the `named` pool lookup misses and
-        // the by_model fallback arm (line 853) handles the request.
+        // the by_model fallback arm handles the request.
         let app = TestApp::new()
             .lane(
                 LaneSpec::new(
@@ -6635,7 +6657,7 @@ mod tests {
     //      `by_model` arm, which calls `forward_with_pool` directly with the ingress protocol so a
     //      cross-protocol backend is translated both ways; and
     //   2. the Anthropic `/<model>/v1/messages` (`named`) / `/<provider>/<model>/v1/messages`
-    //      (`adhoc`) routes → `crate::forward::forward`, which passes `""` (the lane-default breaker
+    //      (`adhoc`) routes → `crate::forward::forward_with_pool`, which passes `""` (the lane-default breaker
     //      CELL shared by every direct/single-model route — forward.rs design intent).
     //
     // forward.rs records every breaker outcome against the CELL keyed by the `pool_name` argument
@@ -6663,7 +6685,7 @@ mod tests {
     ///
     /// NOTE: the model-keyed cell is NOT a usable counter-assertion — reading `*_in(model, 0)` LAZILY
     /// CREATES that cell, and a freshly-minted pool cell INHERITS the lane's (i.e. the `""` cell's)
-    /// current cooldown/state (store.rs `cell`, lines ~701-725). Under the fix it would therefore
+    /// current cooldown/state (store.rs `cell`). Under the fix it would therefore
     /// inherit the non-zero `""` cooldown and read non-zero too — indistinguishable. The `""` cell
     /// cooldown alone cleanly separates fixed from broken.
     #[tokio::test]

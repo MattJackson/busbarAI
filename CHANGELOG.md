@@ -7,20 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-06-20
+
+First stable release. 1.0.0 promotes `1.0.0-rc.7` unchanged — the architectural unification (all
+traffic through the superset IR with a verbatim serialize short-circuit), IR-metered billing with
+provider cache-token correctness, and the config/surface cleanup this release freezes. The HTTP API,
+configuration schema, and the six wire-protocol contracts are now stable under Semantic Versioning: no
+breaking change without a major-version bump.
+
+See [1.0.0-rc.7] below for the full change set and the only migration steps needed to move onto 1.0
+(the rc.6 → rc.7 notes).
+
 ## [1.0.0-rc.7] — 2026-06-20
 
 The 1.0 candidate. Two themes: an architectural unification so every request takes one code path
 (wire → IR → wire) with billing metered from that IR, and the config/surface cleanup that freezes a
 clean 1.0 contract. Same-protocol traffic stays byte-exact and just as fast via a verbatim serialize
 short-circuit, five of six protocols now forward same-protocol requests byte-exact (the prior path
-always re-serialized), and a provider cache-token billing gap is closed. Audited across a four-lens
-Sonnet pass and two deep Opus passes (zero HIGH/CRITICAL). The request path, wire protocols, and
+always re-serialized), and a provider cache-token billing gap is closed. Audited for security and
+correctness with zero HIGH/CRITICAL findings. The request path, wire protocols, and
 breaker FSM are unchanged.
 
 ### Added
 
 - **All operational limits are now operator config (no hardcoded caps).** A new `limits:` block
-  surfaces the 17 previously-hardcoded limits — upstream request timeout, request body max, idle
+  surfaces the eight previously-hardcoded limits — upstream request timeout, request body max, idle
   connections per host, hard-down cooldown, upstream error-body cap, TLS handshake timeout, honored
   `Retry-After` ceiling, default max_tokens — plus a new `max_inbound_concurrent` (0 = unlimited; >0
   installs an outermost concurrency-limit layer). Extended `observability`, `metrics`, `governance`,
@@ -30,7 +41,7 @@ breaker FSM are unchanged.
   (with a `raw` escape hatch for byte-exact Anthropic re-emit) carries Anthropic and Gemini citations
   through the IR, including a streamed `citations_delta`, so citations survive a cross-protocol hop
   instead of being silently dropped. Anthropic same-protocol output is unchanged (raw verbatim).
-- **`observability.emit_server_timing`** (default `true`): set `false` to suppress the
+- **`observability.emit_server_timing`** (default `false`): set `true` to emit the
   `Server-Timing: busbar` response header.
 
 ### Changed
@@ -97,8 +108,9 @@ breaker FSM are unchanged.
 - Prefer the renamed breaker/failover keys; the old names still work but don't set both spellings.
 - Update any script that parses the admin API error shape to `{"error":{"message","type"}}`.
 - Cache-hit requests on Anthropic/Bedrock backends will accrue more token spend (now counted).
-- No change for a default config: enum/casing acceptance, `default_max_tokens` precedence, and the
-  `Server-Timing` header (still on) are unchanged.
+- No change for a default config: enum/casing acceptance and `default_max_tokens` precedence are
+  unchanged. The `Server-Timing` response header is opt-in via `observability.emit_server_timing`
+  (default off).
 
 ## [1.0.0-rc.6] — 2026-06-19
 
@@ -199,7 +211,7 @@ and correctness audit and an internal provider-containment refactor.
     keeping the default binary free of the Rhai dependency.
 
   Both transports honor a per-pool `timeout_ms`; a timeout or transport error falls back
-  to the pool's `on_error` setting (`abstain | weighted | reject | first`) and never
+  to the pool's `on_error` setting (`weighted | reject | first`) and never
   blocks or fails the client request.
 
   **Zero-cost default path.** A pool with `route: weighted` — including any pool that
@@ -268,9 +280,9 @@ and correctness audit and an internal provider-containment refactor.
   Anthropic upstream hop.
 - **SSRF guard covers the Oracle Cloud metadata address.** The trusted-upstream net guard
   now blocks `192.0.0.192` alongside the other link-local / cloud-metadata ranges.
-- Additional cross-cutting correctness fixes from a deep audit pass (streaming-translation
+- Additional cross-cutting correctness fixes (streaming-translation
   vtable flag propagation, request-id header constant) and the multi-round security and
-  correctness review (rounds R3–R12).
+  correctness review.
 
 ### Changed
 
@@ -281,13 +293,12 @@ and correctness audit and an internal provider-containment refactor.
 
 ## [1.0.0-rc.4] — 2026-06-16
 
-A continuation of the rc.3 hardening campaign: nine further rounds (R19→R27) of
-multi-round, dual-model (Sonnet + Opus) security/correctness auditing over the
-rc.3 tree, with adversarial triage and class-level fixes. No API changes vs rc.3.
+A continuation of the rc.3 hardening campaign: continued independent
+security/correctness auditing over the rc.3 tree, with adversarial triage and
+class-level fixes. No API changes vs rc.3.
 
 The severity gate — **0 critical / 0 high / 0 medium-security / 0 medium-correctness**
-— is met and has held flat for the final four rounds; remaining findings are
-documented low/medium-completeness items at the asymptote of the audit loop. The
+— is met; the remaining items are documented low/medium-completeness notes. The
 test suite grew from 267 (rc.2) to **1334** passing; `fmt`, `build`, `clippy
 -D warnings`, and `test` all green.
 
@@ -642,10 +653,9 @@ source for correctness, robustness, and security.
   latent double-count in `record_success`).
 
 ### Notes
-- This changelog was previously stale; entries before 0.14.0 are not yet
-  backfilled (tracked for the 1.0 documentation pass).
+- This changelog begins at 0.14.0; earlier history is not recorded here.
 
-## [Unreleased]
+## [Early development]
 
 ### Added
 - Project scaffolding for open-source release: `README`, `CONTRIBUTING`,

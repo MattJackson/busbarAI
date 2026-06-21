@@ -32,5 +32,5 @@ LLM providers. Issues of particular interest include:
 
 ## Supported versions
 
-Busbar is at 1.0.0-rc.2 (release candidate). Security fixes are applied to the
-latest `main` and the most recent tagged release. Pin to a tag for production use.
+Busbar is at 1.0.0 (stable). Security fixes are applied to the latest `main` and
+the most recent tagged release. Pin to a tag for production use.

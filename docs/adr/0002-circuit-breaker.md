@@ -62,7 +62,7 @@ Outcome rules (applied in `src/forward.rs`, written via `StateStore`):
   config is pointless if config-shared, and in passthrough mode it is the
   caller's key). Billing → fail over (a sibling may have funds).
 - **`ContextLength`** — the lane is healthy; record nothing. Exclude this request's
-  candidates whose `context_max` is `<= the failed lane's, then fail over to a
+  candidates whose `context_max` is <= the failed lane's, then fail over to a
   larger-context member.
 
 Recovery is a **single-flight half-open probe**: when an Open cell's cooldown

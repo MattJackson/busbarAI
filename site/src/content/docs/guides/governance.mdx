@@ -61,7 +61,7 @@ control. Each capability below has two views — read **What it does** for the w
     ```bash
     curl -s http://localhost:8080/admin/keys/<id>/usage \
       -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN"
-    # → { "spend_cents": ..., "tokens": ..., "requests": ... }
+    # → { "id": "...", "spend_cents": ..., "tokens": ..., "requests": ... }
     ```
   </TabItem>
 </Tabs>

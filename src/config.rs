@@ -241,8 +241,12 @@ impl fmt::Debug for ProviderCfg {
     }
 }
 
+/// Default provider protocol when not specified. Wire-contract: providers.yaml catalog entries
+/// and un-overridden deployments use this protocol for the dispatch registry lookup.
+const DEFAULT_PROTOCOL: &str = "anthropic";
+
 fn default_protocol() -> String {
-    "anthropic".to_string()
+    DEFAULT_PROTOCOL.to_string()
 }
 
 /// Per-provider auth-style override. Closed set: the request is signed with the protocol's native
@@ -274,6 +278,7 @@ pub(crate) enum HealthMode {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct HealthCfg {
     /// Probing strategy (see `HealthMode`). Defaults to `none` — a `health:` block with only an
     /// interval does nothing until a mode is chosen.
@@ -288,6 +293,7 @@ pub(crate) struct HealthCfg {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ModelCfg {
     #[serde(default = "neg1")]
     pub(crate) max_requests: i64,
@@ -367,15 +373,29 @@ impl<'de> Deserialize<'de> for PoolCfg {
         // hard error (matching serde's enum behavior), so a typo in `route:` still fails loudly.
         let (route, shorthand_name): (RouteKind, Option<&'static str>) = match raw.route.as_deref()
         {
-            None | Some("weighted") => (RouteKind::Weighted, None),
+            None | Some(crate::routing::native::POLICY_NAME_WEIGHTED) => {
+                (RouteKind::Weighted, None)
+            }
             Some("webhook") => (RouteKind::Webhook, None),
             Some("script") => (RouteKind::Script, None),
             Some("native") => (RouteKind::Native, None),
             // Native shorthands: a bare policy name in `route:` ⇒ Native + that name in policy.name.
-            Some("cheapest") => (RouteKind::Native, Some("cheapest")),
-            Some("fastest") => (RouteKind::Native, Some("fastest")),
-            Some("least_busy") => (RouteKind::Native, Some("least_busy")),
-            Some("usage") => (RouteKind::Native, Some("usage")),
+            Some(crate::routing::native::POLICY_NAME_CHEAPEST) => (
+                RouteKind::Native,
+                Some(crate::routing::native::POLICY_NAME_CHEAPEST),
+            ),
+            Some(crate::routing::native::POLICY_NAME_FASTEST) => (
+                RouteKind::Native,
+                Some(crate::routing::native::POLICY_NAME_FASTEST),
+            ),
+            Some(crate::routing::native::POLICY_NAME_LEAST_BUSY) => (
+                RouteKind::Native,
+                Some(crate::routing::native::POLICY_NAME_LEAST_BUSY),
+            ),
+            Some(crate::routing::native::POLICY_NAME_USAGE) => (
+                RouteKind::Native,
+                Some(crate::routing::native::POLICY_NAME_USAGE),
+            ),
             Some(other) => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown route '{other}': expected one of weighted, webhook, script, native, \
@@ -451,6 +471,7 @@ pub(crate) enum PolicyOnError {
 // `routing::resolve_policy` at config load to construct the matching transport, and validated against
 // `route` at startup.
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PolicyCfg {
     // ── webhook transport ────────────────────────────────────────────────────────────────────────
     /// The operator sidecar URL. Validated by the routing-URL SSRF guard (loopback allowed, IMDS/
@@ -530,6 +551,7 @@ pub(crate) enum BreakerTripMode {
 
 /// Trip configuration parameters (ADR-0002 defaults).
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BreakerTripConfig {
     #[serde(default = "default_trip_mode")]
     pub(crate) mode: BreakerTripMode,
@@ -551,24 +573,34 @@ fn default_trip_mode() -> BreakerTripMode {
     BreakerTripMode::ErrorRate
 }
 
+/// Default sliding-window length in seconds for the breaker trip evaluation (ADR-0002).
+const DEFAULT_BREAKER_WINDOW_SECS: u64 = 30;
+/// Default error-rate threshold for tripping the breaker (fraction in (0.0, 1.0]).
+const DEFAULT_BREAKER_THRESHOLD: f64 = 0.5;
+/// Default minimum request count before the error-rate breaker can trip.
+const DEFAULT_BREAKER_MIN_REQUESTS: usize = 5;
+/// Default consecutive-failure streak length for `BreakerTripMode::Consecutive`.
+const DEFAULT_BREAKER_CONSECUTIVE_N: u32 = 3;
+
 fn default_window_secs() -> u64 {
-    30
+    DEFAULT_BREAKER_WINDOW_SECS
 }
 
 fn default_threshold() -> f64 {
-    0.5
+    DEFAULT_BREAKER_THRESHOLD
 }
 
 fn default_min_requests() -> usize {
-    5
+    DEFAULT_BREAKER_MIN_REQUESTS
 }
 
 fn default_consecutive_n() -> u32 {
-    3
+    DEFAULT_BREAKER_CONSECUTIVE_N
 }
 
 /// Breaker configuration per pool with full trip settings (ADR-0002).
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BreakerCfg {
     #[serde(default = "default_cooldown")]
     pub(crate) base_cooldown_secs: u64,
@@ -591,19 +623,26 @@ impl Default for BreakerCfg {
     }
 }
 
+/// Default base cooldown (seconds) for the escalating breaker back-off (ADR-0002). Single source
+/// of truth for both `BreakerCfg::default()` and the `#[serde(default)]` path.
+const DEFAULT_BREAKER_BASE_COOLDOWN_SECS: u64 = 15;
+/// Default maximum cooldown (seconds) for the escalating breaker back-off (ADR-0002).
+const DEFAULT_BREAKER_MAX_COOLDOWN_SECS: u64 = 120;
+
 fn default_cooldown() -> u64 {
     // Single source of truth for the base cooldown: both `BreakerCfg::default()` (used when a pool
     // omits the `breaker:` block) and `#[serde(default = "default_cooldown")]` (used when the block
     // is present but omits `base_cooldown_secs`) route through here, so the value is a consistent
     // 15s on every path.
-    15
+    DEFAULT_BREAKER_BASE_COOLDOWN_SECS
 }
 
 fn default_max_cooldown() -> u64 {
-    120
+    DEFAULT_BREAKER_MAX_COOLDOWN_SECS
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FailoverCfg {
     /// Failover wall-clock budget in seconds. Renamed from `deadline_secs` in 1.0.0; the old key is
     /// still accepted via the serde alias so existing configs keep loading.
@@ -633,13 +672,17 @@ fn default_max_hops() -> usize {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct OnExhaustedCfg {
     #[serde(default = "default_on_exhausted_action")]
     pub(crate) action: String,
 }
 
+/// Default on_exhausted action: return 503 Service Unavailable when all pool members are exhausted.
+const DEFAULT_ON_EXHAUSTED: &str = "reject";
+
 fn default_on_exhausted_action() -> String {
-    "reject".to_string()
+    DEFAULT_ON_EXHAUSTED.to_string()
 }
 
 /// Pool exhaustion mode configuration.
@@ -657,6 +700,10 @@ pub(crate) enum OnExhausted {
     LeastBad,
 }
 
+/// Prefix for the `fallback_pool:<name>` on_exhausted action. Used for BOTH the `starts_with`
+/// guard AND the slice offset so the prefix literal and the offset are ALWAYS coupled.
+const FALLBACK_POOL_PREFIX: &str = "fallback_pool:";
+
 impl OnExhausted {
     /// Parse an action string from config into an OnExhausted variant.
     /// Returns Err(String) for unknown actions - NO bare _ => allowed.
@@ -666,8 +713,8 @@ impl OnExhausted {
             "fallback_pool" => Err("fallback_pool requires a pool name argument".into()),
             "least_bad" | "least-bad" | "leastbad" => Ok(OnExhausted::LeastBad),
             // FallbackPool with name - parse as "fallback_pool:<pool_name>" format
-            s if s.starts_with("fallback_pool:") => {
-                let pool_name = &s["fallback_pool:".len()..];
+            s if s.starts_with(FALLBACK_POOL_PREFIX) => {
+                let pool_name = &s[FALLBACK_POOL_PREFIX.len()..];
                 if pool_name.is_empty() {
                     Err("fallback_pool requires a non-empty pool name".into())
                 } else {
@@ -701,6 +748,7 @@ pub(crate) enum AffinityMode {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AffinityCfg {
     /// Affinity mode. `session` (the default and only supported mode) pins a session to a lane
     /// using the header named by `header_name`.
@@ -711,8 +759,11 @@ pub(crate) struct AffinityCfg {
     pub(crate) header_name: Option<String>,
 }
 
+/// Default listen address for the inbound HTTP server.
+pub(crate) const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
+
 fn default_listen() -> String {
-    "0.0.0.0:8080".into()
+    DEFAULT_LISTEN_ADDR.into()
 }
 
 /// Provider definition - vetted knowledge shipped in providers.yaml (no keys).
@@ -746,6 +797,7 @@ pub(crate) struct ProviderDef {
 
 /// Provider deployment - operator config in config.yaml (names provider + supplies key).
 #[derive(Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProviderDeploy {
     pub(crate) api_key_env: String,
     #[serde(default)]
@@ -892,7 +944,7 @@ pub(crate) struct GovernanceCfg {
     /// bearer token guarding the /admin management API. None = admin API disabled.
     #[serde(default)]
     pub(crate) admin_token: Option<String>,
-    /// Behavior when the budget store errors during the atomic admission check-and-charge (fix 2b).
+    /// Behavior when the budget store errors during the atomic admission check-and-charge.
     /// `allow` (default) fails OPEN — the request proceeds, preserving availability on a telemetry-
     /// store hiccup (today's behavior). `deny` fails CLOSED — the request is rejected, the strict
     /// stance for security/regulated deployments that want a hard budget guarantee. Only the store-
@@ -925,7 +977,7 @@ impl Default for GovernanceCfg {
     }
 }
 
-/// Fail-mode for the budget check on a store error (fix 2b). Default `allow` (fail-open) preserves
+/// Fail-mode for the budget check on a store error. Default `allow` (fail-open) preserves
 /// today's availability-first behavior.
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -960,8 +1012,11 @@ impl fmt::Debug for GovernanceCfg {
     }
 }
 
+/// Default SQLite database path for the governance store.
+const DEFAULT_GOVERNANCE_DB: &str = "busbar-governance.db";
+
 fn default_gov_db_path() -> String {
-    "busbar-governance.db".to_string()
+    DEFAULT_GOVERNANCE_DB.to_string()
 }
 
 fn default_price_per_request_cents() -> i64 {
@@ -985,10 +1040,11 @@ pub(crate) struct ObservabilityCfg {
     /// Per-delivery webhook timeout (seconds, default 2).
     #[serde(default = "default_webhook_delivery_timeout_secs")]
     pub(crate) webhook_delivery_timeout_secs: u64,
-    /// Emit the `Server-Timing: busbar;dur=<ms>` response header (default `true`). The header is a
+    /// Emit the `Server-Timing: busbar;dur=<ms>` response header (default `false`). The header is a
     /// useful latency probe, but it is also an in-band busbar fingerprint on an otherwise
-    /// anti-fingerprinting gateway, so operators who want backend-facing indistinguishability can set
-    /// this to `false` to suppress it entirely (no Server-Timing header is emitted at all).
+    /// anti-fingerprinting gateway — and it is the one fingerprint observable by an UNAUTHENTICATED
+    /// client on every response — so it defaults OFF to preserve backend-facing indistinguishability.
+    /// Operators who want the latency probe (and accept the product tell) opt IN by setting `true`.
     #[serde(default = "default_emit_server_timing")]
     pub(crate) emit_server_timing: bool,
 }
@@ -1007,8 +1063,8 @@ impl Default for ObservabilityCfg {
     }
 }
 
-/// `Server-Timing: busbar` header is emitted by default; operators opt OUT for indistinguishability.
-pub(crate) const DEFAULT_EMIT_SERVER_TIMING: bool = true;
+/// `Server-Timing: busbar` header is SUPPRESSED by default (indistinguishability); operators opt IN.
+pub(crate) const DEFAULT_EMIT_SERVER_TIMING: bool = false;
 fn default_emit_server_timing() -> bool {
     DEFAULT_EMIT_SERVER_TIMING
 }
@@ -1023,7 +1079,7 @@ fn default_emit_server_timing() -> bool {
 
 /// Default upstream per-request timeout (seconds). Single source of truth for both serde's
 /// `default = "..."` and the resolved-default fallback. Mirrors the historical `main.rs` const.
-pub(crate) const DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// Default maximum accepted request body size (bytes). Couples to the egress translate-body cap
 /// (`crate::limits::translate_body_max_bytes`): a body the gateway accepts inbound must also be
 /// buffer-translatable on egress, so ONE knob (`limits.request_body_max_bytes`) drives both.
@@ -1035,7 +1091,7 @@ pub(crate) const REQUEST_BODY_MAX_BYTES_FLOOR: usize = 64 * 1024;
 /// is a memory-exhaustion foot-gun. 1 GiB is far above any legitimate completion payload.
 pub(crate) const REQUEST_BODY_MAX_BYTES_CEIL: usize = 1024 * 1024 * 1024;
 /// Default max idle keep-alive connections the upstream client pools per host. Mirrors `main.rs`.
-pub(crate) const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 64;
+const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 64;
 /// Default inbound concurrency limit. `0` = unlimited (today's behavior — NO layer added).
 pub(crate) const DEFAULT_MAX_INBOUND_CONCURRENT: usize = 0;
 /// Default hard-down sticky cooldown (seconds). Mirrors `store.rs`.
@@ -1525,7 +1581,7 @@ models:
             },
         );
         let deploy = DeployCfg {
-            listen: "0.0.0.0:8080".into(),
+            listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
             auth: None,
             providers,
@@ -1741,7 +1797,7 @@ models:
         );
     }
 
-    /// fix 2b: `governance.budget_on_store_error` parses `allow`/`deny`, defaults to `allow` (fail-
+    /// `governance.budget_on_store_error` parses `allow`/`deny`, defaults to `allow` (fail-
     /// open, today's behavior), and rejects an unknown value (typed enum, not a free string).
     #[test]
     fn test_budget_on_store_error_parses() {
@@ -1951,7 +2007,7 @@ models:
         defs.insert(
             "z.ai".to_string(),
             ProviderDef {
-                protocol: "anthropic".to_string(),
+                protocol: DEFAULT_PROTOCOL.to_string(),
                 base_url: "https://api.z.ai/api/anthropic".to_string(),
                 error_map,
                 health: None,
@@ -1978,7 +2034,7 @@ models:
         );
 
         let deploy = DeployCfg {
-            listen: "0.0.0.0:8080".into(),
+            listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
             auth: None,
             providers,
@@ -1999,7 +2055,7 @@ models:
             .providers
             .get("z.ai")
             .expect("z.ai should be in resolved providers");
-        assert_eq!(provider_cfg.protocol, "anthropic");
+        assert_eq!(provider_cfg.protocol, DEFAULT_PROTOCOL);
         assert_eq!(provider_cfg.base_url, "https://api.z.ai/api/anthropic");
         assert_eq!(provider_cfg.api_key_env, "ZAI_KEY");
         assert_eq!(
@@ -2039,7 +2095,7 @@ models: {}
         defs.insert(
             "myprov".to_string(),
             ProviderDef {
-                protocol: "anthropic".to_string(),
+                protocol: DEFAULT_PROTOCOL.to_string(),
                 base_url: "https://api.example.com".to_string(),
                 error_map: HashMap::new(),
                 health: None,
@@ -2063,7 +2119,7 @@ models: {}
         // no admin_token silently locks the /admin API — resolve must reject it.
         let defs = HashMap::new();
         let deploy = DeployCfg {
-            listen: "0.0.0.0:8080".into(),
+            listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
             auth: None,
             providers: HashMap::new(),
@@ -2072,7 +2128,7 @@ models: {}
             observability: None,
             governance: Some(GovernanceCfg {
                 enabled: true,
-                db_path: "busbar-governance.db".to_string(),
+                db_path: DEFAULT_GOVERNANCE_DB.to_string(),
                 price_per_request_cents: 1,
                 price_per_1k_tokens_cents: 0,
                 admin_token: None,
@@ -2098,7 +2154,7 @@ models: {}
     fn test_resolve_accepts_enabled_governance_with_admin_token() {
         let defs = HashMap::new();
         let deploy = DeployCfg {
-            listen: "0.0.0.0:8080".into(),
+            listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
             auth: None,
             providers: HashMap::new(),
@@ -2107,7 +2163,7 @@ models: {}
             observability: None,
             governance: Some(GovernanceCfg {
                 enabled: true,
-                db_path: "busbar-governance.db".to_string(),
+                db_path: DEFAULT_GOVERNANCE_DB.to_string(),
                 price_per_request_cents: 1,
                 price_per_1k_tokens_cents: 0,
                 admin_token: Some("operator-secret".to_string()),
@@ -2149,7 +2205,7 @@ models: {}
         );
 
         let deploy = DeployCfg {
-            listen: "0.0.0.0:8080".into(),
+            listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
             auth: None,
             providers,
@@ -2181,7 +2237,7 @@ models: {}
         defs.insert(
             "custom".to_string(),
             ProviderDef {
-                protocol: "anthropic".to_string(),
+                protocol: DEFAULT_PROTOCOL.to_string(),
                 base_url: "https://default.example.com".to_string(),
                 error_map,
                 health: None,
@@ -2211,7 +2267,7 @@ models: {}
         );
 
         let deploy = DeployCfg {
-            listen: "0.0.0.0:8080".into(),
+            listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
             auth: None,
             providers,
@@ -2254,7 +2310,7 @@ models: {}
         defs.insert(
             "minimal".to_string(),
             ProviderDef {
-                protocol: "anthropic".to_string(),
+                protocol: DEFAULT_PROTOCOL.to_string(),
                 base_url: "https://api.example.com".to_string(),
                 error_map: HashMap::new(), // Empty but valid for resolution
                 health: None,
@@ -2281,7 +2337,7 @@ models: {}
         );
 
         let deploy = DeployCfg {
-            listen: "0.0.0.0:8080".into(),
+            listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
             auth: None,
             providers,
@@ -2394,9 +2450,9 @@ models: {}
         );
     }
 
-    /// REGRESSION (LOW #15/#16, SECURITY): every config struct that carries a secret must REDACT it
-    /// in `Debug`, not print it in plaintext. A derived `Debug` (the pre-R24 state for AuthCfg,
-    /// GovernanceCfg, ProviderCfg, ProviderDeploy) would leak the literal token/api_key the moment
+    /// REGRESSION: every config struct that carries a secret must REDACT it
+    /// in `Debug`, not print it in plaintext. A derived `Debug` for AuthCfg,
+    /// GovernanceCfg, ProviderCfg, and ProviderDeploy would leak the literal token/api_key the moment
     /// the struct — or any struct that embeds it (RootCfg/DeployCfg) — is debug-logged. Against the
     /// old derived impls these assertions FAIL (the secret appears); they pass once the manual
     /// redacting impls are in place. The secret values are deliberately distinctive so a substring
@@ -2445,7 +2501,7 @@ models: {}
 
         // ProviderCfg: inline _legacy_api_key.
         let prov = ProviderCfg {
-            protocol: "anthropic".to_string(),
+            protocol: DEFAULT_PROTOCOL.to_string(),
             base_url: "https://example".to_string(),
             api_key_env: "PROV_KEY".to_string(),
             health: None,
@@ -2482,7 +2538,7 @@ models: {}
         );
     }
 
-    /// REGRESSION (LOW #15/#16, SECURITY): the redaction must hold TRANSITIVELY — a derived `Debug`
+    /// REGRESSION: the redaction must hold TRANSITIVELY — a derived `Debug`
     /// on an embedding struct (DeployCfg) delegates to each field's `Debug`, so the redacting impls
     /// above are what protect the whole-config dump an operator is most likely to log. This builds a
     /// DeployCfg containing every secret and asserts none survive its Debug output.

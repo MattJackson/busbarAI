@@ -77,16 +77,12 @@ the next **auth adapters** on a seam that already exists.
   benches it for the others. Concurrency and `max_requests` budget stay shared
   (one upstream); a successful health probe recovers the lane in every pool.
 
-## Roadmap (1.0)
+## Post-1.0 roadmap
 
 ### Auth adapters for enterprise backends
 These reuse existing protocols (no new wire format) gated behind an auth shim — the
-same pattern Bedrock established with SigV4:
+same pattern Bedrock established with SigV4 and Azure OpenAI (shipped in 0.14):
 
-- **Azure OpenAI** — **shipped (0.14).** The `openai` protocol with a per-provider
-  `auth: api-key` style (sends the `api-key` header instead of bearer); the
-  `?api-version=` query parameter and deployment live in the provider's `path`
-  override. No new dependency. See the template in `providers.yaml`.
 - **Google Vertex AI** — largely the `gemini` protocol (plus Claude-on-Vertex via
   the `anthropic` protocol) behind **GCP OAuth2**: a short-lived bearer minted from
   a service-account credential and refreshed, against a per-project/region host.
@@ -99,12 +95,4 @@ same pattern Bedrock established with SigV4:
   vetted catalog. Supportable today via a config entry + `path` override; will be
   documented as a recipe.
 
-### 1.0 hardening
-- Operator documentation — initial pass shipped:
-  [`configuration.md`](configuration.md) (every config field + worked examples),
-  [`architecture.md`](architecture.md) (request lifecycle + IR seam), and
-  [`operations.md`](operations.md) (breaker, health, governance, troubleshooting).
-- Soak / load testing.
-- Security review (virtual-key issuance, budget accounting, Bedrock SigV4).
-
-APIs and config are stable at 1.0.0-rc.7. Changes before 1.0.0 will be limited to compatibility fixes discovered during RC validation.
+APIs and config are stable at 1.0.0 under Semantic Versioning — no breaking change without a major-version bump.

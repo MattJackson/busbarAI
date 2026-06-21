@@ -215,7 +215,7 @@ pub(crate) fn resolve_policy(
             let policy_cfg = cfg.policy.as_ref()?;
             let name = policy_cfg.name.as_deref()?;
             // `weighted` ⇒ the zero-cost default path (no policy object, inline SWRR).
-            if name == "weighted" {
+            if name == native::POLICY_NAME_WEIGHTED {
                 return None;
             }
             let policy = native::native_policy(name)?;
@@ -363,9 +363,8 @@ mod tests {
         }
     }
 
-    /// The Native arm (step 0 fix): `route: native` + a non-weighted `policy.name` must resolve to a
-    /// constructed `Policy` (previously it was an UNREACHABLE `None`). The resolved policy's name
-    /// must round-trip the native registry name.
+    /// `route: native` + a non-weighted `policy.name` must resolve to a constructed `Policy`.
+    /// The resolved policy's name must round-trip the native registry name.
     #[test]
     fn native_arm_resolves_constructed_policy() {
         use crate::config::{PolicyCfg, RouteKind};
@@ -443,9 +442,9 @@ mod tests {
         );
     }
 
-    /// C1 / CH3: `route: cheapest` (the native shorthand) must resolve to a `Policy` whose hard
-    /// deadline is the documented 150ms — NOT the 0ms a `PolicyCfg::default()`-built struct would
-    /// carry. Drives the desugar through serde (as a real config would) and then `resolve_policy`.
+    /// A native shorthand (`route: cheapest`, etc.) must resolve to a `Policy` whose hard deadline
+    /// is the documented default — NOT the 0ms a `PolicyCfg::default()`-built struct would carry.
+    /// Drives the desugar through serde (as a real config would) and then `resolve_policy`.
     #[test]
     fn shorthand_route_resolves_default_timeout_not_zero() {
         let client = reqwest::Client::new();
@@ -457,8 +456,10 @@ mod tests {
                 Some(ResolvedPolicy::Policy { timeout, .. }) => {
                     assert_eq!(
                         timeout,
-                        std::time::Duration::from_millis(crate::limits::default_policy_timeout_ms()),
-                        "shorthand `route: {name}` must resolve to a 150ms deadline, not 0ms"
+                        std::time::Duration::from_millis(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
+                        "shorthand `route: {name}` must resolve to the documented \
+                         {default}ms deadline, not 0ms",
+                        default = crate::config::DEFAULT_POLICY_TIMEOUT_MS,
                     );
                 }
                 other => panic!(
@@ -475,8 +476,8 @@ mod tests {
     fn policy_timeout_treats_zero_as_default() {
         assert_eq!(
             policy_timeout(0),
-            std::time::Duration::from_millis(crate::limits::default_policy_timeout_ms()),
-            "0ms must be coerced to the default policy timeout"
+            std::time::Duration::from_millis(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
+            "0ms must be coerced to the documented default policy timeout, never 0"
         );
         assert_eq!(
             policy_timeout(42),

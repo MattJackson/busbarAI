@@ -58,7 +58,7 @@ fn webhook_delivery_timeout() -> Duration {
 /// fighting the borrow checker over the `'static` semaphore. Releasing via this guard's `Drop`
 /// (rather than a manual `add_permits(1)` at the tail of the task) means the slot is returned even
 /// if the delivery task PANICS — a manual release at the end of the closure would be skipped on
-/// unwind, permanently leaking the slot and, after `MAX_INFLIGHT_WEBHOOK_DELIVERIES` panics,
+/// unwind, permanently leaking the slot and, after `max_inflight_webhook_deliveries()` panics,
 /// silently dropping every subsequent log forever.
 struct InflightGuard;
 
@@ -103,6 +103,15 @@ fn mask_userinfo(url: &str) -> String {
     parsed.into()
 }
 
+/// The HTTP Basic auth scheme prefix (RFC 7617). Includes the trailing space so callers can
+/// write `format!("{OTLP_AUTH_SCHEME}{token}")` without hard-coding the space.
+const OTLP_AUTH_SCHEME: &str = "Basic ";
+
+/// The `https` scheme word used by `scheme_is` to enforce TLS on webhook/OTLP endpoints.
+const SCHEME_HTTPS: &str = "https";
+/// The `http` scheme word used by `scheme_is` to permit plaintext on loopback OTLP endpoints.
+const SCHEME_HTTP: &str = "http";
+
 /// Standard base64 (RFC 4648 §4, with `=` padding) of arbitrary bytes. Used only to build the
 /// `Authorization: Basic <base64(user:pass)>` header value for OTLP export (see
 /// `split_otlp_credentials`); we hand-roll it rather than pull a `base64` crate into the direct
@@ -142,7 +151,7 @@ fn base64_encode(input: &[u8]) -> String {
 ///     `Some(Authorization: Basic base64(user:pass))` — the credential is moved off the URL and into
 ///     a request header (passed as the `HyperClient::new` 3rd argument), which the SDK does not log.
 ///
-/// This is the credential-OUT-of-the-URL fix for LOW #14 (continuation of the R25 OTLP-masking work):
+/// This splits the credential out of the URL so the endpoint handed to the SDK never carries the secret:
 /// masking only sanitized busbar's OWN log lines, but the raw URL was still handed to
 /// `with_endpoint()`, so SDK-internal diagnostics could expose the secret in the request URI.
 ///
@@ -179,7 +188,7 @@ fn split_otlp_credentials(endpoint: &str) -> (String, Option<reqwest::header::He
     // `HeaderValue::from_str` only fails on bytes a header value cannot carry; a base64 token is pure
     // ASCII from `[A-Za-z0-9+/=]`, so this never fails. If it somehow did, drop the credential rather
     // than panic on the startup path — the export simply goes out unauthenticated.
-    let auth = reqwest::header::HeaderValue::from_str(&format!("Basic {token}")).ok();
+    let auth = reqwest::header::HeaderValue::from_str(&format!("{OTLP_AUTH_SCHEME}{token}")).ok();
     (clean, auth)
 }
 
@@ -251,9 +260,9 @@ fn validate_webhook_url(url: Option<String>) -> Result<Option<String>, String> {
     // `Url::parse` lowercases it — so a valid `HTTPS://host/` (or mixed-case `Https://`) would be
     // wrongly rejected by a literal `starts_with("https://")` on the raw string. Compare the scheme
     // (everything up to and including `://`) without allocating by lowercasing only that prefix.
-    if !scheme_is(&u, "https") {
+    if !scheme_is(&u, SCHEME_HTTPS) {
         // Mask any embedded userinfo before it reaches the (logged) error message — the raw URL can
-        // carry `user:pass@` operator credentials (LOW #18).
+        // carry `user:pass@` operator credentials.
         return Err(format!(
             "observability.request_log_webhook_url must be an https:// URL (got '{}')",
             mask_userinfo(&u)
@@ -432,7 +441,7 @@ pub(crate) fn build_request_log(
 /// Fire-and-forget a request-log POST. No-op when no webhook is configured. Never blocks the
 /// request path and never surfaces errors — telemetry must not affect serving.
 ///
-/// Bounded: at most `MAX_INFLIGHT_WEBHOOK_DELIVERIES` deliveries run concurrently (a slow webhook
+/// Bounded: at most `max_inflight_webhook_deliveries()` deliveries run concurrently (a slow webhook
 /// drops logs rather than piling up unbounded tasks), and each POST has its own short timeout
 /// independent of the shared client's upstream timeout.
 pub(crate) fn fire_request_log(payload: Value) {
@@ -446,8 +455,12 @@ pub(crate) fn fire_request_log(payload: Value) {
         return;
     };
     // Acquire a delivery slot WITHOUT awaiting. If the cap is reached the webhook is backed up;
-    // drop this log rather than blocking the caller or accumulating an unbounded task backlog.
+    // drop this log rather than blocking the caller or accumulating an unbounded task backlog. Count
+    // the drop on a metric (not a per-drop warn, which would itself flood the log under sustained
+    // saturation) so an operator can alert on "the webhook is overwhelmed; request logs are being
+    // shed" instead of mistaking the silence for a healthy/disabled webhook.
     let Ok(permit) = webhook_inflight().try_acquire() else {
+        metrics::counter!(crate::metrics::WEBHOOK_LOGS_DROPPED_TOTAL).increment(1);
         return;
     };
     // The permit borrows the 'static semaphore; forget it and hand the slot to an `InflightGuard`
@@ -464,7 +477,10 @@ pub(crate) fn fire_request_log(payload: Value) {
         // non-blocking contract. `payload` is moved into the closure, so relocating the line costs
         // no lifetime change.
         let body = payload.to_string();
-        let _ = client
+        // Best-effort, but NOT silent: a transport error or a non-2xx response means logs are being
+        // dropped, which an operator needs to see. Warn with the URL + status/error-kind ONLY — no
+        // response body, no secrets, no payload — so the diagnostic can't leak request contents.
+        match client
             .post(url.as_str())
             .header(
                 reqwest::header::CONTENT_TYPE,
@@ -473,7 +489,24 @@ pub(crate) fn fire_request_log(payload: Value) {
             .body(body)
             .timeout(webhook_delivery_timeout())
             .send()
-            .await;
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                tracing::warn!(
+                    webhook_url = url.as_str(),
+                    status = resp.status().as_u16(),
+                    "request-log webhook delivery returned a non-2xx status; this log was dropped"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    webhook_url = url.as_str(),
+                    error_kind = %e,
+                    "request-log webhook delivery failed (transport error); this log was dropped"
+                );
+            }
+        }
     });
 }
 
@@ -548,7 +581,7 @@ pub(crate) fn init_logging(otlp_endpoint: Option<&str>) {
     }
     if let Some(endpoint) = otlp_endpoint {
         // Mask any embedded userinfo (`https://user:pass@host`) BEFORE logging — the raw endpoint
-        // can carry operator credentials that must not leak into structured logs (LOW #18).
+        // can carry operator credentials that must not leak into structured logs.
         let endpoint = mask_userinfo(endpoint);
         tracing::info!(endpoint, "OTLP tracing enabled");
     }
@@ -556,7 +589,7 @@ pub(crate) fn init_logging(otlp_endpoint: Option<&str>) {
 
 /// Flush and shut down the OTLP tracer provider's batched span buffer. Idempotent and a no-op when
 /// OTLP was never configured. Wired into the server's graceful-shutdown path (`main.rs`:
-/// `axum::serve(...).with_graceful_shutdown(shutdown_signal())` then `shutdown_tracing()`) so the
+/// `tls::serve(...)` / `tls::serve_plain(...)` driven by `shutdown_signal()`, then `shutdown_tracing()`) so the
 /// final spans (often the most diagnostic) are exported rather than dropped when the runtime tears
 /// down. Covered by `test_shutdown_tracing_is_noop_when_unconfigured`.
 pub(crate) fn shutdown_tracing() {
@@ -592,8 +625,8 @@ fn validate_otlp_endpoint(endpoint: Option<&str>) -> Result<Option<String>, Stri
     };
     // Case-INSENSITIVE scheme check (see `scheme_is`): `HTTP://localhost:4318` / `HTTPS://...` are
     // valid per RFC 3986 and would be wrongly rejected by a literal lowercase `starts_with`.
-    if !(scheme_is(e, "https") || scheme_is(e, "http")) {
-        // Mask any embedded userinfo before it reaches the (logged) error message (LOW #18).
+    if !(scheme_is(e, SCHEME_HTTPS) || scheme_is(e, SCHEME_HTTP)) {
+        // Mask any embedded userinfo before it reaches the (logged) error message.
         return Err(format!(
             "observability.otlp_endpoint must be an http:// or https:// URL (got '{}')",
             mask_userinfo(e)
@@ -615,7 +648,7 @@ fn validate_otlp_endpoint(endpoint: Option<&str>) -> Result<Option<String>, Stri
     // cleartext, so require `https://` for any non-loopback host. (`scheme_is` is case-insensitive,
     // matching the scheme check above; the host already passed `otlp_host_is_blocked`, so a
     // non-loopback host here is an allowed EXTERNAL collector — which must be reached over TLS.)
-    if scheme_is(e, "http") && !otlp_host_is_loopback(&parsed) {
+    if scheme_is(e, SCHEME_HTTP) && !otlp_host_is_loopback(&parsed) {
         return Err(format!(
             "observability.otlp_endpoint must use https:// for a non-loopback collector (plaintext \
              http:// is only permitted for a loopback/localhost collector; traces would otherwise be \
@@ -647,7 +680,7 @@ pub(crate) fn validate_routing_webhook_url(url: Option<&str>) -> Result<String, 
     let Some(u) = url else {
         return Err("routing policy.url is required when route: webhook".to_string());
     };
-    if !(scheme_is(u, "https") || scheme_is(u, "http")) {
+    if !(scheme_is(u, SCHEME_HTTPS) || scheme_is(u, SCHEME_HTTP)) {
         return Err(format!(
             "routing policy.url must be an http:// or https:// URL (got '{}')",
             mask_userinfo(u)
@@ -662,7 +695,7 @@ pub(crate) fn validate_routing_webhook_url(url: Option<&str>) -> Result<String, 
             mask_userinfo(u)
         ));
     }
-    if scheme_is(u, "http") && !otlp_host_is_loopback(&parsed) {
+    if scheme_is(u, SCHEME_HTTP) && !otlp_host_is_loopback(&parsed) {
         return Err(format!(
             "routing policy.url must use https:// for a non-loopback sidecar (plaintext http:// is \
              only permitted for a loopback/localhost sidecar); got '{}'",
@@ -831,7 +864,7 @@ where
         .enable_http1()
         .build();
     // Move any embedded userinfo (`https://user:pass@host`) OUT of the URL and into an
-    // `Authorization: Basic ...` header (LOW #14): the endpoint string passed to `with_endpoint`
+    // `Authorization: Basic ...` header: the endpoint string passed to `with_endpoint`
     // below — which the OTLP SDK may echo into its own error/debug messages as the request URI —
     // must never carry the operator's secret. The credential travels as the `HyperClient::new` 3rd
     // argument (`authorization`), which the SDK injects per-request and does not log.
@@ -868,7 +901,7 @@ mod tests {
 
     #[test]
     fn test_mask_userinfo_strips_credentials() {
-        // Regression (LOW #18): a URL with embedded userinfo (`user:pass@host`) must have the secret
+        // Regression: a URL with embedded userinfo (`user:pass@host`) must have the secret
         // stripped before it is logged. The masked form must NOT contain the username or password,
         // must replace the userinfo with the `***` marker, and must preserve the host/port/path so
         // the diagnostic is still useful.
@@ -915,7 +948,7 @@ mod tests {
 
     #[test]
     fn test_validate_webhook_url_error_masks_userinfo() {
-        // Regression (LOW #18): the validation error message is logged (`configure_webhook` ->
+        // Regression: the validation error message is logged (`configure_webhook` ->
         // tracing::error!), so a rejected webhook URL bearing userinfo must not leak its credentials
         // into that message. Use an internal host so it is rejected by the SSRF guard with the URL
         // interpolated.
@@ -938,7 +971,7 @@ mod tests {
 
     #[test]
     fn test_validate_otlp_endpoint_error_masks_userinfo() {
-        // Regression (LOW #18): the OTLP validation error is printed to stderr (`init_logging`), so a
+        // Regression: the OTLP validation error is printed to stderr (`init_logging`), so a
         // rejected endpoint with userinfo must not leak credentials there either.
         let err = validate_otlp_endpoint(Some("https://svc:topsecret@10.0.0.1/v1/traces"))
             .expect_err("internal host must be rejected");
@@ -981,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_split_otlp_credentials_moves_secret_off_url() {
-        // Regression (LOW #14): an endpoint with embedded userinfo must yield (a) a credential-FREE
+        // Regression: an endpoint with embedded userinfo must yield (a) a credential-FREE
         // endpoint for `with_endpoint` (so the URI the SDK may log never carries the secret) and (b)
         // an `Authorization: Basic base64(user:pass)` header carrying the credential out of band.
         let (clean, auth) =
@@ -996,8 +1029,8 @@ mod tests {
         // The credential rides in a Basic auth header, base64 of `alice:s3cr3t`.
         let auth = auth.expect("userinfo must produce an Authorization header");
         let auth = auth.to_str().expect("header value is ascii");
-        assert_eq!(auth, "Basic YWxpY2U6czNjcjN0");
-        // Belt-and-braces: the raw secret must not appear verbatim in the header either.
+        assert_eq!(auth, "Basic YWxpY2U6czNjcjN0"); // golden wire-contract literal (kept bare on purpose)
+                                                    // Belt-and-braces: the raw secret must not appear verbatim in the header either.
         assert!(
             !auth.contains("s3cr3t") && !auth.contains("alice"),
             "credential must be base64-encoded, not plaintext: {auth}"
@@ -1015,7 +1048,7 @@ mod tests {
         let auth = auth.expect("password-only userinfo still authenticates");
         assert_eq!(
             auth.to_str().unwrap(),
-            format!("Basic {}", base64_encode(b":topsecret"))
+            format!("Basic {}", base64_encode(b":topsecret")) // golden wire-contract literal (kept bare on purpose)
         );
 
         let (clean, auth) = split_otlp_credentials("https://tokenuser@host:4318/v1/traces");
@@ -1026,7 +1059,7 @@ mod tests {
         let auth = auth.expect("username-only userinfo still authenticates");
         assert_eq!(
             auth.to_str().unwrap(),
-            format!("Basic {}", base64_encode(b"tokenuser:"))
+            format!("Basic {}", base64_encode(b"tokenuser:")) // golden wire-contract literal (kept bare on purpose)
         );
     }
 
@@ -1053,7 +1086,7 @@ mod tests {
         // Decoded credential is `u:p@ss:word`.
         assert_eq!(
             auth.to_str().unwrap(),
-            format!("Basic {}", base64_encode(b"u:p@ss:word"))
+            format!("Basic {}", base64_encode(b"u:p@ss:word")) // golden wire-contract literal (kept bare on purpose)
         );
     }
 
@@ -1140,12 +1173,12 @@ mod tests {
 
     #[test]
     fn test_scheme_is_case_insensitive() {
-        assert!(scheme_is("HTTPS://host/", "https"));
-        assert!(scheme_is("https://host/", "https"));
+        assert!(scheme_is("HTTPS://host/", SCHEME_HTTPS));
+        assert!(scheme_is("https://host/", SCHEME_HTTPS));
         assert!(scheme_is("HtTp://host/", "http"));
-        assert!(!scheme_is("http://host/", "https"));
-        assert!(!scheme_is("httpsx://host/", "https")); // require the `://` boundary
-        assert!(!scheme_is("not-a-url", "https"));
+        assert!(!scheme_is("http://host/", SCHEME_HTTPS));
+        assert!(!scheme_is("httpsx://host/", SCHEME_HTTPS)); // require the `://` boundary
+        assert!(!scheme_is("not-a-url", SCHEME_HTTPS));
     }
 
     #[test]
@@ -1368,7 +1401,7 @@ mod tests {
 
     #[test]
     fn test_validate_webhook_url_rejects_trailing_dot_internal_hosts() {
-        // Regression (HIGH SSRF, final audit): a trailing FQDN-root dot made the IP-literal parse
+        // Regression (SSRF): a trailing FQDN-root dot made the IP-literal parse
         // fail (slipping into the allow-by-default DNS arm) and the METADATA_HOSTS exact-compare miss,
         // so a trailing-dot internal target bypassed BOTH guards. getaddrinfo resolves these to the
         // same internal targets as the bare spelling, so they MUST be rejected.
@@ -1510,7 +1543,7 @@ mod tests {
 
     #[test]
     fn test_validate_otlp_endpoint_rejects_cloud_metadata_and_internal() {
-        // Regression (R16 SSRF medium): span data carries key_ids, pool names, and governance
+        // Regression (SSRF): span data carries key_ids, pool names, and governance
         // decisions, so the OTLP sink must block cloud-metadata / RFC1918 / CGNAT / link-local
         // targets exactly like the webhook guard (only loopback is the intentional exception).
         for bad in [
@@ -1610,7 +1643,7 @@ mod tests {
 
     #[test]
     fn test_validate_otlp_endpoint_requires_https_for_remote_collector() {
-        // Regression (R21 LOW #30): the plaintext-`http://` allowance exists ONLY for the co-located
+        // Regression: the plaintext-`http://` allowance exists ONLY for the co-located
         // loopback collector. A plaintext hop to a REMOTE collector would put span data (key_ids,
         // pool names, governance decisions) on the wire in cleartext, so `http://` to a non-loopback
         // host must be rejected; `https://` to the same host is accepted, and `http://` stays valid

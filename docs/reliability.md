@@ -129,24 +129,24 @@ One important guard: a `context_length` mapping in `error_map` is **suppressed o
 
 Configure per pool with `breaker.trip`:
 
-**`error_rate`** (default) — trips when the fraction of failures in the sliding `window_s` reaches `threshold`, provided at least `min_requests` outcomes have accrued. Both numerator (errors) and denominator (total) come from the same window, so a burst of successes after a burst of failures can bring the rate below threshold before the window expires.
+**`error_rate`** (default) — trips when the fraction of failures in the sliding `window_secs` reaches `threshold`, provided at least `min_requests` outcomes have accrued. Both numerator (errors) and denominator (total) come from the same window, so a burst of successes after a burst of failures can bring the rate below threshold before the window expires.
 
 ```yaml
 breaker:
   trip:
     mode: error_rate
-    window_s: 30
+    window_secs: 30
     threshold: 0.5      # trip at 50% error rate
     min_requests: 5     # never trip on fewer than 5 in-window outcomes
 ```
 
-**`consecutive`** — trips on `n` consecutive failures, regardless of interspersed successes in the wider window. More aggressive; a good choice for a pool whose members are either fully up or fully down (batch APIs, fine-tuned models with narrow failure modes).
+**`consecutive`** — trips after `consecutive_n` consecutive failures, regardless of interspersed successes in the wider window. More aggressive; a good choice for a pool whose members are either fully up or fully down (batch APIs, fine-tuned models with narrow failure modes).
 
 ```yaml
 breaker:
   trip:
     mode: consecutive
-    n: 3
+    consecutive_n: 3
 ```
 
 Choose `error_rate` when you want the breaker to absorb a few errors without tripping (normal flakiness tolerance). Choose `consecutive` when a single sustained failure streak indicates the backend is down and you want fast failover with no "maybe it'll recover" window.
@@ -196,10 +196,10 @@ pools:
       max_cooldown_secs: 120    # ceiling for exponential backoff
       trip:
         mode: error_rate        # or: consecutive
-        window_s: 30            # sliding window for error_rate
+        window_secs: 30         # sliding window for error_rate
         threshold: 0.5          # error fraction to trip (error_rate)
         min_requests: 5         # never trip below this many in-window outcomes
-        n: 3                    # consecutive failures to trip (consecutive mode)
+        consecutive_n: 3        # consecutive failures to trip (consecutive mode)
 ```
 
 Omitting the `breaker:` block entirely is equivalent to specifying all the above defaults. There is no inheritance between pools; each pool's breaker is independent.
@@ -241,8 +241,8 @@ pools:
       - target: last-resort-model
         weight: 1
     failover:
-      deadline_secs: 30    # wall-clock budget across all hops; default 120
-      cap: 3               # max hop count; default 3
+      timeout_secs: 30     # wall-clock budget across all hops; default 120
+      max_hops: 3          # max hop count; default 3
       exclusions:
         - last-resort-model    # never selected as primary or failover
 ```
@@ -546,8 +546,7 @@ Always enabled; no config needed.
 | `busbar_key_budget_remaining_cents` | gauge | `key` | Max budget minus current spend for keys with a `max_budget_cents` cap. Only emitted for capped keys. Drive Prometheus budget-burn alerts. |
 | `busbar_key_tokens_total` | gauge | `key` | Accumulated tokens consumed by each virtual key in the current budget window. Only emitted when governance is enabled. |
 | `busbar_lane_state` | gauge | `pool`, `lane` | Per-(pool, lane-index) circuit-breaker health: `0` = Closed (healthy), `1` = HalfOpen (cooling, probe admitted), `2` = Open (tripped). Side-effect-free at scrape time. |
-| `busbar_route_decisions_total` | counter | `pool`, `policy`, `outcome` | Routing policy decisions. `outcome` is `prefer`, `abstain`, `timeout`, `error`, or `reject`. |
-| `busbar_route_decision_seconds` | histogram | `pool`, `policy` | Routing policy decision latency (webhook/script only). |
+| `busbar_route_policy_selections_total` | counter | `pool`, `policy` | Requests where a routing policy produced a usable ranked order. Only incremented on a successful `Order` outcome; abstains and on-error fallbacks are not counted. |
 
 The `pool` label is always a configured pool name or the sentinel `unresolved` (for routes that did not resolve to a pool). It is never a raw client-supplied model string, which would create unbounded label cardinality.
 
@@ -614,12 +613,12 @@ pools:
     breaker:
       trip:
         mode: consecutive
-        n: 2                   # trip fast — 2 consecutive failures
+        consecutive_n: 2       # trip fast — 2 consecutive failures
       base_cooldown_secs: 5
       max_cooldown_secs: 60
     failover:
-      deadline_secs: 30
-      cap: 3
+      timeout_secs: 30
+      max_hops: 3
     on_exhausted:
       action: fallback_pool:overflow
 
@@ -642,7 +641,7 @@ What this achieves:
 
 - **Weighted primary dispatch**: `claude-sonnet` gets 50% of traffic, `gpt-4o` 30%, `gemini-flash` 20%.
 - **Fast trip**: two consecutive failures opens a member's breaker in the `primary` pool with a 5-second initial cooldown. Organic traffic triggers failover to the next member within the 30-second deadline.
-- **Context-length failover**: if `claude-sonnet` rejects a request as too long (200k context), Busbar excludes `claude-sonnet` and retries to `gemini-flash` (1M context) without penalizing the Sonnet lane.
+- **Context-length failover**: if `claude-sonnet` rejects a request as too long (200k context), Busbar excludes `claude-sonnet` and retries to `gemini-flash` (1M context) without penalizing the `claude-sonnet` lane.
 - **Session affinity**: callers with `x-session-id` headers stay pinned to the same member while it is healthy.
 - **Overflow**: if all primary members are exhausted, traffic spills to `claude-haiku`. If haiku is also exhausted, `least_bad` picks the member with the soonest recovery rather than returning 503.
 - **Health probing**: `anthropic` lanes are re-probed on trip (`mode: dead`), so a recovered Anthropic backend is brought back promptly without waiting for organic traffic to probe it.

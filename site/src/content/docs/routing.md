@@ -52,7 +52,7 @@ The sequence for every request routed to a non-weighted pool:
 1. **Policy runs once, before the failover loop.** It receives the healthy candidate set (as a projected read-only view) and returns a ranked list of candidate indices.
 2. **The failover loop walks the ranked list.** It tries candidates in the policy's preferred order, skipping any that are tripped, at capacity, or already tried (`request_ctx.excluded`).
 3. **Candidates not in the ranked list are tried last.** If the policy emits a subset of candidates, the omitted ones are appended after the ranked set in an unspecified order. They are reachable — a policy can never permanently exclude a healthy lane.
-4. **On policy failure, SWRR takes over.** A timeout, error, or `abstain` response causes Busbar to fall back to the pool's `on_error` behavior (default: SWRR), as if no policy were configured.
+4. **On policy failure, SWRR takes over.** A timeout or error causes Busbar to fall back to the pool's `on_error` behavior (default: SWRR), as if no policy were configured. An explicit **abstain** is different: it always falls straight through to SWRR regardless of `on_error` — abstaining is "no opinion," not a failure.
 
 This composition means a policy's job is deliberately narrow. You declare a preference; Busbar's existing reliability machinery handles the rest.
 
@@ -141,7 +141,7 @@ Every policy — native and external — sees the same projection of each candid
 | Per-lane latency | `latency_ms` | Yes | Rolling EWMA in ms, updated per request. `None` until first request. |
 | Live concurrency | `available_concurrency` | Yes | Free semaphore slots. Always populated. |
 | Budget remaining | `budget_remaining` | Yes | Per-lane `max_requests` remaining. `None` = unlimited. |
-| Rate headroom | — | Landing alongside | RPM/TPM headroom from upstream governance counters. Being wired by a parallel effort. |
+| Rate headroom | `rate_headroom` | Yes | Remaining RPM/TPM headroom from governance counters, as a fraction (most headroom first). `None` when governance is disabled or the lane has no rate limit. |
 
 External policies (webhook, script) also receive the request projection. The webhook wire format and the Rhai `req` map share most fields, with the script getting a few extras:
 
@@ -172,7 +172,7 @@ External policies let you run routing logic outside Busbar — in any language, 
 
 Busbar POSTs a JSON payload to your operator-supplied sidecar URL before each request's failover loop. The sidecar returns a ranked list of candidate indices. The URL is operator-config-only — never derived from a request header or body.
 
-**Timeout and fallback.** The request is bounded by `policy.timeout_ms` (default 150 ms). On timeout, non-200 response, malformed JSON, or an at-capacity in-flight queue, Busbar applies `on_error` (default: `weighted` — fall back to SWRR). A broken sidecar is indistinguishable from no policy. Up to 64 concurrent policy calls are in flight at once; additional calls abstain immediately rather than queue.
+**Timeout and fallback.** The request is bounded by `policy.timeout_ms` (default 150 ms). On timeout, non-200 response, or malformed JSON, Busbar applies `on_error` (default: `weighted` — fall back to SWRR). A broken sidecar is indistinguishable from no policy. Concurrency is bounded by `policy.timeout_ms` and the HTTP client's connection pool — there is no separate in-flight cap on routing webhook calls.
 
 **URL security.** The sidecar URL allows loopback (`127.0.0.1`, `localhost`) — routing sidecars are commonly co-located processes. RFC-1918, link-local, CGNAT, and cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`, etc.) are blocked regardless.
 
@@ -197,7 +197,8 @@ Busbar POSTs a JSON payload to your operator-supplied sidecar URL before each re
       "cost_per_mtok": 15.0,
       "latency_ms": 320.5,
       "available_concurrency": 14,
-      "budget_remaining": null
+      "budget_remaining": null,
+      "rate_headroom": 0.82
     },
     {
       "idx": 1,
@@ -206,7 +207,8 @@ Busbar POSTs a JSON payload to your operator-supplied sidecar URL before each re
       "cost_per_mtok": 3.0,
       "latency_ms": 95.2,
       "available_concurrency": 18,
-      "budget_remaining": 5000
+      "budget_remaining": 5000,
+      "rate_headroom": 0.55
     }
   ],
   "context": {
@@ -224,7 +226,8 @@ Field notes:
 - `candidates[*].cost_per_mtok` — `null` if not declared on the member.
 - `candidates[*].latency_ms` — `null` until the lane has served at least one request.
 - `candidates[*].budget_remaining` — `null` = unlimited (`max_requests: -1`).
-- `context.budget_remaining` — per-key governance budget, `null` when governance is disabled or not yet plumbed (v1 default).
+- `candidates[*].rate_headroom` — remaining RPM/TPM headroom as a fraction; `null` when governance is disabled or the lane has no rate limit.
+- `context.budget_remaining` — always `null` in 1.0: the per-key governance budget is intentionally not fed to the routing seam. Use per-member `budget_remaining` for lane-level capacity.
 
 > The payload contains only the request projection — no prompt text, no message bodies. Busbar never sends request content to any external sink.
 
@@ -274,7 +277,7 @@ An embedded [Rhai](https://rhai.rs) script, compiled at startup and evaluated pe
   - `tags` (array of strings)
 
 - `ctx` — a map with routing context:
-  - `pool` (string), `budget_remaining` (int or `()` when not plumbed)
+  - `pool` (string), `budget_remaining` (always `()` in 1.0 — not fed to the routing seam)
 
 Optional/absent values are `()` (Rhai unit), not `null`. Test with `== ()` or default with `??`.
 
@@ -283,7 +286,7 @@ Optional/absent values are `()` (Rhai unit), not `null`. Test with `== ()` or de
 ```rhai
 // Route large requests to a capable model, smaller ones to a cheaper one.
 // ~4 chars/token rule of thumb; 24000 chars ≈ 6k tokens.
-let big = req.total_chars > 24000 || req.max_tokens > 4096;
+let big = req.total_chars > 24000 || (req.max_tokens ?? 0) > 4096;
 let preferred = if big {
     candidates.filter(|c| c.tier == "large")
 } else {
@@ -322,8 +325,8 @@ Scripts are operator-config only — never client-supplied.
 |---|---|---|---|---|
 | `name` | string | none | `native` | Native policy name: `weighted`, `cheapest`, `fastest`, `least_busy`, or `usage`. Required when `route: native`. |
 | `url` | string | none | `webhook` | Operator sidecar URL. Loopback allowed; RFC-1918/CGNAT/metadata blocked. Required when `route: webhook`. |
-| `timeout_ms` | integer | `150` | `webhook`, `script` | Hard wall-clock deadline for the policy decision in milliseconds. On timeout, `on_error` applies. |
-| `on_error` | string | `weighted` | `webhook`, `script` | Fallback when the policy times out, errors, or abstains: `weighted` (SWRR), `reject` (503), or `first` (first member in config order). |
+| `timeout_ms` | integer | `150` | `native`, `webhook`, `script` | Hard wall-clock deadline for the policy decision in milliseconds. On timeout, `on_error` applies. (Native policies are synchronous and effectively never hit it.) |
+| `on_error` | string | `weighted` | `native`, `webhook`, `script` | Fallback when the policy times out or errors: `weighted` (SWRR), `reject` (503), or `first` (first member in config order). An explicit abstain bypasses this and always falls through to SWRR. |
 | `script` | string | none | `script` | Inline Rhai source. Exactly one of `script` or `script_file` is required when `route: script`. |
 | `script_file` | string | none | `script` | Path to a Rhai script file. Alternative to inline `script`. |
 
@@ -364,8 +367,8 @@ pools:
     policy:
       name: cheapest
     failover:
-      deadline_secs: 60
-      cap: 3
+      timeout_secs: 60
+      max_hops: 3
     members:
       - target: gpt-4o-mini
         weight: 1
@@ -412,8 +415,8 @@ pools:
       timeout_ms: 150
       on_error: weighted          # broken sidecar falls back to SWRR, never fails
     failover:
-      deadline_secs: 60
-      cap: 3
+      timeout_secs: 60
+      max_hops: 3
     members:
       - target: claude-opus
         weight: 1
@@ -440,7 +443,7 @@ pools:
     policy:
       on_error: weighted
       script: |
-        let big = req.total_chars > 24000 || req.max_tokens > 4096;
+        let big = req.total_chars > 24000 || (req.max_tokens ?? 0) > 4096;
         let preferred = if big {
             candidates.filter(|c| c.tier == "large")
         } else {
@@ -476,5 +479,4 @@ pools:
 
 | Metric | Labels | Description |
 |---|---|---|
-| `busbar_route_decisions_total` | `pool`, `policy`, `outcome` | Count of routing decisions. `outcome` is one of `prefer`, `abstain`, `timeout`, `error`, `reject`. |
-| `busbar_route_decision_seconds` | `pool`, `policy` | Histogram of policy decision latency (webhook/script only). |
+| `busbar_route_policy_selections_total` | `policy`, `pool` | Count of requests where a non-default routing policy produced a usable ranked order (incremented once per selection). |

@@ -3,14 +3,20 @@
 
 //! OpenAI Responses API protocol reader/writer implementation.
 
+use super::openai_family::{
+    bearer_error_code, ERR_TYPE_AUTHENTICATION, ERR_TYPE_INSUFFICIENT_QUOTA,
+    ERR_TYPE_INVALID_REQUEST, ERR_TYPE_NOT_FOUND, ERR_TYPE_OVERLOADED, ERR_TYPE_PERMISSION,
+    ERR_TYPE_RATE_LIMIT, ERR_TYPE_SERVER_ERROR,
+};
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// Largest wire `output_index` we accept in a streaming Responses event before clamping. The
 /// Responses API, like Chat Completions, documents at most 128 parallel output items, so any larger
 /// index is malformed; clamp it to this value (the highest valid 0-based index, 127) before the
 /// `usize` cast so a crafted `u64::MAX` index can never participate in unbounded set growth or
-/// index arithmetic. Mirrors `openai.rs::MAX_TOOL_INDEX`.
+/// index arithmetic. Mirrors `openai_chat.rs::MAX_TOOL_INDEX`.
 const MAX_OUTPUT_INDEX: usize = 127;
 
 /// Fallback `model` name emitted when the IR carries none. The official OpenAI Responses SDK types
@@ -18,14 +24,14 @@ const MAX_OUTPUT_INDEX: usize = 127;
 /// omits `model` fails a strict Pydantic/Zod decoder — and a real `/v1/responses` endpoint never
 /// omits it, making the omission a distinguishability tell. On any cross-protocol path
 /// (Anthropic→Responses, Bedrock→Responses) the IR `model` is `None`; emit this fallback rather
-/// than dropping the key. Mirrors `openai.rs::DEFAULT_MODEL`.
-const DEFAULT_MODEL: &str = crate::proto::OPENAI_FAMILY_DEFAULT_MODEL;
+/// than dropping the key. Mirrors `openai_family.rs::OPENAI_FAMILY_DEFAULT_MODEL`.
+const DEFAULT_MODEL: &str = super::openai_family::OPENAI_FAMILY_DEFAULT_MODEL;
 
 /// Hard cap on the number of DISTINCT output indices tracked per stream in `StreamDecodeState`
 /// (`open_tools`) and in the writer's open-item sets. Bounds per-request memory against a
 /// pathological backend that emits a unique `output_index` per event (a per-connection amplification
-/// DoS). Matches `openai.rs::MAX_OPEN_TOOLS` (OpenAI's documented parallel-tool-call limit, 128).
-const MAX_OPEN_TOOLS: usize = crate::proto::OPENAI_FAMILY_MAX_OPEN_TOOLS;
+/// DoS). Matches `openai_family.rs::OPENAI_FAMILY_MAX_OPEN_TOOLS` (OpenAI's documented parallel-tool-call limit, 128).
+const MAX_OPEN_TOOLS: usize = super::openai_family::OPENAI_FAMILY_MAX_OPEN_TOOLS;
 
 /// Key offset under which the streaming reader tracks OPEN TEXT output indices inside the shared
 /// `StreamDecodeState::open_tools` set. A native /v1/responses stream can carry MULTIPLE message
@@ -56,6 +62,61 @@ const ITEM_ID_TOKEN_LEN: usize = 48;
 /// ~38+ chars of opaque random data after the `resp_` prefix; 48 base62 chars stays in that profile.
 const RESPONSE_ID_TOKEN_LEN: usize = 48;
 
+/// SSE event type names emitted / consumed on the `/v1/responses` wire.
+const EVT_RESPONSE_CREATED: &str = "response.created";
+const EVT_OUTPUT_ITEM_ADDED: &str = "response.output_item.added";
+const EVT_OUTPUT_ITEM_DONE: &str = "response.output_item.done";
+const EVT_OUTPUT_TEXT_DELTA: &str = "response.output_text.delta";
+const EVT_FUNCTION_CALL_ARGS_DELTA: &str = "response.function_call_arguments.delta";
+const EVT_REASONING_TEXT_DELTA: &str = "response.reasoning_text.delta";
+const EVT_RESPONSE_COMPLETED: &str = "response.completed";
+const EVT_RESPONSE_FAILED: &str = "response.failed";
+const EVT_RESPONSE_INCOMPLETE: &str = "response.incomplete";
+
+/// Internal `provider_signal` sentinel emitted when a `response.failed` event carries no recognizable
+/// `error.code`/`error.type`. Distinct from the `EVT_RESPONSE_FAILED` wire event type ("response.failed"):
+/// this underscore form is the breaker/telemetry label, mapped to `StatusClass::ServerError` via
+/// `class_for_response_failed`'s catch-all arm.
+const SIGNAL_RESPONSE_FAILED: &str = "response_failed";
+
+/// Response status values on the `/v1/responses` wire.
+const STATUS_IN_PROGRESS: &str = "in_progress";
+const STATUS_COMPLETED: &str = "completed";
+const STATUS_FAILED: &str = "failed";
+const STATUS_INCOMPLETE: &str = "incomplete";
+
+/// Output item `type` values on the `/v1/responses` wire.
+const ITEM_TYPE_FUNCTION_CALL: &str = "function_call";
+const ITEM_TYPE_MESSAGE: &str = "message";
+const ITEM_TYPE_REASONING: &str = "reasoning";
+
+/// Content part `type` values on the `/v1/responses` wire.
+const CONTENT_TYPE_OUTPUT_TEXT: &str = "output_text";
+const CONTENT_TYPE_REASONING_TEXT: &str = "reasoning_text";
+const CONTENT_TYPE_INPUT_TEXT: &str = "input_text";
+
+/// `incomplete_details.reason` values on the `/v1/responses` wire.
+const INCOMPLETE_REASON_MAX_OUTPUT: &str = "max_output_tokens";
+const INCOMPLETE_REASON_CONTENT_FILTER: &str = "content_filter";
+const INCOMPLETE_REASON_OTHER: &str = "other";
+
+/// Top-level `object` field value and vendor tag for the Responses protocol.
+const OBJ_RESPONSE: &str = "response";
+const VENDOR_NAME: &str = "responses";
+
+/// Synthesized id prefixes (bare prefix without trailing underscore for item ids).
+const RESPONSE_ID_PREFIX: &str = "resp_";
+const ITEM_ID_PREFIX_MSG: &str = "msg";
+const ITEM_ID_PREFIX_FC: &str = "fc";
+const ITEM_ID_PREFIX_RS: &str = "rs";
+
+/// OpenAI-family error `code` strings self-owned in this protocol module.
+const ERR_CODE_RATE_LIMIT: &str = "rate_limit_exceeded";
+const ERR_CODE_STRING_ABOVE_MAX: &str = "string_above_max_length";
+
+/// Human-readable authentication failure message returned by this protocol's `auth_failure_message`.
+const AUTH_FAILURE_MSG: &str = "Incorrect API key provided.";
+
 /// Fill a fixed-width base62 token ENTIRELY from the OS CSPRNG, with NO counter overlay. A counter
 /// overlaid into any fixed region of the token leaves those characters predictable/low-entropy (the
 /// counter stays small, so its high base62 digits are constant '0') — a structural fingerprint at
@@ -65,7 +126,7 @@ const RESPONSE_ID_TOKEN_LEN: usize = 48;
 /// On entropy failure the buffer stays zeroed (all '0'), so this never panics on the request path.
 /// Returns an owned `String` of exactly `N` base62 characters, each drawn from a UNIFORM base62
 /// distribution: a raw `byte % 62` reduction is biased (256 is not a multiple of 62, so bytes
-/// 248..=255 wrap to base62 digits 0..=7, making those eight chars ~1.56x more likely than 8..=61
+/// 248..=255 wrap to base62 digits 0..=7, making those eight chars ~1.25x more likely than 8..=61
 /// and leaving a faint statistical fingerprint a native uniform-random id never carries). We instead
 /// use REJECTION SAMPLING: any byte >= 248 (= 62 * 4, the largest multiple of 62 that fits in a u8)
 /// is rejected and a fresh CSPRNG byte is drawn for that slot, so every base62 character is
@@ -159,7 +220,11 @@ fn now_unix_secs() -> u64 {
 /// so a counter would only ADD a predictable low-entropy region (a structural fingerprint) for no
 /// uniqueness benefit. Native passthrough never calls this: it carries the upstream id verbatim.
 fn synthesize_response_id() -> String {
-    format!("resp_{}", synth_token::<RESPONSE_ID_TOKEN_LEN>())
+    format!(
+        "{}{}",
+        RESPONSE_ID_PREFIX,
+        synth_token::<RESPONSE_ID_TOKEN_LEN>()
+    )
 }
 
 /// Accumulate the content of a Responses `system`/`developer` input turn into `system_blocks`
@@ -265,8 +330,6 @@ fn write_responses_tool_choice(tc: &crate::ir::IrToolChoice) -> serde_json::Valu
     }
 }
 
-/// Derive the native `error.code` value for a Responses/OpenAI `error.type`.
-///
 /// Map a terminal `response.failed` provider signal (the captured `error.code`/`error.type`) to the
 /// breaker `StatusClass` that drives disposition and failover.
 ///
@@ -284,10 +347,12 @@ fn write_responses_tool_choice(tc: &crate::ir::IrToolChoice) -> serde_json::Valu
 /// HardDown) per the no-`_`-catch-all rule.
 fn class_for_response_failed(signal: &str) -> StatusClass {
     match signal {
-        "invalid_api_key" | "authentication_error" => StatusClass::Auth,
-        "rate_limit_exceeded" | "insufficient_quota" => StatusClass::RateLimit,
-        "context_length_exceeded" | "string_above_max_length" => StatusClass::ContextLength,
-        "server_error" | "overloaded_error" => StatusClass::ServerError,
+        "invalid_api_key" | ERR_TYPE_AUTHENTICATION => StatusClass::Auth,
+        ERR_CODE_RATE_LIMIT | ERR_TYPE_INSUFFICIENT_QUOTA => StatusClass::RateLimit,
+        crate::forward::PROVIDER_CODE_CONTEXT_LENGTH | ERR_CODE_STRING_ABOVE_MAX => {
+            StatusClass::ContextLength
+        }
+        ERR_TYPE_SERVER_ERROR | ERR_TYPE_OVERLOADED => StatusClass::ServerError,
         other => {
             // Unrecognized provider signal: default to the transient ServerError bucket so the lane
             // recovers via cooldown rather than being permanently penalized. Named binding (not `_`)
@@ -296,6 +361,36 @@ fn class_for_response_failed(signal: &str) -> StatusClass {
             StatusClass::ServerError
         }
     }
+}
+
+/// The set of top-level Responses API request keys that `ResponsesReader::read_request` MODELS
+/// into `IrRequest` fields. Keys in this set are EXCLUDED from `extra` (the pass-through map) so
+/// they are not double-emitted by the writer's extra-forwarding loop. Built once per process via
+/// `OnceLock` instead of being reconstructed on every `read_request` call — the rebuild was a
+/// pointless per-request allocation on the Responses ingress hot path.
+///
+/// NOTE: `metadata` is deliberately NOT in this set. The Responses API accepts a top-level
+/// `metadata` object (user-defined key/value tagging); busbar does not model it on `IrRequest`,
+/// so it must flow through `extra` and be re-emitted verbatim. Listing it here would silently
+/// drop a stable public API field (a prior revision made exactly that mistake).
+fn responses_modeled_keys() -> &'static std::collections::HashSet<&'static str> {
+    static MODELED_KEYS: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
+    MODELED_KEYS.get_or_init(|| {
+        [
+            "model",
+            "instructions",
+            "input",
+            "tools",
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+            "stream",
+            "tool_choice",
+        ]
+        .iter()
+        .cloned()
+        .collect()
+    })
 }
 
 #[derive(Clone)]
@@ -326,9 +421,9 @@ impl ProtocolReader for ResponsesReader {
         // path, so the common case flows straight through. But some upstreams (and the OpenAI
         // Chat-Completions-shaped surface this proxy also fronts) signal the same condition only via
         // the error MESSAGE — e.g. `This model's maximum context length is 8192 tokens...` — with a
-        // null or generic `code`. Mirror openai.rs / anthropic.rs: when no canonical code was parsed,
+        // null or generic `code`. Mirror openai_chat.rs / anthropic.rs: when no canonical code was parsed,
         // scan the body for the protocol's context-length phrasing and synthesize the canonical code
-        // so the breaker pipeline (normalize_raw_error, breaker.rs ~122) → StatusClass::ContextLength
+        // so the breaker pipeline (normalize_raw_error, breaker.rs) → StatusClass::ContextLength
         // and oversized-request failover triggers WITHOUT penalizing the lane. This is the production
         // counterpart of the `#[cfg(test)] classify()` helper's message scan below.
         //
@@ -344,8 +439,8 @@ impl ProtocolReader for ResponsesReader {
                 return None;
             }
             let lower = String::from_utf8_lossy(body).to_lowercase();
-            if super::openai_context_length_prose_scan(&lower) {
-                Some("context_length_exceeded".to_string())
+            if super::openai_family::openai_context_length_prose_scan(&lower) {
+                Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string())
             } else {
                 None
             }
@@ -362,21 +457,21 @@ impl ProtocolReader for ResponsesReader {
     #[cfg(test)]
     fn classify(&self, status: StatusCode, body: &[u8]) -> CanonicalSignal {
         // Identical to OpenAiReader::classify — both emit the same OpenAI error envelope, so the
-        // mapping is single-sourced in `super::openai_classify`.
-        super::openai_classify(status, body)
+        // mapping is single-sourced in `super::openai_family::openai_classify`.
+        super::openai_family::openai_classify(status, body)
     }
 
     fn read_request(&self, body: &serde_json::Value) -> Result<crate::ir::IrRequest, IrError> {
         let obj = body.as_object().ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".to_string()),
+            provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
             retry_after: None,
         })?;
 
         if obj.is_empty() {
             return Err(IrError {
                 class: StatusClass::ClientError,
-                provider_signal: Some("ir_parse".to_string()),
+                provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
                 retry_after: None,
             });
         }
@@ -410,7 +505,7 @@ impl ProtocolReader for ResponsesReader {
             } else if let Some(arr) = input_val.as_array() {
                 for item in arr {
                     match item.get("type").and_then(|t| t.as_str()) {
-                        Some("input_text") => {
+                        Some(CONTENT_TYPE_INPUT_TEXT) => {
                             let text = item
                                 .get("text")
                                 .and_then(|t| t.as_str())
@@ -440,7 +535,7 @@ impl ProtocolReader for ResponsesReader {
                                 });
                             }
                         }
-                        Some("output_text") => {
+                        Some(CONTENT_TYPE_OUTPUT_TEXT) => {
                             let text = item
                                 .get("text")
                                 .and_then(|t| t.as_str())
@@ -455,7 +550,7 @@ impl ProtocolReader for ResponsesReader {
                                 }],
                             });
                         }
-                        Some("function_call") => {
+                        Some(ITEM_TYPE_FUNCTION_CALL) => {
                             let call_id = item
                                 .get("call_id")
                                 .and_then(|c| c.as_str())
@@ -520,7 +615,7 @@ impl ProtocolReader for ResponsesReader {
                                 }],
                             });
                         }
-                        Some("message") => {
+                        Some(ITEM_TYPE_MESSAGE) => {
                             // The official OpenAI Responses SDK emits conversation turns as typed
                             // `{"type":"message","role":...,"content":[...]}` items. The role-keyed
                             // fallback below only fires for UNTYPED items, so without this arm a
@@ -557,7 +652,34 @@ impl ProtocolReader for ResponsesReader {
                                 }
                             }
                         }
-                        Some("reasoning") => {}
+                        Some(ITEM_TYPE_REASONING) => {
+                            // Fix #6: a prior-turn `reasoning` INPUT item carries assistant
+                            // reasoning (text under `content`/`summary`, opaque blob under
+                            // `encrypted_content`). Dropping it lost that reasoning entirely on egress
+                            // to a protocol that models reasoning (Anthropic/Bedrock Thinking). Decode
+                            // it into an `IrBlock::Thinking` on its own assistant turn (a Responses
+                            // `reasoning` item is a top-level sibling of the assistant message it
+                            // precedes, so a standalone assistant turn is the faithful mapping). The
+                            // paired writer (`write_request`) re-emits this as a `reasoning` input
+                            // item, so a same-protocol Responses->Responses round-trip is preserved.
+                            let text = read_reasoning_text(item);
+                            let signature = item
+                                .get("encrypted_content")
+                                .and_then(|s| s.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(String::from);
+                            if !text.is_empty() || signature.is_some() {
+                                messages.push(crate::ir::IrMessage {
+                                    role: crate::ir::IrRole::Assistant,
+                                    content: vec![crate::ir::IrBlock::Thinking {
+                                        text,
+                                        signature,
+                                        redacted: false,
+                                        cache_control: None,
+                                    }],
+                                });
+                            }
+                        }
                         Some(_) | None => {}
                     }
 
@@ -598,7 +720,7 @@ impl ProtocolReader for ResponsesReader {
         } else if !obj.contains_key("instructions") {
             return Err(IrError {
                 class: StatusClass::ClientError,
-                provider_signal: Some("ir_parse".to_string()),
+                provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
                 retry_after: None,
             });
         }
@@ -664,27 +786,10 @@ impl ProtocolReader for ResponsesReader {
         // stays empty and is not read.
         let response_format = read_text_format(obj.get("text"));
 
-        // NOTE: `metadata` is deliberately NOT in this exclusion set. The Responses API accepts a
-        // top-level `metadata` object (user-defined key/value tagging used for audit logging and
-        // billing attribution); busbar does not model it on `IrRequest`, so it must flow through
-        // `extra` and be re-emitted verbatim by `write_request`'s extra-forwarding loop. Listing it
-        // here (as a prior revision did) silently dropped a stable public API field.
-        let modeled_keys: std::collections::HashSet<&str> = [
-            "model",
-            "instructions",
-            "input",
-            "tools",
-            "max_output_tokens",
-            "temperature",
-            "top_p",
-            "stream",
-            "tool_choice",
-        ]
-        .iter()
-        .cloned()
-        .collect();
-        // NOTE: `text` is NOT in this set — it is intercepted by its own branch in the loop below
-        // (its `format` sub-key → IR `response_format` per M1, the remainder preserved in `extra`).
+        // NOTE: `text` is NOT in the modeled-keys set — it is intercepted by its own branch in the
+        // loop below (its `format` sub-key → IR `response_format` per M1, the remainder preserved
+        // in `extra`). `metadata` is also deliberately excluded from the set; see `responses_modeled_keys`.
+        let modeled_keys = responses_modeled_keys();
 
         for (key, value) in obj.iter() {
             // `text` is partially modeled: its `format` sub-key is promoted to the IR
@@ -752,7 +857,7 @@ impl ProtocolReader for ResponsesReader {
         }
 
         match event_type {
-            "response.created" | "response.in_progress" => {
+            EVT_RESPONSE_CREATED | "response.in_progress" => {
                 if !state.started {
                     state.started = true;
                     // Capture stream identity from the nested `response` object so a same-protocol
@@ -780,9 +885,11 @@ impl ProtocolReader for ResponsesReader {
                 }
             }
 
-            "response.output_item.added" => {
+            EVT_OUTPUT_ITEM_ADDED => {
                 if let Some(item_obj) = data.get("item") {
-                    if item_obj.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                    if item_obj.get("type").and_then(|t| t.as_str())
+                        == Some(ITEM_TYPE_FUNCTION_CALL)
+                    {
                         let call_id = item_obj
                             .get("call_id")
                             .and_then(|c| c.as_str())
@@ -798,7 +905,7 @@ impl ProtocolReader for ResponsesReader {
                         {
                             // Clamp the wire index before the cast: a crafted `u64::MAX` would
                             // otherwise feed the per-stream set and downstream index arithmetic
-                            // unbounded. Saturate at MAX_OUTPUT_INDEX (mirrors openai.rs).
+                            // unbounded. Saturate at MAX_OUTPUT_INDEX (mirrors openai_chat.rs).
                             let idx = (output_index as usize).min(MAX_OUTPUT_INDEX);
                             // Record the open tool index so the terminal `output_item.done` for
                             // this index closes the block EXACTLY once. Native Responses emits a
@@ -816,7 +923,7 @@ impl ProtocolReader for ResponsesReader {
                             // BlockStart→BlockStart→BlockStop sequence (a duplicate
                             // `content_block_start`), a deterministic proxy tell that corrupts a
                             // downstream writer's tool-call state. Beyond the cap a NEW index is
-                            // silently skipped (no BlockStart), matching openai.rs.
+                            // silently skipped (no BlockStart), matching openai_chat.rs.
                             // An index must not open as BOTH a tool and a text block: a text delta
                             // at this same `output_index` stores its open marker under
                             // `idx + TEXT_INDEX_KEY_OFFSET`, and if such a text block is already open
@@ -836,7 +943,9 @@ impl ProtocolReader for ResponsesReader {
                                 });
                             }
                         }
-                    } else if item_obj.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
+                    } else if item_obj.get("type").and_then(|t| t.as_str())
+                        == Some(ITEM_TYPE_REASONING)
+                    {
                         // H1 REASONING (stream): a native Responses stream opens a chain-of-thought
                         // item with `output_item.added` typed `reasoning`. The prior `_`/`message`
                         // no-op DROPPED it, so a reasoning stream lost its thinking on any
@@ -859,7 +968,9 @@ impl ProtocolReader for ResponsesReader {
                                 });
                             }
                         }
-                    } else if item_obj.get("type").and_then(|t| t.as_str()) == Some("message") {
+                    } else if item_obj.get("type").and_then(|t| t.as_str())
+                        == Some(ITEM_TYPE_MESSAGE)
+                    {
                     }
                 }
             }
@@ -872,7 +983,7 @@ impl ProtocolReader for ResponsesReader {
             // opening the Thinking BlockStart if the `output_item.added` was absent (some backends emit
             // reasoning deltas with no preceding `added`). The block is tracked at the RAW idx in
             // `open_tools`, closed once by the terminal `output_item.done`/stream end.
-            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+            EVT_REASONING_TEXT_DELTA | "response.reasoning_summary_text.delta" => {
                 let delta = data
                     .get("delta")
                     .and_then(|d| d.as_str())
@@ -906,7 +1017,7 @@ impl ProtocolReader for ResponsesReader {
                 }
             }
 
-            "response.output_text.delta" => {
+            EVT_OUTPUT_TEXT_DELTA => {
                 let delta = data
                     .get("delta")
                     .and_then(|d| d.as_str())
@@ -967,7 +1078,7 @@ impl ProtocolReader for ResponsesReader {
                 }
             }
 
-            "response.function_call_arguments.delta" => {
+            EVT_FUNCTION_CALL_ARGS_DELTA => {
                 let delta = data
                     .get("delta")
                     .and_then(|d| d.as_str())
@@ -983,7 +1094,7 @@ impl ProtocolReader for ResponsesReader {
                         // so a BlockDelta against it would be a tool-argument fragment for a block
                         // with no `content_block_start`: an invalid event sequence that breaks a
                         // strict SDK reassembling tool-call arguments and a distinguishability tell.
-                        // Drop it (mirrors openai.rs's `state.open_tools.contains` guard).
+                        // Drop it (mirrors openai_chat.rs's `state.open_tools.contains` guard).
                         if state.open_tools.contains(&idx) {
                             out.push(IrStreamEvent::BlockDelta {
                                 index: idx,
@@ -994,7 +1105,7 @@ impl ProtocolReader for ResponsesReader {
                 }
             }
 
-            "response.output_item.done" | "response.content_part.done" => {
+            EVT_OUTPUT_ITEM_DONE | "response.content_part.done" => {
                 if let Some(output_index) = data.get("output_index").and_then(|i| i.as_u64()) {
                     let idx = (output_index as usize).min(MAX_OUTPUT_INDEX);
                     // Native Responses closes a single text item with TWO terminal frames at the
@@ -1025,7 +1136,7 @@ impl ProtocolReader for ResponsesReader {
                 }
             }
 
-            "response.completed" | "response.failed" | "response.incomplete" => {
+            EVT_RESPONSE_COMPLETED | EVT_RESPONSE_FAILED | EVT_RESPONSE_INCOMPLETE => {
                 // A terminal event ends the message. Any content block still open at this point
                 // (a tool index tracked as a raw `idx`, or a text index tracked under
                 // `TEXT_INDEX_KEY_OFFSET`) was opened with a BlockStart but never received its
@@ -1080,7 +1191,7 @@ impl ProtocolReader for ResponsesReader {
                     // (e.g. an Anthropic client would see stop_reason=end_turn). Surface it as an
                     // explicit IrStreamEvent::Error so the failure propagates, then still terminate
                     // the stream so consumers do not hang.
-                    if status == "failed" {
+                    if status == STATUS_FAILED {
                         let provider_signal = response_obj
                             .get("error")
                             .and_then(|e| e.get("code"))
@@ -1092,7 +1203,7 @@ impl ProtocolReader for ResponsesReader {
                                     .and_then(|t| t.as_str())
                             })
                             .map(String::from)
-                            .or_else(|| Some("response_failed".to_string()));
+                            .or_else(|| Some(SIGNAL_RESPONSE_FAILED.to_string()));
                         // Derive the breaker class from the captured provider signal rather than
                         // hardcoding ServerError: an auth/rate-limit/context-length failure that
                         // arrives mid-stream must classify the same way it would on the non-stream
@@ -1100,7 +1211,7 @@ impl ProtocolReader for ResponsesReader {
                         // fallback "response_failed" (no error code/type present) maps to the
                         // default ServerError bucket.
                         let class = class_for_response_failed(
-                            provider_signal.as_deref().unwrap_or("response_failed"),
+                            provider_signal.as_deref().unwrap_or(SIGNAL_RESPONSE_FAILED),
                         );
                         out.push(IrStreamEvent::Error(IrError {
                             class,
@@ -1116,30 +1227,14 @@ impl ProtocolReader for ResponsesReader {
                     // successful end_turn. An unrecognized status is treated as a terminal stop
                     // with no specific reason (None) rather than silently claiming success.
                     let stop_reason = match status {
-                        "completed" => Some("end_turn".to_string()),
-                        "incomplete" => {
-                            if let Some(incomplete_details) = response_obj.get("incomplete_details")
-                            {
-                                if let Some(reason) =
-                                    incomplete_details.get("reason").and_then(|r| r.as_str())
-                                {
-                                    match reason {
-                                        "max_output_tokens" => Some("max_tokens".to_string()),
-                                        "content_filter" => Some("safety".to_string()),
-                                        _ => Some(reason.to_string()),
-                                    }
-                                } else {
-                                    // No machine-readable reason: an `incomplete` status is NOT a
-                                    // successful end_turn. Mirror the non-streaming `read_response`
-                                    // and surface None rather than masking the truncation.
-                                    None
-                                }
-                            } else {
-                                // `incomplete` with no `incomplete_details` at all — same as above.
-                                None
-                            }
-                        }
-                        "" => Some("end_turn".to_string()),
+                        STATUS_COMPLETED | "" => Some(crate::ir::IrStopReason::EndTurn),
+                        // An `incomplete` is NOT a successful end_turn; map its machine-readable
+                        // reason, or surface None (don't mask the truncation) when there is none.
+                        STATUS_INCOMPLETE => response_obj
+                            .get("incomplete_details")
+                            .and_then(|d| d.get("reason"))
+                            .and_then(|r| r.as_str())
+                            .map(read_responses_incomplete_reason),
                         _ => None,
                     };
 
@@ -1150,19 +1245,78 @@ impl ProtocolReader for ResponsesReader {
                     // Anthropic ingress) never saw the tool-call finish signal on the streaming path.
                     // The `response.completed` event carries the fully-assembled `output`, so detect a
                     // function_call item there and override only the successful end_turn cases.
-                    let stop_reason = if matches!(stop_reason.as_deref(), Some("end_turn"))
+                    let stop_reason = if stop_reason == Some(crate::ir::IrStopReason::EndTurn)
                         && response_obj
                             .get("output")
                             .and_then(|o| o.as_array())
                             .is_some_and(|items| {
                                 items.iter().any(|it| {
-                                    it.get("type").and_then(|t| t.as_str()) == Some("function_call")
+                                    it.get("type").and_then(|t| t.as_str())
+                                        == Some(ITEM_TYPE_FUNCTION_CALL)
                                 })
                             }) {
-                        Some("tool_use".to_string())
+                        Some(crate::ir::IrStopReason::ToolUse)
                     } else {
                         stop_reason
                     };
+
+                    // Refusal override, mirroring the non-streaming `read_response`. A STREAMED
+                    // Responses refusal does NOT arrive via `output_text.delta` — the refusal text
+                    // appears ONLY in this terminal `response.completed` frame as an
+                    // `output[].content[]` `{type:"refusal", refusal:"..."}` part (status stays
+                    // `completed`). Without this scan the streaming path SILENTLY DROPPED the refusal
+                    // text and left stop_reason=end_turn — the client saw an empty response with no
+                    // refusal signal. Emit the refusal text as a Text block (opened here, closed by
+                    // `close_open_blocks` below) and promote stop_reason end_turn -> Refusal so a
+                    // non-Responses client still sees the refusal. Anthropic/Bedrock have no distinct
+                    // refusal part, so a refusal is plain assistant text + a `refusal` stop there.
+                    let mut saw_refusal = false;
+                    if let Some(items) = response_obj.get("output").and_then(|o| o.as_array()) {
+                        for (item_pos, item) in items.iter().enumerate() {
+                            let Some(content) = item.get("content").and_then(|c| c.as_array())
+                            else {
+                                continue;
+                            };
+                            for block in content {
+                                if block.get("type").and_then(|t| t.as_str()) != Some("refusal") {
+                                    continue;
+                                }
+                                let Some(text) = block
+                                    .get("refusal")
+                                    .and_then(|r| r.as_str())
+                                    .filter(|s| !s.is_empty())
+                                else {
+                                    continue;
+                                };
+                                saw_refusal = true;
+                                // Open a Text block for the refusal text at this item's index, unless
+                                // that index is already open (defensive — a refusal is normally the
+                                // sole output) or the per-stream block cap is reached.
+                                let idx = item_pos.min(MAX_OUTPUT_INDEX);
+                                let text_key = idx + TEXT_INDEX_KEY_OFFSET;
+                                if !state.open_tools.contains(&idx)
+                                    && !state.open_tools.contains(&text_key)
+                                    && state.open_tools.len() < MAX_OPEN_TOOLS
+                                {
+                                    state.open_tools.insert(text_key);
+                                    out.push(IrStreamEvent::BlockStart {
+                                        index: idx,
+                                        block: crate::ir::IrBlockMeta::Text,
+                                    });
+                                    out.push(IrStreamEvent::BlockDelta {
+                                        index: idx,
+                                        delta: crate::ir::IrDelta::TextDelta(text.to_string()),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    let stop_reason =
+                        if saw_refusal && stop_reason == Some(crate::ir::IrStopReason::EndTurn) {
+                            Some(crate::ir::IrStopReason::Refusal)
+                        } else {
+                            stop_reason
+                        };
 
                     let usage = response_obj
                         .get("usage")
@@ -1208,7 +1362,7 @@ impl ProtocolReader for ResponsesReader {
                         usage,
                     });
                     out.push(IrStreamEvent::MessageStop);
-                } else if event_type == "response.failed" {
+                } else if event_type == EVT_RESPONSE_FAILED {
                     // Terminal failure event with no nested `response` object (e.g. a truncated SSE
                     // frame or a proxy that stripped the body). The wire `event_type` is the only
                     // failure signal available — honour it. Surfacing this as a successful end_turn
@@ -1219,7 +1373,7 @@ impl ProtocolReader for ResponsesReader {
                     // the wire event_type; classify via the shared helper (which defaults the
                     // unrecognized "response_failed" sentinel to ServerError) so both response.failed
                     // arms derive their class through the same mapping.
-                    let provider_signal = "response_failed";
+                    let provider_signal = SIGNAL_RESPONSE_FAILED;
                     out.push(IrStreamEvent::Error(IrError {
                         class: class_for_response_failed(provider_signal),
                         provider_signal: Some(provider_signal.to_string()),
@@ -1240,8 +1394,8 @@ impl ProtocolReader for ResponsesReader {
                     // `read_response`). Only a `completed` event maps to end_turn. (`failed` is
                     // handled by the branch above; this else covers `completed`/`incomplete`.)
                     let stop_reason = match event_type {
-                        "response.completed" => Some("end_turn".to_string()),
-                        "response.incomplete" => None,
+                        EVT_RESPONSE_COMPLETED => Some(crate::ir::IrStopReason::EndTurn),
+                        EVT_RESPONSE_INCOMPLETE => None,
                         // No other event_type reaches this arm (the outer match guards the set and
                         // `response.failed` is handled above), so anything else is an unrecognized
                         // terminal with no specific reason.
@@ -1272,7 +1426,7 @@ impl ProtocolReader for ResponsesReader {
     fn read_response(&self, body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError> {
         let obj = body.as_object().ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".to_string()),
+            provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
             retry_after: None,
         })?;
 
@@ -1288,7 +1442,7 @@ impl ProtocolReader for ResponsesReader {
         // upstream signal so the real error reaches the client and the breaker sees the correct
         // class via `class_for_response_failed`. Mirror the streaming `response.failed` arm: prefer
         // the `error.code` enum, fall back to `error.type`, then a generic `response_failed`.
-        if status == "failed" {
+        if status == STATUS_FAILED {
             let provider_signal = obj
                 .get("error")
                 .and_then(|e| e.get("code"))
@@ -1299,12 +1453,13 @@ impl ProtocolReader for ResponsesReader {
                         .and_then(|t| t.as_str())
                 })
                 .map(String::from)
-                .or_else(|| Some("response_failed".to_string()));
+                .or_else(|| Some(SIGNAL_RESPONSE_FAILED.to_string()));
             // Same class as the streaming `response.failed` arms: derive the breaker class from the
             // captured provider signal rather than hardcoding ServerError, so an auth/rate-limit/
             // context-length failed body classifies correctly (right breaker disposition/failover).
-            let class =
-                class_for_response_failed(provider_signal.as_deref().unwrap_or("response_failed"));
+            let class = class_for_response_failed(
+                provider_signal.as_deref().unwrap_or(SIGNAL_RESPONSE_FAILED),
+            );
             return Err(IrError {
                 class,
                 provider_signal,
@@ -1312,34 +1467,26 @@ impl ProtocolReader for ResponsesReader {
             });
         }
 
-        let mut stop_reason: Option<String> = match status {
-            "completed" => Some("end_turn".to_string()),
-            "incomplete" => {
-                if let Some(incomplete_details) = obj.get("incomplete_details") {
-                    if let Some(reason) = incomplete_details.get("reason").and_then(|r| r.as_str())
-                    {
-                        match reason {
-                            "max_output_tokens" => Some("max_tokens".to_string()),
-                            "content_filter" => Some("safety".to_string()),
-                            _ => Some(reason.to_string()),
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
+        let mut stop_reason: Option<crate::ir::IrStopReason> = match status {
+            STATUS_COMPLETED => Some(crate::ir::IrStopReason::EndTurn),
+            STATUS_INCOMPLETE => obj
+                .get("incomplete_details")
+                .and_then(|d| d.get("reason"))
+                .and_then(|r| r.as_str())
+                .map(read_responses_incomplete_reason),
             _ => None,
         };
 
         let mut content: Vec<crate::ir::IrBlock> = Vec::new();
+        // A refusal rides on a `refusal` content part with `status:"completed"`, so the refusal
+        // SIGNAL is not in `status`. Track it here to promote `stop_reason` to `Refusal` below.
+        let mut saw_refusal = false;
         if let Some(output_arr) = obj.get("output").and_then(|o| o.as_array()) {
             for item in output_arr {
                 let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
                 match item_type {
-                    "message" => {
+                    ITEM_TYPE_MESSAGE => {
                         if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
                             for block_item in content_arr {
                                 let block_type = block_item
@@ -1347,10 +1494,28 @@ impl ProtocolReader for ResponsesReader {
                                     .and_then(|t| t.as_str())
                                     .unwrap_or("");
 
-                                if block_type == "output_text" {
+                                if block_type == CONTENT_TYPE_OUTPUT_TEXT {
                                     if let Some(text) =
                                         block_item.get("text").and_then(|t| t.as_str())
                                     {
+                                        content.push(crate::ir::IrBlock::Text {
+                                            text: text.to_string(),
+                                            cache_control: None,
+                                            citations: Vec::new(),
+                                        });
+                                    }
+                                } else if block_type == "refusal" {
+                                    // A model refusal rides on a `{type:"refusal", refusal:"..."}`
+                                    // content part (the status stays `completed`). The prior reader
+                                    // only matched `output_text`, SILENTLY DROPPING the refusal text.
+                                    // Carry it as assistant Text so the explanation survives the
+                                    // translation (Anthropic/Bedrock have no distinct refusal part —
+                                    // a refusal is plain assistant text there). The refusal SIGNAL is
+                                    // separately promoted onto `stop_reason` below.
+                                    if let Some(text) =
+                                        block_item.get("refusal").and_then(|t| t.as_str())
+                                    {
+                                        saw_refusal = true;
                                         content.push(crate::ir::IrBlock::Text {
                                             text: text.to_string(),
                                             cache_control: None,
@@ -1362,7 +1527,7 @@ impl ProtocolReader for ResponsesReader {
                         }
                     }
 
-                    "function_call" => {
+                    ITEM_TYPE_FUNCTION_CALL => {
                         let call_id = item
                             .get("call_id")
                             .and_then(|c| c.as_str())
@@ -1411,7 +1576,7 @@ impl ProtocolReader for ResponsesReader {
                     // value, but cross-vendor reasoning-reuse (replaying a foreign vendor's signature)
                     // is inherently unsupported. No behavior change; documented so the limitation is
                     // explicit rather than an implied promise of cross-vendor reasoning continuation.
-                    "reasoning" => {
+                    ITEM_TYPE_REASONING => {
                         let text = read_reasoning_text(item);
                         let signature = item
                             .get("encrypted_content")
@@ -1421,7 +1586,12 @@ impl ProtocolReader for ResponsesReader {
                         // Skip a wholly-empty reasoning item (no text and no encrypted_content)
                         // rather than emitting a blank Thinking block.
                         if !text.is_empty() || signature.is_some() {
-                            content.push(crate::ir::IrBlock::Thinking { text, signature });
+                            content.push(crate::ir::IrBlock::Thinking {
+                                text,
+                                signature,
+                                redacted: false,
+                                cache_control: None,
+                            });
                         }
                     }
 
@@ -1433,7 +1603,7 @@ impl ProtocolReader for ResponsesReader {
             // `output` here is a genuine parse failure (malformed body).
             return Err(IrError {
                 class: StatusClass::ClientError,
-                provider_signal: Some("ir_parse".to_string()),
+                provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
                 retry_after: None,
             });
         }
@@ -1445,32 +1615,40 @@ impl ProtocolReader for ResponsesReader {
         // tool call, and clobbering `max_tokens`/`safety` with `tool_use` would tell the client the
         // call is complete and deny the truncation signal to the breaker. Only the clean-finish case
         // (`end_turn`) is promoted; any other reason is left untouched.
-        if matches!(stop_reason.as_deref(), Some("end_turn"))
+        if stop_reason == Some(crate::ir::IrStopReason::EndTurn)
             && content
                 .iter()
                 .any(|b| matches!(b, crate::ir::IrBlock::ToolUse { .. }))
         {
-            stop_reason = Some("tool_use".to_string());
+            stop_reason = Some(crate::ir::IrStopReason::ToolUse);
         }
 
-        let usage_val = obj.get("usage").ok_or(IrError {
-            class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".into()),
-            retry_after: None,
-        })?;
+        // A `completed` response that carried a `refusal` part is a refusal, not a clean end_turn.
+        // Promote the typed `Refusal` stop_reason (which the Anthropic/OpenAI writers translate) so
+        // the refusal signal survives even though the Responses `status` was `completed`.
+        if saw_refusal && stop_reason == Some(crate::ir::IrStopReason::EndTurn) {
+            stop_reason = Some(crate::ir::IrStopReason::Refusal);
+        }
 
-        let cached = read_cached_tokens(usage_val);
+        // Tolerate an absent `usage` object leniently — zero-default rather than hard-erroring,
+        // mirroring all five sibling readers (openai_chat.rs, gemini, cohere, etc.). A missing
+        // `usage` on an otherwise valid 200 is an upstream response-format quirk (a mock/staging/
+        // proxy backend that omits it), NOT a client mistake: a `ClientError` here would make
+        // forward.rs discard a valid body and emit a spurious 500.
+        let usage_val = obj.get("usage");
+
+        let cached = usage_val.and_then(read_cached_tokens);
         let usage = crate::ir::IrUsage {
             // NORMALIZE to the additive-cache convention: the Responses API's `input_tokens` is a
             // TOTAL that already INCLUDES the cached prefix, so subtract the cached tokens to leave
             // only the uncached input. `saturating_sub` guards an odd upstream where cached > input.
             input_tokens: usage_val
-                .get("input_tokens")
+                .and_then(|u| u.get("input_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0)
                 .saturating_sub(cached.unwrap_or(0)),
             output_tokens: usage_val
-                .get("output_tokens")
+                .and_then(|u| u.get("output_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             cache_creation_input_tokens: None,
@@ -1512,14 +1690,14 @@ impl ProtocolReader for ResponsesReader {
 fn responses_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrError> {
     let obj = block_val.as_object().ok_or(IrError {
         class: StatusClass::ClientError,
-        provider_signal: Some("ir_parse".to_string()),
+        provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
         retry_after: None,
     })?;
 
     let block_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match block_type {
-        "input_text" | "output_text" => {
+        CONTENT_TYPE_INPUT_TEXT | CONTENT_TYPE_OUTPUT_TEXT => {
             let text_val = obj.get("text");
             let text = text_val.and_then(|t| t.as_str()).unwrap_or("").to_string();
             Ok(crate::ir::IrBlock::Text {
@@ -1533,13 +1711,13 @@ fn responses_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, 
             // emitting an empty Image block. Shared with the request-input reader.
             responses_input_image_block(block_val).ok_or(IrError {
                 class: StatusClass::ClientError,
-                provider_signal: Some("ir_parse".to_string()),
+                provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
                 retry_after: None,
             })
         }
         _ => Err(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".to_string()),
+            provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
             retry_after: None,
         }),
     }
@@ -1551,26 +1729,17 @@ fn responses_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, 
 /// `file_id` image without an `image_url`: the writer keys on this value to re-emit
 /// `{type:"input_image","file_id":<data>}` instead of an `image_url`. A real image MIME type
 /// (`image/png`, …) and a non-data URL can never equal this literal, so the dispatch is unambiguous.
-///
-/// Re-exported from the shared [`super::FILE_ID_IMAGE_SENTINEL`] so every NON-Responses writer keys
-/// on the SAME literal to SKIP an unresolvable file_id image (see `super::is_unresolvable_image_ref`)
-/// rather than emit a corrupt block — a file_id is an OpenAI-Responses-scoped reference with no
-/// cross-vendor projection. The Responses writer (same-protocol) still decodes it to the native form.
-use super::FILE_ID_IMAGE_SENTINEL;
-
 /// Build an IR `Image` block from a Responses `input_image` content object (L5). Prefers an inline
-/// `image_url` when present (parsed via the shared `parse_image_url` into the base64-or-URL-sentinel
-/// pair). Otherwise, if the image references an uploaded file by `file_id`, carry that id verbatim
-/// under the `FILE_ID_IMAGE_SENTINEL` media_type so the writer reconstructs the `file_id` form and the
-/// round-trip is lossless — instead of the prior behavior of emitting an EMPTY Image block (both
-/// fields `""`), which silently corrupted a file_id image on the cross-protocol/round-trip path.
-/// Returns `None` when the block carries NEITHER an `image_url` NOR a `file_id` (a degenerate image
-/// reference), so the caller skips it cleanly rather than emitting an empty block.
+/// `image_url` (parsed via the shared `parse_image_url` into a `Base64`/`Url` source). Otherwise, an
+/// uploaded-file reference becomes the typed `FileId` source so the writer reconstructs the native
+/// `file_id` form losslessly. Returns `None` when the block carries NEITHER (a degenerate reference).
 fn responses_input_image_block(item: &serde_json::Value) -> Option<crate::ir::IrBlock> {
     let image_url = item.get("image_url").and_then(|u| u.as_str());
     if let Some(url) = image_url.filter(|u| !u.is_empty()) {
-        let (media_type, data) = super::parse_image_url(url);
-        return Some(crate::ir::IrBlock::Image { media_type, data });
+        return Some(crate::ir::IrBlock::Image {
+            source: super::parse_image_url(url),
+            cache_control: None,
+        });
     }
     if let Some(file_id) = item
         .get("file_id")
@@ -1578,8 +1747,11 @@ fn responses_input_image_block(item: &serde_json::Value) -> Option<crate::ir::Ir
         .filter(|f| !f.is_empty())
     {
         return Some(crate::ir::IrBlock::Image {
-            media_type: FILE_ID_IMAGE_SENTINEL.to_string(),
-            data: file_id.to_string(),
+            source: crate::ir::IrImageSource::Vendor {
+                vendor: VENDOR_NAME,
+                value: serde_json::json!({ "file_id": file_id }),
+            },
+            cache_control: None,
         });
     }
     None
@@ -1594,7 +1766,10 @@ fn responses_input_image_block(item: &serde_json::Value) -> Option<crate::ir::Ir
 /// Returns an empty string when neither array carries text, so the caller can skip an empty item.
 fn read_reasoning_text(item: &serde_json::Value) -> String {
     let mut text = String::new();
-    for (arr_key, type_key) in [("content", "reasoning_text"), ("summary", "summary_text")] {
+    for (arr_key, type_key) in [
+        ("content", CONTENT_TYPE_REASONING_TEXT),
+        ("summary", "summary_text"),
+    ] {
         if let Some(arr) = item.get(arr_key).and_then(|c| c.as_array()) {
             for part in arr {
                 // Accept the part whether or not it carries the exact `type` literal — a missing or
@@ -1616,6 +1791,40 @@ fn read_reasoning_text(item: &serde_json::Value) -> String {
     text
 }
 
+/// Responses `incomplete_details.reason` → canonical [`crate::ir::IrStopReason`]. The ONLY place that
+/// knows the Responses truncation-reason vocabulary; an unmodeled reason maps to `Other`.
+fn read_responses_incomplete_reason(reason: &str) -> crate::ir::IrStopReason {
+    use crate::ir::IrStopReason as S;
+    match reason {
+        INCOMPLETE_REASON_MAX_OUTPUT => S::MaxTokens,
+        INCOMPLETE_REASON_CONTENT_FILTER => S::Safety,
+        "refusal" => S::Refusal,
+        _ => S::Other,
+    }
+}
+
+/// [`crate::ir::IrStopReason`] → Responses terminal `status`. Only a truncation (`max_tokens`) or a
+/// content-filter (`safety`) renders the turn `incomplete`; everything else (incl. tool_use, refusal)
+/// is `completed` (a refusal/tool-call is surfaced via output items, not the status).
+fn write_responses_status(reason: crate::ir::IrStopReason) -> &'static str {
+    use crate::ir::IrStopReason as S;
+    match reason {
+        S::MaxTokens | S::Safety => STATUS_INCOMPLETE,
+        _ => STATUS_COMPLETED,
+    }
+}
+
+/// [`crate::ir::IrStopReason`] → Responses `incomplete_details.reason` (only consulted when the status
+/// is `incomplete`, i.e. for `MaxTokens`/`Safety`; any other reason defaults to `other`).
+fn write_responses_incomplete_reason(reason: crate::ir::IrStopReason) -> &'static str {
+    use crate::ir::IrStopReason as S;
+    match reason {
+        S::MaxTokens => INCOMPLETE_REASON_MAX_OUTPUT,
+        S::Safety => INCOMPLETE_REASON_CONTENT_FILTER,
+        _ => INCOMPLETE_REASON_OTHER,
+    }
+}
+
 /// Normalize a Responses `text` object's `format` into the IR's canonical `response_format` shape
 /// (M1). The Responses API carries structured-output config at `text.format` with a FLAT json_schema
 /// shape (`{"type":"json_schema","name":...,"schema":...,"strict":...,"description":...}`), whereas
@@ -1626,55 +1835,67 @@ fn read_reasoning_text(item: &serde_json::Value) -> String {
 /// no extra fields and pass through as `{"type":...}`. Returns `None` when `text.format` is absent so
 /// the IR field stays unset (no spurious response_format on a request that carried none). An
 /// unrecognized `type` is passed through verbatim rather than dropped.
-fn read_text_format(text_val: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+fn read_text_format(text_val: Option<&serde_json::Value>) -> Option<crate::ir::IrResponseFormat> {
     let format = text_val.and_then(|t| t.get("format"))?;
-    let format_obj = format.as_object()?;
-    let kind = format_obj
-        .get("type")
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    if kind == "json_schema" {
-        // Re-nest the flat Responses fields under `json_schema` to match the canonical IR shape.
-        let mut inner = serde_json::Map::new();
-        for key in ["name", "schema", "strict", "description"] {
-            if let Some(v) = format_obj.get(key) {
-                inner.insert(key.to_string(), v.clone());
-            }
-        }
-        Some(serde_json::json!({
-            "type": "json_schema",
-            "json_schema": serde_json::Value::Object(inner),
-        }))
-    } else {
-        // `text` / `json_object` (or any future/unknown type): carry the object through verbatim —
-        // its shape is already identical between the two surfaces.
-        Some(format.clone())
+    let o = format.as_object()?;
+    match o.get("type").and_then(|t| t.as_str()) {
+        Some("text") => Some(crate::ir::IrResponseFormat {
+            json: false,
+            schema: None,
+            name: None,
+            strict: None,
+            description: None,
+        }),
+        // The Responses `text.format` json_schema form is FLAT — name/schema/strict/description sit
+        // beside `type` (not nested under `json_schema` as in OpenAI).
+        Some("json_schema") => Some(crate::ir::IrResponseFormat {
+            json: true,
+            schema: o.get("schema").cloned(),
+            name: o.get("name").and_then(|n| n.as_str()).map(String::from),
+            strict: o.get("strict").and_then(|s| s.as_bool()),
+            description: o
+                .get("description")
+                .and_then(|d| d.as_str())
+                .map(String::from),
+        }),
+        // `json_object` / any unknown type → free-form JSON (safe default).
+        Some(_) => Some(crate::ir::IrResponseFormat {
+            json: true,
+            schema: None,
+            name: None,
+            strict: None,
+            description: None,
+        }),
+        None => None,
     }
 }
 
-/// Inverse of [`read_text_format`] (M1): convert the IR's canonical `response_format` into a Responses
-/// `text.format` object. The canonical json_schema form NESTS `{name,schema,strict,description}` under
-/// a `json_schema` key; the Responses `text.format` form is FLAT (those fields sit beside `type`), so
-/// this flattens them. `text`/`json_object` formats pass through verbatim. Returns the `format` value
-/// to place under `text.format`; the caller wraps it in `{"text":{"format":...}}`.
-fn text_format_from_response_format(rf: &serde_json::Value) -> serde_json::Value {
-    let kind = rf.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    if kind == "json_schema" {
-        let mut flat = serde_json::Map::new();
-        flat.insert("type".to_string(), serde_json::json!("json_schema"));
-        // The canonical shape nests the schema fields under `json_schema`; flatten them up beside
-        // `type`. Fall back to reading them at the top level too, so a response_format that ALREADY
-        // arrived flat (e.g. from a Responses-native read) still flattens correctly.
-        let inner = rf.get("json_schema");
-        for key in ["name", "schema", "strict", "description"] {
-            if let Some(v) = inner.and_then(|i| i.get(key)).or_else(|| rf.get(key)) {
-                flat.insert(key.to_string(), v.clone());
+/// Project the agnostic [`crate::ir::IrResponseFormat`] into a Responses `text.format` object (inverse
+/// of [`read_text_format`]). The ONLY code that builds the Responses structured-output wire shape: the
+/// json_schema form is FLAT — `name`/`schema`/`strict`/`description` sit beside `type`. Returns the
+/// `format` value to place under `text.format`; the caller wraps it in `{"text":{"format":...}}`.
+fn write_text_format(rf: &crate::ir::IrResponseFormat) -> serde_json::Value {
+    if !rf.json {
+        return serde_json::json!({"type": "text"});
+    }
+    match &rf.schema {
+        Some(schema) => {
+            let mut f = serde_json::Map::new();
+            f.insert("type".to_string(), serde_json::json!("json_schema"));
+            f.insert(
+                "name".to_string(),
+                serde_json::json!(rf.name.as_deref().unwrap_or("response")),
+            );
+            f.insert("schema".to_string(), schema.clone());
+            if let Some(s) = rf.strict {
+                f.insert("strict".to_string(), serde_json::json!(s));
             }
+            if let Some(d) = &rf.description {
+                f.insert("description".to_string(), serde_json::json!(d));
+            }
+            serde_json::Value::Object(f)
         }
-        serde_json::Value::Object(flat)
-    } else {
-        // `text` / `json_object` / unknown: already in the right (flat) shape; emit verbatim.
-        rf.clone()
+        None => serde_json::json!({"type": "json_object"}),
     }
 }
 
@@ -2288,7 +2509,7 @@ impl ProtocolWriter for ResponsesWriter {
         // Shared warn+OMIT policy: a credential with bytes invalid for an HTTP header value is
         // dropped (with a protocol-named warn, never the key bytes) rather than emitting an empty
         // `Authorization:` tell. See `super::bearer_auth_headers`.
-        super::bearer_auth_headers("responses", key)
+        super::bearer_auth_headers(VENDOR_NAME, key)
     }
 
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
@@ -2326,51 +2547,57 @@ impl ProtocolWriter for ResponsesWriter {
                     // FIRST (and only when it actually has content), with the tool items appended
                     // after it in order — matching the conversation order the assistant produced.
                     let mut tool_items: Vec<serde_json::Value> = Vec::new();
+                    // Fix #6: prior-turn reasoning re-emitted as top-level `reasoning` input items,
+                    // placed BEFORE the message they precede (matching how the model produced them).
+                    let mut reasoning_items: Vec<serde_json::Value> = Vec::new();
                     for block in &msg.content {
                         match block {
                             crate::ir::IrBlock::Text { text, .. } => {
                                 let type_str = if msg.role == crate::ir::IrRole::User {
-                                    "input_text"
+                                    CONTENT_TYPE_INPUT_TEXT
                                 } else {
-                                    "output_text"
+                                    CONTENT_TYPE_OUTPUT_TEXT
                                 };
                                 content_arr.push(serde_json::json!({
                                     "type": type_str,
                                     "text": text
                                 }));
                             }
-                            crate::ir::IrBlock::Image { media_type, data } => {
-                                // L5: an Image carrying a `file_id` reference (the
-                                // FILE_ID_IMAGE_SENTINEL media_type) re-emits the native `file_id`
-                                // form, NOT an `image_url` — wrapping a file_id into a data URI would
-                                // corrupt it. Otherwise reconstruct the original `image_url`: a
-                                // URL-sentinel image is emitted verbatim, a base64 image is re-wrapped
-                                // as a data URI (the inverse of `parse_image_url`, so a same-protocol
-                                // round-trip is lossless).
-                                if media_type == FILE_ID_IMAGE_SENTINEL {
-                                    content_arr.push(serde_json::json!({
-                                        "type": "input_image",
-                                        "file_id": data
-                                    }));
-                                } else if super::is_unresolvable_image_ref(media_type) {
-                                    // A non-file_id unresolvable reference here is a Bedrock
-                                    // `s3Location` image (IMAGE_S3_SENTINEL) reaching Responses
-                                    // egress cross-protocol: an AWS-S3 URI has no Responses analog and
-                                    // wrapping it as a `data:image_s3;base64,<json>` URI would corrupt
-                                    // the input_image. SKIP it (no lossless cross-vendor projection).
-                                    tracing::warn!(
-                                        "dropping unresolvable vendor-scoped image reference \
-                                         (media_type={media_type}) on Responses egress: a Bedrock \
-                                         s3Location has no cross-vendor analog and would corrupt an \
-                                         input_image; the block is NOT emitted"
-                                    );
-                                } else {
-                                    let image_url = super::image_url_from_ir(media_type, data);
-                                    content_arr.push(serde_json::json!({
-                                        "type": "input_image",
-                                        "image_url": image_url
-                                    }));
+                            crate::ir::IrBlock::Image { source, .. } => match source {
+                                // L5: a Responses-produced vendor reference is a `file_id` — re-emit
+                                // the native `input_image.file_id` form (a data URI would corrupt it).
+                                crate::ir::IrImageSource::Vendor { vendor, value }
+                                    if *vendor == VENDOR_NAME =>
+                                {
+                                    if let Some(id) = value.get("file_id").and_then(|i| i.as_str())
+                                    {
+                                        content_arr.push(serde_json::json!({
+                                            "type": "input_image",
+                                            "file_id": id
+                                        }));
+                                    }
                                 }
+                                // A foreign vendor reference (a Bedrock s3Location) has no Responses
+                                // analog — drop with a warn rather than corrupt the block.
+                                crate::ir::IrImageSource::Vendor { .. } => {
+                                    tracing::warn!(
+                                        "dropping unresolvable foreign vendor image reference on \
+                                         Responses egress: no cross-vendor analog"
+                                    );
+                                }
+                                // A URL/base64 image reconstructs the original `image_url`.
+                                url_or_b64 => {
+                                    if let Some(image_url) = super::image_url_from_ir(url_or_b64) {
+                                        content_arr.push(serde_json::json!({
+                                            "type": "input_image",
+                                            "image_url": image_url
+                                        }));
+                                    }
+                                }
+                            },
+                            crate::ir::IrBlock::Json(_) => {
+                                // Structured-json (Bedrock tool-result content) has no Responses
+                                // input-content shape; dropped here.
                             }
                             crate::ir::IrBlock::ToolUse {
                                 id, name, input, ..
@@ -2378,7 +2605,7 @@ impl ProtocolWriter for ResponsesWriter {
                                 let args_str = crate::json::to_string(input)
                                     .unwrap_or_else(|_| "{}".to_string());
                                 tool_items.push(serde_json::json!({
-                                    "type": "function_call",
+                                    "type": ITEM_TYPE_FUNCTION_CALL,
                                     "call_id": id,
                                     "name": name,
                                     "arguments": args_str
@@ -2392,7 +2619,7 @@ impl ProtocolWriter for ResponsesWriter {
                             } => {
                                 // Concatenate adjacent text blocks WITHOUT a separator: a space
                                 // between fragments corrupts base64 / split JSON payloads.
-                                // Mirrors `openai.rs::write_request`'s tool_result concat fix.
+                                // Mirrors `openai_chat.rs::write_request`'s tool_result concat fix.
                                 let output_text = content
                                     .iter()
                                     .filter_map(|b| match b {
@@ -2421,14 +2648,58 @@ impl ProtocolWriter for ResponsesWriter {
                                     "output": output_text
                                 }));
                             }
-                            // Lossy-by-necessity: the Responses REQUEST `input` surface has no
-                            // reasoning content-block (a `reasoning` item is OUTPUT-only), so a
-                            // Thinking block on a prior assistant turn is dropped from request input
-                            // (mirrors the OpenAI writer). Reasoning on the RESPONSE side IS preserved
-                            // (see `read_response`/`write_response` H1).
+                            // Fix #6: a prior-turn Thinking block re-emits as a top-level Responses
+                            // `reasoning` INPUT item (a sibling of the message, NOT a content block),
+                            // so a Responses->Responses round-trip preserves reasoning and a
+                            // reasoning block decoded from another protocol survives onto Responses
+                            // egress. Mirrors the `write_response` reasoning item shape: a REDACTED
+                            // reasoning block holds opaque encrypted bytes with no plaintext analog
+                            // on the Responses surface, so it is dropped rather than leaked.
+                            crate::ir::IrBlock::Thinking {
+                                text,
+                                signature,
+                                redacted,
+                                ..
+                            } if !*redacted => {
+                                let emit_sig = signature.as_deref();
+                                // A wholly-empty reasoning block (no text, no signature) emits no item.
+                                if !text.is_empty() || emit_sig.is_some() {
+                                    let mut item = serde_json::Map::new();
+                                    item.insert(
+                                        "type".to_string(),
+                                        serde_json::json!(ITEM_TYPE_REASONING),
+                                    );
+                                    item.insert(
+                                        "id".to_string(),
+                                        serde_json::json!(synthesize_item_id(ITEM_ID_PREFIX_RS)),
+                                    );
+                                    item.insert(
+                                        "summary".to_string(),
+                                        serde_json::Value::Array(Vec::new()),
+                                    );
+                                    item.insert(
+                                        "content".to_string(),
+                                        serde_json::json!([
+                                            { "type": CONTENT_TYPE_REASONING_TEXT, "text": text }
+                                        ]),
+                                    );
+                                    if let Some(sig) = emit_sig {
+                                        item.insert(
+                                            "encrypted_content".to_string(),
+                                            serde_json::json!(sig),
+                                        );
+                                    }
+                                    reasoning_items.push(serde_json::Value::Object(item));
+                                }
+                            }
+                            // A REDACTED reasoning block (opaque encrypted bytes, no plaintext
+                            // analog on Responses) is dropped rather than leaked as `reasoning_text`.
                             crate::ir::IrBlock::Thinking { .. } => {}
                         }
                     }
+
+                    // Reasoning items come BEFORE the message they precede.
+                    input_arr.extend(reasoning_items);
 
                     // Emit the assistant/user `message` wrapper only when it carries content. A
                     // turn that is purely a tool call must NOT produce a spurious
@@ -2456,7 +2727,7 @@ impl ProtocolWriter for ResponsesWriter {
                         {
                             // Concatenate adjacent text blocks WITHOUT a separator: a space
                             // between fragments corrupts base64 / split JSON payloads.
-                            // Mirrors `openai.rs::write_request`'s tool_result concat fix.
+                            // Mirrors `openai_chat.rs::write_request`'s tool_result concat fix.
                             let output_text = content
                                 .iter()
                                 .filter_map(|b| match b {
@@ -2580,7 +2851,7 @@ impl ProtocolWriter for ResponsesWriter {
         // output with another `text` knob keeps both. `extra` is applied FIRST (below) so this merge
         // sees the forwarded remainder; then this overwrites `text` with the merged object.
         if let Some(rf) = &req.response_format {
-            let format = text_format_from_response_format(rf);
+            let format = write_text_format(rf);
             // Start from any `text` object forwarded through extra (the format-stripped remainder the
             // reader preserved), so non-`format` sub-keys like `verbosity` survive alongside `format`.
             let mut text_obj = req
@@ -2644,9 +2915,9 @@ impl ProtocolWriter for ResponsesWriter {
                 // every event.
                 self.set_created_at(created_at);
                 resp_obj.insert("id".to_string(), serde_json::json!(id));
-                resp_obj.insert("object".to_string(), serde_json::json!("response"));
+                resp_obj.insert("object".to_string(), serde_json::json!(OBJ_RESPONSE));
                 resp_obj.insert("created_at".to_string(), serde_json::json!(created_at));
-                resp_obj.insert("status".to_string(), serde_json::json!("in_progress"));
+                resp_obj.insert("status".to_string(), serde_json::json!(STATUS_IN_PROGRESS));
                 // `Response.model` is a REQUIRED non-nullable string in the official SDK; emit it
                 // unconditionally with the DEFAULT_MODEL fallback when the IR carries none (a
                 // cross-protocol stream where `translate_event` strips the model to None) rather
@@ -2666,8 +2937,8 @@ impl ProtocolWriter for ResponsesWriter {
                 resp_obj.insert("error".to_string(), serde_json::Value::Null);
                 resp_obj.insert("usage".to_string(), serde_json::Value::Null);
                 Some((
-                    "response.created".to_string(),
-                    serde_json::json!({ "type": "response.created", "response": resp_obj }),
+                    EVT_RESPONSE_CREATED.to_string(),
+                    serde_json::json!({ "type": EVT_RESPONSE_CREATED, "response": resp_obj }),
                 ))
             }
 
@@ -2690,18 +2961,18 @@ impl ProtocolWriter for ResponsesWriter {
                     if !self.open_text_item(*index) {
                         return None;
                     }
-                    let item_id = self.item_id_for("msg", *index);
+                    let item_id = self.item_id_for(ITEM_ID_PREFIX_MSG, *index);
                     Some((
-                        "response.output_item.added".to_string(),
+                        EVT_OUTPUT_ITEM_ADDED.to_string(),
                         serde_json::json!({
-                            "type": "response.output_item.added",
+                            "type": EVT_OUTPUT_ITEM_ADDED,
                             "output_index": index,
                             "item_id": item_id,
                             "item": {
-                                "type": "message",
+                                "type": ITEM_TYPE_MESSAGE,
                                 "id": item_id,
                                 "role": "assistant",
-                                "status": "in_progress",
+                                "status": STATUS_IN_PROGRESS,
                                 "content": []
                             }
                         }),
@@ -2712,7 +2983,7 @@ impl ProtocolWriter for ResponsesWriter {
                     // carried on the native `output_item.added`/`.done` pair so a client correlates the
                     // item's lifecycle. Synthesize it deterministically from the output index so the
                     // matching `.done` (which sees only the index) reconstructs the same id.
-                    let item_id = self.item_id_for("fc", *index);
+                    let item_id = self.item_id_for(ITEM_ID_PREFIX_FC, *index);
                     // Record the open function-call index so the matching `BlockStop` emits
                     // `output_item.done` for THIS index only — a text block's BlockStop (whose
                     // BlockStart produced no `output_item.added`) must emit no `done`.
@@ -2722,13 +2993,13 @@ impl ProtocolWriter for ResponsesWriter {
                     // BlockStop carries only the index).
                     self.record_tool_meta(*index, id, name);
                     Some((
-                        "response.output_item.added".to_string(),
+                        EVT_OUTPUT_ITEM_ADDED.to_string(),
                         serde_json::json!({
-                            "type": "response.output_item.added",
+                            "type": EVT_OUTPUT_ITEM_ADDED,
                             "output_index": index,
                             "item_id": item_id,
                             "item": {
-                                "type": "function_call",
+                                "type": ITEM_TYPE_FUNCTION_CALL,
                                 "id": item_id,
                                 "call_id": id,
                                 "name": name
@@ -2745,15 +3016,15 @@ impl ProtocolWriter for ResponsesWriter {
                     if !self.open_reasoning_item(*index) {
                         return None;
                     }
-                    let item_id = self.item_id_for("rs", *index);
+                    let item_id = self.item_id_for(ITEM_ID_PREFIX_RS, *index);
                     Some((
-                        "response.output_item.added".to_string(),
+                        EVT_OUTPUT_ITEM_ADDED.to_string(),
                         serde_json::json!({
-                            "type": "response.output_item.added",
+                            "type": EVT_OUTPUT_ITEM_ADDED,
                             "output_index": index,
                             "item_id": item_id,
                             "item": {
-                                "type": "reasoning",
+                                "type": ITEM_TYPE_REASONING,
                                 "id": item_id,
                                 "summary": [],
                                 "content": []
@@ -2776,11 +3047,11 @@ impl ProtocolWriter for ResponsesWriter {
                     // item with its COMPLETE `output_text` for the terminal `response.output` array.
                     self.append_text(*index, text);
                     Some((
-                        "response.output_text.delta".to_string(),
+                        EVT_OUTPUT_TEXT_DELTA.to_string(),
                         serde_json::json!({
-                            "type": "response.output_text.delta",
+                            "type": EVT_OUTPUT_TEXT_DELTA,
                             "output_index": index,
-                            "item_id": self.item_id_for("msg", *index),
+                            "item_id": self.item_id_for(ITEM_ID_PREFIX_MSG, *index),
                             "content_index": 0,
                             "delta": text
                         }),
@@ -2792,11 +3063,11 @@ impl ProtocolWriter for ResponsesWriter {
                     // carries.
                     self.append_tool_arguments(*index, json_str);
                     Some((
-                        "response.function_call_arguments.delta".to_string(),
+                        EVT_FUNCTION_CALL_ARGS_DELTA.to_string(),
                         serde_json::json!({
-                            "type": "response.function_call_arguments.delta",
+                            "type": EVT_FUNCTION_CALL_ARGS_DELTA,
                             "output_index": index,
-                            "item_id": self.item_id_for("fc", *index),
+                            "item_id": self.item_id_for(ITEM_ID_PREFIX_FC, *index),
                             "delta": json_str
                         }),
                     ))
@@ -2810,11 +3081,11 @@ impl ProtocolWriter for ResponsesWriter {
                     // part of the item.
                     self.append_reasoning(*index, text);
                     Some((
-                        "response.reasoning_text.delta".to_string(),
+                        EVT_REASONING_TEXT_DELTA.to_string(),
                         serde_json::json!({
-                            "type": "response.reasoning_text.delta",
+                            "type": EVT_REASONING_TEXT_DELTA,
                             "output_index": index,
-                            "item_id": self.item_id_for("rs", *index),
+                            "item_id": self.item_id_for(ITEM_ID_PREFIX_RS, *index),
                             "content_index": 0,
                             "delta": text
                         }),
@@ -2823,9 +3094,9 @@ impl ProtocolWriter for ResponsesWriter {
                 // An empty ThinkingDelta carries no content (drop it), and Responses has no streaming
                 // analog for a thinking `SignatureDelta` (the signature rides on the item's
                 // `encrypted_content`, not a stream delta) — so both emit no frame.
-                &crate::ir::IrDelta::ThinkingDelta(_) | crate::ir::IrDelta::SignatureDelta(_) => {
-                    None
-                }
+                &crate::ir::IrDelta::ThinkingDelta(_)
+                | crate::ir::IrDelta::SignatureDelta(_)
+                | crate::ir::IrDelta::RedactedReasoningDelta(_) => None,
                 // L2-5: the Responses streaming surface has no confirmable citation/annotation
                 // delta shape to map this onto, so suppress rather than synthesize one (the
                 // citation stays in the IR and is re-emitted by protocols that model streaming
@@ -2836,13 +3107,11 @@ impl ProtocolWriter for ResponsesWriter {
             IrStreamEvent::BlockStop { index } => {
                 // The IR `BlockStop` carries only the integer output index, not the block kind. A
                 // native Responses stream emits `response.output_item.done` ONLY for an item it
-                // previously `output_item.added` — and this writer emits `output_item.added` solely
-                // for function-call items (the Text `BlockStart` arm returns `None`, so a text part
-                // has NO `output_item.added`/`.done` pair; its content-part lifecycle is closed by
-                // the upstream `content_part.done`/`output_text.done` frames the reader already
-                // collapsed). Emitting `output_item.done` unconditionally — as a prior revision did
-                // — produced, for every text block, an `output_item.done` with
-                // `type:"function_call"` for an item that was never opened: an unmatched lifecycle
+                // previously `output_item.added`, and the `.done` type must match the `.added` type.
+                // This writer opens an `output_item.added` for both message (text) and function-call
+                // items, so each must close with a correctly-typed `output_item.done`. Emitting
+                // `output_item.done` with a hardcoded type — as a prior revision did, always typing
+                // it `type:"function_call"` — mis-typed every text item's close: an unmatched lifecycle
                 // event (a `done` with no prior `added`) AND a text response mis-typed as a
                 // function call, both of which break a typed Responses SDK and are deterministic
                 // distinguishability tells.
@@ -2862,21 +3131,21 @@ impl ProtocolWriter for ResponsesWriter {
                     // part. Record the finalized item so the terminal `response.completed` emits it in
                     // `output[]`. The prior writer dropped reasoning entirely, so a reasoning stream
                     // reassembled to an OpenAI/Anthropic client lost the chain-of-thought.
-                    let item_id = self.item_id_for("rs", *index);
+                    let item_id = self.item_id_for(ITEM_ID_PREFIX_RS, *index);
                     let text = self.take_reasoning_accum(*index);
                     let item = serde_json::json!({
-                        "type": "reasoning",
+                        "type": ITEM_TYPE_REASONING,
                         "id": item_id,
                         "summary": [],
                         "content": [
-                            { "type": "reasoning_text", "text": text }
+                            { "type": CONTENT_TYPE_REASONING_TEXT, "text": text }
                         ]
                     });
                     self.record_output_item(*index, item.clone());
                     Some((
-                        "response.output_item.done".to_string(),
+                        EVT_OUTPUT_ITEM_DONE.to_string(),
                         serde_json::json!({
-                            "type": "response.output_item.done",
+                            "type": EVT_OUTPUT_ITEM_DONE,
                             "output_index": index,
                             "item_id": item_id,
                             "item": item,
@@ -2892,10 +3161,10 @@ impl ProtocolWriter for ResponsesWriter {
                     // The function-call `output_item.added` used `item_id_for("fc", index)`, so the
                     // cached id reconstructs the matching pair here. A poisoned-lock-empty accumulator
                     // degrades to empty-string fields rather than panicking.
-                    let item_id = self.item_id_for("fc", *index);
+                    let item_id = self.item_id_for(ITEM_ID_PREFIX_FC, *index);
                     let accum = self.take_tool_accum(*index).unwrap_or_default();
                     let item = serde_json::json!({
-                        "type": "function_call",
+                        "type": ITEM_TYPE_FUNCTION_CALL,
                         "id": item_id,
                         "call_id": accum.call_id,
                         "name": accum.name,
@@ -2906,9 +3175,9 @@ impl ProtocolWriter for ResponsesWriter {
                     // SDK reads `event.response.output` to materialize `Response.output`).
                     self.record_output_item(*index, item.clone());
                     Some((
-                        "response.output_item.done".to_string(),
+                        EVT_OUTPUT_ITEM_DONE.to_string(),
                         serde_json::json!({
-                            "type": "response.output_item.done",
+                            "type": EVT_OUTPUT_ITEM_DONE,
                             "output_index": index,
                             "item_id": item_id,
                             "item": item,
@@ -2922,24 +3191,24 @@ impl ProtocolWriter for ResponsesWriter {
                     // content part with the COMPLETE text the deltas delivered (the SDK accumulates
                     // `Response.output_text` from it), so emit the accumulated text rather than an
                     // empty content array.
-                    let item_id = self.item_id_for("msg", *index);
+                    let item_id = self.item_id_for(ITEM_ID_PREFIX_MSG, *index);
                     let text = self.take_text_accum(*index);
                     let item = serde_json::json!({
-                        "type": "message",
+                        "type": ITEM_TYPE_MESSAGE,
                         "id": item_id,
                         "role": "assistant",
-                        "status": "completed",
+                        "status": STATUS_COMPLETED,
                         "content": [
-                            { "type": "output_text", "text": text, "annotations": [] }
+                            { "type": CONTENT_TYPE_OUTPUT_TEXT, "text": text, "annotations": [] }
                         ]
                     });
                     // Record the finalized message item so the terminal event emits the fully
                     // assembled `output[]` array.
                     self.record_output_item(*index, item.clone());
                     Some((
-                        "response.output_item.done".to_string(),
+                        EVT_OUTPUT_ITEM_DONE.to_string(),
                         serde_json::json!({
-                            "type": "response.output_item.done",
+                            "type": EVT_OUTPUT_ITEM_DONE,
                             "output_index": index,
                             "item_id": item_id,
                             "item": item,
@@ -2962,12 +3231,9 @@ impl ProtocolWriter for ResponsesWriter {
                 // new `refusal`) that did NOT explicitly signal an error must not be misclassified
                 // as a failed response, which would trigger client-side error handling for a
                 // successful turn. Genuine failures arrive via IrStreamEvent::Error, not here.
-                let status = match stop_reason.as_deref() {
-                    Some("tool_use") | Some("end_turn") | Some("stop_sequence") => "completed",
-                    Some("max_tokens") => "incomplete",
-                    Some("safety") => "incomplete",
-                    _ => "completed",
-                };
+                let status = stop_reason
+                    .map(write_responses_status)
+                    .unwrap_or(STATUS_COMPLETED);
 
                 let mut resp_obj = serde_json::Map::new();
                 // The native `response.completed`/`response.incomplete` terminal event ALWAYS
@@ -2988,7 +3254,7 @@ impl ProtocolWriter for ResponsesWriter {
                     .carried_response_id()
                     .unwrap_or_else(synthesize_response_id);
                 resp_obj.insert("id".to_string(), serde_json::json!(response_id));
-                resp_obj.insert("object".to_string(), serde_json::json!("response"));
+                resp_obj.insert("object".to_string(), serde_json::json!(OBJ_RESPONSE));
                 // Replay the `created_at` captured on this stream's opening `MessageStart` so the
                 // terminal event carries the SAME timestamp as `response.created`. The IR
                 // `MessageDelta` carries no identity, so a direct `now_unix_secs()` here would emit
@@ -3006,12 +3272,10 @@ impl ProtocolWriter for ResponsesWriter {
                 // falls back to DEFAULT_MODEL only if the cell was never populated.
                 resp_obj.insert("model".to_string(), serde_json::json!(self.carried_model()));
 
-                if status == "incomplete" {
-                    let reason = match stop_reason.as_deref() {
-                        Some("max_tokens") => "max_output_tokens",
-                        Some("safety") => "content_filter",
-                        _ => "other",
-                    };
+                if status == STATUS_INCOMPLETE {
+                    let reason = stop_reason
+                        .map(write_responses_incomplete_reason)
+                        .unwrap_or(INCOMPLETE_REASON_OTHER);
                     let mut incomplete_details = serde_json::Map::new();
                     incomplete_details.insert("reason".to_string(), serde_json::json!(reason));
                     resp_obj.insert(
@@ -3075,9 +3339,9 @@ impl ProtocolWriter for ResponsesWriter {
                 // arm); the match is over those two with a defensive fallback to `completed` for any
                 // future status string, never a `response.failed` (which would invent a failure).
                 let (event_name, event_type) = match status {
-                    "incomplete" => ("response.incomplete", "response.incomplete"),
-                    "completed" => ("response.completed", "response.completed"),
-                    _ => ("response.completed", "response.completed"),
+                    STATUS_INCOMPLETE => (EVT_RESPONSE_INCOMPLETE, EVT_RESPONSE_INCOMPLETE),
+                    STATUS_COMPLETED => (EVT_RESPONSE_COMPLETED, EVT_RESPONSE_COMPLETED),
+                    _ => (EVT_RESPONSE_COMPLETED, EVT_RESPONSE_COMPLETED),
                 };
                 Some((
                     event_name.to_string(),
@@ -3114,7 +3378,7 @@ impl ProtocolWriter for ResponsesWriter {
                 let code = err
                     .provider_signal
                     .clone()
-                    .unwrap_or_else(|| "server_error".to_string());
+                    .unwrap_or_else(|| ERR_TYPE_SERVER_ERROR.to_string());
                 // Replay the stream's captured `response.id` so `response.failed` correlates with
                 // the opening `response.created` (the SDK reads `event.response.id` on the failure
                 // event); fall back to a fresh id only if the cell is empty (failure before any
@@ -3123,12 +3387,12 @@ impl ProtocolWriter for ResponsesWriter {
                     .carried_response_id()
                     .unwrap_or_else(synthesize_response_id);
                 Some((
-                    "response.failed".to_string(),
+                    EVT_RESPONSE_FAILED.to_string(),
                     serde_json::json!({
-                        "type": "response.failed",
+                        "type": EVT_RESPONSE_FAILED,
                         "response": {
                             "id": response_id,
-                            "object": "response",
+                            "object": OBJ_RESPONSE,
                             // Replay the captured `created_at` so `response.failed` carries the
                             // SAME timestamp as `response.created` (a native stream never changes
                             // it mid-flight); falls back to the current time only if the failure
@@ -3139,7 +3403,7 @@ impl ProtocolWriter for ResponsesWriter {
                             // falls back to DEFAULT_MODEL only if the failure preceded any
                             // `MessageStart`.
                             "model": self.carried_model(),
-                            "status": "failed",
+                            "status": STATUS_FAILED,
                             // A native terminal event's inner `response` always carries `output`
                             // (REQUIRED by the SDK's typed `Response`); a failed response produced
                             // no assistant items, so emit a present-but-empty array — never omit it.
@@ -3157,7 +3421,7 @@ impl ProtocolWriter for ResponsesWriter {
         // EVERY native `/v1/responses` SSE event carries a top-level `sequence_number` (monotonic
         // from 0 per stream). Inject it uniformly here so no writer arm can forget it and so the
         // counter advances exactly once per emitted event. Events that produce no body
-        // (`MessageStop`, empty text deltas, Text/Thinking/Image `BlockStart`) do NOT consume a
+        // (`MessageStop`, empty text deltas, Image `BlockStart`) do NOT consume a
         // sequence number — only events that actually go on the wire are numbered, matching the
         // native stream where the integer counts emitted events.
         emitted.map(|(event_name, mut data)| {
@@ -3175,12 +3439,10 @@ impl ProtocolWriter for ResponsesWriter {
         // Unknown/None stop reasons default to `completed` (not `failed`): a future IR reason that
         // did not explicitly signal an error must not surface as a failed response to a Responses
         // client. Only the explicitly-mapped incomplete reasons downgrade the status.
-        let status = match resp.stop_reason.as_deref() {
-            Some("tool_use") | Some("end_turn") | Some("stop_sequence") => "completed",
-            Some("max_tokens") => "incomplete",
-            Some("safety") => "incomplete",
-            _ => "completed",
-        };
+        let status = resp
+            .stop_reason
+            .map(write_responses_status)
+            .unwrap_or(STATUS_COMPLETED);
 
         // Build the `output` array in IR ENCOUNTER order, emitting one native output item per block
         // exactly as the streaming writer's `drain_output_items` does. The streaming path assigns each
@@ -3205,12 +3467,12 @@ impl ProtocolWriter for ResponsesWriter {
                     // path. Each non-empty text block becomes its OWN message item at its encounter
                     // position (mirroring the per-index message items the stream emits).
                     output_arr.push(serde_json::json!({
-                        "type": "message",
-                        "id": synthesize_item_id("msg"),
+                        "type": ITEM_TYPE_MESSAGE,
+                        "id": synthesize_item_id(ITEM_ID_PREFIX_MSG),
                         "role": "assistant",
-                        "status": "completed",
+                        "status": STATUS_COMPLETED,
                         "content": [{
-                            "type": "output_text",
+                            "type": CONTENT_TYPE_OUTPUT_TEXT,
                             "text": text,
                             "annotations": []
                         }]
@@ -3222,12 +3484,12 @@ impl ProtocolWriter for ResponsesWriter {
                     let args_str =
                         crate::json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                     output_arr.push(serde_json::json!({
-                        "type": "function_call",
+                        "type": ITEM_TYPE_FUNCTION_CALL,
                         // Native function_call items carry an item-level opaque `id` (`fc_…`) DISTINCT
                         // from `call_id` — the streaming `output_item.done` emits it, so the non-stream
                         // body must too or a typed SDK reading `item.id` sees a missing field (a proxy
                         // tell). The IR has no per-item id, so synthesize one of the native shape.
-                        "id": synthesize_item_id("fc"),
+                        "id": synthesize_item_id(ITEM_ID_PREFIX_FC),
                         "call_id": id,
                         "name": name,
                         "arguments": args_str
@@ -3240,28 +3502,33 @@ impl ProtocolWriter for ResponsesWriter {
                 // location); when the IR carries a signature, round-trip it into Responses'
                 // `encrypted_content` slot (the opaque reasoning-reuse blob) so a same-protocol hop is
                 // lossless. A purely-empty Thinking block emits no item.
-                crate::ir::IrBlock::Thinking { text, signature } => {
-                    // HIGH-2: a Bedrock `redactedContent` reasoning block carries the busbar
-                    // redacted-reasoning sentinel in `signature`. It is NOT a valid Responses
-                    // `encrypted_content` blob — drop it rather than leak the `__busbar` marker (a
-                    // busbar fingerprint + an invalid token) into the Responses wire.
-                    let emit_sig = signature
-                        .as_deref()
-                        .filter(|sig| !crate::proto::is_redacted_reasoning_sig(sig));
-                    // A purely-empty Thinking block (no text and no EMITTABLE signature) emits no item.
+                crate::ir::IrBlock::Thinking {
+                    text,
+                    signature,
+                    redacted,
+                    ..
+                } => {
+                    // A REDACTED reasoning block (Bedrock `redactedContent`) holds opaque encrypted
+                    // bytes with no plaintext analog on the Responses surface — drop it entirely
+                    // rather than leak the bytes as visible `reasoning_text`.
+                    if *redacted {
+                        continue;
+                    }
+                    let emit_sig = signature.as_deref();
+                    // A purely-empty Thinking block (no text and no signature) emits no item.
                     if text.is_empty() && emit_sig.is_none() {
                         continue;
                     }
                     let mut item = serde_json::Map::new();
-                    item.insert("type".to_string(), serde_json::json!("reasoning"));
+                    item.insert("type".to_string(), serde_json::json!(ITEM_TYPE_REASONING));
                     item.insert(
                         "id".to_string(),
-                        serde_json::json!(synthesize_item_id("rs")),
+                        serde_json::json!(synthesize_item_id(ITEM_ID_PREFIX_RS)),
                     );
                     item.insert("summary".to_string(), serde_json::Value::Array(Vec::new()));
                     item.insert(
                         "content".to_string(),
-                        serde_json::json!([{ "type": "reasoning_text", "text": text }]),
+                        serde_json::json!([{ "type": CONTENT_TYPE_REASONING_TEXT, "text": text }]),
                     );
                     if let Some(sig) = emit_sig {
                         item.insert("encrypted_content".to_string(), serde_json::json!(sig));
@@ -3274,7 +3541,7 @@ impl ProtocolWriter for ResponsesWriter {
                 // catch-all so a future IrBlock variant forces a compile error instead of silently
                 // vanishing from Responses output.
                 crate::ir::IrBlock::ToolResult { .. } => {}
-                crate::ir::IrBlock::Image { .. } => {}
+                crate::ir::IrBlock::Image { .. } | crate::ir::IrBlock::Json(_) => {}
             }
         }
 
@@ -3312,7 +3579,7 @@ impl ProtocolWriter for ResponsesWriter {
         let id = resp.id.clone().unwrap_or_else(synthesize_response_id);
         let created_at = resp.created.unwrap_or_else(now_unix_secs);
         obj.insert("id".to_string(), serde_json::json!(id));
-        obj.insert("object".to_string(), serde_json::json!("response"));
+        obj.insert("object".to_string(), serde_json::json!(OBJ_RESPONSE));
         obj.insert("created_at".to_string(), serde_json::json!(created_at));
         obj.insert("status".to_string(), serde_json::json!(status));
         // model that served the response (preserved across cross-protocol translation). The
@@ -3335,12 +3602,11 @@ impl ProtocolWriter for ResponsesWriter {
         // is correct here.
         obj.insert("error".to_string(), serde_json::Value::Null);
 
-        if status == "incomplete" {
-            let reason = match resp.stop_reason.as_deref() {
-                Some("max_tokens") => "max_output_tokens",
-                Some("safety") => "content_filter",
-                _ => "other",
-            };
+        if status == STATUS_INCOMPLETE {
+            let reason = resp
+                .stop_reason
+                .map(write_responses_incomplete_reason)
+                .unwrap_or(INCOMPLETE_REASON_OTHER);
             let mut incomplete_details = serde_json::Map::new();
             incomplete_details.insert("reason".to_string(), serde_json::json!(reason));
             obj.insert(
@@ -3366,12 +3632,12 @@ impl ProtocolWriter for ResponsesWriter {
         // string) is passed through verbatim rather than swallowed by a catch-all, so a precise
         // upstream type is never lost.
         let error_type = match kind {
-            "invalid_request" | "invalid_request_error" => "invalid_request_error",
-            "authentication" | "authentication_error" | "auth" => "authentication_error",
-            "permission" | "permission_error" | "forbidden" => "permission_error",
-            "not_found" | "not_found_error" => "not_found_error",
-            "rate_limit" | "rate_limit_error" => "rate_limit_error",
-            "server_error" | "internal" | "internal_error" => "server_error",
+            "invalid_request" | ERR_TYPE_INVALID_REQUEST => ERR_TYPE_INVALID_REQUEST,
+            "authentication" | ERR_TYPE_AUTHENTICATION | "auth" => ERR_TYPE_AUTHENTICATION,
+            "permission" | ERR_TYPE_PERMISSION | "forbidden" => ERR_TYPE_PERMISSION,
+            "not_found" | ERR_TYPE_NOT_FOUND => ERR_TYPE_NOT_FOUND,
+            "rate_limit" | ERR_TYPE_RATE_LIMIT => ERR_TYPE_RATE_LIMIT,
+            ERR_TYPE_SERVER_ERROR | "internal" | "internal_error" => ERR_TYPE_SERVER_ERROR,
             // A 503 exhaustion/timeout is reported by forward.rs as kind `"overloaded"` (an
             // Anthropic-vocabulary token). The OpenAI/Responses error vocabulary has no
             // `overloaded` type — a 5xx is `server_error` — so without this arm `other => other`
@@ -3379,9 +3645,10 @@ impl ProtocolWriter for ResponsesWriter {
             // exhaustion/timeout, a non-native type and a deterministic cross-protocol tell. Map the
             // overloaded/unavailable family onto the native `server_error`. Same class as the OpenAI
             // writer's 5xx bucket.
-            "overloaded" | "overloaded_error" | "service_unavailable" | "unavailable" => {
-                "server_error"
-            }
+            crate::forward::KIND_OVERLOADED
+            | ERR_TYPE_OVERLOADED
+            | "service_unavailable"
+            | "unavailable" => ERR_TYPE_SERVER_ERROR,
             // forward.rs emits these transient/upstream-failure kinds directly to every ingress
             // writer (`timeout`/`network`/`connect` from the request-error path, `5xx`/`transient`
             // from the canonical-signal mapping, `api_error` from the generic upstream-error path).
@@ -3389,13 +3656,20 @@ impl ProtocolWriter for ResponsesWriter {
             // failure as `server_error` — so without these arms `other => other` would leak a
             // non-native `type` such as `{"error":{"type":"timeout"}}` or `{"error":{"type":"5xx"}}`
             // to a Responses-API client: a deterministic cross-protocol tell that breaks SDK
-            // consumers switching on `error.type`. Mirrors openai.rs's `server_error` bucket.
-            "timeout" | "network" | "connect" | "5xx" | "transient" | "api_error" => "server_error",
+            // consumers switching on `error.type`. Mirrors openai_chat.rs's `server_error` bucket.
+            crate::forward::KIND_TIMEOUT
+            | "network"
+            | "connect"
+            | "5xx"
+            | "transient"
+            | crate::forward::KIND_API_ERROR => ERR_TYPE_SERVER_ERROR,
             // A context-length overflow is surfaced by forward.rs as `context_length_exceeded`; the
-            // Responses vocabulary has no dedicated type for it (as openai.rs also maps it), so it
+            // Responses vocabulary has no dedicated type for it (as openai_chat.rs also maps it), so it
             // folds into `invalid_request_error`. `bad_request` is the same client-error class.
-            "context_length_exceeded" | "bad_request" => "invalid_request_error",
-            "billing" | "insufficient_quota" => "insufficient_quota",
+            crate::forward::PROVIDER_CODE_CONTEXT_LENGTH | "bad_request" => {
+                ERR_TYPE_INVALID_REQUEST
+            }
+            "billing" | ERR_TYPE_INSUFFICIENT_QUOTA => ERR_TYPE_INSUFFICIENT_QUOTA,
             other => other,
         };
 
@@ -3411,8 +3685,12 @@ impl ProtocolWriter for ResponsesWriter {
 
     fn egress_user_agent(&self) -> &'static str {
         // Responses API is served by the same OpenAI SDK/UA as the Chat Completions surface.
-        // Pinned — see `EGRESS_UA_OPENAI` audit note in forward.rs.
+        // Pinned — see `EGRESS_UA_OPENAI` in forward.rs.
         crate::forward::EGRESS_UA_OPENAI
+    }
+
+    fn auth_failure_message(&self) -> &'static str {
+        AUTH_FAILURE_MSG
     }
 
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
@@ -3561,13 +3839,13 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(
             content[0].get("type"),
-            Some(&serde_json::json!("input_text"))
+            Some(&serde_json::json!("input_text")) // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(content[0].get("text").and_then(|t| t.as_str()), Some("hi"));
 
         let func_call_item = input
             .iter()
-            .find(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_call"))
+            .find(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_call")) // golden wire-contract literal (kept bare on purpose)
             .expect("should have function_call item");
         assert_eq!(
             func_call_item.get("name").and_then(|n| n.as_str()),
@@ -3622,9 +3900,9 @@ mod tests {
             "model": "gpt-4o",
             "instructions": "You are helpful.",
             "input": [
-                {"role": "user", "content": [{"type": "input_text", "text": "What's the weather?"}]},
-                {"role": "assistant", "content": [{"type": "output_text", "text": "Let me check that for you."}]},
-                {"type": "function_call", "call_id": "fc_1", "name": "get_weather", "arguments": "{\"city\":\"SF\"}"},
+                {"role": "user", "content": [{"type": CONTENT_TYPE_INPUT_TEXT, "text": "What's the weather?"}]},
+                {"role": "assistant", "content": [{"type": CONTENT_TYPE_OUTPUT_TEXT, "text": "Let me check that for you."}]},
+                {"type": ITEM_TYPE_FUNCTION_CALL, "call_id": "fc_1", "name": "get_weather", "arguments": "{\"city\":\"SF\"}"},
                 {"type": "function_call_output", "call_id": "fc_1", "output": "Sunny, 72F"}
             ],
             "tools": [{"type": "function", "name": "get_weather", "description": "Get weather for a location", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}],
@@ -3673,9 +3951,9 @@ mod tests {
             "model": "gpt-4o",
             "input": [
                 // typed message arm, bare-string content
-                {"type": "message", "role": "user", "content": "hello from typed"},
+                {"type": ITEM_TYPE_MESSAGE, "role": "user", "content": "hello from typed"},
                 // typed message arm, assistant bare-string content
-                {"type": "message", "role": "assistant", "content": "typed assistant reply"},
+                {"type": ITEM_TYPE_MESSAGE, "role": "assistant", "content": "typed assistant reply"},
                 // untyped role-keyed fallback, bare-string content
                 {"role": "user", "content": "hello from untyped"},
                 {"role": "assistant", "content": "untyped assistant reply"}
@@ -3774,7 +4052,7 @@ mod tests {
     fn test_temperature_fidelity() {
         let json = serde_json::json!({
             "model": "gpt-4o",
-            "input": [{"role": "user", "content": [{"type": "input_text", "text": "test"}]}],
+            "input": [{"role": "user", "content": [{"type": CONTENT_TYPE_INPUT_TEXT, "text": "test"}]}],
             "temperature": 0.7,
             "max_output_tokens": 1024
         });
@@ -3814,16 +4092,16 @@ mod tests {
     fn test_read_response_decode() {
         let json = serde_json::json!({
             "id": "resp_1",
-            "object": "response",
-            "status": "completed",
+            "object": OBJ_RESPONSE,
+            "status": STATUS_COMPLETED,
             "output": [
                 {
-                    "type": "message",
+                    "type": ITEM_TYPE_MESSAGE,
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": "The weather in SF is sunny."}]
+                    "content": [{"type": CONTENT_TYPE_OUTPUT_TEXT, "text": "The weather in SF is sunny."}]
                 },
                 {
-                    "type": "function_call",
+                    "type": ITEM_TYPE_FUNCTION_CALL,
                     "call_id": "fc_1",
                     "name": "get_weather",
                     "arguments": "{\"city\":\"SF\"}"
@@ -3855,9 +4133,37 @@ mod tests {
             _ => panic!("second block should be ToolUse"),
         }
 
-        assert_eq!(resp.stop_reason, Some("tool_use".to_string()));
+        assert_eq!(resp.stop_reason, Some(crate::ir::IrStopReason::ToolUse));
         assert_eq!(resp.usage.input_tokens, 50);
         assert_eq!(resp.usage.output_tokens, 25);
+    }
+
+    /// Fix #9 (lenience): a Responses `read_response` body with NO `usage` object must parse to a
+    /// zero IrUsage rather than hard-erroring with a ClientError — mirroring all five sibling readers
+    /// (openai_chat.rs, etc.). A missing `usage` on an otherwise valid 200 is an upstream format quirk,
+    /// not a client mistake; erroring here would make forward.rs discard a valid body and 500.
+    #[test]
+    fn read_response_without_usage_zero_defaults_no_error() {
+        let json = serde_json::json!({
+            "id": "resp_no_usage",
+            "object": OBJ_RESPONSE,
+            "status": STATUS_COMPLETED,
+            "output": [
+                {
+                    "type": ITEM_TYPE_MESSAGE,
+                    "role": "assistant",
+                    "content": [{"type": CONTENT_TYPE_OUTPUT_TEXT, "text": "hi"}]
+                }
+            ]
+            // intentionally NO "usage" key
+        });
+
+        let resp = ResponsesReader
+            .read_response(&json)
+            .expect("absent usage must parse to zero, not error");
+        assert_eq!(resp.usage.input_tokens, 0);
+        assert_eq!(resp.usage.output_tokens, 0);
+        assert_eq!(resp.usage.cache_read_input_tokens, None);
     }
 
     #[test]
@@ -3871,15 +4177,15 @@ mod tests {
         // asserts CONFORMANCE + field preservation rather than byte-equality.
         let json = serde_json::json!({
             "id": "resp_abc123",
-            "object": "response",
+            "object": OBJ_RESPONSE,
             "created_at": 1_700_000_000_u64,
-            "status": "completed",
+            "status": STATUS_COMPLETED,
             "model": "gpt-4o",
             "output": [
                 {
-                    "type": "message",
+                    "type": ITEM_TYPE_MESSAGE,
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": "Hello world"}]
+                    "content": [{"type": CONTENT_TYPE_OUTPUT_TEXT, "text": "Hello world"}]
                 }
             ],
             "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -3894,25 +4200,25 @@ mod tests {
 
         // Top-level identity preserved verbatim.
         assert_eq!(out["id"], json["id"]);
-        assert_eq!(out["object"], "response");
+        assert_eq!(out["object"], "response"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(out["created_at"], json["created_at"]);
-        assert_eq!(out["status"], "completed");
+        assert_eq!(out["status"], "completed"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(out["model"], "gpt-4o");
         assert_eq!(out["usage"], json["usage"]);
         assert!(out["error"].is_null());
 
         // The message output item is conformant: native opaque id, status, and annotations.
         let item = &out["output"][0];
-        assert_eq!(item["type"], "message");
+        assert_eq!(item["type"], "message"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(item["role"], "assistant");
-        assert_eq!(item["status"], "completed");
+        assert_eq!(item["status"], "completed"); // golden wire-contract literal (kept bare on purpose)
         let id = item["id"].as_str().expect("message item carries an id");
         assert!(
             id.starts_with("msg_") && id.len() > 4,
             "item id must be a native opaque msg_ token, got {id}"
-        );
+        ); // golden wire-contract literal (kept bare on purpose)
         let part = &item["content"][0];
-        assert_eq!(part["type"], "output_text");
+        assert_eq!(part["type"], "output_text"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(part["text"], "Hello world");
         assert!(
             part["annotations"].as_array().is_some_and(|a| a.is_empty()),
@@ -3920,7 +4226,7 @@ mod tests {
         );
     }
 
-    /// Regression (MEDIUM/conformance, final audit): the NON-streaming `write_response` function_call
+    /// Regression (MEDIUM/conformance): the NON-streaming `write_response` function_call
     /// item must carry the item-level opaque `id` (`fc_…`, distinct from `call_id`) that the streaming
     /// `output_item.done` emits, or a typed SDK reading `item.id` sees a missing field.
     #[test]
@@ -3936,7 +4242,7 @@ mod tests {
                 input: serde_json::json!({"city": "SF"}),
                 cache_control: None,
             }],
-            stop_reason: Some("tool_use".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::ToolUse),
             stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
@@ -3950,7 +4256,7 @@ mod tests {
         let out = writer.write_response(&resp);
         let fc = out["output"]
             .as_array()
-            .and_then(|a| a.iter().find(|i| i["type"] == "function_call"))
+            .and_then(|a| a.iter().find(|i| i["type"] == "function_call")) // golden wire-contract literal (kept bare on purpose)
             .expect("a function_call output item");
         assert_eq!(fc["call_id"], "call_abc", "call_id preserved");
         let id = fc["id"]
@@ -3959,7 +4265,7 @@ mod tests {
         assert!(
             id.starts_with("fc_") && id.len() > 3,
             "function_call item id must be a native opaque fc_ token, got {id}"
-        );
+        ); // golden wire-contract literal (kept bare on purpose)
     }
 
     /// Regression (MED #1): the NON-streaming `read_response` tool-use override must NOT clobber a
@@ -3973,14 +4279,14 @@ mod tests {
     fn test_read_response_incomplete_with_function_call_keeps_max_tokens() {
         let json = serde_json::json!({
             "id": "resp_trunc",
-            "object": "response",
+            "object": OBJ_RESPONSE,
             "created_at": 1_700_000_000_u64,
-            "status": "incomplete",
+            "status": STATUS_INCOMPLETE,
             "model": "gpt-4o",
-            "incomplete_details": { "reason": "max_output_tokens" },
+            "incomplete_details": { "reason": INCOMPLETE_REASON_MAX_OUTPUT },
             "output": [
                 {
-                    "type": "function_call",
+                    "type": ITEM_TYPE_FUNCTION_CALL,
                     "call_id": "call_1",
                     "name": "get_weather",
                     "arguments": "{\"city\":\"SF\"}"
@@ -4002,9 +4308,54 @@ mod tests {
         // ...but the truncation reason must NOT have been clobbered to tool_use.
         assert_eq!(
             resp.stop_reason,
-            Some("max_tokens".to_string()),
+            Some(crate::ir::IrStopReason::MaxTokens),
             "an incomplete (max_output_tokens) response must keep stop_reason=max_tokens, not be \
              promoted to tool_use just because a partial function_call survived"
+        );
+    }
+
+    /// Regression (refusal data-loss): a native Responses refusal rides on a
+    /// `{type:"refusal", refusal:"..."}` content part with `status:"completed"`. The prior reader
+    /// matched only `output_text`, so the refusal text was SILENTLY DROPPED and the turn looked like a
+    /// clean empty end_turn. The refusal text must survive as assistant content AND the stop_reason
+    /// must be promoted to `Refusal` (so a non-Responses client sees the refusal signal).
+    #[test]
+    fn read_response_refusal_part_survives_and_promotes_stop_reason() {
+        let json = serde_json::json!({
+            "id": "resp_refuse",
+            "object": OBJ_RESPONSE,
+            "created_at": 1_700_000_000_u64,
+            "status": STATUS_COMPLETED,
+            "model": "gpt-4o",
+            "output": [
+                {
+                    "type": ITEM_TYPE_MESSAGE,
+                    "role": "assistant",
+                    "content": [
+                        { "type": "refusal", "refusal": "I can't help with that." }
+                    ]
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let reader = ResponsesReader;
+        let resp = reader.read_response(&json).expect("read should succeed");
+
+        // The refusal text survived as assistant Text (not dropped).
+        assert!(
+            resp.content.iter().any(|b| matches!(
+                b,
+                crate::ir::IrBlock::Text { text, .. } if text == "I can't help with that."
+            )),
+            "the refusal text must survive as assistant content, not be silently dropped: {:?}",
+            resp.content
+        );
+        // The completed status was promoted to the typed Refusal stop_reason.
+        assert_eq!(
+            resp.stop_reason,
+            Some(crate::ir::IrStopReason::Refusal),
+            "a completed response carrying a refusal part must surface stop_reason=refusal"
         );
     }
 
@@ -4033,7 +4384,7 @@ mod tests {
                     citations: Vec::new(),
                 },
             ],
-            stop_reason: Some("tool_use".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::ToolUse),
             stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
@@ -4049,12 +4400,14 @@ mod tests {
         assert_eq!(arr.len(), 2, "one item per non-empty block, in order");
         // Encounter order: the tool block came first, the text block second.
         assert_eq!(
-            arr[0]["type"], "function_call",
+            arr[0]["type"],
+            "function_call", // golden wire-contract literal (kept bare on purpose)
             "the tool block was first in IR content, so it must be output[0]"
         );
         assert_eq!(arr[0]["call_id"], "call_1");
         assert_eq!(
-            arr[1]["type"], "message",
+            arr[1]["type"],
+            "message", // golden wire-contract literal (kept bare on purpose)
             "the text block came after the tool block, so it must NOT be forced to output[0]"
         );
         assert_eq!(arr[1]["content"][0]["text"], "Here is the weather.");
@@ -4094,6 +4447,8 @@ mod tests {
     #[test]
     fn test_write_error_kind_mapping() {
         let writer = ResponsesWriter;
+        // The `want` values are golden wire-contract literals (kept bare on purpose) — they are the
+        // exact `error.type` strings busbar emits for each input kind.
         for (kind, want) in [
             ("invalid_request", "invalid_request_error"),
             ("auth", "authentication_error"),
@@ -4123,15 +4478,15 @@ mod tests {
     fn test_same_protocol_roundtrip_preserves_identity() {
         let json = serde_json::json!({
             "id": "resp_0123456789abcdef",
-            "object": "response",
+            "object": OBJ_RESPONSE,
             "created_at": 1_710_000_000_u64,
-            "status": "completed",
+            "status": STATUS_COMPLETED,
             "model": "gpt-4o-2024-08-06",
             "output": [
                 {
-                    "type": "message",
+                    "type": ITEM_TYPE_MESSAGE,
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": "hi"}]
+                    "content": [{"type": CONTENT_TYPE_OUTPUT_TEXT, "text": "hi"}]
                 }
             ],
             "usage": {"input_tokens": 3, "output_tokens": 1}
@@ -4156,6 +4511,7 @@ mod tests {
             "created_at must be preserved verbatim"
         );
         assert_eq!(out.get("object").and_then(|o| o.as_str()), Some("response"));
+        // golden wire-contract literal (kept bare on purpose)
     }
 
     /// The streaming start event captures the nested `response` identity for same-protocol
@@ -4164,14 +4520,14 @@ mod tests {
     fn test_stream_message_start_captures_identity() {
         let mut state = crate::ir::StreamDecodeState::default();
         let events = reader_read_response_events(
-            "response.created",
+            EVT_RESPONSE_CREATED,
             &serde_json::json!({
                 "response": {
                     "id": "resp_streamid",
-                    "object": "response",
+                    "object": OBJ_RESPONSE,
                     "created_at": 1_720_000_000_u64,
                     "model": "gpt-4o",
-                    "status": "in_progress"
+                    "status": STATUS_IN_PROGRESS
                 }
             }),
             &mut state,
@@ -4202,7 +4558,7 @@ mod tests {
                 cache_control: None,
                 citations: Vec::new(),
             }],
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -4222,7 +4578,7 @@ mod tests {
             .and_then(|i| i.as_str())
             .expect("synthesized id present");
         assert!(
-            id1.starts_with("resp_"),
+            id1.starts_with("resp_"), // golden wire-contract literal (kept bare on purpose)
             "synthesized id must use the resp_ prefix, got {id1}"
         );
         assert!(
@@ -4241,8 +4597,8 @@ mod tests {
 
         // response.created → MessageStart only (first time)
         let events1 = reader_read_response_events(
-            "response.created",
-            &serde_json::json!({"response": {"object":"response","status":"in_progress"}}),
+            EVT_RESPONSE_CREATED,
+            &serde_json::json!({"response": {"object": OBJ_RESPONSE, "status": STATUS_IN_PROGRESS}}),
             &mut state,
         );
         assert_eq!(events1.len(), 1);
@@ -4252,10 +4608,10 @@ mod tests {
         ));
         // response.output_item.added for function_call → BlockStart
         let events2 = reader_read_response_events(
-            "response.output_item.added",
+            EVT_OUTPUT_ITEM_ADDED,
             &serde_json::json!({
                 "output_index": 1,
-                "item": {"type":"function_call","call_id":"fc_1","name":"get_weather"}
+                "item": {"type": ITEM_TYPE_FUNCTION_CALL, "call_id":"fc_1","name":"get_weather"}
             }),
             &mut state,
         );
@@ -4267,7 +4623,7 @@ mod tests {
         // response.output_text.delta ×3 → BlockStart (lazy) + BlockDelta ×3
         let delta_json = |d: &str| serde_json::json!({"output_index": 0, "delta": d});
         let events3a =
-            reader_read_response_events("response.output_text.delta", &delta_json("H"), &mut state);
+            reader_read_response_events(EVT_OUTPUT_TEXT_DELTA, &delta_json("H"), &mut state);
         assert_eq!(events3a.len(), 2); // BlockStart + BlockDelta
         assert!(matches!(
             events3a[0],
@@ -4278,19 +4634,19 @@ mod tests {
             crate::ir::IrStreamEvent::BlockDelta { .. }
         ));
         let events3b =
-            reader_read_response_events("response.output_text.delta", &delta_json("i"), &mut state);
+            reader_read_response_events(EVT_OUTPUT_TEXT_DELTA, &delta_json("i"), &mut state);
         assert_eq!(events3b.len(), 1); // BlockDelta only
         assert!(matches!(
             events3b[0],
             crate::ir::IrStreamEvent::BlockDelta { .. }
         ));
         let events3c =
-            reader_read_response_events("response.output_text.delta", &delta_json("!"), &mut state);
+            reader_read_response_events(EVT_OUTPUT_TEXT_DELTA, &delta_json("!"), &mut state);
         assert_eq!(events3c.len(), 1); // BlockDelta only
 
         // response.output_item.done → BlockStop
         let events4 = reader_read_response_events(
-            "response.output_item.done",
+            EVT_OUTPUT_ITEM_DONE,
             &serde_json::json!({"output_index": 0}),
             &mut state,
         );
@@ -4305,12 +4661,12 @@ mod tests {
         // balanced (MED #5), giving: BlockStop + MessageDelta + MessageStop.
         let completed_json = serde_json::json!({
             "response": {
-                "status": "completed",
+                "status": STATUS_COMPLETED,
                 "usage": {"input_tokens": 10, "output_tokens": 5}
             }
         });
         let events5 =
-            reader_read_response_events("response.completed", &completed_json, &mut state);
+            reader_read_response_events(EVT_RESPONSE_COMPLETED, &completed_json, &mut state);
         assert_eq!(events5.len(), 3);
         assert!(
             matches!(events5[0], crate::ir::IrStreamEvent::BlockStop { index: 1 }),
@@ -4325,7 +4681,7 @@ mod tests {
         // response.in_progress should not emit MessageStart again (state.started=true)
         let events6 = reader_read_response_events(
             "response.in_progress",
-            &serde_json::json!({"response": {"object":"response","status":"in_progress"}}),
+            &serde_json::json!({"response": {"object": OBJ_RESPONSE, "status": STATUS_IN_PROGRESS}}),
             &mut state,
         );
         assert_eq!(events6.len(), 0);
@@ -4339,6 +4695,67 @@ mod tests {
         assert_eq!(events7.len(), 0);
     }
 
+    /// Regression (refusal stream data-loss): a STREAMED Responses refusal carries its text only in
+    /// the terminal `response.completed` frame as an `output[].content[]` `{type:"refusal"}` part
+    /// (status `completed`). The streaming reader previously handled only `output_text.delta`, so it
+    /// SILENTLY DROPPED the refusal text AND left stop_reason=end_turn. It must now surface the
+    /// refusal text as a Text block and promote stop_reason to Refusal (mirroring the non-stream path).
+    #[test]
+    fn read_response_events_streamed_refusal_surfaces_text_and_refusal_stop_reason() {
+        use crate::ir::{IrDelta, IrStopReason, IrStreamEvent};
+        let mut state = crate::ir::StreamDecodeState::default();
+        // No output_text.delta is emitted for a refusal — only the terminal completed frame.
+        let events = reader_read_response_events(
+            EVT_RESPONSE_COMPLETED,
+            &serde_json::json!({
+                "response": {
+                    "object": OBJ_RESPONSE,
+                    "status": STATUS_COMPLETED,
+                    "output": [{
+                        "type": ITEM_TYPE_MESSAGE,
+                        "role": "assistant",
+                        "content": [{ "type": "refusal", "refusal": "I can't help with that." }]
+                    }],
+                    "usage": { "input_tokens": 5, "output_tokens": 3 }
+                }
+            }),
+            &mut state,
+        );
+
+        // The refusal text surfaced as a Text BlockDelta (not dropped).
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                IrStreamEvent::BlockDelta { delta: IrDelta::TextDelta(t), .. } if t == "I can't help with that."
+            )),
+            "streamed refusal text must surface as a TextDelta; got {events:?}"
+        );
+        // The terminal MessageDelta promoted stop_reason to Refusal (not end_turn).
+        let stop = events.iter().find_map(|e| match e {
+            IrStreamEvent::MessageDelta { stop_reason, .. } => Some(*stop_reason),
+            _ => None,
+        });
+        assert_eq!(
+            stop,
+            Some(Some(IrStopReason::Refusal)),
+            "a streamed refusal must terminate with stop_reason=Refusal; got {events:?}"
+        );
+        // Block open/close balance: exactly one BlockStart and one BlockStop for the refusal block.
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, IrStreamEvent::BlockStart { .. }))
+            .count();
+        let stops = events
+            .iter()
+            .filter(|e| matches!(e, IrStreamEvent::BlockStop { .. }))
+            .count();
+        assert_eq!(
+            (starts, stops),
+            (1, 1),
+            "one Start/Stop for the refusal block; got {events:?}"
+        );
+    }
+
     #[test]
     fn test_write_response_event_blockdelta() {
         let writer = ResponsesWriter;
@@ -4349,12 +4766,12 @@ mod tests {
             delta: crate::ir::IrDelta::TextDelta("hi".to_string()),
         };
         let (etype1, payload1) = writer.write_response_event(&ev1).expect("should emit");
-        assert_eq!(etype1, "response.output_text.delta");
+        assert_eq!(etype1, "response.output_text.delta"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(payload1.get("delta").and_then(|d| d.as_str()), Some("hi"));
 
         // MessageDelta{end_turn} → ("response.completed", status maps to completed)
         let ev2 = crate::ir::IrStreamEvent::MessageDelta {
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 10,
@@ -4364,13 +4781,13 @@ mod tests {
             },
         };
         let (etype2, payload2) = writer.write_response_event(&ev2).expect("should emit");
-        assert_eq!(etype2, "response.completed");
+        assert_eq!(etype2, "response.completed"); // golden wire-contract literal (kept bare on purpose)
         let resp_obj = payload2
             .get("response")
             .expect("payload should have response");
         assert_eq!(
             resp_obj.get("status"),
-            Some(&serde_json::json!("completed"))
+            Some(&serde_json::json!("completed")) // golden wire-contract literal (kept bare on purpose)
         );
     }
 
@@ -4390,7 +4807,7 @@ mod tests {
     fn test_text_delta_index_pairing_nonzero() {
         let mut state = crate::ir::StreamDecodeState::default();
         let events = reader_read_response_events(
-            "response.output_text.delta",
+            EVT_OUTPUT_TEXT_DELTA,
             &serde_json::json!({"output_index": 2, "delta": "hello"}),
             &mut state,
         );
@@ -4416,7 +4833,7 @@ mod tests {
         let mut state = crate::ir::StreamDecodeState::default();
         // Open a block with a real delta first.
         let opened = reader_read_response_events(
-            "response.output_text.delta",
+            EVT_OUTPUT_TEXT_DELTA,
             &serde_json::json!({"output_index": 0, "delta": "x"}),
             &mut state,
         );
@@ -4424,7 +4841,7 @@ mod tests {
         assert!(state.open_tools.contains(&TEXT_INDEX_KEY_OFFSET));
         // Now an empty keepalive while the block is open -> nothing.
         let keepalive = reader_read_response_events(
-            "response.output_text.delta",
+            EVT_OUTPUT_TEXT_DELTA,
             &serde_json::json!({"output_index": 0, "delta": ""}),
             &mut state,
         );
@@ -4435,7 +4852,7 @@ mod tests {
         // And an empty delta before any block is open also emits nothing.
         let mut fresh = crate::ir::StreamDecodeState::default();
         let pre = reader_read_response_events(
-            "response.output_text.delta",
+            EVT_OUTPUT_TEXT_DELTA,
             &serde_json::json!({"output_index": 0, "delta": ""}),
             &mut fresh,
         );
@@ -4449,13 +4866,13 @@ mod tests {
     fn test_done_clears_text_block_open() {
         let mut state = crate::ir::StreamDecodeState::default();
         let _ = reader_read_response_events(
-            "response.output_text.delta",
+            EVT_OUTPUT_TEXT_DELTA,
             &serde_json::json!({"output_index": 0, "delta": "a"}),
             &mut state,
         );
         assert!(state.open_tools.contains(&TEXT_INDEX_KEY_OFFSET));
         let done = reader_read_response_events(
-            "response.output_item.done",
+            EVT_OUTPUT_ITEM_DONE,
             &serde_json::json!({"output_index": 0}),
             &mut state,
         );
@@ -4470,7 +4887,7 @@ mod tests {
         );
         // A new text part at index 1 re-opens lazily.
         let reopen = reader_read_response_events(
-            "response.output_text.delta",
+            EVT_OUTPUT_TEXT_DELTA,
             &serde_json::json!({"output_index": 1, "delta": "b"}),
             &mut state,
         );
@@ -4490,7 +4907,7 @@ mod tests {
     fn test_bodyless_incomplete_is_not_end_turn() {
         let mut state = crate::ir::StreamDecodeState::default();
         let events = reader_read_response_events(
-            "response.incomplete",
+            EVT_RESPONSE_INCOMPLETE,
             // No nested `response` object at all.
             &serde_json::json!({}),
             &mut state,
@@ -4517,7 +4934,7 @@ mod tests {
         // And a bodyless `completed` still maps to end_turn (the only successful terminal).
         let mut s2 = crate::ir::StreamDecodeState::default();
         let completed =
-            reader_read_response_events("response.completed", &serde_json::json!({}), &mut s2);
+            reader_read_response_events(EVT_RESPONSE_COMPLETED, &serde_json::json!({}), &mut s2);
         let completed_reason = completed
             .iter()
             .find_map(|e| match e {
@@ -4527,7 +4944,7 @@ mod tests {
             .expect("bodyless completed must still emit a MessageDelta");
         assert_eq!(
             *completed_reason,
-            Some("end_turn".to_string()),
+            Some(crate::ir::IrStopReason::EndTurn),
             "bodyless completed must map to end_turn"
         );
     }
@@ -4540,12 +4957,12 @@ mod tests {
         // client never saw the tool-call finish signal on the streaming path.
         let mut state = crate::ir::StreamDecodeState::default();
         let events = reader_read_response_events(
-            "response.completed",
+            EVT_RESPONSE_COMPLETED,
             &serde_json::json!({
                 "response": {
-                    "status": "completed",
+                    "status": STATUS_COMPLETED,
                     "output": [
-                        { "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                        { "type": ITEM_TYPE_FUNCTION_CALL, "id": "fc_1", "call_id": "call_1",
                           "name": "get_weather", "arguments": "{}" }
                     ]
                 }
@@ -4561,7 +4978,7 @@ mod tests {
             .expect("terminal MessageDelta");
         assert_eq!(
             *stop,
-            Some("tool_use".to_string()),
+            Some(crate::ir::IrStopReason::ToolUse),
             "a streamed completed response containing a function_call must be tool_use, not end_turn"
         );
     }
@@ -4571,13 +4988,13 @@ mod tests {
         // No function_call in the output → still a plain end_turn (the override must not over-fire).
         let mut state = crate::ir::StreamDecodeState::default();
         let events = reader_read_response_events(
-            "response.completed",
+            EVT_RESPONSE_COMPLETED,
             &serde_json::json!({
                 "response": {
-                    "status": "completed",
+                    "status": STATUS_COMPLETED,
                     "output": [
-                        { "type": "message", "role": "assistant",
-                          "content": [{ "type": "output_text", "text": "hi", "annotations": [] }] }
+                        { "type": ITEM_TYPE_MESSAGE, "role": "assistant",
+                          "content": [{ "type": CONTENT_TYPE_OUTPUT_TEXT, "text": "hi", "annotations": [] }] }
                     ]
                 }
             }),
@@ -4592,7 +5009,7 @@ mod tests {
             .expect("terminal MessageDelta");
         assert_eq!(
             *stop,
-            Some("end_turn".to_string()),
+            Some(crate::ir::IrStopReason::EndTurn),
             "text-only completed stays end_turn"
         );
     }
@@ -4612,16 +5029,16 @@ mod tests {
             let mut all: Vec<crate::ir::IrStreamEvent> = Vec::new();
             // Open a text block at index 0.
             all.extend(reader_read_response_events(
-                "response.output_text.delta",
+                EVT_OUTPUT_TEXT_DELTA,
                 &serde_json::json!({"output_index": 0, "delta": "partial"}),
                 &mut state,
             ));
             // Open a tool block at index 1.
             all.extend(reader_read_response_events(
-                "response.output_item.added",
+                EVT_OUTPUT_ITEM_ADDED,
                 &serde_json::json!({
                     "output_index": 1,
-                    "item": {"type": "function_call", "call_id": "c1", "name": "f"}
+                    "item": {"type": ITEM_TYPE_FUNCTION_CALL, "call_id": "c1", "name": "f"}
                 }),
                 &mut state,
             ));
@@ -4692,26 +5109,26 @@ mod tests {
         }
 
         // Bodyless terminals (no nested `response`).
-        assert_balanced("response.completed", serde_json::json!({}));
-        assert_balanced("response.incomplete", serde_json::json!({}));
-        assert_balanced("response.failed", serde_json::json!({}));
+        assert_balanced(EVT_RESPONSE_COMPLETED, serde_json::json!({}));
+        assert_balanced(EVT_RESPONSE_INCOMPLETE, serde_json::json!({}));
+        assert_balanced(EVT_RESPONSE_FAILED, serde_json::json!({}));
 
         // Body-present completed.
         assert_balanced(
-            "response.completed",
-            serde_json::json!({"response": {"status": "completed"}}),
+            EVT_RESPONSE_COMPLETED,
+            serde_json::json!({"response": {"status": STATUS_COMPLETED}}),
         );
         // Body-present incomplete (truncated mid-block).
         assert_balanced(
-            "response.incomplete",
+            EVT_RESPONSE_INCOMPLETE,
             serde_json::json!({
-                "response": {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
+                "response": {"status": STATUS_INCOMPLETE, "incomplete_details": {"reason": INCOMPLETE_REASON_MAX_OUTPUT}}
             }),
         );
         // Body-present failed (the early-return path).
         assert_balanced(
-            "response.failed",
-            serde_json::json!({"response": {"status": "failed", "error": {"code": "server_error"}}}),
+            EVT_RESPONSE_FAILED,
+            serde_json::json!({"response": {"status": STATUS_FAILED, "error": {"code": ERR_TYPE_SERVER_ERROR}}}),
         );
     }
 
@@ -4720,7 +5137,7 @@ mod tests {
     fn test_content_part_done_closes_block() {
         let mut state = crate::ir::StreamDecodeState::default();
         let _ = reader_read_response_events(
-            "response.output_text.delta",
+            EVT_OUTPUT_TEXT_DELTA,
             &serde_json::json!({"output_index": 0, "delta": "a"}),
             &mut state,
         );
@@ -4743,7 +5160,7 @@ mod tests {
     fn test_completed_without_response_object_terminates() {
         let mut state = crate::ir::StreamDecodeState::default();
         let events =
-            reader_read_response_events("response.completed", &serde_json::json!({}), &mut state);
+            reader_read_response_events(EVT_RESPONSE_COMPLETED, &serde_json::json!({}), &mut state);
         assert_eq!(events.len(), 2, "must emit MessageDelta + MessageStop");
         assert!(matches!(
             events[0],
@@ -4756,8 +5173,11 @@ mod tests {
     #[test]
     fn test_incomplete_without_response_object_terminates() {
         let mut state = crate::ir::StreamDecodeState::default();
-        let events =
-            reader_read_response_events("response.incomplete", &serde_json::json!({}), &mut state);
+        let events = reader_read_response_events(
+            EVT_RESPONSE_INCOMPLETE,
+            &serde_json::json!({}),
+            &mut state,
+        );
         assert_eq!(events.len(), 2);
         assert!(matches!(
             events[0],
@@ -4768,7 +5188,7 @@ mod tests {
         // response.failed without object still works (pre-existing behavior preserved).
         let mut s2 = crate::ir::StreamDecodeState::default();
         let failed =
-            reader_read_response_events("response.failed", &serde_json::json!({}), &mut s2);
+            reader_read_response_events(EVT_RESPONSE_FAILED, &serde_json::json!({}), &mut s2);
         assert_eq!(failed.len(), 2);
         assert!(matches!(failed[1], crate::ir::IrStreamEvent::MessageStop));
     }
@@ -4781,10 +5201,10 @@ mod tests {
             "model": "gpt-4o",
             "input": [
                 {
-                    "type": "output_text",
+                    "type": CONTENT_TYPE_OUTPUT_TEXT,
                     "role": "assistant",
                     "text": "hello",
-                    "content": [{"type": "output_text", "text": "DUPLICATE"}]
+                    "content": [{"type": CONTENT_TYPE_OUTPUT_TEXT, "text": "DUPLICATE"}]
                 }
             ]
         });
@@ -4847,7 +5267,7 @@ mod tests {
         );
         assert_eq!(
             input[0].get("type").and_then(|t| t.as_str()),
-            Some("function_call")
+            Some("function_call") // golden wire-contract literal (kept bare on purpose)
         );
         // No item should be a message with an empty content array.
         for item in input {
@@ -4926,7 +5346,7 @@ mod tests {
         // function_call after it.
         assert_eq!(
             input[1].get("type").and_then(|t| t.as_str()),
-            Some("function_call")
+            Some("function_call") // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(
             input[1].get("call_id").and_then(|c| c.as_str()),
@@ -4941,11 +5361,11 @@ mod tests {
     fn test_stream_failed_status_emits_error_not_end_turn() {
         let mut state = crate::ir::StreamDecodeState::default();
         let events = reader_read_response_events(
-            "response.failed",
+            EVT_RESPONSE_FAILED,
             &serde_json::json!({
                 "response": {
-                    "status": "failed",
-                    "error": {"code": "server_error", "type": "server_error"}
+                    "status": STATUS_FAILED,
+                    "error": {"code": ERR_TYPE_SERVER_ERROR, "type": ERR_TYPE_SERVER_ERROR}
                 }
             }),
             &mut state,
@@ -4980,11 +5400,11 @@ mod tests {
     fn test_stream_failed_invalid_api_key_classifies_as_auth() {
         let mut state = crate::ir::StreamDecodeState::default();
         let events = reader_read_response_events(
-            "response.failed",
+            EVT_RESPONSE_FAILED,
             &serde_json::json!({
                 "response": {
-                    "status": "failed",
-                    "error": {"code": "invalid_api_key", "type": "authentication_error"}
+                    "status": STATUS_FAILED,
+                    "error": {"code": "invalid_api_key", "type": ERR_TYPE_AUTHENTICATION}
                 }
             }),
             &mut state,
@@ -5008,31 +5428,31 @@ mod tests {
             StatusClass::Auth
         );
         assert_eq!(
-            class_for_response_failed("authentication_error"),
+            class_for_response_failed(ERR_TYPE_AUTHENTICATION),
             StatusClass::Auth
         );
         assert_eq!(
-            class_for_response_failed("rate_limit_exceeded"),
+            class_for_response_failed(ERR_CODE_RATE_LIMIT),
             StatusClass::RateLimit
         );
         assert_eq!(
-            class_for_response_failed("insufficient_quota"),
+            class_for_response_failed(ERR_TYPE_INSUFFICIENT_QUOTA),
             StatusClass::RateLimit
         );
         assert_eq!(
-            class_for_response_failed("context_length_exceeded"),
+            class_for_response_failed(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH),
             StatusClass::ContextLength
         );
         assert_eq!(
-            class_for_response_failed("string_above_max_length"),
+            class_for_response_failed(ERR_CODE_STRING_ABOVE_MAX),
             StatusClass::ContextLength
         );
         assert_eq!(
-            class_for_response_failed("server_error"),
+            class_for_response_failed(ERR_TYPE_SERVER_ERROR),
             StatusClass::ServerError
         );
         assert_eq!(
-            class_for_response_failed("overloaded_error"),
+            class_for_response_failed(ERR_TYPE_OVERLOADED),
             StatusClass::ServerError
         );
         // Unrecognized signal defaults to the transient ServerError bucket.
@@ -5052,9 +5472,9 @@ mod tests {
         let reader = ResponsesReader;
         let err = reader
             .read_response(&serde_json::json!({
-                "status": "failed",
+                "status": STATUS_FAILED,
                 "output": [],
-                "error": {"code": "context_length_exceeded", "type": "invalid_request_error"}
+                "error": {"code": crate::forward::PROVIDER_CODE_CONTEXT_LENGTH, "type": ERR_TYPE_INVALID_REQUEST}
             }))
             .expect_err("failed body must surface an IrError");
         assert_eq!(
@@ -5064,15 +5484,15 @@ mod tests {
         );
         assert_eq!(
             err.provider_signal.as_deref(),
-            Some("context_length_exceeded")
+            Some("context_length_exceeded") // golden wire-contract literal (kept bare on purpose)
         );
 
         // An auth-failed body classifies as Auth.
         let err_auth = reader
             .read_response(&serde_json::json!({
-                "status": "failed",
+                "status": STATUS_FAILED,
                 "output": [],
-                "error": {"code": "invalid_api_key", "type": "authentication_error"}
+                "error": {"code": "invalid_api_key", "type": ERR_TYPE_AUTHENTICATION}
             }))
             .expect_err("failed body must surface an IrError");
         assert_eq!(err_auth.class, StatusClass::Auth);
@@ -5084,7 +5504,7 @@ mod tests {
     fn test_stream_unknown_status_not_end_turn() {
         let mut state = crate::ir::StreamDecodeState::default();
         let events = reader_read_response_events(
-            "response.completed",
+            EVT_RESPONSE_COMPLETED,
             &serde_json::json!({"response": {"status": "some_future_status"}}),
             &mut state,
         );
@@ -5107,8 +5527,8 @@ mod tests {
         // Branch 1: no `incomplete_details` at all.
         let mut state = crate::ir::StreamDecodeState::default();
         let events = reader_read_response_events(
-            "response.incomplete",
-            &serde_json::json!({"response": {"status": "incomplete"}}),
+            EVT_RESPONSE_INCOMPLETE,
+            &serde_json::json!({"response": {"status": STATUS_INCOMPLETE}}),
             &mut state,
         );
         assert_eq!(events.len(), 2);
@@ -5126,9 +5546,9 @@ mod tests {
         // Branch 2: `incomplete_details` present but carries no `reason`.
         let mut state = crate::ir::StreamDecodeState::default();
         let events = reader_read_response_events(
-            "response.incomplete",
+            EVT_RESPONSE_INCOMPLETE,
             &serde_json::json!({
-                "response": {"status": "incomplete", "incomplete_details": {}}
+                "response": {"status": STATUS_INCOMPLETE, "incomplete_details": {}}
             }),
             &mut state,
         );
@@ -5147,24 +5567,24 @@ mod tests {
         // Sanity: a known reason still maps (max_output_tokens -> max_tokens).
         let mut state = crate::ir::StreamDecodeState::default();
         let events = reader_read_response_events(
-            "response.incomplete",
+            EVT_RESPONSE_INCOMPLETE,
             &serde_json::json!({
                 "response": {
-                    "status": "incomplete",
-                    "incomplete_details": {"reason": "max_output_tokens"}
+                    "status": STATUS_INCOMPLETE,
+                    "incomplete_details": {"reason": INCOMPLETE_REASON_MAX_OUTPUT}
                 }
             }),
             &mut state,
         );
         match &events[0] {
             crate::ir::IrStreamEvent::MessageDelta { stop_reason, .. } => {
-                assert_eq!(stop_reason.as_deref(), Some("max_tokens"));
+                assert_eq!(stop_reason, &Some(crate::ir::IrStopReason::MaxTokens));
             }
             other => panic!("expected MessageDelta, got {other:?}"),
         }
     }
 
-    /// Regression (mirrors `openai.rs::write_request_tool_result_multi_text_concatenates_without_separator`):
+    /// Regression (mirrors `openai_chat.rs::write_request_tool_result_multi_text_concatenates_without_separator`):
     /// a multi-block ToolResult must concatenate its text fragments with NO separator. A `.join(" ")`
     /// injects a spurious space that corrupts base64 / split-JSON payloads. Covers BOTH the
     /// Tool-role flat path AND the Assistant-role inline-tool_result path in `write_request`.
@@ -5268,14 +5688,14 @@ mod tests {
         let (etype, payload) = writer
             .write_response_event(&ev)
             .expect("error event should emit");
-        assert_eq!(etype, "response.failed");
-        // The error is nested under `response` (SDK reads `event.response`), not top-level.
+        assert_eq!(etype, "response.failed"); // golden wire-contract literal (kept bare on purpose)
+                                              // The error is nested under `response` (SDK reads `event.response`), not top-level.
         assert!(
             payload.get("error").is_none(),
             "error must not be top-level: {payload}"
         );
         let resp = payload.get("response").expect("response object present");
-        assert_eq!(resp.get("status").and_then(|s| s.as_str()), Some("failed"));
+        assert_eq!(resp.get("status").and_then(|s| s.as_str()), Some("failed")); // golden wire-contract literal (kept bare on purpose)
         let err = resp.get("error").expect("nested error object present");
         assert_eq!(err.get("message").and_then(|m| m.as_str()), Some("boom"));
         // Native ResponseError: code is the non-null enum (here carried from provider_signal).
@@ -5297,7 +5717,7 @@ mod tests {
         let writer = ResponsesWriter;
         // Streaming MessageDelta path.
         let ev = crate::ir::IrStreamEvent::MessageDelta {
-            stop_reason: Some("refusal".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::Refusal),
             stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
@@ -5307,13 +5727,13 @@ mod tests {
             },
         };
         let (etype, payload) = writer.write_response_event(&ev).expect("should emit");
-        assert_eq!(etype, "response.completed");
+        assert_eq!(etype, "response.completed"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(
             payload
                 .get("response")
                 .and_then(|r| r.get("status"))
                 .and_then(|s| s.as_str()),
-            Some("completed"),
+            Some("completed"), // golden wire-contract literal (kept bare on purpose)
             "unknown stop_reason must map to completed in stream"
         );
 
@@ -5325,7 +5745,7 @@ mod tests {
                 cache_control: None,
                 citations: Vec::new(),
             }],
-            stop_reason: Some("refusal".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::Refusal),
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -5341,7 +5761,7 @@ mod tests {
         let out = writer.write_response(&resp);
         assert_eq!(
             out.get("status").and_then(|s| s.as_str()),
-            Some("completed"),
+            Some("completed"), // golden wire-contract literal (kept bare on purpose)
             "unknown stop_reason must map to completed in write_response"
         );
     }
@@ -5356,7 +5776,7 @@ mod tests {
         let req_json = serde_json::json!({
             "model": "gpt-4o",
             "input": [
-                {"type": "function_call", "call_id": "fc_1", "name": "f", "arguments": "not-json{"}
+                {"type": ITEM_TYPE_FUNCTION_CALL, "call_id": "fc_1", "name": "f", "arguments": "not-json{"}
             ]
         });
         let ir = reader.read_request(&req_json).expect("read_request ok");
@@ -5378,9 +5798,9 @@ mod tests {
         // read_response path.
         let resp_json = serde_json::json!({
             "id": "resp_1",
-            "status": "completed",
+            "status": STATUS_COMPLETED,
             "output": [
-                {"type": "function_call", "call_id": "fc_2", "name": "g", "arguments": "broken]"}
+                {"type": ITEM_TYPE_FUNCTION_CALL, "call_id": "fc_2", "name": "g", "arguments": "broken]"}
             ],
             "usage": {"input_tokens": 1, "output_tokens": 1}
         });
@@ -5413,7 +5833,10 @@ mod tests {
         let ir = reader.read_request(&json).expect("read_request ok");
         assert_eq!(ir.messages.len(), 1);
         match &ir.messages[0].content[0] {
-            crate::ir::IrBlock::Image { media_type, data } => {
+            crate::ir::IrBlock::Image {
+                source: crate::ir::IrImageSource::Base64 { media_type, data },
+                ..
+            } => {
                 assert_eq!(media_type, "image/png");
                 assert_eq!(data, payload, "full base64 payload must be preserved");
             }
@@ -5423,7 +5846,10 @@ mod tests {
         // responses_block path (e.g. a content block nested in a function_call_output).
         let block = serde_json::json!({"type": "input_image", "image_url": url});
         match responses_block(&block).expect("responses_block ok") {
-            crate::ir::IrBlock::Image { media_type, data } => {
+            crate::ir::IrBlock::Image {
+                source: crate::ir::IrImageSource::Base64 { media_type, data },
+                ..
+            } => {
                 assert_eq!(media_type, "image/png");
                 assert_eq!(data, payload);
             }
@@ -5443,8 +5869,11 @@ mod tests {
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
                 content: vec![crate::ir::IrBlock::Image {
-                    media_type: media_type.to_string(),
-                    data: payload.to_string(),
+                    source: crate::ir::IrImageSource::Base64 {
+                        media_type: media_type.to_string(),
+                        data: payload.to_string(),
+                    },
+                    cache_control: None,
                 }],
             }],
             tools: Vec::new(),
@@ -5468,8 +5897,12 @@ mod tests {
         let rt = reader.read_request(&json).expect("read round-trip ok");
         match &rt.messages[0].content[0] {
             crate::ir::IrBlock::Image {
-                media_type: mt,
-                data,
+                source:
+                    crate::ir::IrImageSource::Base64 {
+                        media_type: mt,
+                        data,
+                    },
+                ..
             } => {
                 assert_eq!(mt, media_type);
                 assert_eq!(data, payload, "round-trip must not corrupt the payload");
@@ -5485,17 +5918,19 @@ mod tests {
     fn test_input_image_https_url_sentinel_roundtrip() {
         let url = "https://example.com/cat.png";
         let block = serde_json::json!({"type": "input_image", "image_url": url});
-        let (media_type, data) = match responses_block(&block).expect("responses_block ok") {
-            crate::ir::IrBlock::Image { media_type, data } => (media_type, data),
-            other => panic!("expected Image, got {other:?}"),
+        let stored_url = match responses_block(&block).expect("responses_block ok") {
+            crate::ir::IrBlock::Image {
+                source: crate::ir::IrImageSource::Url(url),
+                ..
+            } => url,
+            other => panic!("expected Image(Url), got {other:?}"),
         };
         assert_eq!(
-            media_type, "image_url",
-            "non-data URL must use the sentinel"
+            stored_url, url,
+            "URL must be stored verbatim as the typed Url source"
         );
-        assert_eq!(data, url, "URL must be stored verbatim, not a comment");
         assert!(
-            !data.starts_with("// note"),
+            !stored_url.starts_with("// note"),
             "must not embed a human comment in the payload"
         );
 
@@ -5504,7 +5939,10 @@ mod tests {
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
-                content: vec![crate::ir::IrBlock::Image { media_type, data }],
+                content: vec![crate::ir::IrBlock::Image {
+                    source: crate::ir::IrImageSource::Url(stored_url),
+                    cache_control: None,
+                }],
             }],
             tools: Vec::new(),
             max_tokens: None,
@@ -5578,10 +6016,10 @@ mod tests {
         let json = serde_json::json!({
             "model": "gpt-4o",
             "input": [
-                {"type": "message", "role": "user",
-                 "content": [{"type": "input_text", "text": "hello typed"}]},
-                {"type": "message", "role": "assistant",
-                 "content": [{"type": "output_text", "text": "hi back"}]}
+                {"type": ITEM_TYPE_MESSAGE, "role": "user",
+                 "content": [{"type": CONTENT_TYPE_INPUT_TEXT, "text": "hello typed"}]},
+                {"type": ITEM_TYPE_MESSAGE, "role": "assistant",
+                 "content": [{"type": CONTENT_TYPE_OUTPUT_TEXT, "text": "hi back"}]}
             ]
         });
         let reader = ResponsesReader;
@@ -5619,7 +6057,7 @@ mod tests {
             model: Some("gpt-4o".to_string()),
         };
         let (etype, payload) = writer.write_response_event(&ev).expect("should emit");
-        assert_eq!(etype, "response.created");
+        assert_eq!(etype, "response.created"); // golden wire-contract literal (kept bare on purpose)
         let resp = payload.get("response").expect("response object");
         assert_eq!(
             resp.get("id").and_then(|i| i.as_str()),
@@ -5632,7 +6070,7 @@ mod tests {
         assert_eq!(resp.get("model").and_then(|m| m.as_str()), Some("gpt-4o"));
         assert_eq!(
             resp.get("status").and_then(|s| s.as_str()),
-            Some("in_progress")
+            Some("in_progress") // golden wire-contract literal (kept bare on purpose)
         );
 
         // Identity absent (cross-protocol, stripped by translate_event): synthesized + valid.
@@ -5650,7 +6088,7 @@ mod tests {
             .and_then(|i| i.as_str())
             .expect("synthesized id present");
         assert!(
-            id.starts_with("resp_"),
+            id.starts_with("resp_"), // golden wire-contract literal (kept bare on purpose)
             "synthesized id must use resp_ prefix, got {id}"
         );
         assert!(
@@ -5679,7 +6117,7 @@ mod tests {
             n,
             "all synthesized ids in a burst must be unique"
         );
-        assert!(ids.iter().all(|id| id.starts_with("resp_")));
+        assert!(ids.iter().all(|id| id.starts_with("resp_"))); // golden wire-contract literal (kept bare on purpose)
     }
 
     /// Regression (LOW/correctness, Round 18): `synth_token<const N>` documents and now ENFORCES a
@@ -5702,7 +6140,7 @@ mod tests {
 
         let resp_id = synthesize_response_id();
         let resp_suffix = resp_id
-            .strip_prefix("resp_")
+            .strip_prefix("resp_") // golden wire-contract literal (kept bare on purpose)
             .expect("synthesized response id uses resp_ prefix");
         assert!(
             resp_suffix.len() >= MIN_TOKEN_LEN,
@@ -5712,7 +6150,7 @@ mod tests {
 
         let item_id = synthesize_item_id("msg");
         let item_suffix = item_id
-            .strip_prefix("msg_")
+            .strip_prefix("msg_") // golden wire-contract literal (kept bare on purpose)
             .expect("synthesized item id uses the given prefix");
         assert!(
             item_suffix.len() >= MIN_TOKEN_LEN,
@@ -5736,7 +6174,7 @@ mod tests {
                 retry_after: None,
             }))
             .expect("Error emits response.failed");
-        assert_eq!(etype, "response.failed");
+        assert_eq!(etype, "response.failed"); // golden wire-contract literal (kept bare on purpose)
         let resp = failed
             .get("response")
             .expect("response.failed wraps an inner response object");
@@ -5750,12 +6188,12 @@ mod tests {
         // The native failed skeleton also carries the other non-error required fields.
         assert_eq!(
             resp.get("status").and_then(|s| s.as_str()),
-            Some("failed"),
+            Some("failed"), // golden wire-contract literal (kept bare on purpose)
             "response.failed inner status must be \"failed\""
         );
         assert_eq!(
             resp.get("object").and_then(|o| o.as_str()),
-            Some("response"),
+            Some("response"), // golden wire-contract literal (kept bare on purpose)
             "response.failed inner object must be \"response\""
         );
         assert!(
@@ -5776,7 +6214,7 @@ mod tests {
     fn test_metadata_round_trips_through_extra() {
         let json = serde_json::json!({
             "model": "gpt-4o",
-            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "input": [{"role": "user", "content": [{"type": CONTENT_TYPE_INPUT_TEXT, "text": "hi"}]}],
             "metadata": {"trace_id": "abc-123", "team": "billing"}
         });
         let reader = ResponsesReader;
@@ -5814,7 +6252,7 @@ mod tests {
             model: None,
         };
         let (etype, payload) = writer.write_response_event(&ev).expect("should emit");
-        assert_eq!(etype, "response.created");
+        assert_eq!(etype, "response.created"); // golden wire-contract literal (kept bare on purpose)
         let resp = payload.get("response").expect("response object present");
 
         // usage key MUST be present (null at stream start), not omitted.
@@ -5844,7 +6282,7 @@ mod tests {
         let json = serde_json::json!({
             "model": "gpt-4o",
             "input": [
-                {"role": "user", "content": [{"type": "input_text", "text": "hi there"}]}
+                {"role": "user", "content": [{"type": CONTENT_TYPE_INPUT_TEXT, "text": "hi there"}]}
             ]
         });
         let reader = ResponsesReader;
@@ -5867,8 +6305,8 @@ mod tests {
         let json = serde_json::json!({
             "model": "gpt-4o",
             "input": [
-                {"type": "input_text", "text": "hello"},
-                {"type": "output_text", "text": "world"}
+                {"type": CONTENT_TYPE_INPUT_TEXT, "text": "hello"},
+                {"type": CONTENT_TYPE_OUTPUT_TEXT, "text": "world"}
             ]
         });
         let reader = ResponsesReader;
@@ -5889,7 +6327,7 @@ mod tests {
         let reader = ResponsesReader;
         let mut state = crate::ir::StreamDecodeState::default();
         let data = serde_json::json!({});
-        let events = reader.read_response_events("response.failed", &data, &mut state);
+        let events = reader.read_response_events(EVT_RESPONSE_FAILED, &data, &mut state);
 
         assert_eq!(
             events.len(),
@@ -5924,12 +6362,12 @@ mod tests {
         let reader = ResponsesReader;
         let mut state = crate::ir::StreamDecodeState::default();
         let data = serde_json::json!({});
-        let events = reader.read_response_events("response.completed", &data, &mut state);
+        let events = reader.read_response_events(EVT_RESPONSE_COMPLETED, &data, &mut state);
 
         assert_eq!(events.len(), 2, "expected MessageDelta + MessageStop");
         match &events[0] {
             IrStreamEvent::MessageDelta { stop_reason, .. } => {
-                assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+                assert_eq!(stop_reason, &Some(crate::ir::IrStopReason::EndTurn));
             }
             other => panic!("expected MessageDelta first, got {other:?}"),
         }
@@ -5955,7 +6393,7 @@ mod tests {
         let (etype, payload) = writer
             .write_response_event(&ev)
             .expect("error event should emit");
-        assert_eq!(etype, "response.failed");
+        assert_eq!(etype, "response.failed"); // golden wire-contract literal (kept bare on purpose)
 
         // No top-level `error` key — the SDK reads `event.response`, not `event.error`.
         assert!(
@@ -5970,10 +6408,10 @@ mod tests {
             .and_then(|i| i.as_str())
             .expect("synthesized resp_ id present");
         assert!(
-            id.starts_with("resp_"),
+            id.starts_with("resp_"), // golden wire-contract literal (kept bare on purpose)
             "synthesized id must use resp_ prefix, got {id}"
         );
-        assert_eq!(resp.get("status").and_then(|s| s.as_str()), Some("failed"));
+        assert_eq!(resp.get("status").and_then(|s| s.as_str()), Some("failed")); // golden wire-contract literal (kept bare on purpose)
         let error = resp.get("error").expect("nested error object");
         assert_eq!(
             error.get("message").and_then(|m| m.as_str()),
@@ -6037,7 +6475,7 @@ mod tests {
             },
             IrStreamEvent::BlockStop { index: 0 },
             IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: usage(),
             },
@@ -6097,7 +6535,7 @@ mod tests {
             },
             IrStreamEvent::BlockStop { index: 0 },
             IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: usage_fixture(),
             },
@@ -6192,7 +6630,7 @@ mod tests {
             },
             IrStreamEvent::BlockStop { index: 0 },
             IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: usage_fixture(),
             },
@@ -6236,7 +6674,7 @@ mod tests {
             .and_then(|i| i.as_str())
             .expect("output_text.delta must carry item_id");
         assert!(
-            text_item.starts_with("msg_"),
+            text_item.starts_with("msg_"), // golden wire-contract literal (kept bare on purpose)
             "text delta item_id must be a msg_ id, got {text_item}"
         );
         assert_eq!(
@@ -6260,7 +6698,7 @@ mod tests {
             .and_then(|i| i.as_str())
             .expect("output_item.added must carry item_id");
         assert!(
-            added_item.starts_with("fc_"),
+            added_item.starts_with("fc_"), // golden wire-contract literal (kept bare on purpose)
             "function_call item_id must be an fc_ id, got {added_item}"
         );
         // The nested item id matches the top-level item_id (one logical item).
@@ -6363,7 +6801,7 @@ mod tests {
         let (etype, done) = writer
             .write_response_event(&IrStreamEvent::BlockStop { index: 3 })
             .expect("done emits");
-        assert_eq!(etype, "response.output_item.done");
+        assert_eq!(etype, "response.output_item.done"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(
             done.get("item_id").and_then(|i| i.as_str()),
             Some(added_id.as_str()),
@@ -6376,7 +6814,7 @@ mod tests {
             .expect("output_item.done must carry an item object");
         assert_eq!(
             item.get("type").and_then(|t| t.as_str()),
-            Some("function_call"),
+            Some("function_call"), // golden wire-contract literal (kept bare on purpose)
             "the done item must be typed"
         );
         assert_eq!(
@@ -6402,7 +6840,7 @@ mod tests {
                 retry_after: None,
             }))
             .expect("emit");
-        assert_eq!(etype, "response.failed");
+        assert_eq!(etype, "response.failed"); // golden wire-contract literal (kept bare on purpose)
         let error = payload
             .get("response")
             .and_then(|r| r.get("error"))
@@ -6410,12 +6848,12 @@ mod tests {
             .expect("response.error object present");
         assert_eq!(
             error.get("code").and_then(|c| c.as_str()),
-            Some("rate_limit_exceeded"),
+            Some("rate_limit_exceeded"), // golden wire-contract literal (kept bare on purpose)
             "error.code must be the non-null Responses error enum"
         );
         assert_eq!(
             error.get("message").and_then(|m| m.as_str()),
-            Some("rate_limit_exceeded")
+            Some("rate_limit_exceeded") // golden wire-contract literal (kept bare on purpose)
         );
         assert!(
             !error.contains_key("type"),
@@ -6441,7 +6879,7 @@ mod tests {
             .and_then(|c| c.as_str());
         assert_eq!(
             code,
-            Some("server_error"),
+            Some("server_error"), // golden wire-contract literal (kept bare on purpose)
             "error.code must default to server_error, never null"
         );
     }
@@ -6474,14 +6912,14 @@ mod tests {
                 block: crate::ir::IrBlockMeta::Text,
             })
             .expect("text BlockStart opens a message item");
-        assert_eq!(added_et, "response.output_item.added");
-        assert_eq!(added["item"]["type"], "message");
+        assert_eq!(added_et, "response.output_item.added"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(added["item"]["type"], "message"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(added["item"]["role"], "assistant");
         let added_item_id = added["item_id"]
             .as_str()
             .expect("item_id present")
             .to_string();
-        assert!(added_item_id.starts_with("msg_"), "text item id is msg_…");
+        assert!(added_item_id.starts_with("msg_"), "text item id is msg_…"); // golden wire-contract literal (kept bare on purpose)
 
         let _ = writer.write_response_event(&IrStreamEvent::BlockDelta {
             index: 0,
@@ -6492,8 +6930,8 @@ mod tests {
         let (done_et, done) = writer
             .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
             .expect("text BlockStop closes the message item");
-        assert_eq!(done_et, "response.output_item.done");
-        assert_eq!(done["item"]["type"], "message");
+        assert_eq!(done_et, "response.output_item.done"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(done["item"]["type"], "message"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(
             done["item_id"].as_str(),
             Some(added_item_id.as_str()),
@@ -6547,15 +6985,15 @@ mod tests {
         let (etype, tool_done) = writer
             .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
             .expect("tool BlockStop emits output_item.done");
-        assert_eq!(etype, "response.output_item.done");
-        assert_eq!(tool_done["item"]["type"], "function_call");
-        // Text index closes with a message done.
+        assert_eq!(etype, "response.output_item.done"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(tool_done["item"]["type"], "function_call"); // golden wire-contract literal (kept bare on purpose)
+                                                                // Text index closes with a message done.
         let (text_et, text_done) = writer
             .write_response_event(&IrStreamEvent::BlockStop { index: 1 })
             .expect("text BlockStop emits output_item.done (message)");
-        assert_eq!(text_et, "response.output_item.done");
-        assert_eq!(text_done["item"]["type"], "message");
-        // A SECOND BlockStop at the (already-closed) tool index 0 must not emit a duplicate done.
+        assert_eq!(text_et, "response.output_item.done"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(text_done["item"]["type"], "message"); // golden wire-contract literal (kept bare on purpose)
+                                                          // A SECOND BlockStop at the (already-closed) tool index 0 must not emit a duplicate done.
         assert!(
             writer
                 .write_response_event(&IrStreamEvent::BlockStop { index: 0 })
@@ -6574,12 +7012,12 @@ mod tests {
         let writer = ResponsesWriter;
         let (etype, payload) = writer
             .write_response_event(&IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: usage_fixture(),
             })
             .expect("emit");
-        assert_eq!(etype, "response.completed");
+        assert_eq!(etype, "response.completed"); // golden wire-contract literal (kept bare on purpose)
         let resp = payload
             .get("response")
             .and_then(|r| r.as_object())
@@ -6589,7 +7027,7 @@ mod tests {
             .and_then(|i| i.as_str())
             .expect("response.completed must carry response.id");
         assert!(
-            id.starts_with("resp_"),
+            id.starts_with("resp_"), // golden wire-contract literal (kept bare on purpose)
             "synthesized id must be a resp_ id, got {id}"
         );
         assert!(
@@ -6599,7 +7037,7 @@ mod tests {
     }
 
     /// Regression (MEDIUM/conformance): `write_error` must emit `code:"invalid_api_key"` for an
-    /// authentication failure (mirrors `openai.rs` `write_error_emits_invalid_api_key_code_for_auth_failure`).
+    /// authentication failure (mirrors `openai_chat.rs` `write_error_emits_invalid_api_key_code_for_auth_failure`).
     /// Emitting `code:null` on auth is a deterministic proxy tell vs a real OpenAI Responses 401.
     #[test]
     fn write_error_emits_invalid_api_key_code_for_auth_failure() {
@@ -6608,7 +7046,7 @@ mod tests {
             let body = writer.write_error(401, kind, "bad key");
             assert_eq!(
                 body["error"]["type"],
-                serde_json::json!("authentication_error"),
+                serde_json::json!("authentication_error"), // golden wire-contract literal (kept bare on purpose)
                 "kind {kind} must map to authentication_error"
             );
             assert_eq!(
@@ -6652,12 +7090,12 @@ mod tests {
             let body = writer.write_error(429, kind, "over quota");
             assert_eq!(
                 body["error"]["type"],
-                serde_json::json!("insufficient_quota"),
+                serde_json::json!("insufficient_quota"), // golden wire-contract literal (kept bare on purpose)
                 "kind {kind} maps to the native insufficient_quota type"
             );
             assert_eq!(
                 body["error"]["code"],
-                serde_json::json!("insufficient_quota"),
+                serde_json::json!("insufficient_quota"), // golden wire-contract literal (kept bare on purpose)
                 "kind {kind} must carry code=insufficient_quota, not null"
             );
         }
@@ -6672,7 +7110,7 @@ mod tests {
         let mut state = crate::ir::StreamDecodeState::default();
         // Open a text block lazily.
         let _ = reader_read_response_events(
-            "response.output_text.delta",
+            EVT_OUTPUT_TEXT_DELTA,
             &serde_json::json!({"output_index": 0, "delta": "a"}),
             &mut state,
         );
@@ -6691,7 +7129,7 @@ mod tests {
         assert!(!state.open_tools.contains(&TEXT_INDEX_KEY_OFFSET));
         // Second terminal frame at the same index: output_item.done → NOTHING (already closed).
         let second = reader_read_response_events(
-            "response.output_item.done",
+            EVT_OUTPUT_ITEM_DONE,
             &serde_json::json!({"output_index": 0}),
             &mut state,
         );
@@ -6707,15 +7145,15 @@ mod tests {
     fn test_tool_item_done_emits_single_block_stop() {
         let mut state = crate::ir::StreamDecodeState::default();
         let _ = reader_read_response_events(
-            "response.output_item.added",
+            EVT_OUTPUT_ITEM_ADDED,
             &serde_json::json!({
                 "output_index": 2,
-                "item": {"type":"function_call","call_id":"fc_1","name":"f"}
+                "item": {"type":ITEM_TYPE_FUNCTION_CALL,"call_id":"fc_1","name":"f"}
             }),
             &mut state,
         );
         let first = reader_read_response_events(
-            "response.output_item.done",
+            EVT_OUTPUT_ITEM_DONE,
             &serde_json::json!({"output_index": 2}),
             &mut state,
         );
@@ -6725,7 +7163,7 @@ mod tests {
             crate::ir::IrStreamEvent::BlockStop { index: 2 }
         ));
         let second = reader_read_response_events(
-            "response.output_item.done",
+            EVT_OUTPUT_ITEM_DONE,
             &serde_json::json!({"output_index": 2}),
             &mut state,
         );
@@ -6757,16 +7195,16 @@ mod tests {
             .as_str()
             .expect("created carries id")
             .to_string();
-        assert!(created_id.starts_with("resp_"));
+        assert!(created_id.starts_with("resp_")); // golden wire-contract literal (kept bare on purpose)
 
         let (etype, completed) = writer
             .write_response_event(&IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: usage_fixture(),
             })
             .expect("MessageDelta emits terminal");
-        assert_eq!(etype, "response.completed");
+        assert_eq!(etype, "response.completed"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(
             completed["response"]["id"].as_str(),
             Some(created_id.as_str()),
@@ -6799,7 +7237,7 @@ mod tests {
                 retry_after: None,
             }))
             .expect("Error emits response.failed");
-        assert_eq!(etype, "response.failed");
+        assert_eq!(etype, "response.failed"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(
             failed["response"]["id"].as_str(),
             Some(created_id.as_str()),
@@ -6824,7 +7262,7 @@ mod tests {
         assert_eq!(created["response"]["id"].as_str(), Some("resp_upstream123"));
         let (_, completed) = writer
             .write_response_event(&IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: usage_fixture(),
             })
@@ -6866,7 +7304,7 @@ mod tests {
         assert_eq!(b_created["response"]["id"].as_str(), Some("resp_B"));
         let (_, b_completed) = writer
             .write_response_event(&IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: usage_fixture(),
             })
@@ -6886,10 +7324,10 @@ mod tests {
         let mut state = crate::ir::StreamDecodeState::default();
         for i in 0..(MAX_OPEN_TOOLS as u64 + 200) {
             let _ = reader_read_response_events(
-                "response.output_item.added",
+                EVT_OUTPUT_ITEM_ADDED,
                 &serde_json::json!({
                     "output_index": i,
-                    "item": {"type":"function_call","call_id":"fc","name":"f"}
+                    "item": {"type":ITEM_TYPE_FUNCTION_CALL,"call_id":"fc","name":"f"}
                 }),
                 &mut state,
             );
@@ -6908,10 +7346,10 @@ mod tests {
     fn test_reader_output_index_clamped() {
         let mut state = crate::ir::StreamDecodeState::default();
         let out = reader_read_response_events(
-            "response.output_item.added",
+            EVT_OUTPUT_ITEM_ADDED,
             &serde_json::json!({
                 "output_index": u64::MAX,
-                "item": {"type":"function_call","call_id":"fc","name":"f"}
+                "item": {"type":ITEM_TYPE_FUNCTION_CALL,"call_id":"fc","name":"f"}
             }),
             &mut state,
         );
@@ -6998,7 +7436,7 @@ mod tests {
         let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
         assert_eq!(
             raw.provider_code.as_deref(),
-            Some("context_length_exceeded"),
+            Some("context_length_exceeded"), // golden wire-contract literal (kept bare on purpose)
             "message-only context-length error must synthesize the canonical code for failover"
         );
         assert_eq!(
@@ -7016,7 +7454,7 @@ mod tests {
         let raw = reader.extract_error(StatusCode::BAD_REQUEST, body);
         assert_eq!(
             raw.provider_code.as_deref(),
-            Some("context_length_exceeded")
+            Some("context_length_exceeded") // golden wire-contract literal (kept bare on purpose)
         );
     }
 
@@ -7058,8 +7496,8 @@ mod tests {
         );
     }
 
-    /// `ResponsesReader::classify` delegates to `super::openai_classify` (single-sourced after the R6
-    /// dedup). Every other reader has a direct `classify` test, but the Responses delegate was only
+    /// `ResponsesReader::classify` delegates to `super::openai_family::openai_classify`
+    /// (single-sourced after dedup). Every other reader has a direct `classify` test, but the Responses delegate was only
     /// ever exercised through OpenAi's copy — this guards the delegation directly, mirroring
     /// `test_openai_classify`. 429 → RateLimit.
     #[test]
@@ -7098,28 +7536,29 @@ mod tests {
         });
         let (etype, body) = writer
             .write_response_event(&IrStreamEvent::MessageDelta {
-                stop_reason: Some("max_tokens".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::MaxTokens),
                 stop_sequence: None,
                 usage: usage_fixture(),
             })
             .expect("MessageDelta emits a terminal event");
         assert_eq!(
-            etype, "response.incomplete",
+            etype,
+            "response.incomplete", // golden wire-contract literal (kept bare on purpose)
             "max_tokens truncation must use the response.incomplete event name"
         );
         assert_eq!(
             body["type"].as_str(),
-            Some("response.incomplete"),
+            Some("response.incomplete"), // golden wire-contract literal (kept bare on purpose)
             "inner dispatch type must agree with the event name"
         );
         assert_eq!(
             body["response"]["status"].as_str(),
-            Some("incomplete"),
+            Some("incomplete"), // golden wire-contract literal (kept bare on purpose)
             "inner status stays incomplete"
         );
         assert_eq!(
             body["response"]["incomplete_details"]["reason"].as_str(),
-            Some("max_output_tokens"),
+            Some("max_output_tokens"), // golden wire-contract literal (kept bare on purpose)
             "incomplete_details.reason maps max_tokens → max_output_tokens"
         );
     }
@@ -7138,16 +7577,16 @@ mod tests {
         });
         let (etype, body) = writer
             .write_response_event(&IrStreamEvent::MessageDelta {
-                stop_reason: Some("safety".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::Safety),
                 stop_sequence: None,
                 usage: usage_fixture(),
             })
             .expect("MessageDelta emits a terminal event");
-        assert_eq!(etype, "response.incomplete");
-        assert_eq!(body["type"].as_str(), Some("response.incomplete"));
+        assert_eq!(etype, "response.incomplete"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(body["type"].as_str(), Some("response.incomplete")); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(
             body["response"]["incomplete_details"]["reason"].as_str(),
-            Some("content_filter")
+            Some("content_filter") // golden wire-contract literal (kept bare on purpose)
         );
     }
 
@@ -7169,14 +7608,14 @@ mod tests {
         let created_id = created["response"]["id"].as_str().unwrap().to_string();
         let (etype, body) = writer
             .write_response_event(&IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: usage_fixture(),
             })
             .expect("terminal");
-        assert_eq!(etype, "response.completed");
-        assert_eq!(body["type"].as_str(), Some("response.completed"));
-        assert_eq!(body["response"]["status"].as_str(), Some("completed"));
+        assert_eq!(etype, "response.completed"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(body["type"].as_str(), Some("response.completed")); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(body["response"]["status"].as_str(), Some("completed")); // golden wire-contract literal (kept bare on purpose)
         assert!(body["response"].get("incomplete_details").is_none());
         assert_eq!(body["response"]["id"].as_str(), Some(created_id.as_str()));
     }
@@ -7189,14 +7628,14 @@ mod tests {
         let writer = ResponsesWriter;
         for kind in [
             "overloaded",
-            "overloaded_error",
+            ERR_TYPE_OVERLOADED,
             "service_unavailable",
             "unavailable",
         ] {
             let v = writer.write_error(503, kind, "upstream busy");
             assert_eq!(
                 v["error"]["type"].as_str(),
-                Some("server_error"),
+                Some("server_error"), // golden wire-contract literal (kept bare on purpose)
                 "kind {kind:?} must map to server_error, never leak overloaded"
             );
             // `server_error` carries no machine-readable code in the native shape.
@@ -7283,7 +7722,7 @@ mod tests {
             a1, a2,
             "same (prefix,index) yields a stable id within a stream"
         );
-        assert!(a1.starts_with("msg_"));
+        assert!(a1.starts_with("msg_")); // golden wire-contract literal (kept bare on purpose)
         let b = writer.item_id_for("msg", 1);
         assert_ne!(a1, b, "different indices get distinct ids");
         let fc = writer.item_id_for("fc", 0);
@@ -7291,7 +7730,7 @@ mod tests {
             a1, fc,
             "different prefixes at the same index get distinct ids"
         );
-        assert!(fc.starts_with("fc_"));
+        assert!(fc.starts_with("fc_")); // golden wire-contract literal (kept bare on purpose)
 
         // A new stream (reset) mints a fresh id for the same key.
         writer.reset_sequence_number();
@@ -7321,7 +7760,7 @@ mod tests {
             })
             .expect("output_item.added");
         let added_id = added["item_id"].as_str().unwrap().to_string();
-        assert!(added_id.starts_with("msg_"));
+        assert!(added_id.starts_with("msg_")); // golden wire-contract literal (kept bare on purpose)
 
         let (_, delta) = writer
             .write_response_event(&IrStreamEvent::BlockDelta {
@@ -7353,9 +7792,9 @@ mod tests {
         let mut state = crate::ir::StreamDecodeState::default();
         let item = serde_json::json!({
             "output_index": 0,
-            "item": {"type":"function_call","call_id":"fc_1","name":"f"}
+            "item": {"type":ITEM_TYPE_FUNCTION_CALL,"call_id":"fc_1","name":"f"}
         });
-        let first = reader_read_response_events("response.output_item.added", &item, &mut state);
+        let first = reader_read_response_events(EVT_OUTPUT_ITEM_ADDED, &item, &mut state);
         assert_eq!(
             first.len(),
             1,
@@ -7366,7 +7805,7 @@ mod tests {
             Some(crate::ir::IrStreamEvent::BlockStart { index: 0, .. })
         ));
         // A second added for the SAME index must emit nothing (the block is already open).
-        let second = reader_read_response_events("response.output_item.added", &item, &mut state);
+        let second = reader_read_response_events(EVT_OUTPUT_ITEM_ADDED, &item, &mut state);
         assert!(
             second.is_empty(),
             "a repeated output_item.added for an open index must not re-emit BlockStart, got {second:?}"
@@ -7386,10 +7825,10 @@ mod tests {
         let mut state = crate::ir::StreamDecodeState::default();
         for i in 0..(MAX_OPEN_TOOLS as u64) {
             let out = reader_read_response_events(
-                "response.output_item.added",
+                EVT_OUTPUT_ITEM_ADDED,
                 &serde_json::json!({
                     "output_index": i,
-                    "item": {"type":"function_call","call_id":"fc","name":"f"}
+                    "item": {"type":ITEM_TYPE_FUNCTION_CALL,"call_id":"fc","name":"f"}
                 }),
                 &mut state,
             );
@@ -7400,10 +7839,10 @@ mod tests {
         // impossible here since indices 0..128 already fill it; use a high index that clamps to a
         // value already present is not a "new" index, so instead assert no growth past the cap).
         let over = reader_read_response_events(
-            "response.output_item.added",
+            EVT_OUTPUT_ITEM_ADDED,
             &serde_json::json!({
                 "output_index": (MAX_OPEN_TOOLS as u64) + 50,
-                "item": {"type":"function_call","call_id":"fc","name":"f"}
+                "item": {"type":ITEM_TYPE_FUNCTION_CALL,"call_id":"fc","name":"f"}
             }),
             &mut state,
         );
@@ -7429,7 +7868,7 @@ mod tests {
         let mut state = crate::ir::StreamDecodeState::default();
         // No output_item.added for index 3 — the delta must be dropped.
         let out = reader_read_response_events(
-            "response.function_call_arguments.delta",
+            EVT_FUNCTION_CALL_ARGS_DELTA,
             &serde_json::json!({"output_index": 3, "delta": "{\"a\":1}"}),
             &mut state,
         );
@@ -7445,15 +7884,15 @@ mod tests {
     fn test_args_delta_routed_for_opened_index() {
         let mut state = crate::ir::StreamDecodeState::default();
         let _ = reader_read_response_events(
-            "response.output_item.added",
+            EVT_OUTPUT_ITEM_ADDED,
             &serde_json::json!({
                 "output_index": 1,
-                "item": {"type":"function_call","call_id":"fc","name":"f"}
+                "item": {"type":ITEM_TYPE_FUNCTION_CALL,"call_id":"fc","name":"f"}
             }),
             &mut state,
         );
         let out = reader_read_response_events(
-            "response.function_call_arguments.delta",
+            EVT_FUNCTION_CALL_ARGS_DELTA,
             &serde_json::json!({"output_index": 1, "delta": "{\"a\":1}"}),
             &mut state,
         );
@@ -7489,7 +7928,7 @@ mod tests {
 
         let (_, completed) = writer
             .write_response_event(&IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: usage_fixture(),
             })
@@ -7549,16 +7988,16 @@ mod tests {
             let v = writer.write_error(503, kind, "upstream failure");
             assert_eq!(
                 v["error"]["type"].as_str(),
-                Some("server_error"),
+                Some("server_error"), // golden wire-contract literal (kept bare on purpose)
                 "kind {kind:?} must map to server_error"
             );
             assert!(v["error"]["code"].is_null(), "server_error code is null");
         }
-        for kind in ["context_length_exceeded", "bad_request"] {
+        for kind in [crate::forward::PROVIDER_CODE_CONTEXT_LENGTH, "bad_request"] {
             let v = writer.write_error(400, kind, "bad request");
             assert_eq!(
                 v["error"]["type"].as_str(),
-                Some("invalid_request_error"),
+                Some("invalid_request_error"), // golden wire-contract literal (kept bare on purpose)
                 "kind {kind:?} must map to invalid_request_error"
             );
         }
@@ -7589,7 +8028,7 @@ mod tests {
                 },
             })
             .expect("output_item.added should emit");
-        assert_eq!(added.0, "response.output_item.added");
+        assert_eq!(added.0, "response.output_item.added"); // golden wire-contract literal (kept bare on purpose)
 
         // Two argument fragments accumulate into the complete string.
         let _ = writer.write_response_event(&crate::ir::IrStreamEvent::BlockDelta {
@@ -7605,9 +8044,9 @@ mod tests {
         let (etype, payload) = writer
             .write_response_event(&crate::ir::IrStreamEvent::BlockStop { index: 0 })
             .expect("output_item.done should emit");
-        assert_eq!(etype, "response.output_item.done");
+        assert_eq!(etype, "response.output_item.done"); // golden wire-contract literal (kept bare on purpose)
         let item = &payload["item"];
-        assert_eq!(item["type"].as_str(), Some("function_call"));
+        assert_eq!(item["type"].as_str(), Some("function_call")); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(
             item["call_id"].as_str(),
             Some("call_abc"),
@@ -7636,7 +8075,7 @@ mod tests {
         let mut state = crate::ir::StreamDecodeState::default();
         // First text item at index 0.
         let a = reader_read_response_events(
-            "response.output_text.delta",
+            EVT_OUTPUT_TEXT_DELTA,
             &serde_json::json!({"output_index": 0, "delta": "alpha"}),
             &mut state,
         );
@@ -7648,7 +8087,7 @@ mod tests {
         // Second text item at index 1 arrives BEFORE index 0 closes — must open its OWN block,
         // never an orphan delta against an unopened block.
         let b = reader_read_response_events(
-            "response.output_text.delta",
+            EVT_OUTPUT_TEXT_DELTA,
             &serde_json::json!({"output_index": 1, "delta": "beta"}),
             &mut state,
         );
@@ -7664,7 +8103,7 @@ mod tests {
         ));
         // Close index 0: BlockStop must pair with index 0 (not index 1).
         let close0 = reader_read_response_events(
-            "response.output_item.done",
+            EVT_OUTPUT_ITEM_DONE,
             &serde_json::json!({"output_index": 0}),
             &mut state,
         );
@@ -7676,7 +8115,7 @@ mod tests {
         );
         // Index 1 is still open and closes on its own terminal frame.
         let close1 = reader_read_response_events(
-            "response.output_item.done",
+            EVT_OUTPUT_ITEM_DONE,
             &serde_json::json!({"output_index": 1}),
             &mut state,
         );
@@ -7696,16 +8135,16 @@ mod tests {
         let mut state = crate::ir::StreamDecodeState::default();
         // Tool item opens at index 0.
         let _ = reader_read_response_events(
-            "response.output_item.added",
+            EVT_OUTPUT_ITEM_ADDED,
             &serde_json::json!({
                 "output_index": 0,
-                "item": {"type":"function_call","call_id":"fc_1","name":"f"}
+                "item": {"type":ITEM_TYPE_FUNCTION_CALL,"call_id":"fc_1","name":"f"}
             }),
             &mut state,
         );
         // Text item opens at index 1.
         let t = reader_read_response_events(
-            "response.output_text.delta",
+            EVT_OUTPUT_TEXT_DELTA,
             &serde_json::json!({"output_index": 1, "delta": "hi"}),
             &mut state,
         );
@@ -7715,7 +8154,7 @@ mod tests {
         ));
         // Tool arguments delta at index 0 must still route (tool index intact under raw key).
         let args = reader_read_response_events(
-            "response.function_call_arguments.delta",
+            EVT_FUNCTION_CALL_ARGS_DELTA,
             &serde_json::json!({"output_index": 0, "delta": "{\"x\":1}"}),
             &mut state,
         );
@@ -7729,7 +8168,7 @@ mod tests {
         ));
         // Close the tool index → tool BlockStop.
         let close_tool = reader_read_response_events(
-            "response.output_item.done",
+            EVT_OUTPUT_ITEM_DONE,
             &serde_json::json!({"output_index": 0}),
             &mut state,
         );
@@ -7739,7 +8178,7 @@ mod tests {
         ));
         // Close the text index → text BlockStop.
         let close_text = reader_read_response_events(
-            "response.output_item.done",
+            EVT_OUTPUT_ITEM_DONE,
             &serde_json::json!({"output_index": 1}),
             &mut state,
         );
@@ -7763,7 +8202,7 @@ mod tests {
                 cache_control: None,
                 citations: Vec::new(),
             }],
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -7823,7 +8262,7 @@ mod tests {
         );
 
         let delta = crate::ir::IrStreamEvent::MessageDelta {
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
@@ -7833,7 +8272,7 @@ mod tests {
             },
         };
         let (ename, completed) = writer.write_response_event(&delta).expect("terminal event");
-        assert_eq!(ename, "response.completed");
+        assert_eq!(ename, "response.completed"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(
             completed
                 .get("response")
@@ -7861,7 +8300,7 @@ mod tests {
             retry_after: None,
         });
         let (ename2, failed) = writer2.write_response_event(&err).expect("failed event");
-        assert_eq!(ename2, "response.failed");
+        assert_eq!(ename2, "response.failed"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(
             failed
                 .get("response")
@@ -7879,14 +8318,14 @@ mod tests {
     /// `response.error` unconditionally and is a distinguishability tell.
     #[test]
     fn test_write_response_emits_error_null_for_completed_and_incomplete() {
-        let make_resp = |stop: &str| crate::ir::IrResponse {
+        let make_resp = |stop: crate::ir::IrStopReason| crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hi".to_string(),
                 cache_control: None,
                 citations: Vec::new(),
             }],
-            stop_reason: Some(stop.to_string()),
+            stop_reason: Some(stop),
             usage: usage_fixture(),
             model: Some("gpt-4o-mini".to_string()),
             id: Some("resp_x".to_string()),
@@ -7897,8 +8336,8 @@ mod tests {
         let writer = ResponsesWriter;
 
         // Completed: error key present and explicitly null.
-        let completed = writer.write_response(&make_resp("end_turn"));
-        assert_eq!(completed["status"].as_str(), Some("completed"));
+        let completed = writer.write_response(&make_resp(crate::ir::IrStopReason::EndTurn));
+        assert_eq!(completed["status"].as_str(), Some("completed")); // golden wire-contract literal (kept bare on purpose)
         assert!(
             completed.get("error").is_some(),
             "non-streaming body must include the required error key"
@@ -7910,8 +8349,8 @@ mod tests {
 
         // Incomplete (max_tokens): error is still present and null (the failure path is the error
         // envelope, never this success/incomplete body).
-        let incomplete = writer.write_response(&make_resp("max_tokens"));
-        assert_eq!(incomplete["status"].as_str(), Some("incomplete"));
+        let incomplete = writer.write_response(&make_resp(crate::ir::IrStopReason::MaxTokens));
+        assert_eq!(incomplete["status"].as_str(), Some("incomplete")); // golden wire-contract literal (kept bare on purpose)
         assert!(
             incomplete["error"].is_null(),
             "error must be null on an incomplete response"
@@ -7933,10 +8372,10 @@ mod tests {
         // classify as RateLimit (not the old hardcoded ServerError).
         let body = serde_json::json!({
             "id": "resp_fail",
-            "object": "response",
-            "status": "failed",
+            "object": OBJ_RESPONSE,
+            "status": STATUS_FAILED,
             "output": serde_json::Value::Null,
-            "error": { "code": "rate_limit_exceeded", "message": "slow down" },
+            "error": { "code": ERR_CODE_RATE_LIMIT, "message": "slow down" },
             "usage": { "input_tokens": 1, "output_tokens": 0 },
             "model": "gpt-4o-mini"
         });
@@ -7957,18 +8396,18 @@ mod tests {
         // error.type fallback when code is absent. `content_filter` is not one of the mapped
         // signals, so it falls to the default transient ServerError bucket.
         let body_type = serde_json::json!({
-            "status": "failed",
-            "error": { "type": "content_filter", "message": "blocked" },
+            "status": STATUS_FAILED,
+            "error": { "type": INCOMPLETE_REASON_CONTENT_FILTER, "message": "blocked" },
             "usage": { "input_tokens": 1, "output_tokens": 0 }
         });
         let err_type = reader
             .read_response(&body_type)
             .expect_err("failed status must surface as an error");
         assert_eq!(err_type.class, StatusClass::ServerError);
-        assert_eq!(err_type.provider_signal.as_deref(), Some("content_filter"));
+        assert_eq!(err_type.provider_signal.as_deref(), Some("content_filter")); // golden wire-contract literal (kept bare on purpose)
 
         // failed with no usable error object → generic response_failed signal, default ServerError.
-        let body_bare = serde_json::json!({ "status": "failed" });
+        let body_bare = serde_json::json!({ "status": STATUS_FAILED });
         let err_bare = reader
             .read_response(&body_bare)
             .expect_err("failed status must surface as an error");
@@ -7982,7 +8421,7 @@ mod tests {
             .read_response(&body_parse)
             .expect_err("missing output must surface as a parse error");
         assert_eq!(err_parse.class, StatusClass::ClientError);
-        assert_eq!(err_parse.provider_signal.as_deref(), Some("ir_parse"));
+        assert_eq!(err_parse.provider_signal.as_deref(), Some("ir_parse")); // golden wire-contract literal (kept bare on purpose)
     }
 
     /// Regression (HIGH, re-audit R20): the writer emits a failed body as
@@ -7996,10 +8435,10 @@ mod tests {
         let reader = ResponsesReader;
         let body = serde_json::json!({
             "id": "resp_fail",
-            "object": "response",
-            "status": "failed",
+            "object": OBJ_RESPONSE,
+            "status": STATUS_FAILED,
             "output": [],
-            "error": { "code": "server_error", "message": "boom" },
+            "error": { "code": ERR_TYPE_SERVER_ERROR, "message": "boom" },
             // No `usage` on purpose: pre-fix this body fell through to the usage check and that
             // was part of what masked the error. The failed early return must not require usage.
         });
@@ -8030,15 +8469,15 @@ mod tests {
             "model": "gpt-4o",
             "input": [
                 // typed message, system role, array content
-                { "type": "message", "role": "system",
-                  "content": [{ "type": "input_text", "text": "you are terse" }] },
+                { "type": ITEM_TYPE_MESSAGE, "role": "system",
+                  "content": [{ "type": CONTENT_TYPE_INPUT_TEXT, "text": "you are terse" }] },
                 // typed message, developer role, bare-string content
-                { "type": "message", "role": "developer", "content": "be precise" },
+                { "type": ITEM_TYPE_MESSAGE, "role": "developer", "content": "be precise" },
                 // untyped item, system role, array content
                 { "role": "system",
-                  "content": [{ "type": "input_text", "text": "no emojis" }] },
+                  "content": [{ "type": CONTENT_TYPE_INPUT_TEXT, "text": "no emojis" }] },
                 // a normal user turn must still land in messages
-                { "type": "input_text", "text": "hello" }
+                { "type": CONTENT_TYPE_INPUT_TEXT, "text": "hello" }
             ]
         });
         let req = reader.read_request(&body).expect("request must parse");
@@ -8116,7 +8555,7 @@ mod tests {
         });
         let (_, completed) = writer
             .write_response_event(&IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: usage_fixture(),
             })
@@ -8141,7 +8580,7 @@ mod tests {
         });
         let (_, incomplete) = writer2
             .write_response_event(&IrStreamEvent::MessageDelta {
-                stop_reason: Some("max_tokens".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::MaxTokens),
                 stop_sequence: None,
                 usage: usage_fixture(),
             })
@@ -8171,7 +8610,7 @@ mod tests {
                 retry_after: None,
             }))
             .expect("failed event");
-        assert_eq!(ename, "response.failed");
+        assert_eq!(ename, "response.failed"); // golden wire-contract literal (kept bare on purpose)
         assert!(
             failed["response"]["output"].is_array(),
             "response.failed inner response must carry an output array"
@@ -8236,12 +8675,12 @@ mod tests {
         // Terminal.
         let (ename, completed) = writer
             .write_response_event(&IrStreamEvent::MessageDelta {
-                stop_reason: Some("tool_use".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::ToolUse),
                 stop_sequence: None,
                 usage: usage_fixture(),
             })
             .expect("terminal event");
-        assert_eq!(ename, "response.completed");
+        assert_eq!(ename, "response.completed"); // golden wire-contract literal (kept bare on purpose)
 
         let output = completed["response"]["output"]
             .as_array()
@@ -8254,7 +8693,7 @@ mod tests {
 
         // Items come out in output_index order: message (0) then function_call (1).
         let msg_item = &output[0];
-        assert_eq!(msg_item["type"], serde_json::json!("message"));
+        assert_eq!(msg_item["type"], serde_json::json!("message")); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(msg_item["role"], serde_json::json!("assistant"));
         let text = msg_item["content"][0]["text"]
             .as_str()
@@ -8265,7 +8704,7 @@ mod tests {
         );
 
         let fc_item = &output[1];
-        assert_eq!(fc_item["type"], serde_json::json!("function_call"));
+        assert_eq!(fc_item["type"], serde_json::json!("function_call")); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(fc_item["call_id"], serde_json::json!("call_abc"));
         assert_eq!(fc_item["name"], serde_json::json!("get_weather"));
         assert_eq!(
@@ -8289,7 +8728,7 @@ mod tests {
         });
         let (_, completed) = writer
             .write_response_event(&IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: usage_fixture(),
             })
@@ -8317,10 +8756,10 @@ mod tests {
 
         // Open a tool block at output_index 0.
         let added = reader_read_response_events(
-            "response.output_item.added",
+            EVT_OUTPUT_ITEM_ADDED,
             &serde_json::json!({
                 "output_index": 0,
-                "item": {"type": "function_call", "call_id": "call_x", "name": "f"}
+                "item": {"type": ITEM_TYPE_FUNCTION_CALL, "call_id": "call_x", "name": "f"}
             }),
             &mut state,
         );
@@ -8336,7 +8775,7 @@ mod tests {
         // A text delta arrives at the SAME output_index 0. It must NOT open a second block, and
         // must NOT route a TextDelta into the open tool block.
         let text = reader_read_response_events(
-            "response.output_text.delta",
+            EVT_OUTPUT_TEXT_DELTA,
             &serde_json::json!({"output_index": 0, "delta": "hi"}),
             &mut state,
         );
@@ -8358,8 +8797,8 @@ mod tests {
 
         // A terminal event must close index 0 exactly ONCE.
         let completed = reader_read_response_events(
-            "response.completed",
-            &serde_json::json!({"response": {"status": "completed"}}),
+            EVT_RESPONSE_COMPLETED,
+            &serde_json::json!({"response": {"status": STATUS_COMPLETED}}),
             &mut state,
         );
         let stops_at_0 = completed
@@ -8384,8 +8823,8 @@ mod tests {
         state.open_tools.insert(3 + TEXT_INDEX_KEY_OFFSET);
 
         let events = reader_read_response_events(
-            "response.completed",
-            &serde_json::json!({"response": {"status": "completed"}}),
+            EVT_RESPONSE_COMPLETED,
+            &serde_json::json!({"response": {"status": STATUS_COMPLETED}}),
             &mut state,
         );
         let stops_at_3 = events
@@ -8410,7 +8849,7 @@ mod tests {
         let mut state = crate::ir::StreamDecodeState::default();
         // Open a TEXT block at index 0.
         let text = reader_read_response_events(
-            "response.output_text.delta",
+            EVT_OUTPUT_TEXT_DELTA,
             &serde_json::json!({"output_index": 0, "delta": "a"}),
             &mut state,
         );
@@ -8419,10 +8858,10 @@ mod tests {
 
         // A function_call item arrives at the same index 0 -> must NOT open a tool block.
         let added = reader_read_response_events(
-            "response.output_item.added",
+            EVT_OUTPUT_ITEM_ADDED,
             &serde_json::json!({
                 "output_index": 0,
-                "item": {"type": "function_call", "call_id": "call_y", "name": "g"}
+                "item": {"type": ITEM_TYPE_FUNCTION_CALL, "call_id": "call_y", "name": "g"}
             }),
             &mut state,
         );
@@ -8586,20 +9025,20 @@ mod tests {
     fn test_reasoning_item_thinking_round_trip() {
         let body = serde_json::json!({
             "id": "resp_r",
-            "status": "completed",
+            "status": STATUS_COMPLETED,
             "model": "o3",
             "output": [
                 {
-                    "type": "reasoning",
+                    "type": ITEM_TYPE_REASONING,
                     "id": "rs_1",
                     "summary": [],
-                    "content": [{"type": "reasoning_text", "text": "let me think step by step"}],
+                    "content": [{"type": CONTENT_TYPE_REASONING_TEXT, "text": "let me think step by step"}],
                     "encrypted_content": "ENC_BLOB_123"
                 },
                 {
-                    "type": "message",
+                    "type": ITEM_TYPE_MESSAGE,
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": "the answer"}]
+                    "content": [{"type": CONTENT_TYPE_OUTPUT_TEXT, "text": "the answer"}]
                 }
             ],
             "usage": {"input_tokens": 5, "output_tokens": 7}
@@ -8612,7 +9051,9 @@ mod tests {
             .content
             .iter()
             .find_map(|b| match b {
-                crate::ir::IrBlock::Thinking { text, signature } => Some((text, signature)),
+                crate::ir::IrBlock::Thinking {
+                    text, signature, ..
+                } => Some((text, signature)),
                 _ => None,
             })
             .expect("a Thinking block read from the reasoning item");
@@ -8625,10 +9066,11 @@ mod tests {
         let out = writer.write_response(&ir);
         let reasoning = out["output"]
             .as_array()
-            .and_then(|a| a.iter().find(|i| i["type"] == "reasoning"))
+            .and_then(|a| a.iter().find(|i| i["type"] == "reasoning")) // golden wire-contract literal (kept bare on purpose)
             .expect("a reasoning output item written back");
         assert_eq!(
-            reasoning["content"][0]["type"], "reasoning_text",
+            reasoning["content"][0]["type"],
+            "reasoning_text", // golden wire-contract literal (kept bare on purpose)
             "reasoning text part typed reasoning_text"
         );
         assert_eq!(
@@ -8641,18 +9083,70 @@ mod tests {
         );
     }
 
+    /// Fix #6 (request-input reasoning): a prior-turn `reasoning` INPUT item must read into an IR
+    /// assistant Thinking block (no longer silently dropped) AND the writer must re-emit it as a
+    /// top-level `reasoning` input item — a same-protocol Responses->Responses request round-trip.
+    #[test]
+    fn reasoning_input_item_round_trips_through_request() {
+        let body = serde_json::json!({
+            "model": "o3",
+            "input": [
+                {"role": "user", "content": [{"type": CONTENT_TYPE_INPUT_TEXT, "text": "q"}]},
+                {
+                    "type": ITEM_TYPE_REASONING,
+                    "id": "rs_in",
+                    "summary": [],
+                    "content": [{"type": CONTENT_TYPE_REASONING_TEXT, "text": "prior reasoning"}],
+                    "encrypted_content": "ENC_IN_42"
+                },
+                {
+                    "type": ITEM_TYPE_MESSAGE,
+                    "role": "assistant",
+                    "content": [{"type": CONTENT_TYPE_OUTPUT_TEXT, "text": "a"}]
+                }
+            ]
+        });
+        let reader = ResponsesReader;
+        let ir = reader.read_request(&body).expect("read_request");
+
+        // The reasoning input item is preserved as an assistant Thinking block (NOT dropped).
+        let thinking = ir
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|b| match b {
+                crate::ir::IrBlock::Thinking {
+                    text, signature, ..
+                } => Some((text, signature)),
+                _ => None,
+            })
+            .expect("a Thinking block decoded from the reasoning input item");
+        assert_eq!(thinking.0, "prior reasoning");
+        assert_eq!(thinking.1.as_deref(), Some("ENC_IN_42"));
+
+        // Writer re-emits a top-level `reasoning` input item (round-trip).
+        let writer = ResponsesWriter;
+        let out = writer.write_request(&ir);
+        let reasoning = out["input"]
+            .as_array()
+            .and_then(|a| a.iter().find(|i| i["type"] == "reasoning")) // golden wire-contract literal (kept bare on purpose)
+            .expect("a reasoning input item written back");
+        assert_eq!(reasoning["content"][0]["text"], "prior reasoning");
+        assert_eq!(reasoning["encrypted_content"], "ENC_IN_42");
+    }
+
     // H6: `usage.input_tokens_details.cached_tokens` must read into the IR `cache_read_input_tokens`
     // and write back to the same nested Responses location (the Bedrock-shared cache-read field).
     #[test]
     fn test_cached_tokens_mapping() {
         let body = serde_json::json!({
             "id": "resp_c",
-            "status": "completed",
+            "status": STATUS_COMPLETED,
             "model": "gpt-4o",
             "output": [{
-                "type": "message",
+                "type": ITEM_TYPE_MESSAGE,
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": "hi"}]
+                "content": [{"type": CONTENT_TYPE_OUTPUT_TEXT, "text": "hi"}]
             }],
             "usage": {
                 "input_tokens": 100,
@@ -8678,8 +9172,8 @@ mod tests {
 
         // A response with NO cache details must NOT gain a spurious cached_tokens (None stays absent).
         let no_cache = serde_json::json!({
-            "id": "resp_n", "status": "completed", "model": "gpt-4o",
-            "output": [{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x"}]}],
+            "id": "resp_n", "status": STATUS_COMPLETED, "model": "gpt-4o",
+            "output": [{"type":ITEM_TYPE_MESSAGE,"role":"assistant","content":[{"type":CONTENT_TYPE_OUTPUT_TEXT,"text":"x"}]}],
             "usage": {"input_tokens": 1, "output_tokens": 1}
         });
         let ir2 = reader.read_response(&no_cache).expect("read_response");
@@ -8763,15 +9257,18 @@ mod tests {
         });
         let reader = ResponsesReader;
         let ir = reader.read_request(&body).expect("read_request");
-        // Canonical IR shape NESTS the schema fields under `json_schema`.
+        // Canonicalized into the typed IR (no protocol-shaped Value).
         let rf = ir
             .response_format
             .as_ref()
             .expect("response_format promoted");
-        assert_eq!(rf["type"], "json_schema");
-        assert_eq!(rf["json_schema"]["name"], "out");
-        assert_eq!(rf["json_schema"]["schema"]["type"], "object");
-        assert_eq!(rf["json_schema"]["strict"], true);
+        assert!(rf.json);
+        assert_eq!(rf.name.as_deref(), Some("out"));
+        assert_eq!(
+            rf.schema.as_ref().and_then(|s| s.get("type")),
+            Some(&serde_json::json!("object"))
+        );
+        assert_eq!(rf.strict, Some(true));
         // The non-format `text` sub-key (verbosity) survives via extra.
         assert_eq!(
             ir.extra.get("text").and_then(|t| t.get("verbosity")),
@@ -8815,21 +9312,22 @@ mod tests {
         });
         let reader = ResponsesReader;
         let ir = reader.read_request(&body).expect("read_request");
-        let img = ir
+        let file_id = ir
             .messages
             .iter()
             .flat_map(|m| &m.content)
             .find_map(|b| match b {
-                crate::ir::IrBlock::Image { media_type, data } => Some((media_type, data)),
+                crate::ir::IrBlock::Image {
+                    source: crate::ir::IrImageSource::Vendor { vendor, value },
+                    ..
+                } if *vendor == "responses" => value
+                    .get("file_id")
+                    .and_then(|i| i.as_str())
+                    .map(String::from),
                 _ => None,
             })
-            .expect("an Image block from the file_id image");
-        assert_eq!(
-            img.0, FILE_ID_IMAGE_SENTINEL,
-            "file_id carried via sentinel"
-        );
-        assert_eq!(img.1, "file-abc123", "file_id preserved");
-        assert!(!img.1.is_empty(), "file_id image is NOT an empty block");
+            .expect("a responses-vendor Image block from the file_id image");
+        assert_eq!(file_id, "file-abc123", "file_id preserved");
 
         // Write back: re-emits the native file_id form, not an image_url. The writer emits the
         // CANONICAL message-wrapped form (`{type:message, role, content:[{type:input_image,...}]}`),
@@ -8861,10 +9359,10 @@ mod tests {
 
         // output_item.added (reasoning) at index 0 opens a Thinking BlockStart.
         let added = reader.read_response_events(
-            "response.output_item.added",
+            EVT_OUTPUT_ITEM_ADDED,
             &serde_json::json!({
                 "output_index": 0,
-                "item": {"type": "reasoning", "id": "rs_1"}
+                "item": {"type": ITEM_TYPE_REASONING, "id": "rs_1"}
             }),
             &mut state,
         );
@@ -8881,7 +9379,7 @@ mod tests {
 
         // reasoning_text.delta carries a ThinkingDelta.
         let delta = reader.read_response_events(
-            "response.reasoning_text.delta",
+            EVT_REASONING_TEXT_DELTA,
             &serde_json::json!({"output_index": 0, "delta": "pondering"}),
             &mut state,
         );
@@ -8904,8 +9402,8 @@ mod tests {
                 block: crate::ir::IrBlockMeta::Thinking,
             })
             .expect("Thinking BlockStart emits a frame");
-        assert_eq!(etype, "response.output_item.added");
-        assert_eq!(payload["item"]["type"], "reasoning");
+        assert_eq!(etype, "response.output_item.added"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(payload["item"]["type"], "reasoning"); // golden wire-contract literal (kept bare on purpose)
 
         // A ThinkingDelta emits a native reasoning_text.delta.
         let (etype2, payload2) = writer
@@ -8914,15 +9412,15 @@ mod tests {
                 delta: crate::ir::IrDelta::ThinkingDelta("pondering".to_string()),
             })
             .expect("ThinkingDelta emits a frame");
-        assert_eq!(etype2, "response.reasoning_text.delta");
+        assert_eq!(etype2, "response.reasoning_text.delta"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(payload2["delta"], "pondering");
 
         // BlockStop closes it as a reasoning output_item.done carrying the assembled text.
         let (etype3, payload3) = writer
             .write_response_event(&crate::ir::IrStreamEvent::BlockStop { index: 0 })
             .expect("Thinking BlockStop emits a frame");
-        assert_eq!(etype3, "response.output_item.done");
-        assert_eq!(payload3["item"]["type"], "reasoning");
+        assert_eq!(etype3, "response.output_item.done"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(payload3["item"]["type"], "reasoning"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(payload3["item"]["content"][0]["text"], "pondering");
     }
 
@@ -8934,10 +9432,10 @@ mod tests {
         let reader = ResponsesReader;
         let mut state = crate::ir::StreamDecodeState::default();
         let events = reader.read_response_events(
-            "response.completed",
+            EVT_RESPONSE_COMPLETED,
             &serde_json::json!({
                 "response": {
-                    "status": "completed",
+                    "status": STATUS_COMPLETED,
                     "usage": {
                         "input_tokens": 50,
                         "output_tokens": 5,
@@ -8960,7 +9458,7 @@ mod tests {
         let writer = ResponsesWriter;
         let (_etype, payload) = writer
             .write_response_event(&crate::ir::IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: crate::ir::IrUsage {
                     input_tokens: 50,

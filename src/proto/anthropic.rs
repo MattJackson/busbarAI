@@ -9,18 +9,89 @@ use super::*;
 /// targets). Bump when adopting a newer Anthropic API version.
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
-/// Mixed-case base62 alphabet (`[0-9A-Za-z]`), matching the character set of a native Anthropic id
-/// token. A native `msg_`/`req_` id is `01` followed by a fixed-length mixed-case alphanumeric
-/// token — NOT lowercase hex — so encoding the synthesized suffix in this alphabet (rather than
-/// bare `{:x}`) removes the alphabet/length/version-prefix distinguishability tell.
-const BASE62_ALPHABET: &[u8; 62] =
+/// Mixed-case base62 alphabet (`[0-9A-Za-z]`), UPPERCASE-FIRST, matching the character set/ordering of
+/// a native Anthropic id token. A native `msg_`/`req_` id is `01` followed by a fixed-length mixed-case
+/// alphanumeric token — NOT lowercase hex — so encoding the synthesized suffix in this alphabet (rather
+/// than bare `{:x}`) removes the alphabet/length/version-prefix distinguishability tell. DISTINCT from
+/// the shared `crate::proto::BASE62_ALPHABET` (lowercase-first): named `ANTHROPIC_NATIVE_ALPHABET` so
+/// the two can never be confused — `synth_id_with_prefix` (body ids) needs THIS uppercase-first
+/// ordering, while `synth_anthropic_request_id` (response-header id) deliberately uses the shared one.
+const ANTHROPIC_NATIVE_ALPHABET: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// The response-header name a native Anthropic endpoint always carries (the SDK reads it into
+/// `APIError.request_id` / `Message._request_id`). Defined here (the Anthropic dialect's home) and
+/// used within this module; surfaced externally only via the writer vtable
+/// (`AnthropicWriter::ingress_response_request_id` / `ingress_relayed_response_header_names`), so
+/// the sites that attach it (forward.rs success path) and capture it from upstream cannot drift on
+/// spelling.
+const HDR_REQUEST_ID: &str = "request-id";
 
 /// Width of a synthesized Anthropic id's token (the part after the `01` version marker): a native
 /// `msg_`/`req_` id is `<prefix>01` followed by a fixed-width 24-char mixed-case base62 token, so
 /// `msg_`/`req_` + `01` + 24 = 30 chars total. Matching this exact length AND alphabet is what keeps
 /// the synthesized id structurally indistinguishable from a native one.
 const SYNTH_ID_TOKEN_LEN: usize = 24;
+
+/// SSE event-type strings emitted in the `event:` header of each native Anthropic stream frame.
+const EVT_MESSAGE_START: &str = "message_start";
+const EVT_CONTENT_BLOCK_START: &str = "content_block_start";
+const EVT_CONTENT_BLOCK_DELTA: &str = "content_block_delta";
+const EVT_CONTENT_BLOCK_STOP: &str = "content_block_stop";
+const EVT_MESSAGE_DELTA: &str = "message_delta";
+const EVT_MESSAGE_STOP: &str = "message_stop";
+
+/// `content_block_delta` sub-type values (`delta.type` field).
+const DELTA_TYPE_TEXT: &str = "text_delta";
+const DELTA_TYPE_THINKING: &str = "thinking_delta";
+const DELTA_TYPE_INPUT_JSON: &str = "input_json_delta";
+const DELTA_TYPE_SIGNATURE: &str = "signature_delta";
+const DELTA_TYPE_CITATIONS: &str = "citations_delta";
+
+/// Native Anthropic `stop_reason` token values.
+const STOP_END_TURN: &str = "end_turn";
+const STOP_MAX_TOKENS: &str = "max_tokens";
+const STOP_STOP_SEQUENCE: &str = "stop_sequence";
+const STOP_TOOL_USE: &str = "tool_use";
+const STOP_PAUSE_TURN: &str = "pause_turn";
+const STOP_REFUSAL: &str = "refusal";
+
+/// Anthropic content block `type` values not covered by the delta sub-type constants above.
+const BLOCK_TYPE_REDACTED_THINKING: &str = "redacted_thinking";
+
+/// Anthropic error `type` strings used in error envelopes and in-stream error events.
+const ERR_TYPE_OVERLOADED: &str = "overloaded_error";
+const ERR_TYPE_INVALID_REQUEST: &str = "invalid_request_error";
+const ERR_TYPE_AUTHENTICATION: &str = "authentication_error";
+const ERR_TYPE_RATE_LIMIT: &str = "rate_limit_error";
+const ERR_TYPE_API_ERROR: &str = "api_error";
+const ERR_TYPE_TIMEOUT: &str = "timeout_error";
+const ERR_TYPE_NOT_FOUND: &str = "not_found_error";
+const ERR_TYPE_PERMISSION: &str = "permission_error";
+const ERR_TYPE_REQUEST_TOO_LARGE: &str = "request_too_large";
+
+/// Anthropic citation `type` tag values (the `type` field on each citation object).
+const CITATION_TYPE_CHAR: &str = "char_location";
+const CITATION_TYPE_PAGE: &str = "page_location";
+const CITATION_TYPE_CONTENT_BLOCK: &str = "content_block_location";
+
+/// The sole valid `cache_control.type` Anthropic exposes today.
+const CACHE_KIND_EPHEMERAL: &str = "ephemeral";
+
+/// Header names used when attaching Anthropic credentials to upstream requests.
+const HDR_X_API_KEY: &str = "x-api-key";
+const HDR_ANTHROPIC_VERSION: &str = "anthropic-version";
+
+/// Credential prefix strings used to classify a raw key into its native Anthropic scheme.
+const CRED_PREFIX_API_KEY: &str = "sk-ant-api";
+const CRED_PREFIX_OAUTH: &str = "sk-ant-oat";
+
+/// The upstream path this writer targets on the Anthropic Messages API.
+const PATH_UPSTREAM: &str = "/v1/messages";
+
+/// HTTP status codes that Anthropic (and cross-protocol upstreams) use to signal overload.
+const STATUS_OVERLOADED: u16 = 503;
+const STATUS_ANTHROPIC_OVERLOADED: u16 = 529;
 
 /// Mint a protocol-correct Anthropic message id for the cross-protocol path, where the backend
 /// supplied none. A native id is `msg_01` + a fixed-length mixed-case base62 token; an official
@@ -42,7 +113,7 @@ fn synth_request_id() -> String {
 
 /// Shared id construction for both `msg_` and `req_`. The suffix is the native `01` version marker
 /// followed by a fixed-width 24-char mixed-case base62 token drawn ENTIRELY from the OS CSPRNG
-/// (mirroring `proto::mod::synth_anthropic_request_id` and `openai::synth_completion_id`). The
+/// (mirroring the sibling `synth_anthropic_request_id` and `openai_chat::synth_completion_id`). The
 /// earlier `(unix_second, counter)` encoding was a deterministic clock+counter fingerprint, and even
 /// a counter overlaid into a fixed region of an otherwise-random token leaves those characters
 /// predictable/low-entropy (the counter stays small, so its high base62 digits are constant '0') —
@@ -56,8 +127,8 @@ fn synth_id_with_prefix(prefix: &str) -> String {
     // 8..61 from only 4 — over-representing the low characters by ~25%, a statistical fingerprint
     // that distinguishes a synthesized id from a native (uniform) one. We therefore reject any byte
     // >= 248 (the largest multiple of 62 that fits in a u8) and consume only the in-range bytes,
-    // mirroring `openai::synth_completion_id` (the other rejection-sampling base62 synth;
-    // `proto::mod::synth_anthropic_request_id` reaches a uniform distribution differently, via u128
+    // mirroring `openai_chat::synth_completion_id` (the other rejection-sampling base62 synth; the sibling
+    // `synth_anthropic_request_id` reaches a uniform distribution differently, via u128
     // division). On an entropy failure we leave the remaining '0' fill rather than panic; no counter.
     // Same ordering-independent reduction cutoff as every other base62 synth (4 * 62 = 248); only
     // this module's ALPHABET *ordering* (uppercase-first) is intentionally local.
@@ -74,7 +145,7 @@ fn synth_id_with_prefix(prefix: &str) -> String {
             if byte >= BASE62_REJECT_FLOOR {
                 continue; // biased residue — discard to keep the distribution uniform
             }
-            token[filled] = BASE62_ALPHABET[(byte % 62) as usize];
+            token[filled] = ANTHROPIC_NATIVE_ALPHABET[(byte % 62) as usize];
             filled += 1;
             if filled == SYNTH_ID_TOKEN_LEN {
                 break 'outer;
@@ -88,6 +159,43 @@ fn synth_id_with_prefix(prefix: &str) -> String {
     format!("{prefix}01{token}")
 }
 
+/// Mint a protocol-correct Anthropic request id (`req_01<token>`) for the `request-id` RESPONSE HEADER
+/// a native Anthropic response always carries. The official SDK reads this header into
+/// `APIError.request_id` / `Message._request_id` (NOT the body), so a busbar anthropic response that
+/// omitted it left `request_id == None` — impossible against the real API and a deterministic proxy
+/// tell. Used by `forward.rs` on anthropic-ingress success/relay 2xx responses that have NO upstream
+/// `request-id` to forward (the error path mirrors the writer's own body `request_id` into the header
+/// instead; the same-protocol passthrough forwards the UPSTREAM `request-id` verbatim and never calls
+/// this). The shape mirrors a native id EXACTLY: the `req_` prefix, the `01` version marker, then a
+/// fixed-width 24-char mixed-case base62 token from the OS CSPRNG — `req_01` + 24 = 30 chars
+/// total, matching `synth_id_with_prefix("req_")` (used for the body `request_id`) so the
+/// response-header length is not a fingerprint tell (a 22-char value would be 8 chars short of
+/// native). Returns `None` (caller OMITS the header) only if entropy is unavailable — on the request
+/// path, must never panic. Uses the SHARED `crate::proto::BASE62_ALPHABET` (lowercase-first ordering)
+/// deliberately — NOT this module's local uppercase-first `ANTHROPIC_NATIVE_ALPHABET` — preserving the
+/// exact distribution it had when it lived in `proto::mod`.
+pub(crate) fn synth_anthropic_request_id() -> Option<String> {
+    const ALPHABET: &[u8; 62] = crate::proto::BASE62_ALPHABET;
+    // 24 base62 chars (≈143 bits) of CSPRNG entropy. A u128 holds at most 12 base62 digits worth of
+    // headroom safely (62^12 < 2^128), so build the 24-char token from two independent 9-byte (72-bit)
+    // draws, each emitting 12 base62 digits — collision-free in practice and matching the native
+    // `req_01` + 24 = 30-char shape.
+    let mut token = [0u8; 24];
+    for half in 0..2 {
+        let mut buf = [0u8; 9];
+        getrandom::getrandom(&mut buf).ok()?;
+        // 72 bits → 12 base62 digits (62^12 > 2^71, so 9 bytes fit in 12 digits).
+        let mut n = buf.iter().fold(0u128, |acc, &b| (acc << 8) | b as u128);
+        for slot in token[half * 12..half * 12 + 12].iter_mut().rev() {
+            *slot = ALPHABET[(n % 62) as usize];
+            n /= 62;
+        }
+    }
+    // token is ASCII base62, always valid UTF-8.
+    let token = std::str::from_utf8(&token).unwrap_or("000000000000000000000000");
+    Some(format!("req_01{token}"))
+}
+
 /// Upper bound on an upstream-supplied streaming content-block index. Anthropic's Messages API
 /// numbers blocks densely from 0; a real response has a small handful, never a sparse pathological
 /// index. An upstream-controlled `index` flows into the IR (`BlockStart`/`BlockDelta`/`BlockStop`)
@@ -97,7 +205,7 @@ fn synth_id_with_prefix(prefix: &str) -> String {
 /// read site to this bound before the value enters the IR, mirroring the Bedrock reader's
 /// `MAX_CONTENT_BLOCK_INDEX` (same 1023 cap), the OpenAI reader's `MAX_TOOL_INDEX`, and the Cohere
 /// reader's `MAX_TOOL_FRAME_INDEX`. 1023 is far above any legitimate block count yet bounds the
-/// downstream allocation. (R27 #7, cross-protocol sibling of those clamps.)
+/// downstream allocation. Cross-protocol sibling of those clamps.
 const MAX_ANTHROPIC_BLOCK_INDEX: u64 = 1023;
 
 /// Read a streaming event's `index`, requiring it to be present and numeric (returns `None` to drop
@@ -114,8 +222,8 @@ fn read_clamped_block_index(data: &serde_json::Value) -> Option<usize> {
 }
 
 /// Clamp a temperature to Anthropic's native `[0.0, 1.0]` range, returning `(clamped, was_clamped)`
-/// where `was_clamped` is `true` iff the clamp ACTUALLY changed the value (PF-M1 clamp + PF-H2
-/// non-silent signal). OpenAI / Responses accept temperature up to 2.0, so a cross-protocol request
+/// where `was_clamped` is `true` iff the clamp ACTUALLY changed the value. OpenAI / Responses
+/// accept temperature up to 2.0, so a cross-protocol request
 /// can carry a value Anthropic's API rejects with a 422; the writer forwards the closest valid value
 /// instead of bouncing a 422, and uses `was_clamped` to emit a `warn!` so the mutation is NOT silent.
 /// Factored out so the non-silent-on-change contract is unit-testable without a tracing subscriber.
@@ -159,8 +267,8 @@ impl ProtocolReader for AnthropicReader {
         // Surface the canonical code so the breaker pipeline (normalize_raw_error) → ContextLength.
         //
         // GATE the message-scan override on a request-SIZE status (400 Bad Request / 413 Payload Too
-        // Large) — the only statuses under which an oversized-prompt body is the authoritative signal
-        // (R27 #11, cross-protocol sibling of the Cohere `body_signals_context_length` gate). Without
+        // Large) — the only statuses under which an oversized-prompt body is the authoritative signal.
+        // Cross-protocol sibling of the Cohere `body_signals_context_length` gate. Without
         // the gate, ANY non-2xx whose body merely mentions a token/length phrase was reclassified to
         // context_length: a 401/403 ("...invalid token...") or a 429 ("...rate limit on tokens...")
         // would be turned into a non-penalizing ContextLength fail-over, so the breaker never recorded
@@ -178,7 +286,7 @@ impl ProtocolReader for AnthropicReader {
                 || (lower.contains("exceeds the maximum")
                     && (lower.contains("token") || lower.contains("context")))
             {
-                Some("context_length_exceeded".to_string())
+                Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string())
             } else {
                 None
             }
@@ -306,7 +414,7 @@ impl ProtocolReader for AnthropicReader {
     fn read_request(&self, body: &serde_json::Value) -> Result<crate::ir::IrRequest, IrError> {
         let obj = body.as_object().ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".to_string()),
+            provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
             retry_after: None,
         })?;
 
@@ -413,30 +521,10 @@ impl ProtocolReader for AnthropicReader {
             }
         }
 
-        // INGRESS sentinel scrub (asymmetric twin of the egress redacted-reasoning drop): a CLIENT
-        // request must not be able to forge the upstream-origin `__busbar_bedrock_redacted_reasoning`
-        // signature. Egress drops it on non-Bedrock wires, but a client hitting Anthropic ingress with
-        // `{"type":"thinking","signature":"__busbar_bedrock_redacted_reasoning"}` would otherwise carry
-        // it verbatim into the IR and forge a `redactedContent` block on Bedrock egress. Strip the
-        // signature to `None` here so ONLY a genuine upstream-origin redacted block can bear the
-        // sentinel; a None-signature Thinking block is the harmless unsigned form readers already drop.
-        for block in system_blocks
-            .iter_mut()
-            .chain(messages.iter_mut().flat_map(|m| m.content.iter_mut()))
-        {
-            if let crate::ir::IrBlock::Thinking {
-                signature: signature @ Some(_),
-                ..
-            } = block
-            {
-                if signature
-                    .as_deref()
-                    .is_some_and(crate::proto::is_redacted_reasoning_sig)
-                {
-                    *signature = None;
-                }
-            }
-        }
+        // (No ingress sentinel scrub needed anymore: a client cannot forge a redacted-reasoning block.
+        // `redacted` is a TYPED flag only the Anthropic/Bedrock readers set on a genuine
+        // `redacted_thinking`/`redactedContent` block — a client-supplied `signature` string can never
+        // mark a block redacted, so the old `__busbar` sentinel forgery vector is structurally closed.)
 
         Ok(crate::ir::IrRequest {
             system: system_blocks,
@@ -464,7 +552,7 @@ impl ProtocolReader for AnthropicReader {
         data: &serde_json::Value,
     ) -> Option<IrStreamEvent> {
         match event_type {
-            "message_start" => {
+            EVT_MESSAGE_START => {
                 let msg = data.get("message")?;
                 let role_str = msg.get("role").and_then(|r| r.as_str())?;
                 let role = match role_str {
@@ -507,14 +595,14 @@ impl ProtocolReader for AnthropicReader {
                     model,
                 })
             }
-            "content_block_start" => {
+            EVT_CONTENT_BLOCK_START => {
                 let index = read_clamped_block_index(data)?;
                 let block = data.get("content_block")?;
                 let block_type = block.get("type").and_then(|t| t.as_str())?;
                 let meta = match block_type {
                     "text" => IrBlockMeta::Text,
                     "thinking" => IrBlockMeta::Thinking,
-                    "tool_use" => {
+                    STOP_TOOL_USE => {
                         let id = block.get("id").and_then(|i| i.as_str()).map(String::from)?;
                         let name = block
                             .get("name")
@@ -527,26 +615,26 @@ impl ProtocolReader for AnthropicReader {
                 };
                 Some(IrStreamEvent::BlockStart { index, block: meta })
             }
-            "content_block_delta" => {
+            EVT_CONTENT_BLOCK_DELTA => {
                 let index = read_clamped_block_index(data)?;
                 let delta_val = data.get("delta")?;
                 let delta_type = delta_val.get("type").and_then(|t| t.as_str())?;
                 let delta = match delta_type {
-                    "text_delta" => {
+                    DELTA_TYPE_TEXT => {
                         let text = delta_val
                             .get("text")
                             .and_then(|t| t.as_str())
                             .map(String::from)?;
                         IrDelta::TextDelta(text)
                     }
-                    "thinking_delta" => {
+                    DELTA_TYPE_THINKING => {
                         let thinking = delta_val
                             .get("thinking")
                             .and_then(|t| t.as_str())
                             .map(String::from)?;
                         IrDelta::ThinkingDelta(thinking)
                     }
-                    "input_json_delta" => {
+                    DELTA_TYPE_INPUT_JSON => {
                         let json = delta_val
                             .get("partial_json")
                             .or_else(|| delta_val.get("input_json"))
@@ -554,7 +642,7 @@ impl ProtocolReader for AnthropicReader {
                             .map(String::from)?;
                         IrDelta::InputJsonDelta(json)
                     }
-                    "signature_delta" => {
+                    DELTA_TYPE_SIGNATURE => {
                         let signature = delta_val
                             .get("signature")
                             .and_then(|s| s.as_str())
@@ -567,7 +655,7 @@ impl ProtocolReader for AnthropicReader {
                     // the byte-exact `raw` escape hatch are filled (same as the non-stream path),
                     // then carry it as `IrDelta::CitationsDelta` (one citation per delta). Without
                     // this arm a streamed grounding/web-search citation was silently dropped.
-                    "citations_delta" => {
+                    DELTA_TYPE_CITATIONS => {
                         let citation_val = delta_val.get("citation")?;
                         IrDelta::CitationsDelta(vec![read_citation(citation_val)])
                     }
@@ -575,16 +663,16 @@ impl ProtocolReader for AnthropicReader {
                 };
                 Some(IrStreamEvent::BlockDelta { index, delta })
             }
-            "content_block_stop" => {
+            EVT_CONTENT_BLOCK_STOP => {
                 let index = read_clamped_block_index(data)?;
                 Some(IrStreamEvent::BlockStop { index })
             }
-            "message_delta" => {
+            EVT_MESSAGE_DELTA => {
                 let delta = data.get("delta")?;
                 let stop_reason = delta
                     .get("stop_reason")
                     .and_then(|r| r.as_str())
-                    .map(String::from);
+                    .map(read_anthropic_stop_reason);
                 // `message_delta.delta.stop_sequence` — the matched stop string, present (as a
                 // string) only when a stop sequence actually triggered the stop, `null`/absent
                 // otherwise. Carry it through so the same-protocol writer can re-emit it.
@@ -624,7 +712,7 @@ impl ProtocolReader for AnthropicReader {
                     usage,
                 })
             }
-            "message_stop" => Some(IrStreamEvent::MessageStop),
+            EVT_MESSAGE_STOP => Some(IrStreamEvent::MessageStop),
             "error" => {
                 let err_val = data.get("error")?;
                 // Carry the upstream error `type` through as-is: `Some("rate_limit_error")` when
@@ -668,7 +756,7 @@ impl ProtocolReader for AnthropicReader {
     fn read_response(&self, body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError> {
         let obj = body.as_object().ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".into()),
+            provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.into()),
             retry_after: None,
         })?;
 
@@ -679,7 +767,7 @@ impl ProtocolReader for AnthropicReader {
             _ => {
                 return Err(IrError {
                     class: StatusClass::ClientError,
-                    provider_signal: Some("ir_parse".into()),
+                    provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.into()),
                     retry_after: None,
                 })
             }
@@ -688,7 +776,7 @@ impl ProtocolReader for AnthropicReader {
         // Parse content blocks
         let content_val = obj.get("content").ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".into()),
+            provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.into()),
             retry_after: None,
         })?;
         let mut content: Vec<crate::ir::IrBlock> = Vec::new();
@@ -702,7 +790,7 @@ impl ProtocolReader for AnthropicReader {
         let stop_reason = obj
             .get("stop_reason")
             .and_then(|r| r.as_str())
-            .map(String::from);
+            .map(read_anthropic_stop_reason);
 
         // Parse usage. `usage` is OPTIONAL on read here: do NOT `ok_or?` it. A native Anthropic
         // non-streaming `Message` always carries `usage`, but an Anthropic-compatible backend that
@@ -791,15 +879,15 @@ impl ProtocolReader for AnthropicReader {
 /// `_ =>` swallow, so a future Anthropic error type surfaces as an explicit unmapped case here.
 fn stream_error_class(error_type: Option<&str>) -> StatusClass {
     match error_type {
-        Some("overloaded_error") => StatusClass::Overloaded,
-        Some("rate_limit_error") => StatusClass::RateLimit,
-        Some("api_error") => StatusClass::ServerError,
-        Some("timeout_error") => StatusClass::Timeout,
-        Some("authentication_error") | Some("permission_error") => StatusClass::Auth,
+        Some(ERR_TYPE_OVERLOADED) => StatusClass::Overloaded,
+        Some(ERR_TYPE_RATE_LIMIT) => StatusClass::RateLimit,
+        Some(ERR_TYPE_API_ERROR) => StatusClass::ServerError,
+        Some(ERR_TYPE_TIMEOUT) => StatusClass::Timeout,
+        Some(ERR_TYPE_AUTHENTICATION) | Some(ERR_TYPE_PERMISSION) => StatusClass::Auth,
         Some("billing_error") => StatusClass::Billing,
-        Some("invalid_request_error")
-        | Some("not_found_error")
-        | Some("request_too_large")
+        Some(ERR_TYPE_INVALID_REQUEST)
+        | Some(ERR_TYPE_NOT_FOUND)
+        | Some(ERR_TYPE_REQUEST_TOO_LARGE)
         | None => StatusClass::ClientError,
         Some(_unrecognized) => StatusClass::ClientError,
     }
@@ -809,7 +897,7 @@ fn stream_error_class(error_type: Option<&str>) -> StatusClass {
 fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrError> {
     let obj = block_val.as_object().ok_or(IrError {
         class: StatusClass::ClientError,
-        provider_signal: Some("ir_parse".to_string()),
+        provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
         retry_after: None,
     })?;
 
@@ -844,9 +932,15 @@ fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrErr
             let signature = obj
                 .get("signature")
                 .and_then(|v| v.as_str().map(String::from));
-            Ok(crate::ir::IrBlock::Thinking { text, signature })
+            let cache_control = read_cache_control(obj.get("cache_control"))?;
+            Ok(crate::ir::IrBlock::Thinking {
+                text,
+                signature,
+                redacted: false,
+                cache_control,
+            })
         }
-        "tool_use" => {
+        STOP_TOOL_USE => {
             let id = obj
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -897,9 +991,12 @@ fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrErr
         "image" => {
             let source = obj.get("source").ok_or(IrError {
                 class: StatusClass::ClientError,
-                provider_signal: Some("ir_parse".to_string()),
+                provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
                 retry_after: None,
             })?;
+            // `cache_control` sits on the OUTER image block object (a sibling of `source`), not on
+            // the source — read it once and attach to whichever source shape we produce.
+            let cache_control = read_cache_control(obj.get("cache_control"))?;
             if let Some(src_obj) = source.as_object() {
                 // Anthropic's Messages API has TWO native image source shapes:
                 //   - `{"type":"url","url":<url>}`           — a remote image reference
@@ -916,8 +1013,8 @@ fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrErr
                         .unwrap_or("")
                         .to_string();
                     return Ok(crate::ir::IrBlock::Image {
-                        media_type: "image_url".to_string(),
-                        data: url,
+                        source: crate::ir::IrImageSource::Url(url),
+                        cache_control,
                     });
                 }
                 let media_type = src_obj
@@ -930,17 +1027,43 @@ fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrErr
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                Ok(crate::ir::IrBlock::Image { media_type, data })
+                Ok(crate::ir::IrBlock::Image {
+                    source: crate::ir::IrImageSource::Base64 { media_type, data },
+                    cache_control,
+                })
             } else {
                 Err(IrError {
                     class: StatusClass::ClientError,
-                    provider_signal: Some("ir_parse".to_string()),
+                    provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
                     retry_after: None,
                 })
             }
         }
+        // A native `redacted_thinking` block carries opaque `data` bytes (Anthropic's encrypted
+        // reasoning). Map it onto the same typed IR carrier Bedrock's `redactedContent` uses: a
+        // `Thinking { redacted: true }` with the opaque bytes in `text` and no signature. The
+        // Anthropic WRITER matches `Thinking { redacted: true, .. }` and re-emits a native
+        // `redacted_thinking` block, so a `read_response` -> `write_response` (Anthropic->Anthropic)
+        // round-trip preserves the block. Forgery is structurally impossible: a client-supplied
+        // `thinking` block on the REQUEST path can only set `text`/`signature` (it reads as
+        // `redacted: false`), never the typed `redacted: true` flag — so no anti-forgery scrub is
+        // needed (the old String-sentinel approach that required one is gone).
+        BLOCK_TYPE_REDACTED_THINKING => {
+            let data = block_val
+                .get("data")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string();
+            let cache_control = read_cache_control(block_val.get("cache_control"))?;
+            Ok(crate::ir::IrBlock::Thinking {
+                text: data,
+                signature: None,
+                redacted: true,
+                cache_control,
+            })
+        }
         // Forward-compatibility: a valid native Anthropic content-block type the IR does not model
-        // (e.g. `document`, `redacted_thinking`, or a future type Anthropic adds after this build).
+        // (e.g. `document`, or a future type Anthropic adds after this build).
         // These appear in legitimate Messages API requests, so the prior `_ => Err(ClientError)`
         // catch-all turned an otherwise-valid request into a 400. Mirror the OpenAI reader's
         // unmodeled-part handling (see `read_openai_block`): degrade gracefully to an empty Text
@@ -966,7 +1089,7 @@ fn read_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, IrErr
 fn read_message(msg_val: &serde_json::Value) -> Result<crate::ir::IrMessage, IrError> {
     let obj = msg_val.as_object().ok_or(IrError {
         class: StatusClass::ClientError,
-        provider_signal: Some("ir_parse".to_string()),
+        provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
         retry_after: None,
     })?;
 
@@ -978,7 +1101,7 @@ fn read_message(msg_val: &serde_json::Value) -> Result<crate::ir::IrMessage, IrE
         _ => {
             return Err(IrError {
                 class: StatusClass::ClientError,
-                provider_signal: Some("ir_parse".to_string()),
+                provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
                 retry_after: None,
             })
         }
@@ -1001,7 +1124,7 @@ fn read_message(msg_val: &serde_json::Value) -> Result<crate::ir::IrMessage, IrE
 fn read_tool(tool_val: &serde_json::Value) -> Result<crate::ir::IrTool, IrError> {
     let obj = tool_val.as_object().ok_or(IrError {
         class: StatusClass::ClientError,
-        provider_signal: Some("ir_parse".to_string()),
+        provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
         retry_after: None,
     })?;
 
@@ -1031,7 +1154,7 @@ fn read_tool(tool_val: &serde_json::Value) -> Result<crate::ir::IrTool, IrError>
 ///
 /// Shared by every site that can carry an Anthropic cache breakpoint — text/system blocks, tool
 /// definitions, and tool_use/tool_result blocks — so a breakpoint placed ON a tool def or tool
-/// result survives the cross-protocol seam instead of being silently dropped (PF-H2). Absent/`null`
+/// result survives the cross-protocol seam instead of being silently dropped. Absent/`null`
 /// yields `None`; the only valid `type` is `ephemeral` (Anthropic's sole cache kind today), and an
 /// unrecognized `type` is a client error (matching the strictness the text-block parser already had).
 fn read_cache_control(
@@ -1042,13 +1165,13 @@ fn read_cache_control(
         return Ok(None);
     };
     match cc_obj.get("type").and_then(|t| t.as_str()) {
-        Some("ephemeral") => Ok(Some(crate::ir::CacheControl {
+        Some(CACHE_KIND_EPHEMERAL) => Ok(Some(crate::ir::CacheControl {
             kind: crate::ir::CacheKind::Ephemeral,
         })),
         None => Ok(None),
         Some(_) => Err(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".to_string()),
+            provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
             retry_after: None,
         }),
     }
@@ -1057,11 +1180,11 @@ fn read_cache_control(
 /// Serialize the IR's `CacheControl` back to Anthropic's native `{"type":"ephemeral"}` object.
 fn write_cache_control(cc: &crate::ir::CacheControl) -> serde_json::Value {
     match cc.kind {
-        crate::ir::CacheKind::Ephemeral => serde_json::json!({"type": "ephemeral"}),
+        crate::ir::CacheKind::Ephemeral => serde_json::json!({"type": CACHE_KIND_EPHEMERAL}),
     }
 }
 
-/// Normalize Anthropic's native `tool_choice` object into the IR union (PF-H1).
+/// Normalize Anthropic's native `tool_choice` object into the IR union.
 ///
 /// Anthropic shape: `{"type":"auto"|"any"|"tool"|"none","name"?:"..."}`. `auto` → `Auto`, `none` →
 /// `None`, `any` → `Required` (must call some tool), `tool` + `name` → the targeted `Tool{name}`. An
@@ -1085,7 +1208,7 @@ fn read_anthropic_tool_choice(val: Option<&serde_json::Value>) -> Option<crate::
     }
 }
 
-/// Emit the IR tool-choice union in Anthropic's native `tool_choice` object shape (PF-H1).
+/// Emit the IR tool-choice union in Anthropic's native `tool_choice` object shape.
 fn write_anthropic_tool_choice(tc: &crate::ir::IrToolChoice) -> serde_json::Value {
     match tc {
         crate::ir::IrToolChoice::Auto => serde_json::json!({"type": "auto"}),
@@ -1097,18 +1220,36 @@ fn write_anthropic_tool_choice(tc: &crate::ir::IrToolChoice) -> serde_json::Valu
     }
 }
 
-/// Map an IR stop_reason to a value valid on the Anthropic egress (PF-L1).
-///
-/// Anthropic's native `StopReason` enum is `end_turn | max_tokens | stop_sequence | tool_use |
-/// pause_turn` — there is NO `safety` member. The IR's `safety` reason (synthesized from Gemini
-/// `SAFETY`/`RECITATION` and OpenAI `content_filter`) would otherwise be emitted verbatim and
-/// decode-fail against the typed SDKs, so collapse it to `end_turn` (the closest native value:
-/// the turn ended, just not by the model's choice). All other reasons pass through unchanged so
-/// same-protocol round-trips stay lossless.
-fn map_stop_reason_for_anthropic(reason: &str) -> &str {
+/// Anthropic native `stop_reason` token → canonical [`crate::ir::IrStopReason`]. The ONLY place that
+/// knows Anthropic's finish vocabulary on the read side; an unmodeled token maps to `Other`.
+fn read_anthropic_stop_reason(token: &str) -> crate::ir::IrStopReason {
+    use crate::ir::IrStopReason as S;
+    match token {
+        STOP_END_TURN => S::EndTurn,
+        STOP_MAX_TOKENS => S::MaxTokens,
+        STOP_STOP_SEQUENCE => S::StopSequence,
+        STOP_TOOL_USE => S::ToolUse,
+        STOP_PAUSE_TURN => S::PauseTurn,
+        STOP_REFUSAL => S::Refusal,
+        _ => S::Other,
+    }
+}
+
+/// [`crate::ir::IrStopReason`] → Anthropic native `stop_reason`. EXHAUSTIVE: Anthropic's enum is
+/// `end_turn | max_tokens | stop_sequence | tool_use | pause_turn | refusal` — there is NO `safety`
+/// member, so `safety` (and `error`/`other`, which Anthropic also can't name) degrades to `end_turn`
+/// (the turn ended, just not by the model's choice) rather than leak an off-spec value a strict
+/// Anthropic SDK rejects.
+fn write_anthropic_stop_reason(reason: crate::ir::IrStopReason) -> &'static str {
+    use crate::ir::IrStopReason as S;
     match reason {
-        "safety" => "end_turn",
-        other => other,
+        S::EndTurn => STOP_END_TURN,
+        S::MaxTokens => STOP_MAX_TOKENS,
+        S::StopSequence => STOP_STOP_SEQUENCE,
+        S::ToolUse => STOP_TOOL_USE,
+        S::PauseTurn => STOP_PAUSE_TURN,
+        S::Refusal => STOP_REFUSAL,
+        S::Safety | S::Error | S::Other => STOP_END_TURN,
     }
 }
 
@@ -1169,9 +1310,9 @@ fn is_anthropic_citation_shape(raw: &serde_json::Value) -> bool {
     matches!(
         raw.get("type").and_then(|v| v.as_str()),
         Some(
-            "char_location"
-                | "page_location"
-                | "content_block_location"
+            CITATION_TYPE_CHAR
+                | CITATION_TYPE_PAGE
+                | CITATION_TYPE_CONTENT_BLOCK
                 | "web_search_result_location"
         )
     )
@@ -1201,7 +1342,7 @@ fn write_citation(c: &crate::ir::IrCitation) -> serde_json::Value {
         obj.insert("cited_text".to_string(), serde_json::json!(t));
     }
     match kind {
-        "page_location" => {
+        CITATION_TYPE_PAGE => {
             if let Some(di) = c.document_index {
                 obj.insert("document_index".to_string(), serde_json::json!(di));
             }
@@ -1215,7 +1356,7 @@ fn write_citation(c: &crate::ir::IrCitation) -> serde_json::Value {
                 obj.insert("end_page_number".to_string(), serde_json::json!(e));
             }
         }
-        "content_block_location" => {
+        CITATION_TYPE_CONTENT_BLOCK => {
             if let Some(di) = c.document_index {
                 obj.insert("document_index".to_string(), serde_json::json!(di));
             }
@@ -1271,7 +1412,9 @@ fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
             obj.insert("text".to_string(), serde_json::json!(text));
             if let Some(cc) = cache_control {
                 let cc_val = match cc.kind {
-                    crate::ir::CacheKind::Ephemeral => serde_json::json!({"type": "ephemeral"}),
+                    crate::ir::CacheKind::Ephemeral => {
+                        serde_json::json!({"type": CACHE_KIND_EPHEMERAL})
+                    }
                 };
                 obj.insert("cache_control".to_string(), cc_val);
             }
@@ -1281,18 +1424,40 @@ fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
             }
             serde_json::Value::Object(obj)
         }
-        crate::ir::IrBlock::Thinking { text, signature } => {
+        // A REDACTED reasoning block (opaque encrypted bytes in `text`) re-emits as Anthropic's native
+        // `redacted_thinking` block so an Anthropic→Anthropic round-trip preserves the native shape and
+        // the bytes are NOT leaked as visible `thinking` text.
+        crate::ir::IrBlock::Thinking {
+            text,
+            redacted: true,
+            cache_control,
+            ..
+        } => {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "type".to_string(),
+                serde_json::json!(BLOCK_TYPE_REDACTED_THINKING),
+            );
+            obj.insert("data".to_string(), serde_json::json!(text));
+            if let Some(cc) = cache_control {
+                obj.insert("cache_control".to_string(), write_cache_control(cc));
+            }
+            serde_json::Value::Object(obj)
+        }
+        crate::ir::IrBlock::Thinking {
+            text,
+            signature,
+            redacted: false,
+            cache_control,
+        } => {
             let mut obj = serde_json::Map::new();
             obj.insert("type".to_string(), serde_json::json!("thinking"));
             obj.insert("thinking".to_string(), serde_json::json!(text));
             if let Some(sig) = signature {
-                // HIGH-2: a Bedrock `redactedContent` reasoning block carries the busbar
-                // redacted-reasoning sentinel in `signature`. It is NOT a valid Anthropic signature
-                // token — emit the thinking text with NO signature rather than leak the `__busbar`
-                // marker (a busbar fingerprint + an invalid signature) to a native Anthropic SDK.
-                if !crate::proto::is_redacted_reasoning_sig(sig) {
-                    obj.insert("signature".to_string(), serde_json::json!(sig));
-                }
+                obj.insert("signature".to_string(), serde_json::json!(sig));
+            }
+            if let Some(cc) = cache_control {
+                obj.insert("cache_control".to_string(), write_cache_control(cc));
             }
             serde_json::Value::Object(obj)
         }
@@ -1303,7 +1468,7 @@ fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
             cache_control,
         } => {
             let mut obj = serde_json::Map::new();
-            obj.insert("type".to_string(), serde_json::json!("tool_use"));
+            obj.insert("type".to_string(), serde_json::json!(STOP_TOOL_USE));
             obj.insert("id".to_string(), serde_json::json!(id));
             obj.insert("name".to_string(), serde_json::json!(name));
             obj.insert("input".to_string(), input.clone());
@@ -1356,18 +1521,37 @@ fn write_block(block: &crate::ir::IrBlock) -> serde_json::Value {
             }
             serde_json::Value::Object(obj)
         }
-        crate::ir::IrBlock::Image { media_type, data } => {
-            // The OpenAI and Responses readers record an https:// image reference with the
-            // "image_url" media_type sentinel (the raw URL lives in `data`, not base64 bytes).
-            // Anthropic's Messages API has a native URL image source — emit it as
-            // `{"type":"url","url":<url>}` rather than wrapping the URL in a base64 source with
-            // `media_type:"image_url"`, which Anthropic rejects with a 400. A genuine base64 image
-            // (any real `image/*` media_type) still takes the base64 source path below.
-            if media_type == "image_url" {
-                serde_json::json!({ "type": "image", "source": { "type": "url", "url": data } })
-            } else {
-                serde_json::json!({ "type": "image", "source": { "type": "base64", "media_type": media_type, "data": data } })
+        crate::ir::IrBlock::Image {
+            source,
+            cache_control,
+        } => {
+            // Anthropic's Messages API has both a native URL image source and a base64 source.
+            // S3/FileId references have no Anthropic projection and are FILTERED before write_block
+            // (see the unresolvable-image drop in write_message); the arm here is a defensive empty
+            // placeholder for the unreachable case.
+            let mut img = match source {
+                crate::ir::IrImageSource::Url(url) => {
+                    serde_json::json!({ "type": "image", "source": { "type": "url", "url": url } })
+                }
+                crate::ir::IrImageSource::Base64 { media_type, data } => {
+                    serde_json::json!({ "type": "image", "source": { "type": "base64", "media_type": media_type, "data": data } })
+                }
+                crate::ir::IrImageSource::Vendor { .. } => {
+                    serde_json::json!({ "type": "text", "text": "" })
+                }
+            };
+            if let Some(cc) = cache_control {
+                if let Some(obj) = img.as_object_mut() {
+                    obj.insert("cache_control".to_string(), write_cache_control(cc));
+                }
             }
+            img
+        }
+        crate::ir::IrBlock::Json(_) => {
+            // A structured-json tool-result block has no top-level Anthropic content shape; it is
+            // dropped before reaching write_block (see the json-tool-result filter in the ToolResult
+            // arm). Defensive empty placeholder for the unreachable case.
+            serde_json::json!({ "type": "text", "text": "" })
         }
     }
 }
@@ -1404,12 +1588,10 @@ fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
             {
                 dropped_unsigned_thinking += 1;
                 false
-            } else if let crate::ir::IrBlock::Image { media_type, .. } = block {
-                // A Responses `file_id` image (the FILE_ID_IMAGE_SENTINEL media_type) is an
-                // unresolvable cross-vendor reference. Emitting it here would write an Anthropic
-                // base64 source with `media_type:"file_id"` — a corrupt block Anthropic rejects.
-                // SKIP it (no lossless cross-vendor projection of an uploaded-file id).
-                if super::is_unresolvable_image_ref(media_type) {
+            } else if let crate::ir::IrBlock::Image { source, .. } = block {
+                // A Responses `file_id` / Bedrock `s3Location` image is an unresolvable cross-vendor
+                // reference with no Anthropic projection. SKIP it rather than emit a corrupt block.
+                if super::is_unresolvable_image_ref(source) {
                     dropped_file_id_image += 1;
                     false
                 } else {
@@ -1490,9 +1672,9 @@ impl AnthropicWriter {
     /// surrounding whitespace (a likely config artifact) doesn't misclassify a credential.
     fn classify_credential(key: &str) -> AnthropicCredScheme {
         let k = key.trim_start();
-        if k.starts_with("sk-ant-api") {
+        if k.starts_with(CRED_PREFIX_API_KEY) {
             AnthropicCredScheme::ApiKey
-        } else if k.starts_with("sk-ant-oat") {
+        } else if k.starts_with(CRED_PREFIX_OAUTH) {
             AnthropicCredScheme::OAuth
         } else {
             AnthropicCredScheme::Ambiguous
@@ -1571,9 +1753,9 @@ fn anthropic_auth_headers(
             }
         }
     };
-    let x_api_key = || safe("x-api-key", key.to_string());
-    // ApiKey-scheme variant of `x-api-key` that strips LEADING whitespace from the configured key
-    // (R25 LOW #15). `classify_credential` matches on `key.trim_start()`, so `"  sk-ant-api…"`
+    let x_api_key = || safe(HDR_X_API_KEY, key.to_string());
+    // ApiKey-scheme variant of `x-api-key` that strips LEADING whitespace from the configured key.
+    // `classify_credential` matches on `key.trim_start()`, so `"  sk-ant-api…"`
     // classifies as `ApiKey` — but the raw `x_api_key` closure above forwards the key VERBATIM,
     // emitting `x-api-key: "  sk-ant-api…"` (a header value with a leading-space artifact the
     // upstream rejects with a 401). Trim the leading whitespace so the emitted header matches the
@@ -1581,10 +1763,10 @@ fn anthropic_auth_headers(
     // (`ApiKey`) scheme is trimmed here. The OAuth (`authorization: Bearer`) and the Ambiguous
     // passthrough/static fallbacks keep the raw closures below, preserving their byte-for-byte
     // round-trip contract — a forwarded caller token must reach the upstream exactly as presented.
-    let x_api_key_trimmed = || safe("x-api-key", key.trim_start().to_string());
-    let authorization = || safe("authorization", format!("Bearer {key}"));
+    let x_api_key_trimmed = || safe(HDR_X_API_KEY, key.trim_start().to_string());
+    let authorization = || safe(crate::proto::HDR_AUTHORIZATION, format!("Bearer {key}"));
     let version = (
-        HeaderName::from_static("anthropic-version"),
+        HeaderName::from_static(HDR_ANTHROPIC_VERSION),
         HeaderValue::from_static(ANTHROPIC_API_VERSION),
     );
     // Assemble the credential header(s) (each an `Option`, omitted on bad bytes) followed by the
@@ -1621,7 +1803,14 @@ impl ProtocolWriter for AnthropicWriter {
     }
 
     fn upstream_path(&self) -> &str {
-        "/v1/messages"
+        PATH_UPSTREAM
+    }
+
+    /// Anthropic's streamed `citations_delta` SSE event carries EXACTLY ONE `citation` object (a
+    /// native SDK `JSON.parse`s one object per `data:` line and crashes on an array), so a multi-
+    /// citation `CitationsDelta` must be fanned out into one event each. See `StreamTranslate`.
+    fn max_citations_per_delta(&self) -> Option<usize> {
+        Some(1)
     }
 
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
@@ -1662,29 +1851,31 @@ impl ProtocolWriter for AnthropicWriter {
         // a native SDK raises the right exception (and the body matches what real Anthropic returns
         // under load) rather than a generic server error. Status takes precedence over `kind` here
         // because the wire status is the authoritative signal of the overload condition.
-        if status == 503 || status == 529 {
-            return Self::error_envelope("overloaded_error", message);
+        if status == STATUS_OVERLOADED || status == STATUS_ANTHROPIC_OVERLOADED {
+            return Self::error_envelope(ERR_TYPE_OVERLOADED, message);
         }
         let anthropic_type = match kind {
             // Generic router/auth/forward `kind`s → Anthropic's typed error vocabulary.
-            "invalid_request" | "bad_request" => "invalid_request_error",
-            "authentication" | "unauthorized" => "authentication_error",
-            "permission" | "forbidden" => "permission_error",
-            "not_found" => "not_found_error",
-            "request_too_large" | "payload_too_large" => "request_too_large",
-            "rate_limit" | "too_many_requests" => "rate_limit_error",
-            "overloaded" => "overloaded_error",
-            "timeout" => "timeout_error",
-            "api_error" | "server_error" | "internal" => "api_error",
+            "invalid_request" | "bad_request" => ERR_TYPE_INVALID_REQUEST,
+            "authentication" | "unauthorized" => ERR_TYPE_AUTHENTICATION,
+            "permission" | "forbidden" => ERR_TYPE_PERMISSION,
+            "not_found" => ERR_TYPE_NOT_FOUND,
+            ERR_TYPE_REQUEST_TOO_LARGE | "payload_too_large" => ERR_TYPE_REQUEST_TOO_LARGE,
+            "rate_limit" | "too_many_requests" => ERR_TYPE_RATE_LIMIT,
+            crate::forward::KIND_OVERLOADED => ERR_TYPE_OVERLOADED,
+            crate::forward::KIND_TIMEOUT => ERR_TYPE_TIMEOUT,
+            ERR_TYPE_API_ERROR | crate::forward::KIND_SERVER_ERROR | "internal" => {
+                ERR_TYPE_API_ERROR
+            }
             // Already an Anthropic-native type (e.g. "invalid_request_error") or an unmapped value:
             // emit it unchanged rather than collapsing every unknown into one bucket.
-            "invalid_request_error"
-            | "authentication_error"
-            | "permission_error"
-            | "not_found_error"
-            | "rate_limit_error"
-            | "overloaded_error"
-            | "timeout_error" => kind,
+            ERR_TYPE_INVALID_REQUEST
+            | ERR_TYPE_AUTHENTICATION
+            | ERR_TYPE_PERMISSION
+            | ERR_TYPE_NOT_FOUND
+            | ERR_TYPE_RATE_LIMIT
+            | ERR_TYPE_OVERLOADED
+            | ERR_TYPE_TIMEOUT => kind,
             other => other,
         };
         Self::error_envelope(anthropic_type, message)
@@ -1703,20 +1894,34 @@ impl ProtocolWriter for AnthropicWriter {
         // proxy tell on every error response.
         if let Some(rid) = envelope.get("request_id").and_then(|v| v.as_str()) {
             if let Ok(hv) = axum::http::HeaderValue::from_str(rid) {
-                headers.insert("request-id", hv);
+                headers.insert(HDR_REQUEST_ID, hv);
             }
         }
     }
 
-    fn ingress_relays_request_id_header(&self) -> bool {
-        // A real Anthropic endpoint ALWAYS sends `request-id`; the official SDK reads it into
-        // `APIError.request_id` / `Message._request_id` (NOT the body `request_id`). Omitting it
-        // was a deterministic proxy tell and left the SDK's `request_id == None` on every response.
-        true
+    fn ingress_response_request_id(
+        &self,
+        upstream_request_id: Option<&str>,
+    ) -> Option<(&'static str, String)> {
+        // Forward the captured UPSTREAM `request-id` verbatim on a same-protocol passthrough;
+        // synthesize a shape-correct `req_…` id otherwise. Synthesis failure OMITS the header.
+        upstream_request_id
+            .map(String::from)
+            .or_else(synth_anthropic_request_id)
+            .map(|id| (HDR_REQUEST_ID, id))
+    }
+
+    fn ingress_relayed_response_header_names(&self) -> &'static [&'static str] {
+        // Forwarded VERBATIM on a same-protocol anthropic passthrough: `request-id`.
+        &[HDR_REQUEST_ID]
+    }
+
+    fn auth_failure_message(&self) -> &'static str {
+        "invalid x-api-key"
     }
 
     fn egress_user_agent(&self) -> &'static str {
-        // Anthropic Python SDK UA shape — pinned, see `EGRESS_UA_ANTHROPIC` audit note in forward.rs.
+        // Anthropic Python SDK UA shape — pinned, see `EGRESS_UA_ANTHROPIC` in forward.rs.
         crate::forward::EGRESS_UA_ANTHROPIC
     }
 
@@ -1754,7 +1959,7 @@ impl ProtocolWriter for AnthropicWriter {
             let tools_array: Vec<_> = req.tools.iter().map(write_tool).collect();
             out.insert("tools".to_string(), serde_json::Value::Array(tools_array));
         }
-        // Emit `tool_choice` in Anthropic's native object shape when present (PF-H1) so a forced /
+        // Emit `tool_choice` in Anthropic's native object shape when present so a forced /
         // targeted directive translated from another protocol does not silently degrade to `auto`.
         if let Some(tc) = &req.tool_choice {
             out.insert("tool_choice".to_string(), write_anthropic_tool_choice(tc));
@@ -1763,8 +1968,8 @@ impl ProtocolWriter for AnthropicWriter {
             out.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
         }
         if let Some(temperature) = req.temperature {
-            // Clamp to Anthropic's valid [0.0, 1.0] (PF-M1) — see `clamp_temperature_for_anthropic`.
-            // NON-SILENT clamp (PF-H2 fidelity fix): silently rewriting a caller's sampling temperature
+            // Clamp to Anthropic's valid [0.0, 1.0] — see `clamp_temperature_for_anthropic`.
+            // NON-SILENT clamp: silently rewriting a caller's sampling temperature
             // is exactly the lossy mutation busbar exists to avoid; we keep the clamp (Anthropic 422s on
             // >1.0) but emit a `warn!` whenever it ACTUALLY changes the value so an operator can detect
             // the divergence in logs. A request-time RESPONSE header (`x-busbar-parameter-clamped`)
@@ -1901,10 +2106,10 @@ impl ProtocolWriter for AnthropicWriter {
                 // header (e.g. `{"type":"message_start",...}`). The SDK streaming decoder accepts the
                 // event off the header, but native parity (and any consumer that dispatches on
                 // `data.type`) requires the field — emit it on every event body.
-                data_obj.insert("type".to_string(), serde_json::json!("message_start"));
+                data_obj.insert("type".to_string(), serde_json::json!(EVT_MESSAGE_START));
                 data_obj.insert("message".to_string(), serde_json::Value::Object(msg_obj));
                 Some((
-                    "message_start".to_string(),
+                    EVT_MESSAGE_START.to_string(),
                     serde_json::Value::Object(data_obj),
                 ))
             }
@@ -1917,42 +2122,41 @@ impl ProtocolWriter for AnthropicWriter {
                         serde_json::json!({ "type": "thinking" })
                     }
                     IrBlockMeta::ToolUse { id, name } => {
-                        serde_json::json!({ "type": "tool_use", "id": id, "name": name })
+                        serde_json::json!({ "type": STOP_TOOL_USE, "id": id, "name": name })
                     }
                     IrBlockMeta::Image => {
                         serde_json::json!({ "type": "image" })
                     }
                 };
                 let mut data_obj = serde_json::Map::new();
-                data_obj.insert("type".to_string(), serde_json::json!("content_block_start"));
+                data_obj.insert(
+                    "type".to_string(),
+                    serde_json::json!(EVT_CONTENT_BLOCK_START),
+                );
                 data_obj.insert("index".to_string(), serde_json::json!(index));
                 data_obj.insert("content_block".to_string(), content_block);
                 Some((
-                    "content_block_start".to_string(),
+                    EVT_CONTENT_BLOCK_START.to_string(),
                     serde_json::Value::Object(data_obj),
                 ))
             }
             IrStreamEvent::BlockDelta { index, delta } => {
                 let delta_val = match delta {
                     IrDelta::TextDelta(text) => {
-                        serde_json::json!({ "type": "text_delta", "text": text })
+                        serde_json::json!({ "type": DELTA_TYPE_TEXT, "text": text })
                     }
                     IrDelta::ThinkingDelta(thinking) => {
-                        serde_json::json!({ "type": "thinking_delta", "thinking": thinking })
+                        serde_json::json!({ "type": DELTA_TYPE_THINKING, "thinking": thinking })
                     }
                     IrDelta::InputJsonDelta(json) => {
-                        serde_json::json!({ "type": "input_json_delta", "partial_json": json })
+                        serde_json::json!({ "type": DELTA_TYPE_INPUT_JSON, "partial_json": json })
                     }
                     IrDelta::SignatureDelta(sig) => {
-                        // HIGH-2: a streamed Bedrock `redactedContent` reasoning delta carries the
-                        // busbar redacted-reasoning sentinel (the stream form appends the bytes:
-                        // `{SENTINEL}{base64}`). Never write the `__busbar` marker as a wire
-                        // `signature_delta` — emit NOTHING for this signature-only frame.
-                        if crate::proto::is_redacted_reasoning_sig(sig) {
-                            return None;
-                        }
-                        serde_json::json!({ "type": "signature_delta", "signature": sig })
+                        serde_json::json!({ "type": DELTA_TYPE_SIGNATURE, "signature": sig })
                     }
+                    // A streamed redacted-reasoning delta (opaque encrypted bytes) has no Anthropic
+                    // streaming-delta analog — emit nothing for this frame.
+                    IrDelta::RedactedReasoningDelta(_) => return None,
                     // L2-5 STREAMING citation: re-emit each carried citation as its own native
                     // `content_block_delta`/`citations_delta` event (the native wire carries ONE
                     // `citation` per delta). `write_citation` re-emits a byte-exact Anthropic `raw`
@@ -1976,37 +2180,45 @@ impl ProtocolWriter for AnthropicWriter {
                         // an array.
                         let c = citations.first()?;
                         let mut data_obj = serde_json::Map::new();
-                        data_obj
-                            .insert("type".to_string(), serde_json::json!("content_block_delta"));
+                        data_obj.insert(
+                            "type".to_string(),
+                            serde_json::json!(EVT_CONTENT_BLOCK_DELTA),
+                        );
                         data_obj.insert("index".to_string(), serde_json::json!(index));
                         data_obj.insert(
                             "delta".to_string(),
                             serde_json::json!({
-                                "type": "citations_delta",
+                                "type": DELTA_TYPE_CITATIONS,
                                 "citation": write_citation(c),
                             }),
                         );
                         return Some((
-                            "content_block_delta".to_string(),
+                            EVT_CONTENT_BLOCK_DELTA.to_string(),
                             serde_json::Value::Object(data_obj),
                         ));
                     }
                 };
                 let mut data_obj = serde_json::Map::new();
-                data_obj.insert("type".to_string(), serde_json::json!("content_block_delta"));
+                data_obj.insert(
+                    "type".to_string(),
+                    serde_json::json!(EVT_CONTENT_BLOCK_DELTA),
+                );
                 data_obj.insert("index".to_string(), serde_json::json!(index));
                 data_obj.insert("delta".to_string(), delta_val);
                 Some((
-                    "content_block_delta".to_string(),
+                    EVT_CONTENT_BLOCK_DELTA.to_string(),
                     serde_json::Value::Object(data_obj),
                 ))
             }
             IrStreamEvent::BlockStop { index } => {
                 let mut data_obj = serde_json::Map::new();
-                data_obj.insert("type".to_string(), serde_json::json!("content_block_stop"));
+                data_obj.insert(
+                    "type".to_string(),
+                    serde_json::json!(EVT_CONTENT_BLOCK_STOP),
+                );
                 data_obj.insert("index".to_string(), serde_json::json!(index));
                 Some((
-                    "content_block_stop".to_string(),
+                    EVT_CONTENT_BLOCK_STOP.to_string(),
                     serde_json::Value::Object(data_obj),
                 ))
             }
@@ -2019,7 +2231,7 @@ impl ProtocolWriter for AnthropicWriter {
                 if let Some(reason) = stop_reason {
                     delta_obj.insert(
                         "stop_reason".to_string(),
-                        serde_json::json!(map_stop_reason_for_anthropic(reason)),
+                        serde_json::json!(write_anthropic_stop_reason(*reason)),
                     );
                 } else {
                     delta_obj.insert("stop_reason".to_string(), serde_json::Value::Null);
@@ -2057,17 +2269,17 @@ impl ProtocolWriter for AnthropicWriter {
                     );
                 }
                 let mut data_obj = serde_json::Map::new();
-                data_obj.insert("type".to_string(), serde_json::json!("message_delta"));
+                data_obj.insert("type".to_string(), serde_json::json!(EVT_MESSAGE_DELTA));
                 data_obj.insert("delta".to_string(), serde_json::Value::Object(delta_obj));
                 data_obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
                 Some((
-                    "message_delta".to_string(),
+                    EVT_MESSAGE_DELTA.to_string(),
                     serde_json::Value::Object(data_obj),
                 ))
             }
             IrStreamEvent::MessageStop => Some((
-                "message_stop".to_string(),
-                serde_json::json!({ "type": "message_stop" }),
+                EVT_MESSAGE_STOP.to_string(),
+                serde_json::json!({ "type": EVT_MESSAGE_STOP }),
             )),
             IrStreamEvent::Error(err) => {
                 // Native Anthropic in-stream error event:
@@ -2118,7 +2330,7 @@ impl ProtocolWriter for AnthropicWriter {
 
         // id: an official SDK's `Message.id` is a REQUIRED `"msg_<rand>"` string — the Python/TS SDK
         // types `Message.id` as a non-optional `str`, so a body that omits it fails to decode. Emit
-        // it UNCONDITIONALLY, mirroring the streaming `message_start` writer (line ~1065) and every
+        // it UNCONDITIONALLY, mirroring the streaming `message_start` writer and every
         // other protocol writer (openai/cohere/responses), all of which `unwrap_or_else` a synthesized
         // id rather than gating on a second field:
         //   * same-protocol passthrough / any source that carried an id — `resp.id` is `Some`; re-emit
@@ -2160,7 +2372,7 @@ impl ProtocolWriter for AnthropicWriter {
         if let Some(ref reason) = resp.stop_reason {
             obj.insert(
                 "stop_reason".to_string(),
-                serde_json::json!(map_stop_reason_for_anthropic(reason)),
+                serde_json::json!(write_anthropic_stop_reason(*reason)),
             );
         }
 
@@ -2214,6 +2426,28 @@ impl ProtocolWriter for AnthropicWriter {
 mod anthropic_hardening_tests {
     use super::*;
 
+    #[test]
+    fn stop_reason_egress_never_leaks_foreign_tokens() {
+        use crate::ir::IrStopReason as S;
+        // Anthropic-native reasons map to their wire token; `refusal`/`pause_turn` are real Anthropic
+        // StopReason members and survive.
+        assert_eq!(write_anthropic_stop_reason(S::EndTurn), "end_turn"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(write_anthropic_stop_reason(S::ToolUse), "tool_use"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(write_anthropic_stop_reason(S::PauseTurn), "pause_turn"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(write_anthropic_stop_reason(S::Refusal), "refusal"); // golden wire-contract literal (kept bare on purpose)
+                                                                        // `safety` has no Anthropic member, and `error`/`other` are off-enum → all degrade to
+                                                                        // end_turn rather than leak an off-spec value a strict Anthropic SDK rejects.
+        assert_eq!(write_anthropic_stop_reason(S::Safety), "end_turn"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(write_anthropic_stop_reason(S::Error), "end_turn"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(write_anthropic_stop_reason(S::Other), "end_turn"); // golden wire-contract literal (kept bare on purpose)
+                                                                       // The reader maps an unknown native token (e.g. the non-enum `model_context_window_exceeded`)
+                                                                       // to `Other`, which then degrades on egress — it is never carried verbatim.
+        assert_eq!(
+            read_anthropic_stop_reason("model_context_window_exceeded"),
+            S::Other
+        );
+    }
+
     fn header_value(headers: &[(HeaderName, HeaderValue)], name: &str) -> Option<String> {
         headers
             .iter()
@@ -2229,7 +2463,7 @@ mod anthropic_hardening_tests {
         let headers = AnthropicWriter.auth_headers("sk-ant-api03-secret-key");
 
         assert_eq!(
-            header_value(&headers, "x-api-key").as_deref(),
+            header_value(&headers, "x-api-key").as_deref(), // golden wire-contract literal (kept bare on purpose)
             Some("sk-ant-api03-secret-key")
         );
         assert!(
@@ -2237,12 +2471,12 @@ mod anthropic_hardening_tests {
             "an API key must NOT emit an authorization header (native API-key clients never do)"
         );
         assert_eq!(
-            header_value(&headers, "anthropic-version").as_deref(),
+            header_value(&headers, "anthropic-version").as_deref(), // golden wire-contract literal (kept bare on purpose)
             Some("2023-06-01")
         );
     }
 
-    /// R25 LOW #15 regression: a configured API key with LEADING WHITESPACE (a common config
+    /// Regression: a configured API key with LEADING WHITESPACE (a common config
     /// artifact — a stray space or indentation in an env var / secrets file) classifies as `ApiKey`
     /// (because `classify_credential` matches on the trimmed key) but, before the fix, was forwarded
     /// VERBATIM — emitting `x-api-key: "  sk-ant-api…"`, a malformed header value the upstream rejects
@@ -2255,7 +2489,7 @@ mod anthropic_hardening_tests {
         let raw = "   sk-ant-api03-secret-key";
         let ctx = crate::proto::SigningContext {
             host: "api.anthropic.com".to_string(),
-            canonical_uri: "/v1/messages".to_string(),
+            canonical_uri: PATH_UPSTREAM.to_string(),
             body: b"{}",
             timestamp_epoch: 0,
             auth_mode: crate::auth::AuthMode::Token,
@@ -2265,7 +2499,7 @@ mod anthropic_hardening_tests {
             AnthropicWriter.sign_request(raw, &ctx),
         ] {
             assert_eq!(
-                header_value(&headers, "x-api-key").as_deref(),
+                header_value(&headers, "x-api-key").as_deref(), // golden wire-contract literal (kept bare on purpose)
                 Some("sk-ant-api03-secret-key"),
                 "the ApiKey scheme must forward the configured key with leading whitespace stripped"
             );
@@ -2277,7 +2511,7 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// Precision guard for R25 LOW #15: the leading-whitespace trim is scoped to the configured-key
+    /// Precision guard: the leading-whitespace trim is scoped to the configured-key
     /// (`ApiKey`) scheme ONLY. An OAuth (`sk-ant-oat…`) credential — and any Ambiguous passthrough
     /// Bearer token — must round-trip BYTE-FOR-BYTE, leading whitespace included, so a forwarded
     /// caller token reaches the upstream exactly as presented (the passthrough contract). Trimming
@@ -2294,7 +2528,7 @@ mod anthropic_hardening_tests {
             "OAuth Bearer must round-trip the credential verbatim (no trim)"
         );
         assert!(
-            header_value(&oauth_headers, "x-api-key").is_none(),
+            header_value(&oauth_headers, "x-api-key").is_none(), // golden wire-contract literal (kept bare on purpose)
             "OAuth must not emit x-api-key"
         );
 
@@ -2302,7 +2536,7 @@ mod anthropic_hardening_tests {
         let amb = "  opaque-caller-token";
         let ctx = crate::proto::SigningContext {
             host: "api.anthropic.com".to_string(),
-            canonical_uri: "/v1/messages".to_string(),
+            canonical_uri: PATH_UPSTREAM.to_string(),
             body: b"{}",
             timestamp_epoch: 0,
             auth_mode: crate::auth::AuthMode::Passthrough,
@@ -2324,7 +2558,7 @@ mod anthropic_hardening_tests {
         let headers = AnthropicWriter.auth_headers("caller-specific-token-abc123");
 
         assert_eq!(
-            header_value(&headers, "x-api-key").as_deref(),
+            header_value(&headers, "x-api-key").as_deref(), // golden wire-contract literal (kept bare on purpose)
             Some("caller-specific-token-abc123")
         );
         assert_eq!(
@@ -2332,7 +2566,7 @@ mod anthropic_hardening_tests {
             Some("Bearer caller-specific-token-abc123")
         );
         assert_eq!(
-            header_value(&headers, "anthropic-version").as_deref(),
+            header_value(&headers, "anthropic-version").as_deref(), // golden wire-contract literal (kept bare on purpose)
             Some("2023-06-01")
         );
     }
@@ -2346,7 +2580,7 @@ mod anthropic_hardening_tests {
         let body = b"{}";
         let ctx = |mode| crate::proto::SigningContext {
             host: "api.anthropic.com".to_string(),
-            canonical_uri: "/v1/messages".to_string(),
+            canonical_uri: PATH_UPSTREAM.to_string(),
             body,
             timestamp_epoch: 0,
             auth_mode: mode,
@@ -2360,7 +2594,7 @@ mod anthropic_hardening_tests {
             Some("Bearer caller-specific-token-abc123")
         );
         assert!(
-            header_value(&pt, "x-api-key").is_none(),
+            header_value(&pt, "x-api-key").is_none(), // golden wire-contract literal (kept bare on purpose)
             "passthrough wire path must NOT also emit x-api-key (dual-header tell)"
         );
 
@@ -2368,7 +2602,7 @@ mod anthropic_hardening_tests {
         for mode in [crate::auth::AuthMode::Token, crate::auth::AuthMode::None] {
             let h = AnthropicWriter.sign_request(amb, &ctx(mode));
             assert_eq!(
-                header_value(&h, "x-api-key").as_deref(),
+                header_value(&h, "x-api-key").as_deref(), // golden wire-contract literal (kept bare on purpose)
                 Some("caller-specific-token-abc123")
             );
             assert!(
@@ -2380,7 +2614,7 @@ mod anthropic_hardening_tests {
         // Clear API-key / OAuth credentials stay single-header on the wire path regardless of mode.
         let api = AnthropicWriter.sign_request("sk-ant-api03-x", &ctx(crate::auth::AuthMode::None));
         assert!(
-            header_value(&api, "x-api-key").is_some()
+            header_value(&api, "x-api-key").is_some() // golden wire-contract literal (kept bare on purpose)
                 && header_value(&api, "authorization").is_none()
         );
     }
@@ -2420,11 +2654,11 @@ mod anthropic_hardening_tests {
             Some("Bearer sk-ant-oat01-caller-token")
         );
         assert!(
-            header_value(&headers, "x-api-key").is_none(),
+            header_value(&headers, "x-api-key").is_none(), // golden wire-contract literal (kept bare on purpose)
             "an OAuth token must NOT emit an x-api-key header (native OAuth clients never do)"
         );
         assert_eq!(
-            header_value(&headers, "anthropic-version").as_deref(),
+            header_value(&headers, "anthropic-version").as_deref(), // golden wire-contract literal (kept bare on purpose)
             Some("2023-06-01")
         );
     }
@@ -2440,7 +2674,7 @@ mod anthropic_hardening_tests {
             header_value(&headers, "authorization").as_deref(),
             Some("Bearer   sk-ant-oat01-caller-token")
         );
-        assert!(header_value(&headers, "x-api-key").is_none());
+        assert!(header_value(&headers, "x-api-key").is_none()); // golden wire-contract literal (kept bare on purpose)
     }
 
     /// A key with bytes invalid for an HTTP header value (e.g. a trailing newline) must not panic
@@ -2454,7 +2688,7 @@ mod anthropic_hardening_tests {
         // invalid for an HTTP header value.
         let headers = AnthropicWriter.auth_headers("sk-ant-api03-bad\nkey");
         assert!(
-            header_value(&headers, "x-api-key").is_none(),
+            header_value(&headers, "x-api-key").is_none(), // golden wire-contract literal (kept bare on purpose)
             "an invalid API key must OMIT x-api-key, not emit an empty value"
         );
         assert!(
@@ -2463,7 +2697,7 @@ mod anthropic_hardening_tests {
         );
         // anthropic-version is static and unaffected by the bad key — it remains the only header.
         assert_eq!(
-            header_value(&headers, "anthropic-version").as_deref(),
+            header_value(&headers, "anthropic-version").as_deref(), // golden wire-contract literal (kept bare on purpose)
             Some("2023-06-01")
         );
         assert_eq!(
@@ -2483,11 +2717,11 @@ mod anthropic_hardening_tests {
             "an invalid OAuth token must OMIT authorization, not emit an empty value"
         );
         assert!(
-            header_value(&headers, "x-api-key").is_none(),
+            header_value(&headers, "x-api-key").is_none(), // golden wire-contract literal (kept bare on purpose)
             "an invalid OAuth token still must not emit an x-api-key header"
         );
         assert_eq!(
-            header_value(&headers, "anthropic-version").as_deref(),
+            header_value(&headers, "anthropic-version").as_deref(), // golden wire-contract literal (kept bare on purpose)
             Some("2023-06-01")
         );
         assert_eq!(
@@ -2500,13 +2734,15 @@ mod anthropic_hardening_tests {
     /// extract_error parses the body once and surfaces both provider_code and structured_type.
     #[test]
     fn extract_error_parses_both_fields() {
-        let body = br#"{"error":{"type":"invalid_request_error","code":"some_code"}}"#;
-        let raw = AnthropicReader.extract_error(StatusCode::BAD_REQUEST, body);
+        let body_json =
+            serde_json::json!({"error":{"type": ERR_TYPE_INVALID_REQUEST,"code":"some_code"}});
+        let body = serde_json::to_vec(&body_json).unwrap();
+        let raw = AnthropicReader.extract_error(StatusCode::BAD_REQUEST, &body);
         assert_eq!(raw.http_status, 400);
         assert_eq!(raw.provider_code.as_deref(), Some("some_code"));
         assert_eq!(
             raw.structured_type.as_deref(),
-            Some("invalid_request_error")
+            Some("invalid_request_error") // golden wire-contract literal (kept bare on purpose)
         );
     }
 
@@ -2523,19 +2759,20 @@ mod anthropic_hardening_tests {
     /// the canonical code synthesis from the body text.
     #[test]
     fn extract_error_context_length_from_message() {
-        let body = br#"{"error":{"type":"invalid_request_error","message":"prompt is too long"}}"#;
-        let raw = AnthropicReader.extract_error(StatusCode::BAD_REQUEST, body);
+        let body_json = serde_json::json!({"error":{"type": ERR_TYPE_INVALID_REQUEST,"message":"prompt is too long"}});
+        let body = serde_json::to_vec(&body_json).unwrap();
+        let raw = AnthropicReader.extract_error(StatusCode::BAD_REQUEST, &body);
         assert_eq!(
             raw.provider_code.as_deref(),
             Some("context_length_exceeded")
         );
         assert_eq!(
             raw.structured_type.as_deref(),
-            Some("invalid_request_error")
+            Some("invalid_request_error") // golden wire-contract literal (kept bare on purpose)
         );
     }
 
-    /// R27 #7 regression (block-index clamp): a streaming `content_block_start` whose `index` is an
+    /// Regression (block-index clamp): a streaming `content_block_start` whose `index` is an
     /// upstream-controlled pathological value (`u64::MAX`) must be CLAMPED to
     /// `MAX_ANTHROPIC_BLOCK_INDEX` before it enters the IR, so a downstream writer (GeminiWriter
     /// `open_tools`, Bedrock `contentBlockIndex`) never allocates/serializes against the raw value.
@@ -2544,12 +2781,12 @@ mod anthropic_hardening_tests {
     #[test]
     fn content_block_start_clamps_pathological_index() {
         let data = serde_json::json!({
-            "type": "content_block_start",
+            "type": EVT_CONTENT_BLOCK_START,
             "index": u64::MAX,
             "content_block": { "type": "text" }
         });
         let ev = AnthropicReader
-            .read_response_event("content_block_start", &data)
+            .read_response_event(EVT_CONTENT_BLOCK_START, &data)
             .expect("content_block_start parses");
         match ev {
             IrStreamEvent::BlockStart { index, .. } => {
@@ -2562,18 +2799,18 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// R27 #7 regression (block-index clamp, delta + stop sites): the same clamp must apply to
+    /// Regression (block-index clamp, delta + stop sites): the same clamp must apply to
     /// `content_block_delta` and `content_block_stop`, not just `content_block_start` — all three
     /// share `read_clamped_block_index`. Guards that the class is fixed at every read site.
     #[test]
     fn content_block_delta_and_stop_clamp_pathological_index() {
         let delta = serde_json::json!({
-            "type": "content_block_delta",
+            "type": EVT_CONTENT_BLOCK_DELTA,
             "index": u64::MAX,
-            "delta": { "type": "text_delta", "text": "x" }
+            "delta": { "type": DELTA_TYPE_TEXT, "text": "x" }
         });
         match AnthropicReader
-            .read_response_event("content_block_delta", &delta)
+            .read_response_event(EVT_CONTENT_BLOCK_DELTA, &delta)
             .expect("content_block_delta parses")
         {
             IrStreamEvent::BlockDelta { index, .. } => {
@@ -2583,11 +2820,11 @@ mod anthropic_hardening_tests {
         }
 
         let stop = serde_json::json!({
-            "type": "content_block_stop",
+            "type": EVT_CONTENT_BLOCK_STOP,
             "index": u64::MAX
         });
         match AnthropicReader
-            .read_response_event("content_block_stop", &stop)
+            .read_response_event(EVT_CONTENT_BLOCK_STOP, &stop)
             .expect("content_block_stop parses")
         {
             IrStreamEvent::BlockStop { index } => {
@@ -2597,7 +2834,7 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// R27 #11 regression (cross-protocol sibling of the Cohere context-length gate): a 429 whose
+    /// Regression (cross-protocol sibling of the Cohere context-length gate): a 429 whose
     /// body merely MENTIONS tokens/length must NOT be reclassified to context_length. The
     /// message-scan override is now gated on a request-size status (400/413), so a 429 keeps its
     /// rate-limit disposition: `extract_error` leaves `provider_code` empty of the context-length
@@ -2608,8 +2845,9 @@ mod anthropic_hardening_tests {
     #[test]
     fn extract_error_429_with_token_body_not_reclassified_to_context_length() {
         // A 429 rate-limit body that happens to mention tokens (e.g. a per-token rate limit).
-        let body = br#"{"error":{"type":"rate_limit_error","message":"rate limit exceeds the maximum tokens per minute"}}"#;
-        let raw = AnthropicReader.extract_error(StatusCode::TOO_MANY_REQUESTS, body);
+        let body_json = serde_json::json!({"error":{"type": ERR_TYPE_RATE_LIMIT,"message":"rate limit exceeds the maximum tokens per minute"}});
+        let body = serde_json::to_vec(&body_json).unwrap();
+        let raw = AnthropicReader.extract_error(StatusCode::TOO_MANY_REQUESTS, &body);
         assert_eq!(raw.http_status, 429);
         assert_ne!(
             raw.provider_code.as_deref(),
@@ -2626,13 +2864,14 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// R27 #11 regression (positive case preserved): a genuine 400 oversized-prompt body STILL
+    /// Regression (positive case): a genuine 400 oversized-prompt body STILL
     /// synthesizes the canonical context-length code under the new 400/413 gate, so legitimate
     /// context-length fail-over is unaffected by the gating change.
     #[test]
     fn extract_error_400_context_length_still_synthesized_under_gate() {
-        let body = br#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens"}}"#;
-        let raw = AnthropicReader.extract_error(StatusCode::BAD_REQUEST, body);
+        let body_json = serde_json::json!({"error":{"type": ERR_TYPE_INVALID_REQUEST,"message":"prompt is too long: 250000 tokens"}});
+        let body = serde_json::to_vec(&body_json).unwrap();
+        let raw = AnthropicReader.extract_error(StatusCode::BAD_REQUEST, &body);
         assert_eq!(
             raw.provider_code.as_deref(),
             Some("context_length_exceeded"),
@@ -2654,7 +2893,7 @@ mod anthropic_hardening_tests {
         let err = v.get("error").expect("error object present");
         assert_eq!(
             err.get("type").and_then(|t| t.as_str()),
-            Some("not_found_error"),
+            Some("not_found_error"), // golden wire-contract literal (kept bare on purpose)
             "generic `not_found` must map to Anthropic `not_found_error`"
         );
         assert_eq!(
@@ -2678,19 +2917,19 @@ mod anthropic_hardening_tests {
                 .and_then(|t| t.as_str())
                 .map(String::from)
         };
-        assert_eq!(map_of("rate_limit").as_deref(), Some("rate_limit_error"));
+        assert_eq!(map_of("rate_limit").as_deref(), Some("rate_limit_error")); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(
             map_of("authentication").as_deref(),
-            Some("authentication_error")
+            Some("authentication_error") // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(
             map_of("invalid_request").as_deref(),
-            Some("invalid_request_error")
+            Some("invalid_request_error") // golden wire-contract literal (kept bare on purpose)
         );
         // Already-native type is emitted verbatim.
         assert_eq!(
-            map_of("invalid_request_error").as_deref(),
-            Some("invalid_request_error")
+            map_of(ERR_TYPE_INVALID_REQUEST).as_deref(),
+            Some("invalid_request_error") // golden wire-contract literal (kept bare on purpose)
         );
         // Unknown/unmapped kind passes through rather than being swallowed into one bucket.
         assert_eq!(
@@ -2709,7 +2948,7 @@ mod anthropic_hardening_tests {
     fn write_error_503_maps_to_overloaded_error_not_api_error() {
         let type_for = |status: u16| {
             AnthropicWriter
-                .write_error(status, "api_error", "upstream is overloaded")
+                .write_error(status, ERR_TYPE_API_ERROR, "upstream is overloaded")
                 .get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str())
@@ -2717,17 +2956,24 @@ mod anthropic_hardening_tests {
         };
         // The finding's exact scenario: cross-protocol 503 + generic `api_error` kind.
         assert_eq!(
-            type_for(503).as_deref(),
-            Some("overloaded_error"),
+            type_for(STATUS_OVERLOADED).as_deref(),
+            Some("overloaded_error"), // golden wire-contract literal (kept bare on purpose)
             "a 503 must surface as Anthropic's overloaded_error, not a generic api_error"
         );
         // The native 529 overload status maps the same way regardless of incoming kind.
-        assert_eq!(type_for(529).as_deref(), Some("overloaded_error"));
-        // A genuine 500-class server error (not the overload family) still maps to api_error —
-        // the status override is scoped to 503/529 and does not swallow other server errors.
-        assert_eq!(type_for(500).as_deref(), Some("api_error"));
-        // The envelope is still well-formed and request_id is minted on the status-override path.
-        let v = AnthropicWriter.write_error(503, "api_error", "upstream is overloaded");
+        assert_eq!(
+            type_for(STATUS_ANTHROPIC_OVERLOADED).as_deref(),
+            Some("overloaded_error")
+        ); // golden wire-contract literal (kept bare on purpose)
+           // A genuine 500-class server error (not the overload family) still maps to api_error —
+           // the status override is scoped to 503/529 and does not swallow other server errors.
+        assert_eq!(type_for(500).as_deref(), Some("api_error")); // golden wire-contract literal (kept bare on purpose)
+                                                                 // The envelope is still well-formed and request_id is minted on the status-override path.
+        let v = AnthropicWriter.write_error(
+            STATUS_OVERLOADED,
+            ERR_TYPE_API_ERROR,
+            "upstream is overloaded",
+        );
         assert_eq!(v.get("type").and_then(|t| t.as_str()), Some("error"));
         assert!(
             v.get("request_id")
@@ -2755,14 +3001,14 @@ mod anthropic_hardening_tests {
             "role": "assistant",
             "model": "claude-opus-4-8",
             "content": [{"type": "text", "text": "hi"}],
-            "stop_reason": "stop_sequence",
+            "stop_reason": STOP_STOP_SEQUENCE,
             "stop_sequence": "\n\nHuman:",
             "usage": {"input_tokens": 3, "output_tokens": 1}
         });
         let ir = AnthropicReader.read_response(&body).expect("read_response");
         assert_eq!(ir.id.as_deref(), Some("msg_01XYZabc123"));
         assert_eq!(ir.model.as_deref(), Some("claude-opus-4-8"));
-        assert_eq!(ir.stop_reason.as_deref(), Some("stop_sequence"));
+        assert_eq!(ir.stop_reason, Some(crate::ir::IrStopReason::StopSequence));
         assert_eq!(ir.stop_sequence.as_deref(), Some("\n\nHuman:"));
 
         let out = AnthropicWriter.write_response(&ir);
@@ -2779,7 +3025,7 @@ mod anthropic_hardening_tests {
         );
         assert_eq!(
             out.get("stop_reason").and_then(|v| v.as_str()),
-            Some("stop_sequence")
+            Some("stop_sequence") // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(
             out.get("stop_sequence").and_then(|v| v.as_str()),
@@ -2802,7 +3048,7 @@ mod anthropic_hardening_tests {
             }
         });
         let ev = AnthropicReader
-            .read_response_event("message_start", &data)
+            .read_response_event(EVT_MESSAGE_START, &data)
             .expect("message_start parses");
         match &ev {
             IrStreamEvent::MessageStart { id, model, .. } => {
@@ -2814,7 +3060,7 @@ mod anthropic_hardening_tests {
         let (et, out) = AnthropicWriter
             .write_response_event(&ev)
             .expect("writes message_start");
-        assert_eq!(et, "message_start");
+        assert_eq!(et, "message_start"); // golden wire-contract literal (kept bare on purpose)
         let msg = out.get("message").expect("message object");
         assert_eq!(
             msg.get("id").and_then(|v| v.as_str()),
@@ -2844,7 +3090,7 @@ mod anthropic_hardening_tests {
                 cache_control: None,
                 citations: Vec::new(),
             }],
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -2939,7 +3185,7 @@ mod anthropic_hardening_tests {
     fn write_response_event_error_serializes_native_shape() {
         let err = IrError {
             class: StatusClass::RateLimit,
-            provider_signal: Some("rate_limit_error".to_string()),
+            provider_signal: Some(ERR_TYPE_RATE_LIMIT.to_string()),
             retry_after: None,
         };
         let (event_type, data) = AnthropicWriter
@@ -2956,7 +3202,7 @@ mod anthropic_hardening_tests {
         let error_obj = data.get("error").expect("error sub-object present");
         assert_eq!(
             error_obj.get("type").and_then(|t| t.as_str()),
-            Some("rate_limit_error"),
+            Some("rate_limit_error"), // golden wire-contract literal (kept bare on purpose)
             "error.type must carry the provider signal"
         );
         let message = error_obj
@@ -2973,8 +3219,8 @@ mod anthropic_hardening_tests {
     }
 
     /// When the upstream error event carries no `type`, the writer must emit `error.type: null`
-    /// (not `""`) and still a non-empty `message`. Guards finding #7 (Option carried through, no
-    /// `unwrap_or_default()`) end-to-end and finding #3 (message always present).
+    /// (not `""`) and still a non-empty `message`. Guards that the Option is carried through
+    /// (no `unwrap_or_default()`) and that a message is always present.
     #[test]
     fn write_response_event_error_null_type_when_signal_absent() {
         let err = IrError {
@@ -3008,7 +3254,6 @@ mod anthropic_hardening_tests {
 
     /// The reader must carry a missing error `type` through as `None` (not `Some("")`), so a
     /// `read -> write` of a type-less error event yields `error.type: null` rather than `""`.
-    /// Regression guard for finding #7.
     #[test]
     fn read_error_event_without_type_carries_none() {
         let data = serde_json::json!({ "error": { "message": "boom" } });
@@ -3027,7 +3272,7 @@ mod anthropic_hardening_tests {
     /// A reader-captured error type round-trips through the writer verbatim.
     #[test]
     fn read_error_event_with_type_round_trips() {
-        let data = serde_json::json!({ "error": { "type": "overloaded_error" } });
+        let data = serde_json::json!({ "error": { "type": ERR_TYPE_OVERLOADED } });
         let ev = AnthropicReader
             .read_response_event("error", &data)
             .expect("error event parses");
@@ -3038,11 +3283,11 @@ mod anthropic_hardening_tests {
             out.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("overloaded_error")
+            Some("overloaded_error") // golden wire-contract literal (kept bare on purpose)
         );
     }
 
-    /// Regression for LOW #34: the streaming `error` reader hardcoded `StatusClass::ClientError`
+    /// Regression: the streaming `error` reader hardcoded `StatusClass::ClientError`
     /// for EVERY error type, so a mid-stream transient/hard-down fault was misclassified as a client
     /// fault (`Disposition::ClientFault` records nothing) and the breaker took the wrong transition.
     /// The class must now derive from the upstream `error.type`, mirroring the HTTP classifier intent.
@@ -3062,11 +3307,11 @@ mod anthropic_hardening_tests {
     #[test]
     fn stream_error_overloaded_is_transient_not_client_fault() {
         assert_eq!(
-            read_stream_error_class("overloaded_error"),
+            read_stream_error_class(ERR_TYPE_OVERLOADED),
             StatusClass::Overloaded
         );
         let sig = CanonicalSignal {
-            class: read_stream_error_class("overloaded_error"),
+            class: read_stream_error_class(ERR_TYPE_OVERLOADED),
             provider_signal: None,
             retry_after: None,
         };
@@ -3080,11 +3325,11 @@ mod anthropic_hardening_tests {
     #[test]
     fn stream_error_rate_limit_is_rate_limit_class() {
         assert_eq!(
-            read_stream_error_class("rate_limit_error"),
+            read_stream_error_class(ERR_TYPE_RATE_LIMIT),
             StatusClass::RateLimit
         );
         let sig = CanonicalSignal {
-            class: read_stream_error_class("rate_limit_error"),
+            class: read_stream_error_class(ERR_TYPE_RATE_LIMIT),
             provider_signal: None,
             retry_after: None,
         };
@@ -3097,11 +3342,11 @@ mod anthropic_hardening_tests {
     #[test]
     fn stream_error_api_error_is_server_error_class() {
         assert_eq!(
-            read_stream_error_class("api_error"),
+            read_stream_error_class(ERR_TYPE_API_ERROR),
             StatusClass::ServerError
         );
         let sig = CanonicalSignal {
-            class: read_stream_error_class("api_error"),
+            class: read_stream_error_class(ERR_TYPE_API_ERROR),
             provider_signal: None,
             retry_after: None,
         };
@@ -3114,7 +3359,7 @@ mod anthropic_hardening_tests {
     #[test]
     fn stream_error_timeout_is_timeout_class() {
         assert_eq!(
-            read_stream_error_class("timeout_error"),
+            read_stream_error_class(ERR_TYPE_TIMEOUT),
             StatusClass::Timeout
         );
     }
@@ -3122,11 +3367,11 @@ mod anthropic_hardening_tests {
     #[test]
     fn stream_error_authentication_is_auth_hard_down() {
         assert_eq!(
-            read_stream_error_class("authentication_error"),
+            read_stream_error_class(ERR_TYPE_AUTHENTICATION),
             StatusClass::Auth
         );
         let sig = CanonicalSignal {
-            class: read_stream_error_class("authentication_error"),
+            class: read_stream_error_class(ERR_TYPE_AUTHENTICATION),
             provider_signal: None,
             retry_after: None,
         };
@@ -3140,7 +3385,7 @@ mod anthropic_hardening_tests {
     #[test]
     fn stream_error_permission_is_auth_hard_down() {
         assert_eq!(
-            read_stream_error_class("permission_error"),
+            read_stream_error_class(ERR_TYPE_PERMISSION),
             StatusClass::Auth
         );
     }
@@ -3165,11 +3410,11 @@ mod anthropic_hardening_tests {
     #[test]
     fn stream_error_invalid_request_stays_client_error() {
         assert_eq!(
-            read_stream_error_class("invalid_request_error"),
+            read_stream_error_class(ERR_TYPE_INVALID_REQUEST),
             StatusClass::ClientError
         );
         let sig = CanonicalSignal {
-            class: read_stream_error_class("invalid_request_error"),
+            class: read_stream_error_class(ERR_TYPE_INVALID_REQUEST),
             provider_signal: None,
             retry_after: None,
         };
@@ -3183,11 +3428,11 @@ mod anthropic_hardening_tests {
     #[test]
     fn stream_error_not_found_and_too_large_are_client_error() {
         assert_eq!(
-            read_stream_error_class("not_found_error"),
+            read_stream_error_class(ERR_TYPE_NOT_FOUND),
             StatusClass::ClientError
         );
         assert_eq!(
-            read_stream_error_class("request_too_large"),
+            read_stream_error_class(ERR_TYPE_REQUEST_TOO_LARGE),
             StatusClass::ClientError
         );
     }
@@ -3215,7 +3460,7 @@ mod anthropic_hardening_tests {
     }
 
     /// write_error must include a synthesized top-level `request_id` (`req_...`) to match the native
-    /// Anthropic error envelope, alongside the `type`/`error` fields. Regression guard for finding #6.
+    /// Anthropic error envelope, alongside the `type`/`error` fields.
     #[test]
     fn write_error_includes_synthesized_request_id() {
         let v = AnthropicWriter.write_error(429, "rate_limit", "slow down");
@@ -3237,11 +3482,11 @@ mod anthropic_hardening_tests {
             v.get("error")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
-            Some("rate_limit_error")
+            Some("rate_limit_error") // golden wire-contract literal (kept bare on purpose)
         );
     }
 
-    /// Finding #3 regression: a `system` field in ARRAY form must be read via `as_array()` (no
+    /// Regression: a `system` field in ARRAY form must be read via `as_array()` (no
     /// `is_array()`/`unwrap()` pair on the request path) and yield one IR block per element without
     /// panicking. Guards that the unwrap-removal refactor preserves array-system behavior.
     #[test]
@@ -3265,7 +3510,7 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// Finding #3 regression: a non-array, non-string `system` value (e.g. a number) must NOT panic
+    /// Regression: a non-array, non-string `system` value (e.g. a number) must NOT panic
     /// — the refactored `as_array()`/`is_string()` guards simply produce no system blocks rather
     /// than reaching a `.unwrap()`. Direct guard that the unwrap is gone from the request path.
     #[test]
@@ -3285,7 +3530,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Finding #3 regression: a `tool_result` block whose `content` is an ARRAY of nested blocks
+    /// Regression: a `tool_result` block whose `content` is an ARRAY of nested blocks
     /// must be read via `as_array()` (no `is_array()`/`unwrap()`) and recurse into each nested
     /// block without panic. Exercises the read_block tool_result array branch.
     #[test]
@@ -3312,7 +3557,7 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// Finding #3 regression: a `read_response` body whose top-level `content` is an array must be
+    /// Regression: a `read_response` body whose top-level `content` is an array must be
     /// read via `as_array()` without the removed `unwrap()`. Guards the response-path array read.
     #[test]
     fn read_response_array_content_parses_no_unwrap() {
@@ -3330,11 +3575,10 @@ mod anthropic_hardening_tests {
         assert_eq!(ir.content.len(), 2);
     }
 
-    /// Round-5 finding (id synthesis class): the fixed-width-counter encoding must be injective, so
-    /// no `(ts, seq)` pair collides with an adjacent-second pair the bare `{:x}{:x}` scheme would
-    /// merge. We can't control the real clock, but we CAN assert the synthesized ids are strictly
-    /// unique across many rapid calls (same second, monotonic counter) — the exact regime where the
-    /// old scheme collided. Also asserts the suffix is fixed-width (the counter padded to 16 hex).
+    /// Id-synthesis collision guard: `synth_message_id` fills its 24-char suffix with pure CSPRNG
+    /// base62 (no timestamp, no counter), so distinct ids must not collide even under rapid minting.
+    /// We assert the synthesized ids are strictly unique across many rapid calls, and that each has
+    /// the native Anthropic shape (`msg_01` + 24 base62 chars = 30 chars).
     #[test]
     fn synth_message_id_no_collision_under_rapid_minting() {
         let n = 10_000;
@@ -3344,11 +3588,9 @@ mod anthropic_hardening_tests {
             n,
             "every synthesized message id must be unique (fixed-width counter is injective)"
         );
-        // Every id matches the native Anthropic shape: `msg_` + `01` version marker + two
-        // 12-digit base62 fields (unix second, counter) = 30 chars total, with the timestamp and
-        // counter fields unambiguously separable (the fixed widths kill the bare-concat collision).
-        // The 30-char total matches native `msg_01` + 24 random chars, removing the id-LENGTH tell
-        // a client could use to distinguish a synthesized id.
+        // Every id matches the native Anthropic shape: `msg_` + `01` version marker + 24 random
+        // base62 chars = 30 chars total. The 30-char total matches native `msg_01` + 24 random
+        // chars, removing the id-LENGTH tell a client could use to distinguish a synthesized id.
         for id in &ids {
             assert_eq!(
                 id.len(),
@@ -3370,8 +3612,7 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// Round-5 finding (id synthesis class): request ids share the same fixed-width construction and
-    /// must likewise never collide across rapid minting.
+    /// Request ids share the same fixed-width construction and must never collide across rapid minting.
     #[test]
     fn synth_request_id_no_collision_under_rapid_minting() {
         let n = 10_000;
@@ -3383,15 +3624,15 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Round-5 finding (image_url sentinel class): an IR Image carrying the "image_url" media_type
-    /// sentinel (an https:// URL recorded by the OpenAI/Responses reader) must be written as
-    /// Anthropic's native URL image source `{"type":"url","url":<url>}`, NOT as a base64 source with
-    /// `media_type:"image_url"` (which Anthropic 400s).
+    /// An IR Image carrying the `"image_url"` media_type sentinel (an https:// URL recorded by the
+    /// OpenAI/Responses reader) must be written as Anthropic's native URL image source
+    /// `{"type":"url","url":<url>}`, NOT as a base64 source with `media_type:"image_url"`
+    /// (which Anthropic 400s).
     #[test]
     fn write_block_image_url_sentinel_emits_native_url_source() {
         let block = crate::ir::IrBlock::Image {
-            media_type: "image_url".to_string(),
-            data: "https://example.com/cat.png".to_string(),
+            source: crate::ir::IrImageSource::Url("https://example.com/cat.png".to_string()),
+            cache_control: None,
         };
         let out = write_block(&block);
         assert_eq!(out.get("type").and_then(|t| t.as_str()), Some("image"));
@@ -3416,14 +3657,16 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Round-5 finding (image_url sentinel class): a genuine base64 image (a real `image/*`
-    /// media_type) must still take the base64 source path unchanged — the sentinel handling must not
-    /// regress the common case.
+    /// A genuine base64 image (a real `image/*` media_type) must still take the base64 source path
+    /// unchanged — the sentinel handling must not regress the common case.
     #[test]
     fn write_block_real_base64_image_unchanged() {
         let block = crate::ir::IrBlock::Image {
-            media_type: "image/png".to_string(),
-            data: "iVBORw0KGgo=".to_string(),
+            source: crate::ir::IrImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "iVBORw0KGgo=".to_string(),
+            },
+            cache_control: None,
         };
         let out = write_block(&block);
         let source = out.get("source").expect("source present");
@@ -3438,7 +3681,57 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// R19 #9/#11 (cross-protocol image data loss): an Anthropic URL-type image source
+    /// An Anthropic `cache_control` breakpoint placed ON an `image` or `thinking`
+    /// content block must survive read→IR→write instead of silently vanishing (a cache-hit cost
+    /// regression and a same-protocol byte difference). Both block types now carry the breakpoint
+    /// first-class in the IR; the reader populates it and the writer re-emits it.
+    #[test]
+    fn cache_control_on_image_and_thinking_blocks_round_trips() {
+        // Image block with an ephemeral cache breakpoint.
+        let img_in = serde_json::json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="},
+            "cache_control": {"type": CACHE_KIND_EPHEMERAL}
+        });
+        let ir_img = read_block(&img_in).expect("read image block");
+        match &ir_img {
+            crate::ir::IrBlock::Image { cache_control, .. } => assert!(
+                cache_control.is_some(),
+                "image cache_control must be carried into the IR"
+            ),
+            other => panic!("expected Image, got {other:?}"),
+        }
+        let img_out = write_block(&ir_img);
+        assert_eq!(
+            img_out.get("cache_control"),
+            Some(&serde_json::json!({"type": "ephemeral"})), // golden wire-contract literal (kept bare on purpose)
+            "image cache_control must be re-emitted on the wire: {img_out}"
+        );
+
+        // Thinking block with an ephemeral cache breakpoint.
+        let think_in = serde_json::json!({
+            "type": "thinking",
+            "thinking": "reasoning…",
+            "signature": "sig-xyz",
+            "cache_control": {"type": CACHE_KIND_EPHEMERAL}
+        });
+        let ir_think = read_block(&think_in).expect("read thinking block");
+        match &ir_think {
+            crate::ir::IrBlock::Thinking { cache_control, .. } => assert!(
+                cache_control.is_some(),
+                "thinking cache_control must be carried into the IR"
+            ),
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+        let think_out = write_block(&ir_think);
+        assert_eq!(
+            think_out.get("cache_control"),
+            Some(&serde_json::json!({"type": "ephemeral"})), // golden wire-contract literal (kept bare on purpose)
+            "thinking cache_control must be re-emitted on the wire: {think_out}"
+        );
+    }
+
+    /// Regression (cross-protocol image data loss): an Anthropic URL-type image source
     /// `{"type":"url","url":...}` must round-trip through the `image_url` sentinel rather than
     /// silently flatten to empty base64 (the base64 path reads media_type/data, both absent from a
     /// url source). Old code: `media_type`/`data` both `""`; fixed code: `media_type:"image_url"`,
@@ -3451,17 +3744,16 @@ mod anthropic_hardening_tests {
         });
         let ir = read_block(&block_json).expect("url image source parses");
         match &ir {
-            crate::ir::IrBlock::Image { media_type, data } => {
+            crate::ir::IrBlock::Image {
+                source: crate::ir::IrImageSource::Url(url),
+                ..
+            } => {
                 assert_eq!(
-                    media_type, "image_url",
-                    "url source must map to the image_url sentinel, not empty base64 media_type"
-                );
-                assert_eq!(
-                    data, "https://example.com/cat.png",
-                    "the url must be preserved in `data`, not dropped to empty"
+                    url, "https://example.com/cat.png",
+                    "a url source must map to the typed Url variant, preserved verbatim"
                 );
             }
-            other => panic!("expected IrBlock::Image, got {other:?}"),
+            other => panic!("expected IrBlock::Image(Url), got {other:?}"),
         }
         // Round-trip: writing the parsed block must re-emit Anthropic's native url source.
         let out = write_block(&ir);
@@ -3477,7 +3769,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// R19 #9/#11 (no regression): a genuine base64 image source must still parse to its real
+    /// Non-regression: a genuine base64 image source must still parse to its real
     /// `image/*` media_type and base64 data — the url branch must not intercept it.
     #[test]
     fn read_block_base64_image_source_unchanged() {
@@ -3487,7 +3779,10 @@ mod anthropic_hardening_tests {
         });
         let ir = read_block(&block_json).expect("base64 image source parses");
         match ir {
-            crate::ir::IrBlock::Image { media_type, data } => {
+            crate::ir::IrBlock::Image {
+                source: crate::ir::IrImageSource::Base64 { media_type, data },
+                ..
+            } => {
                 assert_eq!(media_type, "image/png");
                 assert_eq!(data, "iVBORw0KGgo=");
             }
@@ -3495,7 +3790,7 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// R23 #9 (completeness): a valid native Anthropic content-block type the IR does not model
+    /// Completeness: a valid native Anthropic content-block type the IR does not model
     /// (e.g. `document`) must NOT hard-error the whole request with a ClientError 400. Mirroring the
     /// OpenAI reader, `read_block` now degrades an unmodeled block to an empty Text block, preserving
     /// the turn. Against the old `_ => Err(ClientError)` catch-all this asserted `Err`, so this test
@@ -3521,16 +3816,69 @@ mod anthropic_hardening_tests {
             other => panic!("expected graceful IrBlock::Text degradation, got {other:?}"),
         }
 
-        // A `redacted_thinking` block (another valid native type the IR does not model) must
-        // likewise degrade rather than 400.
-        let redacted = serde_json::json!({ "type": "redacted_thinking", "data": "abc123" });
+        // A `redacted_thinking` block (a valid native type the IR does not model directly)
+        // is now PRESERVED — not degraded to empty Text — by mapping it onto the redacted-reasoning
+        // sentinel carrier (the same IR shape Bedrock's `redactedContent` uses), with the opaque
+        // `data` bytes in `text`. It must still not 400.
+        let redacted =
+            serde_json::json!({ "type": BLOCK_TYPE_REDACTED_THINKING, "data": "abc123" });
+        match read_block(&redacted).expect("redacted_thinking must not 400") {
+            crate::ir::IrBlock::Thinking {
+                text,
+                redacted,
+                signature,
+                ..
+            } => {
+                assert_eq!(text, "abc123", "opaque redacted data preserved in text");
+                assert!(redacted, "redacted_thinking sets the typed redacted flag");
+                assert!(signature.is_none(), "no sentinel smuggled in signature");
+            }
+            other => panic!("expected Thinking carrier for redacted_thinking, got {other:?}"),
+        }
+    }
+
+    /// Round-trip: an Anthropic `redacted_thinking` block read on the RESPONSE path must
+    /// re-emit as a NATIVE `redacted_thinking` block (preserving the opaque `data` bytes) on
+    /// Anthropic egress — NOT as a plaintext `thinking` block, and WITHOUT leaking the `__busbar`
+    /// sentinel onto the wire. This confirms the reader/writer pairing round-trips response reasoning.
+    #[test]
+    fn redacted_thinking_response_round_trips_as_native_block() {
+        let native = serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude",
+            "content": [{"type": BLOCK_TYPE_REDACTED_THINKING, "data": "OPAQUEBYTES"}],
+            "stop_reason": STOP_END_TURN,
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let ir = AnthropicReader
+            .read_response(&native)
+            .expect("response with redacted_thinking parses");
+        // Carrier shape preserved in the IR.
+        match &ir.content[0] {
+            crate::ir::IrBlock::Thinking { text, redacted, .. } => {
+                assert_eq!(text, "OPAQUEBYTES");
+                assert!(*redacted, "redacted_thinking sets the typed redacted flag");
+            }
+            other => panic!("expected redacted Thinking carrier, got {other:?}"),
+        }
+        // Writer re-emits a NATIVE redacted_thinking block.
+        let out = AnthropicWriter.write_response(&ir);
+        let block = &out["content"][0];
+        assert_eq!(
+            block["type"].as_str(),
+            Some("redacted_thinking"), // golden wire-contract literal (kept bare on purpose)
+            "must re-emit native redacted_thinking, not plaintext thinking"
+        );
+        assert_eq!(block["data"].as_str(), Some("OPAQUEBYTES"));
         assert!(
-            matches!(read_block(&redacted), Ok(crate::ir::IrBlock::Text { .. })),
-            "redacted_thinking must degrade gracefully, not hard-error"
+            !out.to_string().contains("__busbar"),
+            "no busbar marker may reach the wire"
         );
     }
 
-    /// R19 #10/#26 (synth id uniformity): `synth_id_with_prefix` must draw each base62 character
+    /// Uniformity: `synth_id_with_prefix` must draw each base62 character
     /// uniformly via rejection sampling, NOT `byte % 62`. The old modulo over-represents characters
     /// 0..7 by ~25% (256 = 4*62 + 8). Mint a large burst and assert (a) every id is unique, (b) the
     /// per-character frequency of the low/biased band vs the high band is balanced within tolerance.
@@ -3552,7 +3900,7 @@ mod anthropic_hardening_tests {
         for id in &ids {
             let token = id.strip_prefix("req_01").expect("req_01 prefix");
             for &b in token.as_bytes() {
-                let idx = BASE62_ALPHABET
+                let idx = ANTHROPIC_NATIVE_ALPHABET
                     .iter()
                     .position(|&a| a == b)
                     .expect("token char is in the base62 alphabet");
@@ -3578,7 +3926,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// R19 #10/#26 (synth id shape preserved): rejection sampling must not change the native length
+    /// Shape invariant: rejection sampling must not change the native length
     /// or alphabet — `req_01` + 24 base62 chars = 30 total.
     #[test]
     fn synth_id_matches_native_length_and_alphabet() {
@@ -3592,7 +3940,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// R19 #27 (unchecked cast truncation): `max_tokens`/`top_k` larger than `u32::MAX` must drop to
+    /// Regression (unchecked cast truncation): `max_tokens`/`top_k` larger than `u32::MAX` must drop to
     /// `None` via checked `try_from`, NOT silently truncate. Old code: `4_294_967_297 as u32` == 1,
     /// forwarding a corrupted cap. Fixed code: out-of-range → None.
     #[test]
@@ -3626,7 +3974,7 @@ mod anthropic_hardening_tests {
         assert_eq!(ir2.top_k, Some(40));
     }
 
-    /// R19 #28 (unsigned thinking 400): on the REQUEST side `write_message` must drop an assistant
+    /// On the REQUEST side `write_message` must drop an assistant
     /// Thinking block whose `signature` is None (Anthropic 400s an unsigned thinking block), while a
     /// signed thinking block and surrounding text survive.
     #[test]
@@ -3637,10 +3985,14 @@ mod anthropic_hardening_tests {
                 crate::ir::IrBlock::Thinking {
                     text: "unsigned reasoning".to_string(),
                     signature: None,
+                    redacted: false,
+                    cache_control: None,
                 },
                 crate::ir::IrBlock::Thinking {
                     text: "signed reasoning".to_string(),
                     signature: Some("sig-abc".to_string()),
+                    redacted: false,
+                    cache_control: None,
                 },
                 crate::ir::IrBlock::Text {
                     text: "the answer".to_string(),
@@ -3678,7 +4030,7 @@ mod anthropic_hardening_tests {
         assert!(!texts.contains(&"unsigned reasoning"));
     }
 
-    /// R22 LOW #15 (empty-content class): when every content block is filtered out — e.g. an
+    /// Regression (empty-content): when every content block is filtered out — e.g. an
     /// all-thinking assistant message whose unsigned thinking blocks are all dropped on the request
     /// path — `write_message` must emit `content: []` (an empty array, a valid zero-block message),
     /// NOT `content: ""` (an empty string, which Anthropic's Messages API rejects with a 400). The
@@ -3691,10 +4043,14 @@ mod anthropic_hardening_tests {
                 crate::ir::IrBlock::Thinking {
                     text: "unsigned reasoning A".to_string(),
                     signature: None,
+                    redacted: false,
+                    cache_control: None,
                 },
                 crate::ir::IrBlock::Thinking {
                     text: "unsigned reasoning B".to_string(),
                     signature: None,
+                    redacted: false,
+                    cache_control: None,
                 },
             ],
         };
@@ -3713,7 +4069,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// R22 LOW #15 (companion): a message with a single surviving block still emits a populated
+    /// Companion: a message with a single surviving block still emits a populated
     /// content ARRAY (never the empty-string fallback) — confirms the non-empty branch is intact
     /// after collapsing the old `if blocks.is_empty()` split.
     #[test]
@@ -3735,7 +4091,7 @@ mod anthropic_hardening_tests {
         assert_eq!(arr[0].get("text").and_then(|t| t.as_str()), Some("kept"));
     }
 
-    /// R19 #28 (response reasoning untouched): the request-side filter must NOT affect the response
+    /// Non-regression: the request-side filter must NOT affect the response
     /// path — `write_response` still surfaces an unsigned thinking block as a `thinking` content
     /// block (response reasoning has no signature requirement).
     #[test]
@@ -3745,6 +4101,8 @@ mod anthropic_hardening_tests {
             content: vec![crate::ir::IrBlock::Thinking {
                 text: "visible reasoning".to_string(),
                 signature: None,
+                redacted: false,
+                cache_control: None,
             }],
             stop_reason: None,
             usage: crate::ir::IrUsage {
@@ -3772,10 +4130,10 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Round-5 finding (stream-start skeleton class): `message_start` must carry a `usage` object
-    /// even when the IR `MessageStart.usage` is None (the OpenAI→Anthropic case). The native API
-    /// always emits `usage:{input_tokens,output_tokens}` at stream open, and the TS SDK types it as
-    /// required — a missing key crashes a client that reads `message.usage.input_tokens`.
+    /// `message_start` must carry a `usage` object even when the IR `MessageStart.usage` is None
+    /// (the OpenAI→Anthropic case). The native API always emits `usage:{input_tokens,output_tokens}`
+    /// at stream open, and the TS SDK types it as required — a missing key crashes a client that
+    /// reads `message.usage.input_tokens`.
     #[test]
     fn message_start_emits_zero_usage_when_none() {
         let ev = IrStreamEvent::MessageStart {
@@ -3788,7 +4146,7 @@ mod anthropic_hardening_tests {
         let (et, out) = AnthropicWriter
             .write_response_event(&ev)
             .expect("message_start writes");
-        assert_eq!(et, "message_start");
+        assert_eq!(et, "message_start"); // golden wire-contract literal (kept bare on purpose)
         let usage = out
             .get("message")
             .and_then(|m| m.get("usage"))
@@ -3805,8 +4163,8 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Round-5 finding (stream-start skeleton class): when usage IS present, its values and the
-    /// optional cache fields must flow through verbatim.
+    /// When usage IS present on `message_start`, its values and the optional cache fields must flow
+    /// through verbatim.
     #[test]
     fn message_start_emits_present_usage_with_cache_fields() {
         let ev = IrStreamEvent::MessageStart {
@@ -3843,17 +4201,17 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Round-12 finding (terminal-event drop class): reading a `message_delta` whose data omits the
+    /// Regression (terminal-event drop): reading a `message_delta` whose data omits the
     /// `usage` key must STILL yield the `MessageDelta` event — `usage` is optional on read and must
     /// not be `?`-propagated, because dropping the event would discard the terminal `stop_reason` and
     /// leave the client unable to tell whether generation completed. Counters default to zero.
     #[test]
     fn read_message_delta_without_usage_preserves_terminal_event() {
         let data = serde_json::json!({
-            "delta": { "stop_reason": "end_turn", "stop_sequence": null }
+            "delta": { "stop_reason": STOP_END_TURN, "stop_sequence": null }
         });
         let ev = AnthropicReader
-            .read_response_event("message_delta", &data)
+            .read_response_event(EVT_MESSAGE_DELTA, &data)
             .expect("message_delta without usage must still parse, not be dropped");
         match ev {
             IrStreamEvent::MessageDelta {
@@ -3863,7 +4221,7 @@ mod anthropic_hardening_tests {
             } => {
                 assert_eq!(
                     stop_reason,
-                    Some("end_turn".to_string()),
+                    Some(crate::ir::IrStopReason::EndTurn),
                     "terminal stop_reason must survive a missing usage"
                 );
                 assert_eq!(stop_sequence, None);
@@ -3876,12 +4234,12 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// Round-12 finding (terminal-event drop class): when `usage` IS present on a `message_delta`,
+    /// When `usage` IS present on a `message_delta`,
     /// its counters and optional cache fields flow through verbatim.
     #[test]
     fn read_message_delta_with_usage_flows_through() {
         let data = serde_json::json!({
-            "delta": { "stop_reason": "max_tokens" },
+            "delta": { "stop_reason": STOP_MAX_TOKENS },
             "usage": {
                 "input_tokens": 11,
                 "output_tokens": 22,
@@ -3890,7 +4248,7 @@ mod anthropic_hardening_tests {
             }
         });
         let ev = AnthropicReader
-            .read_response_event("message_delta", &data)
+            .read_response_event(EVT_MESSAGE_DELTA, &data)
             .expect("message_delta parses");
         match ev {
             IrStreamEvent::MessageDelta { usage, .. } => {
@@ -3903,7 +4261,7 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// Round-12 finding (required-`model` conformance class): the non-stream `write_response` must
+    /// Conformance: the non-stream `write_response` must
     /// emit `model` UNCONDITIONALLY — the official SDKs type `Message.model` as a required string, so
     /// a body that omits it fails to decode. On a Bedrock→Anthropic path where `resp.model` is None,
     /// the key must still be present (empty-string fallback), not dropped.
@@ -3933,7 +4291,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Round-12 finding (required-`model` conformance class): a present model round-trips verbatim.
+    /// A present model round-trips verbatim.
     #[test]
     fn write_response_preserves_present_model() {
         let resp = crate::ir::IrResponse {
@@ -3959,7 +4317,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Round-12 finding (required-`model` conformance class, streaming sibling): the streaming
+    /// Conformance (streaming sibling): the streaming
     /// `message_start.message` must also carry `model` UNCONDITIONALLY — it's the skeleton the SDK
     /// reads to populate the assembled streaming Message. A None source model emits "" rather than
     /// dropping the mandatory field.
@@ -3984,7 +4342,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Round-6 finding #1 (cross-protocol `type` discriminator class): EVERY event the writer emits
+    /// EVERY event the writer emits
     /// — including the Error variant — must carry a top-level `type` in its data body that matches
     /// the SSE event name. A native SDK dispatches on `data.type`; a missing/mismatched `type` is a
     /// decode failure and a proxy-signature tell. This sweeps all `write_response_event` arms, not
@@ -4009,7 +4367,7 @@ mod anthropic_hardening_tests {
             },
             IrStreamEvent::BlockStop { index: 0 },
             IrStreamEvent::MessageDelta {
-                stop_reason: Some("end_turn".to_string()),
+                stop_reason: Some(crate::ir::IrStopReason::EndTurn),
                 stop_sequence: None,
                 usage: IrUsage {
                     input_tokens: 1,
@@ -4021,7 +4379,7 @@ mod anthropic_hardening_tests {
             IrStreamEvent::MessageStop,
             IrStreamEvent::Error(IrError {
                 class: StatusClass::ServerError,
-                provider_signal: Some("overloaded_error".to_string()),
+                provider_signal: Some(ERR_TYPE_OVERLOADED.to_string()),
                 retry_after: None,
             }),
         ];
@@ -4042,10 +4400,9 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// Round-7 finding (stop_sequence conformance class, non-streaming sibling): a non-streaming
-    /// `write_response` whose IR carried no stop sequence must still emit `stop_sequence: null` — a
-    /// native `Message` always carries the key. Sweeps the same class beyond the cited streaming arm.
-    /// IR-idempotence is preserved: re-reading a `null` stop_sequence yields `None` again.
+    /// A non-streaming `write_response` whose IR carried no stop sequence must still emit
+    /// `stop_sequence: null` — a native `Message` always carries the key. IR-idempotence is
+    /// preserved: re-reading a `null` stop_sequence yields `None` again.
     #[test]
     fn write_response_emits_null_stop_sequence_when_absent() {
         let resp = crate::ir::IrResponse {
@@ -4055,7 +4412,7 @@ mod anthropic_hardening_tests {
                 cache_control: None,
                 citations: Vec::new(),
             }],
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -4081,14 +4438,14 @@ mod anthropic_hardening_tests {
         assert_eq!(reread.stop_sequence, None);
     }
 
-    /// Round-7 finding (stop_sequence conformance class): when present, the non-streaming
-    /// `write_response` must carry the matched string (unchanged from prior behavior).
+    /// When a stop sequence IS present, the non-streaming `write_response` must carry the matched
+    /// string verbatim.
     #[test]
     fn write_response_emits_matched_stop_sequence_string() {
         let resp = crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
             content: vec![],
-            stop_reason: Some("stop_sequence".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::StopSequence),
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -4108,7 +4465,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Round-6 finding #2 (classify ordering class): a billing error whose body carries a message
+    /// A billing error whose body carries a message
     /// substring but NO structured `error.code` must still classify as Billing — the message check
     /// must not be gated behind the `error.code` guard. Mirror for the auth substring.
     #[test]
@@ -4132,12 +4489,13 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Round-6 finding #2 regression: the structured `error.code` 400/422 → ClientError path must
+    /// Non-regression: the structured `error.code` 400/422 → ClientError path must
     /// still fire when the code IS present (the lift-out of the message checks must not regress it).
     #[test]
     fn classify_structured_code_still_maps_client_error() {
-        let body = br#"{"error":{"type":"invalid_request_error","code":"400","message":"bad"}}"#;
-        let sig = AnthropicReader.classify(StatusCode::BAD_REQUEST, body);
+        let body_json = serde_json::json!({"error":{"type": ERR_TYPE_INVALID_REQUEST,"code":"400","message":"bad"}});
+        let body = serde_json::to_vec(&body_json).unwrap();
+        let sig = AnthropicReader.classify(StatusCode::BAD_REQUEST, &body);
         assert!(
             matches!(sig.class, StatusClass::ClientError),
             "structured code 400 must still classify as ClientError, got {:?}",
@@ -4145,7 +4503,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Round-6 finding #3 (id-shape distinguishability class): synthesized ids must match the native
+    /// Synthesized ids must match the native
     /// Anthropic shape — `<prefix>01` version marker, a mixed-case base62 alphabet (`[0-9A-Za-z]`,
     /// NOT lowercase hex), and a FIXED length — so a client inspecting id shape can't tell a
     /// synthesized id from a native one. Covers both `msg_` and `req_`.
@@ -4171,7 +4529,7 @@ mod anthropic_hardening_tests {
                 token.bytes().all(|b| b.is_ascii_alphanumeric()),
                 "token must be mixed-case base62 (no hex-only/non-alphanumeric chars), got `{token}`"
             );
-            // Round-15 HIGH (clock+counter fingerprint): the previous `(unix_second, counter)`
+            // The previous clock+counter `(unix_second, counter)` scheme
             // encoding base62-padded the timestamp to a fixed `000000…` run, so every synthesized
             // id began `01000000…` — a structural tell impossible in a native (CSPRNG) Anthropic id.
             // Assert the CSPRNG-backed token carries no run of six or more leading '0' chars.
@@ -4185,8 +4543,8 @@ mod anthropic_hardening_tests {
         check(&synth_request_id(), "req_");
     }
 
-    /// Round-15 HIGH regression: synthesized ids must come from the CSPRNG, not a deterministic
-    /// clock+counter scheme. Two back-to-back calls within the same clock tick must differ (the old
+    /// Regression: synthesized ids must come from the CSPRNG, not a deterministic clock+counter
+    /// scheme. Two back-to-back calls within the same clock tick must differ (the old
     /// scheme relied on the second-resolution clock for its high bits, so rapid calls within one
     /// second shared a 12-char prefix and differed only in the counter tail — here the leading 13
     /// chars are random and the counter backstop still forces distinctness). Also asserts the token
@@ -4211,7 +4569,7 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// Round-15 HIGH regression: the leading characters of the token must vary across calls. The old
+    /// Regression: the leading characters of the token must vary across calls. The old
     /// clock+counter scheme produced an IDENTICAL leading prefix for every id minted in the same
     /// second; the CSPRNG scheme keeps the leading 13 chars random, so across many samples the first
     /// character must take on more than one distinct value (a deterministic prefix would yield one).
@@ -4229,7 +4587,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Round-15 MEDIUM regression: the modeled-key filter (now a sorted `binary_search` slice rather
+    /// Regression: the modeled-key filter (now a sorted `binary_search` slice rather
     /// than a per-request `HashSet`) must still route every unmodeled top-level key into `extra` and
     /// must still EXCLUDE every modeled key. Guards against a typo/ordering break in `MODELED_KEYS`.
     #[test]
@@ -4279,15 +4637,15 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// Round-13 HIGH (error-message proxy vocabulary): the in-stream `error` event's
+    /// The in-stream `error` event's
     /// `error.message` must NEVER carry reverse-proxy vocabulary ("upstream", "gateway",
     /// "backend", "proxy"). When a provider signal is present, the message is the provider's own
     /// type token VERBATIM (no router prefix).
     #[test]
     fn write_response_event_error_message_has_no_proxy_vocabulary() {
         for (signal, expected) in [
-            (Some("overloaded_error".to_string()), "overloaded_error"),
-            (Some("rate_limit_error".to_string()), "rate_limit_error"),
+            (Some(ERR_TYPE_OVERLOADED.to_string()), "overloaded_error"), // golden wire-contract literal (kept bare on purpose)
+            (Some(ERR_TYPE_RATE_LIMIT.to_string()), "rate_limit_error"), // golden wire-contract literal (kept bare on purpose)
             (None, "an error occurred while streaming the response"),
         ] {
             let err = IrError {
@@ -4317,7 +4675,7 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// Finding #10 regression: a 200 `read_response` body that OMITS `usage` must read back
+    /// Regression: a 200 `read_response` body that OMITS `usage` must read back
     /// successfully with each counter zero-defaulted, NOT 400. The prior `obj.get("usage").ok_or?`
     /// hard-required the field — inconsistent with this protocol's own streaming readers
     /// (`message_start`/`message_delta` already zero-default a missing `usage`) and the gemini/cohere
@@ -4342,7 +4700,7 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// Finding #11 regression (ROOT fix): a wire `role:"system"` message inside `messages` must be
+    /// Regression: a wire `role:"system"` message inside `messages` must be
     /// PROMOTED into `IrRequest.system` by `read_request`, not pushed into `req.messages` as an
     /// `IrRole::System` message. Anthropic's Messages API has no `system` role in `messages`
     /// (system goes top-level), so the writer must never see a System message. Guards the root.
@@ -4383,7 +4741,7 @@ mod anthropic_hardening_tests {
         }
     }
 
-    /// Finding #11 regression (writer): `write_request` must NEVER emit a message with
+    /// Regression (writer): `write_request` must NEVER emit a message with
     /// `role:"system"` — even for a CROSS-PROTOCOL IR that still carries an `IrRole::System` message
     /// in `req.messages` (one that never passed through Anthropic's own `read_request` promotion).
     /// The writer folds it into the top-level `system` field and filters it out of `messages`,
@@ -4454,7 +4812,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Finding #11 regression (writer unit): a direct `write_message` call on an `IrRole::System`
+    /// Regression (writer unit): a direct `write_message` call on an `IrRole::System`
     /// message must NOT emit `role:"system"` (the invalid Anthropic role). Defense-in-depth: even if
     /// a future caller bypasses `write_request`, the writer can never produce the rejected role.
     #[test]
@@ -4475,7 +4833,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    // ---- PF-H1: tool_choice round-trips (Anthropic native shape) ----
+    // ---- tool_choice round-trips (Anthropic native shape) ----
 
     fn read_anthropic_request(body: serde_json::Value) -> crate::ir::IrRequest {
         AnthropicReader.read_request(&body).expect("read_request")
@@ -4541,7 +4899,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// Cross-protocol PF-H1: an OpenAI forced-function `tool_choice` reaches an Anthropic backend as
+    /// Cross-protocol: an OpenAI forced-function `tool_choice` reaches an Anthropic backend as
     /// the native `{type:"tool", name}` directive — NOT silently degraded to auto. Simulates the
     /// cross-protocol seam by clearing `extra` between read and write (forward.rs `ir.extra.clear()`).
     #[test]
@@ -4551,7 +4909,7 @@ mod anthropic_hardening_tests {
             "tools": [{"type":"function","function":{"name":"get_weather","parameters":{}}}],
             "tool_choice": {"type":"function","function":{"name":"get_weather"}}
         });
-        let mut ir = crate::proto::OpenAiReader
+        let mut ir = crate::proto::openai_chat::OpenAiReader
             .read_request(&openai_body)
             .expect("openai read");
         assert_eq!(
@@ -4569,7 +4927,7 @@ mod anthropic_hardening_tests {
         );
     }
 
-    // ---- PF-H2: tool-scoped cache_control survives ----
+    // ---- tool-scoped cache_control survives the cross-protocol seam ----
 
     #[test]
     fn tool_definition_cache_control_roundtrips() {
@@ -4577,17 +4935,17 @@ mod anthropic_hardening_tests {
             "model": "c", "max_tokens": 16, "messages": [],
             "tools": [{
                 "name": "big_tool", "input_schema": {"type":"object"},
-                "cache_control": {"type": "ephemeral"}
+                "cache_control": {"type": CACHE_KIND_EPHEMERAL}
             }]
         }));
         assert!(
             ir.tools[0].cache_control.is_some(),
-            "tool-def cache_control must be promoted into the IR (PF-H2)"
+            "tool-def cache_control must be promoted into the IR"
         );
         let out = AnthropicWriter.write_request(&ir);
         assert_eq!(
             out["tools"][0]["cache_control"],
-            serde_json::json!({"type": "ephemeral"}),
+            serde_json::json!({"type": "ephemeral"}), // golden wire-contract literal (kept bare on purpose)
             "tool-def cache breakpoint must survive to the Anthropic egress"
         );
     }
@@ -4598,12 +4956,12 @@ mod anthropic_hardening_tests {
             "model": "c", "max_tokens": 16,
             "messages": [
                 {"role": "assistant", "content": [
-                    {"type":"tool_use","id":"t1","name":"f","input":{},
-                     "cache_control":{"type":"ephemeral"}}
+                    {"type":STOP_TOOL_USE,"id":"t1","name":"f","input":{},
+                     "cache_control":{"type": CACHE_KIND_EPHEMERAL}}
                 ]},
                 {"role": "user", "content": [
                     {"type":"tool_result","tool_use_id":"t1","content":"ok",
-                     "cache_control":{"type":"ephemeral"}}
+                     "cache_control":{"type": CACHE_KIND_EPHEMERAL}}
                 ]}
             ]
         }));
@@ -4624,15 +4982,15 @@ mod anthropic_hardening_tests {
         let out = AnthropicWriter.write_request(&ir);
         assert_eq!(
             out["messages"][0]["content"][0]["cache_control"],
-            serde_json::json!({"type": "ephemeral"})
+            serde_json::json!({"type": "ephemeral"}) // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(
             out["messages"][1]["content"][0]["cache_control"],
-            serde_json::json!({"type": "ephemeral"})
+            serde_json::json!({"type": "ephemeral"}) // golden wire-contract literal (kept bare on purpose)
         );
     }
 
-    // ---- PF-M1: temperature clamp to Anthropic's [0,1] ----
+    // ---- temperature clamp to Anthropic's [0,1] ----
 
     #[test]
     fn temperature_above_one_is_clamped_not_422() {
@@ -4658,7 +5016,7 @@ mod anthropic_hardening_tests {
         assert_eq!(out["temperature"], serde_json::json!(0.0));
     }
 
-    // ---- PF-H2: temperature clamp is NON-SILENT (signals when it changes the value) ----
+    // ---- temperature clamp is NON-SILENT (signals when it changes the value) ----
     #[test]
     fn test_clamp_temperature_for_anthropic_signals_on_change() {
         // An out-of-range value is clamped AND flagged as changed (so the writer warns).
@@ -4714,7 +5072,7 @@ mod anthropic_hardening_tests {
         assert_eq!(ir_ok.max_tokens, Some(256));
     }
 
-    // ---- PF-H7: OpenAI -> Anthropic tool_choice direction ----
+    // ---- OpenAI -> Anthropic tool_choice cross-protocol translation ----
     // The IR variant is protocol-neutral, so an OpenAI-ingress tool_choice (read into the IR by the
     // OpenAI reader) must emit the correct Anthropic native shape on the Anthropic writer. The
     // `required` -> `{"type":"any"}` mapping is the load-bearing case.
@@ -4743,7 +5101,7 @@ mod anthropic_hardening_tests {
         }
     }
 
-    // ---- PF-M5: catch-all tool_choice values map to None (never silently Auto/Required) ----
+    // ---- catch-all tool_choice values map to None (never silently Auto/Required) ----
     #[test]
     fn test_anthropic_unknown_tool_choice_type_is_none() {
         // An object with an unrecognized `type` must degrade to None, not force a tool call.
@@ -4763,13 +5121,13 @@ mod anthropic_hardening_tests {
         );
     }
 
-    // ---- PF-L1: IR `safety` stop_reason is not a native Anthropic StopReason -> map to end_turn ----
+    // ---- IR `safety` stop_reason is not a native Anthropic stop_reason -> map to end_turn ----
     #[test]
     fn test_anthropic_safety_stop_reason_maps_to_end_turn() {
         let resp = crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
             content: vec![],
-            stop_reason: Some("safety".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::Safety),
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -4785,26 +5143,26 @@ mod anthropic_hardening_tests {
         let out = AnthropicWriter.write_response(&resp);
         assert_eq!(
             out["stop_reason"],
-            serde_json::json!("end_turn"),
+            serde_json::json!("end_turn"), // golden wire-contract literal (kept bare on purpose)
             "IR `safety` must collapse to the native `end_turn` on Anthropic egress; got {out}"
         );
         // A native reason still passes through verbatim.
         let resp2 = crate::ir::IrResponse {
-            stop_reason: Some("max_tokens".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::MaxTokens),
             ..resp
         };
         let out2 = AnthropicWriter.write_response(&resp2);
-        assert_eq!(out2["stop_reason"], serde_json::json!("max_tokens"));
+        assert_eq!(out2["stop_reason"], serde_json::json!("max_tokens")); // golden wire-contract literal (kept bare on purpose)
     }
 
-    // ---- PF-L1 (streaming egress): the SAME `safety` -> `end_turn` collapse must hold on the
-    // streaming path (`write_response_event` / `MessageDelta`), not just the non-stream
-    // `write_response`. A non-native IR `safety` reason must never leak into the wire
+    // ---- Streaming egress: the SAME `safety` -> `end_turn` collapse must hold on the streaming
+    // path (`write_response_event` / `MessageDelta`), not just the non-stream `write_response`.
+    // A non-native IR `safety` reason must never leak into the wire
     // `message_delta.delta.stop_reason`. ----
     #[test]
     fn test_anthropic_streaming_safety_stop_reason_maps_to_end_turn() {
         let ev = IrStreamEvent::MessageDelta {
-            stop_reason: Some("safety".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::Safety),
             stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
@@ -4816,17 +5174,17 @@ mod anthropic_hardening_tests {
         let (event, data) = AnthropicWriter
             .write_response_event(&ev)
             .expect("MessageDelta must emit a message_delta event");
-        assert_eq!(event, "message_delta");
+        assert_eq!(event, "message_delta"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(
             data["delta"]["stop_reason"],
-            serde_json::json!("end_turn"),
+            serde_json::json!("end_turn"), // golden wire-contract literal (kept bare on purpose)
             "IR `safety` must collapse to native `end_turn` on the STREAMING Anthropic egress \
              (not leak `safety`); got {data}"
         );
 
         // A native reason still passes through verbatim on the streaming path.
         let ev2 = IrStreamEvent::MessageDelta {
-            stop_reason: Some("max_tokens".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::MaxTokens),
             stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
@@ -4840,7 +5198,7 @@ mod anthropic_hardening_tests {
             .expect("MessageDelta must emit a message_delta event");
         assert_eq!(
             data2["delta"]["stop_reason"],
-            serde_json::json!("max_tokens")
+            serde_json::json!("max_tokens") // golden wire-contract literal (kept bare on purpose)
         );
     }
 
@@ -4937,10 +5295,13 @@ mod anthropic_hardening_tests {
                 }],
             }],
             max_tokens: Some(16),
-            response_format: Some(serde_json::json!({
-                "type": "json_schema",
-                "json_schema": {"name": "out", "schema": {"type": "object"}}
-            })),
+            response_format: Some(crate::ir::IrResponseFormat {
+                json: true,
+                schema: Some(serde_json::json!({"type": "object"})),
+                name: Some("out".to_string()),
+                strict: None,
+                description: None,
+            }),
             ..Default::default()
         };
 
@@ -4979,10 +5340,7 @@ mod anthropic_hardening_tests {
                             cache_control: None,
                             citations: Vec::new(),
                         },
-                        crate::ir::IrBlock::Image {
-                            media_type: crate::proto::JSON_BLOCK_SENTINEL.to_string(),
-                            data: r#"{"answer":42}"#.to_string(),
-                        },
+                        crate::ir::IrBlock::Json(serde_json::json!({ "answer": 42 })),
                     ],
                     is_error: false,
                     cache_control: None,
@@ -5057,7 +5415,9 @@ mod anthropic_hardening_tests {
         // Read → IR.
         let block = read_block(&native).expect("thinking block reads");
         match &block {
-            crate::ir::IrBlock::Thinking { text, signature } => {
+            crate::ir::IrBlock::Thinking {
+                text, signature, ..
+            } => {
                 assert_eq!(text, "let me reason about this");
                 assert_eq!(
                     signature.as_deref(),
@@ -5097,6 +5457,8 @@ mod anthropic_hardening_tests {
                 crate::ir::IrBlock::Thinking {
                     text: "step-by-step".to_string(),
                     signature: Some("sig-abc".to_string()),
+                    redacted: false,
+                    cache_control: None,
                 },
                 crate::ir::IrBlock::Text {
                     text: "answer".to_string(),
@@ -5104,7 +5466,7 @@ mod anthropic_hardening_tests {
                     citations: Vec::new(),
                 },
             ],
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -5155,8 +5517,11 @@ mod anthropic_hardening_tests {
                         citations: Vec::new(),
                     },
                     crate::ir::IrBlock::Image {
-                        media_type: crate::proto::FILE_ID_IMAGE_SENTINEL.to_string(),
-                        data: "file-abc123".to_string(),
+                        source: crate::ir::IrImageSource::Vendor {
+                            vendor: "responses",
+                            value: serde_json::json!({ "file_id": "file-abc123" }),
+                        },
+                        cache_control: None,
                     },
                 ],
             }],
@@ -5218,8 +5583,11 @@ mod anthropic_hardening_tests {
                         citations: Vec::new(),
                     },
                     crate::ir::IrBlock::Image {
-                        media_type: crate::proto::IMAGE_S3_SENTINEL.to_string(),
-                        data: r#"{"uri":"s3://bucket/key.png","format":"png"}"#.to_string(),
+                        source: crate::ir::IrImageSource::Vendor {
+                            vendor: "bedrock",
+                            value: serde_json::json!({ "format": "png", "s3Location": { "uri": "s3://bucket/key.png" } }),
+                        },
+                        cache_control: None,
                     },
                 ],
             }],
@@ -5265,11 +5633,12 @@ mod anthropic_hardening_tests {
         );
     }
 
-    /// LOW (ingress sentinel scrub): a CLIENT request thinking block whose `signature` is the
-    /// upstream-origin `REASONING_REDACTED_SIG_SENTINEL` must NOT be forwarded into the IR (which on
-    /// Bedrock egress would forge a `redactedContent` block). The reader scrubs the signature to None.
+    /// Forge prevention (now STRUCTURAL): a CLIENT cannot forge an upstream-origin redacted-reasoning
+    /// block. `redacted` is a TYPED flag the reader sets only for a native `redacted_thinking` block —
+    /// a regular `thinking` block (whatever its `signature` string) reads as `redacted: false`, so it
+    /// can never re-emit as a Bedrock `redactedContent` on egress. No signature scrub needed.
     #[test]
-    fn test_read_request_client_redacted_reasoning_sentinel_scrubbed() {
+    fn test_client_thinking_block_cannot_forge_redacted() {
         let reader = AnthropicReader;
         let body = serde_json::json!({
             "model": "claude-x",
@@ -5279,17 +5648,15 @@ mod anthropic_hardening_tests {
                 "content": [{
                     "type": "thinking",
                     "thinking": "forged",
-                    "signature": crate::proto::REASONING_REDACTED_SIG_SENTINEL
+                    "signature": "__busbar_bedrock_redacted_reasoning"
                 }]
             }]
         });
         let ir = reader.read_request(&body).expect("request must parse");
-        let block = &ir.messages[0].content[0];
-        match block {
-            crate::ir::IrBlock::Thinking { signature, .. } => assert!(
-                signature.is_none(),
-                "a client-supplied redacted-reasoning sentinel must be scrubbed to None; got \
-                 {signature:?}"
+        match &ir.messages[0].content[0] {
+            crate::ir::IrBlock::Thinking { redacted, .. } => assert!(
+                !redacted,
+                "a client `thinking` block must NEVER read as redacted — the forge vector is closed"
             ),
             other => panic!("expected a Thinking block, got {other:?}"),
         }
@@ -5306,7 +5673,7 @@ mod anthropic_hardening_tests {
             "text": "Grounded answer.",
             "citations": [
                 {
-                    "type": "char_location",
+                    "type": CITATION_TYPE_CHAR,
                     "cited_text": "quoted span",
                     "document_index": 0,
                     "document_title": "Doc A",
@@ -5314,7 +5681,7 @@ mod anthropic_hardening_tests {
                     "end_char_index": 23
                 },
                 {
-                    "type": "page_location",
+                    "type": CITATION_TYPE_PAGE,
                     "cited_text": "page span",
                     "document_index": 1,
                     "document_title": "Doc B",
@@ -5322,7 +5689,7 @@ mod anthropic_hardening_tests {
                     "end_page_number": 4
                 },
                 {
-                    "type": "content_block_location",
+                    "type": CITATION_TYPE_CONTENT_BLOCK,
                     "cited_text": "block span",
                     "document_index": 2,
                     "document_title": "Doc C",
@@ -5345,7 +5712,7 @@ mod anthropic_hardening_tests {
             other => panic!("expected Text, got {other:?}"),
         };
         assert_eq!(citations.len(), 4);
-        assert_eq!(citations[0].kind.as_deref(), Some("char_location"));
+        assert_eq!(citations[0].kind.as_deref(), Some("char_location")); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(citations[0].start_index, Some(12));
         assert_eq!(citations[1].start_index, Some(3)); // page number into shared slot
         assert_eq!(citations[2].end_index, Some(7)); // block index into shared slot
@@ -5436,14 +5803,14 @@ mod anthropic_hardening_tests {
             "encrypted_index": "opaque-cursor-123"
         });
         let data = serde_json::json!({
-            "type": "content_block_delta",
+            "type": EVT_CONTENT_BLOCK_DELTA,
             "index": 0,
-            "delta": { "type": "citations_delta", "citation": native_citation }
+            "delta": { "type": DELTA_TYPE_CITATIONS, "citation": native_citation }
         });
 
         // READ: a citations_delta content_block_delta → IrDelta::CitationsDelta(vec![citation]).
         let ev = AnthropicReader
-            .read_response_event("content_block_delta", &data)
+            .read_response_event(EVT_CONTENT_BLOCK_DELTA, &data)
             .expect("a citations_delta content_block_delta must parse, not be dropped");
         let (index, citations) = match &ev {
             IrStreamEvent::BlockDelta {
@@ -5467,10 +5834,10 @@ mod anthropic_hardening_tests {
         let (event_type, body) = AnthropicWriter
             .write_response_event(&ev)
             .expect("a CitationsDelta must emit a content_block_delta, not None");
-        assert_eq!(event_type, "content_block_delta");
+        assert_eq!(event_type, "content_block_delta"); // golden wire-contract literal (kept bare on purpose)
         assert_eq!(
             body.pointer("/delta/type").and_then(|t| t.as_str()),
-            Some("citations_delta")
+            Some("citations_delta") // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(
             body.pointer("/index").and_then(|i| i.as_u64()),

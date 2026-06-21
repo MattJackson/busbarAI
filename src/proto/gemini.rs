@@ -5,6 +5,22 @@
 
 use super::*;
 
+/// Router-internal shim key the gemini ingress route injects into the request body when the client
+/// sent a streaming `:streamGenerateContent` request WITHOUT `?alt=sse` (so the response must be the
+/// JSON-array streaming format, not SSE). It rides alongside the `model`/`stream` shims. Single
+/// source of truth shared by the route injection (`route.rs`), the forward-layer strip
+/// (`forward::strip_router_shim_keys`), and the Gemini reader's `modeled_keys` exclusion so it never
+/// reaches a backend on any path. A leading `__busbar` makes a collision with a real provider field
+/// impossible. Defined here and referenced at this owning path, so the route/forward sites reach it
+/// via `crate::proto::gemini::GEMINI_JSON_ARRAY_SHIM_KEY`.
+pub(crate) const GEMINI_JSON_ARRAY_SHIM_KEY: &str = "__busbar_gemini_json_array";
+
+/// The canonical Gemini bad-API-key message text (`google.rpc.Status.message` a real Generative
+/// Language API 400/INVALID_ARGUMENT carries on an invalid key). Single-sourced here: the auth-failure
+/// path returns it via `GeminiWriter::auth_failure_message`, and `write_error` matches on it to gate
+/// the `details[].reason == "API_KEY_INVALID"` ErrorInfo array onto exactly that bad-key 400.
+pub(crate) const GEMINI_BAD_KEY_MESSAGE: &str = "API key not valid. Please pass a valid API key.";
+
 /// Hard cap on the number of distinct tool-call block indices recorded in `state.open_tools` for a
 /// single Gemini SSE stream. The set is only drained when a `finishReason` chunk arrives (the
 /// terminal frame closes every open tool block), so a hostile or buggy upstream that streams an
@@ -15,6 +31,84 @@ use super::*;
 /// stays bounded. The cap leaves every realistic stream untouched. Mirrors the Cohere reader's
 /// `MAX_TRACKED_TOOL_FRAMES`.
 const MAX_GEMINI_TOOL_FRAMES: usize = 4096;
+
+// ── finishReason value tokens ─────────────────────────────────────────────────
+/// Gemini `FinishReason.STOP` — normal/tool-call end.
+const GEMINI_FINISH_STOP: &str = "STOP";
+/// Gemini `FinishReason.MAX_TOKENS` — output truncated by token cap.
+const GEMINI_FINISH_MAX_TOKENS: &str = "MAX_TOKENS";
+/// Gemini `FinishReason.SAFETY` — content-safety stop.
+const GEMINI_FINISH_SAFETY: &str = "SAFETY";
+/// Gemini `FinishReason.OTHER` — unenumerated stop reason.
+const GEMINI_FINISH_OTHER: &str = "OTHER";
+/// Gemini `FinishReason.MALFORMED_FUNCTION_CALL` — model produced an unparseable tool call.
+const GEMINI_FINISH_MALFORMED_FUNCTION_CALL: &str = "MALFORMED_FUNCTION_CALL";
+/// Gemini `FinishReason.RECITATION` — verbatim recitation stop (maps to `safety` in the IR).
+const GEMINI_FINISH_RECITATION: &str = "RECITATION";
+/// Gemini `FinishReason.PROHIBITED_CONTENT` — content-policy block (maps to `safety`).
+const GEMINI_FINISH_PROHIBITED_CONTENT: &str = "PROHIBITED_CONTENT";
+
+/// Upstream URL path prefix shared by all Gemini Generative Language API endpoints. The
+/// per-request path appends `/{model}:{method}` (and optionally `?alt=sse`) via
+/// `upstream_path_for` / `upstream_path_for_stream`. Single source of truth for the four
+/// sites that previously hard-coded the string literal.
+const GEMINI_PATH_BASE: &str = "/v1beta/models";
+
+// ── usageMetadata field names ─────────────────────────────────────────────────
+/// JSON key for Gemini's top-level usage wrapper (`usageMetadata`).
+const FIELD_USAGE_METADATA: &str = "usageMetadata";
+/// JSON key for the prompt (input) token count inside `usageMetadata`.
+const FIELD_PROMPT_TOKEN_COUNT: &str = "promptTokenCount";
+/// JSON key for the candidates (output) token count inside `usageMetadata`.
+const FIELD_CANDIDATES_TOKEN_COUNT: &str = "candidatesTokenCount";
+/// JSON key for the total token count inside `usageMetadata`.
+const FIELD_TOTAL_TOKEN_COUNT: &str = "totalTokenCount";
+/// JSON key for the context-cache token count inside `usageMetadata`.
+const FIELD_CACHED_CONTENT_TOKEN_COUNT: &str = "cachedContentTokenCount";
+
+// ── response identity field names ─────────────────────────────────────────────
+/// JSON key for the opaque response identifier emitted at the top level.
+const FIELD_RESPONSE_ID: &str = "responseId";
+/// JSON key for the serving model name emitted at the top level.
+const FIELD_MODEL_VERSION: &str = "modelVersion";
+
+// ── gRPC / google.rpc.Code status name tokens ────────────────────────────────
+/// google.rpc.Code name for a malformed/bad-argument request.
+const GRPC_INVALID_ARGUMENT: &str = "INVALID_ARGUMENT";
+/// google.rpc.Code name for a quota/rate-limit failure.
+const GRPC_RESOURCE_EXHAUSTED: &str = "RESOURCE_EXHAUSTED";
+/// google.rpc.Code name for a service-overload / temporarily unavailable failure.
+const GRPC_UNAVAILABLE: &str = "UNAVAILABLE";
+/// google.rpc.Code name for a missing or invalid credential.
+const GRPC_UNAUTHENTICATED: &str = "UNAUTHENTICATED";
+/// google.rpc.Code name for a permission / billing failure.
+const GRPC_PERMISSION_DENIED: &str = "PERMISSION_DENIED";
+/// google.rpc.Code name for an internal server error.
+const GRPC_INTERNAL: &str = "INTERNAL";
+/// google.rpc.Code name for a deadline / timeout failure.
+const GRPC_DEADLINE_EXCEEDED: &str = "DEADLINE_EXCEEDED";
+/// google.rpc.Code name for a resource not found.
+const GRPC_NOT_FOUND: &str = "NOT_FOUND";
+/// google.rpc.Code name for an unimplemented / not-supported operation.
+const GRPC_UNIMPLEMENTED: &str = "UNIMPLEMENTED";
+/// Busbar/Anthropic internal error kind for an overloaded upstream (maps to GRPC_UNAVAILABLE).
+const ERR_TYPE_OVERLOADED: &str = "overloaded_error";
+
+// ── ErrorInfo tokens ──────────────────────────────────────────────────────────
+/// The machine-readable `reason` value carried in `google.rpc.ErrorInfo` for an invalid API key.
+const GEMINI_ERROR_REASON_API_KEY_INVALID: &str = "API_KEY_INVALID";
+/// The protobuf type URL for `google.rpc.ErrorInfo` (carried in `details[].@type`).
+const GEMINI_ERROR_INFO_TYPE_URL: &str = "type.googleapis.com/google.rpc.ErrorInfo";
+
+// ── structured-output + generation field keys ─────────────────────────────────
+/// JSON key for the MIME type of the response format inside `generationConfig`.
+const FIELD_RESPONSE_MIME_TYPE: &str = "responseMimeType";
+/// MIME type value for JSON structured output.
+const MIME_APPLICATION_JSON: &str = "application/json";
+/// JSON key for a `functionCall` content part.
+const FIELD_FUNCTION_CALL: &str = "functionCall";
+/// JSON key for the finish reason on a candidate.
+const FIELD_FINISH_REASON: &str = "finishReason";
 
 /// The set of top-level Gemini request keys the reader models into typed `IrRequest` fields (any
 /// OTHER key is swept verbatim into `extra` for round-trip fidelity). This set is a compile-time
@@ -42,7 +136,7 @@ fn modeled_request_keys() -> &'static std::collections::HashSet<&'static str> {
             "tools",
             "systemInstruction",
             "model",
-            crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY,
+            crate::proto::gemini::GEMINI_JSON_ARRAY_SHIM_KEY,
         ]
         .into_iter()
         .collect()
@@ -93,7 +187,7 @@ impl ProtocolReader for GeminiReader {
         // therefore the bare HTTP status int (`"400"`) / status name, which the breaker classifies as
         // a generic ClientError that PENALIZES the lane instead of failing over. Detect the canonical
         // context-length signal here and OVERRIDE `provider_code` with the canonical
-        // `context_length_exceeded` string the breaker recognizes (breaker.rs ~122) →
+        // `context_length_exceeded` string the breaker recognizes (breaker.rs) →
         // StatusClass::ContextLength → fail over to a larger-context model WITHOUT penalty. Without
         // this, oversized-request failover never triggered for the Gemini protocol in production
         // (only the `#[cfg(test)]` `classify()` helper recognized the pattern). Mirrors
@@ -122,7 +216,7 @@ impl ProtocolReader for GeminiReader {
                     || (lower.contains("exceeds the maximum")
                         && (lower.contains("token") || lower.contains("context")))
                 {
-                    Some("context_length_exceeded".to_string())
+                    Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string())
                 } else {
                     provider_code
                 }
@@ -182,7 +276,9 @@ impl ProtocolReader for GeminiReader {
             // only trusted under one of these statuses.
             let status_is_auth_shaped = matches!(
                 structured_type.as_deref(),
-                Some("INVALID_ARGUMENT") | Some("PERMISSION_DENIED") | Some("UNAUTHENTICATED")
+                Some(GRPC_INVALID_ARGUMENT)
+                    | Some(GRPC_PERMISSION_DENIED)
+                    | Some(GRPC_UNAUTHENTICATED)
             );
             if has_api_key_invalid_reason || (status_is_auth_shaped && api_key_message) {
                 (401u16, Some("auth".to_string()))
@@ -210,7 +306,7 @@ impl ProtocolReader for GeminiReader {
         {
             return CanonicalSignal {
                 class: StatusClass::ContextLength,
-                provider_signal: Some("context_length_exceeded".to_string()),
+                provider_signal: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
                 retry_after: None,
             };
         }
@@ -261,7 +357,7 @@ impl ProtocolReader for GeminiReader {
     fn read_request(&self, body: &serde_json::Value) -> Result<crate::ir::IrRequest, IrError> {
         let obj = body.as_object().ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".to_string()),
+            provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
             retry_after: None,
         })?;
 
@@ -300,19 +396,26 @@ impl ProtocolReader for GeminiReader {
                 let role = match role_str {
                     // Gemini's Content.role is optional; an absent/empty role is an
                     // implicit user turn per the GenerateContentRequest schema and the
-                    // official SDK. Match the streaming reader's leniency (line ~467).
+                    // official SDK. Match the streaming reader's leniency.
                     "user" | "" => crate::ir::IrRole::User,
                     "model" => crate::ir::IrRole::Assistant,
                     _ => {
                         return Err(IrError {
                             class: StatusClass::ClientError,
-                            provider_signal: Some("ir_parse".to_string()),
+                            provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
                             retry_after: None,
                         })
                     }
                 };
 
                 let mut msg_content = Vec::new();
+                // Track functionResponse names seen IN THIS TURN: Gemini correlates a tool result
+                // only by `name`, which we map to `tool_use_id`. Two results with the same name in
+                // one turn collide into a duplicate `tool_use_id`, making cross-protocol correlation
+                // ambiguous. We do NOT synthesize disambiguating ids (that would break Gemini->Gemini
+                // passthrough, which round-trips the name verbatim) — we only warn.
+                let mut seen_func_resp_names: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 if let Some(parts_arr) = content_val.get("parts").and_then(|p| p.as_array()) {
                     for part in parts_arr {
                         // Thinking part (H2): a `thought: true` part carries reasoning text + an
@@ -328,15 +431,17 @@ impl ProtocolReader for GeminiReader {
                             let signature = part
                                 .get("thoughtSignature")
                                 .and_then(|s| s.as_str())
-                                // INGRESS sentinel scrub: a CLIENT must not be able to forge the
-                                // upstream-origin `__busbar_bedrock_redacted_reasoning` signature
-                                // (which forges a Bedrock `redactedContent` block on egress). Gemini
-                                // has no redacted-reasoning concept, so a sentinel here is always
-                                // client-supplied; drop it to None. Mirrors the Anthropic request
-                                // reader's scrub.
-                                .filter(|s| !crate::proto::is_redacted_reasoning_sig(s))
+                                // The signature is accepted verbatim; no scrub is needed. `redacted`
+                                // is hardcoded `false` below, so a Gemini client can never forge a
+                                // redacted reasoning block via this path regardless of the signature
+                                // it sends (redacted-ness is a typed flag, not a signature string).
                                 .map(String::from);
-                            msg_content.push(crate::ir::IrBlock::Thinking { text, signature });
+                            msg_content.push(crate::ir::IrBlock::Thinking {
+                                text,
+                                signature,
+                                redacted: false,
+                                cache_control: None,
+                            });
                         }
                         // Text part
                         else if let Some(text_val) = part.get("text").and_then(|t| t.as_str()) {
@@ -347,7 +452,7 @@ impl ProtocolReader for GeminiReader {
                             });
                         }
                         // FunctionCall (ToolUse)
-                        else if let Some(func_call) = part.get("functionCall") {
+                        else if let Some(func_call) = part.get(FIELD_FUNCTION_CALL) {
                             let name = func_call
                                 .get("name")
                                 .and_then(|n| n.as_str())
@@ -395,6 +500,13 @@ impl ProtocolReader for GeminiReader {
                             // but it must not leak onto the result name here). Cross-protocol egress
                             // that correlates strictly by id is the pre-existing Gemini limitation:
                             // the result still carries the name as its handle.
+                            if !name.is_empty() && !seen_func_resp_names.insert(name.clone()) {
+                                tracing::warn!(
+                                    tool_name = %name,
+                                    "duplicate gemini functionResponse name in one turn yields a \
+                                     duplicate tool_use_id; cross-protocol correlation is ambiguous"
+                                );
+                            }
                             msg_content.push(crate::ir::IrBlock::ToolResult {
                                 tool_use_id: name,
                                 content: vec![crate::ir::IrBlock::Text {
@@ -419,36 +531,25 @@ impl ProtocolReader for GeminiReader {
                                 .unwrap_or("")
                                 .to_string();
                             msg_content.push(crate::ir::IrBlock::Image {
-                                media_type: mime_type,
-                                data,
+                                source: crate::ir::IrImageSource::Base64 {
+                                    media_type: mime_type,
+                                    data,
+                                },
+                                cache_control: None,
                             });
                         }
-                        // FileData (Image by URI) → carry the URI under the `"image_url"` sentinel so
-                        // it survives into the IR exactly as the OpenAI/Responses readers store a
-                        // remote image URL. The writer (and cross-protocol egress) re-emit the
-                        // sentinel as a native URL reference rather than mangling it into base64.
+                        // FileData (Image by URI) → a remote URL reference, carried as the typed
+                        // `Url` source so it survives into the IR exactly as the OpenAI/Responses
+                        // readers store a remote image URL.
                         else if let Some(file_data) = part.get("fileData") {
                             let uri = file_data
                                 .get("fileUri")
                                 .and_then(|u| u.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            // L1: preserve the part's REAL `mimeType` when Gemini supplied one (it is
-                            // optional on `fileData` but commonly present, e.g. `image/png`) instead
-                            // of flattening every `fileData` to the `"image_url"` sentinel. Carrying
-                            // the true MIME type lets cross-protocol egress (and the writer) emit a
-                            // faithful media reference. When `mimeType` is ABSENT — a bare remote URI,
-                            // the OpenAI/Responses-equivalent case — fall back to the `"image_url"`
-                            // sentinel so a URL-only `fileData` still round-trips as before.
-                            let media_type = file_data
-                                .get("mimeType")
-                                .and_then(|m| m.as_str())
-                                .filter(|m| !m.is_empty())
-                                .map(String::from)
-                                .unwrap_or_else(|| "image_url".to_string());
                             msg_content.push(crate::ir::IrBlock::Image {
-                                media_type,
-                                data: uri,
+                                source: crate::ir::IrImageSource::Url(uri),
+                                cache_control: None,
                             });
                         }
                     }
@@ -638,7 +739,7 @@ impl ProtocolReader for GeminiReader {
     ) -> Vec<IrStreamEvent> {
         let mut out: Vec<IrStreamEvent> = Vec::new();
 
-        if data.as_str() == Some("[DONE]") || !data.is_object() {
+        if data.as_str() == Some(crate::proto::SSE_DONE_SENTINEL) || !data.is_object() {
             return out;
         }
 
@@ -651,8 +752,8 @@ impl ProtocolReader for GeminiReader {
         // the failure and leaving the downstream client (or cross-protocol ingress writer) on a
         // hung/non-terminated stream while the breaker/observability never see it. forward.rs only
         // converts HTTP-status-level errors, so an inline 200-status error object bypasses that path
-        // entirely. Mirror the Bedrock reader's inline `*Exception` surfacing (bedrock.rs:906-946)
-        // and the Cohere terminal `ERROR` mapping (cohere.rs:629): map `error.status`/`error.code`
+        // entirely. Mirror the Bedrock reader's inline `*Exception` surfacing (bedrock.rs)
+        // and the Cohere terminal `ERROR` mapping (cohere.rs): map `error.status`/`error.code`
         // to a canonical `StatusClass` and push a single `IrStreamEvent::Error` so the downstream
         // writer terminates the stream with a native error frame. This is handled BEFORE the
         // MessageStart/candidates block so an error-only chunk never emits a stray MessageStart.
@@ -690,11 +791,11 @@ impl ProtocolReader for GeminiReader {
                 if !state.started {
                     state.started = true;
                     let id = data
-                        .get("responseId")
+                        .get(FIELD_RESPONSE_ID)
                         .and_then(|i| i.as_str())
                         .map(String::from);
                     let model = data
-                        .get("modelVersion")
+                        .get(FIELD_MODEL_VERSION)
                         .or_else(|| data.get("model"))
                         .and_then(|m| m.as_str())
                         .map(String::from);
@@ -737,11 +838,11 @@ impl ProtocolReader for GeminiReader {
         if !state.started {
             state.started = true;
             let id = data
-                .get("responseId")
+                .get(FIELD_RESPONSE_ID)
                 .and_then(|i| i.as_str())
                 .map(String::from);
             let model = data
-                .get("modelVersion")
+                .get(FIELD_MODEL_VERSION)
                 .or_else(|| data.get("model"))
                 .and_then(|m| m.as_str())
                 .map(String::from);
@@ -804,7 +905,7 @@ impl ProtocolReader for GeminiReader {
                             }
 
                             // FunctionCall (ToolUse) - Gemini sends whole args, not streamed
-                            if let Some(func_call) = part.get("functionCall") {
+                            if let Some(func_call) = part.get(FIELD_FUNCTION_CALL) {
                                 let name_val = func_call
                                     .get("name")
                                     .and_then(|n| n.as_str())
@@ -905,7 +1006,8 @@ impl ProtocolReader for GeminiReader {
             }
 
             // 3. finishReason → close blocks + MessageDelta + MessageStop
-            if let Some(finish_reason_val) = candidate.get("finishReason").and_then(|r| r.as_str())
+            if let Some(finish_reason_val) =
+                candidate.get(FIELD_FINISH_REASON).and_then(|r| r.as_str())
             {
                 // PF-M2: map Gemini's full FinishReason set to the canonical IR stop reasons (no
                 // verbatim-lowercased Gemini-only token leaks to a non-Gemini client).
@@ -921,8 +1023,8 @@ impl ProtocolReader for GeminiReader {
                 // `Some("tool_use")` back to STOP, keeping same-protocol streaming lossless. Only a
                 // bare `end_turn` is promoted; a tool-call truncated/blocked mid-flight keeps its
                 // stronger `max_tokens`/`safety` reason.
-                if stop_reason == "end_turn" && !state.open_tools.is_empty() {
-                    stop_reason = "tool_use".to_string();
+                if stop_reason == crate::ir::IrStopReason::EndTurn && !state.open_tools.is_empty() {
+                    stop_reason = crate::ir::IrStopReason::ToolUse;
                 }
 
                 // Close text block first if open, at the index it actually claimed (not a hardcoded
@@ -942,7 +1044,7 @@ impl ProtocolReader for GeminiReader {
                 let usage = gemini_usage(data);
 
                 out.push(IrStreamEvent::MessageDelta {
-                    stop_reason: Some(stop_reason.to_string()),
+                    stop_reason: Some(stop_reason),
                     // Gemini has no stop_sequence analog in its stream.
                     stop_sequence: None,
                     usage,
@@ -957,7 +1059,7 @@ impl ProtocolReader for GeminiReader {
     fn read_response(&self, body: &serde_json::Value) -> Result<crate::ir::IrResponse, IrError> {
         let obj = body.as_object().ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".to_string()),
+            provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
             retry_after: None,
         })?;
 
@@ -974,12 +1076,12 @@ impl ProtocolReader for GeminiReader {
             if let Some(block_reason) = prompt_block_reason(body) {
                 let usage = gemini_usage(body);
                 let model = obj
-                    .get("modelVersion")
+                    .get(FIELD_MODEL_VERSION)
                     .or_else(|| obj.get("model"))
                     .and_then(|m| m.as_str())
                     .map(String::from);
                 let id = obj
-                    .get("responseId")
+                    .get(FIELD_RESPONSE_ID)
                     .and_then(|i| i.as_str())
                     .map(String::from);
                 return Ok(crate::ir::IrResponse {
@@ -999,19 +1101,19 @@ impl ProtocolReader for GeminiReader {
         // Parse candidates array - must have at least one
         let candidates_val = obj.get("candidates").ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".into()),
+            provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
             retry_after: None,
         })?;
         let candidates = candidates_val.as_array().ok_or(IrError {
             class: StatusClass::ClientError,
-            provider_signal: Some("ir_parse".into()),
+            provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
             retry_after: None,
         })?;
 
         if candidates.is_empty() {
             return Err(IrError {
                 class: StatusClass::ClientError,
-                provider_signal: Some("ir_parse".into()),
+                provider_signal: Some(crate::proto::SIGNAL_IR_PARSE.to_string()),
                 retry_after: None,
             });
         }
@@ -1051,7 +1153,12 @@ impl ProtocolReader for GeminiReader {
                         .get("thoughtSignature")
                         .and_then(|s| s.as_str())
                         .map(String::from);
-                    content.push(crate::ir::IrBlock::Thinking { text, signature });
+                    content.push(crate::ir::IrBlock::Thinking {
+                        text,
+                        signature,
+                        redacted: false,
+                        cache_control: None,
+                    });
                 }
                 // Text part → IrBlock::Text
                 else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
@@ -1067,7 +1174,7 @@ impl ProtocolReader for GeminiReader {
                 // FunctionCall → IrBlock::ToolUse. Gemini carries no id, so synthesize a stable,
                 // non-empty one keyed by (index, name) — the writer ignores the ToolUse `id`, and
                 // cross-protocol Anthropic/OpenAI egress requires a non-empty id for correlation.
-                if let Some(func_call) = part.get("functionCall") {
+                if let Some(func_call) = part.get(FIELD_FUNCTION_CALL) {
                     let name_val = func_call
                         .get("name")
                         .and_then(|n| n.as_str())
@@ -1108,7 +1215,7 @@ impl ProtocolReader for GeminiReader {
 
         // Parse finishReason → stop_reason (map Gemini→canonical)
         let stop_reason = candidate
-            .get("finishReason")
+            .get(FIELD_FINISH_REASON)
             .and_then(|r| r.as_str())
             // PF-M2: canonical-map the full Gemini FinishReason set (see
             // `map_gemini_finish_reason`) so a Gemini-only reason never reaches a non-Gemini
@@ -1125,13 +1232,12 @@ impl ProtocolReader for GeminiReader {
         // `max_tokens`/`safety`/etc. (a tool-call truncated/blocked mid-flight) keep their stronger
         // terminal reason.
         let stop_reason = match stop_reason {
-            Some(sr)
-                if sr == "end_turn"
-                    && content
-                        .iter()
-                        .any(|b| matches!(b, crate::ir::IrBlock::ToolUse { .. })) =>
+            Some(crate::ir::IrStopReason::EndTurn)
+                if content
+                    .iter()
+                    .any(|b| matches!(b, crate::ir::IrBlock::ToolUse { .. })) =>
             {
-                Some("tool_use".to_string())
+                Some(crate::ir::IrStopReason::ToolUse)
             }
             other => other,
         };
@@ -1141,7 +1247,7 @@ impl ProtocolReader for GeminiReader {
 
         // Gemini reports the serving model as `modelVersion` (fall back to `model`).
         let model = obj
-            .get("modelVersion")
+            .get(FIELD_MODEL_VERSION)
             .or_else(|| obj.get("model"))
             .and_then(|m| m.as_str())
             .map(String::from);
@@ -1154,7 +1260,7 @@ impl ProtocolReader for GeminiReader {
         // fabricated field a native client never sees). `system_fingerprint`/`stop_sequence` have
         // no Gemini analogue and remain `None`.
         let id = obj
-            .get("responseId")
+            .get(FIELD_RESPONSE_ID)
             .and_then(|i| i.as_str())
             .map(String::from);
 
@@ -1212,11 +1318,11 @@ const RESPONSE_ID_REJECT_THRESHOLD: u8 = crate::proto::BASE62_REJECT_THRESHOLD;
 /// failure the buffer stays the base62 zero char.
 ///
 /// The byte→base62 reduction uses REJECTION SAMPLING, not a bare `byte % 62`. `256 % 62 != 0`, so a
-/// plain modulo over a uniform `u8` is biased: residues `0..=8` (the values `<256-194=62`… i.e. the
-/// low residues reachable by the extra high byte values `248..=255`) occur slightly more often than
-/// `9..=61`. We instead reject any byte `>= RESPONSE_ID_REJECT_THRESHOLD` (the largest multiple of 62
-/// at or below 256, i.e. `4*62 = 248`) and resample, so every surviving byte maps uniformly across
-/// the 62 symbols. Rejected bytes are simply skipped and more random bytes are drawn as needed.
+/// plain modulo over a uniform `u8` is biased: residues `0..=7` (reachable by the 8 extra byte values
+/// `248..=255`) occur slightly more often than `8..=61`. We instead reject any byte `>=
+/// RESPONSE_ID_REJECT_THRESHOLD` (the largest multiple of 62 that fits in a `u8`, i.e. `4*62 = 248`)
+/// and resample, so every surviving byte maps uniformly across the 62 symbols. Rejected bytes are
+/// simply skipped and more random bytes are drawn as needed.
 fn synth_response_id() -> String {
     let mut token = [b'0'; RESPONSE_ID_TOKEN_LEN];
     let mut filled = 0usize;
@@ -1295,16 +1401,27 @@ fn read_gemini_tool_choice(
         "NONE" => Some(crate::ir::IrToolChoice::None),
         "ANY" => {
             // `allowedFunctionNames` is a LIST in Gemini, but the IR's `Tool` variant models a
-            // SINGLE targeted tool — so when N>1 names are allowed, only the FIRST survives into the
-            // IR, and the remaining names are dropped on cross-protocol egress (PF-L2). Same-protocol
-            // Gemini round-trips through a single-element list and stay faithful; the loss only
-            // affects a multi-name allow-list translated to a protocol with single-tool targeting.
+            // SINGLE targeted tool. The IR cannot express "call one of this SUBSET". A single name
+            // maps cleanly to `Tool{name}`. With N>1 names, fabricating `Tool{name: first}` would
+            // INVENT a stricter constraint (force exactly one specific tool) the request never made;
+            // instead degrade to `Required` (call SOME tool) — a true superset of the allow-list —
+            // and warn that the subset restriction is lost on this (cross-protocol) hop.
             let names = fcc.get("allowedFunctionNames").and_then(|a| a.as_array());
-            match names.and_then(|a| a.first()).and_then(|n| n.as_str()) {
-                Some(name) => Some(crate::ir::IrToolChoice::Tool {
-                    name: name.to_string(),
-                }),
-                None => Some(crate::ir::IrToolChoice::Required),
+            match names {
+                Some(arr) if arr.len() > 1 => {
+                    tracing::warn!(
+                        allowed_count = arr.len(),
+                        "gemini allowedFunctionNames subset restriction is not representable in the \
+                         IR; relaxing to Required (call some tool)"
+                    );
+                    Some(crate::ir::IrToolChoice::Required)
+                }
+                _ => match names.and_then(|a| a.first()).and_then(|n| n.as_str()) {
+                    Some(name) => Some(crate::ir::IrToolChoice::Tool {
+                        name: name.to_string(),
+                    }),
+                    None => Some(crate::ir::IrToolChoice::Required),
+                },
             }
         }
         _ => None,
@@ -1467,115 +1584,101 @@ fn prompt_block_reason(data: &serde_json::Value) -> Option<&str> {
 /// `STOP`/`MAX_TOKENS`/`SAFETY` map to their direct canonical siblings (`end_turn`/`max_tokens`/
 /// `safety`). The remaining Gemini-only reasons — `RECITATION`, `IMAGE_SAFETY`, `SPII`,
 /// `BLOCKLIST`, `PROHIBITED_CONTENT` (content-policy stops) → `safety`; `MALFORMED_FUNCTION_CALL`
-/// (the model emitted an unparseable tool call) → `tool_use`; `OTHER`, `LANGUAGE`, and any unknown
-/// future reason → `end_turn` (a benign natural stop) — were previously passed through
-/// `to_lowercase()` VERBATIM, producing values (`recitation`, `malformed_function_call`, `spii`, …)
-/// that NO downstream SDK enum recognizes. Mapping them to the canonical IR set the
+/// (the model emitted an UNPARSEABLE tool call — generation FAILED, there is NO valid call to run)
+/// → `error`, NOT `tool_use`: `tool_use` would tell the client to execute and continue a tool call
+/// that does not exist, so it would search for a tool_use block, find none/garbage and break; `OTHER`,
+/// `LANGUAGE`, and any unknown future reason → `end_turn` (a benign natural stop) — were previously
+/// passed through `to_lowercase()` VERBATIM, producing values (`recitation`, `malformed_function_call`,
+/// `spii`, …) that NO downstream SDK enum recognizes. Mapping them to the canonical IR set the
 /// Anthropic/OpenAI writers already translate (`safety`→Anthropic `safety`/OpenAI `content_filter`;
-/// `tool_use`→`tool_use`/`tool_calls`; `end_turn`→`end_turn`/`stop`) keeps the translation lossless
-/// instead of leaking an unrecognized Gemini token to a non-Gemini client. A Gemini→Gemini
-/// round-trip is unaffected: the writer's reverse map turns `end_turn` back into `STOP` and `safety`
-/// back into `SAFETY` (the dominant cases), and these stops are terminal — the body is not replayed.
-fn map_gemini_finish_reason(finish_reason: &str) -> String {
+/// `error`/`end_turn`→`end_turn`/`stop`) keeps the translation lossless instead of leaking an
+/// unrecognized Gemini token to a non-Gemini client. A Gemini→Gemini round-trip is unaffected: the
+/// writer's reverse map turns `end_turn` back into `STOP` and `safety` back into `SAFETY` (the
+/// dominant cases), and these stops are terminal — the body is not replayed.
+fn map_gemini_finish_reason(finish_reason: &str) -> crate::ir::IrStopReason {
+    use crate::ir::IrStopReason as S;
     match finish_reason {
-        "STOP" => "end_turn",
-        "MAX_TOKENS" => "max_tokens",
-        "SAFETY" | "RECITATION" | "IMAGE_SAFETY" | "SPII" | "BLOCKLIST" | "PROHIBITED_CONTENT" => {
-            "safety"
-        }
-        "MALFORMED_FUNCTION_CALL" => "tool_use",
-        // OTHER / LANGUAGE / any novel future reason → a benign natural stop the SDKs accept.
-        _ => "end_turn",
+        GEMINI_FINISH_STOP => S::EndTurn,
+        GEMINI_FINISH_MAX_TOKENS => S::MaxTokens,
+        GEMINI_FINISH_SAFETY
+        | GEMINI_FINISH_RECITATION
+        | "IMAGE_SAFETY"
+        | "SPII"
+        | "BLOCKLIST"
+        | GEMINI_FINISH_PROHIBITED_CONTENT => S::Safety,
+        // The model produced an invalid function call: an abnormal stop with no runnable tool call.
+        GEMINI_FINISH_MALFORMED_FUNCTION_CALL => S::Error,
+        // OTHER / LANGUAGE / any novel future reason.
+        _ => S::Other,
     }
-    .to_string()
 }
 
 /// Map a Gemini `promptFeedback.blockReason` to a canonical IR stop reason. A prompt block is a
 /// content-policy refusal of the input, so it surfaces as `safety` (matching the candidate-level
 /// `finishReason: SAFETY` → `safety` mapping) for the well-known content-policy reasons; any other
 /// reason is lowercased so a novel block reason is still surfaced rather than dropped.
-fn prompt_block_stop_reason(block_reason: &str) -> String {
+fn prompt_block_stop_reason(block_reason: &str) -> crate::ir::IrStopReason {
+    use crate::ir::IrStopReason as S;
     match block_reason {
-        "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" => "safety".to_string(),
-        other => other.to_lowercase(),
+        GEMINI_FINISH_SAFETY | "BLOCKLIST" | GEMINI_FINISH_PROHIBITED_CONTENT => S::Safety,
+        _ => S::Other,
     }
 }
 
-/// Read Gemini's structured-output directive out of `generationConfig` into the IR's normalized
-/// `response_format` object (M1). Gemini has no single `response_format` key: structured output is
-/// `generationConfig.responseMimeType` (e.g. `"application/json"`) plus an optional
-/// `responseSchema`. We collect whichever sub-fields are present into a normalized object
-/// `{"responseMimeType": …, "responseSchema": …}` (each verbatim) so the value survives the
-/// cross-protocol seam where `extra` is cleared. Best-effort + lossy in SHAPE by design: the IR keeps
-/// the Gemini-native sub-fields and the writer reproduces them; cross-protocol writers map this
-/// normalized object into their own structured-output shape. Returns `None` when NEITHER sub-field
-/// is present, so a plain request never gains a spurious `response_format`.
+/// [`crate::ir::IrStopReason`] → Gemini native `finishReason`. EXHAUSTIVE: Gemini's enum has NO
+/// TOOL_USE member (a tool-call turn ends with STOP), so EndTurn/StopSequence/ToolUse → STOP;
+/// MaxTokens → MAX_TOKENS; Safety → SAFETY; any other reason → the native `OTHER` member (a valid enum
+/// value that honestly signals an unenumerated stop, never an off-spec upper-cased token).
+fn write_gemini_stop_reason(reason: crate::ir::IrStopReason) -> &'static str {
+    use crate::ir::IrStopReason as S;
+    match reason {
+        S::EndTurn | S::StopSequence | S::ToolUse => GEMINI_FINISH_STOP,
+        S::MaxTokens => GEMINI_FINISH_MAX_TOKENS,
+        S::Safety => GEMINI_FINISH_SAFETY,
+        S::Refusal | S::Error | S::PauseTurn | S::Other => GEMINI_FINISH_OTHER,
+    }
+}
+
+/// Read Gemini's structured-output directive out of `generationConfig` into the protocol-agnostic
+/// [`crate::ir::IrResponseFormat`]. The ONLY code that knows Gemini's structured-output wire shape:
+/// `generationConfig.responseMimeType` (e.g. `"application/json"`) plus an optional `responseSchema`
+/// — Gemini has no single `response_format` key. Returns `None` when NEITHER sub-field is present, so
+/// a plain request never gains a spurious directive.
 fn read_gemini_response_format(
     gen_config: Option<&serde_json::Value>,
-) -> Option<serde_json::Value> {
+) -> Option<crate::ir::IrResponseFormat> {
     let gc = gen_config?;
-    let mime = gc.get("responseMimeType");
+    let mime = gc.get(FIELD_RESPONSE_MIME_TYPE).and_then(|m| m.as_str());
     let schema = gc.get("responseSchema");
     if mime.is_none() && schema.is_none() {
         return None;
     }
-    let mut obj = serde_json::Map::new();
-    if let Some(m) = mime {
-        obj.insert("responseMimeType".to_string(), m.clone());
-    }
-    if let Some(s) = schema {
-        obj.insert("responseSchema".to_string(), s.clone());
-    }
-    Some(serde_json::Value::Object(obj))
+    Some(crate::ir::IrResponseFormat {
+        json: schema.is_some() || mime == Some(MIME_APPLICATION_JSON),
+        schema: schema.cloned(),
+        name: None,
+        strict: None,
+        description: None,
+    })
 }
 
-/// Write the IR `response_format` back into a Gemini `generationConfig` map (M1), inverse of
-/// `read_gemini_response_format`. The normalized IR object may carry `responseMimeType` and/or
-/// `responseSchema` (the Gemini-native round-trip shape this writer produced), so when those keys are
-/// present they are copied straight through. As a best-effort accommodation for a CROSS-protocol
-/// `response_format` that arrived in a foreign shape (e.g. OpenAI's
-/// `{"type":"json_object"}` / `{"type":"json_schema","json_schema":{"schema":…}}`), map the foreign
-/// `type` onto `responseMimeType` and lift an embedded JSON-Schema into `responseSchema`. Anything we
-/// cannot interpret is ignored rather than emitted verbatim (an unknown key in `generationConfig`
-/// risks a 400) — the raw value still survives same-protocol via the preserved `generationConfig` in
-/// `extra`. Mutates `gen_config` in place; emits nothing when there is nothing interpretable.
+/// Project the agnostic [`crate::ir::IrResponseFormat`] into a Gemini `generationConfig` map. The ONLY
+/// code that builds Gemini's structured-output wire shape: a JSON directive emits
+/// `responseMimeType:"application/json"` plus the sanitized `responseSchema` (schema keywords Gemini
+/// rejects are stripped). A non-JSON directive emits nothing — Gemini's default is plain text.
 fn write_gemini_response_format(
     gen_config: &mut serde_json::Map<String, serde_json::Value>,
-    rf: &serde_json::Value,
+    rf: &crate::ir::IrResponseFormat,
 ) {
-    let Some(obj) = rf.as_object() else { return };
-    // Native round-trip shape (this writer's own output, or a same-protocol Gemini value).
-    if let Some(mime) = obj.get("responseMimeType") {
-        gen_config.insert("responseMimeType".to_string(), mime.clone());
+    if !rf.json {
+        return;
     }
-    if let Some(schema) = obj.get("responseSchema") {
+    gen_config.insert(
+        FIELD_RESPONSE_MIME_TYPE.to_string(),
+        serde_json::json!(MIME_APPLICATION_JSON),
+    );
+    if let Some(schema) = &rf.schema {
         gen_config.insert("responseSchema".to_string(), sanitize_gemini_schema(schema));
-    }
-    // Best-effort foreign (OpenAI-style) mapping when no native key was present.
-    if !obj.contains_key("responseMimeType") && !obj.contains_key("responseSchema") {
-        match obj.get("type").and_then(|t| t.as_str()) {
-            Some("json_object") => {
-                gen_config.insert(
-                    "responseMimeType".to_string(),
-                    serde_json::json!("application/json"),
-                );
-            }
-            Some("json_schema") => {
-                gen_config.insert(
-                    "responseMimeType".to_string(),
-                    serde_json::json!("application/json"),
-                );
-                // OpenAI nests the schema under `json_schema.schema`.
-                if let Some(schema) = obj
-                    .get("json_schema")
-                    .and_then(|js| js.get("schema"))
-                    .or_else(|| obj.get("schema"))
-                {
-                    gen_config.insert("responseSchema".to_string(), sanitize_gemini_schema(schema));
-                }
-            }
-            _ => {}
-        }
     }
 }
 
@@ -1625,15 +1728,6 @@ fn sanitize_gemini_schema(schema: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Heuristic: is this Image `data` a URI REFERENCE (a `fileData.fileUri`) rather than base64
-/// `inlineData`? (L1.) Base64 image payloads never contain a `://` scheme separator and never start
-/// with a `gs:` / `http` scheme, whereas every Gemini `fileData` URI does (`gs://…`,
-/// `https://…`, a Files-API `https://generativelanguage.googleapis.com/…`). Used by the writer to
-/// route a real-MIME-typed image back to `fileData` vs `inlineData`.
-fn is_uri_reference(data: &str) -> bool {
-    data.contains("://")
-}
-
 /// Parse a Gemini `usageMetadata` block into `IrUsage`, defaulting every counter to 0 when the
 /// field (or an individual counter) is absent. Shared by the streaming and prompt-block paths so
 /// usage accounting stays identical regardless of how a response terminates.
@@ -1644,13 +1738,13 @@ fn is_uri_reference(data: &str) -> bool {
 /// `cache_read_input_tokens` populate — so cached-prompt accounting survives the cross-protocol seam
 /// instead of being dropped. `None` when absent (no cache hit / older response).
 fn gemini_usage(data: &serde_json::Value) -> crate::ir::IrUsage {
-    let u = data.get("usageMetadata");
+    let u = data.get(FIELD_USAGE_METADATA);
     let prompt = u
-        .and_then(|u| u.get("promptTokenCount"))
+        .and_then(|u| u.get(FIELD_PROMPT_TOKEN_COUNT))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let cached = u
-        .and_then(|u| u.get("cachedContentTokenCount"))
+        .and_then(|u| u.get(FIELD_CACHED_CONTENT_TOKEN_COUNT))
         .and_then(|v| v.as_u64());
     crate::ir::IrUsage {
         // NORMALIZE to the additive-cache convention: Gemini's `promptTokenCount` is a TOTAL that
@@ -1658,7 +1752,7 @@ fn gemini_usage(data: &serde_json::Value) -> crate::ir::IrUsage {
         // the uncached input. `saturating_sub` guards an odd upstream where cached > prompt.
         input_tokens: prompt.saturating_sub(cached.unwrap_or(0)),
         output_tokens: u
-            .and_then(|u| u.get("candidatesTokenCount"))
+            .and_then(|u| u.get(FIELD_CANDIDATES_TOKEN_COUNT))
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
         cache_creation_input_tokens: None,
@@ -1671,15 +1765,15 @@ fn gemini_usage(data: &serde_json::Value) -> crate::ir::IrUsage {
 /// a new class forces a conscious choice here rather than silently degrading to INTERNAL.
 fn gemini_stream_error_code_status(class: StatusClass) -> (u16, &'static str) {
     match class {
-        StatusClass::RateLimit => (429, "RESOURCE_EXHAUSTED"),
-        StatusClass::Overloaded => (503, "UNAVAILABLE"),
-        StatusClass::ServerError => (500, "INTERNAL"),
-        StatusClass::Timeout => (504, "DEADLINE_EXCEEDED"),
-        StatusClass::Network => (503, "UNAVAILABLE"),
-        StatusClass::Auth => (401, "UNAUTHENTICATED"),
-        StatusClass::Billing => (403, "PERMISSION_DENIED"),
-        StatusClass::ClientError => (400, "INVALID_ARGUMENT"),
-        StatusClass::ContextLength => (400, "INVALID_ARGUMENT"),
+        StatusClass::RateLimit => (429, GRPC_RESOURCE_EXHAUSTED),
+        StatusClass::Overloaded => (503, GRPC_UNAVAILABLE),
+        StatusClass::ServerError => (500, GRPC_INTERNAL),
+        StatusClass::Timeout => (504, GRPC_DEADLINE_EXCEEDED),
+        StatusClass::Network => (503, GRPC_UNAVAILABLE),
+        StatusClass::Auth => (401, GRPC_UNAUTHENTICATED),
+        StatusClass::Billing => (403, GRPC_PERMISSION_DENIED),
+        StatusClass::ClientError => (400, GRPC_INVALID_ARGUMENT),
+        StatusClass::ContextLength => (400, GRPC_INVALID_ARGUMENT),
     }
 }
 
@@ -1701,19 +1795,19 @@ fn gemini_stream_error_code_status(class: StatusClass) -> (u16, &'static str) {
 fn gemini_error_status_class(status: Option<&str>, code: Option<u64>) -> StatusClass {
     if let Some(name) = status {
         match name {
-            "RESOURCE_EXHAUSTED" => return StatusClass::RateLimit,
-            "UNAVAILABLE" => return StatusClass::Overloaded,
-            "DEADLINE_EXCEEDED" => return StatusClass::Timeout,
-            "UNAUTHENTICATED" => return StatusClass::Auth,
-            "PERMISSION_DENIED" => return StatusClass::Billing,
-            "INVALID_ARGUMENT"
+            GRPC_RESOURCE_EXHAUSTED => return StatusClass::RateLimit,
+            GRPC_UNAVAILABLE => return StatusClass::Overloaded,
+            GRPC_DEADLINE_EXCEEDED => return StatusClass::Timeout,
+            GRPC_UNAUTHENTICATED => return StatusClass::Auth,
+            GRPC_PERMISSION_DENIED => return StatusClass::Billing,
+            GRPC_INVALID_ARGUMENT
             | "FAILED_PRECONDITION"
             | "OUT_OF_RANGE"
-            | "NOT_FOUND"
+            | GRPC_NOT_FOUND
             | "ALREADY_EXISTS"
             | "ABORTED"
             | "CANCELLED" => return StatusClass::ClientError,
-            "INTERNAL" | "UNKNOWN" | "DATA_LOSS" | "UNIMPLEMENTED" => {
+            GRPC_INTERNAL | "UNKNOWN" | "DATA_LOSS" | GRPC_UNIMPLEMENTED => {
                 return StatusClass::ServerError
             }
             // An UPPER_SNAKE status string outside the modeled google.rpc.Code set: fall through to
@@ -1823,7 +1917,7 @@ impl Clone for GeminiWriter {
 impl ProtocolWriter for GeminiWriter {
     fn upstream_path(&self) -> &str {
         // Model-independent fallback; the real per-request path comes from upstream_path_for().
-        "/v1beta/models"
+        GEMINI_PATH_BASE
     }
 
     /// Gemini's URL embeds the model AND the stream mode. Streaming requests go to
@@ -1833,14 +1927,14 @@ impl ProtocolWriter for GeminiWriter {
         if stream {
             // SSE streaming endpoint. `alt=sse` yields `data:`-framed chunks the gemini
             // reader's read_response_events already decodes.
-            format!("/v1beta/models/{model}:streamGenerateContent?alt=sse")
+            format!("{GEMINI_PATH_BASE}/{model}:streamGenerateContent?alt=sse")
         } else {
-            format!("/v1beta/models/{model}:generateContent")
+            format!("{GEMINI_PATH_BASE}/{model}:generateContent")
         }
     }
 
     fn upstream_path_for(&self, model: &str) -> String {
-        format!("/v1beta/models/{model}:generateContent")
+        format!("{GEMINI_PATH_BASE}/{model}:generateContent")
     }
 
     fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
@@ -1879,7 +1973,16 @@ impl ProtocolWriter for GeminiWriter {
                     crate::ir::IrBlock::Text { text, .. } => {
                         Some(serde_json::json!({ "text": text }))
                     }
-                    _ => None, // Only Text blocks in systemInstruction (Gemini limitation)
+                    // Gemini's systemInstruction.parts carries text only. Drop any non-Text system
+                    // block WITH a warn (matching cohere's warn for the same case) rather than
+                    // vanishing silently — a system array with a non-text block is degenerate.
+                    _ => {
+                        tracing::warn!(
+                            "dropping non-text system block on Gemini egress: systemInstruction \
+                             carries text only"
+                        );
+                        None
+                    }
                 })
                 .collect();
             if !parts.is_empty() {
@@ -1948,9 +2051,15 @@ impl ProtocolWriter for GeminiWriter {
                         // Struct); coerce any non-object input (array/scalar/null/unparseable string)
                         // the same way `functionResponse.response` is coerced below.
                         let args_val = coerce_tool_args(input);
-                        parts_arr.push(serde_json::json!({
-                            "functionCall": { "name": name, "args": args_val }
-                        }))
+                        let mut fc_obj = serde_json::Map::new();
+                        fc_obj.insert("name".to_string(), serde_json::json!(name));
+                        fc_obj.insert("args".to_string(), args_val);
+                        let mut part_obj = serde_json::Map::new();
+                        part_obj.insert(
+                            FIELD_FUNCTION_CALL.to_string(),
+                            serde_json::Value::Object(fc_obj),
+                        );
+                        parts_arr.push(serde_json::Value::Object(part_obj))
                     }
                     crate::ir::IrBlock::ToolResult {
                         tool_use_id,
@@ -2014,63 +2123,43 @@ impl ProtocolWriter for GeminiWriter {
                             "functionResponse": { "name": name, "response": response_val }
                         }))
                     }
-                    crate::ir::IrBlock::Image { media_type, data } => {
-                        // Image → inlineData{mimeType, data} for base64 payloads. The cross-protocol
-                        // OpenAI/Responses readers store a non-data (https) image URL verbatim in
-                        // `data` under the `"image_url"` media_type SENTINEL (they cannot guess a MIME
-                        // type for a remote URL). Emitting that sentinel as `inlineData` would write
-                        // the URL string into the base64 `data` field with a bogus `mimeType:
-                        // "image_url"` — a corrupt part the model cannot decode. Gemini's native way to
-                        // reference an image by URI is `fileData{fileUri, mimeType}`, so route the
-                        // sentinel there (URL natively, not base64). `mimeType` is omitted: it is
-                        // unknown for a remote URL and is optional on `fileData`.
-                        if super::is_unresolvable_image_ref(media_type) {
-                            // A Responses `file_id` (FILE_ID_IMAGE_SENTINEL) or Bedrock `s3Location`
-                            // (IMAGE_S3_SENTINEL) image is an unresolvable cross-vendor reference:
-                            // emitting it as inlineData/fileData would corrupt the part (a file_id
-                            // or S3 URI is not inline base64). SKIP it (no lossless cross-vendor
-                            // projection of an uploaded-file id or an AWS-S3 URI).
-                            tracing::warn!(
-                                "dropping unresolvable vendor-scoped image reference \
-                                 (media_type={media_type}) on Gemini egress: a Responses \
-                                 input_image.file_id or a Bedrock s3Location has no cross-vendor \
-                                 analog and would corrupt an inlineData/fileData part; the block is \
-                                 NOT emitted"
-                            );
-                        } else if media_type == "image_url" {
-                            parts_arr.push(serde_json::json!({
-                                "fileData": { "fileUri": data }
-                            }))
-                        } else if is_uri_reference(data) {
-                            // L1: an Image whose `data` is a URI (not base64) — e.g. a Gemini
-                            // `fileData` part the reader preserved WITH its real `mimeType` — must
-                            // re-emit as `fileData{fileUri, mimeType}`, NOT `inlineData` (which would
-                            // shove the URI into the base64 `data` field). Carry the real `mimeType`
-                            // back so the native fileData reference round-trips faithfully.
-                            parts_arr.push(serde_json::json!({
-                                "fileData": { "fileUri": data, "mimeType": media_type }
-                            }))
-                        } else {
+                    crate::ir::IrBlock::Image { source, .. } => match source {
+                        // A remote URL → Gemini's native `fileData{fileUri}` (URL reference, not base64).
+                        crate::ir::IrImageSource::Url(uri) => parts_arr.push(serde_json::json!({
+                            "fileData": { "fileUri": uri }
+                        })),
+                        // Inline base64 → `inlineData{mimeType, data}`.
+                        crate::ir::IrImageSource::Base64 { media_type, data } => {
                             parts_arr.push(serde_json::json!({
                                 "inlineData": { "mimeType": media_type, "data": data }
                             }))
                         }
+                        // A Responses `file_id` / Bedrock `s3Location` reference has no Gemini
+                        // projection — emitting it would corrupt the part. Drop with a warn.
+                        crate::ir::IrImageSource::Vendor { .. } => {
+                            tracing::warn!(
+                                "dropping unresolvable vendor-scoped image reference on Gemini \
+                                 egress: a file_id / s3Location has no cross-vendor analog"
+                            );
+                        }
+                    },
+                    crate::ir::IrBlock::Json(_) => {
+                        // Structured-json (Bedrock tool-result content) has no Gemini part shape.
                     }
-                    crate::ir::IrBlock::Thinking { text, signature } => {
+                    // A REDACTED reasoning block holds opaque encrypted bytes with no Gemini analog —
+                    // drop it (its `text` is not plaintext reasoning).
+                    crate::ir::IrBlock::Thinking { redacted: true, .. } => {}
+                    crate::ir::IrBlock::Thinking {
+                        text, signature, ..
+                    } => {
                         // Thinking → Gemini `{text, thought:true, thoughtSignature?}` (H2). Gemini
                         // DOES carry reasoning parts; round-trip the text and the opaque resumable
-                        // `thoughtSignature` so a prior-turn reasoning block survives both
-                        // same-protocol Gemini→Gemini and cross-protocol ingress instead of being
-                        // dropped. `thoughtSignature` is emitted only when present.
+                        // `thoughtSignature`. `thoughtSignature` is emitted only when present.
                         let mut part = serde_json::Map::new();
                         part.insert("text".to_string(), serde_json::json!(text));
                         part.insert("thought".to_string(), serde_json::json!(true));
                         if let Some(sig) = signature {
-                            // HIGH-2: never leak the busbar redacted-reasoning sentinel as a Gemini
-                            // `thoughtSignature` — it is a busbar fingerprint + an invalid token.
-                            if !crate::proto::is_redacted_reasoning_sig(sig) {
-                                part.insert("thoughtSignature".to_string(), serde_json::json!(sig));
-                            }
+                            part.insert("thoughtSignature".to_string(), serde_json::json!(sig));
                         }
                         parts_arr.push(serde_json::Value::Object(part));
                     }
@@ -2267,19 +2356,19 @@ impl ProtocolWriter for GeminiWriter {
         // google.rpc.Code name for an HTTP status (the canonical Generative Language API mapping).
         fn status_name_for_http(status: u16) -> &'static str {
             match status {
-                400 => "INVALID_ARGUMENT",
-                401 => "UNAUTHENTICATED",
-                403 => "PERMISSION_DENIED",
-                404 => "NOT_FOUND",
+                400 => GRPC_INVALID_ARGUMENT,
+                401 => GRPC_UNAUTHENTICATED,
+                403 => GRPC_PERMISSION_DENIED,
+                404 => GRPC_NOT_FOUND,
                 409 => "ABORTED",
-                429 => "RESOURCE_EXHAUSTED",
+                429 => GRPC_RESOURCE_EXHAUSTED,
                 499 => "CANCELLED",
-                500 => "INTERNAL",
-                501 => "UNIMPLEMENTED",
-                503 => "UNAVAILABLE",
-                504 => "DEADLINE_EXCEEDED",
-                s if (400..500).contains(&s) => "INVALID_ARGUMENT",
-                s if (500..600).contains(&s) => "INTERNAL",
+                500 => GRPC_INTERNAL,
+                501 => GRPC_UNIMPLEMENTED,
+                503 => GRPC_UNAVAILABLE,
+                504 => GRPC_DEADLINE_EXCEEDED,
+                s if (400..500).contains(&s) => GRPC_INVALID_ARGUMENT,
+                s if (500..600).contains(&s) => GRPC_INTERNAL,
                 _ => "UNKNOWN",
             }
         }
@@ -2293,18 +2382,24 @@ impl ProtocolWriter for GeminiWriter {
         fn status_name_for_kind(kind: &str) -> Option<&'static str> {
             match kind {
                 "invalid_request_error" | "invalid_argument" | "bad_request" => {
-                    Some("INVALID_ARGUMENT")
+                    Some(GRPC_INVALID_ARGUMENT)
                 }
-                "authentication_error" | "unauthenticated" | "auth" => Some("UNAUTHENTICATED"),
-                "permission_error" | "permission_denied" | "forbidden" => Some("PERMISSION_DENIED"),
-                "not_found_error" | "not_found" => Some("NOT_FOUND"),
+                "authentication_error" | "unauthenticated" | "auth" => Some(GRPC_UNAUTHENTICATED),
+                "permission_error" | "permission_denied" | "forbidden" => {
+                    Some(GRPC_PERMISSION_DENIED)
+                }
+                "not_found_error" | "not_found" => Some(GRPC_NOT_FOUND),
                 "rate_limit_error" | "resource_exhausted" | "rate_limit" => {
-                    Some("RESOURCE_EXHAUSTED")
+                    Some(GRPC_RESOURCE_EXHAUSTED)
                 }
-                "overloaded_error" | "overloaded" | "unavailable" => Some("UNAVAILABLE"),
-                "deadline_exceeded" | "timeout" => Some("DEADLINE_EXCEEDED"),
-                "api_error" | "internal" | "server_error" => Some("INTERNAL"),
-                "unimplemented" | "not_implemented" => Some("UNIMPLEMENTED"),
+                ERR_TYPE_OVERLOADED | crate::forward::KIND_OVERLOADED | "unavailable" => {
+                    Some(GRPC_UNAVAILABLE)
+                }
+                "deadline_exceeded" | crate::forward::KIND_TIMEOUT => Some(GRPC_DEADLINE_EXCEEDED),
+                crate::forward::KIND_API_ERROR | "internal" | crate::forward::KIND_SERVER_ERROR => {
+                    Some(GRPC_INTERNAL)
+                }
+                "unimplemented" | "not_implemented" => Some(GRPC_UNIMPLEMENTED),
                 _ => None,
             }
         }
@@ -2316,15 +2411,15 @@ impl ProtocolWriter for GeminiWriter {
         // return (no `_ =>` collapse) so a new kind→name arm forces a conscious choice here.
         fn http_for_status_name(name: &str) -> Option<u16> {
             match name {
-                "INVALID_ARGUMENT" => Some(400),
-                "UNAUTHENTICATED" => Some(401),
-                "PERMISSION_DENIED" => Some(403),
-                "NOT_FOUND" => Some(404),
-                "RESOURCE_EXHAUSTED" => Some(429),
-                "UNAVAILABLE" => Some(503),
-                "DEADLINE_EXCEEDED" => Some(504),
-                "INTERNAL" => Some(500),
-                "UNIMPLEMENTED" => Some(501),
+                GRPC_INVALID_ARGUMENT => Some(400),
+                GRPC_UNAUTHENTICATED => Some(401),
+                GRPC_PERMISSION_DENIED => Some(403),
+                GRPC_NOT_FOUND => Some(404),
+                GRPC_RESOURCE_EXHAUSTED => Some(429),
+                GRPC_UNAVAILABLE => Some(503),
+                GRPC_DEADLINE_EXCEEDED => Some(504),
+                GRPC_INTERNAL => Some(500),
+                GRPC_UNIMPLEMENTED => Some(501),
                 _ => None,
             }
         }
@@ -2356,9 +2451,9 @@ impl ProtocolWriter for GeminiWriter {
         // 400/INVALID_ARGUMENT (which carries a DIFFERENT message and does NOT carry API_KEY_INVALID
         // at real Google) is left untouched, so we neither under-fill the auth surface nor over-fill
         // an unrelated 400 with a reason it should not carry.
-        const GEMINI_BAD_KEY_MESSAGE: &str = "API key not valid. Please pass a valid API key.";
-        let is_auth_bad_key =
-            status == 400 && status_str == "INVALID_ARGUMENT" && message == GEMINI_BAD_KEY_MESSAGE;
+        let is_auth_bad_key = status == 400
+                && status_str == "INVALID_ARGUMENT" // golden wire-contract literal (kept bare on purpose)
+                && message == GEMINI_BAD_KEY_MESSAGE;
         if is_auth_bad_key {
             serde_json::json!({
                 "error": {
@@ -2366,8 +2461,8 @@ impl ProtocolWriter for GeminiWriter {
                     "message": message,
                     "status": status_str,
                     "details": [{
-                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                        "reason": "API_KEY_INVALID",
+                        "@type": GEMINI_ERROR_INFO_TYPE_URL,
+                        "reason": GEMINI_ERROR_REASON_API_KEY_INVALID,
                         "domain": "googleapis.com",
                         "metadata": {
                             "service": "generativelanguage.googleapis.com"
@@ -2404,7 +2499,7 @@ impl ProtocolWriter for GeminiWriter {
                 let mut frame = serde_json::Map::new();
                 match (id, model) {
                     (Some(id), _) => {
-                        frame.insert("responseId".to_string(), serde_json::json!(id));
+                        frame.insert(FIELD_RESPONSE_ID.to_string(), serde_json::json!(id));
                     }
                     // Cross-protocol stream: `StreamTranslate` strips the foreign `id` to `None`
                     // before this writer runs (it does NOT strip `model` — that is the lane's model
@@ -2415,7 +2510,7 @@ impl ProtocolWriter for GeminiWriter {
                     // matching the non-stream `write_response` behavior — rather than dropping it.
                     (None, _) => {
                         frame.insert(
-                            "responseId".to_string(),
+                            FIELD_RESPONSE_ID.to_string(),
                             serde_json::json!(synth_response_id()),
                         );
                     }
@@ -2426,7 +2521,7 @@ impl ProtocolWriter for GeminiWriter {
                 // populated on cross-protocol streams (not just same-protocol passthrough) and the
                 // SDK no longer sees an empty model on every cross-protocol response.
                 if let Some(model) = model {
-                    frame.insert("modelVersion".to_string(), serde_json::json!(model));
+                    frame.insert(FIELD_MODEL_VERSION.to_string(), serde_json::json!(model));
                 }
                 Some(("".to_string(), serde_json::Value::Object(frame)))
             }
@@ -2519,27 +2614,20 @@ impl ProtocolWriter for GeminiWriter {
                 // signature arrives as its own IR delta, so emit a minimal thought part bearing the
                 // signature (empty text, `thought:true`) — the closest faithful streamed form, since a
                 // bare signature has no accompanying incremental text. Previously dropped (None).
-                crate::ir::IrDelta::SignatureDelta(sig) => {
-                    // HIGH-2: a streamed Bedrock `redactedContent` reasoning delta carries the busbar
-                    // redacted-reasoning sentinel (stream form: `{SENTINEL}{base64}`). Never emit the
-                    // `__busbar` marker as a Gemini `thoughtSignature` — drop this signature-only
-                    // frame entirely (None) rather than leak the fingerprint/invalid token.
-                    if crate::proto::is_redacted_reasoning_sig(sig) {
-                        None
-                    } else {
-                        Some((
-                            "".to_string(),
-                            serde_json::json!({
-                                "candidates": [{
-                                    "content": {
-                                        "role": "model",
-                                        "parts": [{"text": "", "thought": true, "thoughtSignature": sig}]
-                                    }
-                                }]
-                            }),
-                        ))
-                    }
-                }
+                crate::ir::IrDelta::SignatureDelta(sig) => Some((
+                    "".to_string(),
+                    serde_json::json!({
+                        "candidates": [{
+                            "content": {
+                                "role": "model",
+                                "parts": [{"text": "", "thought": true, "thoughtSignature": sig}]
+                            }
+                        }]
+                    }),
+                )),
+                // A streamed redacted-reasoning delta (opaque encrypted bytes) has no Gemini analog —
+                // drop it rather than emit a non-native part.
+                crate::ir::IrDelta::RedactedReasoningDelta(_) => None,
 
                 // L2-5 STREAMING citations → emit a candidate-level `citationMetadata.citationSources`
                 // chunk, mirroring the non-stream `read_response`/`write_response` shape (Gemini
@@ -2596,13 +2684,21 @@ impl ProtocolWriter for GeminiWriter {
                     } else {
                         crate::json::parse_str(&args_str).unwrap_or_else(|_| serde_json::json!({}))
                     };
+                    let mut fc_obj = serde_json::Map::new();
+                    fc_obj.insert("name".to_string(), serde_json::json!(name));
+                    fc_obj.insert("args".to_string(), args);
+                    let mut part_obj = serde_json::Map::new();
+                    part_obj.insert(
+                        FIELD_FUNCTION_CALL.to_string(),
+                        serde_json::Value::Object(fc_obj),
+                    );
                     (
                         "".to_string(),
                         serde_json::json!({
                             "candidates": [{
                                 "content": {
                                     "role": "model",
-                                    "parts": [{"functionCall": {"name": name, "args": args}}]
+                                    "parts": [serde_json::Value::Object(part_obj)]
                                 }
                             }]
                         }),
@@ -2616,20 +2712,9 @@ impl ProtocolWriter for GeminiWriter {
                 usage,
                 stop_sequence: _,
             } => {
-                let finish_reason = match stop_reason.as_deref() {
-                    // Gemini reports STOP for a normal completion AND for a tool/function-call
-                    // completion (its `FinishReason` enum has NO TOOL_USE member). Every other
-                    // protocol's reader emits the canonical `tool_use` stop reason for a tool-call
-                    // turn, so it MUST map to STOP here — upper-casing it to "TOOL_USE" would emit an
-                    // invalid enum value a strict google-genai client rejects.
-                    Some("end_turn") | Some("stop_sequence") | Some("tool_use") => {
-                        "STOP".to_string()
-                    }
-                    Some("max_tokens") => "MAX_TOKENS".to_string(),
-                    Some("safety") => "SAFETY".to_string(),
-                    Some(other) => other.to_uppercase(),
-                    None => "STOP".to_string(),
-                };
+                let finish_reason = stop_reason
+                    .map(write_gemini_stop_reason)
+                    .unwrap_or(GEMINI_FINISH_STOP);
 
                 // Native Gemini SSE carries `usageMetadata` (incl. `totalTokenCount`) on the final
                 // chunk; a strict google-genai client computing totals reads `totalTokenCount`.
@@ -2651,23 +2736,40 @@ impl ProtocolWriter for GeminiWriter {
                     .saturating_add(cache_read)
                     .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
                 let total = prompt_total.saturating_add(usage.output_tokens);
-                let mut usage_metadata = serde_json::json!({
-                    "promptTokenCount": prompt_total,
-                    "candidatesTokenCount": usage.output_tokens,
-                    "totalTokenCount": total
-                });
+                let mut usage_metadata = serde_json::Map::new();
+                usage_metadata.insert(
+                    FIELD_PROMPT_TOKEN_COUNT.to_string(),
+                    serde_json::json!(prompt_total),
+                );
+                usage_metadata.insert(
+                    FIELD_CANDIDATES_TOKEN_COUNT.to_string(),
+                    serde_json::json!(usage.output_tokens),
+                );
+                usage_metadata.insert(
+                    FIELD_TOTAL_TOKEN_COUNT.to_string(),
+                    serde_json::json!(total),
+                );
                 if usage.cache_read_input_tokens.is_some() {
-                    usage_metadata["cachedContentTokenCount"] = serde_json::json!(cache_read);
+                    usage_metadata.insert(
+                        FIELD_CACHED_CONTENT_TOKEN_COUNT.to_string(),
+                        serde_json::json!(cache_read),
+                    );
                 }
-                Some((
-                    "".to_string(),
-                    serde_json::json!({
-                        "candidates": [{
-                            "finishReason": finish_reason
-                        }],
-                        "usageMetadata": usage_metadata
-                    }),
-                ))
+                let mut candidate_obj = serde_json::Map::new();
+                candidate_obj.insert(
+                    FIELD_FINISH_REASON.to_string(),
+                    serde_json::json!(finish_reason),
+                );
+                let mut out_obj = serde_json::Map::new();
+                out_obj.insert(
+                    "candidates".to_string(),
+                    serde_json::Value::Array(vec![serde_json::Value::Object(candidate_obj)]),
+                );
+                out_obj.insert(
+                    FIELD_USAGE_METADATA.to_string(),
+                    serde_json::Value::Object(usage_metadata),
+                );
+                Some(("".to_string(), serde_json::Value::Object(out_obj)))
             }
 
             // MessageStop → None (no frame needed)
@@ -2728,46 +2830,47 @@ impl ProtocolWriter for GeminiWriter {
                     id: _, name, input, ..
                 } => {
                     let args_val = coerce_tool_args(input);
-                    parts_arr.push(serde_json::json!({
-                        "functionCall": {"name": name, "args": args_val}
-                    }));
+                    let mut fc_obj = serde_json::Map::new();
+                    fc_obj.insert("name".to_string(), serde_json::json!(name));
+                    fc_obj.insert("args".to_string(), args_val);
+                    let mut part_obj = serde_json::Map::new();
+                    part_obj.insert(
+                        FIELD_FUNCTION_CALL.to_string(),
+                        serde_json::Value::Object(fc_obj),
+                    );
+                    parts_arr.push(serde_json::Value::Object(part_obj));
                 }
 
                 // Thinking → Gemini `{text, thought:true, thoughtSignature?}` (H2). Gemini DOES
                 // surface reasoning as a `thought:true` content part with an opaque resumable
                 // `thoughtSignature`; emit it so reasoning + signature round-trip on the response
                 // path instead of being dropped.
-                crate::ir::IrBlock::Thinking { text, signature } => {
+                // A REDACTED reasoning block holds opaque encrypted bytes with no Gemini analog —
+                // drop it (emitting its `text` would leak the encrypted bytes as visible reasoning).
+                crate::ir::IrBlock::Thinking { redacted: true, .. } => {}
+                crate::ir::IrBlock::Thinking {
+                    text, signature, ..
+                } => {
                     let mut part = serde_json::Map::new();
                     part.insert("text".to_string(), serde_json::json!(text));
                     part.insert("thought".to_string(), serde_json::json!(true));
                     if let Some(sig) = signature {
-                        // HIGH-2: never leak the busbar redacted-reasoning sentinel as a Gemini
-                        // `thoughtSignature` — it is a busbar fingerprint + an invalid token.
-                        if !crate::proto::is_redacted_reasoning_sig(sig) {
-                            part.insert("thoughtSignature".to_string(), serde_json::json!(sig));
-                        }
+                        part.insert("thoughtSignature".to_string(), serde_json::json!(sig));
                     }
                     parts_arr.push(serde_json::Value::Object(part));
                 }
 
                 // Image/ToolResult not supported in response output (lossy)
-                crate::ir::IrBlock::Image { .. } | crate::ir::IrBlock::ToolResult { .. } => {}
+                crate::ir::IrBlock::Image { .. }
+                | crate::ir::IrBlock::ToolResult { .. }
+                | crate::ir::IrBlock::Json(_) => {}
             }
         }
 
-        let finish_reason = match resp.stop_reason.as_deref() {
-            // Gemini reports STOP for a normal completion AND for a tool/function-call completion
-            // (its `FinishReason` enum has NO TOOL_USE member). The canonical `tool_use` stop reason
-            // every other protocol's reader emits for a tool-call turn MUST map to STOP here — upper-
-            // casing it to "TOOL_USE" would emit an invalid enum value a strict google-genai client
-            // rejects on the most common cross-protocol tool-calling path.
-            Some("end_turn") | Some("stop_sequence") | Some("tool_use") => "STOP".to_string(),
-            Some("max_tokens") => "MAX_TOKENS".to_string(),
-            Some("safety") => "SAFETY".to_string(),
-            Some(other) => other.to_uppercase(),
-            None => "STOP".to_string(),
-        };
+        let finish_reason = resp
+            .stop_reason
+            .map(write_gemini_stop_reason)
+            .unwrap_or(GEMINI_FINISH_STOP);
 
         // A native Gemini `generateContent` response ALWAYS carries
         // `usageMetadata.totalTokenCount` (= promptTokenCount + candidatesTokenCount); the
@@ -2810,24 +2913,35 @@ impl ProtocolWriter for GeminiWriter {
             .input_tokens
             .saturating_add(cache_read)
             .saturating_add(resp.usage.cache_creation_input_tokens.unwrap_or(0));
-        let mut usage_metadata = serde_json::json!({
-            "promptTokenCount": prompt_total,
-            "candidatesTokenCount": resp.usage.output_tokens
-        });
+        let mut usage_metadata = serde_json::Map::new();
+        usage_metadata.insert(
+            FIELD_PROMPT_TOKEN_COUNT.to_string(),
+            serde_json::json!(prompt_total),
+        );
+        usage_metadata.insert(
+            FIELD_CANDIDATES_TOKEN_COUNT.to_string(),
+            serde_json::json!(resp.usage.output_tokens),
+        );
         if resp.usage.cache_read_input_tokens.is_some() {
-            usage_metadata["cachedContentTokenCount"] = serde_json::json!(cache_read);
+            usage_metadata.insert(
+                FIELD_CACHED_CONTENT_TOKEN_COUNT.to_string(),
+                serde_json::json!(cache_read),
+            );
         }
         if resp.created.is_some() || resp.model.is_some() {
             let total = prompt_total.saturating_add(resp.usage.output_tokens);
-            usage_metadata["totalTokenCount"] = serde_json::json!(total);
+            usage_metadata.insert(
+                FIELD_TOTAL_TOKEN_COUNT.to_string(),
+                serde_json::json!(total),
+            );
         }
         let mut candidate = serde_json::json!({
             "content": {
                 "role": "model",
                 "parts": parts_arr
-            },
-            "finishReason": finish_reason
+            }
         });
+        candidate[FIELD_FINISH_REASON] = serde_json::json!(finish_reason);
         // L2: re-emit candidate-level citationMetadata when the IR carried citations (grounding /
         // web-search). Only emitted when non-empty so a normal response stays byte-identical.
         if !citation_sources.is_empty() {
@@ -2836,12 +2950,12 @@ impl ProtocolWriter for GeminiWriter {
             });
         }
         let mut out = serde_json::json!({
-            "candidates": [candidate],
-            "usageMetadata": usage_metadata
+            "candidates": [candidate]
         });
+        out[FIELD_USAGE_METADATA] = serde_json::Value::Object(usage_metadata);
         // model that served the response (preserved across cross-protocol translation)
         if let Some(ref model) = resp.model {
-            out["modelVersion"] = serde_json::json!(model);
+            out[FIELD_MODEL_VERSION] = serde_json::json!(model);
         }
         // Response identity. This mirrors the Anthropic writer's id rule, keying synthesis off
         // "did we cross a protocol boundary" (proxied by `created` being populated) rather than off
@@ -2867,10 +2981,10 @@ impl ProtocolWriter for GeminiWriter {
         // Gemini bodies carry no `created`, so none is emitted in the wire shape.
         match (&resp.id, resp.created) {
             (Some(id), _) => {
-                out["responseId"] = serde_json::json!(id);
+                out[FIELD_RESPONSE_ID] = serde_json::json!(id);
             }
             (None, Some(_)) => {
-                out["responseId"] = serde_json::json!(synth_response_id());
+                out[FIELD_RESPONSE_ID] = serde_json::json!(synth_response_id());
             }
             (None, None) => {}
         }
@@ -2878,7 +2992,7 @@ impl ProtocolWriter for GeminiWriter {
     }
 
     fn egress_user_agent(&self) -> &'static str {
-        // Google GenAI SDK UA shape — pinned, see `EGRESS_UA_GEMINI` audit note in forward.rs.
+        // Google GenAI SDK UA shape — pinned, see `EGRESS_UA_GEMINI` in forward.rs.
         crate::forward::EGRESS_UA_GEMINI
     }
 
@@ -2905,6 +3019,26 @@ impl ProtocolWriter for GeminiWriter {
         true
     }
 
+    fn make_array_stream_framer(&self) -> Option<Box<dyn crate::proto::JsonArrayFramer>> {
+        // Gemini `:streamGenerateContent` WITHOUT `?alt=sse` expects a JSON-array streamed body; this
+        // builds the framer that reframes the (gemini-shape) SSE bytes into that array. The forward
+        // path engages it only when `uses_array_stream_shim()` AND `wants_array_stream(body)` hold.
+        Some(Box::new(GeminiJsonArrayFramer::new()))
+    }
+
+    fn wants_array_stream(&self, body: &serde_json::Value) -> bool {
+        // The gemini ingress route injects `GEMINI_JSON_ARRAY_SHIM_KEY: true` when the client sent a
+        // streaming `:streamGenerateContent` request WITHOUT `?alt=sse`. Read it here (the only site
+        // that knows this shim key) so the forward core stays shim-key-agnostic.
+        body.get(GEMINI_JSON_ARRAY_SHIM_KEY)
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false)
+    }
+
+    fn array_stream_shim_key(&self) -> Option<&'static str> {
+        Some(GEMINI_JSON_ARRAY_SHIM_KEY)
+    }
+
     fn has_native_path_not_found(&self) -> bool {
         // Gemini native NOT_FOUND responses carry a structured message naming the resource path
         // and API version (e.g. "Invalid resource path: models/{rest} is not found for API
@@ -2912,8 +3046,226 @@ impl ProtocolWriter for GeminiWriter {
         true
     }
 
+    fn auth_failure_message(&self) -> &'static str {
+        GEMINI_BAD_KEY_MESSAGE
+    }
+
     fn clone_box(&self) -> Box<dyn ProtocolWriter> {
         Box::new(self.clone())
+    }
+}
+
+/// Re-frame a Gemini SSE response stream as the JSON-ARRAY streaming format a native
+/// `:streamGenerateContent` request WITHOUT `?alt=sse` expects: a leading `[`, the per-chunk
+/// `GenerateContentResponse` JSON objects separated by `,`, and a trailing `]`. (The SSE variant —
+/// `?alt=sse` — emits `data:`-framed chunks instead; busbar always requests `?alt=sse` UPSTREAM, so
+/// the bytes reaching this framer are Gemini SSE frames either way, whether the egress is gemini
+/// same-protocol passthrough or a cross-protocol `StreamTranslate` whose ingress writer is gemini.)
+///
+/// This framer is the JSON-array sibling of [`StreamTranslate`]'s SSE path: it consumes the SSE
+/// bytes (already in the gemini ingress wire shape), strips the `data:` framing, and re-emits the
+/// payloads as one streaming JSON array. The output is ALWAYS a syntactically valid JSON array
+/// (`finish` emits `]`, or `[]` when no chunk was seen) so a client that buffers and `JSON.parse`s
+/// the whole body still succeeds.
+pub(crate) struct GeminiJsonArrayFramer {
+    buf: Vec<u8>,
+    /// How far into `buf` the SSE terminator scan has already advanced (keeps `feed` linear; mirrors
+    /// `StreamTranslate::scanned`).
+    scanned: usize,
+    /// Whether the opening `[` (and, for every object after the first, the separating `,`) has been
+    /// emitted yet.
+    started: bool,
+    /// Set once `finish` has emitted the closing `]`, so a second `finish` is a no-op.
+    finished: bool,
+    /// Abandon the stream if the reassembly buffer grows past the cap with no complete frame.
+    aborted: bool,
+}
+
+impl GeminiJsonArrayFramer {
+    // `pub(crate)` so the framer's tests in `mod.rs` (which exercise the buffer-overflow abort path)
+    // can size a payload off the cap; it stays an internal cap, not part of the wire surface.
+    pub(crate) const MAX_BUF: usize = crate::eventstream::MAX_FRAME_BYTES;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            scanned: 0,
+            started: false,
+            finished: false,
+            aborted: false,
+        }
+    }
+
+    /// Feed a chunk of GEMINI SSE bytes; return JSON-array bytes for whatever complete SSE frames are
+    /// now available (empty if only a partial frame is buffered, or if the buffered frames carried no
+    /// data payload yet). Each emitted object is preceded by `[` (first) or `,` (subsequent).
+    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if self.aborted || self.finished {
+            return Vec::new();
+        }
+        self.buf.extend_from_slice(chunk);
+        let mut out: Vec<u8> = Vec::new();
+        // FRONT cursor (mirrors `StreamTranslate::feed`): advance `consumed` per complete frame and
+        // reclaim the prefix in ONE shift after the loop, instead of `drain(..end)` per frame (which
+        // shifted the whole tail once per frame → O(n^2) on a buffer of many small frames). The search
+        // floor is `consumed` — never below it, or the just-consumed terminator is re-found (infinite
+        // loop); the 3-byte straddle backup and the `scanned` skip apply only above that floor.
+        let mut consumed = 0usize;
+        loop {
+            let search_from = self
+                .scanned
+                .saturating_sub(3)
+                .max(consumed)
+                .min(self.buf.len());
+            match find_frame_terminator(&self.buf[search_from..]) {
+                Some((rel, term_len)) => {
+                    let end = search_from + rel + term_len;
+                    let frame = &self.buf[consumed..end];
+                    consumed = end;
+                    self.scanned = end;
+                    let Some((_event_type, data_str)) = parse_sse_frame(frame) else {
+                        continue; // no data: line — keepalive/comment frame
+                    };
+                    if data_str.is_empty() || data_str == crate::proto::SSE_DONE_SENTINEL {
+                        continue; // egress terminator/keepalive — the array close is finish()'s job
+                    }
+                    // Validate the payload is JSON before forwarding so a malformed frame cannot
+                    // corrupt the array; re-serialize from the parsed Value to normalize whitespace.
+                    let Ok(data) = crate::json::parse_str::<serde_json::Value>(&data_str) else {
+                        continue;
+                    };
+                    if self.started {
+                        out.push(b',');
+                    } else {
+                        out.push(b'[');
+                        self.started = true;
+                    }
+                    out.extend_from_slice(data.to_string().as_bytes());
+                }
+                None => {
+                    self.scanned = self.buf.len();
+                    break;
+                }
+            }
+        }
+        if consumed > 0 {
+            self.buf.drain(..consumed);
+            self.scanned = self.buf.len();
+        }
+        if self.buf.len() > Self::MAX_BUF {
+            self.aborted = true;
+            self.buf.clear();
+            self.buf.shrink_to_fit();
+            self.scanned = 0;
+        }
+        out
+    }
+
+    /// Call once at end-of-stream. Emits the closing `]` (and the opening `[` too, as `[]`, when the
+    /// stream carried no chunk) so the body is always a complete, parseable JSON array. When the
+    /// framer ABORTED (the reassembly buffer overran `MAX_BUF` without a frame terminator), the
+    /// stream was silently truncated — so instead of a bare `]` that would make the partial array
+    /// look complete, append a Gemini-shaped `google.rpc.Status` error element so a parsing client
+    /// can see the stream ended abnormally (then close the array).
+    pub(crate) fn finish(&mut self) -> Vec<u8> {
+        if self.finished {
+            return Vec::new();
+        }
+        if self.aborted {
+            return self.finish_with_error(
+                500,
+                GRPC_INTERNAL,
+                // Client-facing wire body: must carry NO product/internal vocabulary (the
+                // protocol-indistinguishability promise). "upstream" is busbar-internal routing
+                // vocabulary no real Gemini API ever emits — a fingerprintable tell. Mirror Gemini's
+                // own canonical 500 status message text instead (the `google.rpc.Status.message` a
+                // real Generative Language API 500 carries), so substring-matching clients can't
+                // distinguish the proxy.
+                "Internal error encountered.",
+            );
+        }
+        self.finished = true;
+        if self.started {
+            b"]".to_vec()
+        } else {
+            b"[]".to_vec()
+        }
+    }
+
+    /// Close the array at end-of-stream when this framer sits DOWNSTREAM of a cross-protocol
+    /// [`StreamTranslate`] (gemini ingress, non-gemini egress). Identical to [`finish`] except it ALSO
+    /// surfaces an abort that happened on the TRANSLATE side: when the translate's reassembly buffer
+    /// overflowed `MAX_BUF` it stopped feeding this framer and its SSE terminal-error frame is
+    /// discarded by the caller (an SSE error cannot ride inside a JSON-array body), so this framer's
+    /// own `aborted` flag stays clear and a plain [`finish`] would emit a bare `]` — a SILENT
+    /// truncation indistinguishable from a successful short completion. Pass
+    /// `translate_aborted = StreamTranslate::aborted()`; when EITHER side aborted, emit the
+    /// Gemini-shaped error element + `]` (mirroring the SSE-ingress terminal-error path in
+    /// `StreamTranslate::finish`) instead of the bare close. Idempotent via the shared `finished` flag.
+    ///
+    /// [`finish`]: Self::finish
+    ///
+    /// Production wiring lives in `forward.rs`: the `FirstByteBody` `Poll::Ready(None)` JSON-array
+    /// close arm calls this with `translate.aborted()` (captured before draining the translate's SSE
+    /// terminator) instead of discarding `translate.finish()` then calling plain `framer.finish()`.
+    pub(crate) fn finish_for_translate(&mut self, translate_aborted: bool) -> Vec<u8> {
+        if self.finished {
+            return Vec::new();
+        }
+        if translate_aborted || self.aborted {
+            return self.finish_with_error(
+                500,
+                GRPC_INTERNAL,
+                // Same client-facing wire body as the framer-side abort in `finish`: a native
+                // Gemini 500 `google.rpc.Status.message`, carrying no busbar-internal vocabulary
+                // (the protocol-indistinguishability promise).
+                "Internal error encountered.",
+            );
+        }
+        self.finish()
+    }
+
+    /// Terminate the array with a trailing Gemini-shaped error element, then the closing `]`. Used on
+    /// a mid-stream upstream transport failure (and on internal abort): a native Gemini JSON-array
+    /// body is `application/json`, so the in-band error MUST itself be a valid array element — a
+    /// `{"error":{"code","message","status"}}` object matching Gemini's `google.rpc.Status` envelope
+    /// (the same shape `GeminiWriter::write_error` emits). Emitting raw SSE `event:`/`data:` text here
+    /// (the bug this replaces) spliced non-JSON into the array, yielding an unparseable body and a
+    /// protocol tell (a native Gemini JSON-array stream never contains SSE framing). Idempotent.
+    pub(crate) fn finish_with_error(&mut self, code: u16, status: &str, message: &str) -> Vec<u8> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        let err = serde_json::json!({
+            "error": { "code": code, "message": message, "status": status }
+        });
+        let mut out: Vec<u8> = Vec::new();
+        if self.started {
+            out.push(b',');
+        } else {
+            out.push(b'[');
+            self.started = true;
+        }
+        out.extend_from_slice(err.to_string().as_bytes());
+        out.push(b']');
+        out
+    }
+}
+
+impl crate::proto::JsonArrayFramer for GeminiJsonArrayFramer {
+    fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        GeminiJsonArrayFramer::feed(self, chunk)
+    }
+
+    fn finish_for_translate(&mut self, translate_aborted: bool) -> Vec<u8> {
+        GeminiJsonArrayFramer::finish_for_translate(self, translate_aborted)
+    }
+
+    fn finish_with_server_error(&mut self, message: &str) -> Vec<u8> {
+        // The implementor owns the wire shape: a native Gemini server error is HTTP 500 / gRPC
+        // `INTERNAL`. The agnostic caller passes only the message, so forward.rs names no Gemini value.
+        GeminiJsonArrayFramer::finish_with_error(self, 500, GRPC_INTERNAL, message)
     }
 }
 
@@ -2943,7 +3295,7 @@ mod tests {
                     "role": "model",
                     "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "SF"}}}]
                 },
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }]
         })]);
 
@@ -2991,15 +3343,15 @@ mod tests {
             "candidates": [
                 {
                     "content": {"role": "model", "parts": [{"text": "first"}]},
-                    "finishReason": "STOP"
+                    "finishReason": GEMINI_FINISH_STOP
                 },
                 {
                     "content": {"role": "model", "parts": [{"text": "second"}]},
-                    "finishReason": "STOP"
+                    "finishReason": GEMINI_FINISH_STOP
                 },
                 {
                     "content": {"role": "model", "parts": [{"text": "third"}]},
-                    "finishReason": "MAX_TOKENS"
+                    "finishReason": GEMINI_FINISH_MAX_TOKENS
                 }
             ]
         })]);
@@ -3066,7 +3418,7 @@ mod tests {
                         {"functionCall": {"name": "f", "args": {}}}
                     ]
                 },
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }]
         })]);
 
@@ -3122,12 +3474,12 @@ mod tests {
                         {"functionCall": {"name": "f", "args": {}}},
                         {"text": "hello"}
                     ]},
-                    "finishReason": "STOP"
+                    "finishReason": GEMINI_FINISH_STOP
                 }]
             })],
             vec![
                 serde_json::json!({"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"f","args":{}}}]}}]}),
-                serde_json::json!({"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":"STOP"}]}),
+                serde_json::json!({"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason": GEMINI_FINISH_STOP}]}),
             ],
         ] {
             let events = collect_stream(&chunks);
@@ -3192,7 +3544,7 @@ mod tests {
                 }]
             }),
             serde_json::json!({
-                "candidates": [{ "finishReason": "STOP" }]
+                "candidates": [{ "finishReason": GEMINI_FINISH_STOP }]
             }),
         ]);
 
@@ -3228,7 +3580,7 @@ mod tests {
                         {"functionCall": {"name": "b", "args": {}}}
                     ]
                 },
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }]
         })]);
 
@@ -3275,7 +3627,7 @@ mod tests {
                         {"functionCall": {"name": "b", "args": {}}}
                     ]
                 },
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }]
         })]);
 
@@ -3333,7 +3685,7 @@ mod tests {
                         {"functionCall": {"name": "b", "args": {}}}
                     ]
                 },
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }]
         })]);
 
@@ -3414,8 +3766,11 @@ mod tests {
                         citations: Vec::new(),
                     },
                     crate::ir::IrBlock::Image {
-                        media_type: crate::proto::IMAGE_S3_SENTINEL.to_string(),
-                        data: r#"{"uri":"s3://bucket/key.png","format":"png"}"#.to_string(),
+                        source: crate::ir::IrImageSource::Vendor {
+                            vendor: "bedrock",
+                            value: serde_json::json!({ "format": "png", "s3Location": { "uri": "s3://bucket/key.png" } }),
+                        },
+                        cache_control: None,
                     },
                 ],
             }],
@@ -3466,7 +3821,7 @@ mod tests {
                     .and_then(|p| p.as_array())
                 {
                     for part in parts {
-                        if let Some(fc) = part.get("functionCall") {
+                        if let Some(fc) = part.get(FIELD_FUNCTION_CALL) {
                             calls.push(fc.clone());
                         }
                     }
@@ -3512,7 +3867,7 @@ mod tests {
         );
     }
 
-    /// Regression for the HIGH finding: the `arguments` JSON arrives SPLIT across MULTIPLE partial-
+    /// Regression: the `arguments` JSON arrives SPLIT across MULTIPLE partial-
     /// JSON InputJsonDelta fragments (the normal OpenAI/Anthropic streaming behavior — the reader
     /// emits one InputJsonDelta per upstream `arguments` fragment, none coalesced). The fragments
     /// individually do NOT parse (`{"lo`, `c":"SF","u":1}`); the writer MUST reassemble them and emit
@@ -3564,7 +3919,7 @@ mod tests {
         );
     }
 
-    /// Regression for the MEDIUM finding: TWO parallel tool blocks in one stream, with their
+    /// Regression: TWO parallel tool blocks in one stream, with their
     /// BlockStarts NOT strictly interleaved with their own BlockStops (the OpenAI reader emits
     /// BlockStart(1), BlockStart(2), then their deltas, then BlockStop(1), BlockStop(2)). The
     /// single-slot buffer this replaced would clobber tool 1 when tool 2's BlockStart arrived. Each
@@ -3704,7 +4059,10 @@ mod tests {
         let raw = reader.extract_error(StatusCode::TOO_MANY_REQUESTS, body);
         assert_eq!(raw.http_status, 429);
         assert_eq!(raw.provider_code.as_deref(), Some("429"));
-        assert_eq!(raw.structured_type.as_deref(), Some("RESOURCE_EXHAUSTED"));
+        assert_eq!(
+            raw.structured_type.as_deref(),
+            Some(GRPC_RESOURCE_EXHAUSTED)
+        );
         // classify()/extract_error do not see headers, so retry_after is sourced elsewhere.
         assert_eq!(raw.retry_after_secs, None);
     }
@@ -3723,7 +4081,7 @@ mod tests {
             Some("503"),
             "integer code must be stringified, not fall back to status"
         );
-        assert_eq!(raw.structured_type.as_deref(), Some("UNAVAILABLE"));
+        assert_eq!(raw.structured_type.as_deref(), Some(GRPC_UNAVAILABLE));
     }
 
     /// A string-typed `code` (some proxies emit one) is still accepted as the secondary path.
@@ -3741,15 +4099,15 @@ mod tests {
         let reader = GeminiReader;
         let body = br#"{"error":{"status":"PERMISSION_DENIED"}}"#;
         let raw = reader.extract_error(StatusCode::FORBIDDEN, body);
-        assert_eq!(raw.provider_code.as_deref(), Some("PERMISSION_DENIED"));
-        assert_eq!(raw.structured_type.as_deref(), Some("PERMISSION_DENIED"));
+        assert_eq!(raw.provider_code.as_deref(), Some(GRPC_PERMISSION_DENIED));
+        assert_eq!(raw.structured_type.as_deref(), Some(GRPC_PERMISSION_DENIED));
     }
 
     /// Regression (R21 #17, ContextLength reachability): a real Gemini oversized-context error is a
     /// 400 `INVALID_ARGUMENT` whose MESSAGE carries the token-overflow text — there is no distinct
     /// google.rpc.Code for it. `extract_error` (the PRODUCTION path; `classify` is `#[cfg(test)]`
     /// only) must synthesize the canonical `context_length_exceeded` provider code so the breaker
-    /// (breaker.rs ~122) maps it to StatusClass::ContextLength and fails over WITHOUT penalty,
+    /// (breaker.rs) maps it to StatusClass::ContextLength and fails over WITHOUT penalty,
     /// instead of treating the bare `"400"` code as a lane-penalizing ClientError. Before the fix
     /// `provider_code` was the bare HTTP-status int and this assertion failed.
     #[test]
@@ -3765,7 +4123,7 @@ mod tests {
             "oversized-context 400 must synthesize the canonical code so the breaker fails over"
         );
         // The structured google.rpc.Code name is preserved unchanged.
-        assert_eq!(raw.structured_type.as_deref(), Some("INVALID_ARGUMENT"));
+        assert_eq!(raw.structured_type.as_deref(), Some(GRPC_INVALID_ARGUMENT));
     }
 
     /// A second real-world phrasing the official API emits ("input is longer than the maximum number
@@ -3898,7 +4256,7 @@ mod tests {
         let raw = reader.extract_error(StatusCode::FORBIDDEN, body);
         // http_status is the real 403, provider_code falls back to the status name — unchanged.
         assert_eq!(raw.http_status, 403);
-        assert_eq!(raw.provider_code.as_deref(), Some("PERMISSION_DENIED"));
+        assert_eq!(raw.provider_code.as_deref(), Some(GRPC_PERMISSION_DENIED));
     }
 
     /// Malformed (non-JSON) error bodies yield None fields without panicking.
@@ -3944,11 +4302,12 @@ mod tests {
         assert_eq!(v["error"]["code"], serde_json::json!(429));
         assert_eq!(
             v["error"]["status"],
-            serde_json::json!("RESOURCE_EXHAUSTED")
+            serde_json::json!("RESOURCE_EXHAUSTED") // golden wire-contract literal (kept bare on purpose)
         );
 
         let v = writer.write_error(400, "invalid_request_error", "bad");
         assert_eq!(v["error"]["status"], serde_json::json!("INVALID_ARGUMENT"));
+        // golden wire-contract literal (kept bare on purpose)
     }
 
     /// An unrecognized `kind` falls back to the HTTP-status-derived google.rpc.Code name (never a
@@ -3957,10 +4316,10 @@ mod tests {
     fn test_write_error_unknown_kind_falls_back_to_http_status() {
         let writer = GeminiWriter;
         let v = writer.write_error(403, "totally_made_up_kind", "nope");
-        assert_eq!(v["error"]["status"], serde_json::json!("PERMISSION_DENIED"));
-        // A 5xx with an unknown kind maps to INTERNAL.
+        assert_eq!(v["error"]["status"], serde_json::json!("PERMISSION_DENIED")); // golden wire-contract literal (kept bare on purpose)
+                                                                                  // A 5xx with an unknown kind maps to INTERNAL.
         let v = writer.write_error(502, "totally_made_up_kind", "bad gateway");
-        assert_eq!(v["error"]["status"], serde_json::json!("INTERNAL"));
+        assert_eq!(v["error"]["status"], serde_json::json!("INTERNAL")); // golden wire-contract literal (kept bare on purpose)
     }
 
     /// Regression (R15): the emitted `code`/`status` pair must always be an INTERNALLY CONSISTENT
@@ -3979,28 +4338,29 @@ mod tests {
         assert_eq!(v["error"]["code"], serde_json::json!(503));
         assert_eq!(
             v["error"]["status"],
-            serde_json::json!("UNAVAILABLE"),
+            serde_json::json!("UNAVAILABLE"), // golden wire-contract literal (kept bare on purpose)
             "code:503 must pair with UNAVAILABLE, never INTERNAL: {v}"
         );
 
         // The bare `overloaded` alias (cross_protocol_error_kind's 503 kind) maps to UNAVAILABLE.
         let v = writer.write_error(503, "overloaded", "upstream overloaded");
-        assert_eq!(v["error"]["status"], serde_json::json!("UNAVAILABLE"));
+        assert_eq!(v["error"]["status"], serde_json::json!("UNAVAILABLE")); // golden wire-contract literal (kept bare on purpose)
 
         // A genuine 500 with `api_error` stays INTERNAL (consistent: INTERNAL pairs with 500).
         let v = writer.write_error(500, "api_error", "boom");
         assert_eq!(v["error"]["code"], serde_json::json!(500));
-        assert_eq!(v["error"]["status"], serde_json::json!("INTERNAL"));
+        assert_eq!(v["error"]["status"], serde_json::json!("INTERNAL")); // golden wire-contract literal (kept bare on purpose)
 
         // A 504 relayed as `timeout` stays DEADLINE_EXCEEDED (canonical 504 == 504).
         let v = writer.write_error(504, "timeout", "slow");
-        assert_eq!(v["error"]["status"], serde_json::json!("DEADLINE_EXCEEDED"));
+        assert_eq!(v["error"]["status"], serde_json::json!("DEADLINE_EXCEEDED")); // golden wire-contract literal (kept bare on purpose)
 
         // A kind whose canonical status disagrees with the code (auth→401 vs code 403) lets the HTTP
         // status drive so the pair stays a real google.rpc pairing (403→PERMISSION_DENIED).
         let v = writer.write_error(403, "auth", "denied");
         assert_eq!(v["error"]["code"], serde_json::json!(403));
         assert_eq!(v["error"]["status"], serde_json::json!("PERMISSION_DENIED"));
+        // golden wire-contract literal (kept bare on purpose)
     }
 
     /// Same-protocol (Gemini→Gemini) passthrough preserves the upstream `responseId` and
@@ -4012,7 +4372,7 @@ mod tests {
         let upstream = serde_json::json!({
             "candidates": [{
                 "content": {"role": "model", "parts": [{"text": "hi"}]},
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }],
             "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1},
             "modelVersion": "gemini-1.5-pro-002",
@@ -4024,12 +4384,12 @@ mod tests {
 
         let wire = writer.write_response(&ir);
         assert_eq!(
-            wire["responseId"],
+            wire[FIELD_RESPONSE_ID],
             serde_json::json!("abc-XYZ-123_opaque"),
             "responseId must be preserved verbatim on same-protocol passthrough: {wire}"
         );
         assert_eq!(
-            wire["modelVersion"],
+            wire[FIELD_MODEL_VERSION],
             serde_json::json!("gemini-1.5-pro-002"),
             "modelVersion must be preserved verbatim: {wire}"
         );
@@ -4038,6 +4398,62 @@ mod tests {
             wire.get("created").is_none(),
             "must not synthesize a `created` field Gemini never emits: {wire}"
         );
+    }
+
+    /// F2 conformance: a foreign / novel IR stop_reason (`refusal` from Responses, `error` from
+    /// Cohere) must NOT upper-case-leak into `finishReason` (e.g. "REFUSAL"/"ERROR" are outside
+    /// Gemini's `FinishReason` enum and a strict google-genai client rejects them). It maps to the
+    /// native `OTHER` member, on both the whole-body and streamed paths.
+    #[test]
+    fn foreign_stop_reason_maps_to_other_not_verbatim() {
+        use crate::ir::IrStopReason as S;
+        let writer = GeminiWriter;
+        for foreign in [S::Refusal, S::Error, S::Other] {
+            let ir = crate::ir::IrResponse {
+                role: crate::ir::IrRole::Assistant,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "x".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+                stop_reason: Some(foreign),
+                usage: crate::ir::IrUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+                model: None,
+                id: None,
+                created: None,
+                system_fingerprint: None,
+                stop_sequence: None,
+            };
+            let wire = writer.write_response(&ir);
+            assert_eq!(
+                wire["candidates"][0]["finishReason"],
+                serde_json::json!("OTHER"), // golden wire-contract literal (kept bare on purpose)
+                "whole-body: foreign stop_reason {foreign:?} must map to OTHER: {wire}"
+            );
+            let ev = IrStreamEvent::MessageDelta {
+                stop_reason: Some(foreign),
+                stop_sequence: None,
+                usage: crate::ir::IrUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            };
+            let (_, frame) = writer
+                .write_response_event(&ev)
+                .expect("MessageDelta must emit a frame");
+            assert_eq!(
+                frame["candidates"][0]["finishReason"],
+                serde_json::json!("OTHER"), // golden wire-contract literal (kept bare on purpose)
+                "streamed: foreign stop_reason {foreign:?} must map to OTHER: {frame}"
+            );
+        }
     }
 
     /// Cross-protocol write where a non-Gemini backend reader DID set a response id (the normal
@@ -4054,7 +4470,7 @@ mod tests {
                 cache_control: None,
                 citations: Vec::new(),
             }],
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -4069,7 +4485,7 @@ mod tests {
         };
         let wire = writer.write_response(&ir);
         assert_eq!(
-            wire["responseId"],
+            wire[FIELD_RESPONSE_ID],
             serde_json::json!("chatcmpl-abc123"),
             "a cross-protocol response id must surface as responseId: {wire}"
         );
@@ -4089,7 +4505,7 @@ mod tests {
                 cache_control: None,
                 citations: Vec::new(),
             }],
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -4104,7 +4520,7 @@ mod tests {
         };
         let wire = writer.write_response(&ir);
         assert!(
-            wire.get("responseId").is_none(),
+            wire.get(FIELD_RESPONSE_ID).is_none(),
             "must not fabricate a responseId when the IR carries none: {wire}"
         );
     }
@@ -4142,7 +4558,7 @@ mod tests {
             })
             .expect("MessageStart must emit an identity frame");
         assert_eq!(
-            frame.1["responseId"],
+            frame.1[FIELD_RESPONSE_ID],
             serde_json::json!("stream-abc-1"),
             "stream MessageStart frame must carry responseId: {}",
             frame.1
@@ -4171,7 +4587,7 @@ mod tests {
         assert!(
             frame
                 .1
-                .get("responseId")
+                .get(FIELD_RESPONSE_ID)
                 .and_then(|v| v.as_str())
                 .is_some_and(|s| !s.is_empty()),
             "post-strip MessageStart must synthesize a responseId: {}",
@@ -4318,6 +4734,8 @@ mod tests {
                     content: vec![crate::ir::IrBlock::Thinking {
                         text: "internal reasoning".to_string(),
                         signature: None,
+                        redacted: false,
+                        cache_control: None,
                     }],
                 },
                 crate::ir::IrMessage {
@@ -4684,7 +5102,7 @@ mod tests {
                 cache_control: None,
                 citations: Vec::new(),
             }],
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -4699,7 +5117,7 @@ mod tests {
         };
         let wire = writer.write_response(&ir);
         let synth = wire
-            .get("responseId")
+            .get(FIELD_RESPONSE_ID)
             .and_then(|v| v.as_str())
             .expect("cross-protocol response (created set, id none) must synthesize responseId");
         assert!(
@@ -4729,7 +5147,7 @@ mod tests {
         );
         assert_eq!(
             frame.pointer("/error/status").and_then(|s| s.as_str()),
-            Some("RESOURCE_EXHAUSTED"),
+            Some("RESOURCE_EXHAUSTED"), // golden wire-contract literal (kept bare on purpose)
             "frame: {frame}"
         );
         assert_eq!(
@@ -4754,7 +5172,7 @@ mod tests {
         assert_eq!(frame.pointer("/error/code"), Some(&serde_json::json!(500)));
         assert_eq!(
             frame.pointer("/error/status").and_then(|s| s.as_str()),
-            Some("INTERNAL")
+            Some("INTERNAL") // golden wire-contract literal (kept bare on purpose)
         );
         // No provider_signal → default message, no panic.
         assert_eq!(
@@ -4779,7 +5197,7 @@ mod tests {
             })
             .expect("a model-bearing MessageStart must emit a frame");
         assert_eq!(
-            frame.1["modelVersion"],
+            frame.1[FIELD_MODEL_VERSION],
             serde_json::json!("gemini-1.5-pro"),
             "frame must carry modelVersion: {}",
             frame.1
@@ -4787,7 +5205,7 @@ mod tests {
         assert!(
             frame
                 .1
-                .get("responseId")
+                .get(FIELD_RESPONSE_ID)
                 .and_then(|v| v.as_str())
                 .is_some_and(|s| !s.is_empty()),
             "no id → responseId synthesized so the SDK still sees one: {}",
@@ -4908,7 +5326,7 @@ mod tests {
                     "role": "model",
                     "parts": [{"functionCall": {"name": "f", "args": {}}}]
                 },
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }],
             "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
         });
@@ -4923,7 +5341,7 @@ mod tests {
         );
     }
 
-    /// Regression (MEDIUM/correctness, final audit): a SAFETY-filtered Gemini candidate carries only
+    /// Regression (MEDIUM/correctness): a SAFETY-filtered Gemini candidate carries only
     /// `finishReason` + `safetyRatings` and NO `content` field. `read_response` must decode it as an
     /// empty-content response with the mapped stop reason, NOT hard-fail (which forward.rs turned into
     /// a spurious 500). Mirrors the streaming reader's `if let Some(content)` tolerance.
@@ -4932,7 +5350,7 @@ mod tests {
         let reader = GeminiReader;
         let body = serde_json::json!({
             "candidates": [{
-                "finishReason": "SAFETY",
+                "finishReason": GEMINI_FINISH_SAFETY,
                 "safetyRatings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}]
             }],
             "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 0}
@@ -4959,7 +5377,7 @@ mod tests {
     #[test]
     fn test_stream_prompt_block_emits_terminal_sequence() {
         let events = collect_stream(&[serde_json::json!({
-            "promptFeedback": {"blockReason": "SAFETY"},
+            "promptFeedback": {"blockReason": GEMINI_FINISH_SAFETY},
             "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 0}
         })]);
 
@@ -4973,12 +5391,12 @@ mod tests {
             "prompt-block stream must emit exactly one MessageStart: {events:?}"
         );
         let stop_reason = events.iter().find_map(|e| match e {
-            IrStreamEvent::MessageDelta { stop_reason, .. } => stop_reason.clone(),
+            IrStreamEvent::MessageDelta { stop_reason, .. } => *stop_reason,
             _ => None,
         });
         assert_eq!(
-            stop_reason.as_deref(),
-            Some("safety"),
+            stop_reason,
+            Some(crate::ir::IrStopReason::Safety),
             "prompt-block must surface a `safety` stop_reason: {events:?}"
         );
         assert!(
@@ -5031,14 +5449,14 @@ mod tests {
         let second = reader.read_response_events(
             "",
             &serde_json::json!({
-                "promptFeedback": {"blockReason": "SAFETY"},
+                "promptFeedback": {"blockReason": GEMINI_FINISH_SAFETY},
                 "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 0}
             }),
             &mut state,
         );
 
         let stop_reason = second.iter().find_map(|e| match e {
-            IrStreamEvent::MessageDelta { stop_reason, .. } => stop_reason.clone(),
+            IrStreamEvent::MessageDelta { stop_reason, .. } => *stop_reason,
             _ => None,
         });
         assert!(
@@ -5053,8 +5471,8 @@ mod tests {
             "mid-stream prompt-block must emit [BlockStop{{0}}, MessageDelta, MessageStop]: {second:?}"
         );
         assert_eq!(
-            stop_reason.as_deref(),
-            Some("safety"),
+            stop_reason,
+            Some(crate::ir::IrStopReason::Safety),
             "the terminal MessageDelta must carry a `safety` stop_reason: {second:?}"
         );
         assert!(
@@ -5072,7 +5490,7 @@ mod tests {
         let reader = GeminiReader;
         let body = serde_json::json!({
             "promptFeedback": {
-                "blockReason": "PROHIBITED_CONTENT",
+                "blockReason": GEMINI_FINISH_PROHIBITED_CONTENT,
                 "safetyRatings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}]
             },
             "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 0}
@@ -5086,8 +5504,8 @@ mod tests {
             ir.content
         );
         assert_eq!(
-            ir.stop_reason.as_deref(),
-            Some("safety"),
+            ir.stop_reason,
+            Some(crate::ir::IrStopReason::Safety),
             "a blocked prompt must surface a `safety` stop_reason"
         );
         assert_eq!(ir.usage.input_tokens, 9, "usage must still be surfaced");
@@ -5113,7 +5531,7 @@ mod tests {
         let events = collect_stream(&[serde_json::json!({
             "candidates": [{
                 "content": {"role": "model", "parts": [{"functionCall": {"name": "ping"}}]},
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }]
         })]);
         let args_json = events.iter().find_map(|e| match e {
@@ -5138,7 +5556,7 @@ mod tests {
         let body = serde_json::json!({
             "candidates": [{
                 "content": {"role": "model", "parts": [{"functionCall": {"name": "ping"}}]},
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }]
         });
         let ir = reader.read_response(&body).expect("read_response");
@@ -5164,7 +5582,7 @@ mod tests {
                     "role": "model",
                     "parts": [{"functionCall": {"name": "f", "args": {}}}]
                 },
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }]
         })]);
         let id = events.iter().find_map(|e| match e {
@@ -5313,7 +5731,7 @@ mod tests {
             "generationConfig": {
                 "maxOutputTokens": 256,
                 "temperature": 0.3,
-                "responseMimeType": "application/json",
+                "responseMimeType": MIME_APPLICATION_JSON,
                 "thinkingConfig": {"thinkingBudget": 1024},
                 "candidateCount": 2,
                 "seed": 42
@@ -5341,8 +5759,8 @@ mod tests {
         assert_eq!(gc.get("temperature"), Some(&serde_json::json!(0.3)));
         // Unmodeled sub-fields preserved (the defect was silently dropping these).
         assert_eq!(
-            gc.get("responseMimeType"),
-            Some(&serde_json::json!("application/json")),
+            gc.get(FIELD_RESPONSE_MIME_TYPE),
+            Some(&serde_json::json!(MIME_APPLICATION_JSON)),
             "responseMimeType (JSON mode) must survive: {wire}"
         );
         assert_eq!(
@@ -5409,7 +5827,7 @@ mod tests {
             "typed max_tokens must overlay the raw extra value: {wire}"
         );
         assert_eq!(
-            gc.get("responseMimeType"),
+            gc.get(FIELD_RESPONSE_MIME_TYPE),
             Some(&serde_json::json!("text/plain")),
             "unmodeled sub-field must survive the overlay: {wire}"
         );
@@ -5423,7 +5841,7 @@ mod tests {
     fn test_stream_message_delta_includes_total_token_count() {
         let writer = GeminiWriter;
         let ev = IrStreamEvent::MessageDelta {
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 7,
@@ -5456,7 +5874,7 @@ mod tests {
     fn test_stream_message_delta_total_token_count_saturates() {
         let writer = GeminiWriter;
         let ev = IrStreamEvent::MessageDelta {
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: u64::MAX,
@@ -5491,7 +5909,7 @@ mod tests {
                 cache_control: None,
                 citations: Vec::new(),
             }],
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: crate::ir::IrUsage {
                 input_tokens: 5,
                 output_tokens: 3,
@@ -5535,7 +5953,7 @@ mod tests {
                 cache_control: None,
                 citations: Vec::new(),
             }],
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: crate::ir::IrUsage {
                 input_tokens: 5,
                 output_tokens: 3,
@@ -5562,7 +5980,7 @@ mod tests {
         let ir = crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
             content: Vec::new(),
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: crate::ir::IrUsage {
                 input_tokens: u64::MAX,
                 output_tokens: 1,
@@ -5602,7 +6020,7 @@ mod tests {
                 cache_control: None,
                 citations: Vec::new(),
             }],
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: crate::ir::IrUsage {
                 input_tokens: 11,
                 output_tokens: 4,
@@ -5640,7 +6058,7 @@ mod tests {
         let ir = crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
             content: Vec::new(),
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
             usage: crate::ir::IrUsage {
                 input_tokens: u64::MAX,
                 output_tokens: 7,
@@ -5679,7 +6097,7 @@ mod tests {
             "tools",
             "systemInstruction",
             "model",
-            crate::proto::GEMINI_JSON_ARRAY_SHIM_KEY,
+            crate::proto::gemini::GEMINI_JSON_ARRAY_SHIM_KEY,
         ] {
             assert!(a.contains(k), "modeled key set must contain {k}");
         }
@@ -5738,7 +6156,7 @@ mod tests {
                 input: serde_json::json!({"city": "SF"}),
                 cache_control: None,
             }],
-            stop_reason: Some("tool_use".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::ToolUse),
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -5755,7 +6173,7 @@ mod tests {
         assert_eq!(
             wire.pointer("/candidates/0/finishReason")
                 .and_then(|f| f.as_str()),
-            Some("STOP"),
+            Some("STOP"), // golden wire-contract literal (kept bare on purpose)
             "tool_use must map to STOP, never TOOL_USE: {wire}"
         );
     }
@@ -5766,7 +6184,7 @@ mod tests {
     fn test_stream_message_delta_tool_use_maps_to_stop() {
         let writer = GeminiWriter;
         let ev = IrStreamEvent::MessageDelta {
-            stop_reason: Some("tool_use".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::ToolUse),
             stop_sequence: None,
             usage: crate::ir::IrUsage {
                 input_tokens: 1,
@@ -5782,7 +6200,7 @@ mod tests {
             frame
                 .pointer("/candidates/0/finishReason")
                 .and_then(|f| f.as_str()),
-            Some("STOP"),
+            Some("STOP"), // golden wire-contract literal (kept bare on purpose)
             "streamed tool_use must map to STOP, never TOOL_USE: {frame}"
         );
     }
@@ -5801,8 +6219,10 @@ mod tests {
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
                 content: vec![crate::ir::IrBlock::Image {
-                    media_type: "image_url".to_string(),
-                    data: "https://example.com/cat.png".to_string(),
+                    source: crate::ir::IrImageSource::Url(
+                        "https://example.com/cat.png".to_string(),
+                    ),
+                    cache_control: None,
                 }],
             }],
             tools: Vec::new(),
@@ -5843,8 +6263,11 @@ mod tests {
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
                 content: vec![crate::ir::IrBlock::Image {
-                    media_type: "image/png".to_string(),
-                    data: "aGVsbG8=".to_string(),
+                    source: crate::ir::IrImageSource::Base64 {
+                        media_type: "image/png".to_string(),
+                        data: "aGVsbG8=".to_string(),
+                    },
+                    cache_control: None,
                 }],
             }],
             tools: Vec::new(),
@@ -5876,10 +6299,10 @@ mod tests {
         );
     }
 
-    /// Round-trip: a native Gemini `fileData{fileUri}` part reads into the `"image_url"` sentinel IR
-    /// Image and the writer re-emits it as `fileData{fileUri}` verbatim (same-protocol fidelity).
+    /// Round-trip: a native Gemini `fileData{fileUri}` part reads into the typed `Url` image source
+    /// and the writer re-emits it as `fileData{fileUri}` verbatim (same-protocol fidelity).
     #[test]
-    fn test_file_data_image_round_trips_via_sentinel() {
+    fn test_file_data_image_round_trips_via_url() {
         let reader = GeminiReader;
         let writer = GeminiWriter;
         let body = serde_json::json!({
@@ -5889,16 +6312,17 @@ mod tests {
             }]
         });
         let ir = reader.read_request(&body).expect("read_request");
-        let img = ir.messages[0].content.iter().find_map(|b| match b {
-            crate::ir::IrBlock::Image { media_type, data } => {
-                Some((media_type.clone(), data.clone()))
-            }
+        let url = ir.messages[0].content.iter().find_map(|b| match b {
+            crate::ir::IrBlock::Image {
+                source: crate::ir::IrImageSource::Url(url),
+                ..
+            } => Some(url.clone()),
             _ => None,
         });
         assert_eq!(
-            img,
-            Some(("image_url".to_string(), "gs://bucket/img.jpg".to_string())),
-            "fileData must read into the image_url sentinel: {ir:?}"
+            url.as_deref(),
+            Some("gs://bucket/img.jpg"),
+            "fileData must read into the typed Url source: {ir:?}"
         );
         let wire = writer.write_request(&ir);
         assert_eq!(
@@ -6248,7 +6672,7 @@ mod tests {
             "an Assistant functionCall turn must stay role:\"model\": {wire}"
         );
         assert_eq!(
-            content["parts"][0]["functionCall"]["name"], "get_weather",
+            content["parts"][0][FIELD_FUNCTION_CALL]["name"], "get_weather",
             "functionCall must be preserved under the model turn: {wire}"
         );
     }
@@ -6264,7 +6688,7 @@ mod tests {
             "error": {
                 "code": 429,
                 "message": "Resource has been exhausted (e.g. check quota).",
-                "status": "RESOURCE_EXHAUSTED"
+                "status": GRPC_RESOURCE_EXHAUSTED
             }
         })]);
 
@@ -6320,28 +6744,28 @@ mod tests {
     #[test]
     fn test_gemini_error_status_class_mapping() {
         assert_eq!(
-            gemini_error_status_class(Some("UNAVAILABLE"), Some(503)),
+            gemini_error_status_class(Some(GRPC_UNAVAILABLE), Some(503)),
             StatusClass::Overloaded
         );
         assert_eq!(
-            gemini_error_status_class(Some("UNAUTHENTICATED"), Some(401)),
+            gemini_error_status_class(Some(GRPC_UNAUTHENTICATED), Some(401)),
             StatusClass::Auth
         );
         assert_eq!(
-            gemini_error_status_class(Some("PERMISSION_DENIED"), Some(403)),
+            gemini_error_status_class(Some(GRPC_PERMISSION_DENIED), Some(403)),
             StatusClass::Billing
         );
         assert_eq!(
-            gemini_error_status_class(Some("DEADLINE_EXCEEDED"), Some(504)),
+            gemini_error_status_class(Some(GRPC_DEADLINE_EXCEEDED), Some(504)),
             StatusClass::Timeout
         );
         assert_eq!(
-            gemini_error_status_class(Some("INVALID_ARGUMENT"), Some(400)),
+            gemini_error_status_class(Some(GRPC_INVALID_ARGUMENT), Some(400)),
             StatusClass::ClientError
         );
         // status wins over code: an INTERNAL status with a (nonsensical) 429 code is ServerError.
         assert_eq!(
-            gemini_error_status_class(Some("INTERNAL"), Some(429)),
+            gemini_error_status_class(Some(GRPC_INTERNAL), Some(429)),
             StatusClass::ServerError
         );
         // Unknown status string → fall through to the numeric code (429 → RateLimit).
@@ -6363,7 +6787,7 @@ mod tests {
         let envelope = writer.write_error(
             400,
             "invalid_request_error",
-            "API key not valid. Please pass a valid API key.",
+            crate::proto::gemini::GEMINI_BAD_KEY_MESSAGE,
         );
 
         assert_eq!(
@@ -6373,7 +6797,7 @@ mod tests {
         );
         assert_eq!(
             envelope.pointer("/error/status").and_then(|s| s.as_str()),
-            Some("INVALID_ARGUMENT"),
+            Some("INVALID_ARGUMENT"), // golden wire-contract literal (kept bare on purpose)
             "envelope: {envelope}"
         );
         let detail = envelope
@@ -6381,12 +6805,12 @@ mod tests {
             .expect("bad-key envelope must carry error.details[0]");
         assert_eq!(
             detail.get("@type").and_then(|t| t.as_str()),
-            Some("type.googleapis.com/google.rpc.ErrorInfo"),
+            Some("type.googleapis.com/google.rpc.ErrorInfo"), // golden wire-contract literal (kept bare on purpose)
             "detail: {detail}"
         );
         assert_eq!(
             detail.get("reason").and_then(|r| r.as_str()),
-            Some("API_KEY_INVALID"),
+            Some("API_KEY_INVALID"), // golden wire-contract literal (kept bare on purpose)
             "detail: {detail}"
         );
         assert_eq!(
@@ -6411,7 +6835,7 @@ mod tests {
             writer.write_error(400, "invalid_request_error", "Invalid value at 'contents'.");
         assert_eq!(
             envelope.pointer("/error/status").and_then(|s| s.as_str()),
-            Some("INVALID_ARGUMENT"),
+            Some("INVALID_ARGUMENT"), // golden wire-contract literal (kept bare on purpose)
             "envelope: {envelope}"
         );
         assert!(
@@ -6556,16 +6980,16 @@ mod tests {
     fn test_stream_empty_candidates_array_prompt_block_terminates() {
         let events = collect_stream(&[serde_json::json!({
             "candidates": [],
-            "promptFeedback": {"blockReason": "SAFETY"},
+            "promptFeedback": {"blockReason": GEMINI_FINISH_SAFETY},
             "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 0}
         })]);
         let stop_reason = events.iter().find_map(|e| match e {
-            IrStreamEvent::MessageDelta { stop_reason, .. } => stop_reason.clone(),
+            IrStreamEvent::MessageDelta { stop_reason, .. } => *stop_reason,
             _ => None,
         });
         assert_eq!(
-            stop_reason.as_deref(),
-            Some("safety"),
+            stop_reason,
+            Some(crate::ir::IrStopReason::Safety),
             "an empty candidates[] + blockReason stream must surface a `safety` stop: {events:?}"
         );
         assert!(
@@ -6583,7 +7007,7 @@ mod tests {
         let reader = GeminiReader;
         let body = serde_json::json!({
             "candidates": [],
-            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"},
+            "promptFeedback": {"blockReason": GEMINI_FINISH_PROHIBITED_CONTENT},
             "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 0}
         });
         let ir = reader
@@ -6595,8 +7019,8 @@ mod tests {
             ir.content
         );
         assert_eq!(
-            ir.stop_reason.as_deref(),
-            Some("safety"),
+            ir.stop_reason,
+            Some(crate::ir::IrStopReason::Safety),
             "an empty candidates[] + blockReason body must surface a `safety` stop_reason"
         );
     }
@@ -6628,7 +7052,7 @@ mod tests {
                     "role": "model",
                     "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "SF"}}}]
                 },
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }]
         });
         let ir = reader
@@ -6642,8 +7066,8 @@ mod tests {
             ir.content
         );
         assert_eq!(
-            ir.stop_reason.as_deref(),
-            Some("tool_use"),
+            ir.stop_reason,
+            Some(crate::ir::IrStopReason::ToolUse),
             "STOP + functionCall must read back as `tool_use`, not `end_turn`"
         );
     }
@@ -6656,13 +7080,13 @@ mod tests {
         let body = serde_json::json!({
             "candidates": [{
                 "content": {"role": "model", "parts": [{"text": "hello"}]},
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }]
         });
         let ir = reader.read_response(&body).expect("plain STOP must decode");
         assert_eq!(
-            ir.stop_reason.as_deref(),
-            Some("end_turn"),
+            ir.stop_reason,
+            Some(crate::ir::IrStopReason::EndTurn),
             "a plain STOP with no tool block must stay `end_turn`"
         );
     }
@@ -6679,16 +7103,16 @@ mod tests {
                     "role": "model",
                     "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "SF"}}}]
                 },
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }]
         })]);
         let stop = events.iter().find_map(|e| match e {
-            IrStreamEvent::MessageDelta { stop_reason, .. } => Some(stop_reason.clone()),
+            IrStreamEvent::MessageDelta { stop_reason, .. } => Some(*stop_reason),
             _ => None,
         });
         assert_eq!(
-            stop.flatten().as_deref(),
-            Some("tool_use"),
+            stop.flatten(),
+            Some(crate::ir::IrStopReason::ToolUse),
             "streamed STOP + functionCall must terminate with `tool_use`: {events:?}"
         );
     }
@@ -6700,16 +7124,16 @@ mod tests {
         let events = collect_stream(&[serde_json::json!({
             "candidates": [{
                 "content": {"role": "model", "parts": [{"text": "hello"}]},
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }]
         })]);
         let stop = events.iter().find_map(|e| match e {
-            IrStreamEvent::MessageDelta { stop_reason, .. } => Some(stop_reason.clone()),
+            IrStreamEvent::MessageDelta { stop_reason, .. } => Some(*stop_reason),
             _ => None,
         });
         assert_eq!(
-            stop.flatten().as_deref(),
-            Some("end_turn"),
+            stop.flatten(),
+            Some(crate::ir::IrStopReason::EndTurn),
             "a plain STOP stream must terminate with `end_turn`: {events:?}"
         );
     }
@@ -6768,7 +7192,7 @@ mod tests {
         let resp = crate::ir::IrResponse {
             role: crate::ir::IrRole::Assistant,
             content: vec![block],
-            stop_reason: Some("tool_use".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::ToolUse),
             usage: crate::ir::IrUsage {
                 input_tokens: 0,
                 output_tokens: 0,
@@ -6809,7 +7233,7 @@ mod tests {
                 input: serde_json::json!({"city": "SF", "unit": "C"}),
                 cache_control: None,
             }],
-            stop_reason: Some("tool_use".to_string()),
+            stop_reason: Some(crate::ir::IrStopReason::ToolUse),
             usage: crate::ir::IrUsage {
                 input_tokens: 0,
                 output_tokens: 0,
@@ -6877,6 +7301,37 @@ mod tests {
         );
     }
 
+    /// Fix #10 (fidelity): `ANY` + `allowedFunctionNames` with N>1 names cannot be expressed by the
+    /// IR's single-tool `Tool` variant. Rather than fabricating `Tool{name: first}` (inventing a
+    /// stricter constraint the request never made), it must degrade to `Required` (call SOME tool) —
+    /// a true superset of the allow-list. A SINGLE name still maps to `Tool{name}` (unchanged).
+    #[test]
+    fn tool_choice_multi_name_allowlist_relaxes_to_required() {
+        let ir = gemini_read(serde_json::json!({
+            "contents": [],
+            "toolConfig": {"functionCallingConfig":
+                {"mode": "ANY", "allowedFunctionNames": ["get_weather", "get_time"]}}
+        }));
+        assert_eq!(
+            ir.tool_choice,
+            Some(crate::ir::IrToolChoice::Required),
+            "a multi-name allow-list must relax to Required, not Tool{{name: first}}"
+        );
+
+        // A single-name allow-list is still representable and must stay a targeted Tool.
+        let ir_one = gemini_read(serde_json::json!({
+            "contents": [],
+            "toolConfig": {"functionCallingConfig":
+                {"mode": "ANY", "allowedFunctionNames": ["get_weather"]}}
+        }));
+        assert_eq!(
+            ir_one.tool_choice,
+            Some(crate::ir::IrToolChoice::Tool {
+                name: "get_weather".to_string()
+            })
+        );
+    }
+
     #[test]
     fn tool_choice_none_and_auto_roundtrip() {
         for (mode, variant) in [
@@ -6931,34 +7386,30 @@ mod tests {
 
     #[test]
     fn finish_reason_maps_gemini_only_reasons_to_canonical() {
-        // The Gemini-only reasons must map to canonical IR stop reasons, NOT verbatim lowercase.
-        assert_eq!(map_gemini_finish_reason("RECITATION"), "safety");
-        assert_eq!(map_gemini_finish_reason("IMAGE_SAFETY"), "safety");
-        assert_eq!(map_gemini_finish_reason("SPII"), "safety");
+        use crate::ir::IrStopReason as S;
+        // The Gemini-only reasons map to canonical IR stop reasons (NOT a verbatim lowercase token).
         assert_eq!(
-            map_gemini_finish_reason("MALFORMED_FUNCTION_CALL"),
-            "tool_use"
+            map_gemini_finish_reason(GEMINI_FINISH_RECITATION),
+            S::Safety
         );
-        assert_eq!(map_gemini_finish_reason("OTHER"), "end_turn");
-        assert_eq!(map_gemini_finish_reason("LANGUAGE"), "end_turn");
+        assert_eq!(map_gemini_finish_reason("IMAGE_SAFETY"), S::Safety);
+        assert_eq!(map_gemini_finish_reason("SPII"), S::Safety);
+        // A malformed function call is a FAILED generation with no runnable tool call — it maps to
+        // `error`, NOT `tool_use` (which would tell the client to execute a call that doesn't exist).
+        assert_eq!(
+            map_gemini_finish_reason(GEMINI_FINISH_MALFORMED_FUNCTION_CALL),
+            S::Error
+        );
+        // Unenumerated reasons map to `Other` (the writer projects it to the native OTHER member).
+        assert_eq!(map_gemini_finish_reason(GEMINI_FINISH_OTHER), S::Other);
+        assert_eq!(map_gemini_finish_reason("LANGUAGE"), S::Other);
         // The direct ones still map.
-        assert_eq!(map_gemini_finish_reason("STOP"), "end_turn");
-        assert_eq!(map_gemini_finish_reason("MAX_TOKENS"), "max_tokens");
-        assert_eq!(map_gemini_finish_reason("SAFETY"), "safety");
-        // None of these is a verbatim lowercase of the input (the bug being fixed).
-        for bad in [
-            "recitation",
-            "spii",
-            "malformed_function_call",
-            "language",
-            "other",
-        ] {
-            assert_ne!(
-                map_gemini_finish_reason(&bad.to_uppercase()),
-                bad,
-                "{bad} must be canonicalized, not passed through lowercased"
-            );
-        }
+        assert_eq!(map_gemini_finish_reason(GEMINI_FINISH_STOP), S::EndTurn);
+        assert_eq!(
+            map_gemini_finish_reason(GEMINI_FINISH_MAX_TOKENS),
+            S::MaxTokens
+        );
+        assert_eq!(map_gemini_finish_reason(GEMINI_FINISH_SAFETY), S::Safety);
     }
 
     #[test]
@@ -6968,12 +7419,53 @@ mod tests {
         let body = serde_json::json!({
             "candidates": [{
                 "content": {"parts": [{"text": "x"}], "role": "model"},
-                "finishReason": "RECITATION"
+                "finishReason": GEMINI_FINISH_RECITATION
             }],
             "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
         });
         let resp = GeminiReader.read_response(&body).expect("read_response");
-        assert_eq!(resp.stop_reason.as_deref(), Some("safety"));
+        assert_eq!(resp.stop_reason, Some(crate::ir::IrStopReason::Safety));
+    }
+
+    /// End-to-end through read_response: a MALFORMED_FUNCTION_CALL finishReason surfaces as the
+    /// canonical `error` stop_reason (a failed generation with no runnable tool call) — NOT `tool_use`.
+    /// Guards that the read_response path actually routes through `map_gemini_finish_reason` (the unit
+    /// test alone would not catch a read_response site that bypassed the mapping).
+    #[test]
+    fn finish_reason_malformed_function_call_in_response_is_error() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "x"}], "role": "model"},
+                "finishReason": GEMINI_FINISH_MALFORMED_FUNCTION_CALL
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
+        });
+        let resp = GeminiReader.read_response(&body).expect("read_response");
+        assert_eq!(resp.stop_reason, Some(crate::ir::IrStopReason::Error));
+    }
+
+    /// The STREAMING reader (read_response_events) routes finishReason through the SAME
+    /// `map_gemini_finish_reason`, so a MALFORMED_FUNCTION_CALL terminal chunk must surface
+    /// stop_reason=Error on the MessageDelta — guarding the stream call site, not just the unit fn.
+    #[test]
+    fn finish_reason_malformed_function_call_stream_is_error() {
+        let chunks = vec![serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "x"}]},
+                "finishReason": GEMINI_FINISH_MALFORMED_FUNCTION_CALL
+            }],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
+        })];
+        let events = collect_stream(&chunks);
+        let stop = events.iter().find_map(|e| match e {
+            IrStreamEvent::MessageDelta { stop_reason, .. } => Some(*stop_reason),
+            _ => None,
+        });
+        assert_eq!(
+            stop,
+            Some(Some(crate::ir::IrStopReason::Error)),
+            "streamed MALFORMED_FUNCTION_CALL must terminate stop_reason=Error; got {events:?}"
+        );
     }
 
     // ---- C4: context-length override is status-gated ----
@@ -7125,7 +7617,7 @@ mod tests {
         let body = serde_json::json!({
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
             "generationConfig": {
-                "responseMimeType": "application/json",
+                "responseMimeType": MIME_APPLICATION_JSON,
                 "responseSchema": {"type": "object", "properties": {"x": {"type": "string"}}}
             }
         });
@@ -7134,11 +7626,11 @@ mod tests {
             .response_format
             .as_ref()
             .expect("response_format must be populated");
-        assert_eq!(
-            rf.get("responseMimeType"),
-            Some(&serde_json::json!("application/json"))
+        assert!(
+            rf.json,
+            "application/json mime must read as a JSON directive"
         );
-        assert!(rf.get("responseSchema").is_some());
+        assert!(rf.schema.is_some(), "responseSchema must be carried");
 
         let wire = {
             let __w = GeminiWriter;
@@ -7146,8 +7638,8 @@ mod tests {
         };
         let gc = wire.get("generationConfig").expect("generationConfig");
         assert_eq!(
-            gc.get("responseMimeType"),
-            Some(&serde_json::json!("application/json"))
+            gc.get(FIELD_RESPONSE_MIME_TYPE),
+            Some(&serde_json::json!("application/json")) // golden wire-contract literal (kept bare on purpose)
         );
         assert_eq!(
             gc.pointer("/responseSchema/properties/x/type"),
@@ -7156,23 +7648,30 @@ mod tests {
         );
     }
 
-    /// OpenAI-shaped response_format (`{type:"json_schema", json_schema:{schema:…}}`) maps
-    /// best-effort onto Gemini responseMimeType + responseSchema (cross-protocol survival).
+    /// A JSON structured-output directive (from any source protocol — here a typed IR carrying a
+    /// schema) maps onto Gemini responseMimeType + responseSchema, with JSON-Schema keywords Gemini
+    /// rejects (e.g. `$schema`) stripped by `sanitize_gemini_schema`.
     #[test]
-    fn test_response_format_maps_openai_json_schema_to_gemini() {
+    fn test_response_format_maps_to_gemini_and_sanitizes_schema() {
         let mut req = base_ir_request();
-        req.response_format = Some(serde_json::json!({
-            "type": "json_schema",
-            "json_schema": {"schema": {"type": "object", "$schema": "http://json-schema.org/draft-07/schema#"}}
-        }));
+        req.response_format = Some(crate::ir::IrResponseFormat {
+            json: true,
+            schema: Some(serde_json::json!({
+                "type": "object",
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            })),
+            name: None,
+            strict: None,
+            description: None,
+        });
         let wire = {
             let __w = GeminiWriter;
             __w.write_request(&req)
         };
         let gc = wire.get("generationConfig").expect("generationConfig");
         assert_eq!(
-            gc.get("responseMimeType"),
-            Some(&serde_json::json!("application/json")),
+            gc.get(FIELD_RESPONSE_MIME_TYPE),
+            Some(&serde_json::json!("application/json")), // golden wire-contract literal (kept bare on purpose)
             "json_schema type maps to application/json: {wire}"
         );
         assert_eq!(
@@ -7198,14 +7697,16 @@ mod tests {
                     {"text": "let me reason", "thought": true, "thoughtSignature": "sig-abc"},
                     {"text": "the answer"}
                 ]},
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }],
             "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
         });
         let resp = GeminiReader.read_response(&body).expect("read_response");
         // First block is Thinking with text + signature; second is plain Text.
         match &resp.content[0] {
-            crate::ir::IrBlock::Thinking { text, signature } => {
+            crate::ir::IrBlock::Thinking {
+                text, signature, ..
+            } => {
                 assert_eq!(text, "let me reason");
                 assert_eq!(signature.as_deref(), Some("sig-abc"));
             }
@@ -7242,6 +7743,8 @@ mod tests {
             content: vec![crate::ir::IrBlock::Thinking {
                 text: "thinking...".to_string(),
                 signature: Some("sig-1".to_string()),
+                redacted: false,
+                cache_control: None,
             }],
         });
         let wire = {
@@ -7272,7 +7775,7 @@ mod tests {
         let body = serde_json::json!({
             "candidates": [{
                 "content": {"role": "model", "parts": [{"text": "hi"}]},
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }],
             "usageMetadata": {
                 "promptTokenCount": 100,
@@ -7288,7 +7791,7 @@ mod tests {
         );
         // Absent cache count stays None.
         let body_no_cache = serde_json::json!({
-            "candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]}, "finishReason": "STOP"}],
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]}, "finishReason": GEMINI_FINISH_STOP}],
             "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}
         });
         let resp2 = GeminiReader
@@ -7297,12 +7800,14 @@ mod tests {
         assert_eq!(resp2.usage.cache_read_input_tokens, None);
     }
 
-    // --- Gap 5 (L1): fileData real mimeType preserved ---
+    // --- Gap 5 (L1): fileData reads into the typed Url source ---
 
-    /// A Gemini fileData part WITH a real mimeType reads into the IR Image with that mimeType (not
-    /// the image_url sentinel), and write_request re-emits fileData{fileUri, mimeType}.
+    /// A Gemini `fileData` part (with or without a mimeType) is a remote URL reference → reads into
+    /// the typed `Url` source and re-emits as `fileData{fileUri}`. The optional `mimeType` hint is not
+    /// carried on this path; that is operationally lossless — Gemini's `fileData.mimeType` is optional
+    /// (inferred from the URI), so the backend accepts the part and a native client is unaffected.
     #[test]
-    fn test_file_data_real_mime_type_preserved_and_round_trips() {
+    fn test_file_data_reads_into_url_source_and_round_trips() {
         let body = serde_json::json!({
             "contents": [{"role": "user", "parts": [
                 {"fileData": {"fileUri": "gs://bucket/img.png", "mimeType": "image/png"}}
@@ -7310,11 +7815,11 @@ mod tests {
         });
         let ir = GeminiReader.read_request(&body).expect("read_request");
         match &ir.messages[0].content[0] {
-            crate::ir::IrBlock::Image { media_type, data } => {
-                assert_eq!(media_type, "image/png", "real mimeType must be preserved");
-                assert_eq!(data, "gs://bucket/img.png");
-            }
-            other => panic!("expected Image, got {other:?}"),
+            crate::ir::IrBlock::Image {
+                source: crate::ir::IrImageSource::Url(url),
+                ..
+            } => assert_eq!(url, "gs://bucket/img.png"),
+            other => panic!("expected Image(Url), got {other:?}"),
         }
         let wire = {
             let __w = GeminiWriter;
@@ -7323,12 +7828,7 @@ mod tests {
         assert_eq!(
             wire.pointer("/contents/0/parts/0/fileData/fileUri"),
             Some(&serde_json::json!("gs://bucket/img.png")),
-            "fileUri must round-trip: {wire}"
-        );
-        assert_eq!(
-            wire.pointer("/contents/0/parts/0/fileData/mimeType"),
-            Some(&serde_json::json!("image/png")),
-            "real mimeType must round-trip as fileData.mimeType (not inlineData): {wire}"
+            "fileUri must round-trip as a fileData reference: {wire}"
         );
     }
 
@@ -7341,9 +7841,11 @@ mod tests {
         });
         let ir = GeminiReader.read_request(&body).expect("read_request");
         match &ir.messages[0].content[0] {
-            crate::ir::IrBlock::Image { media_type, data } => {
-                assert_eq!(media_type, "image_url");
-                assert_eq!(data, "https://x/i.jpg");
+            crate::ir::IrBlock::Image {
+                source: crate::ir::IrImageSource::Url(url),
+                ..
+            } => {
+                assert_eq!(url, "https://x/i.jpg");
             }
             other => panic!("expected Image, got {other:?}"),
         }
@@ -7526,7 +8028,7 @@ mod tests {
                         }
                     ]
                 },
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }],
             "usageMetadata": {
                 "promptTokenCount": 5,
@@ -7589,7 +8091,7 @@ mod tests {
                         {"startIndex": 1, "endIndex": 7, "uri": "https://src/x", "title": "X"}
                     ]
                 },
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }],
             "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 1}
         });
@@ -7610,7 +8112,7 @@ mod tests {
         let plain_body = serde_json::json!({
             "candidates": [{
                 "content": {"role": "model", "parts": [{"text": "Plain."}]},
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }],
             "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 1}
         });
@@ -7651,7 +8153,7 @@ mod tests {
                             }
                         ]
                     },
-                    "finishReason": "STOP"
+                    "finishReason": GEMINI_FINISH_STOP
                 }],
                 "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 4}
             }),
@@ -7787,7 +8289,7 @@ mod tests {
         let events = collect_stream(&[serde_json::json!({
             "candidates": [{
                 "content": {"role": "model", "parts": [{"text": "Plain answer."}]},
-                "finishReason": "STOP"
+                "finishReason": GEMINI_FINISH_STOP
             }],
             "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 1}
         })]);

@@ -17,10 +17,22 @@ use super::{
 };
 use std::time::Duration;
 
+// ── Policy-name constants ─────────────────────────────────────────────────────────────────────────
+// Single source of truth for the five native policy wire names. Referenced from:
+//   • the `name()` impls below (what feeds `x-busbar-route-policy`),
+//   • the `native_policy` registry match arms below,
+//   • `config.rs` (deserialization / shorthand desugar),
+//   • `routing/mod.rs` (zero-cost-path guard).
+pub(crate) const POLICY_NAME_WEIGHTED: &str = "weighted";
+pub(crate) const POLICY_NAME_CHEAPEST: &str = "cheapest";
+pub(crate) const POLICY_NAME_FASTEST: &str = "fastest";
+pub(crate) const POLICY_NAME_LEAST_BUSY: &str = "least_busy";
+pub(crate) const POLICY_NAME_USAGE: &str = "usage";
+
 /// `weighted` — the explicit form of the default. Always `Abstain`, so selection falls through to
 /// the unchanged inline SWRR. Lets operators write `route: native, policy.name: weighted` and get
 /// byte-identical behavior to the default, proving the seam without changing the hot path.
-pub(crate) struct WeightedPolicy;
+struct WeightedPolicy;
 
 #[async_trait::async_trait]
 impl RoutingPolicy for WeightedPolicy {
@@ -35,7 +47,7 @@ impl RoutingPolicy for WeightedPolicy {
     }
 
     fn name(&self) -> &'static str {
-        "weighted"
+        POLICY_NAME_WEIGHTED
     }
 }
 
@@ -90,7 +102,7 @@ fn rank_descending_by<K: PartialOrd + Copy>(
 
 /// `cheapest` — prefer the lowest operator-declared `cost_per_mtok`. Members with no declared cost
 /// are demoted (but reachable). Proof-of-completeness for the `cost` signal.
-pub(crate) struct CheapestPolicy;
+struct CheapestPolicy;
 
 #[async_trait::async_trait]
 impl RoutingPolicy for CheapestPolicy {
@@ -104,13 +116,13 @@ impl RoutingPolicy for CheapestPolicy {
         Ok(rank_ascending_by(candidates, |c| c.cost_per_mtok))
     }
     fn name(&self) -> &'static str {
-        "cheapest"
+        POLICY_NAME_CHEAPEST
     }
 }
 
 /// `fastest` — prefer the lowest measured rolling-EWMA latency. Members with no latency sample yet
 /// are demoted (reachable). Proof-of-completeness for the `latency` signal.
-pub(crate) struct FastestPolicy;
+struct FastestPolicy;
 
 #[async_trait::async_trait]
 impl RoutingPolicy for FastestPolicy {
@@ -124,14 +136,14 @@ impl RoutingPolicy for FastestPolicy {
         Ok(rank_ascending_by(candidates, |c| c.latency_ms))
     }
     fn name(&self) -> &'static str {
-        "fastest"
+        POLICY_NAME_FASTEST
     }
 }
 
 /// `least_busy` — prefer the lane with the most available concurrency permits (the most headroom).
 /// Always has data (available_concurrency is always known), so never Abstains. Proof-of-completeness
 /// for the `concurrency` signal.
-pub(crate) struct LeastBusyPolicy;
+struct LeastBusyPolicy;
 
 #[async_trait::async_trait]
 impl RoutingPolicy for LeastBusyPolicy {
@@ -147,7 +159,7 @@ impl RoutingPolicy for LeastBusyPolicy {
         }))
     }
     fn name(&self) -> &'static str {
-        "least_busy"
+        POLICY_NAME_LEAST_BUSY
     }
 }
 
@@ -157,7 +169,7 @@ impl RoutingPolicy for LeastBusyPolicy {
 /// by `Candidate.rate_headroom` (most headroom first); candidates with no headroom signal (`None`) are
 /// demoted to last but stay reachable. Abstains when EVERY candidate lacks the signal (no rate limit
 /// in play → fall through to the default SWRR). Proof-of-completeness for the `rate_headroom` signal.
-pub(crate) struct UsagePolicy;
+struct UsagePolicy;
 
 #[async_trait::async_trait]
 impl RoutingPolicy for UsagePolicy {
@@ -171,7 +183,7 @@ impl RoutingPolicy for UsagePolicy {
         Ok(rank_descending_by(candidates, |c| c.rate_headroom))
     }
     fn name(&self) -> &'static str {
-        "usage"
+        POLICY_NAME_USAGE
     }
 }
 
@@ -180,11 +192,11 @@ impl RoutingPolicy for UsagePolicy {
 pub(crate) fn native_policy(name: &str) -> Option<std::sync::Arc<dyn RoutingPolicy>> {
     use std::sync::Arc;
     match name {
-        "weighted" => Some(Arc::new(WeightedPolicy)),
-        "cheapest" => Some(Arc::new(CheapestPolicy)),
-        "fastest" => Some(Arc::new(FastestPolicy)),
-        "least_busy" => Some(Arc::new(LeastBusyPolicy)),
-        "usage" => Some(Arc::new(UsagePolicy)),
+        POLICY_NAME_WEIGHTED => Some(Arc::new(WeightedPolicy)),
+        POLICY_NAME_CHEAPEST => Some(Arc::new(CheapestPolicy)),
+        POLICY_NAME_FASTEST => Some(Arc::new(FastestPolicy)),
+        POLICY_NAME_LEAST_BUSY => Some(Arc::new(LeastBusyPolicy)),
+        POLICY_NAME_USAGE => Some(Arc::new(UsagePolicy)),
         _ => None,
     }
 }
@@ -335,9 +347,7 @@ mod tests {
     }
 
     /// `usage` Abstains when EVERY candidate lacks the rate-headroom signal (no rate limit in play),
-    /// so selection falls through to the default SWRR. (Repurposed from the old conformance-stub test
-    /// that asserted `usage` always Abstained for want of a `Candidate.rate_headroom` field — the
-    /// field now exists and is populated at the seam.)
+    /// so selection falls through to the default SWRR.
     #[tokio::test]
     async fn usage_all_unknown_abstains() {
         let cands = [

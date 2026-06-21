@@ -9,7 +9,7 @@
 [![CI](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/MattJackson/busbarAI?include_prereleases)](https://github.com/MattJackson/busbarAI/releases)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
-![Status](https://img.shields.io/badge/status-1.0.0--rc.7-blue)
+![Status](https://img.shields.io/badge/status-1.0.0-brightgreen)
 
 📖 **Docs:** [getbusbar.com](https://getbusbar.com)  
 ⚡ **Install:** `curl -fsSL https://getbusbar.com/install.sh | sh`  
@@ -27,7 +27,7 @@ Busbar sits between your application and your LLM providers. Point any SDK — O
 
 A single static Rust binary — no Python sidecar, no interpreter, no GC in the request path. Linux, macOS, Windows (Intel and ARM). Your keys, your network, your data path.
 
-> **Status: 1.0.0-rc.7** — feature-complete, API-stable, hardened across a multi-round security and correctness audit. AGPL-3.0.
+> **Status: 1.0.0** — stable. The HTTP API, configuration schema, and the six wire-protocol contracts are frozen under Semantic Versioning. Hardened across a multi-round security and correctness audit. AGPL-3.0.
 
 ---
 
@@ -53,7 +53,7 @@ That request left as OpenAI, may have been served by Anthropic, and came back as
 - **Six wire protocols**, lossless both ways — any client protocol reaches any pool → [Protocols](https://getbusbar.com/protocols/)
 - **Fault-attributed circuit breaking** + **streaming-safe in-flight failover** → [Reliability](https://getbusbar.com/reliability/)
 - **Weighted pools** — smooth weighted round-robin, session affinity, per-lane concurrency → [Reliability](https://getbusbar.com/reliability/)
-- **Hooks — a programmable request path** — routing is hook #1: `weighted` / `cheapest` / `fastest` / `least-busy` / `usage` natively, plus operator-owned **webhook** and **Rhai script** policies. A policy sees per-member cost, latency, live concurrency, budget, and rate headroom — your logic, in any language, fail-safe (a timeout or error falls back, never blocks the request) → [Routing](https://getbusbar.com/routing/)
+- **Hooks — a programmable request path** — routing is hook #1: `weighted` / `cheapest` / `fastest` / `least_busy` / `usage` natively, plus operator-owned **webhook** and **Rhai script** policies. A policy sees per-member cost, latency, live concurrency, budget, and rate headroom — your logic, in any language, fail-safe (a timeout or error falls back, never blocks the request) → [Routing](https://getbusbar.com/routing/)
 - **Native TLS + optional mTLS** — Busbar terminates TLS itself (cert + key in config, no reverse proxy needed). Turn on mutual TLS to require a client certificate signed by your CA; clients without one are rejected at the handshake, before any HTTP or bearer-token check. TLS = encrypted and server-verified out of the box; mTLS = only your cert-holding clients can connect at all — zero-trust without a service mesh → [Security](https://getbusbar.com/security/)
 - **Governance** — virtual keys, budgets, RPM/TPM limits, spend tracking → [Governance](https://getbusbar.com/guides/governance/)
 - **Vetted provider catalog** — plus any provider on the six protocols in a few lines of YAML → [Providers](https://getbusbar.com/providers/)

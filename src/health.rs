@@ -328,10 +328,10 @@ mod tests {
         (app, server)
     }
 
-    /// Regression (MEDIUM/conformance, final audit): an active health probe must send the SAME
-    /// native-SDK fingerprint headers organic traffic sends — `User-Agent` and `Accept` — or a
-    /// backend could fingerprint and special-case busbar's probes (defeating indistinguishability).
-    /// reqwest emits no default User-Agent, so its absence on the probe was a tell.
+    /// Regression (conformance): an active health probe must send the SAME native-SDK fingerprint
+    /// headers organic traffic sends — `User-Agent` and `Accept` — or a backend could fingerprint
+    /// and special-case busbar's probes (defeating indistinguishability). reqwest emits no default
+    /// User-Agent, so its absence on the probe was a tell.
     #[tokio::test]
     async fn test_probe_sends_native_user_agent_and_accept_headers() {
         let state = Arc::new(MockServerState::new());

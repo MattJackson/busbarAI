@@ -240,7 +240,7 @@ Declares which catalog providers this deployment uses and supplies the env var h
 |---|---|---|---|---|
 | `api_key_env` | string | **yes** | — | Name of the env var that holds the upstream API key or credential. Read once at boot. An unset or empty env var logs a startup warning; the lane starts but will fail upstream auth. |
 | `protocol` | string | no | Catalog value | Override the catalog protocol. Rarely needed. |
-| `base_url` | string | no | Catalog value | Override the upstream base URL. Must start with `https://` (SSRF guard). |
+| `base_url` | string | no | Catalog value | Override the upstream base URL. Must use `https://` for public/external hosts. Plain `http://` is permitted only for private or loopback hosts (e.g. a local Ollama or vLLM instance). Cloud-metadata hosts are blocked regardless of scheme (see SSRF guard). |
 | `error_map` | map<string, string> | no | `{}` merged onto catalog | Merged with the catalog's `error_map`; deployment entries win per code. |
 | `path` | string | no | Catalog value | Override the upstream path. Must begin with `/`. |
 | `auth` | string | no | Catalog value | `bearer` or `api-key`. |
@@ -355,7 +355,7 @@ A pool spanning members that use different underlying protocols produces a start
 
 #### `route` and `policy`
 
-A pool's routing policy decides the **order** in which healthy members are tried. The default — `weighted` (SWRR) — is zero-cost and unchanged from the pre-routing-policy baseline. Any other `route` value wires a pluggable policy that runs once per request, before the failover loop. The full guide, including external policies and signals, lives in [routing.md](routing.md).
+A pool's routing policy decides the **order** in which healthy members are tried. The default — `weighted` (SWRR) — is zero-cost and unchanged from the pre-routing-policy baseline. Any other `route` value wires a pluggable policy that runs once per request, before the failover loop. The full guide, including external policies and signals, lives in the [routing guide](https://getbusbar.com/routing/).
 
 ```yaml
 pools:
@@ -410,7 +410,7 @@ pools:
 | `script` | string | none | `script` | Inline Rhai source string. Exactly one of `script` or `script_file` is required when `route: script`. Mutually exclusive with `script_file`. |
 | `script_file` | string | none | `script` | Path to a Rhai script file on disk. Alternative to inline `script`. |
 
-The per-member `tier`, `cost_per_mtok`, and `tags` fields documented in [Members and weights](#members-and-weights) above feed these policies. See [routing.md](routing.md) for the native policy catalog, the webhook wire format, the Rhai script environment and sandbox limits, and the `x-busbar-route-policy` / `x-busbar-route-target` observability headers.
+The per-member `tier`, `cost_per_mtok`, and `tags` fields documented in [Members and weights](#members-and-weights) above feed these policies. See the [routing guide](https://getbusbar.com/routing/) for the native policy catalog, the webhook wire format, the Rhai script environment and sandbox limits, and the `x-busbar-route-policy` / `x-busbar-route-target` observability headers.
 
 ---
 
@@ -576,18 +576,18 @@ Members without `context_max` set are always eligible for context-length failove
 
 ### `limits`
 
-Optional. Exposes the 17 previously-hardcoded operational limits so operators can tune them without rebuilding. All fields default to the historical hard-coded values, so omitting this block is a no-op.
+Optional. Exposes nine operational limits — eight previously hardcoded, plus the new `max_inbound_concurrent` — so operators can tune them without rebuilding. All fields default to their historical values, so omitting this block is a no-op.
 
 ```yaml
 limits:
   max_inbound_concurrent: 0       # 0 = unlimited; > 0 adds a global concurrency cap
   request_body_max_bytes: 33554432  # 32 MiB
-  upstream_timeout_secs: 120
+  upstream_request_timeout_secs: 300
   tls_handshake_timeout_secs: 10
-  idle_connections_per_host: 64
+  pool_max_idle_per_host: 64
   hard_down_cooldown_secs: 1800   # 30 min
-  upstream_error_body_cap_bytes: 65536
-  retry_after_ceiling_secs: 86400 # 24 h
+  upstream_error_body_max_bytes: 262144  # 256 KiB
+  max_honored_retry_after_secs: 86400 # 24 h
   default_max_tokens: 4096
 ```
 
@@ -595,12 +595,12 @@ limits:
 |---|---|---|---|
 | `max_inbound_concurrent` | integer | `0` | Global inbound concurrency cap. `0` = unlimited (no cap layer installed). Any positive value installs an outermost concurrency-limit middleware before routing. |
 | `request_body_max_bytes` | integer | `33554432` | Maximum inbound request body size (bytes). Exceeding this returns a protocol-native 413. |
-| `upstream_timeout_secs` | integer | `120` | Per-upstream-request wall-clock timeout. Applies to both the connect and the full response. |
+| `upstream_request_timeout_secs` | integer | `300` | Per-upstream-request wall-clock timeout. Applies to both the connect and the full response. |
 | `tls_handshake_timeout_secs` | integer | `10` | Wall-clock cap on each inbound TLS handshake; prevents slowloris / handshake-flood. Ignored when `tls:` is absent. |
-| `idle_connections_per_host` | integer | `64` | HTTP connection pool idle connection limit per upstream host. |
+| `pool_max_idle_per_host` | integer | `64` | HTTP connection pool idle connection limit per upstream host. |
 | `hard_down_cooldown_secs` | integer | `1800` | Sticky cooldown for `auth`/`billing` breaker dispositions (hard-down). Recovering these lanes requires a successful health probe. |
-| `upstream_error_body_cap_bytes` | integer | `65536` | Maximum bytes buffered from a non-2xx upstream response body for error classification. |
-| `retry_after_ceiling_secs` | integer | `86400` | Maximum value honored from an upstream `Retry-After` header (to prevent overflow). |
+| `upstream_error_body_max_bytes` | integer | `262144` | Maximum bytes buffered from a non-2xx upstream response body for error classification. |
+| `max_honored_retry_after_secs` | integer | `86400` | Maximum value honored from an upstream `Retry-After` header (to prevent overflow). |
 | `default_max_tokens` | integer | `4096` | Gateway-wide default injected on cross-protocol hops to Anthropic when the caller omitted `max_tokens`. Overridden by a per-model `default_max_tokens` when set. |
 
 ---
@@ -620,7 +620,7 @@ observability:
 |---|---|---|---|
 | `otlp_endpoint` | string | none | When set, installs an OTLP/HTTP trace exporter. Loopback `http://` is allowed (standard collector default). Remote endpoints must use `https://`. SSRF-guarded: rejects RFC-1918, link-local, CGNAT, metadata hosts. Traces are flushed on graceful shutdown. |
 | `request_log_webhook_url` | string | none | When set, fires a fire-and-forget JSON POST per completed request: `{ts, ingress_protocol, pool, outcome, latency_ms}`. Must be `https://`. SSRF-guarded (same classes as `otlp_endpoint` plus broadcast). At most 64 deliveries in flight; drops rather than queues. 2-second delivery timeout. |
-| `emit_server_timing` | bool | `true` | Controls whether the `Server-Timing: busbar;dur=<ms>` response header is emitted on every response. Set to `false` to suppress it entirely — it is an in-band busbar fingerprint operators may want to hide for backend indistinguishability. |
+| `emit_server_timing` | bool | `false` | Controls whether the `Server-Timing: busbar;dur=<ms>` response header is emitted on every response. Defaults to `false` — the header is an in-band busbar fingerprint, so it is suppressed by default for backend indistinguishability. Set to `true` to enable it as a latency probe. |
 
 **OTLP credential hygiene.** If your OTLP endpoint requires auth, supply credentials in the URL userinfo (`https://user:pass@collector.example.com/…`) — Busbar moves them to an `Authorization: Basic` header and strips them from the URL before logging, so they do not appear in logs or spans.
 
@@ -647,6 +647,8 @@ governance:
 | `price_per_request_cents` | integer | no | `1` | Negative values clamped to 0 | Flat per-request charge against each virtual key's budget (in cents). |
 | `price_per_1k_tokens_cents` | integer | no | `0` | Negative values clamped to 0 | Per-1,000-token charge (input + output tokens from response usage metadata). |
 | `budget_on_store_error` | string | no | `allow` | `allow` or `deny` | Behavior when the budget store errors during the atomic admission check-and-charge. `allow` (default) fails open — the request proceeds, preserving availability on a store hiccup. `deny` fails closed — the request is rejected, providing a hard budget guarantee for security/regulated deployments. A definitive over-budget result always rejects regardless of this setting. |
+| `sqlite_busy_timeout_ms` | integer | no | `5000` | — | SQLite `busy_timeout` (milliseconds) for the governance store under write contention. |
+| `rate_sweep_interval` | integer | no | `256` | Must be ≥ 1 | How often (every N admissions) the in-memory rate-limit map evicts idle entries. Correctness does not depend on it (per-key windows reset on lookup); it only bounds memory. `0` is rejected at startup. |
 
 **Budget spend per request:** `price_per_request_cents + (total_tokens / 1000) * price_per_1k_tokens_cents`.
 
@@ -675,7 +677,7 @@ See [operations.md](operations.md) for the full admin API payload schemas and vi
 
 ### `security`
 
-Optional. Extends or overrides the hardcoded cloud-metadata SSRF denylist. When absent, only the built-in denylist applies. See [Security — Provider upstreams & SSRF](security.md#provider-upstreams--ssrf) for the full threat model, the complete denylist, and worked examples.
+Optional. Extends or overrides the hardcoded cloud-metadata SSRF denylist. When absent, only the built-in denylist applies. See [Security — Provider upstreams & SSRF](https://getbusbar.com/security/) for the full threat model, the complete denylist, and worked examples.
 
 ```yaml
 security:
@@ -880,8 +882,8 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 |---|---|
 | Provider name reserved | Any provider named `admin` or beginning with `admin/` |
 | Protocol unknown | `protocol` not in `{anthropic, openai, gemini, bedrock, responses, cohere}` |
-| `base_url` SSRF | `base_url` resolves to loopback, link-local, RFC-1918, CGNAT (100.64/10), IPv6 ULA, metadata hosts (`metadata.google.internal`, `localhost`, `*.localhost`), or uses alternate IP encodings (decimal, hex, octal, short-dotted) |
-| `base_url` plaintext | `base_url` does not start with `https://` |
+| `base_url` SSRF | `base_url` resolves to a cloud-metadata/IMDS host (e.g. `169.254.169.254`, `100.100.100.200`, `metadata.google.internal`) or uses an alternate IP encoding (decimal-int, hex, octal, IPv4-mapped IPv6) that decodes to a metadata address |
+| `base_url` plaintext | `base_url` uses `http://` with a public (non-private, non-loopback) host — plain HTTP to a public host would expose the API key on the wire |
 | `error_map` value unknown | A value in `error_map` is not one of the nine canonical disposition classes |
 | `auth` value unknown | `auth` field value not `bearer` or `api-key` |
 | `auth.mode` value unknown | `auth.mode` not one of `token`, `passthrough`, `none` (case-insensitive) |

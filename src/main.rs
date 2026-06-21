@@ -32,6 +32,10 @@
 // long sticky cooldown; client-supplied 4xx are relayed verbatim and never penalize the lane; an
 // exhausted lifetime budget disables the lane. Tripped lanes recover via a half-open probe.
 
+// busbar contains ZERO `unsafe` code; enforce that as a compile-time guarantee so any future PR that
+// introduces an `unsafe` block fails to build rather than slipping in unreviewed.
+#![forbid(unsafe_code)]
+
 mod admin;
 mod auth;
 mod breaker;
@@ -76,6 +80,22 @@ use store::{InMemoryStore, LaneData};
 // threaded from `cfg.limits` into the client builder and router below; the egress translate-body cap
 // is COUPLED to `request_body_max_bytes` via `crate::limits::translate_body_max_bytes`.
 
+/// Environment variable name for the providers.yaml path.
+const ENV_PROVIDERS: &str = "BUSBAR_PROVIDERS";
+/// Environment variable name for the config.yaml path.
+const ENV_CONFIG: &str = "BUSBAR_CONFIG";
+/// Default path to the providers definition file.
+const DEFAULT_PROVIDERS_PATH: &str = "/etc/busbar/providers.yaml";
+/// Default path to the deployment config file.
+const DEFAULT_CONFIG_PATH: &str = "/etc/busbar/config.yaml";
+/// Response header name for the W3C Server-Timing field.
+const HEADER_SERVER_TIMING: &str = "server-timing";
+/// Sentinel value stored in the `UPSTREAM_RTT_US` task-local when NO upstream hop was dispatched
+/// (admin / health / early error). `server_timing_dur_ms` treats this as "report the full request
+/// time" rather than subtracting a nonexistent RTT. Only this exact u64::MAX meaning is replaced
+/// with the const; overflow/conversion fallbacks that happen to produce u64::MAX are NOT this.
+const NO_UPSTREAM_RTT: u64 = u64::MAX;
+
 /// Handle CLI flags before any environment or file access, so they work without a configured
 /// deployment. Returns `Some(exit_code)` when the process should exit (after printing), `None` to
 /// proceed to normal startup. busbar takes no positional arguments and is configured via
@@ -96,7 +116,7 @@ fn handle_cli_flags() -> Option<i32> {
             // so the flag is useful even before a deployment is wired up. One entry per line, exit 0.
             let mut entries = config_validate::metadata_denylist_entries();
             let config_path =
-                std::env::var("BUSBAR_CONFIG").unwrap_or_else(|_| "/etc/busbar/config.yaml".into());
+                std::env::var(ENV_CONFIG).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into());
             if let Ok(raw) = std::fs::read_to_string(&config_path) {
                 if let Ok(interpolated) = config::interpolate_env(&raw) {
                     match serde_yaml::from_str::<config::DeployCfg>(&interpolated) {
@@ -246,10 +266,10 @@ async fn main() {
 
     // Read providers.yaml (shipped definitions)
     let providers_path =
-        std::env::var("BUSBAR_PROVIDERS").unwrap_or_else(|_| "/etc/busbar/providers.yaml".into());
+        std::env::var(ENV_PROVIDERS).unwrap_or_else(|_| DEFAULT_PROVIDERS_PATH.into());
     let raw_providers = std::fs::read_to_string(&providers_path).unwrap_or_else(|e| {
         die(format!(
-            "cannot read providers file '{providers_path}': {e} (set BUSBAR_PROVIDERS)"
+            "cannot read providers file '{providers_path}': {e} (set {ENV_PROVIDERS})"
         ))
     });
     let interpolated_providers = config::interpolate_env(&raw_providers)
@@ -258,11 +278,10 @@ async fn main() {
         .unwrap_or_else(|e| die(format!("providers.yaml: invalid YAML: {e}")));
 
     // Read config.yaml (deployment)
-    let config_path =
-        std::env::var("BUSBAR_CONFIG").unwrap_or_else(|_| "/etc/busbar/config.yaml".into());
+    let config_path = std::env::var(ENV_CONFIG).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into());
     let raw_config = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
         die(format!(
-            "cannot read config file '{config_path}': {e} (set BUSBAR_CONFIG)"
+            "cannot read config file '{config_path}': {e} (set {ENV_CONFIG})"
         ))
     });
     let interpolated_config =
@@ -286,9 +305,10 @@ async fn main() {
     // Resolve deployment + definitions into resolved RootCfg
     let cfg = config::resolve(&deploy, &defs)
         .unwrap_or_else(|errs| die(format!("config errors:\n  - {}", errs.join("\n  - "))));
-    // cfg.auth is ALREADY normalized: config::resolve calls AuthCfg::normalize() on the auth block
-    // (legacy single-token promotion). Normalizing again here would be redundant work and obscure
-    // the single-normalization invariant, so just clone the resolved value.
+    // No normalization step exists: config::resolve passes the auth block through as-is
+    // (`deploy.auth.clone()`). The legacy single-token `token:` field was removed in 1.0.0, so there
+    // is nothing to promote; the only post-resolve step is the `unwrap_or_else(default_none)` fallback
+    // for an absent `auth:` block.
     let auth_cfg = cfg
         .auth
         .clone()
@@ -589,7 +609,7 @@ async fn main() {
                     g.admin_token.clone(),
                 ) {
                     Ok(gs) => {
-                        // fix 2b: thread the budget store-error fail-mode (allow|deny) onto GovState.
+                        // Thread the budget store-error fail-mode (allow|deny) onto GovState.
                         let gs = gs.with_budget_on_store_error(g.budget_on_store_error);
                         eprintln!("busbar: governance enabled (sqlite {})", g.db_path);
                         Some(Arc::new(gs))
@@ -652,12 +672,13 @@ async fn main() {
     // a failed registration logs and parks forever (so a missing signal facility degrades to "no
     // graceful shutdown", never a crash), and `shutdown_tracing()` is a no-op when OTLP is off.
     match tls_cfg {
-        // DEFAULT PATH — unchanged. With no `tls:` block this is byte-for-byte the historical
-        // plain-HTTP server: axum::serve over the TcpListener with graceful shutdown.
+        // DEFAULT PATH — no `tls:` block. Serves plain HTTP over the TcpListener with graceful
+        // shutdown, via the shared native hyper loop so the plain listener gets the SAME slow-loris
+        // header-read timeout the TLS listener has (the prior `axum::serve` path exposed no such
+        // bound). Behavior is otherwise identical: TCP_NODELAY on, graceful drain on shutdown.
         None => {
             tracing::info!(%listen, "busbar listening");
-            let serve = axum::serve(listener, router).with_graceful_shutdown(shutdown_signal());
-            if let Err(e) = serve.await {
+            if let Err(e) = tls::serve_plain(listener, router, shutdown_signal()).await {
                 die(format!("server error: {e}"));
             }
         }
@@ -779,7 +800,7 @@ async fn fallback_handler(uri: axum::http::Uri) -> axum::response::Response {
         // The previous `not_found` passed through the OpenAI writer verbatim, so a 404 on an
         // OpenAI-inferred path emitted `{"error":{"type":"not_found"}}` — a non-canonical type that
         // breaks native SDK exception mapping and is a distinguishability tell.
-        "not_found_error",
+        crate::admin::ERR_TYPE_NOT_FOUND,
         "the requested resource was not found",
     )
 }
@@ -791,7 +812,7 @@ async fn method_not_allowed_handler(uri: axum::http::Uri) -> axum::response::Res
     fallback_error_response(
         uri.path(),
         axum::http::StatusCode::METHOD_NOT_ALLOWED,
-        "invalid_request_error",
+        crate::admin::ERR_TYPE_INVALID_REQUEST,
         "method not allowed for this resource",
     )
 }
@@ -799,15 +820,15 @@ async fn method_not_allowed_handler(uri: axum::http::Uri) -> axum::response::Res
 /// The exact body axum 0.7's `DefaultBodyLimit` emits when a request exceeds the limit: its
 /// extractor rejection (`FailedToBufferBody::LengthLimitError`) renders a 413 with this literal
 /// `text/plain` body. This is the SENTINEL used to distinguish axum's OWN body-limit 413 from a
-/// forward-path-relayed upstream 413 (LOW #14): the reshape acts only on a response whose body is
+/// forward-path-relayed upstream 413: the reshape acts only on a response whose body is
 /// exactly this marker, so a relayed upstream 413 (any other body, JSON or not) passes through
 /// untouched. (Pinned to axum's wire shape; covered by `test_reshape_oversized_413_passthrough`.)
 const AXUM_BODY_LIMIT_413_MARKER: &[u8] = b"length limit exceeded";
 
 /// Reshape an oversized-body rejection into a protocol-native error. axum's `DefaultBodyLimit`
 /// rejects a too-large request with HTTP 413 and a bare `text/plain` body (`"length limit
-/// exceeded"`) — a router/proxy tell no native vendor API emits (the §8.1 indistinguishability
-/// gap). This middleware wraps the body-limit layer: it captures the request path, runs the inner
+/// exceeded"`) — a router/proxy tell no native vendor API emits. This middleware wraps the
+/// body-limit layer: it captures the request path, runs the inner
 /// stack, and when the result is axum's OWN body-limit 413 (identified by the
 /// [`AXUM_BODY_LIMIT_413_MARKER`] sentinel body — NOT merely any non-JSON 413), it replaces that
 /// response with the inferred ingress protocol's native JSON `request_too_large` envelope (Bedrock
@@ -828,7 +849,7 @@ async fn reshape_body_limit_413(
 /// "no upstream hop" (admin/health/early error), so the full time is reported. Saturating, so clock
 /// skew (upstream measured slightly larger than total) can never underflow into a huge value.
 fn server_timing_dur_ms(total_us: u64, upstream_us: u64) -> f64 {
-    let internal_us = if upstream_us == u64::MAX {
+    let internal_us = if upstream_us == NO_UPSTREAM_RTT {
         total_us
     } else {
         total_us.saturating_sub(upstream_us)
@@ -849,12 +870,12 @@ async fn server_timing(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use std::sync::atomic::Ordering;
-    let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(NO_UPSTREAM_RTT));
     let start = std::time::Instant::now();
     let mut resp = forward::UPSTREAM_RTT_US
         .scope(slot.clone(), next.run(req))
         .await;
-    // Gated by `observability.emit_server_timing` (default true). When disabled, NO Server-Timing
+    // Gated by `observability.emit_server_timing` (default false). When disabled, NO Server-Timing
     // header is emitted at all — the inner stack still runs unchanged, only the header is suppressed
     // (the header is an in-band busbar fingerprint an operator may want to hide). We still scope the
     // RTT task-local so disabling this never changes any other timing behavior.
@@ -863,7 +884,7 @@ async fn server_timing(
         let dur_ms = server_timing_dur_ms(total_us, slot.load(Ordering::Relaxed));
         if let Ok(v) = axum::http::HeaderValue::from_str(&format!("busbar;dur={dur_ms:.3}")) {
             resp.headers_mut()
-                .insert(axum::http::HeaderName::from_static("server-timing"), v);
+                .insert(axum::http::HeaderName::from_static(HEADER_SERVER_TIMING), v);
         }
     }
     resp
@@ -896,7 +917,7 @@ async fn reshape_oversized_413(
     }
     // Non-JSON 413: it could be axum's OWN body-limit reject (reshape it) OR a forward-relayed
     // UPSTREAM 413 that happens to be non-JSON (e.g. a `text/plain`/`text/html` upstream error —
-    // LOW #14: must pass through untouched). Distinguish by the sentinel body. Buffer the body so
+    // must pass through untouched). Distinguish by the sentinel body. Buffer the body so
     // we can compare it; if it is not the sentinel, re-attach the buffered bytes verbatim.
     use http_body_util::BodyExt as _;
     let (parts, body) = resp.into_parts();
@@ -914,14 +935,14 @@ async fn reshape_oversized_413(
         path,
         axum::http::StatusCode::PAYLOAD_TOO_LARGE,
         // CANONICAL kind for an oversized payload across the protocol writers.
-        "request_too_large",
+        crate::forward::KIND_REQUEST_TOO_LARGE,
         "request body exceeds the maximum allowed size",
     )
 }
 
 /// Build the busbar HTTP router for a given `App` state with default limits. Factored out so the
-/// full route table + auth middleware can be exercised end-to-end in tests; production (`run`) calls
-/// [`build_router_with_limits`] with the operator-configured values, so this convenience wrapper is
+/// full route table + auth middleware can be exercised end-to-end in tests; production (`main`) calls
+/// `build_router_with_limits` with the operator-configured values, so this convenience wrapper is
 /// reached only from the test harness.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
@@ -941,7 +962,7 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
 /// wiring without touching the process-wide install. `max_inbound_concurrent == 0` ⇒ NO concurrency
 /// layer is added (a true no-op, today's behavior); `> 0` wraps the whole router in a tower
 /// `GlobalConcurrencyLimitLayer` as the OUTERMOST layer.
-pub(crate) fn build_router_with_limits(
+fn build_router_with_limits(
     app: std::sync::Arc<state::App>,
     request_body_max_bytes: usize,
     max_inbound_concurrent: usize,
@@ -979,9 +1000,9 @@ pub(crate) fn build_router_with_limits(
         .route("/:provider/:model/v1/messages", post(route::adhoc))
         // Global fallback for unmatched paths (404) and wrong-method hits on a valid path (405).
         // axum's built-in responses are an EMPTY body (404) or an `Allow`-header-only 405 — both bare
-        // text, which a native vendor SDK cannot decode and which fingerprint busbar as a router/proxy
-        // (the §8.1 transparency gap). Reshape into the inferred ingress protocol's native JSON error
-        // envelope so a client probing an unsupported edge still sees a vendor-shaped error.
+        // text that a native vendor SDK cannot decode and that fingerprint busbar as a router/proxy.
+        // Reshape into the inferred ingress protocol's native JSON error envelope so a client probing
+        // an unsupported edge still sees a vendor-shaped error.
         .fallback(fallback_handler)
         // Wrong-method hits on a VALID path (axum's built-in 405) get the same native-envelope
         // treatment as the 404 fallback above.
@@ -1001,7 +1022,7 @@ pub(crate) fn build_router_with_limits(
         .layer(axum::middleware::from_fn(reshape_body_limit_413))
         // Outermost: stamp the `Server-Timing: busbar;dur=<ms>` gateway-overhead header on every
         // response (times the full inner stack). Must be the LAST `.layer()` so it wraps everything.
-        // Gated on `observability.emit_server_timing` (default true): when false the header is fully
+        // Gated on `observability.emit_server_timing` (default false): when false the header is fully
         // suppressed (see `server_timing`). The `bool` state is independent of the router's `App`
         // state, so it is wired with its own `from_fn_with_state`.
         .layer(axum::middleware::from_fn_with_state(
@@ -1211,7 +1232,7 @@ mod tests {
         assert!(open_relay_banner(None, true).is_none());
     }
 
-    /// MEDIUM/conformance (main.rs:569): the fallback handlers infer the ingress protocol from the
+    /// The fallback handlers infer the ingress protocol from the
     /// request path so a 404/405 is shaped in the client's own protocol, not a bare axum body.
     #[test]
     fn test_proto_for_path_inference() {
@@ -1227,7 +1248,7 @@ mod tests {
             proto_for_path("/v1beta/models/gemini-pro:streamGenerateContent"),
             "gemini"
         );
-        // REGRESSION (MEDIUM/conformance, main.rs:589): an OpenAI-SDK `model.retrieve` hits
+        // REGRESSION: an OpenAI-SDK `model.retrieve` hits
         // `GET /v1/models/{model_id}` — NO `:<action>` colon. That must infer OpenAI (so the 405/404
         // error is OpenAI-decodable), not Gemini, even though it shares the `/v1/models/` prefix.
         assert_eq!(proto_for_path("/v1/models/gpt-4o"), "openai");
@@ -1248,7 +1269,7 @@ mod tests {
             "bedrock"
         );
         assert_eq!(proto_for_path("/my-model/v1/messages"), "anthropic");
-        // REGRESSION (R7 MEDIUM): a NON-Converse `/model/...` path must NOT be classified as bedrock
+        // REGRESSION: a NON-Converse `/model/...` path must NOT be classified as bedrock
         // (it lacks the `/converse`/`/converse-stream` suffix). The previous unconditional
         // `starts_with("/model/")` shaped it as bedrock here while auth shaped it as openai —
         // contradictory error envelopes for one path. The canonical classifier now requires the
@@ -1263,7 +1284,7 @@ mod tests {
         assert_eq!(proto_for_path("/totally/unknown"), "openai");
     }
 
-    /// REGRESSION (R7 MEDIUM): the two `proto_for_path` classifiers (main.rs fallback/405 handlers
+    /// REGRESSION: the two `proto_for_path` classifiers (main.rs fallback/405 handlers
     /// and `auth.rs` 401 shaping) must agree for EVERY path — they now share one canonical
     /// implementation in `proto`, so this guards that main.rs's delegate matches the canonical source
     /// across the full table including the previously-divergent non-Converse `/model/` paths.
@@ -1300,7 +1321,7 @@ mod tests {
         let resp = fallback_error_response(
             "/model/some.model/converse",
             axum::http::StatusCode::NOT_FOUND,
-            "not_found_error",
+            crate::admin::ERR_TYPE_NOT_FOUND,
             "missing",
         );
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
@@ -1308,7 +1329,7 @@ mod tests {
             resp.headers()
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|h| h.to_str().ok()),
-            Some("application/json"),
+            Some("application/json"), // golden wire-contract literal (kept bare on purpose)
             "fallback must be application/json, not bare text"
         );
         assert!(
@@ -1327,29 +1348,30 @@ mod tests {
         let resp = fallback_error_response(
             "/v1/chat/completions",
             axum::http::StatusCode::NOT_FOUND,
-            // REGRESSION (R7 MEDIUM): the fallback 404 emits the CANONICAL `not_found_error` kind, so
+            // REGRESSION: the fallback 404 emits the CANONICAL `not_found_error` kind, so
             // an OpenAI-inferred 404 carries `{"error":{"type":"not_found_error"}}`, not `not_found`.
-            "not_found_error",
+            crate::admin::ERR_TYPE_NOT_FOUND,
             "missing",
         );
         assert_eq!(
             resp.headers()
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|h| h.to_str().ok()),
-            Some("application/json")
+            Some("application/json") // golden wire-contract literal (kept bare on purpose)
         );
         // Guard the canonical kind reaches the body via the OpenAI writer's verbatim passthrough.
         use http_body_util::BodyExt as _;
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            v["error"]["type"], "not_found_error",
+            v["error"]["type"],
+            "not_found_error", // golden wire-contract literal (kept bare on purpose)
             "OpenAI-inferred 404 must carry the canonical not_found_error type, not not_found"
         );
         let resp = fallback_error_response(
             "/v1/chat/completions",
             axum::http::StatusCode::NOT_FOUND,
-            "not_found_error",
+            crate::admin::ERR_TYPE_NOT_FOUND,
             "missing",
         );
         assert!(
@@ -1366,12 +1388,12 @@ mod tests {
         // total 1090µs − upstream 1000µs = 90µs internal = 0.090 ms.
         assert!((server_timing_dur_ms(1090, 1000) - 0.090).abs() < 1e-9);
         // No upstream hop (sentinel) → report the full time (e.g. /healthz at 57µs).
-        assert!((server_timing_dur_ms(57, u64::MAX) - 0.057).abs() < 1e-9);
+        assert!((server_timing_dur_ms(57, NO_UPSTREAM_RTT) - 0.057).abs() < 1e-9);
         // Clock skew (upstream measured ≥ total) saturates to 0, never underflows.
         assert_eq!(server_timing_dur_ms(500, 800), 0.0);
     }
 
-    /// REGRESSION (MED #14, security/indistinguishability): axum's `DefaultBodyLimit` rejects an
+    /// REGRESSION: axum's `DefaultBodyLimit` rejects an
     /// oversized body with a bare `text/plain` 413 (`"length limit exceeded"`) — a router/proxy
     /// tell. `reshape_oversized_413` must turn that into a protocol-native `application/json`
     /// envelope. Against the OLD code (no reshaping layer) the response stayed `text/plain`, so this
@@ -1400,7 +1422,7 @@ mod tests {
             .and_then(|h| h.to_str().ok());
         assert_eq!(
             ct,
-            Some("application/json"),
+            Some("application/json"), // golden wire-contract literal (kept bare on purpose)
             "oversized-body 413 must be reshaped to application/json, not the bare text/plain tell"
         );
         let bytes = reshaped.into_body().collect().await.unwrap().to_bytes();
@@ -1418,7 +1440,7 @@ mod tests {
         );
     }
 
-    /// REGRESSION (MED #14): a Bedrock-inferred oversized-body 413 must carry the native AWS
+    /// REGRESSION: a Bedrock-inferred oversized-body 413 must carry the native AWS
     /// `__type` envelope AND the `x-amzn-*` headers, indistinguishable from a real Bedrock reject.
     #[tokio::test]
     async fn test_oversized_body_413_bedrock_native_envelope_with_amzn_headers() {
@@ -1442,7 +1464,7 @@ mod tests {
                 .headers()
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|h| h.to_str().ok()),
-            Some("application/json")
+            Some("application/json") // golden wire-contract literal (kept bare on purpose)
         );
         assert!(
             reshaped.headers().get("x-amzn-requestid").is_some(),
@@ -1484,7 +1506,7 @@ mod tests {
             axum::http::StatusCode::PAYLOAD_TOO_LARGE,
             [(
                 axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("application/json"),
+                axum::http::HeaderValue::from_static(crate::forward::APPLICATION_JSON),
             )],
             r#"{"error":{"type":"request_too_large","message":"native"}}"#,
         )
@@ -1498,7 +1520,7 @@ mod tests {
         );
     }
 
-    /// REGRESSION (LOW #14): a forward-path-relayed UPSTREAM 413 with a NON-JSON content-type (e.g.
+    /// REGRESSION: a forward-path-relayed UPSTREAM 413 with a NON-JSON content-type (e.g.
     /// an upstream that itself answers 413 with a `text/plain`/`text/html` body that is NOT axum's
     /// own `length limit exceeded` marker) must pass through `reshape_oversized_413` UNTOUCHED —
     /// reshaping it would clobber the upstream's relayed error with busbar's own envelope.
@@ -1530,7 +1552,7 @@ mod tests {
                 .headers()
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|h| h.to_str().ok()),
-            Some("text/plain; charset=utf-8"),
+            Some("text/plain; charset=utf-8"), // golden wire-contract literal (kept bare on purpose)
             "a relayed upstream 413 must keep its own content-type, not be reshaped to JSON"
         );
         let bytes = passed.into_body().collect().await.unwrap().to_bytes();
@@ -1565,7 +1587,7 @@ mod tests {
                 .headers()
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|h| h.to_str().ok()),
-            Some("application/json"),
+            Some("application/json"), // golden wire-contract literal (kept bare on purpose)
             "axum's own body-limit 413 (sentinel body) must be reshaped to JSON"
         );
         let bytes = reshaped.into_body().collect().await.unwrap().to_bytes();

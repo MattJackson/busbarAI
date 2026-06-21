@@ -70,6 +70,20 @@ in-flight requests first, so a restart on rotation does not drop live traffic.
 Envoy) in front of a plain-HTTP Busbar still works if you prefer to manage certs
 there — simply omit the `tls` block.
 
+### Connection-level hardening (slow-loris)
+
+When Busbar terminates TLS itself, the native listener bounds the request **header-read**
+phase (30 s) in addition to the TLS handshake, so a client that completes the handshake
+and then trickles request headers one byte at a time cannot pin a connection open
+indefinitely. This bound applies only to reading the request headers — it never limits a
+streaming response, so long model completions are unaffected.
+
+The plain-HTTP listener (no `tls` block) does **not** apply a header-read timeout. For an
+**edge-facing** deployment, either enable the `tls` block (recommended) or front Busbar
+with a reverse proxy / load balancer (nginx, Caddy, Envoy, an ALB), which terminates
+client connections and provides its own slow-client protection. A plain-HTTP Busbar
+directly exposed to untrusted networks is not recommended.
+
 ## Health & readiness
 
 | Endpoint | Auth | Meaning |
@@ -99,8 +113,9 @@ All metrics are Prometheus counters/histograms exposed at `/metrics`.
 | `busbar_key_budget_remaining_cents` | gauge | `key` | Max budget minus current spend for capped keys. Enables Prometheus burn-rate alerting. Only emitted for keys with a `max_budget_cents` cap. |
 | `busbar_key_tokens_total` | gauge | `key` | Tokens consumed by each virtual key in the current budget window. Only emitted when governance is enabled. |
 | `busbar_lane_state` | gauge | `pool`, `lane` | Circuit-breaker health per lane: `0` = Closed, `1` = HalfOpen, `2` = Open (tripped). Side-effect-free at scrape. |
-| `busbar_route_decisions_total` | counter | `pool`, `policy`, `outcome` | Routing policy decisions. `outcome` is `prefer` / `abstain` / `timeout` / `error` / `reject`. |
-| `busbar_route_decision_seconds` | histogram | `pool`, `policy` | Policy decision latency (webhook/script policies only). |
+| `busbar_route_policy_selections_total` | counter | `pool`, `policy` | Requests where a routing policy (webhook/script/native) produced a usable ranked order. Only incremented on a successful `Order` outcome; abstains and on-error fallbacks are not counted. |
+| `busbar_webhook_logs_dropped_total` | counter | — | Request-log webhook deliveries shed because the in-flight delivery pool was saturated (a slow/unreachable webhook endpoint). A non-zero rate means request logs are being silently dropped — scale the endpoint or alert. |
+| `busbar_billing_truncated_total` | counter | — | Same-protocol non-stream responses whose body exceeded the usage-tap reassembly cap, so the terminal `usage` frame was missed and the request billed zero tokens (the client still got a full response). A non-zero rate signals an over-cap billing gap. |
 
 `/metrics` requires a valid client token in `token` mode (or a virtual key under
 governance) — it is treated as an information-disclosure surface and goes through
@@ -153,10 +168,10 @@ A successful active health probe (it tests the shared upstream) clears the break
 Configured per pool via `breaker.trip` (see
 [configuration.md](configuration.md#breaker)):
 
-- **`error_rate`** (default) — trips when the failure fraction over `window_s`
+- **`error_rate`** (default) — trips when the failure fraction over `window_secs`
   reaches `threshold` (default 0.5), but never before `min_requests` (default 5)
   outcomes have accrued in the window.
-- **`consecutive`** — trips on `n` consecutive failures (default 3).
+- **`consecutive`** — trips on `consecutive_n` consecutive failures (default 3).
 
 ### Cooldown & backoff
 
@@ -192,13 +207,13 @@ Each probing lane gets one background task. `interval_secs` (default 30) and
 `timeout_secs` (default 5) are honored (floored at 1s). The first tick is skipped so
 busbar doesn't probe before any traffic establishes health. A lane with no key is
 skipped (a guaranteed 401 would only thrash the breaker). A 2xx probe recovers a
-tripped lane to Closed without polluting the `ok` stats; a failed probe records a
+tripped lane to Closed and increments the lane's `ok` counter by one; a failed probe records a
 transient (which, on a Closed lane in `active` mode, can trip it out).
 
 ## Failover & exhaustion
 
 For a single request, busbar will retry across pool members up to the failover
-`cap` (default 3) and within the `deadline_secs` budget (default 120). Failover is
+`max_hops` (default 3) and within the `timeout_secs` budget (default 120). Failover is
 allowed **only before the first upstream byte reaches the client** — once streaming
 has started, a failure cannot fail over (the client holds a partial response); the
 lane records the breaker fault and the stream terminates with an SSE `error` event,

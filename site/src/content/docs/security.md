@@ -173,6 +173,7 @@ The hardcoded denylist targets **cloud-instance metadata endpoints** — the add
 | `169.254.0.0/16` | Entire link-local range: AWS IMDS (`169.254.169.254`), AWS ECS credentials (`169.254.170.2`), Tencent Cloud metadata (`169.254.0.23`), and any future link-local IMDS |
 | `100.100.100.200` | Alibaba Cloud metadata |
 | `168.63.129.16` | Azure WireServer |
+| `192.0.0.192` | Oracle Cloud (OCI) metadata |
 | `fd00:ec2::254` | AWS IMDSv6 |
 | `metadata.google.internal` | GCE metadata hostname |
 | `metadata.internal` | Generic cloud metadata hostname |
@@ -196,6 +197,8 @@ Four knobs cover every scenario:
 | Disable the guard entirely | `security.allow_all_metadata: true` | Global — every metadata endpoint becomes reachable; **logs a startup WARNING** |
 
 **Precedence (one sentence):** a host is blocked if and only if it is on the denylist (hardcoded union `blocked_metadata_hosts`) and is not in any allow-override (`security.allow_metadata_hosts` union that provider's `allow_metadata_hosts`) and `allow_all_metadata` is not set. Allow always wins over block.
+
+**Entries must be exact IPs or hostnames.** CIDR notation (e.g. `169.254.0.0/16`) is **not** supported in `blocked_metadata_hosts` or `allow_metadata_hosts` and is rejected at startup with a clear error — list specific addresses instead. (The built-in `169.254.0.0/16` link-local range is enforced internally; config cannot add new CIDR ranges.)
 
 **Example — extend the denylist and carve a surgical per-provider exception:**
 
@@ -231,7 +234,7 @@ models:
     max_concurrent: 4
 ```
 
-`security.allow_all_metadata: true` is a nuclear option intended for development environments only. When set, Busbar logs a startup warning: `metadata protection DISABLED — allow_all_metadata is set`.
+`security.allow_all_metadata: true` is a nuclear option intended for development environments only. When set, Busbar logs a startup warning: `metadata protection DISABLED — all cloud-metadata endpoints reachable`.
 
 ### Inspecting the effective denylist
 
@@ -239,4 +242,4 @@ Two ways to see exactly what Busbar is blocking:
 
 1. **CLI flag:** `busbar --print-metadata-blocklist` dumps the effective denylist — hardcoded entries plus any `blocked_metadata_hosts` additions, minus any allow-overrides. This is always the ground truth for the running binary and config.
 
-2. **Startup log:** at `info` level Busbar logs `metadata protection: N hosts blocked (--print-metadata-blocklist to view)`. When `allow_all_metadata` is set the log line is instead a `WARN`: `metadata protection DISABLED — allow_all_metadata is set`.
+2. **Startup log:** at `info` level Busbar logs `metadata protection: N hosts blocked (--print-metadata-blocklist to view)`. When `allow_all_metadata` is set the log line is instead a `WARN`: `metadata protection DISABLED — all cloud-metadata endpoints reachable`.

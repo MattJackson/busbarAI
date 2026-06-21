@@ -55,7 +55,7 @@ use crate::state::App;
 /// that closes the resurrection race with the surface we own. Both ops are admin-only and rare, so a
 /// single global lock has no meaningful cost.
 ///
-/// CANCELLATION SAFETY (R26): this is a `std::sync::Mutex`, NOT a `tokio::sync::Mutex`, and the guard
+/// CANCELLATION SAFETY: this is a `std::sync::Mutex`, NOT a `tokio::sync::Mutex`, and the guard
 /// is acquired INSIDE each operation's `spawn_blocking` closure — bound to the SYNCHRONOUS store
 /// mutation, not to the async handler future. An earlier design held an async guard across the
 /// cancellable outer `.await`; if the client dropped the request, the guard was dropped while the
@@ -70,7 +70,7 @@ use crate::state::App;
 static EXISTENCE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Deserialize)]
-pub(crate) struct CreateKeyReq {
+struct CreateKeyReq {
     name: String,
     #[serde(default)]
     allowed_pools: Vec<String>,
@@ -99,10 +99,23 @@ pub(crate) struct CreateKeyReq {
 /// `governance::budget_window`.
 const VALID_BUDGET_PERIODS: &[&str] = &["total", "daily", "monthly"];
 
+/// Error-type taxonomy strings used by the admin API and by `main.rs` (which references them via
+/// `crate::admin::ERR_TYPE_*`). `forward.rs` defines parallel `KIND_NOT_FOUND`/`KIND_INVALID_REQUEST`
+/// consts with the same string values independently, rather than importing from here.
+pub(crate) const ERR_TYPE_NOT_FOUND: &str = "not_found_error";
+pub(crate) const ERR_TYPE_INVALID_REQUEST: &str = "invalid_request_error";
+const ERR_TYPE_INTERNAL: &str = "internal_error";
+
+/// Maximum byte lengths for admin-API path / body fields (defense-in-depth DB/log-bloat guards).
+/// A real minted key id is `vk_` + 16 hex chars (19 chars); 64 is generous headroom.
+/// 256 chars for a key name is far past any reasonable label.
+const MAX_KEY_NAME_LEN: usize = 256;
+const MAX_KEY_ID_LEN: usize = 64;
+
 fn json_response(status: StatusCode, body: Value) -> Response {
     (
         status,
-        [(CONTENT_TYPE, "application/json")],
+        [(CONTENT_TYPE, crate::forward::APPLICATION_JSON)],
         body.to_string(),
     )
         .into_response()
@@ -130,7 +143,7 @@ fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
     tracing::error!(operation = op, error = %e, "admin store operation failed");
     error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
-        "internal_error",
+        ERR_TYPE_INTERNAL,
         "internal error",
     )
 }
@@ -153,9 +166,25 @@ fn key_meta(k: &VirtualKey) -> Value {
 fn disabled() -> Response {
     error_response(
         StatusCode::NOT_FOUND,
-        "not_found_error",
+        ERR_TYPE_NOT_FOUND,
         "governance/admin API is not enabled",
     )
+}
+
+/// Bound a path `id` (the virtual-key id from `/admin/keys/{id}`). Admin-gated, but an unbounded id
+/// flows into a store lookup / log lines — cap it as defense-in-depth (DB/log-bloat guard). A real
+/// minted id is `vk_` + 16 hex chars (19 chars), so [`MAX_KEY_ID_LEN`] is generous headroom. Returns
+/// a 400 response when too long, `None` when acceptable.
+fn reject_overlong_id(id: &str) -> Option<Response> {
+    if id.len() > MAX_KEY_ID_LEN {
+        Some(error_response(
+            StatusCode::BAD_REQUEST,
+            ERR_TYPE_INVALID_REQUEST,
+            "id must be <= 64 characters",
+        ))
+    } else {
+        None
+    }
 }
 
 /// 500 for a `spawn_blocking` task that failed to run to completion (cancelled or panicked). The
@@ -165,7 +194,7 @@ fn join_error(op: &str, e: &tokio::task::JoinError) -> Response {
     tracing::error!(operation = op, error = %e, "admin store task failed to join");
     error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
-        "internal_error",
+        ERR_TYPE_INTERNAL,
         "internal error",
     )
 }
@@ -186,20 +215,32 @@ pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Resp
             tracing::warn!("create_key: {}", crate::json::parse_err_log(body.len()));
             return error_response(
                 StatusCode::BAD_REQUEST,
-                "invalid_request_error",
+                ERR_TYPE_INVALID_REQUEST,
                 "invalid JSON",
             );
         }
     };
+    // Bound the key name. It is admin-gated, but an unbounded `name` persists verbatim into the
+    // store (DB-bloat / log-line-bloat vector) — cap it as defense-in-depth. MAX_KEY_NAME_LEN chars
+    // is far past any reasonable label.
+    if req.name.len() > MAX_KEY_NAME_LEN {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            ERR_TYPE_INVALID_REQUEST,
+            "name must be <= 256 characters",
+        );
+    }
     // Default to the all-time `"total"` window when omitted; otherwise the value MUST be one
     // `governance::budget_window` enforces. Reject an unrecognized period with 400 rather than
     // letting it persist and silently degrade to `"total"` at evaluation time (a key whose stored
     // metadata disagrees with the cap it actually enforces).
-    let budget_period = req.budget_period.unwrap_or_else(|| "total".to_string());
+    let budget_period = req
+        .budget_period
+        .unwrap_or_else(|| VALID_BUDGET_PERIODS[0].to_string());
     if !VALID_BUDGET_PERIODS.contains(&budget_period.as_str()) {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ERR_TYPE_INVALID_REQUEST,
             // Do NOT echo the caller-supplied value back in the error body (matches every other 400).
             format!("invalid budget_period: must be one of {VALID_BUDGET_PERIODS:?}"),
         );
@@ -217,7 +258,7 @@ pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Resp
         if budget < 0 {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                "invalid_request_error",
+                ERR_TYPE_INVALID_REQUEST,
                 "max_budget_cents must be >= 0",
             );
         }
@@ -233,14 +274,14 @@ pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Resp
     if req.rpm_limit == Some(0) {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ERR_TYPE_INVALID_REQUEST,
             "rpm_limit must be >= 1 (omit the field for unlimited)",
         );
     }
     if req.tpm_limit == Some(0) {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ERR_TYPE_INVALID_REQUEST,
             "tpm_limit must be >= 1 (omit the field for unlimited)",
         );
     }
@@ -319,7 +360,7 @@ pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Resp
 /// A single `Option<T>` could not tell absent from present-null, so a cap could never be cleared
 /// once set. `enabled` is a plain `Option<bool>` (a bool has no "unlimited"/clear state).
 #[derive(Deserialize)]
-pub(crate) struct UpdateKeyReq {
+struct UpdateKeyReq {
     #[serde(default)]
     enabled: Option<bool>,
     #[serde(default, deserialize_with = "double_option")]
@@ -343,6 +384,9 @@ pub(crate) async fn update_key(
     let Some(gov) = &app.governance else {
         return disabled();
     };
+    if let Some(resp) = reject_overlong_id(&id) {
+        return resp;
+    }
     // Parse via the depth-guarded `crate::json` seam, not axum's `Json<T>` (whose rejection body
     // echoes the raw serde error / an input fragment). Any failure maps to a GENERIC 400, logging
     // only the byte length via `parse_err_log` — no raw error, no input fragment.
@@ -352,7 +396,7 @@ pub(crate) async fn update_key(
             tracing::warn!("update_key: {}", crate::json::parse_err_log(body.len()));
             return error_response(
                 StatusCode::BAD_REQUEST,
-                "invalid_request_error",
+                ERR_TYPE_INVALID_REQUEST,
                 "invalid JSON",
             );
         }
@@ -369,7 +413,7 @@ pub(crate) async fn update_key(
         if budget < 0 {
             return error_response(
                 StatusCode::BAD_REQUEST,
-                "invalid_request_error",
+                ERR_TYPE_INVALID_REQUEST,
                 "max_budget_cents must be >= 0 (use null to clear to unlimited)",
             );
         }
@@ -377,14 +421,14 @@ pub(crate) async fn update_key(
     if req.rpm_limit == Some(Some(0)) {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ERR_TYPE_INVALID_REQUEST,
             "rpm_limit must be >= 1 (omit to leave unchanged, null to clear to unlimited)",
         );
     }
     if req.tpm_limit == Some(Some(0)) {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "invalid_request_error",
+            ERR_TYPE_INVALID_REQUEST,
             "tpm_limit must be >= 1 (omit to leave unchanged, null to clear to unlimited)",
         );
     }
@@ -403,7 +447,7 @@ pub(crate) async fn update_key(
     // before the DELETE (row removed afterward) or sees `None` after it (404, no re-put). See
     // `EXISTENCE_GATE`.
     //
-    // CANCELLATION SAFETY (R26): the gate is locked INSIDE the `spawn_blocking` closure so its
+    // CANCELLATION SAFETY: the gate is locked INSIDE the `spawn_blocking` closure so its
     // lifetime is bound to the synchronous `gov.update_key` mutation, not to this cancellable async
     // handler. If the client drops the request, the already-scheduled closure still runs to completion
     // holding the gate — so a dropped outer future can never release the gate while the lookup→write
@@ -415,7 +459,7 @@ pub(crate) async fn update_key(
     .await;
     match res {
         Ok(Ok(Some(key))) => json_response(StatusCode::OK, key_meta(&key)),
-        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, "not_found_error", "key not found"),
+        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found"),
         Ok(Err(e)) => internal_error("update_key", &e),
         Err(e) => join_error("update_key", &e),
     }
@@ -443,6 +487,9 @@ pub(crate) async fn key_usage(State(app): State<Arc<App>>, Path(id): Path<String
     let Some(gov) = &app.governance else {
         return disabled();
     };
+    if let Some(resp) = reject_overlong_id(&id) {
+        return resp;
+    }
     let now = crate::store::now();
     let gov2 = gov.clone();
     let id2 = id.clone();
@@ -452,7 +499,7 @@ pub(crate) async fn key_usage(State(app): State<Arc<App>>, Path(id): Path<String
             StatusCode::OK,
             json!({"id": id, "spend_cents": u.spend_cents, "tokens": u.tokens, "requests": u.requests}),
         ),
-        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, "not_found_error", "key not found"),
+        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found"),
         Ok(Err(e)) => internal_error("key_usage", &e),
         Err(e) => join_error("key_usage", &e),
     }
@@ -465,6 +512,9 @@ pub(crate) async fn delete_key(State(app): State<Arc<App>>, Path(id): Path<Strin
     let Some(gov) = &app.governance else {
         return disabled();
     };
+    if let Some(resp) = reject_overlong_id(&id) {
+        return resp;
+    }
     // Existence check before delete: `usage_for` resolves the key by id and returns Ok(None) when it
     // does not exist (the store's `delete_key` silently no-ops a zero-row delete, so we cannot rely
     // on it to signal not-found). Use the public GovState API rather than reaching into the store.
@@ -482,7 +532,7 @@ pub(crate) async fn delete_key(State(app): State<Arc<App>>, Path(id): Path<Strin
     // removes (see `EXISTENCE_GATE`). The loser of a delete race observes `Ok(None)` and correctly
     // returns 404. Deletes are admin-only and rare, so a single global lock has no meaningful cost.
     //
-    // CANCELLATION SAFETY (R26): the gate is locked INSIDE the `spawn_blocking` closure, so the whole
+    // CANCELLATION SAFETY: the gate is locked INSIDE the `spawn_blocking` closure, so the whole
     // lookup→delete runs under the lock on the blocking thread. `spawn_blocking` is uncancellable once
     // scheduled, so even if the client drops this request the critical section completes while still
     // holding the gate — the gate can never be released mid-sequence by an outer-future drop.
@@ -500,7 +550,7 @@ pub(crate) async fn delete_key(State(app): State<Arc<App>>, Path(id): Path<Strin
     .await;
     match res {
         Ok(Ok(Some(()))) => json_response(StatusCode::OK, json!({"deleted": id})),
-        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, "not_found_error", "key not found"),
+        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found"),
         Ok(Err(e)) => internal_error("delete_key", &e),
         Err(e) => join_error("delete_key", &e),
     }
@@ -739,13 +789,14 @@ mod tests {
                 "400 body must name budget_period: {body}"
             );
             assert_eq!(
-                body["error"]["type"], "invalid_request_error",
+                body["error"]["type"],
+                "invalid_request_error", // golden wire-contract literal (kept bare on purpose)
                 "400 error type must be invalid_request_error: {body}"
             );
         }
 
         // Each valid period (and the omitted-default) creates the key with that exact period.
-        for good in ["total", "daily", "monthly"] {
+        for &good in super::VALID_BUDGET_PERIODS {
             let resp = client
                 .post(&url)
                 .header("x-admin-token", "admintok")
@@ -776,7 +827,8 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 201, "omitted period must default");
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(
-            body["budget_period"], "total",
+            body["budget_period"],
+            "total", // golden wire-contract literal (kept bare on purpose)
             "omitted period defaults to total"
         );
 
@@ -807,7 +859,7 @@ mod tests {
             };
             let resp = req
                 .header("x-admin-token", "admintok")
-                .header("content-type", "application/json")
+                .header("content-type", crate::forward::APPLICATION_JSON)
                 .body(malformed.clone())
                 .send()
                 .await
@@ -836,7 +888,8 @@ mod tests {
                 "the 400 body on {path} must be the generic envelope; got {text}"
             );
             assert_eq!(
-                body["error"]["type"], "invalid_request_error",
+                body["error"]["type"],
+                "invalid_request_error", // golden wire-contract literal (kept bare on purpose)
                 "the 400 error type must be invalid_request_error; got {text}"
             );
         }
@@ -1299,7 +1352,7 @@ mod tests {
                     name: "k".to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: None,
-                    budget_period: "total".to_string(),
+                    budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
                     rpm_limit: None,
                     tpm_limit: None,
                 },
@@ -1340,7 +1393,7 @@ mod tests {
         );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["error"]["message"], "key not found");
-        assert_eq!(body["error"]["type"], "not_found_error");
+        assert_eq!(body["error"]["type"], "not_found_error"); // golden wire-contract literal (kept bare on purpose)
         handle.abort();
     }
 
@@ -1357,7 +1410,7 @@ mod tests {
                     name: "k".to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: None,
-                    budget_period: "total".to_string(),
+                    budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
                     rpm_limit: None,
                     tpm_limit: None,
                 },
@@ -1399,7 +1452,7 @@ mod tests {
                     name: "k".to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: None,
-                    budget_period: "total".to_string(),
+                    budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
                     rpm_limit: None,
                     tpm_limit: None,
                 },
@@ -1461,7 +1514,7 @@ mod tests {
                     name: "k".to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: None,
-                    budget_period: "total".to_string(),
+                    budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
                     rpm_limit: None,
                     tpm_limit: None,
                 },
@@ -1642,7 +1695,7 @@ mod tests {
                     name: "k".to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: None,
-                    budget_period: "total".to_string(),
+                    budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
                     rpm_limit: None,
                     tpm_limit: None,
                 },
@@ -1768,7 +1821,7 @@ mod tests {
                     name: "k".to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: None,
-                    budget_period: "total".to_string(),
+                    budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
                     rpm_limit: None,
                     tpm_limit: None,
                 },

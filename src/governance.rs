@@ -27,12 +27,43 @@ const RATE_WINDOW_SECS: u64 = 60;
 /// the tests that exercise the default-configured sweep cadence.
 #[cfg(test)]
 const RATE_SWEEP_INTERVAL: u32 = crate::config::DEFAULT_RATE_SWEEP_INTERVAL;
-/// `price_per_1k_tokens_cents` is priced per this many tokens.
-const TOKENS_PER_PRICE_UNIT: u64 = 1_000;
-/// Seconds in a UTC day, for `budget_window`'s day/month arithmetic. `pub(crate)` so sibling
-/// modules (which need the same constant for their own window math) reference it as
-/// `crate::governance::SECS_PER_DAY` rather than re-hardcoding `86_400`.
+/// Millicents per whole cent — the divisor that flushes the sub-cent spend carry (`record_tokens`).
+/// This is the milli-prefix scale (1/1000), NOT a token-pricing unit: `price_per_1k_tokens_cents` is
+/// cents-per-1000-tokens ≡ millicents-per-token, so `tokens * price` already lands in millicents and
+/// `/ MILLICENTS_PER_CENT` flushes whole cents with a 0..999 millicent remainder. Named for the
+/// milli→cent conversion it actually performs so a future change to the token-pricing scale (e.g.
+/// per-100-tokens) cannot silently corrupt this divisor.
+const MILLICENTS_PER_CENT: u64 = 1_000;
+/// Seconds in a UTC day, for `budget_window`'s day/month arithmetic. `pub(crate)` so cross-module
+/// TEST code can reference it as `crate::governance::SECS_PER_DAY`; production modules that need the
+/// same value independently (e.g. `sigv4.rs`) keep a private copy where layering prohibits importing
+/// it for a one-line constant.
 pub(crate) const SECS_PER_DAY: u64 = 86_400;
+
+// ── Budget-period sentinel tokens (matched in `budget_window`) ───────────────────────────────────
+/// The "all-time" budget window sentinel: a single window from epoch 0.
+const BUDGET_PERIOD_TOTAL: &str = "total";
+/// The "daily" budget window sentinel: resets at UTC midnight.
+const BUDGET_PERIOD_DAILY: &str = "daily";
+/// The "monthly" budget window sentinel: resets at UTC first-of-month.
+const BUDGET_PERIOD_MONTHLY: &str = "monthly";
+
+// ── Virtual-key / bearer-secret formats ──────────────────────────────────────────────────────────
+/// The `"vk_"` prefix prepended to the 16-hex-char hash prefix to form a virtual-key id.
+const VK_ID_PREFIX: &str = "vk_";
+/// Number of hex characters from the SHA-256 hash used as the suffix of a virtual-key id.
+const VK_ID_HASH_PREFIX_LEN: usize = 16;
+/// The `"sk-bb-"` prefix for bearer secrets returned by `generate_secret`.
+const SK_SECRET_PREFIX: &str = "sk-bb-";
+
+// ── AWS-key formats ───────────────────────────────────────────────────────────────────────────────
+/// The literal `"AKIA"` prefix required by AWS SDK validators for long-term AccessKeyIds.
+const AWS_ACCESS_KEY_PREFIX: &str = "AKIA";
+/// Fixed total length (in characters) of a busbar-issued AWS AccessKeyId (`"AKIA"` + 16 random).
+const AWS_ACCESS_KEY_ID_LEN: usize = 20;
+/// Fixed length (in characters) of a busbar-issued AWS secret access key (base64-ish, 40 chars).
+const AWS_SECRET_ACCESS_KEY_LEN: usize = 40;
+
 // SQLite `busy_timeout` for the on-disk DB: a transient lock contention retries for this many
 // milliseconds before failing, rather than erroring instantly with `SQLITE_BUSY`. Operator-tunable
 // via `governance.sqlite_busy_timeout_ms` (default 5000); read through `crate::limits`.
@@ -67,7 +98,7 @@ struct GovCaches {
 pub(crate) struct GovState {
     store: Arc<dyn Store>,
     /// Both auth-path caches under ONE lock so `refresh` swaps them atomically — a reader can never
-    /// observe a new `by_hash` against a stale `by_access_key_id` (LOW-1). See `GovCaches`.
+    /// observe a new `by_hash` against a stale `by_access_key_id`. See `GovCaches`.
     caches: RwLock<GovCaches>,
     /// Flat cents charged per request (one half of the cost model; the other is per-token, below).
     /// Total budget spend = per-request fee + tokens/1000 * price_per_1k_tokens_cents.
@@ -76,20 +107,35 @@ pub(crate) struct GovState {
     price_per_1k_tokens_cents: i64,
     /// per-key RPM/TPM windows (ephemeral).
     rate: RwLock<HashMap<String, RateState>>,
+    /// Per-key accumulator of the sub-cent (millicent) remainder of token spend. Token cost is
+    /// `tokens/1000 * price_per_1k_tokens_cents`; in pure integer cents a request whose cost is < 1
+    /// cent (e.g. 500 tokens at 1¢/1k = 0.5¢) used to TRUNCATE to 0 and be lost forever. We instead
+    /// accrue spend in MILLICENTS (`tokens * price_per_1k_cents`), flush WHOLE cents to the durable
+    /// store, and carry the 0..999 millicent remainder here until it crosses a cent on a later
+    /// request. In-memory only (dropping a sub-1¢ remainder per key on restart is acceptable);
+    /// bounded by the key count (the same set `caches.by_hash` already holds). The `Mutex` keeps the
+    /// per-key read-modify-write atomic under concurrent requests for the same key. The value is
+    /// `(window, remainder)`: the remainder is attributed to the budget WINDOW it was generated in and
+    /// RESET when the window rolls over, so a sub-cent remainder never leaks across a day/month boundary
+    /// into the next window's spend (the <1¢ dropped at a rollover is the same accepted trade-off as the
+    /// on-restart drop). One entry per key (not per key×window), so growth stays key-count-bounded.
+    token_spend_carry: std::sync::Mutex<HashMap<String, (u64, u64)>>,
     /// Admission counter that amortizes the bounded eviction sweep of `rate` (see
     /// `RATE_SWEEP_INTERVAL`): every Nth `check_rate` call performs the full stale-entry retain,
     /// so the per-request hot path does not scan all active keys on every admission.
     rate_sweep_ticker: AtomicU32,
-    /// bearer token guarding the /admin management API (None = admin API disabled).
-    admin_token: Option<String>,
-    /// Fail-mode for the atomic budget check-and-charge on a STORE ERROR (fix 2b). `Allow` (default)
-    /// fails open (proceed → availability); `Deny` fails closed (reject → hard guarantee). Only the
+    /// SHA-256 hex digest of the configured /admin bearer token, computed once at construction. The
+    /// plaintext token is NOT retained — only its digest, which is all the constant-time compare on
+    /// the /admin path needs (less plaintext secret held in memory). `None` = admin API disabled.
+    admin_token_hash: Option<String>,
+    /// Fail-mode for the atomic budget check-and-charge on a STORE ERROR. `Allow` (default) fails
+    /// open (proceed → availability); `Deny` fails closed (reject → hard guarantee). Only the
     /// store-error path consults this; a definitive over-budget result always rejects. Set from
     /// `GovernanceCfg::budget_on_store_error` via `with_budget_on_store_error` at construction.
     budget_on_store_error: crate::config::BudgetOnStoreError,
 }
 
-/// parameters for minting a new virtual key (from the management API).
+/// Parameters for minting a new virtual key (from the management API).
 pub(crate) struct NewKeySpec {
     pub(crate) name: String,
     pub(crate) allowed_pools: Vec<String>,
@@ -117,14 +163,17 @@ impl GovState {
             price_per_request_cents,
             price_per_1k_tokens_cents,
             rate: RwLock::new(HashMap::new()),
+            token_spend_carry: std::sync::Mutex::new(HashMap::new()),
             rate_sweep_ticker: AtomicU32::new(0),
-            admin_token,
-            // Default fail-open (today's behavior); main.rs overrides from config via the setter.
+            admin_token_hash: admin_token
+                .as_ref()
+                .map(|t| crate::sigv4::sha256_hex(t.as_bytes())),
+            // Default fail-open; main.rs overrides from config via the setter.
             budget_on_store_error: crate::config::BudgetOnStoreError::Allow,
         })
     }
 
-    /// Set the budget store-error fail-mode (fix 2b). Builder-style so `GovState::new`'s signature is
+    /// Set the budget store-error fail-mode. Builder-style so `GovState::new`'s signature is
     /// unchanged (its many call sites stay intact); main.rs chains this from `GovernanceCfg`.
     pub(crate) fn with_budget_on_store_error(
         mut self,
@@ -134,7 +183,7 @@ impl GovState {
         self
     }
 
-    /// The configured budget store-error fail-mode (fix 2b). Consulted by the route.rs admission site.
+    /// The configured budget store-error fail-mode. Consulted by the route.rs admission site.
     pub(crate) fn budget_on_store_error(&self) -> crate::config::BudgetOnStoreError {
         self.budget_on_store_error
     }
@@ -177,8 +226,31 @@ impl GovState {
             return; // nothing to spend or count
         }
         let window = budget_window(budget_period, now);
-        let spend = (tokens.saturating_mul(self.price_per_1k_tokens_cents.max(0) as u64)
-            / TOKENS_PER_PRICE_UNIT) as i64;
+        // Sub-cent precision (no zero-billing of small requests): accrue spend in MILLICENTS. Price is
+        // cents-per-1000-tokens, so `tokens * price_per_1k_cents` is already millicents (= cents*1000).
+        // Add the carried remainder, flush the WHOLE cents, keep the 0..999 millicent remainder.
+        let millicents = tokens.saturating_mul(self.price_per_1k_tokens_cents.max(0) as u64);
+        let whole_cents = {
+            let mut carry = self
+                .token_spend_carry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = carry.entry(key_id.to_string()).or_insert((window, 0));
+            // Reset the remainder when the budget window rolls over, so a sub-cent remainder is
+            // attributed to the window it was generated in rather than leaking into the next window's
+            // spend. The <1¢ dropped at the rollover is the documented "sub-1¢ per key is acceptable
+            // to drop" trade-off (same as the on-restart drop).
+            if entry.0 != window {
+                *entry = (window, 0);
+            }
+            let total = entry.1.saturating_add(millicents);
+            entry.1 = total % MILLICENTS_PER_CENT;
+            total / MILLICENTS_PER_CENT
+        };
+        // Clamp the whole-cent flush into i64. Defense-in-depth (data-integrity LOW): a bare `as i64`
+        // on a value > i64::MAX wraps NEGATIVE and would DECREMENT the stored counter (defeating the
+        // budget cap). Unreachable from real token counts, but the clamp makes it impossible.
+        let spend = whole_cents.min(i64::MAX as u64) as i64;
         let key_owned = key_id.to_string();
         // count_request = false: this accrues token spend for a request already counted at admission
         // (production: the atomic `charge_within_budget`; tests: `record_request`), so it must not
@@ -274,19 +346,22 @@ impl GovState {
         self.caches.write().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// the configured admin token (None = admin API disabled).
-    pub(crate) fn admin_token(&self) -> Option<&str> {
-        self.admin_token.as_deref()
+    /// SHA-256 hex digest of the configured admin token, pre-computed at construction.
+    /// `Some` exactly when an admin token was supplied to `GovState::new` (the plaintext is hashed and discarded).
+    pub(crate) fn admin_token_hash(&self) -> Option<&str> {
+        self.admin_token_hash.as_deref()
     }
 
-    /// mint a new virtual key, persist it, refresh the cache, and return (key, plaintext
-    /// secret). The secret is shown to the caller ONCE here and never stored (only its hash is).
+    /// Mint a new virtual key, persist it, refresh the cache, and return `(key, plaintext
+    /// secret)`. The secret is shown to the caller ONCE here and never stored (only its hash is).
     pub(crate) fn create_key(
         &self,
         spec: NewKeySpec,
         now: u64,
     ) -> StoreResult<(VirtualKey, String)> {
-        let secret = generate_secret();
+        // `?` converts a getrandom failure into a StoreError (see `From<getrandom::Error>`), so the
+        // admin handler returns a 500 via its existing error_response path instead of panicking.
+        let secret = generate_secret()?;
         let hash = crate::sigv4::sha256_hex(secret.as_bytes());
         // `id` is a 64-bit prefix of the 256-bit secret hash, while `key_hash` is the full hash with
         // a UNIQUE constraint. Two distinct secrets sharing the same 64-bit prefix would produce the
@@ -297,7 +372,7 @@ impl GovState {
         // DIFFERENT key_hash, refuse rather than clobber an unrelated key. (A genuine retry that
         // somehow reproduces the same secret — and thus the same key_hash — is idempotent and allowed
         // through, since it overwrites the row with identical data.)
-        let id = format!("vk_{}", &hash[..16]);
+        let id = format!("{VK_ID_PREFIX}{}", &hash[..VK_ID_HASH_PREFIX_LEN]);
         self.ensure_id_free_for_hash(&id, &hash)?;
         let key = VirtualKey {
             id,
@@ -337,12 +412,14 @@ impl GovState {
         spec: NewKeySpec,
         now: u64,
     ) -> StoreResult<(VirtualKey, String, String, String)> {
-        let secret = generate_secret();
+        // `?` converts any getrandom failure into a StoreError (see `From<getrandom::Error>`), so the
+        // admin handler returns a 500 via its existing error_response path instead of panicking.
+        let secret = generate_secret()?;
         let hash = crate::sigv4::sha256_hex(secret.as_bytes());
-        let id = format!("vk_{}", &hash[..16]);
+        let id = format!("{VK_ID_PREFIX}{}", &hash[..VK_ID_HASH_PREFIX_LEN]);
         self.ensure_id_free_for_hash(&id, &hash)?;
-        let access_key_id = generate_aws_access_key_id();
-        let secret_access_key = generate_aws_secret_access_key();
+        let access_key_id = generate_aws_access_key_id()?;
+        let secret_access_key = generate_aws_secret_access_key()?;
         let key = VirtualKey {
             id: id.clone(),
             key_hash: hash,
@@ -387,12 +464,12 @@ impl GovState {
         Ok(())
     }
 
-    /// all virtual keys (metadata; callers must strip `key_hash` before returning).
+    /// All virtual keys (metadata; callers must strip `key_hash` before returning).
     pub(crate) fn all_keys(&self) -> StoreResult<Vec<VirtualKey>> {
         self.store.list_keys()
     }
 
-    /// delete a key by id + refresh the cache.
+    /// Delete a key by id and refresh the cache.
     pub(crate) fn delete_key(&self, id: &str) -> StoreResult<()> {
         self.store.delete_key(id)?;
         self.refresh()
@@ -447,7 +524,7 @@ impl GovState {
         Ok(Some(key))
     }
 
-    /// current-window usage for a key (None if the key doesn't exist).
+    /// Current-window usage for a key (`None` if the key does not exist).
     pub(crate) fn usage_for(&self, id: &str, now: u64) -> StoreResult<Option<Usage>> {
         match self.store.get_key(id)? {
             Some(key) => {
@@ -565,14 +642,13 @@ impl GovState {
 
     /// Add tokens to the key's rate window for TPM accounting. Called post-response from
     /// `record_tokens` (the production token-fee path; `record_request` is test-only). `now` is the
-    /// request's pinned
-    /// `charged_at` (the header-arrival epoch), i.e. the window the request STARTED in — NOT a fresh
-    /// completion clock. This matters for a request that straddles a 60s boundary: it is admitted by
+    /// request's pinned `charged_at` (the header-arrival epoch), i.e. the window the request STARTED
+    /// in — NOT a fresh completion clock. This matters for a request that straddles a 60s boundary: it is admitted by
     /// `check_rate` in its start window W0, but by the time its (streamed) response completes, a LATER
     /// admission for the same key may have rolled the live entry forward to W1. The credit then
     /// arrives carrying `charged_at` in W0 while the entry lives in W1.
     ///
-    /// CREDIT THE ENTRY'S LIVE WINDOW (MED #6 fix, option b). A start-window OLDER-or-equal to the
+    /// CREDIT THE ENTRY'S LIVE WINDOW. A start-window OLDER-or-equal to the
     /// entry's window is the straddle case above: the request's tokens belong to the same TPM budget
     /// the key is currently spending, so we credit the entry's existing (live) window IN PLACE rather
     /// than dropping the credit or rewinding the entry to the older start window. Previously a `<`
@@ -608,7 +684,7 @@ impl GovState {
             // admission. The tokens belong to the key's currently-live TPM budget, so credit the
             // entry's existing window IN PLACE — do not rewind it to the older start window (which
             // would wipe the live counter) and do not drop the credit (which would let a straddling
-            // request escape TPM). This is the MED #6 fix.
+            // request escape TPM accounting).
             st.tokens = st.tokens.saturating_add(tokens);
         } else {
             // Start-window strictly NEWER than the entry -> the entry is genuinely stale (an old
@@ -634,11 +710,11 @@ impl GovState {
     /// The overshoot is bounded by the caller's parallelism. A hard cap would require an atomic
     /// check-and-charge (a single UPSERT returning post-charge spend) in the `Store`.
     // Read-only budget probe. The admission path now uses the ATOMIC `try_charge_request_within_budget`
-    // (fix 2a) rather than this read-then-charge pair, so PRODUCTION no longer calls it; it is retained
+    // rather than this read-then-charge pair, so production no longer calls it; it is retained
     // ONLY as a governance-unit-test helper. Hence `#[cfg(test)]` (compiled out of the release binary)
     // rather than a dead-code allow.
     #[cfg(test)]
-    pub(crate) fn is_over_budget(&self, key: &VirtualKey, now: u64) -> bool {
+    fn is_over_budget(&self, key: &VirtualKey, now: u64) -> bool {
         let Some(limit) = key.max_budget_cents else {
             return false;
         };
@@ -678,7 +754,7 @@ impl GovState {
         }
     }
 
-    /// ATOMIC budget check-and-charge for the admission path — the HARD-cap primitive (fix 2a).
+    /// ATOMIC budget check-and-charge for the admission path — the HARD-cap primitive.
     ///
     /// In ONE indivisible store round-trip, charge the flat per-request fee + one request to the key's
     /// current budget window IFF it stays within `max_budget_cents`. Replaces the old non-atomic
@@ -695,7 +771,7 @@ impl GovState {
     /// Returns:
     ///   * `Ok(true)`  — charged and admitted (or uncapped key: always charged),
     ///   * `Ok(false)` — would exceed the cap → reject,
-    ///   * `Err(_)`    — store/join error → the caller applies the fail-open/closed knob (fix 2b).
+    ///   * `Err(_)`    — store/join error → the caller applies the configured fail-open/closed knob.
     ///
     /// The flat fee is charged HERE (atomically), so the caller must NOT also charge it in `finish`;
     /// `finish` emits metrics, fires the request-log webhook, and (on a non-2xx outcome) refunds the
@@ -733,7 +809,7 @@ impl GovState {
         });
     }
 
-    /// charge one request (flat per-request cost + token count) to the key's current window.
+    /// Charge one request (flat per-request cost + token count) to the key's current window.
     /// Best-effort: a store error is logged-and-dropped (telemetry must not break serving). The
     /// SQLite write is offloaded to the blocking pool so it never stalls the async executor; the
     /// in-memory TPM counter is updated inline.
@@ -837,10 +913,10 @@ impl GovState {
     pub(crate) fn refresh(&self) -> StoreResult<()> {
         let fresh = Self::load(self.store.as_ref())?;
         let fresh_akid = Self::load_by_access_key_id(self.store.as_ref(), &fresh)?;
-        // LOW-1 (fixed): both indices live under the single `caches` lock, so the swap below is ONE
-        // atomic critical section — a concurrent reader holding `caches_read` sees either the entire
-        // old pair or the entire new pair, never a new `by_hash` against a stale `by_access_key_id`
-        // (or vice versa). There is no longer a transient cross-index inconsistency window.
+        // Both indices live under the single `caches` lock, so the swap below is ONE atomic critical
+        // section — a concurrent reader holding `caches_read` sees either the entire old pair or the
+        // entire new pair, never a new `by_hash` against a stale `by_access_key_id` (or vice versa).
+        // There is no longer a transient cross-index inconsistency window.
         let mut c = self.caches_write();
         c.by_hash = fresh;
         c.by_access_key_id = fresh_akid;
@@ -858,53 +934,58 @@ pub(crate) struct GovCtx {
 /// Generate a virtual-key secret from 16 bytes of the OS CSPRNG (portable across Unix/Windows via
 /// getrandom). Fails closed: if the OS exposes no entropy source we refuse to mint a key rather
 /// than fall back to a guessable (time-derived) secret. getrandom failure is near-impossible on
-/// supported platforms; the panic aborts only the key-mint request (the server stays up).
-fn generate_secret() -> String {
+/// supported platforms; on failure we return the error so the caller (`create_key`) surfaces a 500
+/// instead of panicking the process — the server stays up.
+fn generate_secret() -> Result<String, getrandom::Error> {
     // Portable OS CSPRNG via getrandom: /dev/urandom on Unix, BCryptGenRandom on Windows, etc.
     let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf)
-        .expect("OS CSPRNG (getrandom) unavailable — refusing to mint a guessable virtual key");
-    format!("sk-bb-{}", hex::encode(buf))
+    getrandom::getrandom(&mut buf)?;
+    Ok(format!("{SK_SECRET_PREFIX}{}", hex::encode(buf)))
 }
 
 /// Generate an AWS-style AccessKeyId: the literal `AKIA` prefix (matching the real long-term-key
-/// shape an AWS SDK expects and validates) followed by 16 chars from the AWS access-key alphabet
-/// (uppercase A-Z + 2-7, the base32 set AWS uses). The AccessKeyId is NOT secret — it travels in
-/// plaintext in the SigV4 `Authorization` header and is the public lookup handle — but it is minted
-/// from the OS CSPRNG so it is unguessable and collision-resistant. Fails closed (panics the mint
-/// request only, never the server) if the OS exposes no entropy, mirroring `generate_secret`.
-fn generate_aws_access_key_id() -> String {
-    // AWS access-key alphabet: 32 symbols (A-Z, 2-7). 16 symbols → 80 bits of entropy.
-    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+/// shape an AWS SDK expects and validates) followed by 16 chars from a 36-symbol uppercase
+/// alphanumeric alphabet (A-Z + 0-9), for a fixed total length of 20 — the exact AKID shape AWS
+/// SDK client-side validators accept. The AccessKeyId is NOT secret — it travels in plaintext in
+/// the SigV4 `Authorization` header and is the public lookup handle — but it is minted from the OS
+/// CSPRNG so it is unguessable and collision-resistant. Fails closed (returns the error so the
+/// caller surfaces a 500, never panics the server) if the OS exposes no entropy.
+fn generate_aws_access_key_id() -> Result<String, getrandom::Error> {
+    // 36-symbol uppercase-alphanumeric alphabet (A-Z, 0-9). The AKID format is a FIXED 20 chars
+    // (AKIA + 16 random), so we emit 16 symbols over 36 symbols → 16*log2(36) ≈ 82.7 bits. That is
+    // the maximum entropy attainable inside the fixed 20-char AWS shape; the old code masked each
+    // byte to its low 5 bits (`& 0x1f`) over a 32-symbol set for only 80 bits AND discarded 3 bits
+    // per byte. Dropping the mask and widening the alphabet recovers that headroom without changing
+    // the wire length AWS SDKs validate. (A full ≥100-bit handle is incompatible with the fixed
+    // 20-char format; the secret access key, not the public AKID, carries the real signing entropy.)
+    const ALPHABET: &[u8; 36] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).expect(
-        "OS CSPRNG (getrandom) unavailable — refusing to mint a guessable AWS access key id",
-    );
-    let mut s = String::with_capacity(20);
-    s.push_str("AKIA");
+    getrandom::getrandom(&mut buf)?;
+    let mut s = String::with_capacity(AWS_ACCESS_KEY_ID_LEN);
+    s.push_str(AWS_ACCESS_KEY_PREFIX);
     for &b in &buf {
-        // Map each byte into the 32-symbol alphabet. `& 0x1f` is always in 0..=31, so the index can
-        // never go out of bounds (no panic on the mint path).
-        s.push(ALPHABET[(b & 0x1f) as usize] as char);
+        // Map each FULL byte into the alphabet via modulo. 256 is not a multiple of 36 so the
+        // lowest 4 symbols are marginally favored (a ~0.02-bit bias, negligible for an unguessable
+        // public lookup handle), but no byte bits are discarded. Index is always in 0..36 (no
+        // out-of-bounds, no panic on the mint path).
+        s.push(ALPHABET[(b as usize) % ALPHABET.len()] as char);
     }
-    s
+    Ok(s)
 }
 
 /// Generate an AWS-style secret access key: 40 chars from a base64-like alphabet (matching the shape
 /// real AWS secret keys take), sourced from 30 bytes of the OS CSPRNG (240 bits, encoded). This is
 /// the SYMMETRIC SigV4 signing secret — stored in plaintext (HMAC verification needs the same value
 /// the client signs with) and shown to the operator exactly once at mint. Fails closed on no entropy.
-fn generate_aws_secret_access_key() -> String {
+fn generate_aws_secret_access_key() -> Result<String, getrandom::Error> {
     // Base64-url-safe-ish alphabet without padding: A-Z a-z 0-9 + /. 64 symbols → 6 bits each.
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     // 40 chars * 6 bits = 240 bits = 30 bytes of entropy; draw the 30 bytes and emit 40 symbols.
     let mut buf = [0u8; 30];
-    getrandom::getrandom(&mut buf).expect(
-        "OS CSPRNG (getrandom) unavailable — refusing to mint a guessable AWS secret access key",
-    );
+    getrandom::getrandom(&mut buf)?;
     // Pack the 240 bits and slice them into 40 six-bit groups. A running bit accumulator avoids any
     // dependency on a base64 crate and keeps the mapping panic-free (every index is `& 0x3f`).
-    let mut out = String::with_capacity(40);
+    let mut out = String::with_capacity(AWS_SECRET_ACCESS_KEY_LEN);
     let mut acc: u32 = 0;
     let mut bits = 0u32;
     for &b in &buf {
@@ -916,7 +997,7 @@ fn generate_aws_secret_access_key() -> String {
             out.push(ALPHABET[idx] as char);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Whether `key` may target `pool` (empty allowed_pools = all pools).
@@ -928,13 +1009,13 @@ pub(crate) fn pool_allowed(key: &VirtualKey, pool: &str) -> bool {
 /// single all-time window (0); "daily" = UTC midnight; "monthly" = UTC first-of-month.
 pub(crate) fn budget_window(period: &str, now: u64) -> u64 {
     match period {
-        "daily" => now / SECS_PER_DAY * SECS_PER_DAY,
-        "monthly" => {
+        BUDGET_PERIOD_DAILY => now / SECS_PER_DAY * SECS_PER_DAY,
+        BUDGET_PERIOD_MONTHLY => {
             let days = (now / SECS_PER_DAY) as i64;
             let (y, m, _) = civil_from_days(days);
             (days_from_civil(y, m, 1) as u64) * SECS_PER_DAY
         }
-        "total" => 0, // explicit all-time window (the documented sentinel)
+        BUDGET_PERIOD_TOTAL => 0, // explicit all-time window (the documented sentinel)
         // An unrecognized period (typo such as `monthlly`, or an unsupported value such as
         // `weekly`) is NOT silently accepted as `total`: it almost always means a misconfigured
         // key. We fail safe to the all-time window (0) — the tightest enforcement, never wider —
@@ -1113,6 +1194,11 @@ impl From<rusqlite::Error> for StoreError {
         StoreError(e.to_string())
     }
 }
+impl From<getrandom::Error> for StoreError {
+    fn from(e: getrandom::Error) -> Self {
+        StoreError(format!("OS CSPRNG (getrandom) unavailable: {e}"))
+    }
+}
 
 /// The durable governance store seam. Swappable: `SqliteStore` today, `PostgresStore`
 /// later behind the same trait.
@@ -1169,7 +1255,7 @@ pub(crate) trait Store: Send + Sync + 'static {
         max_cents: Option<i64>,
     ) -> StoreResult<bool>;
 
-    /// REFUND a previously-charged flat per-request fee + its request count (fix 2a companion). The
+    /// REFUND a previously-charged flat per-request fee + its request count. The
     /// atomic admission charge bills EVERY admitted request up front (hard cap); a request that then
     /// produced no usable upstream result (non-2xx) must be refunded so the flat-fee billing policy
     /// stays "charge successful requests only" — matching the pre-fix behavior where `finish` only
@@ -1802,7 +1888,7 @@ mod tests {
             name: "test-key".to_string(),
             allowed_pools: vec!["prod".to_string(), "cheap".to_string()],
             max_budget_cents: Some(5000),
-            budget_period: "monthly".to_string(),
+            budget_period: BUDGET_PERIOD_MONTHLY.to_string(),
             rpm_limit: Some(60),
             tpm_limit: None,
             enabled: true,
@@ -1935,7 +2021,7 @@ mod tests {
                     name: "k".to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: Some(5), // 5c cap → at most 5 one-cent admissions
-                    budget_period: "total".to_string(),
+                    budget_period: BUDGET_PERIOD_TOTAL.to_string(),
                     rpm_limit: None,
                     tpm_limit: None,
                 },
@@ -1984,7 +2070,7 @@ mod tests {
                     name: "k".to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: Some(1), // 1c cap → exactly one request fits
-                    budget_period: "total".to_string(),
+                    budget_period: BUDGET_PERIOD_TOTAL.to_string(),
                     rpm_limit: None,
                     tpm_limit: None,
                 },
@@ -2073,7 +2159,7 @@ mod tests {
                     name: "k".to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: Some(2),
-                    budget_period: "total".to_string(),
+                    budget_period: BUDGET_PERIOD_TOTAL.to_string(),
                     rpm_limit: None,
                     tpm_limit: None,
                 },
@@ -2281,7 +2367,7 @@ mod tests {
                     name: "bedrock-key".to_string(),
                     allowed_pools: vec!["prod".to_string()],
                     max_budget_cents: Some(1000),
-                    budget_period: "total".to_string(),
+                    budget_period: BUDGET_PERIOD_TOTAL.to_string(),
                     rpm_limit: None,
                     tpm_limit: None,
                 },
@@ -2289,10 +2375,10 @@ mod tests {
             )
             .unwrap();
         // AccessKeyId is AKIA-prefixed, 20 chars; secret is 40 chars.
-        assert!(akid.starts_with("AKIA"), "akid shape: {akid}");
-        assert_eq!(akid.len(), 20);
-        assert_eq!(secret.len(), 40);
-        // The AccessKeyId resolves to the SAME key + its secret.
+        assert!(akid.starts_with("AKIA"), "akid shape: {akid}"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(akid.len(), 20); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(secret.len(), 40); // golden wire-contract literal (kept bare on purpose)
+                                      // The AccessKeyId resolves to the SAME key + its secret.
         let entry = gov.lookup_by_access_key_id(&akid).expect("akid resolves");
         assert_eq!(entry.key.id, key.id);
         assert_eq!(entry.secret_access_key, secret);
@@ -2318,7 +2404,7 @@ mod tests {
                         name: "k".to_string(),
                         allowed_pools: vec![],
                         max_budget_cents: None,
-                        budget_period: "total".to_string(),
+                        budget_period: BUDGET_PERIOD_TOTAL.to_string(),
                         rpm_limit: None,
                         tpm_limit: None,
                     },
@@ -2345,7 +2431,7 @@ mod tests {
                     name: "k".to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: None,
-                    budget_period: "total".to_string(),
+                    budget_period: BUDGET_PERIOD_TOTAL.to_string(),
                     rpm_limit: None,
                     tpm_limit: None,
                 },
@@ -2377,7 +2463,7 @@ mod tests {
                     name: "dual-index-key".to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: None,
-                    budget_period: "total".to_string(),
+                    budget_period: BUDGET_PERIOD_TOTAL.to_string(),
                     rpm_limit: None,
                     tpm_limit: None,
                 },
@@ -2449,7 +2535,7 @@ mod tests {
                     name: n.to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: None,
-                    budget_period: "total".to_string(),
+                    budget_period: BUDGET_PERIOD_TOTAL.to_string(),
                     rpm_limit: None,
                     tpm_limit: None,
                 },
@@ -2493,11 +2579,17 @@ mod tests {
 
     #[test]
     fn test_budget_window_periods() {
-        assert_eq!(budget_window("total", 1_700_000_000), 0);
+        assert_eq!(budget_window(BUDGET_PERIOD_TOTAL, 1_700_000_000), 0);
         assert_eq!(budget_window("unknown", 1_700_000_000), 0);
-        assert_eq!(budget_window("daily", 1_700_000_000), 1_699_920_000);
+        assert_eq!(
+            budget_window(BUDGET_PERIOD_DAILY, 1_700_000_000),
+            1_699_920_000
+        );
         // 1700000000 = 2023-11-14 → 2023-11-01 00:00Z = 1698796800.
-        assert_eq!(budget_window("monthly", 1_700_000_000), 1_698_796_800);
+        assert_eq!(
+            budget_window(BUDGET_PERIOD_MONTHLY, 1_700_000_000),
+            1_698_796_800
+        );
     }
 
     /// LEGACY / NON-PRODUCTION PATH. This exercises the deprecated, non-atomic read-then-write pair
@@ -2512,7 +2604,7 @@ mod tests {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let mut k = sample_key("k1", "h1");
         k.max_budget_cents = Some(100);
-        k.budget_period = "total".to_string();
+        k.budget_period = BUDGET_PERIOD_TOTAL.to_string();
         store.put_key(&k).unwrap();
         let gov = GovState::new(store, 30, 0, None).unwrap(); // 30 cents/request
 
@@ -2534,10 +2626,65 @@ mod tests {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         // 50 cents per 1000 tokens, no per-request fee.
         let gov = GovState::new(store.clone(), 0, 50, None).unwrap();
-        gov.record_tokens("k1", "total", 1_700_000_000, 2000); // 2000 * 50 / 1000 = 100 cents
+        gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, 1_700_000_000, 2000); // 2000 * 50 / 1000 = 100 cents
         let u = store.get_usage("k1", 0).unwrap();
         assert_eq!(u.spend_cents, 100);
         assert_eq!(u.tokens, 2000);
+    }
+
+    /// Regression (sub-cent truncation): a request whose token cost is < 1 cent must NOT be
+    /// zero-billed and lost. With 1¢/1k pricing a 500-token request costs 0.5¢ — pure integer-cent
+    /// math truncated that to 0 forever. The millicent carry accrues it, so two such requests
+    /// accumulate to a whole cent. (No runtime → `offload_store_write` runs the write inline.)
+    #[test]
+    fn test_record_tokens_sub_cent_carry_accumulates() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store.clone(), 0, 1, None).unwrap(); // 1¢ per 1000 tokens
+
+        gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, 1_700_000_000, 500); // 0.5¢ → carried, flush 0
+        let u1 = store.get_usage("k1", 0).unwrap();
+        assert_eq!(
+            u1.spend_cents, 0,
+            "first sub-cent request flushes 0 cents (remainder carried)"
+        );
+        assert_eq!(u1.tokens, 500, "but the token COUNT is still recorded");
+
+        gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, 1_700_000_000, 500); // +0.5¢ → 1.0¢ crosses, flush 1
+        let u2 = store.get_usage("k1", 0).unwrap();
+        assert_eq!(
+            u2.spend_cents, 1,
+            "two 0.5¢ requests accrue a whole cent — no truncation loss"
+        );
+        assert_eq!(u2.tokens, 1000);
+    }
+
+    /// Regression (sub-cent carry must NOT leak across budget windows): the remainder is keyed to the
+    /// window it was generated in and reset on rollover, so a 0.5¢ remainder from one daily window is
+    /// NOT flushed into the next day's spend. Without the window-reset both 0.5¢ requests would key the
+    /// same per-key carry and the day-2 request would flush 1¢ that belonged to day 1.
+    #[test]
+    fn test_sub_cent_carry_does_not_leak_across_budget_windows() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store.clone(), 0, 1, None).unwrap(); // 1¢ per 1000 tokens
+        let day1 = 1_700_000_000;
+        let day2 = day1 + 86_400; // one day later → a different "daily" window
+        let w1 = budget_window(BUDGET_PERIOD_DAILY, day1);
+        let w2 = budget_window(BUDGET_PERIOD_DAILY, day2);
+        assert_ne!(
+            w1, w2,
+            "the two timestamps must fall in different daily windows"
+        );
+
+        gov.record_tokens("k1", BUDGET_PERIOD_DAILY, day1, 500); // 0.5¢ in window 1 → carried, flush 0
+        assert_eq!(store.get_usage("k1", w1).unwrap().spend_cents, 0);
+
+        gov.record_tokens("k1", BUDGET_PERIOD_DAILY, day2, 500); // 0.5¢ in window 2: the day-1 remainder is reset
+        assert_eq!(
+            store.get_usage("k1", w2).unwrap().spend_cents,
+            0,
+            "day-2 window must NOT inherit day-1's sub-cent remainder (no cross-window leak)"
+        );
+        assert_eq!(store.get_usage("k1", w2).unwrap().tokens, 500);
     }
 
     /// Token-charge offload UNDER a real Tokio runtime: `test_record_tokens_cost` runs with no runtime
@@ -2554,7 +2701,7 @@ mod tests {
         let gov = GovState::new(store.clone(), 0, 50, None).unwrap();
         // 2000 tokens * 50c / 1000 = 100c. Fire-and-forget; the SQLite write is offloaded to the
         // blocking pool, so the charge is NOT yet visible synchronously after this returns.
-        gov.record_tokens("k1", "total", 1_700_000_000, 2000);
+        gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, 1_700_000_000, 2000);
         // Drain the offloaded write with a bounded poll (NOT a fixed sleep): yield to let the blocking
         // task be scheduled, then re-read until the charge lands or the retry budget is exhausted.
         let mut usage = None;
@@ -2622,6 +2769,17 @@ mod tests {
         unl.tpm_limit = None;
         assert_eq!(gov.rate_headroom(&unl, now), None);
 
+        // RPM=0: a fully-closed limit. The code guards the divide-by-zero (rpm==0 → no headroom);
+        // assert 0.0 rather than a panic, so a future removal of that guard is caught here.
+        let mut kz = sample_key("kz", "hz");
+        kz.rpm_limit = Some(0);
+        kz.tpm_limit = None;
+        assert_eq!(
+            gov.rate_headroom(&kz, now),
+            Some(0.0),
+            "rpm=0 is fully closed → 0.0 headroom, not a divide-by-zero panic"
+        );
+
         // RPM=4: fresh window is fully available (1.0). Observation must NOT consume budget.
         let mut k = sample_key("k1", "h1");
         k.rpm_limit = Some(4);
@@ -2669,7 +2827,7 @@ mod tests {
             "first request admits regardless of TPM"
         );
         // Its response completes in the same window and accrues 1000 tokens (>= the cap).
-        gov.record_tokens("k1", "total", now, 1000);
+        gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, now, 1000);
         // Next request in the same window is now rejected on TPM.
         let retry = gov.check_rate(&k, now + 1).unwrap_err();
         assert!(
@@ -2704,8 +2862,8 @@ mod tests {
         assert!(gov.check_rate(&k, w1).is_ok());
         // The straddling request's response completes; its credit carries the pinned `charged_at` in
         // W0 (older than the live W1 entry). It must land on the LIVE W1 window, not be dropped.
-        gov.record_tokens("k1", "total", w0, 400);
-        gov.record_tokens("k1", "total", w0, 200); // 600 >= 500 against the live W1 budget
+        gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, w0, 400);
+        gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, w0, 200); // 600 >= 500 against the live W1 budget
         let retry = gov.check_rate(&k, w1 + 1).unwrap_err();
         assert!(
             (1..=60).contains(&retry),
@@ -2740,7 +2898,7 @@ mod tests {
                 },
             );
         }
-        gov.record_tokens("k1", "total", w1, 40);
+        gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, w1, 40);
         let map = gov.rate.read().unwrap_or_else(|p| p.into_inner());
         let st = map.get("k1").expect("entry exists");
         assert_eq!(
@@ -2946,7 +3104,7 @@ mod tests {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let mut k = sample_key("k1", "h1");
         k.max_budget_cents = Some(1000);
-        k.budget_period = "total".to_string();
+        k.budget_period = BUDGET_PERIOD_TOTAL.to_string();
         let gov = GovState::new(store.clone(), 30, 0, None).unwrap();
 
         gov.record_request(&k, 1_700_000_000, 0);
@@ -2977,7 +3135,7 @@ mod tests {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let mut k = sample_key("k1", "h1");
         k.max_budget_cents = Some(100);
-        k.budget_period = "total".to_string();
+        k.budget_period = BUDGET_PERIOD_TOTAL.to_string();
         let gov = GovState::new(store.clone(), -50, 0, None).unwrap(); // hostile negative price
 
         for _ in 0..5 {
@@ -2998,7 +3156,7 @@ mod tests {
         // Mirror assertion for the token-price path (already clamped pre-fix; lock it in).
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let gov = GovState::new(store.clone(), 0, -100, None).unwrap();
-        gov.record_tokens("k1", "total", 1_700_000_000, 5000);
+        gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, 1_700_000_000, 5000);
         let u = store.get_usage("k1", 0).unwrap();
         assert_eq!(u.spend_cents, 0, "negative token price must clamp to 0");
         assert_eq!(u.tokens, 5000, "tokens are still counted");
@@ -3013,13 +3171,13 @@ mod tests {
             name: "first".to_string(),
             allowed_pools: vec![],
             max_budget_cents: None,
-            budget_period: "total".to_string(),
+            budget_period: BUDGET_PERIOD_TOTAL.to_string(),
             rpm_limit: None,
             tpm_limit: None,
         };
         let (key, secret) = gov.create_key(spec, 1_700_000_000).unwrap();
-        assert!(key.id.starts_with("vk_"));
-        // The minted key resolves by its own secret.
+        assert!(key.id.starts_with("vk_")); // golden wire-contract literal (kept bare on purpose)
+                                            // The minted key resolves by its own secret.
         assert_eq!(gov.lookup(&secret).unwrap().id, key.id);
     }
 
@@ -3035,7 +3193,7 @@ mod tests {
                     name: "k".to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: None,
-                    budget_period: "total".to_string(),
+                    budget_period: BUDGET_PERIOD_TOTAL.to_string(),
                     rpm_limit: Some(10),
                     tpm_limit: None,
                 },
@@ -3085,7 +3243,7 @@ mod tests {
                     name: "k".to_string(),
                     allowed_pools: vec![],
                     max_budget_cents: Some(5000),
-                    budget_period: "total".to_string(),
+                    budget_period: BUDGET_PERIOD_TOTAL.to_string(),
                     rpm_limit: Some(10),
                     tpm_limit: Some(2000),
                 },
@@ -3162,7 +3320,7 @@ mod tests {
             gov.record_request(&uncapped, now, 1234); // non-zero tokens — would feed the map pre-fix
         }
         // record_tokens carries only the key id (no caps), so it must also not materialise an entry.
-        gov.record_tokens("uncapped", "total", now, 9999);
+        gov.record_tokens("uncapped", BUDGET_PERIOD_TOTAL, now, 9999);
         assert!(
             gov.rate
                 .read()
@@ -3221,7 +3379,7 @@ mod tests {
         );
 
         // Likewise via record_tokens (the token-fee path): no entry exists, so nothing is created.
-        gov.record_tokens("late", "total", now, 500);
+        gov.record_tokens("late", BUDGET_PERIOD_TOTAL, now, 500);
         assert!(
             gov.rate
                 .read()
@@ -3371,7 +3529,7 @@ mod tests {
             name: "victim".into(),
             allowed_pools: vec!["p1".into()],
             max_budget_cents: Some(1000),
-            budget_period: "total".into(),
+            budget_period: BUDGET_PERIOD_TOTAL.into(),
             rpm_limit: Some(60),
             tpm_limit: Some(1000),
             enabled: true,
@@ -3415,7 +3573,7 @@ mod tests {
             name: "k".into(),
             allowed_pools: vec![],
             max_budget_cents: None,
-            budget_period: "total".into(),
+            budget_period: BUDGET_PERIOD_TOTAL.into(),
             rpm_limit: None,
             tpm_limit: None,
             enabled: true,

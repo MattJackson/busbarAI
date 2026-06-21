@@ -355,6 +355,17 @@ Same-protocol error responses (`4xx`) are relayed verbatim.
 
 ## What survives translation and what does not
 
+### What "lossless" means here
+
+Busbar's translation is **lossless** in a specific, testable sense: **neither end can tell the hop happened.**
+
+- **The client is never confused.** It gets a response its own SDK parses cleanly, in its own protocol's shape, that never contradicts what it sent — no `finish_reason`/`stop_reason` outside its enum, no field in a shape its validator rejects, no identifier minted by a foreign vendor.
+- **The backend never rejects the request.** What Busbar sends upstream is a valid request in the *backend's* protocol — never a foreign-shaped structured-output object, an off-enum image format, a non-alternating message sequence, or any field the backend 400s as malformed.
+
+The reference is native-to-native: a translated exchange should behave exactly as if the client had spoken the backend's protocol directly. A difference counts as *loss* only if it trips one of those two tests — a client that can't parse what it got back, or a backend that rejects what it was sent. Field-level differences that trip neither test (e.g. an upstream `id` replaced with an ingress-native one) are not loss.
+
+Where a construct genuinely has **no representation** in the target protocol — a rare, inherent limit, see [Lost on a cross-protocol hop](#lost-on-a-cross-protocol-hop) — Busbar degrades it to the closest valid native form **and emits a `warn!`**, never something either end would reject. The degradation is observable in logs; it is never silent and never yields an unparseable or malformed wire body.
+
 ### Always preserved
 
 These fields survive a cross-protocol hop because they are first-class in the IR:
@@ -364,17 +375,20 @@ These fields survive a cross-protocol hop because they are first-class in the IR
 | `system` prompt | `IrRequest.system` |
 | Messages (user / assistant / tool turns) | `IrRequest.messages: Vec<IrMessage>` |
 | Text blocks | `IrBlock::Text { text, cache_control, citations }` |
-| Thinking / extended-thinking blocks | `IrBlock::Thinking { text, signature }` |
+| Thinking / extended-thinking blocks | `IrBlock::Thinking { text, signature, cache_control }` |
 | Tool definitions | `IrRequest.tools` — `IrTool { name, description, input_schema }` |
 | Tool-use and tool-result blocks | `IrBlock::ToolUse`, `IrBlock::ToolResult` |
-| Image blocks | `IrBlock::Image { media_type, data }` |
+| Image blocks | `IrBlock::Image { media_type, data, cache_control }` |
+| Prompt-cache breakpoints (`cache_control`) | First-class on text, tool-use, tool-result, **thinking, and image** blocks — an Anthropic cache breakpoint survives a same-protocol re-serialize instead of vanishing |
+| Structured output (`response_format` / `responseSchema`) | `IrRequest.response_format` — mapped into **each backend's native shape** (OpenAI `json_schema`, Cohere `json_object`, Gemini `responseMimeType`/`responseSchema`), never forwarded in a foreign shape the backend rejects |
+| Stop reason (`finish_reason` / `stop_reason` / `finishReason`) | Normalized to a **valid member of each protocol's enum** on egress — an unknown/foreign reason degrades to that protocol's SDK-safe value rather than leaking an off-enum string the client can't parse |
 | `max_tokens` | `IrRequest.max_tokens` |
 | `temperature` | `IrRequest.temperature: f64` (not f32 — no lossy round-trip) |
 | `top_p`, `top_k` | `IrRequest.top_p`, `IrRequest.top_k` |
 | `stop` sequences | `IrRequest.stop: Vec<String>` |
 | `stream` flag | `IrRequest.stream` |
-| `frequency_penalty`, `presence_penalty`, `seed` | First-class IR fields as of rc.6; survive cross-protocol hops (dropped with `warn!` where the target protocol has no analog) |
-| Grounding/web-search citations | `IrCitation` (with `raw` escape hatch for byte-exact Anthropic re-emit); streaming `citations_delta` included — as of rc.7 |
+| `frequency_penalty`, `presence_penalty`, `seed` | First-class IR fields; survive cross-protocol hops (dropped with `warn!` where the target protocol has no analog) |
+| Grounding/web-search citations | `IrCitation` (with `raw` escape hatch for byte-exact Anthropic re-emit); streaming `citations_delta` included |
 | Serving model name | `IrResponse.model` (so pooled cross-protocol responses report which model served) |
 | Token usage | `IrUsage` (input/output tokens, with input-usage backfill on streams that only report it at message start) |
 
