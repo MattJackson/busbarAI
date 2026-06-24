@@ -38,6 +38,18 @@ pub(crate) struct Lane {
     /// (Anthropic Messages — see `ProtocolWriter::requires_max_tokens`). Falls back to
     /// `crate::proto::DEFAULT_MAX_TOKENS` when unset.
     pub(crate) default_max_tokens: Option<u32>,
+    /// Optional upstream model name override. When set, this value is sent to the provider as the
+    /// model identifier in the request body and URL path, instead of `self.model` (the config key).
+    /// Useful when the provider expects a different model string (e.g. Bedrock model IDs).
+    pub(crate) upstream_name: Option<String>,
+}
+
+impl Lane {
+    /// The model name to send on the wire. Returns `upstream_name` when set,
+    /// otherwise falls back to the config key (`self.model`).
+    pub(crate) fn upstream_model(&self) -> &str {
+        self.upstream_name.as_deref().unwrap_or(&self.model)
+    }
 }
 
 /// A pool lane with its associated weight.

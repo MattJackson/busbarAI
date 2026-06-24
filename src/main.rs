@@ -392,6 +392,7 @@ async fn main() {
             ok: 0,
             err: 0,
             client_fault: 0,
+            upstream_name: mc.upstream_name.clone(),
         });
 
         eprintln!(
@@ -445,6 +446,7 @@ async fn main() {
             path: provider_cfg.path.clone(),
             auth: provider_cfg.auth,
             health: provider_cfg.health.clone(),
+            upstream_name: ld.upstream_name.clone(),
             default_max_tokens: model_default_max_tokens.get(&ld.model).copied().flatten(),
         });
     }

@@ -110,6 +110,7 @@ pub(crate) struct MockServerState {
     last_auth_header: std::sync::Mutex<Option<String>>,
     last_request_body: std::sync::Mutex<Option<Vec<u8>>>,
     last_request_headers: std::sync::Mutex<Option<axum::http::HeaderMap>>,
+    last_request_path: std::sync::Mutex<Option<String>>,
 }
 
 impl MockServerState {
@@ -136,6 +137,16 @@ impl MockServerState {
     /// Clear the recorded Authorization header
     pub(crate) fn clear_auth_header(&self) {
         *self.last_auth_header.lock().unwrap() = None;
+    }
+
+    /// Record the received request path (for translation / on-the-wire assertions).
+    pub(crate) fn record_request_path(&self, path: &str) {
+        *self.last_request_path.lock().unwrap() = Some(path.to_string());
+    }
+
+    /// Get the last received request path.
+    pub(crate) fn get_last_request_path(&self) -> Option<String> {
+        self.last_request_path.lock().unwrap().clone()
     }
 
     /// Record the last received request body (for translation / on-the-wire assertions).
@@ -212,6 +223,9 @@ async fn mock_handler(
     request: Request<Body>,
 ) -> Response<Body> {
     let (parts, body) = request.into_parts();
+
+    // Record the request path for upstream-path assertions.
+    state.record_request_path(parts.uri.path());
 
     // Record the full header set the upstream received (indistinguishability assertions).
     state.record_request_headers(&parts.headers);
@@ -452,6 +466,7 @@ pub(crate) struct LaneSpec {
     auth: Option<String>,
     health: Option<crate::config::HealthCfg>,
     default_max_tokens: Option<u32>,
+    upstream_name: Option<String>,
     // LaneData-only runtime state (defaults = a fresh, healthy, unlimited lane):
     limited: bool,
     budget: i64,
@@ -483,6 +498,7 @@ impl LaneSpec {
             auth: None,
             health: None,
             default_max_tokens: None,
+            upstream_name: None,
             limited: false,
             budget: -1,
             cooldown_until: 0,
@@ -529,6 +545,10 @@ impl LaneSpec {
     }
     pub(crate) fn default_max_tokens(mut self, n: u32) -> Self {
         self.default_max_tokens = Some(n);
+        self
+    }
+    pub(crate) fn upstream_name(mut self, n: &str) -> Self {
+        self.upstream_name = Some(n.into());
         self
     }
     /// Mark the lane as budget-limited with `n` remaining requests (sets `limited = true`).
@@ -583,6 +603,7 @@ impl LaneSpec {
             }),
             health: self.health.clone(),
             default_max_tokens: self.default_max_tokens,
+            upstream_name: self.upstream_name.clone(),
         }
     }
     fn to_lane_data(&self) -> crate::store::LaneData {
@@ -603,6 +624,7 @@ impl LaneSpec {
             ok: self.ok,
             err: self.err,
             client_fault: self.client_fault,
+            upstream_name: self.upstream_name.clone(),
         }
     }
 }
@@ -3651,6 +3673,7 @@ mod tests {
                 provider: "p".into(),
                 max_concurrent: 10,
                 default_max_tokens: None,
+                upstream_name: None,
             };
             let pool = crate::config::PoolCfg {
                 members: vec![crate::config::PoolMember {

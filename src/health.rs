@@ -125,11 +125,11 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
         return;
     }
 
-    let body = lane.protocol.writer().probe_body(&lane.model);
+    let body = lane.protocol.writer().probe_body(lane.upstream_model());
     let url_path = lane.path.clone().unwrap_or_else(|| {
         lane.protocol
             .writer()
-            .upstream_path_for_stream(&lane.model, false)
+            .upstream_path_for_stream(lane.upstream_model(), false)
     });
 
     // SigV4 signs over the URI-encoded canonical path, so the probe MUST send the wire request over
@@ -591,6 +591,40 @@ mod tests {
              ok == 8 (the pre-fix per-cell multi-count of 4 per probe)"
         );
         server.shutdown().await;
+    }
+
+    /// REGRESSION: active health probes must use `upstream_name` on the wire so they exercise the
+    /// same model actual traffic hits. Without this a lane with `upstream_name` reports healthy
+    /// against the config key while real requests fail against the upstream model ID.
+    #[tokio::test]
+    async fn test_probe_uses_upstream_name_override() {
+        let state = Arc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: StatusCode::OK,
+            body: serde_json::json!({"ok": true}),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("config-key", Protocol::bedrock(), &server.base_url())
+                    .api_key("sk-test")
+                    .upstream_name("anthropic.claude-3-5-sonnet-20241022-v2:0")
+                    .health(health_active()),
+            )
+            .pool("p", &[(0, 1)])
+            .build();
+        probe_lane(&app, 0, Duration::from_secs(5)).await;
+
+        // Path must carry the upstream model ID (with SigV4-safe percent encoding for reserved `:`).
+        let path = state.get_last_request_path().expect("probe must reach upstream");
+        assert!(
+            path.contains("anthropic.claude-3-5-sonnet-20241022-v2%3A0"),
+            "probe path must encode upstream_name, got {path}"
+        );
+
+        // Body is empty for Bedrock (model lives in URL), but for body-model protocols probe_body
+        // also passes upstream_model — indistinguishability from organic traffic requires the same
+        // wire name everywhere.
     }
 
     /// REGRESSION (R16 HIGH, SigV4 signed==sent): the active probe MUST sign the canonical URI from

@@ -1473,6 +1473,9 @@ pub(crate) struct LaneData {
     pub(crate) ok: u64,
     pub(crate) err: u64,
     pub(crate) client_fault: u64,
+    /// Optional upstream model name override. When set, this value is sent to the provider as the
+    /// model identifier in the request body and URL path, instead of `self.model` (the config key).
+    pub(crate) upstream_name: Option<String>,
 }
 
 /// Helper for weighted selection tests - creates a lane with specific weight.
@@ -1492,6 +1495,7 @@ fn make_lane_data_with_weight(id: usize, max_permits: usize) -> (LaneData, u32) 
         ok: 0,
         err: 0,
         client_fault: 0,
+        upstream_name: None,
     };
     (lane, (id as u32) + 1) // weight = id + 1 (so lane 0 has weight 1, lane 1 has weight 2, etc.)
 }
@@ -2429,6 +2433,7 @@ mod tests {
             ok: 0,
             err: 0,
             client_fault: 0,
+            upstream_name: None,
         }
     }
 

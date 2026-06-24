@@ -1467,6 +1467,7 @@ mod tests {
             provider: provider.into(),
             max_concurrent,
             default_max_tokens: None,
+            upstream_name: None,
         }
     }
 

@@ -478,7 +478,7 @@ fn translate_request_cross_protocol(
     pristine &= !app.lanes[i]
         .protocol
         .writer()
-        .rewrite_model_if_needed(&mut body, &app.lanes[i].model); // invalidator #3
+        .rewrite_model_if_needed(&mut body, app.lanes[i].upstream_model()); // invalidator #3
     if ingress_protocol == egress_name {
         pristine &= !strip_same_protocol_model_shim(&mut body, ingress_protocol);
         // invalidator #4
@@ -2487,7 +2487,7 @@ pub(crate) async fn forward_with_pool_parsed(
         let url_path = match &app.lanes[i].path {
             // Provider-configured path override (e.g. version-in-base-url providers).
             Some(p) => p.clone(),
-            None => writer.upstream_path_for_stream(&app.lanes[i].model, wants_stream),
+            None => writer.upstream_path_for_stream(app.lanes[i].upstream_model(), wants_stream),
         };
         // SigV4 signs over the URI-encoded canonical path, so the wire request MUST be sent over the
         // SAME encoding or AWS rejects with SignatureDoesNotMatch (e.g. a Bedrock modelId carrying
@@ -3628,7 +3628,7 @@ async fn forward_once(
     let writer = app.lanes[i].protocol.writer();
     let url_path = match &app.lanes[i].path {
         Some(p) => p.clone(),
-        None => writer.upstream_path_for_stream(&app.lanes[i].model, wants_stream),
+        None => writer.upstream_path_for_stream(app.lanes[i].upstream_model(), wants_stream),
     };
     // Sign and send the SAME path encoding — see `sign_and_wire_path_parts` (mirrors the main forward
     // path): it returns the SigV4 canonical_uri (query stripped) alongside the wire path, so the
@@ -4841,6 +4841,7 @@ mod auth_style_tests {
                 other => panic!("unexpected test auth style: {other}"),
             }),
             health: None,
+            upstream_name: None,
         }
     }
 
@@ -5035,6 +5036,7 @@ mod max_tokens_precedence_tests {
             path: None,
             auth: None,
             health: None,
+            upstream_name: None,
         }
     }
 
@@ -5194,8 +5196,46 @@ mod request_short_circuit_tests {
         }
     }
 
+    // `upstream_name` override must win on the wire. Covers the override branch of
+    // `Lane::upstream_model()` that no existing test exercises (all default `upstream_name` to
+    // `None`). Body-model protocol: rewrite_model_if_needed installs `upstream_name`. URL-model
+    // protocol: upstream_path_for_stream embeds `upstream_name` in the path.
+    #[test]
+    fn upstream_name_override_rewrites_body_and_url_model() {
+        // Body-model protocol: rewrite_model_if_needed installs `upstream_name`.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("config-key", Protocol::openai(), "http://unused.local")
+                    .upstream_name("upstream-real"),
+            )
+            .build();
+        let body = json!({"model":"client-alias","messages":[]});
+        let hop_bytes = crate::json::to_vec(&body).unwrap();
+        let out = translate_request_cross_protocol(&app, 0, "openai", body, &hop_bytes)
+            .expect("same-proto shaping is infallible for a valid body");
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed.get("model").and_then(|m| m.as_str()),
+            Some("upstream-real"),
+            "body-model egress must carry the upstream_name override"
+        );
+
+        // URL-model protocol: upstream_path_for_stream embeds upstream_name in the path.
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("config-key", Protocol::bedrock(), "http://unused.local")
+                    .upstream_name("upstream.real/model"),
+            )
+            .build();
+        let writer = app.lanes[0].protocol.writer();
+        assert_eq!(
+            writer.upstream_path_for_stream(app.lanes[0].upstream_model(), false),
+            "/model/upstream.real/model/converse",
+            "URL-model path must embed the upstream_name override (raw; percent-encoding happens at sign/send time)"
+        );
+    }
+
     // MODEL-IN-URL protocols (gemini/bedrock): a pristine native request carries NO body `model`
-    // (it rides the URL) and NO `stream`/array-shim key → nothing mutates → original bytes verbatim.
     #[test]
     fn pristine_same_proto_is_byte_identical_url_model() {
         let cases: &[(Protocol, &'static str, serde_json::Value)] = &[
@@ -9081,6 +9121,7 @@ mod probe_guard_tests {
             ok: 0,
             err: 0,
             client_fault: 0,
+            upstream_name: None,
         }
     }
 
