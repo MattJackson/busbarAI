@@ -22,7 +22,7 @@ and the two common extension tasks.
 | `state.rs` | Runtime types: `Lane`, `WeightedLane`, `PoolRuntime`, and the `App` shared state. |
 | `route.rs` | Axum handlers — one per ingress protocol: `openai_ingress` (`/v1/chat/completions`), `cohere_ingress` (`/v2/chat`), `responses_ingress` (`/v1/responses`), `gemini_ingress` (`/v1/models/*rest` and `/v1beta/models/*rest` — both the stable `v1` and the `v1beta` path prefixes route to the same handler), `bedrock_converse` / `bedrock_converse_stream` (`/model/:model_id/converse[-stream]`), `named` (`/:name/v1/messages`), `adhoc` (`/:provider/:model/v1/messages`); governance pre-checks (allowed-pools/budget/rate); affinity-header resolution; `UsageSink` construction. |
 | `auth.rs` | `AuthMode` (none/token/passthrough), `AuthMiddleware`, the `auth_middleware` layer (open `/healthz` only — `/metrics` is auth-gated like other routes; admin-token guard for `/admin/*`, virtual-key resolution, passthrough token threading), constant-time token compare. |
-| `forward.rs` | The forwarding engine: `forward` / `forward_with_pool` (selection → translate → sign → POST → classify → stream/failover), `RequestCtx` (deadline + exclusions + visited-pools), `FirstByteBody` (streaming body with the before-first-byte failover boundary + cross-protocol `StreamTranslate` wiring), `UsageTap`/`UsageSink`, `lane_auth_headers` (the `api-key` auth-adapter seam), and the `on_exhausted` handlers (`Status503`/`FallbackPool`/`LeastBad`). |
+| `forward.rs` | The forwarding engine: `forward` / `forward_with_pool` (selection → translate → sign → POST → classify → stream/failover), `RequestCtx` (deadline + exclusions + visited-pools), `FirstByteBody` (streaming body with the before-first-byte failover boundary + cross-protocol `StreamTranslate` wiring), `UsageSink`, `lane_auth_headers` (the `api-key` auth-adapter seam), and the `on_exhausted` handlers (`Status503`/`FallbackPool`/`LeastBad`). |
 | `breaker.rs` | The protocol-agnostic Stage 1b/2 classifier: `StatusClass`, `Disposition`, `RawUpstreamError`, `CanonicalSignal`, `normalize_raw_error`, `classify` (exhaustive). |
 | `store.rs` | The breaker FSM + lane state: `StateStore` trait, `InMemoryStore`, `LaneState`, `BreakerCell` / `BreakerCellAccess`, `OutcomeWindow`, SWRR `select_weighted`, the lane-default vs `_in(pool, …)` method split, `BreakerCfg`/`TripConfig`, test time injection (`set_now_for_test`/`now_for_test`). |
 | `ir.rs` | The superset IR (ADR-0005): `IrRequest`, `IrResponse`, `IrMessage`, `IrBlock`, `IrTool`, `IrUsage`, `IrStreamEvent`, `IrDelta`, `StreamDecodeState`. |
@@ -205,7 +205,7 @@ checklist as authoritative.
   methods that release code reaches only via the `_in` variants but tests exercise
   directly — keep that pattern when adding parallel default/`_in` methods.
 
-- **No `memchr` dependency.** Byte scanning (e.g. `UsageTap`'s bounded brace-scan,
-  the SSE frame splitting) is done with plain slice iteration, not the `memchr`
-  crate. Keep it that way — don't add `memchr` (or pull it in transitively for
-  scanning) when a small hand-rolled scan will do.
+- **No `memchr` dependency.** Byte scanning (e.g. the SSE frame splitting and
+  translation-body boundary scans) is done with plain slice iteration, not the
+  `memchr` crate. Keep it that way — don't add `memchr` (or pull it in transitively
+  for scanning) when a small hand-rolled scan will do.
