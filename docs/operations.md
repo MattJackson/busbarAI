@@ -115,7 +115,7 @@ All metrics are Prometheus counters/histograms exposed at `/metrics`.
 | `busbar_lane_state` | gauge | `pool`, `lane` | Circuit-breaker health per lane: `0` = Closed, `1` = HalfOpen, `2` = Open (tripped). Side-effect-free at scrape. |
 | `busbar_route_policy_selections_total` | counter | `pool`, `policy` | Requests where a routing policy (webhook/script/native) produced a usable ranked order. Only incremented on a successful `Order` outcome; abstains and on-error fallbacks are not counted. |
 | `busbar_webhook_logs_dropped_total` | counter | — | Request-log webhook deliveries shed because the in-flight delivery pool was saturated (a slow/unreachable webhook endpoint). A non-zero rate means request logs are being silently dropped — scale the endpoint or alert. |
-| `busbar_billing_truncated_total` | counter | — | Same-protocol non-stream responses whose body exceeded the usage-tap reassembly cap, so the terminal `usage` frame was missed and the request billed zero tokens (the client still got a full response). A non-zero rate signals an over-cap billing gap. |
+| `busbar_billing_truncated_total` | counter | — | Same-protocol non-stream responses whose body exceeded the translate-body cap, so the terminal `usage` frame was missed and the request billed zero tokens (the client still got a full response). A non-zero rate signals an over-cap billing gap. |
 
 `/metrics` requires a valid client token in `token` mode (or a virtual key under
 governance) — it is treated as an information-disclosure surface and goes through
