@@ -341,7 +341,7 @@ Busbar reassembles frames that arrive split across TCP chunks, threads per-reque
 
 ### Same-protocol passthrough
 
-When ingress and egress protocols match, the IR round-trip is skipped entirely (`StreamTranslate::new` returns `None`, signaling byte-exact native passthrough). The request body and response body pass through byte-for-byte. Cache-control annotations, thinking blocks, citations, and any other protocol-specific fields that the IR would not model survive untouched.
+When ingress and egress protocols match, the IR round-trip is still used, but `StreamTranslate::new_same_proto` runs a byte-exact passthrough: the translator re-emits the original frame bytes verbatim instead of re-serializing from IR. This keeps same-protocol traffic lossless and just as cheap as native passthrough while using the same code path as cross-protocol traffic.
 
 A `busbar_translations_total{from, to}` Prometheus counter is incremented per cross-protocol hop and is not touched for same-protocol requests.
 

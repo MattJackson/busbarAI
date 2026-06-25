@@ -35,10 +35,11 @@ everything it models, and to make a same-protocol hop lossless for *everything*.
   to the modeled subset (e.g. `top_p`). A reader can stash unmodeled request
   fields here; whether a given writer re-emits them depends on that writer.
 - **Lossy by necessity.** Anything neither modeled in the IR enums nor carried in
-  `extra` does not survive a *cross-protocol* hop. **Same-protocol routes never
-  touch the IR** — `forward_with_pool` only translates when
-  `ingress_protocol != egress_name`, so a same-protocol request/response is
-  byte-for-byte passthrough and fully lossless.
+  `extra` does not survive a *cross-protocol* hop. **Same-protocol routes use the IR
+  path but remain byte-exact.** `StreamTranslate::new_same_proto` re-emits the
+  original frame bytes verbatim instead of re-serializing from IR, so a
+  same-protocol request/response stays fully lossless while sharing the unified
+  translate path.
 
 Streaming uses a parallel set of IR types: `IrStreamEvent`
 (MessageStart/BlockStart/BlockDelta/BlockStop/MessageDelta/MessageStop/Error),
