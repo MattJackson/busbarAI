@@ -38,9 +38,11 @@ confidence-threshold = 0.9
 
 [[licenses.exceptions]]
 # busbar's own crate is AGPL — exempt it from the allow-list above (the allow-list
-# governs third-party deps, not the workspace member itself).
+# governs third-party deps, not the workspace member itself). Must be the EXACT SPDX
+# string in Cargo.toml (`AGPL-3.0-or-later`); `AGPL-3.0` would not match and the
+# exception would be silently skipped.
 name = "busbar"
-allow = ["AGPL-3.0"]
+allow = ["AGPL-3.0-or-later"]
 
 [bans]
 # Enforce the "single stack" goal documented throughout Cargo.toml: duplicate major
