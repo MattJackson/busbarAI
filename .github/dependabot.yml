@@ -11,7 +11,8 @@ updates:
     commit-message:
       prefix: "deps"
 
-  # GitHub Actions used by the CI / release / pages workflows.
+  # GitHub Actions used by the CI / release / pages / security workflows.
+  # A compromised action is itself a supply-chain vector, so these are tracked too.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

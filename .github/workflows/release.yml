@@ -8,7 +8,9 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: write      # create the Release + upload assets
+  id-token: write      # OIDC identity for keyless Sigstore signing (provenance)
+  attestations: write  # record the build-provenance attestation
 
 jobs:
   # Create the Release first so the parallel upload jobs have something to attach to
@@ -26,6 +28,32 @@ jobs:
             --title "busbar ${GITHUB_REF_NAME}" \
             --verify-tag --generate-notes \
           || gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
+
+  # Generate a CycloneDX Software Bill of Materials (every dependency + version +
+  # license) and attach it to the Release. Lets downstream users answer "is the
+  # crate in advisory X inside busbar v1.0.1?" without decompiling, and satisfies
+  # enterprise/government (EO 14028) procurement that increasingly requires an SBOM.
+  sbom:
+    needs: create-release
+    name: sbom (cyclonedx)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      - name: Generate SBOM
+        run: cargo cyclonedx --format json --override-filename "busbar-${GITHUB_REF_NAME}.cdx"
+      - name: Attach SBOM to Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # cargo-cyclonedx writes the SBOM next to the package's Cargo.toml.
+          sbom="$(find . -name "busbar-${GITHUB_REF_NAME}.cdx.json" -print -quit)"
+          test -n "$sbom" || { echo "SBOM not found"; exit 1; }
+          gh release upload "${GITHUB_REF_NAME}" "$sbom" \
+            --repo "${GITHUB_REPOSITORY}" --clobber
 
   upload-assets:
     needs: create-release
@@ -57,3 +85,14 @@ jobs:
           target: ${{ matrix.target }}
           archive: busbar-$target
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Generate a keyless (Sigstore/OIDC) build-provenance attestation binding THIS
+      # archive's digest to this workflow run + commit. A user verifies the download with
+      #   gh attestation verify <archive> --repo ${{ github.repository }}
+      # so a swapped/backdoored artifact on the Release page (the LiteLLM-PyPI scenario)
+      # fails verification. The glob matches whichever extension was produced (.tar.gz on
+      # unix, .zip on windows); `archive: busbar-$target` leaves it in the workspace.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: "busbar-${{ matrix.target }}.*"

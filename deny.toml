@@ -1,0 +1,60 @@
+# cargo-deny policy for busbar. Run locally with `cargo deny check`, and in CI
+# via .github/workflows/security.yml. This file mechanically enforces the
+# supply-chain discipline that Cargo.toml already applies by hand (single TLS/HTTP
+# stack, no unmaintained/unsafe deps, license hygiene) so a future PR cannot
+# silently regress it.
+
+[advisories]
+# RustSec advisory DB: fail on any crate in Cargo.lock with a known vulnerability.
+# `yanked` deps are also flagged. Add specific advisory IDs to `ignore` ONLY with a
+# written justification and a tracking link — never blanket-ignore.
+version = 2
+ignore = []
+
+[licenses]
+# busbar is AGPL-3.0-or-later; only allow licenses compatible with redistributing
+# under that. SPDX identifiers. A dependency under anything not listed fails the
+# build, forcing a conscious decision rather than an accidental license violation.
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+    "BSL-1.0",                # Boost Software License (permissive); appears dual w/ Apache
+    "CDLA-Permissive-2.0",    # Community Data License Agreement (permissive); single-licensed dep in tree
+    "Unlicense",              # public-domain equivalent; appears dual w/ MIT
+]
+confidence-threshold = 0.9
+
+[[licenses.exceptions]]
+# busbar's own crate is AGPL — exempt it from the allow-list above (the allow-list
+# governs third-party deps, not the workspace member itself).
+name = "busbar"
+allow = ["AGPL-3.0"]
+
+[bans]
+# Enforce the "single stack" goal documented throughout Cargo.toml: duplicate major
+# versions of the same crate (e.g. two reqwest majors, two rustls backends) are a
+# warning to investigate, since they bloat the binary and double the audit surface.
+multiple-versions = "warn"
+# A crate pulled in via wildcard (`*`) version is unpinnable and a supply-chain risk.
+wildcards = "deny"
+deny = []
+
+[sources]
+# Only allow crates from crates.io. A dependency sourced from an arbitrary git repo
+# or a private registry bypasses crates.io's (limited) protections and the advisory
+# DB — block it so any such addition is an explicit, reviewed allow-list entry.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
