@@ -1,0 +1,79 @@
+name: Monthly dependency refresh
+
+# The routine "we are updated" release. On the 1st of each month (and on demand),
+# run a semver-compatible `cargo update` sweep, prove it green, bump the patch
+# version, and open a PR. Merging that PR is the monthly release action — push the
+# resulting tag and the Release workflow ships binaries + SBOM + provenance.
+#
+# SCOPE: `cargo update` only takes semver-COMPATIBLE upgrades (patch/minor within
+# the manifest's caret ranges). MAJOR bumps (e.g. axum 0.7->0.8, getrandom 0.3->0.4)
+# require a manifest edit + possible code migration, so they stay as individual
+# Dependabot PRs for human review — they are intentionally NOT swept here.
+on:
+  schedule:
+    - cron: "0 9 1 * *" # 09:00 UTC, first of the month
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo update (semver-compatible sweep)
+        run: cargo update
+
+      - name: Detect changes
+        id: diff
+        run: |
+          if git diff --quiet Cargo.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No dependency updates available this month."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Gate (fmt · clippy · test)
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      - name: Bump patch version
+        if: steps.diff.outputs.changed == 'true'
+        id: bump
+        run: |
+          cur=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')
+          IFS=. read -r MA MI PA <<< "$cur"
+          new="$MA.$MI.$((PA + 1))"
+          sed -i "0,/^version = \"$cur\"/s//version = \"$new\"/" Cargo.toml
+          # Sync busbar's own entry in Cargo.lock (an incremental build rewrites it).
+          cargo build --quiet
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+          echo "Bumped $cur -> $new"
+
+      - name: Open refresh PR
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          new="${{ steps.bump.outputs.version }}"
+          branch="deps/monthly-refresh-v$new"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "chore: monthly dependency refresh -> v$new"
+          git push -u origin "$branch"
+          gh pr create \
+            --base main --head "$branch" \
+            --title "Monthly dependency refresh -> v$new" \
+            --body "Automated semver-compatible \`cargo update\` sweep for this month. Gates ran green in this workflow; CI + Security re-run on the PR. **Merge, then push tag \`v$new\`** to cut the release (binaries + SBOM + provenance). Major-version bumps are handled separately via individual Dependabot PRs."
