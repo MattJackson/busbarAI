@@ -392,15 +392,21 @@ async fn main() {
             ok: 0,
             err: 0,
             client_fault: 0,
-            upstream_name: mc.upstream_name.clone(),
+            upstream_model: mc.upstream_model.clone(),
         });
 
         eprintln!(
-            "  model {} via {} ({}) max {}",
+            "  model {} via {} ({}) max {}{}",
             model,
             mc.provider,
             provider_cfg.base_url.trim_end_matches('/'),
-            mc.max_concurrent
+            mc.max_concurrent,
+            // Surface the alias→wire-id indirection at boot so an operator can see this lane sends a
+            // different model string upstream than the config key it's filed under.
+            match &mc.upstream_model {
+                Some(u) => format!(" → upstream {u}"),
+                None => String::new(),
+            }
         );
     }
 
@@ -446,7 +452,7 @@ async fn main() {
             path: provider_cfg.path.clone(),
             auth: provider_cfg.auth,
             health: provider_cfg.health.clone(),
-            upstream_name: ld.upstream_name.clone(),
+            upstream_model: ld.upstream_model.clone(),
             default_max_tokens: model_default_max_tokens.get(&ld.model).copied().flatten(),
         });
     }

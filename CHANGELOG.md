@@ -5,6 +5,25 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-06-30
+
+### Added
+
+- **`upstream_model` config field** — decouples a model's config key (operator alias) from the model
+  id sent to the provider on the wire. Lets the **same model run behind two providers** in one
+  failover pool (e.g. Claude 3.5 Sonnet via Anthropic *and* Bedrock), where the keys must differ but
+  each provider needs its own model string. Threaded through body rewriting, URL generation, and
+  health probes (probes hit the same wire id as real traffic). Metrics, breaker cells, and logs
+  continue to key off the config key. Feature contributed by [@lguzzon](https://github.com/lguzzon)
+  (adopted as `upstream_model`; the resolver is `Lane::wire_model()`).
+
+### Fixed
+
+- Documentation drift surfaced by [@lguzzon](https://github.com/lguzzon) and a deep doc-vs-code
+  audit: removed dead `UsageTap` references, corrected same-protocol passthrough to the IR-unified
+  model, fixed the `billing_truncated` metric and budget-atomicity descriptions, updated all route
+  notation to axum 0.8 `{param}`/`{*rest}` syntax, and `window_s` → `window_secs`.
+
 ## [1.0.1] — 2026-06-30
 
 First hardened maintenance release. No request-path behavior change — the binary is functionally

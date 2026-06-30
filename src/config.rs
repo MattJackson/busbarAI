@@ -308,7 +308,7 @@ pub(crate) struct ModelCfg {
     /// model identifier in the request body and URL path, instead of the config key. Useful when
     /// the provider expects a different model string (e.g. Bedrock model IDs).
     #[serde(default)]
-    pub(crate) upstream_name: Option<String>,
+    pub(crate) upstream_model: Option<String>,
 }
 
 fn neg1() -> i64 {

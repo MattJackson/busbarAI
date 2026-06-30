@@ -77,6 +77,17 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 model_name
             ));
         }
+        // `upstream_model`, when set, is sent to the provider as the wire model id — an empty or
+        // whitespace-only override would put a blank model on the wire (a guaranteed upstream 400/404)
+        // with no boot diagnostic. Reject it loudly; omit the field to fall back to the config key.
+        if let Some(um) = &model_cfg.upstream_model {
+            if um.trim().is_empty() {
+                errors.push(format!(
+                    "model '{}' has an empty upstream_model; set a non-empty provider model id, or omit it to use the config key",
+                    model_name
+                ));
+            }
+        }
         // Reserved-name check (same rule as the pool and provider loops below): a model named `admin`
         // is reached at `POST /admin/v1/messages`, which the auth middleware classifies as the
         // operator admin surface (guarded by admin_token, not a client/virtual-key token). So the
@@ -1467,7 +1478,7 @@ mod tests {
             provider: provider.into(),
             max_concurrent,
             default_max_tokens: None,
-            upstream_name: None,
+            upstream_model: None,
         }
     }
 
@@ -1649,6 +1660,36 @@ mod tests {
         assert!(
             !errs.iter().any(|e| e.contains("okmodel")),
             "a positive default_max_tokens must not error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_upstream_model() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "myprovider".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        // Whitespace-only override → empty wire model id → must error.
+        let mut bad = make_model("myprovider", 10);
+        bad.upstream_model = Some("   ".to_string());
+        models.insert("badmodel".to_string(), bad);
+        // A real override (and the unset None default) must NOT error.
+        let mut ok = make_model("myprovider", 10);
+        ok.upstream_model = Some("anthropic.claude-3-5-sonnet-20241022-v2:0".to_string());
+        models.insert("okmodel".to_string(), ok);
+
+        let cfg = make_root_cfg(providers, models, HashMap::new());
+        let errs = validate(&cfg).expect_err("empty upstream_model must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("badmodel") && e.contains("upstream_model")),
+            "expected an empty-upstream_model error for 'badmodel'; got: {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("okmodel")),
+            "a non-empty upstream_model must not error; got: {errs:?}"
         );
     }
 

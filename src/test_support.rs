@@ -466,7 +466,7 @@ pub(crate) struct LaneSpec {
     auth: Option<String>,
     health: Option<crate::config::HealthCfg>,
     default_max_tokens: Option<u32>,
-    upstream_name: Option<String>,
+    upstream_model: Option<String>,
     // LaneData-only runtime state (defaults = a fresh, healthy, unlimited lane):
     limited: bool,
     budget: i64,
@@ -498,7 +498,7 @@ impl LaneSpec {
             auth: None,
             health: None,
             default_max_tokens: None,
-            upstream_name: None,
+            upstream_model: None,
             limited: false,
             budget: -1,
             cooldown_until: 0,
@@ -547,8 +547,8 @@ impl LaneSpec {
         self.default_max_tokens = Some(n);
         self
     }
-    pub(crate) fn upstream_name(mut self, n: &str) -> Self {
-        self.upstream_name = Some(n.into());
+    pub(crate) fn upstream_model(mut self, n: &str) -> Self {
+        self.upstream_model = Some(n.into());
         self
     }
     /// Mark the lane as budget-limited with `n` remaining requests (sets `limited = true`).
@@ -603,7 +603,7 @@ impl LaneSpec {
             }),
             health: self.health.clone(),
             default_max_tokens: self.default_max_tokens,
-            upstream_name: self.upstream_name.clone(),
+            upstream_model: self.upstream_model.clone(),
         }
     }
     fn to_lane_data(&self) -> crate::store::LaneData {
@@ -624,7 +624,7 @@ impl LaneSpec {
             ok: self.ok,
             err: self.err,
             client_fault: self.client_fault,
-            upstream_name: self.upstream_name.clone(),
+            upstream_model: self.upstream_model.clone(),
         }
     }
 }
@@ -3673,7 +3673,7 @@ mod tests {
                 provider: "p".into(),
                 max_concurrent: 10,
                 default_max_tokens: None,
-                upstream_name: None,
+                upstream_model: None,
             };
             let pool = crate::config::PoolCfg {
                 members: vec![crate::config::PoolMember {

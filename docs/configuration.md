@@ -286,6 +286,7 @@ A model is a **lane**: one model at one provider, with its own concurrency semap
 | `max_concurrent` | integer | **yes** | — | Maximum simultaneous in-flight requests for this lane (semaphore size). Must be ≥ 1. |
 | `max_requests` | integer | no | `-1` | Lifetime request budget. `-1` = unlimited. When the counter reaches `0` the lane is unusable. Must not be `0` (zero budget = permanently unusable = startup error). |
 | `default_max_tokens` | integer | no | `4096` | Injected **only** on a cross-protocol hop to a backend that requires `max_tokens` (Anthropic protocol) when the caller omitted it. Has no effect on same-protocol passthrough. Must be > 0 when set. |
+| `upstream_model` | string | no | the config key | The model id sent to the provider on the wire (request body for body-model protocols; URL path for path-model protocols like Bedrock/Gemini; and health probes). Defaults to the config key. Set it when the key can't be the wire id — most commonly to run the **same model behind two providers** (the keys must differ, but each needs its own provider-specific model string). Must be non-empty when set. Metrics, breaker cells, and logs still key off the config key, not this. |
 
 ```yaml
 models:
@@ -308,9 +309,35 @@ models:
     max_concurrent: 10
 ```
 
-**Direct routing:** a model named `my-model` is reachable at `POST /my-model/v1/messages` (Anthropic ingress). The ad-hoc route `POST /<provider>/<model>/v1/messages` bypasses the model map entirely — it routes to the named provider with the named model string, using no pool.
+**Direct routing:** a model named `my-model` is reachable at `POST /my-model/v1/messages` (Anthropic ingress). The ad-hoc route `POST /{provider}/{model}/v1/messages` bypasses the model map entirely — it routes to the named provider with the named model string, using no pool.
 
 **Reserved name:** a model named `admin` is a startup error.
+
+#### Same model, two providers (`upstream_model`)
+
+To run one real model — say Claude 3.5 Sonnet — behind **both** Anthropic and Bedrock in a single failover pool, the two model keys must differ (keys are unique), but each provider expects its own model string. `upstream_model` carries the provider-specific wire id while the key stays a stable operator alias:
+
+```yaml
+models:
+  sonnet-anthropic:
+    provider: anthropic
+    max_concurrent: 20
+    upstream_model: claude-3-5-sonnet-20241022             # what Anthropic expects on the wire
+  sonnet-bedrock:
+    provider: bedrock-us-east-1
+    max_concurrent: 10
+    upstream_model: anthropic.claude-3-5-sonnet-20241022-v2:0   # Bedrock's modelId
+
+pools:
+  sonnet:                                  # clients call ONE name: POST /sonnet/v1/messages
+    members:
+      - target: sonnet-anthropic
+        weight: 3                          # primary
+      - target: sonnet-bedrock
+        weight: 1                          # cross-provider failover lane
+```
+
+Clients always address `sonnet`; when Anthropic rate-limits or trips its breaker, busbar fails over in-flight to the **same model** on Bedrock. Health probes use `upstream_model` too, so a lane can't report healthy on the alias while real traffic fails on the wrong upstream id. Models without a collision (e.g. `gpt-4o`) need no `upstream_model` — the key already is the wire id.
 
 ---
 

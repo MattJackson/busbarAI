@@ -41,14 +41,14 @@ pub(crate) struct Lane {
     /// Optional upstream model name override. When set, this value is sent to the provider as the
     /// model identifier in the request body and URL path, instead of `self.model` (the config key).
     /// Useful when the provider expects a different model string (e.g. Bedrock model IDs).
-    pub(crate) upstream_name: Option<String>,
+    pub(crate) upstream_model: Option<String>,
 }
 
 impl Lane {
-    /// The model name to send on the wire. Returns `upstream_name` when set,
+    /// The model name to send on the wire. Returns `upstream_model` when set,
     /// otherwise falls back to the config key (`self.model`).
-    pub(crate) fn upstream_model(&self) -> &str {
-        self.upstream_name.as_deref().unwrap_or(&self.model)
+    pub(crate) fn wire_model(&self) -> &str {
+        self.upstream_model.as_deref().unwrap_or(&self.model)
     }
 }
 
