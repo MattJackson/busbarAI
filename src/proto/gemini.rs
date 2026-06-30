@@ -1336,7 +1336,7 @@ fn synth_response_id() -> String {
         // Draw a generous batch so a single getrandom call typically fills the whole token even after
         // rejections (RESPONSE_ID_TOKEN_LEN*2 bytes leave ample headroom for the ~1.6% reject rate).
         let mut batch = [0u8; RESPONSE_ID_TOKEN_LEN * 2];
-        if getrandom::getrandom(&mut batch).is_err() {
+        if getrandom::fill(&mut batch).is_err() {
             break;
         }
         for &byte in batch.iter() {

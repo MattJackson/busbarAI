@@ -303,7 +303,7 @@ fn synthesize_cohere_id() -> String {
     let mut bytes = [0u8; 16];
     // OS CSPRNG. Ignore failure (no unwrap/expect/panic on the request path): the version/variant
     // stamping below still produces a valid v4 even if the buffer stays all-zero.
-    let _ = getrandom::getrandom(&mut bytes);
+    let _ = getrandom::fill(&mut bytes);
 
     // RFC-4122 v4: high nibble of byte 6 (the 3rd group's first nibble) = 4; top two bits of byte 8
     // (the 4th group's first nibble) = 10.

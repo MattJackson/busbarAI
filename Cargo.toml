@@ -15,7 +15,7 @@ name = "busbar"
 path = "src/main.rs"
 
 [dependencies]
-axum = "0.7"
+axum = "0.8"
 # Already present transitively (axum's middleware stack). Pulled in directly ONLY for
 # `GlobalConcurrencyLimitLayer` — the OUTERMOST inbound-concurrency cap applied when the operator
 # sets `limits.max_inbound_concurrent > 0` (the `0` default adds NO layer). `limit` is the sole
@@ -87,7 +87,7 @@ sha2 = "0.11.0"
 hmac = "0.13.0"
 hex = "0.4.3"
 rusqlite = { version = "0.40.0", features = ["bundled"] }
-getrandom = "0.2"
+getrandom = "0.3"
 # CRC32 for the AWS `application/vnd.amazon.eventstream` encoder (Bedrock ingress streaming): AWS
 # SDK clients validate both the prelude and message CRC32 on every frame, so the encoder needs a
 # correct, fast CRC32. `crc32fast` is small, dependency-light, and the de-facto standard.
@@ -137,13 +137,13 @@ script-policy = ["dep:rhai"]
 [dev-dependencies]
 # In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
-axum = { version = "0.7", features = ["http1"] }
+axum = { version = "0.8", features = ["http1"] }
 http-body-util = "0.1"
 futures = "0.3"
 bytes = "1"
 # Generates self-signed server certs + a CA/leaf pair at test runtime so the TLS/mTLS integration
 # tests exercise a real rustls handshake without checked-in key material.
-rcgen = "0.13"
+rcgen = "0.14"
 
 [profile.release]
 # Tuned for the shipped "deploy-and-done" binary: max optimization and smallest size,

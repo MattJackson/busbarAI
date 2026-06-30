@@ -137,7 +137,7 @@ fn synth_id_with_prefix(prefix: &str) -> String {
     let mut filled = 0usize;
     'outer: while filled < SYNTH_ID_TOKEN_LEN {
         let mut batch = [0u8; SYNTH_ID_TOKEN_LEN];
-        if getrandom::getrandom(&mut batch).is_err() {
+        if getrandom::fill(&mut batch).is_err() {
             // Near-impossible entropy failure: keep the remaining '0' fill rather than panic.
             break 'outer;
         }
@@ -183,7 +183,7 @@ pub(crate) fn synth_anthropic_request_id() -> Option<String> {
     let mut token = [0u8; 24];
     for half in 0..2 {
         let mut buf = [0u8; 9];
-        getrandom::getrandom(&mut buf).ok()?;
+        getrandom::fill(&mut buf).ok()?;
         // 72 bits → 12 base62 digits (62^12 > 2^71, so 9 bytes fit in 12 digits).
         let mut n = buf.iter().fold(0u128, |acc, &b| (acc << 8) | b as u128);
         for slot in token[half * 12..half * 12 + 12].iter_mut().rev() {

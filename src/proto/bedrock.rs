@@ -84,7 +84,7 @@ pub(crate) fn error_kind_to_bedrock_type(kind: &str) -> &'static str {
 /// copies.
 pub(crate) fn synth_amzn_request_id() -> Option<String> {
     let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).ok()?;
+    getrandom::fill(&mut buf).ok()?;
     // RFC 4122 v4 layout (version + variant bits) so the value is a well-formed UUID.
     buf[6] = (buf[6] & 0x0f) | 0x40;
     buf[8] = (buf[8] & 0x3f) | 0x80;

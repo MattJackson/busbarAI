@@ -939,7 +939,7 @@ pub(crate) struct GovCtx {
 fn generate_secret() -> Result<String, getrandom::Error> {
     // Portable OS CSPRNG via getrandom: /dev/urandom on Unix, BCryptGenRandom on Windows, etc.
     let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf)?;
+    getrandom::fill(&mut buf)?;
     Ok(format!("{SK_SECRET_PREFIX}{}", hex::encode(buf)))
 }
 
@@ -960,7 +960,7 @@ fn generate_aws_access_key_id() -> Result<String, getrandom::Error> {
     // 20-char format; the secret access key, not the public AKID, carries the real signing entropy.)
     const ALPHABET: &[u8; 36] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf)?;
+    getrandom::fill(&mut buf)?;
     let mut s = String::with_capacity(AWS_ACCESS_KEY_ID_LEN);
     s.push_str(AWS_ACCESS_KEY_PREFIX);
     for &b in &buf {
@@ -982,7 +982,7 @@ fn generate_aws_secret_access_key() -> Result<String, getrandom::Error> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     // 40 chars * 6 bits = 240 bits = 30 bytes of entropy; draw the 30 bytes and emit 40 symbols.
     let mut buf = [0u8; 30];
-    getrandom::getrandom(&mut buf)?;
+    getrandom::fill(&mut buf)?;
     // Pack the 240 bits and slice them into 40 six-bit groups. A running bit accumulator avoids any
     // dependency on a base64 crate and keeps the mapping panic-free (every index is `& 0x3f`).
     let mut out = String::with_capacity(AWS_SECRET_ACCESS_KEY_LEN);
@@ -2389,6 +2389,50 @@ mod tests {
             .is_none());
         // The bearer secret still resolves the key via the hash index too.
         assert_eq!(gov.lookup(&_bearer).unwrap().id, key.id);
+    }
+
+    /// Contract guard for the OS-CSPRNG-backed credential generators (`getrandom`). Pins the exact
+    /// wire shapes that downstream AWS SDKs and busbar's bearer scheme validate, so a future
+    /// `getrandom` major (or any change to these minting fns) that alters length, prefix, or charset
+    /// fails HERE with a clear cause — instead of surfacing later as a confusing auth rejection.
+    #[test]
+    fn test_credential_generators_contract() {
+        // Bearer secret: `sk-bb-` prefix + 32 lowercase-hex chars (16 random bytes).
+        let s = generate_secret().expect("OS entropy available");
+        assert!(s.starts_with(SK_SECRET_PREFIX), "bearer prefix: {s}");
+        let hex_part = &s[SK_SECRET_PREFIX.len()..];
+        assert_eq!(hex_part.len(), 32, "16 random bytes -> 32 hex chars");
+        assert!(
+            hex_part
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "bearer body is lowercase hex: {hex_part}"
+        );
+
+        // AWS AccessKeyId: `AKIA` prefix + uppercase-alphanumeric body, fixed total length 20.
+        let akid = generate_aws_access_key_id().expect("OS entropy available");
+        assert_eq!(akid.len(), AWS_ACCESS_KEY_ID_LEN);
+        assert!(
+            akid.starts_with(AWS_ACCESS_KEY_PREFIX),
+            "akid prefix: {akid}"
+        );
+        assert!(
+            akid.bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()),
+            "akid is uppercase-alphanumeric: {akid}"
+        );
+
+        // AWS secret access key: fixed 40 chars (240 bits over a base64-ish alphabet).
+        let sak = generate_aws_secret_access_key().expect("OS entropy available");
+        assert_eq!(sak.len(), AWS_SECRET_ACCESS_KEY_LEN);
+
+        // Each draw differs — proves the CSPRNG is actually read, not returning a constant.
+        assert_ne!(generate_secret().unwrap(), s, "secrets must not repeat");
+        assert_ne!(
+            generate_aws_access_key_id().unwrap(),
+            akid,
+            "akids must not repeat"
+        );
     }
 
     #[test]

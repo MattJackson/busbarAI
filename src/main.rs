@@ -975,10 +975,10 @@ fn build_router_with_limits(
         // virtual-key management API (admin-token guarded in auth_middleware).
         .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
         .route(
-            "/admin/keys/:id",
+            "/admin/keys/{id}",
             axum::routing::delete(admin::delete_key).patch(admin::update_key),
         )
-        .route("/admin/keys/:id/usage", get(admin::key_usage))
+        .route("/admin/keys/{id}/usage", get(admin::key_usage))
         .route("/v1/chat/completions", post(route::openai_ingress))
         // Cohere v2 + OpenAI Responses ingress: model+stream in the body (body-model protocols).
         .route("/v2/chat", post(route::cohere_ingress))
@@ -988,16 +988,16 @@ fn build_router_with_limits(
         // Both the stable `v1` and the `v1beta` surfaces are wire-identical for generateContent /
         // streamGenerateContent; the google-generativeai / Gen AI SDKs use either, so a client pinned
         // to the stable `v1` endpoint must also resolve here rather than fall through to a bare 404.
-        .route("/v1/models/*rest", post(route::gemini_ingress))
-        .route("/v1beta/models/*rest", post(route::gemini_ingress))
+        .route("/v1/models/{*rest}", post(route::gemini_ingress))
+        .route("/v1beta/models/{*rest}", post(route::gemini_ingress))
         // Bedrock Converse ingress: model in the path, stream selected by the endpoint suffix.
-        .route("/model/:model_id/converse", post(route::bedrock_converse))
+        .route("/model/{model_id}/converse", post(route::bedrock_converse))
         .route(
-            "/model/:model_id/converse-stream",
+            "/model/{model_id}/converse-stream",
             post(route::bedrock_converse_stream),
         )
-        .route("/:name/v1/messages", post(route::named))
-        .route("/:provider/:model/v1/messages", post(route::adhoc))
+        .route("/{name}/v1/messages", post(route::named))
+        .route("/{provider}/{model}/v1/messages", post(route::adhoc))
         // Global fallback for unmatched paths (404) and wrong-method hits on a valid path (405).
         // axum's built-in responses are an EMPTY body (404) or an `Allow`-header-only 405 — both bare
         // text that a native vendor SDK cannot decode and that fingerprint busbar as a router/proxy.

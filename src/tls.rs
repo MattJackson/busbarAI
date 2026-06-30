@@ -354,7 +354,7 @@ mod tests {
 
     use axum::routing::get;
     use axum::Router;
-    use rcgen::{CertificateParams, CertifiedKey, IsCa, KeyPair};
+    use rcgen::{CertificateParams, CertifiedKey, IsCa, Issuer, KeyPair};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
 
@@ -385,10 +385,10 @@ mod tests {
 
     /// Generate a self-signed server cert for `localhost`/`127.0.0.1`. Returns (cert_pem, key_pem).
     fn gen_self_signed() -> (String, String) {
-        let CertifiedKey { cert, key_pair } =
+        let CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
                 .unwrap();
-        (cert.pem(), key_pair.serialize_pem())
+        (cert.pem(), signing_key.serialize_pem())
     }
 
     /// Generate a CA + a leaf signed by it (for mTLS). Returns (ca_cert_pem, leaf_cert_pem,
@@ -399,9 +399,13 @@ mod tests {
         ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
 
+        // rcgen 0.14: leaf signing goes through an `Issuer` (CA params + CA key) rather than
+        // passing the CA cert + key positionally. `from_params` borrows the CA params and takes
+        // ownership of the CA key pair, which we no longer need after this.
+        let issuer = Issuer::from_params(&ca_params, ca_kp);
         let leaf_kp = KeyPair::generate().unwrap();
         let leaf_params = CertificateParams::new(cn_sans).unwrap();
-        let leaf_cert = leaf_params.signed_by(&leaf_kp, &ca_cert, &ca_kp).unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_kp, &issuer).unwrap();
 
         (ca_cert.pem(), leaf_cert.pem(), leaf_kp.serialize_pem())
     }

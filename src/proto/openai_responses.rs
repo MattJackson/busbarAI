@@ -165,7 +165,7 @@ fn synth_token<const N: usize>() -> String {
         // and the loop still terminates — keeping the function infallible and panic-free.
         let mut buf = [0u8; 1];
         loop {
-            if getrandom::getrandom(&mut buf).is_err() {
+            if getrandom::fill(&mut buf).is_err() {
                 // Entropy failure: leave this slot at its existing '0' fallback and move on.
                 break;
             }
