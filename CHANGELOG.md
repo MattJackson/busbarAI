@@ -5,6 +5,29 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — 2026-06-30
+
+First hardened maintenance release. No request-path behavior change — the binary is functionally
+identical to 1.0.0; the API, config schema, and six wire-protocol contracts are unchanged.
+
+### Supply chain
+
+- **Dependency scanning gate.** A `cargo-deny` CI workflow checks every dependency against the
+  RustSec advisory DB and enforces a license allow-list, crates.io-only sources, and a
+  duplicate-version ban — on dependency changes and on a weekly schedule (an advisory can be filed
+  after a dep is merged).
+- **Signed, inventoried releases.** Each release now ships a CycloneDX SBOM and a keyless
+  (Sigstore/OIDC) build-provenance attestation, so a downloaded artifact can be verified with
+  `gh attestation verify <file> --repo MattJackson/busbarAI`.
+
+### Dependencies
+
+- **axum 0.7 → 0.8** — route path-param syntax migrated (`:id` → `{id}`, `*rest` → `{*rest}`); no
+  behavior change. **getrandom 0.2 → 0.3** (`getrandom()` → `fill()`, same OS-CSPRNG). **rcgen
+  0.13 → 0.14** (test-only). All build-verified: 1,667 tests pass, clippy `-D warnings` clean.
+- Added a credential-generator contract test pinning the bearer / AWS-AKID / AWS-secret wire shapes
+  so future dependency changes that alter them fail loudly.
+
 ## [1.0.0] — 2026-06-21
 
 First stable release. 1.0.0 keeps the `1.0.0-rc.7` architecture (all traffic through the superset IR
