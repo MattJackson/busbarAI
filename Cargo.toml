@@ -35,7 +35,7 @@ serde_json = "1"
 # the translate path, where its SIMD escape-scanning is ~5× serde_json on the large string-heavy
 # bodies LLM traffic carries. `serde_json` is retained for the cold/config/error paths and as the
 # `Value` type; sonic-rs serializes/deserializes that same `serde_json::Value` at the hot boundaries.
-sonic-rs = "0.3"
+sonic-rs = "0.5"
 # `serde_yaml` (dtolnay) is archived/deprecated — the locked 0.9 is literally `0.9.34+deprecated`.
 # `serde_yaml_ng` is the maintained, API-compatible fork (still backed by `unsafe-libyaml`, but at a
 # maintained, patched version); the `package` rename keeps every `serde_yaml::from_str` call site unchanged.

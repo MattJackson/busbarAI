@@ -18,7 +18,7 @@ jobs:
   create-release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -38,7 +38,7 @@ jobs:
     name: sbom (cyclonedx)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-cyclonedx
@@ -74,7 +74,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Builds --release for the target (installing the toolchain + cross-linker as
       # needed), tarballs the `busbar` binary, and uploads it to the Release for this tag.
@@ -93,6 +93,6 @@ jobs:
       # fails verification. The glob matches whichever extension was produced (.tar.gz on
       # unix, .zip on windows); `archive: busbar-$target` leaves it in the workspace.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: "busbar-${{ matrix.target }}.*"
