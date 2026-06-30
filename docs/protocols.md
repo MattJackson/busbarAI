@@ -58,11 +58,11 @@ The key architectural guarantee: **Busbar's ingress is statically determined by 
 **Ingress routes:**
 
 ```
-POST /:name/v1/messages
-POST /:provider/:model/v1/messages
+POST /{name}/v1/messages
+POST /{provider}/{model}/v1/messages
 ```
 
-`:name` resolves first against your configured pools, then against your configured models. The two-segment form (`:provider/:model`) is an ad-hoc direct route that bypasses pool configuration and hits a specific provider+model pair directly — useful for debugging or for models you don't need to pool.
+`{name}` resolves first against your configured pools, then against your configured models. The two-segment form (`{provider}/{model}`) is an ad-hoc direct route that bypasses pool configuration and hits a specific provider+model pair directly — useful for debugging or for models you don't need to pool.
 
 **Auth carrier (ingress):** `Authorization: Bearer <token>` or `x-api-key: <token>`. Both are accepted; bearer takes precedence. (Busbar's token-extraction precedence is `Authorization: Bearer`, then `x-api-key`, then `x-goog-api-key` — the same single Busbar token validates identically through any of those carriers.)
 
@@ -79,7 +79,7 @@ import anthropic
 
 client = anthropic.Anthropic(
     api_key="your-busbar-token",
-    base_url="http://busbar:8080/my-pool",   # ← :name is the pool or model
+    base_url="http://busbar:8080/my-pool",   # ← {name} is the pool or model
 )
 
 message = client.messages.create(
@@ -200,7 +200,7 @@ POST /v1beta/models/{model}:generateContent
 POST /v1beta/models/{model}:streamGenerateContent
 ```
 
-Both the stable `/v1/` and the beta `/v1beta/` path prefixes are accepted by the same handler (registered as `/v1/models/*rest` and `/v1beta/models/*rest`). The Google `google-generativeai` and `google-genai` SDKs use either surface depending on the version and the method called; Busbar accepts both so you do not need to know which one your SDK version issues.
+Both the stable `/v1/` and the beta `/v1beta/` path prefixes are accepted by the same handler (registered as `/v1/models/{*rest}` and `/v1beta/models/{*rest}`). The Google `google-generativeai` and `google-genai` SDKs use either surface depending on the version and the method called; Busbar accepts both so you do not need to know which one your SDK version issues.
 
 **Auth carrier (ingress):** `x-goog-api-key: <token>` (the header the Gemini SDK sends). Busbar also accepts `Authorization: Bearer` on this route (any of Busbar's carriers validate the same token). Under `token` or governance mode, the value is matched against your Busbar client tokens — not forwarded to Google.
 
@@ -235,8 +235,8 @@ response = model.generate_content("Hello")
 **Ingress routes:**
 
 ```
-POST /model/{modelId}/converse
-POST /model/{modelId}/converse-stream
+POST /model/{model_id}/converse
+POST /model/{model_id}/converse-stream
 ```
 
 **Auth carrier (ingress):** AWS SDKs sign requests with SigV4 (`Authorization: AWS4-HMAC-SHA256 ...`). Busbar supports two tracks for Bedrock ingress depending on whether governance is enabled.
@@ -249,7 +249,7 @@ POST /model/{modelId}/converse-stream
 
 **Upstream paths:** `POST /model/{model}/converse` (non-stream) and `POST /model/{model}/converse-stream` (stream).
 
-**Model selection (path-model):** The model is `{modelId}` in the ingress URL path.
+**Model selection (path-model):** The model is `{model_id}` in the ingress URL path.
 
 **Wire format:** Bedrock uses a binary `application/vnd.amazon.eventstream` framing for streaming, with real CRC32 checksums. Busbar decodes these frames on the egress path (when a Bedrock backend is the upstream) and re-encodes translated events as valid binary eventstream frames for Bedrock-ingress clients. Non-stream responses use JSON.
 
@@ -287,13 +287,13 @@ These three protocols share one ingress implementation (`route::ingress_body_mod
 The model and stream intent live in the URL, not the body:
 
 - **Gemini:** `/v1beta/models/{model}:generateContent` (non-stream) vs `/v1beta/models/{model}:streamGenerateContent` (stream). The model and action are packed into the last path segment separated by `:`. Axum cannot split on `:` inside a single path segment, so the wildcard tail (`*rest`) is captured and split on the last colon in the handler.
-- **Bedrock:** `/model/{modelId}/converse` vs `/model/{modelId}/converse-stream`. Busbar determines stream intent from which route matched.
+- **Bedrock:** `/model/{model_id}/converse` vs `/model/{model_id}/converse-stream`. Busbar determines stream intent from which route matched.
 
 Because the body does not carry `"model"` or `"stream"`, Busbar injects them into the parsed body before running the same pool-resolution and forwarding code as body-model protocols. This injection is internal — the upstream never sees it (the injected shim keys are stripped before the egress write).
 
 ### `anthropic` — routed by path, handled separately
 
-Anthropic ingress takes its pool-or-model name from the URL (`:name` in `/:name/v1/messages`), so like the path-model protocols the model field in the Anthropic body does not drive routing. But it is handled by its own handlers rather than the shared body/path-model code: `route::named` for `/:name/v1/messages` and `route::adhoc` for the two-segment ad-hoc form (`/:provider/:model/v1/messages`).
+Anthropic ingress takes its pool-or-model name from the URL (`{name}` in `/{name}/v1/messages`), so like the path-model protocols the model field in the Anthropic body does not drive routing. But it is handled by its own handlers rather than the shared body/path-model code: `route::named` for `/{name}/v1/messages` and `route::adhoc` for the two-segment ad-hoc form (`/{provider}/{model}/v1/messages`).
 
 ---
 
@@ -578,7 +578,7 @@ import anthropic
 
 client = anthropic.Anthropic(
     api_key="my-busbar-token",
-    base_url="http://localhost:8080/smart",   # :name = the pool
+    base_url="http://localhost:8080/smart",   # {name} = the pool
 )
 
 message = client.messages.create(
@@ -626,9 +626,9 @@ A heterogeneous pool (members spanning more than one egress protocol) emits a wa
 
 | Protocol | Ingress route(s) | SDK config — change `base_url` to | Auth header sent by SDK |
 |---|---|---|---|
-| `anthropic` | `POST /:name/v1/messages` | `http://busbar:8080/<pool-or-model>` | `x-api-key` or `Authorization: Bearer` |
+| `anthropic` | `POST /{name}/v1/messages` | `http://busbar:8080/<pool-or-model>` | `x-api-key` or `Authorization: Bearer` |
 | `openai` | `POST /v1/chat/completions` | `http://busbar:8080` | `Authorization: Bearer` |
 | `responses` | `POST /v1/responses` | `http://busbar:8080` | `Authorization: Bearer` |
 | `cohere` | `POST /v2/chat` | `http://busbar:8080` | `Authorization: Bearer` |
 | `gemini` | `POST /v1[beta]/models/{model}:generateContent[Stream]` | `http://busbar:8080` (via `api_endpoint`) | `x-goog-api-key` |
-| `bedrock` | `POST /model/{modelId}/converse[-stream]` | `http://busbar:8080` (via `endpoint_url`) | SigV4 — with governance: minted `aws_access_key_id`/`aws_secret_access_key` (verified by Busbar); without governance: `auth.mode: passthrough` or `none` |
+| `bedrock` | `POST /model/{model_id}/converse[-stream]` | `http://busbar:8080` (via `endpoint_url`) | SigV4 — with governance: minted `aws_access_key_id`/`aws_secret_access_key` (verified by Busbar); without governance: `auth.mode: passthrough` or `none` |

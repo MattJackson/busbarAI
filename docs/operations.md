@@ -133,7 +133,7 @@ upstream fault; this section covers *what happens to the lane* once it does.
 Breaker state is **per-(pool, lane)**: a lane that is a member of more than one pool
 carries independent Open/Closed/HalfOpen state, streak, cooldown, and error window in
 each pool, so one pool's traffic tripping a lane does not bench it for the others.
-Direct/ad-hoc routes (`POST /:provider/:model`, `POST /:model`) and `/stats` share a
+Direct/ad-hoc routes (`POST /{provider}/{model}`, `POST /{model}`) and `/stats` share a
 single lane-default cell. The concurrency limit and the `max_requests` lifetime budget
 are **not** per-pool — they cap the shared upstream, so they apply across every pool.
 A successful active health probe (it tests the shared upstream) clears the breaker in
@@ -243,9 +243,9 @@ the admin API returns `401`.
 |---|---|
 | `POST /admin/keys` | Mint a virtual key. The plaintext secret is returned **once**. Pass `"issue_aws_credential": true` to also mint an AWS credential pair for Bedrock-SDK clients (see below). |
 | `GET /admin/keys` | List key metadata (never secrets/hashes). |
-| `GET /admin/keys/:id/usage` | Current-window usage: `spend_cents`, `tokens`, `requests`. |
-| `PATCH /admin/keys/:id` | Update key fields (budget, rate limits, allowed pools). Three-state: absent = unchanged, `null` = clear to unlimited, value = set. |
-| `DELETE /admin/keys/:id` | Revoke a key. |
+| `GET /admin/keys/{id}/usage` | Current-window usage: `spend_cents`, `tokens`, `requests`. |
+| `PATCH /admin/keys/{id}` | Update key fields (budget, rate limits, allowed pools). Three-state: absent = unchanged, `null` = clear to unlimited, value = set. |
+| `DELETE /admin/keys/{id}` | Revoke a key. |
 
 ### Creating a key
 
@@ -300,7 +300,7 @@ Create-key fields:
 | `503` on every request | `/stats` — are all lanes `dead` or in cooldown? Check `dead_reason`. |
 | A lane stuck `dead` with `billing` reason | Upstream wallet/quota; the lane recovers on a successful probe once funded. Consider `health.mode: dead`. |
 | A lane stuck `dead` with `auth` reason | Wrong/expired key in the provider's `api_key_env`. |
-| `429` from busbar itself | A virtual key hit a limit. The body's `error.type` distinguishes the cause: `rate_limit_error` = RPM/TPM cap; `insufficient_quota` = over budget for its window (Bedrock ingress signals over-budget as `400` instead). Check `GET /admin/keys/:id/usage`. |
+| `429` from busbar itself | A virtual key hit a limit. The body's `error.type` distinguishes the cause: `rate_limit_error` = RPM/TPM cap; `insufficient_quota` = over budget for its window (Bedrock ingress signals over-budget as `400` instead). Check `GET /admin/keys/{id}/usage`. |
 | `403` from busbar | The virtual key's `allowed_pools` doesn't include the target. |
 | Startup panic: "unset environment variable" | A `${VAR}` (possibly in a comment) isn't exported. |
 | Startup panic: "not found in providers.yaml" | A `config.yaml` provider name isn't in the catalog. |

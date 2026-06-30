@@ -134,7 +134,7 @@ InMemoryStore {
   cooldown and releases the probe flag). The lane-global `ok` counter is bumped
   by the caller because it is shared.
 - **`should_trip`**: `ErrorRate` mode trips when the windowed failure fraction
-  `>= threshold` but only once `min_requests` outcomes have accrued in `window_s`
+  `>= threshold` but only once `min_requests` outcomes have accrued in `window_secs`
   (the `err` count is capped at the windowed outcome count so a stale cumulative
   error can't dominate). `Consecutive` mode trips when `streak >= consecutive_n`.
 - **`compute_cooldown_with_retry_after`**: exponential backoff doubling from

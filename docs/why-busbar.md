@@ -26,7 +26,7 @@ Direct API usage gives you a bill at the end of the month. It does not give you 
 
 Busbar's governance layer issues virtual keys — scoped bearer tokens with configurable per-request and per-1k-token pricing, daily/monthly/total budget caps, RPM and TPM limits, and pool-level access controls. A virtual key for a staging environment can be capped at a daily budget and restricted to a cheaper model pool. An internal tool can be rate-limited independently of the production path. Usage is tracked per key and queryable via the admin API.
 
-One operational caveat worth stating plainly: RPM limits are enforced precisely (the counter is incremented synchronously on admission), but TPM limits and budget caps are best-effort under concurrency — token usage is fed back after the response, and the budget check is a non-atomic read-then-charge, so concurrent in-flight requests can overshoot a cap by a bounded amount. Busbar deliberately fails open on a governance store error rather than dropping traffic.
+One operational caveat worth stating plainly: RPM limits are enforced precisely (the counter is incremented synchronously on admission), and so are budget caps — the over-budget check and the spend charge are a single atomic SQLite UPSERT (`charge_within_budget`), so concurrent in-flight requests cannot overshoot the cap. TPM limits remain best-effort under concurrency, since token usage is only known after the response. On a governance store error Busbar fails open by default (`budget_on_store_error: allow`) to preserve availability; set `deny` for a hard guarantee that rejects on any store error.
 
 ### Your data path is also your security perimeter
 

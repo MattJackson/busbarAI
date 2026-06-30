@@ -81,19 +81,19 @@ The route table (`src/main.rs` `build_router`, `src/route.rs`) determines the
 first-class ingress — one handler per protocol (Gemini's handler is reachable via
 two path prefixes, `v1` and `v1beta`):
 
-- `POST /:name/v1/messages` → ingress `anthropic`. `name` is a model or a pool.
-- `POST /:provider/:model/v1/messages` → ingress `anthropic`, ad-hoc direct route.
+- `POST /{name}/v1/messages` → ingress `anthropic`. `name` is a model or a pool.
+- `POST /{provider}/{model}/v1/messages` → ingress `anthropic`, ad-hoc direct route.
 - `POST /v1/chat/completions` → ingress `openai`. The body's `model` field names the
   model or pool.
 - `POST /v1/responses` → ingress `responses` (OpenAI Responses API). Model in the body.
 - `POST /v2/chat` → ingress `cohere`. Model in the body.
-- `POST /v1/models/*rest` and `POST /v1beta/models/*rest` → ingress `gemini`. Both the
+- `POST /v1/models/{*rest}` and `POST /v1beta/models/{*rest}` → ingress `gemini`. Both the
   stable `v1` and the `v1beta` path prefixes are accepted by the same handler, because the
   google-generativeai / Gen AI SDKs use either surface. The model and the action
   (`:generateContent` / `:streamGenerateContent`) are packed into the last path
   segment after a `:`; axum can't split on `:` inside a segment, so the tail is
   captured with a wildcard and split in `gemini_ingress`.
-- `POST /model/:model_id/converse` and `/model/:model_id/converse-stream` → ingress
+- `POST /model/{model_id}/converse` and `/model/{model_id}/converse-stream` → ingress
   `bedrock`. The model is in the path; the streaming variant is selected by the
   endpoint suffix.
 

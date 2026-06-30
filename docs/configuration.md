@@ -667,9 +667,9 @@ governance:
 |---|---|---|
 | `/admin/keys` | `POST` | Mint a new virtual key. Returns plaintext bearer `secret` once. Pass `"issue_aws_credential": true` to also receive `aws_access_key_id` + `aws_secret_access_key` for Bedrock-SDK clients (both shown once). |
 | `/admin/keys` | `GET` | List all keys (metadata only; no secrets). |
-| `/admin/keys/:id` | `PATCH` | Update key fields. Three-state semantics: absent = unchanged, `null` = clear to unlimited, value = set. |
-| `/admin/keys/:id/usage` | `GET` | Current-window spend, tokens, and request count. |
-| `/admin/keys/:id` | `DELETE` | Revoke a key. Returns 404 if not found (not idempotent). |
+| `/admin/keys/{id}` | `PATCH` | Update key fields. Three-state semantics: absent = unchanged, `null` = clear to unlimited, value = set. |
+| `/admin/keys/{id}/usage` | `GET` | Current-window spend, tokens, and request count. |
+| `/admin/keys/{id}` | `DELETE` | Revoke a key. Returns 404 if not found (not idempotent). |
 
 See [operations.md](operations.md) for the full admin API payload schemas and virtual key fields, including the `issue_aws_credential` Bedrock SigV4 option.
 
