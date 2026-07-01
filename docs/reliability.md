@@ -41,6 +41,8 @@ Cross-references: [configuration.md](configuration.md) (full field reference) ·
 
 ## Concepts: pools, lanes, and cells
 
+> New to pools? The [**Pools**](pools.md) guide covers what a pool is, how member selection works, the full config reference, and copy-paste recipes. This section is the short version, focused on how the three terms map to the circuit breaker below.
+
 Three terms underpin everything else.
 
 **Lane**: one model on one provider. A lane has a concurrency semaphore (`max_concurrent`), an optional lifetime budget (`max_requests`), and health state. A lane is declared with a `models:` entry and backed by exactly one provider.
@@ -80,6 +82,8 @@ When a member is tripped or at-capacity, it is dropped from the eligible set and
 
 Weights must be ≥ 1. A pool with equal-weight members distributes traffic evenly. The pool itself has no weight field: weights are only between members within one pool.
 
+For cost-aware, latency-aware, and custom selection (`route: cheapest` / `fastest` / `least_busy` / `webhook` / `script`), and for ready-to-paste pool configs, see the [Pools guide](pools.md#recipes).
+
 **Multi-protocol pools**: members can span different providers and protocols. Busbar translates through its superset IR on cross-protocol hops (see [internals.md](internals.md)). A warning is logged at startup for heterogeneous pools because the IR models a common superset: same-protocol requests are byte-exact passthrough, but cross-protocol hops drop source-only fields that have no analog on the target (e.g. `logprobs`, `n`). For pools where all members speak the same protocol, there is no translation overhead and no field loss.
 
 ---
@@ -111,13 +115,43 @@ One important guard: a `context_length` mapping in `error_map` is **suppressed o
 
 ### Breaker state machine
 
-```
-         ┌──── trip condition met ────────────────────────────────────────────────┐
-         │                                                                        ▼
-       Closed ◀── probe succeeds ── HalfOpen ◀── cooldown expires ──── Open
-                                        │
-                                        └── probe fails ──▶ Open (escalated cooldown)
-```
+<svg viewBox="0 0 720 340" role="img" aria-label="Breaker state machine: Closed trips to Open when the trip condition is met; Open moves to HalfOpen when the cooldown expires; HalfOpen returns to Closed if the recovery probe succeeds, or back to Open with an escalated cooldown if the probe fails." style="width:100%;height:auto;max-width:720px;font-family:ui-sans-serif,system-ui,sans-serif;">
+  <defs>
+    <marker id="brk-arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+    </marker>
+    <marker id="brk-ok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#16a34a"/>
+    </marker>
+    <marker id="brk-fail" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="720" height="340" fill="#ffffff"/>
+  <!-- nodes -->
+  <rect x="48" y="48" width="180" height="64" rx="12" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+  <text x="138" y="80" text-anchor="middle" fill="#166534" font-size="16" font-weight="700">Closed</text>
+  <text x="138" y="99" text-anchor="middle" fill="#15803d" font-size="11">healthy, serving</text>
+  <rect x="492" y="48" width="180" height="64" rx="12" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+  <text x="582" y="80" text-anchor="middle" fill="#991b1b" font-size="16" font-weight="700">Open</text>
+  <text x="582" y="99" text-anchor="middle" fill="#b91c1c" font-size="11">tripped, skipped</text>
+  <rect x="270" y="236" width="180" height="64" rx="12" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="360" y="268" text-anchor="middle" fill="#92400e" font-size="16" font-weight="700">HalfOpen</text>
+  <text x="360" y="287" text-anchor="middle" fill="#b45309" font-size="11">one probe admitted</text>
+  <!-- Closed -> Open -->
+  <line x1="228" y1="80" x2="486" y2="80" stroke="#64748b" stroke-width="2" marker-end="url(#brk-arw)"/>
+  <text x="357" y="70" text-anchor="middle" fill="#334155" font-size="12" font-weight="600">trip condition met</text>
+  <!-- Open -> HalfOpen -->
+  <path d="M540,112 Q470,160 452,236" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#brk-arw)"/>
+  <text x="470" y="176" text-anchor="middle" fill="#334155" font-size="12" font-weight="600">cooldown expires</text>
+  <!-- HalfOpen -> Closed -->
+  <path d="M270,258 Q168,202 150,116" fill="none" stroke="#16a34a" stroke-width="2" marker-end="url(#brk-ok)"/>
+  <text x="176" y="182" text-anchor="middle" fill="#166534" font-size="12" font-weight="600">probe succeeds</text>
+  <!-- HalfOpen -> Open (fail) -->
+  <path d="M452,272 Q642,236 582,116" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#brk-fail)"/>
+  <text x="632" y="204" text-anchor="middle" fill="#991b1b" font-size="12" font-weight="600">probe fails</text>
+  <text x="632" y="220" text-anchor="middle" fill="#b91c1c" font-size="11">(escalated cooldown)</text>
+</svg>
 
 **Closed**: the lane is healthy and receives traffic. Failures are recorded against the window/streak. A single failure that does not meet the trip condition arms a brief cooldown on the cell (the lane is temporarily deprioritized) but the breaker stays Closed.
 

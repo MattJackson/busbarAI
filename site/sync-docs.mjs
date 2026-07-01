@@ -17,7 +17,8 @@ const PAGES = {
   'configuration': 'Full configuration reference — every key, default, and validation rule.',
   'protocols': 'The six wire protocols and lossless cross-protocol translation.',
   'providers': 'How to add any provider that speaks one of the six protocols — a config entry, no code.',
-  'reliability': 'Pools, fault-attributed circuit breaking, in-flight failover, and governance.',
+  'pools': 'What a pool is, how member selection and failover work, the full config reference, and copy-paste recipes.',
+  'reliability': 'Fault-attributed circuit breaking, in-flight failover, and governance.',
 };
 
 const esc = (s) => s.replace(/"/g, '\\"');

@@ -56,6 +56,7 @@ export default defineConfig({
         {
           label: 'Guides',
           items: [
+            { label: 'Pools', slug: 'pools' },
             { label: 'Reliability & Failover', slug: 'reliability' },
             { label: 'Routing Policies', slug: 'routing' },
             { label: 'Protocols & Translation', slug: 'protocols' },
