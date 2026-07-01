@@ -41,6 +41,13 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Blog',
+          items: [
+            { label: 'All posts', slug: 'blog' },
+            { label: 'Busbar, in numbers', slug: 'blog/busbar-in-numbers' },
+          ],
+        },
+        {
           label: 'Guides',
           items: [
             { label: 'Reliability & Failover', slug: 'reliability' },
