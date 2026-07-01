@@ -8,11 +8,16 @@ import glyphPrimary from '../assets/busbar-primary.svg';
 // Crate version, synced from the repo Cargo.toml into src/release.json by sync-docs.mjs
 // (runs before every dev/build). Importing keeps the read inside site/ — robust in astro build.
 import release from '../release.json';
+import Nav from '../components/Nav.astro';
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
 const REL = `${GITHUB}/releases/latest/download`;
 const YEAR = new Date().getFullYear();
 const version = release.version || '';
+
+const ORG = { '@context': 'https://schema.org', '@type': 'Organization', name: 'Busbar', url: 'https://getbusbar.com', logo: 'https://getbusbar.com/favicon.svg', sameAs: ['https://github.com/MattJackson/busbarAI'] };
+const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'Busbar', url: 'https://getbusbar.com' };
+const SOFTWARE = { '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Busbar', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows', offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }, url: 'https://getbusbar.com', description: 'The reliability and fidelity layer for multi-model AI traffic — lossless cross-protocol translation, fault-aware circuit breaking, and in-flight failover in one static Rust binary.' };
 
 // Each archive contains the single `busbar` binary. Targets mirror release.yml's matrix.
 const groups = [
@@ -56,22 +61,12 @@ const groups = [
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <meta name="color-scheme" content="light" />
+    <script type="application/ld+json" set:html={JSON.stringify(ORG)} />
+    <script type="application/ld+json" set:html={JSON.stringify(WEBSITE)} />
+    <script type="application/ld+json" set:html={JSON.stringify(SOFTWARE)} />
   </head>
   <body>
-    <header class="nav">
-      <div class="wrap nav-inner">
-        <a href="/" class="brand" aria-label="Busbar home">
-          <img src={glyphPrimary.src} alt="" width="30" height="30" />
-          <span>Busbar</span>
-        </a>
-        <nav class="nav-links">
-          <a href="/why-busbar/">Docs</a>
-          <a href="/benchmark/">Benchmark</a>
-          <a href="/download/" class="active">Download</a>
-          <a href={GITHUB} class="ghost">GitHub</a>
-        </nav>
-      </div>
-    </header>
+    <Nav />
 
     <main class="dl-wrap">
       <div class="dl-head">

@@ -13,7 +13,12 @@ const fmt = (d: Date) =>
   d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
 ---
 
-<BlogLayout title={`${post.data.title} — Busbar`} description={post.data.description}>
+<BlogLayout
+  title={`${post.data.title} — Busbar`}
+  description={post.data.description}
+  datePublished={post.data.date.toISOString().slice(0, 10)}
+  author={post.data.author}
+>
   <article class="post">
     <a class="post-back" href="/blog/">← Blog</a>
     <p class="post-meta">{post.data.author} · {post.data.authorTitle} · {fmt(post.data.date)}</p>
