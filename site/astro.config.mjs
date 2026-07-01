@@ -30,6 +30,7 @@ export default defineConfig({
       ],
       social: [
         { icon: 'github', label: 'GitHub', href: 'https://github.com/MattJackson/busbarAI' },
+        { icon: 'discord', label: 'Discord', href: 'https://discord.gg/f5XtWw4NT' },
       ],
       sidebar: [
         {
