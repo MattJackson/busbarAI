@@ -244,6 +244,29 @@ Omitting the `breaker:` block entirely is equivalent to specifying all the above
 
 ### The first-byte boundary
 
+<svg viewBox="0 0 760 210" role="img" aria-label="A timeline split at the first byte reaching the client: before it, Busbar can transparently reroute connect errors, timeouts, 429s, and 5xxs; after it, no failover is possible because the client already holds tokens." style="width:100%;height:auto;max-width:760px;font-family:ui-sans-serif,system-ui,sans-serif;">
+  <rect x="0" y="0" width="760" height="210" fill="#ffffff"/>
+  <!-- divider marker -->
+  <text x="420" y="34" text-anchor="middle" fill="#334155" font-size="12" font-weight="700">first byte reaches client</text>
+  <line x1="420" y1="42" x2="420" y2="150" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <!-- green (before) -->
+  <rect x="56" y="56" width="360" height="64" rx="12" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+  <text x="236" y="84" text-anchor="middle" fill="#166534" font-size="15" font-weight="700">Failover window</text>
+  <text x="236" y="105" text-anchor="middle" fill="#15803d" font-size="10.5">connect · timeout · 429 · 5xx  →  reroute</text>
+  <!-- red (after) -->
+  <rect x="424" y="56" width="280" height="64" rx="12" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+  <text x="564" y="84" text-anchor="middle" fill="#991b1b" font-size="15" font-weight="700">No failover</text>
+  <text x="564" y="105" text-anchor="middle" fill="#b91c1c" font-size="10.5">client already holds tokens</text>
+  <!-- captions -->
+  <text x="236" y="150" text-anchor="middle" fill="#475569" font-size="11">The bulk of real provider failures land here.</text>
+  <text x="564" y="150" text-anchor="middle" fill="#475569" font-size="11">Mid-stream death → SSE error; client retries.</text>
+  <!-- time axis -->
+  <line x1="56" y1="180" x2="700" y2="180" stroke="#cbd5e1" stroke-width="1.5"/>
+  <polygon points="700,175 712,180 700,185" fill="#cbd5e1"/>
+  <text x="56" y="198" text-anchor="start" fill="#94a3b8" font-size="10.5">request starts</text>
+  <text x="712" y="198" text-anchor="end" fill="#94a3b8" font-size="10.5">time →</text>
+</svg>
+
 Failover is bounded by when the upstream starts streaming a response body to the client. Before the first upstream byte reaches the client, any transport or pre-response failure (connect error, timeout waiting for headers, transient upstream response) transparently fails over to another pool member. From the client's perspective, the request is still in flight.
 
 **This pre-first-byte window covers the bulk of real provider failures**: connect errors and timeouts, `429` rate-limit responses, and `5xx` errors returned on the response headers all arrive *before* any body byte, so they fail over transparently. A failure only becomes unrecoverable once the upstream has already streamed a byte to the client and *then* dies mid-generation.
@@ -392,6 +415,41 @@ Choosing a mode: `none` is fine for pools with multiple members, one member goin
 ## Governance and limits
 
 Governance adds per-client virtual keys with allowed-pool ACLs, budget caps, and rate limits. State persists in embedded SQLite. It is optional and disabled by default.
+
+<svg viewBox="0 0 760 270" role="img" aria-label="A request carrying a virtual key passes through the governance gate, which checks the allowed-pools ACL, the budget cap, and the rate limit; if all pass the request reaches the pool and upstream, otherwise it is denied with a 403 or 429." style="width:100%;height:auto;max-width:760px;font-family:ui-sans-serif,system-ui,sans-serif;">
+  <defs>
+    <marker id="gov-arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="gov-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="760" height="270" fill="#ffffff"/>
+  <!-- request -->
+  <rect x="20" y="100" width="150" height="56" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="95" y="126" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Request</text>
+  <text x="95" y="144" text-anchor="middle" fill="#64748b" font-size="10.5">sk-bb-… virtual key</text>
+  <line x1="170" y1="128" x2="214" y2="128" stroke="#94a3b8" stroke-width="2" marker-end="url(#gov-arw)"/>
+  <!-- gate -->
+  <rect x="218" y="44" width="220" height="168" rx="14" fill="#f8fafc" stroke="#0f172a" stroke-width="2"/>
+  <text x="328" y="72" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Governance gate</text>
+  <circle cx="246" cy="104" r="5" fill="#a3e635"/><text x="260" y="108" fill="#334155" font-size="12">allowed_pools ACL</text>
+  <circle cx="246" cy="140" r="5" fill="#a3e635"/><text x="260" y="144" fill="#334155" font-size="12">budget cap</text>
+  <circle cx="246" cy="176" r="5" fill="#a3e635"/><text x="260" y="180" fill="#334155" font-size="12">rate limit · rpm/tpm</text>
+  <!-- admitted -->
+  <line x1="438" y1="128" x2="556" y2="128" stroke="#94a3b8" stroke-width="2" marker-end="url(#gov-arw)"/>
+  <text x="497" y="118" text-anchor="middle" fill="#166534" font-size="10.5" font-weight="600">admitted</text>
+  <!-- pool -->
+  <rect x="560" y="100" width="150" height="56" rx="10" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+  <text x="635" y="126" text-anchor="middle" fill="#166534" font-size="14" font-weight="700">Pool</text>
+  <text x="635" y="144" text-anchor="middle" fill="#15803d" font-size="10.5">→ upstream</text>
+  <!-- denied -->
+  <line x1="328" y1="212" x2="328" y2="230" stroke="#dc2626" stroke-width="2" marker-end="url(#gov-red)"/>
+  <rect x="278" y="232" width="100" height="30" rx="8" fill="#fef2f2" stroke="#dc2626"/>
+  <text x="328" y="252" text-anchor="middle" fill="#991b1b" font-size="13" font-weight="700">403 / 429</text>
+  <text x="392" y="252" text-anchor="start" fill="#b91c1c" font-size="10.5">any check fails → denied</text>
+</svg>
 
 ### Enabling governance
 

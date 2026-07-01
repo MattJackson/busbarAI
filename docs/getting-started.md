@@ -6,6 +6,38 @@ It does the same job as LiteLLM or OpenRouter, one API in front of every model a
 
 This guide takes you from zero to a working request in about five minutes.
 
+<svg viewBox="0 0 800 130" role="img" aria-label="Four steps to a working request: install the binary, write a minimal config, run Busbar, then send a request." style="width:100%;height:auto;max-width:800px;font-family:ui-sans-serif,system-ui,sans-serif;">
+  <defs>
+    <marker id="gs-arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="800" height="130" fill="#ffffff"/>
+  <g stroke="#94a3b8" stroke-width="2" marker-end="url(#gs-arw)">
+    <line x1="185" y1="68" x2="203" y2="68"/>
+    <line x1="375" y1="68" x2="393" y2="68"/>
+    <line x1="565" y1="68" x2="583" y2="68"/>
+  </g>
+  <g>
+    <rect x="15"  y="30" width="170" height="76" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+    <circle cx="43"  cy="60" r="14" fill="#a3e635"/><text x="43"  y="65" text-anchor="middle" fill="#1a2e05" font-size="13" font-weight="700">1</text>
+    <text x="66"  y="57" fill="#0f172a" font-size="14" font-weight="700">Install</text>
+    <text x="66"  y="77" fill="#64748b" font-size="10.5">one-line script</text>
+    <rect x="205" y="30" width="170" height="76" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+    <circle cx="233" cy="60" r="14" fill="#a3e635"/><text x="233" y="65" text-anchor="middle" fill="#1a2e05" font-size="13" font-weight="700">2</text>
+    <text x="256" y="57" fill="#0f172a" font-size="14" font-weight="700">Configure</text>
+    <text x="256" y="77" fill="#64748b" font-size="10.5">one provider + model</text>
+    <rect x="395" y="30" width="170" height="76" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+    <circle cx="423" cy="60" r="14" fill="#a3e635"/><text x="423" y="65" text-anchor="middle" fill="#1a2e05" font-size="13" font-weight="700">3</text>
+    <text x="446" y="57" fill="#0f172a" font-size="14" font-weight="700">Run</text>
+    <text x="446" y="77" fill="#64748b" font-size="10.5">serves on :8080</text>
+    <rect x="585" y="30" width="170" height="76" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+    <circle cx="613" cy="60" r="14" fill="#a3e635"/><text x="613" y="65" text-anchor="middle" fill="#1a2e05" font-size="13" font-weight="700">4</text>
+    <text x="636" y="57" fill="#0f172a" font-size="14" font-weight="700">Request</text>
+    <text x="636" y="77" fill="#64748b" font-size="10.5">point any SDK at it</text>
+  </g>
+</svg>
+
 ---
 
 ## What you need
