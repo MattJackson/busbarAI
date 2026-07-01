@@ -336,7 +336,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         --bg-soft: #f8fafc;
       }
       * { box-sizing: border-box; }
-      html { scroll-behavior: smooth; }
+      html { scroll-behavior: smooth; overflow-x: clip; }
       body {
         margin: 0;
         background: var(--bg);
@@ -548,56 +548,46 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
 
       /* RESPONSIVE */
       @media (max-width: 900px) {
-        .hero-grid.qs-grid { grid-template-columns: 1fr; gap: 40px; }
+        /* Two-column sections collapse to one column. These are SEPARATE elements,
+           so the selector must be a list (`.a, .b`), not a compound (`.a.b`). */
+        .hero-grid, .qs-grid { grid-template-columns: 1fr; gap: 40px; }
         .feature-grid { grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(3, auto 1fr auto); }
-        /* Diagram: collapse to vertical stack. Hide SVG connectors. */
-        .diagram {
-          grid-template-columns: 1fr;
-          gap: 0;
-          padding: 32px 20px 32px;
-        }
+        /* Diagram: collapse to a vertical stack, hide the SVG connectors. */
+        .diagram { grid-template-columns: 1fr; gap: 0; padding: 32px 20px; }
         .link-zone { display: none; }
-        /* col-label is position:absolute (bottom: calc(100% + 9px)), on stacked layout that
-           would overlap the cell above. Convert to a normal flow label with margin instead. */
+        /* col-label is absolutely positioned above each column; in a stack it would
+           overlap the cell above, so make it a normal-flow label. */
         .col { padding-top: 28px; }
-        .col-label {
-          position: static;
-          display: block;
-          margin-bottom: 10px;
-          margin-top: 0;
-        }
-        /* hook-line and hook-out are absolute, positioned below col-busbar. On stacked layout
-           they'd overflow the diagram. Hide them, the busbar-box text already conveys the info. */
-        .hook-line.hook-out { display: none; }
+        .col-label { position: static; display: block; margin: 0 0 10px; }
+        /* hook-line / hook-out are absolute below col-busbar; hide them in the stack. */
+        .hook-line, .hook-out { display: none; }
         .col-busbar { padding-bottom: 0; }
         .footer-inner { grid-template-columns: 1fr; gap: 32px; }
         .footer-cols { grid-template-columns: repeat(2, 1fr); }
       }
       @media (max-width: 640px) {
-        /* Body-level overflow guard, catches any stray element wider than viewport */
-        body { overflow-x: hidden; }
-        .nav-links { gap: 14px; }
-        .nav-links a.ghost.nav-links a[href='/why-busbar/'].nav-links a[href='/benchmark/'] { display: none; }
-        .feature-grid.trust-grid.footer-cols { grid-template-columns: 1fr; }
-        .feature-grid { grid-template-rows: repeat(6, auto 1fr auto); }
+        .feature-grid { grid-template-columns: 1fr; grid-template-rows: repeat(6, auto 1fr auto); }
         .trust-grid { grid-template-columns: repeat(2, 1fr); }
         .hero-grid { padding: 48px 20px 44px; }
-        /* Code cards: ensure long lines scroll inside box, not push page wide */
-        .code-card pre.qs-block pre { overflow-x: auto; }
-        .code-card code.qs-block code { white-space: pre; }
-        /* Quickstart copy + steps stack was already 1-col from 900px media. Tighten padding. */
         .quickstart { padding: 56px 0; }
+        .core { padding: 64px 20px; }
+        .core p { font-size: 17px; }
+        .flow { padding: 8px 20px 64px; }
+        .features { padding: 8px 20px 72px; }
+        .section-title { margin-bottom: 28px; }
         .hero h1 { font-size: clamp(30px, 9vw, 42px); }
         .lede { font-size: 16px; }
-        /* CTA row: allow buttons to wrap and fill width on very small screens */
+        /* CTA buttons stack full-width for easy tap targets. */
         .cta-row { flex-direction: column; align-items: stretch; gap: 10px; }
-        .btn { text-align: center; }
+        .cta-row .btn { width: 100%; }
+        .footer-base { flex-direction: column; gap: 6px; }
       }
       @media (max-width: 420px) {
-        .nav-links { gap: 10px; font-size: 13.5px; }
         .wrap { padding: 0 16px; }
         .hero-grid { padding: 40px 16px 36px; }
-        .diagram { padding: 24px 16px 24px; }
+        .diagram { padding: 24px 16px; }
+        .footer-cols { grid-template-columns: 1fr; }
+        .trust-grid { grid-template-columns: 1fr; }
       }
     </style>
   </body>

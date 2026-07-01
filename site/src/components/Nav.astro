@@ -61,8 +61,16 @@ try {
   @media (max-width: 640px) {
     .nav-links { gap: 14px; }
   }
+  /* Download is also in the hero and footer; drop it from the nav on phones so the
+     header can never overflow the viewport. */
+  @media (max-width: 520px) {
+    .nav-links a[href='/download/'] { display: none; }
+  }
   @media (max-width: 420px) {
     .nav-links { gap: 10px; font-size: 13.5px; }
+  }
+  @media (max-width: 360px) {
+    .nav-links a[href='/blog/'] { display: none; }
   }
 </style>
 

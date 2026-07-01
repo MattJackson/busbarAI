@@ -320,9 +320,8 @@ const groups = [
         .footer-cols { grid-template-columns: repeat(2, 1fr); }
       }
       @media (max-width: 640px) {
-        body { overflow-x: hidden; }
+        html { overflow-x: clip; }
         .nav-links { gap: 14px; }
-        .nav-links a.ghost.nav-links a[href='/benchmark/'] { display: none; }
         .footer-cols { grid-template-columns: 1fr 1fr; }
         .dl-wrap { padding: 48px 16px 72px; }
         /* Install command row: stack code above copy button on narrow screens so
