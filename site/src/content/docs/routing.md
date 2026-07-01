@@ -56,13 +56,39 @@ The sequence for every request routed to a non-weighted pool:
 
 This composition means a policy's job is deliberately narrow. You declare a preference; Busbar's existing reliability machinery handles the rest.
 
-```
-request
-  → policy decides ranked order (once)
-      → failover loop walks ranked order
-          → breaker filter (unchanged: health, exclusion, half-open probe)
-              → dispatch → first-byte boundary
-```
+<svg viewBox="0 0 940 150" role="img" aria-label="Request flow: the policy ranks candidates once, then the failover loop walks that order, the breaker filter skips unhealthy or already-tried lanes, and the request is dispatched to the upstream up to the first-byte boundary." style="width:100%;height:auto;max-width:940px;font-family:ui-sans-serif,system-ui,sans-serif;">
+  <defs>
+    <marker id="rt-arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="940" height="150" fill="#ffffff"/>
+  <!-- arrows -->
+  <g stroke="#94a3b8" stroke-width="2" marker-end="url(#rt-arw)">
+    <line x1="160" y1="78" x2="206" y2="78"/>
+    <line x1="350" y1="78" x2="396" y2="78"/>
+    <line x1="540" y1="78" x2="586" y2="78"/>
+    <line x1="730" y1="78" x2="776" y2="78"/>
+  </g>
+  <!-- stages -->
+  <g>
+    <rect x="20"  y="44" width="140" height="68" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+    <text x="90"  y="76" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Request</text>
+    <text x="90"  y="94" text-anchor="middle" fill="#64748b" font-size="10.5">the client call</text>
+    <rect x="210" y="44" width="140" height="68" rx="10" fill="#f7fee7" stroke="#a3e635" stroke-width="2"/>
+    <text x="280" y="76" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Policy</text>
+    <text x="280" y="94" text-anchor="middle" fill="#4d7c0f" font-size="10.5">ranks candidates once</text>
+    <rect x="400" y="44" width="140" height="68" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+    <text x="470" y="76" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Failover loop</text>
+    <text x="470" y="94" text-anchor="middle" fill="#64748b" font-size="10.5">walks the ranked order</text>
+    <rect x="590" y="44" width="140" height="68" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+    <text x="660" y="76" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Breaker filter</text>
+    <text x="660" y="94" text-anchor="middle" fill="#64748b" font-size="10.5">skips unhealthy / tried</text>
+    <rect x="780" y="44" width="140" height="68" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+    <text x="850" y="76" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Dispatch</text>
+    <text x="850" y="94" text-anchor="middle" fill="#64748b" font-size="10.5">to first-byte boundary</text>
+  </g>
+</svg>
 
 ---
 

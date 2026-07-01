@@ -17,6 +17,55 @@ This document covers:
 
 ## One protocol in, any backend out
 
+<svg viewBox="0 0 760 400" role="img" aria-label="Any of six client protocols enters Busbar, is translated through a superset intermediate representation, and reaches any of six backend protocols, losslessly and in both directions." style="width:100%;height:auto;max-width:760px;font-family:ui-sans-serif,system-ui,sans-serif;">
+  <defs>
+    <marker id="ir-both" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="760" height="400" fill="#ffffff"/>
+  <text x="102" y="26" text-anchor="middle" fill="#64748b" font-size="12" font-weight="700" letter-spacing="0.04em">CLIENT SPEAKS</text>
+  <text x="658" y="26" text-anchor="middle" fill="#64748b" font-size="12" font-weight="700" letter-spacing="0.04em">BACKEND SPEAKS</text>
+  <!-- spokes (drawn first, under the chips) -->
+  <g stroke="#cbd5e1" stroke-width="1.5" marker-start="url(#ir-both)" marker-end="url(#ir-both)">
+    <line x1="184" y1="62"  x2="296" y2="200"/>
+    <line x1="184" y1="120" x2="296" y2="200"/>
+    <line x1="184" y1="178" x2="296" y2="200"/>
+    <line x1="184" y1="236" x2="296" y2="200"/>
+    <line x1="184" y1="294" x2="296" y2="200"/>
+    <line x1="184" y1="352" x2="296" y2="200"/>
+    <line x1="464" y1="200" x2="576" y2="62"/>
+    <line x1="464" y1="200" x2="576" y2="120"/>
+    <line x1="464" y1="200" x2="576" y2="178"/>
+    <line x1="464" y1="200" x2="576" y2="236"/>
+    <line x1="464" y1="200" x2="576" y2="294"/>
+    <line x1="464" y1="200" x2="576" y2="352"/>
+  </g>
+  <!-- hub -->
+  <rect x="300" y="152" width="160" height="96" rx="16" fill="#0f172a" stroke="#a3e635" stroke-width="2.5"/>
+  <text x="380" y="196" text-anchor="middle" fill="#ffffff" font-size="16" font-weight="700">Superset IR</text>
+  <text x="380" y="216" text-anchor="middle" fill="#a3e635" font-size="10.5" letter-spacing="0.02em">lossless both ways</text>
+  <!-- protocol chips -->
+  <g font-size="13" font-weight="600" fill="#0f172a">
+    <g>
+      <rect x="24"  y="40"  width="160" height="44" rx="10" fill="#f8fafc" stroke="#e2e8f0"/><text x="104" y="66"  text-anchor="middle">OpenAI</text>
+      <rect x="24"  y="98"  width="160" height="44" rx="10" fill="#f8fafc" stroke="#e2e8f0"/><text x="104" y="124" text-anchor="middle">Anthropic</text>
+      <rect x="24"  y="156" width="160" height="44" rx="10" fill="#f8fafc" stroke="#e2e8f0"/><text x="104" y="182" text-anchor="middle">Gemini</text>
+      <rect x="24"  y="214" width="160" height="44" rx="10" fill="#f8fafc" stroke="#e2e8f0"/><text x="104" y="240" text-anchor="middle">Bedrock</text>
+      <rect x="24"  y="272" width="160" height="44" rx="10" fill="#f8fafc" stroke="#e2e8f0"/><text x="104" y="298" text-anchor="middle">Cohere</text>
+      <rect x="24"  y="330" width="160" height="44" rx="10" fill="#f8fafc" stroke="#e2e8f0"/><text x="104" y="356" text-anchor="middle">Responses</text>
+    </g>
+    <g>
+      <rect x="576" y="40"  width="160" height="44" rx="10" fill="#f8fafc" stroke="#e2e8f0"/><text x="656" y="66"  text-anchor="middle">OpenAI</text>
+      <rect x="576" y="98"  width="160" height="44" rx="10" fill="#f8fafc" stroke="#e2e8f0"/><text x="656" y="124" text-anchor="middle">Anthropic</text>
+      <rect x="576" y="156" width="160" height="44" rx="10" fill="#f8fafc" stroke="#e2e8f0"/><text x="656" y="182" text-anchor="middle">Gemini</text>
+      <rect x="576" y="214" width="160" height="44" rx="10" fill="#f8fafc" stroke="#e2e8f0"/><text x="656" y="240" text-anchor="middle">Bedrock</text>
+      <rect x="576" y="272" width="160" height="44" rx="10" fill="#f8fafc" stroke="#e2e8f0"/><text x="656" y="298" text-anchor="middle">Cohere</text>
+      <rect x="576" y="330" width="160" height="44" rx="10" fill="#f8fafc" stroke="#e2e8f0"/><text x="656" y="356" text-anchor="middle">Responses</text>
+    </g>
+  </g>
+</svg>
+
 Each request Busbar receives speaks **one** protocol, the one the client chose. You can pick *any* of the six on the way in, but a single request is exactly one of them. The important part: a pool has **no fixed input protocol**. It's just a routing target. So different clients can reach the *same* pool, each in its own protocol, and Busbar fans each request out to whichever backend in the pool serves it, translating both ways when they differ.
 
 Say you define a pool `fast` backed by Claude Opus (an `anthropic` backend) and GPT (an `openai` backend). Each of these clients can hit it natively, with no extra configuration:

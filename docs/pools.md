@@ -16,7 +16,7 @@ Pools are optional: you can route directly to a single model. But the moment you
   <!-- pool -->
   <rect x="216" y="28" width="488" height="244" rx="16" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.5"/>
   <text x="240" y="56" fill="#0f172a" font-size="14" font-weight="700">pool: chat</text>
-  <text x="612" y="56" fill="#64748b" font-size="11">weighted · failover</text>
+  <text x="680" y="56" text-anchor="end" fill="#64748b" font-size="11">weighted · failover</text>
   <!-- lanes -->
   <g>
     <rect x="240" y="72" width="440" height="52" rx="10" fill="#ffffff" stroke="#e2e8f0"/>
