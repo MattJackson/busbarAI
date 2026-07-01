@@ -39,12 +39,12 @@ Yes. The overhead harness (a mock upstream, the gateway, and a load client that 
 
 ## How does Busbar compare?
 
-Lower overhead. An order of magnitude less memory. By each project's own published benchmark.
+Lower overhead. An order of magnitude less memory. Ours and a widely-used gateway's, each from its own published benchmark.
 
 - **Overhead:** Busbar adds about **38 µs**. The fastest-moving alternative reports about **50 µs** for its Rust core.
 - **Memory:** Busbar peaks around **4.5 MB** resident. That same alternative reports about **32 MB** for its Rust build and about **359 MB** for its Python one. Busbar is **7 to 80 times lighter**.
 
-Fair caveat: these are each project's own numbers on its own hardware, so treat the overhead figures as same-class-or-lower rather than a controlled stopwatch. Memory barely moves with CPU, so that gap is real and architectural, not a hardware artifact.
+Fair caveat: these are each side's own numbers on its own hardware, so treat the overhead figures as same-class-or-lower rather than a controlled stopwatch. Memory barely moves with CPU, so that gap is real and architectural, not a hardware artifact.
 
 And both sets of numbers are meant to be reproducible. Ours is: the harness is checked in under `bench/`, and Busbar reports its own added latency in-band on every response, so you can verify it on your own traffic instead of taking our word for it.
 
