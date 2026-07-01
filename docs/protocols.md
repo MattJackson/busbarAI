@@ -362,8 +362,8 @@ Steps, in order:
 
 1. The ingress reader parses the request body into an `IrRequest`.
 2. If the egress protocol requires `max_tokens` (only Anthropic returns `true` for `requires_max_tokens()`), and the IR has none, the lane's `default_max_tokens` is injected (falling back to `4096`).
-3. Tool IDs are remapped from the egress backend's native shape to what the ingress client expects on the response side.
-4. The `extra` map: which holds unmodeled source-protocol fields like OpenAI's `logprobs` or `n`, is cleared before writing. This is the structural leak guard: OpenAI-only fields must not reach an Anthropic or Gemini backend, where they would be rejected or silently ignored.
+3. Tool IDs the client echoes back in `tool_result` blocks are decoded from the ingress-native shape to the egress backend's original id, so the backend sees the id it actually issued. (The reverse remap, egress id to ingress-native, runs on the response side.)
+4. The `extra` map: which holds unmodeled source-protocol fields like OpenAI's `logprobs` or `logit_bias`, is cleared before writing. This is the structural leak guard: OpenAI-only fields must not reach an Anthropic or Gemini backend, where they would be rejected or silently ignored.
 5. The egress writer serializes the IR into the upstream protocol's wire format.
 6. Router shim keys are stripped (the Gemini JSON-array flag, and `"stream"` for path-model egress where stream intent is in the URL).
 7. The `"model"` field is rewritten to the selected lane's actual model identifier.
@@ -376,7 +376,7 @@ Steps, in order:
 egress.reader().read_response(body)   →   IrResponse   →   ingress.writer().write_response(ir)
 ```
 
-The upstream response is buffered (up to 32 MiB), parsed, and re-serialized in the caller's protocol format. On a cross-protocol hop, the upstream-assigned `id` is stripped and the ingress writer mints a native-format ID; `model` and `created` are preserved as the synthesis anchor.
+The upstream response is buffered (up to the configured `request_body_max_bytes`, 32 MiB by default), parsed, and re-serialized in the caller's protocol format. On a cross-protocol hop, the upstream-assigned `id` is stripped and the ingress writer mints a native-format ID; `model` and `created` are preserved as the synthesis anchor.
 
 **Response translation (streaming):** `StreamTranslate` composes the reader and writer event-by-event:
 
@@ -427,7 +427,7 @@ These fields survive a cross-protocol hop because they are first-class in the IR
 | Thinking / extended-thinking blocks | `IrBlock::Thinking { text, signature, cache_control }` |
 | Tool definitions | `IrRequest.tools`: `IrTool { name, description, input_schema }` |
 | Tool-use and tool-result blocks | `IrBlock::ToolUse`, `IrBlock::ToolResult` |
-| Image blocks | `IrBlock::Image { media_type, data, cache_control }` |
+| Image blocks | `IrBlock::Image { source: IrImageSource, cache_control }` (media type and data live in `IrImageSource::Base64 { media_type, data }`) |
 | Prompt-cache breakpoints (`cache_control`) | First-class on text, tool-use, tool-result, **thinking, and image** blocks: an Anthropic cache breakpoint survives a same-protocol re-serialize instead of vanishing |
 | Structured output (`response_format` / `responseSchema`) | `IrRequest.response_format`, mapped into **each backend's native shape** (OpenAI `json_schema`, Cohere `json_object`, Gemini `responseMimeType`/`responseSchema`), never forwarded in a foreign shape the backend rejects |
 | Stop reason (`finish_reason` / `stop_reason` / `finishReason`) | Normalized to a **valid member of each protocol's enum** on egress: an unknown/foreign reason degrades to that protocol's SDK-safe value rather than leaking an off-enum string the client can't parse |
@@ -436,6 +436,7 @@ These fields survive a cross-protocol hop because they are first-class in the IR
 | `top_p`, `top_k` | `IrRequest.top_p`, `IrRequest.top_k` |
 | `stop` sequences | `IrRequest.stop: Vec<String>` |
 | `stream` flag | `IrRequest.stream` |
+| `n` (multiple completions) | `IrRequest.n`, a first-class field written only by protocols that model it (OpenAI `n`, Gemini `candidateCount`); preserved across those hops, omitted where the target has no analog |
 | `frequency_penalty`, `presence_penalty`, `seed` | First-class IR fields; survive cross-protocol hops (dropped with `warn!` where the target protocol has no analog) |
 | Grounding/web-search citations | `IrCitation` (with `raw` escape hatch for byte-exact Anthropic re-emit); streaming `citations_delta` included |
 | Serving model name | `IrResponse.model` (so pooled cross-protocol responses report which model served) |
@@ -447,13 +448,13 @@ These fields survive a cross-protocol hop because they are first-class in the IR
 
 Fields that are not modeled in the IR do not survive a translated hop, they live only in the `extra` passthrough map, which is cleared at the cross-protocol seam. Examples:
 
-- **OpenAI-only (no IR analog):** `logprobs`, `n` (multiple completions), `logit_bias`. These flow through `extra` verbatim on same-protocol OpenAI passthrough and are stripped on a cross-protocol hop.
+- **OpenAI-only (no IR analog):** `logprobs`, `logit_bias`. These flow through `extra` verbatim on same-protocol OpenAI passthrough and are stripped on a cross-protocol hop. (`n` is *not* in this list, it is a first-class IR field, see "Always preserved" above.)
 - **Other source-protocol-specific fields** that no IR field models are likewise stored in `extra` and dropped at the seam.
 - **Protocol-specific identifiers:** The upstream's `id` field is stripped and replaced with an ingress-native minted ID on cross-protocol responses (so Anthropic `msg_...` IDs don't appear in OpenAI responses).
 
 ### The `extra` map
 
-Fields that the ingress reader encounters but does not model as first-class IR fields are stored in `IrRequest.extra` (a passthrough JSON map). On a same-protocol passthrough they reach the upstream unchanged. On a cross-protocol hop, `extra` is cleared in its entirety before the egress write (the same step that drops `logprobs` and `n`): intentionally, so source-protocol-specific fields never reach a backend that rejects unknown fields.
+Fields that the ingress reader encounters but does not model as first-class IR fields are stored in `IrRequest.extra` (a passthrough JSON map). On a same-protocol passthrough they reach the upstream unchanged. On a cross-protocol hop, `extra` is cleared in its entirety before the egress write (the same step that drops `logprobs` and `logit_bias`): intentionally, so source-protocol-specific fields never reach a backend that rejects unknown fields.
 
 ### Same-protocol note
 

@@ -10,7 +10,7 @@ Providers live in `providers.yaml` as a map of name → definition. The shipped 
 |---|---|---|
 | `protocol` | **yes** | The wire protocol the provider speaks: `anthropic`, `openai`, `gemini`, `bedrock`, `responses`, or `cohere`. |
 | `base_url` | **yes** | Scheme + host (+ optional path prefix). Must be `https://` for external endpoints. |
-| `error_map` | no | Provider-specific **JSON** error codes → a disposition (`billing` or `rate_limit`). HTTP-status errors (429/5xx/401/…) are classified automatically without this. |
+| `error_map` | no | Provider-specific **JSON** error codes → a canonical disposition: one of `auth`, `billing`, `rate_limit`, `context_length`, `overloaded`, `server_error`, `timeout`, `network`, or `client_error` (the shipped catalog mostly uses `billing`/`rate_limit`). HTTP-status errors (429/5xx/401/…) are classified automatically without this. |
 | `path` | no | Override the upstream request path appended to `base_url`: for providers that embed an API version in `base_url`. |
 | `auth` | no | `bearer` (default) or `api-key` (header style), when a backend doesn't use its protocol's native auth. |
 | `health` | no | Optional health-probe configuration. |

@@ -22,7 +22,7 @@ For reference, a widely-used gateway's own published benchmark reports peak memo
 
 ## How much latency does Busbar add?
 
-The only honest number is its *added* latency: the microseconds Busbar spends parsing, translating, and serializing, not the network and not the model. Busbar measures exactly that on its own clock and reports it in-band on every response (`Server-Timing: busbar;dur=`):
+The only honest number is its *added* latency: the microseconds Busbar spends parsing, translating, and serializing, not the network and not the model. Busbar measures exactly that on its own clock and can report it in-band on every response via an opt-in `Server-Timing: busbar;dur=` header:
 
 - **38 µs** (0.038 ms) for a small call
 - **84 µs** (0.084 ms) for a full 12k-token cross-protocol translation, Anthropic in and a different protocol out, both directions
@@ -35,7 +35,7 @@ Saturating two pinned cores, Busbar sustained **19,505 req/s** (about 9,750 per 
 
 ## Are these benchmarks reproducible?
 
-Yes. The overhead harness (a mock upstream, the gateway, and a load client that times each request in microseconds) is checked in under `bench/`, and Busbar reports its own added latency in-band on every response via `Server-Timing`. You don't have to trust our number. You can read Busbar's overhead on your own traffic, in production, per request. That's the number that can't be cherry-picked.
+Yes. The overhead harness (a mock upstream, the gateway, and a load client that times each request in microseconds) is checked in under `bench/`, and Busbar can report its own added latency in-band on every response via the opt-in `Server-Timing` header. You don't have to trust our number. You can read Busbar's overhead on your own traffic, in production, per request. That's the number that can't be cherry-picked.
 
 ## How does Busbar compare?
 
@@ -46,7 +46,7 @@ Lower overhead. An order of magnitude less memory. Ours and a widely-used gatewa
 
 Fair caveat: these are each side's own numbers on its own hardware, so treat the overhead figures as same-class-or-lower rather than a controlled stopwatch. Memory barely moves with CPU, so that gap is real and architectural, not a hardware artifact.
 
-And both sets of numbers are meant to be reproducible. Ours is: the harness is checked in under `bench/`, and Busbar reports its own added latency in-band on every response, so you can verify it on your own traffic instead of taking our word for it.
+And both sets of numbers are meant to be reproducible. Ours is: the harness is checked in under `bench/`, and Busbar can report its own added latency in-band on every response (an opt-in header), so you can verify it on your own traffic instead of taking our word for it.
 
 We won't call Busbar "the fastest gateway in existence," because we haven't benchmarked every compiled gateway on one machine. What the numbers on the table say today is clear: lower overhead, far less memory, and it shipped.
 

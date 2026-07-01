@@ -49,9 +49,11 @@ control. Each capability below has two views — read **What it does** for the w
     `monthly` window) and its own **spend tracking** (running spend, tokens, and requests).
 
     Spend is computed from a price you set: a flat charge per request, plus a per-1,000-token charge
-    accrued from each response's usage. Budgets are a **soft guard** — usage is reconciled after the
-    response, so concurrent in-flight requests can overshoot a cap by a bounded amount; Busbar fails
-    *open* on a store error rather than dropping your traffic.
+    accrued from each response's usage. The flat per-request fee is an **atomic hard cap** — charged
+    in a single conditional UPSERT, so concurrent requests cannot race past the budget; only a single
+    admitted request's post-response token cost can marginally overshoot. By default Busbar fails
+    *open* on a store error rather than dropping your traffic (set `budget_on_store_error: deny` to
+    fail closed).
 
     **Why it matters:** you get per-key cost attribution and caps without trusting every developer
     and deployment to self-police. A staging key can be capped at a monthly budget; a production key
@@ -66,7 +68,7 @@ control. Each capability below has two views — read **What it does** for the w
     ```yaml
     governance:
       enabled: true
-      admin_token: "${BUSBAR_ADMIN_TOKEN}"   # guards /admin; unset = admin API off
+      admin_token: "${BUSBAR_ADMIN_TOKEN}"   # guards /admin; required when enabled — boot fails if unset/blank
       price_per_request_cents: 1             # flat charge per request (default 1)
       price_per_1k_tokens_cents: 20          # + per 1k input+output tokens (default 0)
       db_path: busbar-governance.db          # SQLite store (default)

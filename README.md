@@ -9,7 +9,7 @@
 [![CI](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/MattJackson/busbarAI?include_prereleases)](https://github.com/MattJackson/busbarAI/releases)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
-![Status](https://img.shields.io/badge/status-1.0.1-brightgreen)
+![Status](https://img.shields.io/badge/status-1.1.0-brightgreen)
 
 📖 **Docs:** [getbusbar.com](https://getbusbar.com)  
 ⚡ **Install:** `curl -fsSL https://getbusbar.com/install.sh | sh`  
@@ -27,7 +27,7 @@ Busbar sits between your application and your LLM providers. Point any SDK: Open
 
 A single static Rust binary, no Python sidecar, no interpreter, no GC in the request path. Linux, macOS, Windows (Intel and ARM). Your keys, your network, your data path.
 
-> **Status: 1.0.1**: stable. The HTTP API, configuration schema, and the six wire-protocol contracts are frozen under Semantic Versioning. Hardened across a multi-round security and correctness audit; releases ship a CycloneDX SBOM and a verifiable build-provenance attestation. AGPL-3.0.
+> **Status: 1.1.0**: stable. The HTTP API, configuration schema, and the six wire-protocol contracts are frozen under Semantic Versioning. Hardened across a multi-round security and correctness audit; releases ship a CycloneDX SBOM and a verifiable build-provenance attestation. AGPL-3.0.
 
 ---
 

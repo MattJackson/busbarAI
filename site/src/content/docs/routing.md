@@ -20,7 +20,7 @@ Cross-references: [Pools](/pools/) (how to define a pool and its members) · [Co
   - [cheapest](#cheapest)
   - [fastest](#fastest)
   - [least_busy](#least_busy)
-  - [usage (landing alongside)](#usage)
+  - [usage](#usage)
 - [The routing signals](#the-routing-signals)
 - [External policies](#external-policies)
   - [webhook](#webhook)
@@ -153,7 +153,7 @@ Use this when your members have different `max_concurrent` limits or when you wa
 
 `policy.name: usage`
 
-Prefers the member with the most remaining rate-limit headroom (RPM/TPM headroom from the caller key's governance counters). The `rate_headroom` signal is computed in `src/forward.rs` (`rate_headroom_for_token`) and passed to each `Candidate` before the routing decision. Candidates with no headroom signal (`None`, e.g. when governance is disabled or no rate limit is set) are demoted to last but remain reachable. Abstains only when every candidate lacks the signal (no rate limit in play), falling back to SWRR.
+Prefers the member with the most remaining rate-limit headroom (RPM/TPM headroom computed from the caller key's governance rate-limit counters). The `rate_headroom` signal is passed to each candidate before the routing decision. Candidates with no headroom signal (e.g. when governance is disabled or no rate limit is set) are demoted to last but remain reachable. Abstains only when every candidate lacks the signal (no rate limit in play), falling back to SWRR.
 
 ---
 
@@ -300,6 +300,7 @@ An embedded [Rhai](https://rhai.rs) script, compiled at startup and evaluated pe
   - `tier` (string or `()` if unset)
   - `cost_per_mtok` (float or `()` if unset), `latency_ms` (float or `()` until first request)
   - `available_concurrency` (int), `budget_remaining` (int or `()` = unlimited)
+  - `rate_headroom` (float or `()` when governance is off or the lane has no rate limit)
   - `tags` (array of strings)
 
 - `ctx` — a map with routing context:
@@ -349,12 +350,12 @@ Scripts are operator-config only — never client-supplied.
 
 | Field | Type | Default | Transport | Description |
 |---|---|---|---|---|
-| `name` | string | none | `native` | Native policy name: `weighted`, `cheapest`, `fastest`, `least_busy`, or `usage`. Required when `route: native`. |
+| `name` | string | none | `native` | Native policy name: `weighted`, `cheapest`, `fastest`, `least_busy`, or `usage`. Needed for `route: native`; if absent or unknown, routing degrades to weighted SWRR. |
 | `url` | string | none | `webhook` | Operator sidecar URL. Loopback allowed; RFC-1918/CGNAT/metadata blocked. Required when `route: webhook`. |
 | `timeout_ms` | integer | `150` | `native`, `webhook`, `script` | Hard wall-clock deadline for the policy decision in milliseconds. On timeout, `on_error` applies. (Native policies are synchronous and effectively never hit it.) |
 | `on_error` | string | `weighted` | `native`, `webhook`, `script` | Fallback when the policy times out or errors: `weighted` (SWRR), `reject` (503), or `first` (first member in config order). An explicit abstain bypasses this and always falls through to SWRR. |
-| `script` | string | none | `script` | Inline Rhai source. Exactly one of `script` or `script_file` is required when `route: script`. |
-| `script_file` | string | none | `script` | Path to a Rhai script file. Alternative to inline `script`. |
+| `script` | string | none | `script` | Inline Rhai source. If both `script` and `script_file` are set, inline `script` takes precedence. |
+| `script_file` | string | none | `script` | Path to a Rhai script file. Alternative to inline `script`. If neither is set (or the `script-policy` feature is off), routing degrades to weighted SWRR. |
 
 ### Per-member routing metadata fields
 
@@ -366,17 +367,20 @@ Added to each pool member. All optional; inert for pools with `route: weighted`.
 | `cost_per_mtok` | float | none | Operator-declared cost in currency units per million tokens. Drives `cheapest` and is exposed to webhook/script. |
 | `tags` | list<string> | `[]` | Free-form labels (e.g. `["opus", "large-context"]`). Exposed to webhook and script for tag-based selection. |
 
-### Startup validation
+### Startup validation and misconfiguration behavior
 
-| Rule | Condition |
+Only webhook misconfiguration is a hard startup error. A misconfigured `native` or `script` policy never fails the boot; it degrades to weighted SWRR (a script fallback logs a warning), because routing must never take the gateway down.
+
+| Condition | Behavior |
 |---|---|
-| `route: native` + no `policy.name` | Startup error |
-| `route: native` + unknown `policy.name` | Startup error (must be one of: `weighted`, `cheapest`, `fastest`, `least_busy`, `usage`) |
-| `route: webhook` + no `policy.url` | Startup error |
-| `route: webhook` + SSRF-blocked URL | Startup error (RFC-1918, CGNAT, link-local, metadata hosts blocked; loopback allowed) |
-| `route: script` + neither `policy.script` nor `policy.script_file` | Startup error |
-| `route: script` + both `policy.script` and `policy.script_file` | Startup error |
-| `route: script` without the `script-policy` feature flag | Startup error |
+| `route:` set to an unknown value | **Startup error** (config deserialization rejects it) |
+| `route: webhook` + no `policy.url` | **Startup error** |
+| `route: webhook` + SSRF-blocked URL | **Startup error** (RFC-1918, CGNAT, link-local, metadata hosts blocked; loopback allowed) |
+| `route: native` + no `policy.name` | Degrades to weighted SWRR (no error) |
+| `route: native` + unknown `policy.name` | Degrades to weighted SWRR (no error) |
+| `route: script` + neither `policy.script` nor `policy.script_file` | Degrades to weighted SWRR, logs a boot warning |
+| `route: script` + both `policy.script` and `policy.script_file` | Inline `policy.script` wins; `policy.script_file` is ignored |
+| `route: script` without the `script-policy` feature flag | Degrades to weighted SWRR, logs a boot warning |
 
 ---
 
@@ -493,13 +497,13 @@ pools:
 
 **Response headers.** Every request with a non-default routing policy emits two headers (`src/forward.rs` constants `HDR_ROUTE_POLICY` and `HDR_ROUTE_TARGET`):
 
-- `x-busbar-route-policy: <policy>` — the policy name that made the decision (e.g. `webhook`, `native:cheapest`)
+- `x-busbar-route-policy: <policy>` — the policy name that made the decision (e.g. `webhook`, `cheapest`)
 - `x-busbar-route-target: <chosen-lane-model>` — the model of the chosen lane (e.g. `claude-sonnet`, `gpt-4o-mini`)
 
 | Example headers | Meaning |
 |---|---|
 | `x-busbar-route-policy: webhook` / `x-busbar-route-target: claude-sonnet` | Webhook policy chose `claude-sonnet` |
-| `x-busbar-route-policy: native:cheapest` / `x-busbar-route-target: gpt-4o-mini` | Native cheapest policy chose `gpt-4o-mini` |
+| `x-busbar-route-policy: cheapest` / `x-busbar-route-target: gpt-4o-mini` | Native cheapest policy chose `gpt-4o-mini` |
 
 **Prometheus metrics:**
 

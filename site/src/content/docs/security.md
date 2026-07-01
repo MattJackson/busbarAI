@@ -240,6 +240,6 @@ models:
 
 Two ways to see exactly what Busbar is blocking:
 
-1. **CLI flag:** `busbar --print-metadata-blocklist` dumps the effective denylist — hardcoded entries plus any `blocked_metadata_hosts` additions, minus any allow-overrides. This is always the ground truth for the running binary and config.
+1. **CLI flag:** `busbar --print-metadata-blocklist` dumps the denylist — the hardcoded entries plus any `blocked_metadata_hosts` additions (allow-overrides and `allow_all_metadata` are not subtracted from this list). This is the ground truth for what the compiled binary and config consider metadata hosts.
 
 2. **Startup log:** at `info` level Busbar logs `metadata protection: N hosts blocked (--print-metadata-blocklist to view)`. When `allow_all_metadata` is set the log line is instead a `WARN`: `metadata protection DISABLED — all cloud-metadata endpoints reachable`.

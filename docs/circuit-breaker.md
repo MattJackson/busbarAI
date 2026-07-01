@@ -48,7 +48,7 @@ Before the breaker records anything, every upstream outcome runs through a two-s
 | `TransientUpstream` | 5xx, 429, 408, 529, network error, timeout | Records a failure; drives trip evaluation. |
 | `HardDown` | 401, 403 (auth/billing); JSON codes mapped to `auth` or `billing` | Trips the lane immediately, regardless of window/streak, with a 30-minute sticky cooldown. |
 | `ClientFault` | 4xx other than 401/403/408/429 | Relayed verbatim; lane records nothing (the request was bad, not the upstream). |
-| `ContextLength` | Provider signals context-length exceeded, on 400/413 only | No lane penalty; request fails over to a larger-context member (see [context-length failover](/failover/#context-length-failover)). |
+| `ContextLength` | Provider signals context-length exceeded. The built-in code detection applies on 400/413 only; an operator `error_map` mapping to `context_length` applies on any non-5xx status | No lane penalty; request fails over to a larger-context member (see [context-length failover](/failover/#context-length-failover)). |
 
 One important guard: a `context_length` mapping in `error_map` is **suppressed on any 5xx**, so a provider returning 500 with a body that mentions `context_length` is still classified as `TransientUpstream`. This prevents a misconfigured or adversarial backend from masking an outage as a context-limit.
 
@@ -134,7 +134,7 @@ cooldown = min(base_cooldown_secs × 2^streak, max_cooldown_secs) ± 10% jitter
 
 Jitter is seeded by a hash of the current time, the cell's memory address, and the streak: so simultaneously tripped lanes desynchronize their recovery probes rather than flooding a recovering backend together.
 
-The minimum effective cooldown is 1 second regardless of the computed value.
+The jitter band itself is floored at 1 second, so simultaneously tripped lanes always spread their recovery probes rather than collapsing onto the same instant. The cooldown value otherwise follows the formula above (with the default `base_cooldown_secs` of 15, the first cooldown is never near zero).
 
 A server `Retry-After` header is always honored as a **floor**. If the upstream says to wait 90 seconds but your `max_cooldown_secs` is 60, the lane stays Open for 90 seconds. The floor is hard-capped at 24 hours to prevent overflow on malformed headers.
 
@@ -148,12 +148,12 @@ Default cooldowns (no `breaker:` block, or block present with fields omitted): `
 
 **Hard-down** faults (auth or billing, either by HTTP status 401/403 or by a matching `error_map` entry) trip the lane immediately: bypassing the window/streak entirely, with a **30-minute sticky cooldown** (`HARD_DOWN_COOLDOWN_SECS = 1800`). The distinction in behavior:
 
-- An `auth` hard-down relays the `401`/`403` to the caller (it was the caller's key, or Busbar's configured key is wrong). The lane is benched in this pool's cell.
+- An `auth` hard-down surfaces an auth error to the caller. If the caller presented their own key (passthrough), the upstream `401`/`403` is relayed verbatim; when Busbar's configured key is wrong, the caller instead gets a normalized ingress-native auth error (the status is remapped to the ingress protocol and the upstream body is suppressed). The lane is benched in this pool's cell.
 - A `billing` hard-down fails the request over to another pool member (or exhausts the pool). The error is not relayed: the caller sees a failover, not a billing error.
 
-A hard-down lane is still recoverable: a successful active health probe (or the organic half-open probe on cooldown expiry) brings it back. It is **not** the same as the permanent `dead` flag, which only a restart clears.
+A hard-down lane is still recoverable: a successful active health probe (or the organic half-open probe on cooldown expiry) brings it back automatically, no restart needed. Hard-down deliberately does **not** set the permanent `dead` flag (that would block recovery).
 
-If a lane shows `dead` in `/stats` with `dead_reason: auth`, the provider credential (`api_key_env`) is wrong or expired. Fix the credential and restart. If it shows `dead_reason: billing`, the upstream wallet is empty; fund it and Busbar will recover on the next successful probe.
+After an auth or billing hard-down, `/stats` shows the lane with `usable: false`, a non-zero `cooldown_remaining_s`, and a `dead_reason` describing the fault (an `auth rejected …` or `billing / insufficient balance` message) rather than `dead: true`. Fix the credential (`api_key_env`) for an auth fault or fund the account for a billing fault, and Busbar recovers on the next successful probe.
 
 ## Circuit breaker configuration
 

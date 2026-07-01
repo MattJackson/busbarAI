@@ -415,7 +415,7 @@ pools:
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `route` | string (enum) | `weighted` | Routing transport. One of `weighted`, `native`, `webhook`, `script`. `weighted` (default/absent) is zero-cost SWRR: no policy object is constructed and behavior is byte-identical to the baseline. Any other value runs a pluggable policy once per request before the failover loop. |
-| `policy` | object | none | Transport configuration. Required (and validated) when `route` is `native`, `webhook`, or `script`. Parsed but inert when `route: weighted`. |
+| `policy` | object | none | Transport configuration. Only `webhook` is validated at boot (a missing or SSRF-blocked `policy.url` is a startup error); a misconfigured `native` or `script` policy is not fatal, it degrades to weighted SWRR. Parsed but inert when `route: weighted`. |
 
 **`route` enum values:**
 
@@ -425,6 +425,8 @@ pools:
 | `native` | A Busbar-built policy selected by `policy.name`. Sync, no I/O, no external deps. |
 | `webhook` | An operator HTTP sidecar. Busbar POSTs a request projection and waits for a ranked preference list, bounded by `policy.timeout_ms`. |
 | `script` | An embedded Rhai script (behind the `script-policy` cargo feature). Compiled at startup; evaluated per request in a sandboxed thread pool. |
+
+`route:` also accepts the bare native policy names `cheapest`, `fastest`, `least_busy`, and `usage` as shorthand for `route: native` + `policy.name: <name>`. See the [Routing guide](/routing/) for what each policy does.
 
 **`policy` block fields:**
 

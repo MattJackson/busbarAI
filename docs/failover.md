@@ -84,7 +84,7 @@ pools:
         context_max: 1048576
 ```
 
-A member with no `context_max` set is never excluded on context-length grounds, it is always a candidate, and if it also rejects the request as too long, a normal transient/hard-down classification applies.
+A member with no `context_max` set is never excluded on context-length grounds, it is always a candidate, and if it also rejects the request as too long, that rejection is still treated as a context-length failure (no breaker penalty) and the lane is simply excluded for the rest of this request.
 
 Context-length failover is suppressed on 5xx responses, even if the body mentions a context-length-related code, to prevent a broken backend from dodging normal breaker penalties.
 
