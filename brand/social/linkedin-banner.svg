@@ -1,0 +1,50 @@
+<svg width="2256" height="382" viewBox="0 0 1128 191" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Busbar — One endpoint. Every LLM protocol. Losslessly.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0F172A"/>
+      <stop offset="1" stop-color="#1E293B"/>
+    </linearGradient>
+  </defs>
+
+  <!-- surface -->
+  <rect width="1128" height="191" fill="url(#bg)"/>
+
+  <!-- faint oversized glyph watermark, far right -->
+  <g transform="translate(980 96) scale(1.9) translate(-62 -64)" opacity="0.10">
+    <rect x="46" y="39" width="9" height="50" rx="4.5" fill="#A3E635"/>
+    <g stroke="#A3E635" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="36" y1="64" x2="41" y2="64" stroke-width="5"/>
+      <path d="M60 45 L79 45 Q87 45 87 55" stroke-width="5"/>
+      <line x1="60" y1="64" x2="72" y2="64" stroke-width="5"/>
+      <path d="M60 83 L79 83 Q87 83 87 73" stroke-width="5"/>
+    </g>
+    <g fill="#A3E635">
+      <circle cx="31" cy="64" r="4.6"/><circle cx="87" cy="55" r="4.6"/>
+      <circle cx="76" cy="64" r="4.6"/><circle cx="87" cy="73" r="4.6"/>
+    </g>
+  </g>
+
+  <!-- brand mark, left (kept clear of the bottom-left logo overlap by centering vertically) -->
+  <g transform="translate(96 95) scale(0.85) translate(-62 -64)">
+    <rect x="46" y="39" width="9" height="50" rx="4.5" fill="#A3E635"/>
+    <g stroke="#A3E635" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="36" y1="64" x2="41" y2="64" stroke-width="5"/>
+      <path d="M60 45 L79 45 Q87 45 87 55" stroke-width="5"/>
+      <line x1="60" y1="64" x2="72" y2="64" stroke-width="5"/>
+      <path d="M60 83 L79 83 Q87 83 87 73" stroke-width="5"/>
+    </g>
+    <g fill="#A3E635">
+      <circle cx="31" cy="64" r="4.6"/><circle cx="87" cy="55" r="4.6"/>
+      <circle cx="76" cy="64" r="4.6"/><circle cx="87" cy="73" r="4.6"/>
+    </g>
+  </g>
+
+  <!-- hero tagline -->
+  <text x="170" y="88" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="40" font-weight="700" fill="#FFFFFF">One endpoint. Every LLM protocol. <tspan fill="#A3E635">Losslessly.</tspan></text>
+
+  <!-- supporting line -->
+  <text x="172" y="126" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="20" font-weight="500" fill="#94A3B8">Lossless cross-protocol translation · fault-aware circuit breaking · in-flight failover · one Rust binary</text>
+
+  <!-- url — bottom-right so the Company Page logo (bottom-left overlap) never covers it -->
+  <text x="1090" y="165" text-anchor="end" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="19" font-weight="700" fill="#A3E635">getbusbar.com</text>
+</svg>
