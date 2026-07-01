@@ -82,7 +82,7 @@ When a member is tripped or at-capacity, it is dropped from the eligible set and
 
 Weights must be ≥ 1. A pool with equal-weight members distributes traffic evenly. The pool itself has no weight field: weights are only between members within one pool.
 
-For cost-aware, latency-aware, and custom selection (`route: cheapest` / `fastest` / `least_busy` / `webhook` / `script`), and for ready-to-paste pool configs, see the [Pools guide](pools.md#recipes).
+For pool structure and ready-to-paste pool configs, see the [Pools guide](pools.md#recipes). For cost-aware, latency-aware, and custom selection (`route: cheapest` / `fastest` / `least_busy` / `webhook` / `script`), see the [Routing guide](routing.md).
 
 **Multi-protocol pools**: members can span different providers and protocols. Busbar translates through its superset IR on cross-protocol hops (see [internals.md](internals.md)). A warning is logged at startup for heterogeneous pools because the IR models a common superset: same-protocol requests are byte-exact passthrough, but cross-protocol hops drop source-only fields that have no analog on the target (e.g. `logprobs`, `n`). For pools where all members speak the same protocol, there is no translation overhead and no field loss.
 
