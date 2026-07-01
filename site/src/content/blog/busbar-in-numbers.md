@@ -1,9 +1,10 @@
 ---
 title: "Busbar, in numbers"
 description: "A fast, lightweight, single-binary AI gateway isn't our roadmap — it's what shipped. Our answers on memory, latency, throughput, and what you actually deploy."
+date: 2026-07-01
+author: "Matthew Jackson"
+authorTitle: "Founder, Busbar"
 ---
-
-*Matthew Jackson · Founder, Busbar · July 1, 2026*
 
 We build **Busbar**: the reliability and fidelity layer for multi-model AI traffic. Point any SDK at one endpoint; Busbar routes across your providers, translates losslessly between six wire protocols, and keeps serving through provider failures — as a single static Rust binary you run in your own network.
 

@@ -1,0 +1,26 @@
+---
+import { getCollection, render } from 'astro:content';
+import BlogLayout from '../../layouts/BlogLayout.astro';
+
+export async function getStaticPaths() {
+  const posts = await getCollection('blog');
+  return posts.map((post) => ({ params: { slug: post.id }, props: { post } }));
+}
+
+const { post } = Astro.props;
+const { Content } = await render(post);
+const fmt = (d: Date) =>
+  d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+---
+
+<BlogLayout title={`${post.data.title} — Busbar`} description={post.data.description}>
+  <article class="post">
+    <a class="post-back" href="/blog/">← Blog</a>
+    <p class="post-meta">{post.data.author} · {post.data.authorTitle} · {fmt(post.data.date)}</p>
+    <h1>{post.data.title}</h1>
+    <p class="post-lede">{post.data.description}</p>
+    <div class="post-body">
+      <Content />
+    </div>
+  </article>
+</BlogLayout>

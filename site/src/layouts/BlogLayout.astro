@@ -1,0 +1,196 @@
+---
+// Marketing-styled layout for the Busbar blog — mirrors the homepage/terms nav + footer
+// so posts look like the website, not the Starlight docs.
+import glyphPrimary from '../assets/busbar-primary.svg';
+
+interface Props {
+  title: string;
+  description: string;
+}
+const { title, description } = Astro.props;
+
+const GITHUB = 'https://github.com/MattJackson/busbarAI';
+const DOCS = '/why-busbar/';
+const YEAR = new Date().getFullYear();
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="color-scheme" content="light" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="article" />
+    <meta property="og:image" content="https://getbusbar.com/og-card.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+  </head>
+  <body>
+    <header class="nav">
+      <div class="wrap nav-inner">
+        <a href="/" class="brand" aria-label="Busbar home">
+          <img src={glyphPrimary.src} alt="" width="30" height="30" />
+          <span>Busbar</span>
+        </a>
+        <nav class="nav-links">
+          <a href={DOCS}>Docs</a>
+          <a href="/blog/">Blog</a>
+          <a href="/benchmark/">Benchmark</a>
+          <a href="/download/">Download</a>
+          <a href={GITHUB} class="ghost">GitHub</a>
+        </nav>
+      </div>
+    </header>
+
+    <main class="post-wrap">
+      <slot />
+    </main>
+
+    <footer class="footer">
+      <div class="wrap footer-inner">
+        <div class="footer-brand">
+          <img src={glyphPrimary.src} alt="" width="26" height="26" />
+          <div>
+            <strong>Busbar</strong>
+            <span>The reliability layer for LLM traffic.</span>
+          </div>
+        </div>
+        <nav class="footer-cols">
+          <div>
+            <h4>Docs</h4>
+            <a href="/getting-started/">Getting Started</a>
+            <a href="/why-busbar/">Why Busbar</a>
+            <a href="/reliability/">Reliability</a>
+            <a href="/benchmark/">Benchmark</a>
+          </div>
+          <div>
+            <h4>Reference</h4>
+            <a href="/protocols/">Protocols</a>
+            <a href="/configuration/">Configuration</a>
+            <a href="/security/">Security</a>
+            <a href="/providers/">Providers</a>
+          </div>
+          <div>
+            <h4>Project</h4>
+            <a href="/blog/">Blog</a>
+            <a href={GITHUB}>GitHub</a>
+            <a href="/llms.txt">llms.txt</a>
+          </div>
+          <div>
+            <h4>Legal</h4>
+            <a href="/privacy/">Privacy Policy</a>
+            <a href="/terms/">Terms of Service</a>
+          </div>
+        </nav>
+      </div>
+      <div class="wrap footer-base">
+        <span>© {YEAR} Merseyway LLC d/b/a Busbar · Licensed AGPL-3.0</span>
+        <span>One endpoint. Every LLM protocol. Losslessly.</span>
+      </div>
+    </footer>
+
+    <style is:global>
+      :root {
+        color-scheme: light;
+        --slate: #0f172a;
+        --charcoal: #1e293b;
+        --lime: #a3e635;
+        --line: #e2e8f0;
+        --muted: #64748b;
+        --bg: #ffffff;
+        --bg-soft: #f8fafc;
+      }
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--slate);
+        font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+      .wrap { width: 100%; max-width: 1120px; margin: 0 auto; padding: 0 28px; }
+      a { color: inherit; text-decoration: none; }
+      h1, h2, h3, h4 { letter-spacing: -0.02em; line-height: 1.15; margin: 0; }
+
+      /* NAV */
+      .nav { position: sticky; top: 0; z-index: 50; background: rgba(255,255,255,0.82); backdrop-filter: saturate(180%) blur(12px); border-bottom: 1px solid var(--line); }
+      .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+      .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; letter-spacing: -0.01em; }
+      .nav-links { display: flex; align-items: center; gap: 26px; font-size: 14.5px; font-weight: 500; }
+      .nav-links a { color: var(--charcoal); transition: color 0.15s; }
+      .nav-links a:hover { color: var(--slate); }
+      .nav-links a.ghost { color: var(--muted); }
+
+      /* POST */
+      .post-wrap { min-height: calc(100vh - 64px - 200px); padding: 64px 28px 96px; }
+      .post { max-width: 720px; margin: 0 auto; }
+      .post-back { display: inline-block; font-size: 14px; color: var(--muted); margin-bottom: 28px; }
+      .post-back:hover { color: var(--slate); }
+      .post-meta { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; margin: 0 0 12px; }
+      .post > h1 { font-size: clamp(30px, 4.5vw, 46px); font-weight: 800; margin: 0 0 18px; color: var(--slate); }
+      .post-lede { font-size: 18px; color: #334155; line-height: 1.7; margin: 0 0 36px; padding-bottom: 28px; border-bottom: 1px solid var(--line); }
+
+      /* PROSE (markdown body) */
+      .post-body h2 { font-size: 24px; font-weight: 800; color: var(--slate); margin: 44px 0 14px; }
+      .post-body h3 { font-size: 18px; font-weight: 700; color: var(--slate); margin: 32px 0 10px; }
+      .post-body p { font-size: 16.5px; color: #334155; line-height: 1.8; margin: 0 0 18px; }
+      .post-body ul, .post-body ol { margin: 0 0 18px; padding-left: 24px; }
+      .post-body li { font-size: 16.5px; color: #334155; line-height: 1.8; margin-bottom: 8px; }
+      .post-body a { color: #4d7c0f; text-decoration: underline; text-underline-offset: 3px; }
+      .post-body a:hover { color: var(--slate); }
+      .post-body strong { color: var(--slate); font-weight: 700; }
+      .post-body em { color: var(--muted); }
+      .post-body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; background: var(--bg-soft); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
+      .post-body pre { background: var(--slate); color: #e2e8f0; border-radius: 10px; padding: 18px 20px; overflow-x: auto; margin: 0 0 20px; }
+      .post-body pre code { background: none; border: none; padding: 0; color: inherit; font-size: 13.5px; }
+      .post-body blockquote { margin: 0 0 22px; padding: 4px 0 4px 20px; border-left: 3px solid var(--lime); color: #475569; font-size: 17px; }
+
+      /* LIST */
+      .post-list { max-width: 760px; margin: 0 auto; }
+      .post-list > h1 { font-size: clamp(30px, 4.5vw, 46px); font-weight: 800; margin: 0 0 8px; }
+      .post-list .list-lede { font-size: 17px; color: var(--muted); margin: 0 0 40px; }
+      .post-card { display: block; padding: 24px 26px; border: 1px solid var(--line); border-radius: 14px; margin-bottom: 18px; transition: border-color 0.15s, transform 0.15s; background: #fff; }
+      .post-card:hover { border-color: var(--lime); transform: translateY(-2px); }
+      .post-card .c-date { font-size: 12.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+      .post-card .c-title { font-size: 22px; font-weight: 800; color: var(--slate); margin: 6px 0 8px; letter-spacing: -0.02em; }
+      .post-card .c-desc { font-size: 15.5px; color: #475569; line-height: 1.7; margin: 0; }
+
+      /* FOOTER */
+      .footer { background: #fff; padding: 64px 0 32px; border-top: 1px solid var(--line); }
+      .footer-inner { display: grid; grid-template-columns: 1fr 1.4fr; gap: 48px; padding-bottom: 40px; border-bottom: 1px solid var(--line); }
+      .footer-brand { display: flex; gap: 12px; align-items: flex-start; }
+      .footer-brand strong { display: block; font-size: 16px; }
+      .footer-brand span { font-size: 13.5px; color: var(--muted); }
+      .footer-cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 28px; }
+      .footer-cols h4 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 14px; }
+      .footer-cols a { display: block; font-size: 14px; color: var(--charcoal); padding: 4px 0; }
+      .footer-cols a:hover { color: var(--slate); }
+      .footer-base { display: flex; justify-content: space-between; padding-top: 24px; font-size: 13px; color: var(--muted); flex-wrap: wrap; gap: 10px; }
+
+      @media (max-width: 900px) {
+        .footer-inner { grid-template-columns: 1fr; gap: 32px; }
+        .footer-cols { grid-template-columns: repeat(2, 1fr); }
+      }
+      @media (max-width: 640px) {
+        body { overflow-x: hidden; }
+        .nav-links { gap: 14px; }
+        .nav-links a.ghost, .nav-links a[href='/benchmark/'] { display: none; }
+        .footer-cols { grid-template-columns: 1fr 1fr; }
+        .post-wrap { padding: 40px 16px 64px; }
+      }
+      @media (max-width: 420px) {
+        .wrap { padding: 0 16px; }
+        .nav-links { gap: 10px; font-size: 13.5px; }
+      }
+    </style>
+  </body>
+</html>
