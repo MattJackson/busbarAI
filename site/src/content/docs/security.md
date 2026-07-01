@@ -106,7 +106,7 @@ The order of checks on an mTLS-enabled listener:
 
 1. **TLS handshake.** The client presents its certificate. If it is missing or not signed by `client_ca_file`'s CA, the handshake fails and the connection is dropped. No HTTP request is parsed; no header, path, or token is ever read.
 2. **HTTP request parsed.** Only a client that cleared step 1 reaches this point.
-3. **Bearer-token / virtual-key auth.** The usual `auth` (or [governance](/reliability/#governance)) check runs on the now-decrypted request.
+3. **Bearer-token / virtual-key auth.** The usual `auth` (or [governance](/guides/governance/)) check runs on the now-decrypted request.
 
 The practical consequence: a client without a valid certificate cannot probe your routes, cannot trigger token comparisons, and cannot reach any application code. It is rejected at the lowest layer. This is what "zero-trust without a service mesh" means in practice — you get cert-based mutual authentication between your services and Busbar without deploying or operating a mesh.
 

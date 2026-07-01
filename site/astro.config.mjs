@@ -54,22 +54,35 @@ export default defineConfig({
           ],
         },
         {
-          label: 'Guides',
+          label: 'Core concepts',
           items: [
             { label: 'Pools', slug: 'pools' },
-            { label: 'Reliability & Failover', slug: 'reliability' },
             { label: 'Routing Policies', slug: 'routing' },
             { label: 'Protocols & Translation', slug: 'protocols' },
+          ],
+        },
+        {
+          label: 'Reliability',
+          items: [
+            { label: 'Overview', slug: 'reliability' },
+            { label: 'Circuit Breaker', slug: 'circuit-breaker' },
+            { label: 'In-flight Failover', slug: 'failover' },
+            { label: 'Health & Observability', slug: 'observability' },
+          ],
+        },
+        {
+          label: 'Operate',
+          items: [
             { label: 'Adding a Provider', slug: 'providers' },
             { label: 'Governance', slug: 'guides/governance' },
             { label: 'Security', slug: 'security' },
             { label: 'Configuration', slug: 'configuration' },
-            { label: 'Benchmark', slug: 'benchmark' },
           ],
         },
         {
-          label: 'Project',
+          label: 'Reference',
           items: [
+            { label: 'Benchmark', slug: 'benchmark' },
             { label: 'Changelog', slug: 'changelog' },
           ],
         },

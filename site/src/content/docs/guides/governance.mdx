@@ -10,6 +10,36 @@ It's off by default; turn it on when you need budgets, rate limits, spend visibi
 control. Each capability below has two views — read **What it does** for the why, flip to
 **Configure it** for the exact YAML and commands.
 
+<svg viewBox="0 0 760 270" role="img" aria-label="A request carrying a virtual key passes through the governance gate, which checks the allowed-pools ACL, the budget cap, and the rate limit; if all pass the request reaches the pool and upstream, otherwise it is denied with a 403 or 429." style="width:100%;height:auto;max-width:760px;font-family:ui-sans-serif,system-ui,sans-serif;">
+  <defs>
+    <marker id="gov-arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="gov-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="760" height="270" fill="#ffffff"/>
+  <rect x="20" y="100" width="150" height="56" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="95" y="126" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Request</text>
+  <text x="95" y="144" text-anchor="middle" fill="#64748b" font-size="10.5">sk-bb-… virtual key</text>
+  <line x1="170" y1="128" x2="214" y2="128" stroke="#94a3b8" stroke-width="2" marker-end="url(#gov-arw)"/>
+  <rect x="218" y="44" width="220" height="168" rx="14" fill="#f8fafc" stroke="#0f172a" stroke-width="2"/>
+  <text x="328" y="72" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Governance gate</text>
+  <circle cx="246" cy="104" r="5" fill="#a3e635"/><text x="260" y="108" fill="#334155" font-size="12">allowed_pools ACL</text>
+  <circle cx="246" cy="140" r="5" fill="#a3e635"/><text x="260" y="144" fill="#334155" font-size="12">budget cap</text>
+  <circle cx="246" cy="176" r="5" fill="#a3e635"/><text x="260" y="180" fill="#334155" font-size="12">rate limit · rpm/tpm</text>
+  <line x1="438" y1="128" x2="556" y2="128" stroke="#94a3b8" stroke-width="2" marker-end="url(#gov-arw)"/>
+  <text x="497" y="118" text-anchor="middle" fill="#166534" font-size="10.5" font-weight="600">admitted</text>
+  <rect x="560" y="100" width="150" height="56" rx="10" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+  <text x="635" y="126" text-anchor="middle" fill="#166534" font-size="14" font-weight="700">Pool</text>
+  <text x="635" y="144" text-anchor="middle" fill="#15803d" font-size="10.5">→ upstream</text>
+  <line x1="328" y1="212" x2="328" y2="230" stroke="#dc2626" stroke-width="2" marker-end="url(#gov-red)"/>
+  <rect x="278" y="232" width="100" height="30" rx="8" fill="#fef2f2" stroke="#dc2626"/>
+  <text x="328" y="252" text-anchor="middle" fill="#991b1b" font-size="13" font-weight="700">403 / 429</text>
+  <text x="392" y="252" text-anchor="start" fill="#b91c1c" font-size="10.5">any check fails → denied</text>
+</svg>
+
 ## Virtual keys, budgets & spend
 
 <Tabs>
@@ -111,3 +141,85 @@ control. Each capability below has two views — read **What it does** for the w
     The key now returns `403` if it targets any pool outside that list.
   </TabItem>
 </Tabs>
+
+---
+
+## Admin API
+
+All `/admin` routes require the configured admin token, sent as `Authorization: Bearer <admin_token>` or `X-Admin-Token: <admin_token>`. These are not virtual keys, and they are not the vendor SDK carriers (`x-api-key` / `x-goog-api-key`); the admin token is a single static credential set in `governance.admin_token`.
+
+### Mint a key
+
+```bash
+curl -s -X POST http://localhost:8080/admin/keys \
+  -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "name": "team-ml",
+        "allowed_pools": ["fast", "overflow"],
+        "max_budget_cents": 50000,
+        "budget_period": "monthly",
+        "rpm_limit": 600,
+        "tpm_limit": 200000
+      }'
+```
+
+Response includes `id` (`vk_<16hex>`), `secret` (`sk-bb-<32hex>`, **shown once**), and all attributes. Store the secret immediately.
+
+To also issue an AWS credential pair for Bedrock-SDK clients, add `"issue_aws_credential": true` to the request body. The 201 response then additionally includes `aws_access_key_id` and `aws_secret_access_key`: both shown **once** and never returned by any subsequent read API. Configure your Bedrock SDK with those credentials; Busbar verifies the inbound SigV4 signature and enforces the key's governance controls. See [Bedrock ingress](protocols.md#bedrock).
+
+Create-key field validation: `budget_period` must be `total`, `daily`, or `monthly` (400 otherwise); `max_budget_cents` must be ≥ 0; `rpm_limit` and `tpm_limit` must each be ≥ 1 when set. `allowed_pools` that name no configured pool logs a warning but does not fail.
+
+### List keys
+
+```bash
+curl -s http://localhost:8080/admin/keys \
+  -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN"
+```
+
+Returns key metadata. Secret hashes are never returned.
+
+### Check usage
+
+```bash
+curl -s "http://localhost:8080/admin/keys/vk_abc123def456.../usage" \
+  -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN"
+```
+
+Returns `{ "spend_cents": ..., "tokens": ..., "requests": ... }` for the current budget window. `404` if the key does not exist.
+
+### Update a key
+
+```bash
+curl -s -X PATCH "http://localhost:8080/admin/keys/vk_abc123def456..." \
+  -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "rpm_limit": 1200, "max_budget_cents": null }'
+```
+
+Absent fields are left unchanged. `null` clears a cap to unlimited. Providing a value sets it. Same validation as create. `404` if the key does not exist.
+
+### Revoke a key
+
+```bash
+curl -s -X DELETE "http://localhost:8080/admin/keys/vk_abc123def456..." \
+  -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN"
+```
+
+Returns `404` if the key does not exist (delete is not idempotent). After deletion, the key's `sk-bb-…` secret is immediately rejected with a native `401`.
+
+## Enforcement model and precision
+
+Understanding where each limit is precise and where it is approximate is important for setting realistic budgets:
+
+**RPM**: precise. The counter is incremented synchronously on admission, before the request is forwarded. A request that would exceed the limit is rejected before any upstream call is made.
+
+**TPM**: best-effort. Token counts are recorded post-response, after the upstream reports them. In-flight concurrent requests do not yet contribute to the window. The first request of each new 60-second window is always admitted regardless of the previous window's total. If multiple large concurrent requests arrive simultaneously at the window boundary, all may be admitted before the TPM limit kicks in.
+
+**Budget**: atomic hard cap. The over-budget check and the spend charge are performed as a single atomic SQLite UPSERT (`charge_within_budget`). Concurrent requests cannot cause an overshoot; if the cap is reached mid-burst, the excess requests are rejected. On a store error during the admission check, behavior is controlled by `governance.budget_on_store_error`: the default `allow` fails open (preserves availability); set `deny` for a hard budget guarantee that rejects on any store error. A definitive over-budget result always rejects regardless of this setting. Budget is a true spending ceiling when `deny` is used, and a reliable guardrail with `allow`.
+
+**`allowed_pools` ACL**: precise and pre-forwarding. A key with `allowed_pools: ["fast"]` trying to target `overflow` or any direct model route not in the list gets `403` before any upstream call.
+
+Rate windows are per-process, in-memory. Running multiple Busbar instances against the same governance database means RPM/TPM windows are per-instance, not shared. For distributed rate limiting, run one instance per governance database or front multiple instances with an upstream rate limiter.
+
+---

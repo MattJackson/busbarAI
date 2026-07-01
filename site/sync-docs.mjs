@@ -18,7 +18,10 @@ const PAGES = {
   'protocols': 'The six wire protocols and lossless cross-protocol translation.',
   'providers': 'How to add any provider that speaks one of the six protocols — a config entry, no code.',
   'pools': 'What a pool is, how member selection and failover work, the full config reference, and copy-paste recipes.',
-  'reliability': 'Fault-attributed circuit breaking, in-flight failover, and governance.',
+  'reliability': 'How Busbar keeps serving through provider failures: the reliability layers, tied together with one worked example.',
+  'circuit-breaker': 'Fault-attributed circuit breaking: scope, failure classification, the state machine, trip conditions, cooldown, and config.',
+  'failover': 'In-flight failover: the first-byte boundary, failover budget, context-length failover, session affinity, and pool exhaustion.',
+  'observability': 'Health, metrics, and observability endpoints: /healthz, /stats, /metrics, and the signals worth alerting on.',
 };
 
 const esc = (s) => s.replace(/"/g, '\\"');
