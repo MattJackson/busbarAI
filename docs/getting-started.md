@@ -1,8 +1,8 @@
 # Getting Started with Busbar
 
-Busbar is a self-hosted LLM gateway: a single static Rust binary that sits between your application and your LLM providers. Point any SDK at it — OpenAI, Anthropic, Gemini, Cohere, Bedrock, or the OpenAI Responses API — and Busbar routes each request to the provider (or pool of providers) you configured, translating between wire protocols when the ingress and egress differ.
+Busbar is a self-hosted LLM gateway: a single static Rust binary that sits between your application and your LLM providers. Point any SDK at it, OpenAI, Anthropic, Gemini, Cohere, Bedrock, or the OpenAI Responses API, and Busbar routes each request to the provider (or pool of providers) you configured, translating between wire protocols when the ingress and egress differ.
 
-It does the same job as LiteLLM or OpenRouter — one API in front of every model and provider — and goes further: it speaks six provider protocols natively (so any vendor's SDK can point at it, not just OpenAI-shaped ones), ships as one binary with no Python runtime and no third party in your data path, and gives you per-(pool, lane) circuit breaking with in-flight failover. You run it in your own infra and it holds your keys.
+It does the same job as LiteLLM or OpenRouter, one API in front of every model and provider, and goes further: it speaks six provider protocols natively (so any vendor's SDK can point at it, not just OpenAI-shaped ones), ships as one binary with no Python runtime and no third party in your data path, and gives you per-(pool, lane) circuit breaking with in-flight failover. You run it in your own infra and it holds your keys.
 
 This guide takes you from zero to a working request in about five minutes.
 
@@ -18,7 +18,7 @@ This guide takes you from zero to a working request in about five minutes.
 
 ## Step 1: Get the binary
 
-**One-line install** (macOS / Linux) — detects your platform, downloads the latest release binary *and* the provider catalog into the current directory, and prints the next steps:
+**One-line install** (macOS / Linux), detects your platform, downloads the latest release binary *and* the provider catalog into the current directory, and prints the next steps:
 
 ```bash
 curl -fsSL https://getbusbar.com/install.sh | sh
@@ -26,7 +26,7 @@ curl -fsSL https://getbusbar.com/install.sh | sh
 
 Drops `busbar` and `providers.yaml` where you run it (no sudo). To install onto your PATH instead: `BUSBAR_INSTALL_DIR=/usr/local/bin curl -fsSL https://getbusbar.com/install.sh | sh`.
 
-**Or download manually** — grab the archive for your platform from the [latest release](https://github.com/MattJackson/busbarAI/releases/latest) (Linux `x86_64`/`aarch64`, macOS Intel/Apple Silicon, Windows `x86_64`), plus the provider catalog from [getbusbar.com/providers.yaml](https://getbusbar.com/providers.yaml). The binary is self-contained — no runtime, no virtualenv, no dependencies:
+**Or download manually**: grab the archive for your platform from the [latest release](https://github.com/MattJackson/busbarAI/releases/latest) (Linux `x86_64`/`aarch64`, macOS Intel/Apple Silicon, Windows `x86_64`), plus the provider catalog from [getbusbar.com/providers.yaml](https://getbusbar.com/providers.yaml). The binary is self-contained, no runtime, no virtualenv, no dependencies:
 
 ```bash
 tar -xzf busbar-*.tar.gz   # extracts the `busbar` binary
@@ -46,20 +46,20 @@ cargo build --release      # binary at target/release/busbar
 
 Busbar reads two YAML files:
 
-- `providers.yaml` — the shipped provider catalog (protocol, `base_url`, error maps). You almost never edit this. The one-line installer fetches it for you, or grab it from [getbusbar.com/providers.yaml](https://getbusbar.com/providers.yaml).
-- `config.yaml` — your deployment: which providers to activate, their key env-var names, your models, and optionally pools.
+- `providers.yaml`: the shipped provider catalog (protocol, `base_url`, error maps). You almost never edit this. The one-line installer fetches it for you, or grab it from [getbusbar.com/providers.yaml](https://getbusbar.com/providers.yaml).
+- `config.yaml`, your deployment: which providers to activate, their key env-var names, your models, and optionally pools.
 
-**Important — keys are never written into config.** `api_key_env` names the *environment variable* that holds a provider's key; Busbar reads the key from there at startup. (Separately, `${VAR}` tokens elsewhere in `config.yaml` are also expanded from the environment at load time.) An unset referenced variable is a loud startup failure, not a silent skip.
+**Important, keys are never written into config.** `api_key_env` names the *environment variable* that holds a provider's key; Busbar reads the key from there at startup. (Separately, `${VAR}` tokens elsewhere in `config.yaml` are also expanded from the environment at load time.) An unset referenced variable is a loud startup failure, not a silent skip.
 
 ### Minimal `config.yaml` (one provider, one model, no auth)
 
 This is the smallest config that boots and serves requests. Use it on a local machine to try Busbar quickly.
 
 ```yaml
-# config.yaml (dev/minimal — no client auth gate)
+# config.yaml (dev/minimal, no client auth gate)
 providers:
   anthropic:
-    api_key_env: ANTHROPIC_KEY   # the NAME of the env var to read the key from — NOT the key itself
+    api_key_env: ANTHROPIC_KEY   # the NAME of the env var to read the key from, NOT the key itself
 
 models:
   claude-sonnet:
@@ -67,7 +67,7 @@ models:
     max_concurrent: 10
 ```
 
-The key itself is never in this file. `api_key_env: ANTHROPIC_KEY` tells Busbar "read this provider's key from the `$ANTHROPIC_KEY` environment variable at startup" — so you set the real secret in your environment ([Step 3](#step-3-set-environment-variables-and-run)), and `config.yaml` stays safe to commit and share.
+The key itself is never in this file. `api_key_env: ANTHROPIC_KEY` tells Busbar "read this provider's key from the `$ANTHROPIC_KEY` environment variable at startup", so you set the real secret in your environment ([Step 3](#step-3-set-environment-variables-and-run)), and `config.yaml` stays safe to commit and share.
 
 Save this as `config.yaml` in your working directory.
 
@@ -81,14 +81,14 @@ Save this as `config.yaml` in your working directory.
 | `models.<name>.provider` | Which provider entry in the `providers` block this model calls |
 | `models.<name>.max_concurrent` | Max simultaneous in-flight requests to this model (the concurrency semaphore); must be ≥ 1 |
 
-`providers` and `models` are the only required sections. `listen` defaults to `0.0.0.0:8080`. `auth` defaults to `none` (open relay) when omitted — fine for local dev, not for production.
+`providers` and `models` are the only required sections. `listen` defaults to `0.0.0.0:8080`. `auth` defaults to `none` (open relay) when omitted, fine for local dev, not for production.
 
 ---
 
 ## Step 3: Set environment variables and run
 
 ```bash
-# the actual secret — this is what `api_key_env: ANTHROPIC_KEY` in config.yaml points at
+# the actual secret, this is what `api_key_env: ANTHROPIC_KEY` in config.yaml points at
 export ANTHROPIC_KEY=sk-ant-...
 
 BUSBAR_PROVIDERS=./providers.yaml BUSBAR_CONFIG=./config.yaml ./busbar
@@ -109,7 +109,7 @@ curl -s http://localhost:8080/healthz
 
 ## Step 4: Send a request
 
-### Via curl — Anthropic-format ingress
+### Via curl: Anthropic-format ingress
 
 The model name goes in the URL path: `POST /<model-name>/v1/messages`. Busbar resolves `<model-name>` against your configured pools first, then your models, and routes the request to the matching lane.
 
@@ -124,7 +124,7 @@ curl -s http://localhost:8080/claude-sonnet/v1/messages \
 
 You get back a standard Anthropic Messages response. Because both ingress and egress are Anthropic here, Busbar relays it as a native same-protocol passthrough. Routing keys off the name in the URL, not the `model` field in the body.
 
-### Via curl — OpenAI-format ingress
+### Via curl, OpenAI-format ingress
 
 The model name goes in the request body: `POST /v1/chat/completions`. This works with any OpenAI SDK or tool that targets `http://localhost:8080` as the base URL.
 
@@ -137,7 +137,7 @@ curl -s http://localhost:8080/v1/chat/completions \
   }' | jq .
 ```
 
-Busbar translates the request from OpenAI format to Anthropic format on the way out, and the response from Anthropic format back to OpenAI format on the way in — through its intermediate representation, transparently. Your client receives a standard `chat.completion` object, with the answer in `choices[0].message.content`.
+Busbar translates the request from OpenAI format to Anthropic format on the way out, and the response from Anthropic format back to OpenAI format on the way in, through its intermediate representation, transparently. Your client receives a standard `chat.completion` object, with the answer in `choices[0].message.content`.
 
 ### Via the OpenAI Python SDK
 
@@ -185,7 +185,7 @@ The Anthropic SDK sends `x-api-key`; Busbar accepts it on the `/v1/messages` rou
 Once the single-provider setup is working, extend the config to introduce a pool. A pool is a named group of models with weighted load balancing, per-member circuit breaking, and automatic failover.
 
 ```yaml
-# config.yaml — two providers, two models, one pool, with client auth
+# config.yaml, two providers, two models, one pool, with client auth
 auth:
   mode: token
   client_tokens:
@@ -227,24 +227,24 @@ BUSBAR_PROVIDERS=./providers.yaml BUSBAR_CONFIG=./config.yaml ./busbar
 Now call the pool by name. Both ingress styles work against a pool:
 
 ```bash
-# OpenAI ingress — model field selects the pool
+# OpenAI ingress, model field selects the pool
 curl -s http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"model": "smart", "messages": [{"role": "user", "content": "Hello!"}]}'
 
-# Anthropic ingress — pool name in the URL path
+# Anthropic ingress, pool name in the URL path
 curl -s http://localhost:8080/smart/v1/messages \
   -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"max_tokens": 256, "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
-With `weight: 2` on `claude-sonnet` and `weight: 1` on `gpt-4o`, Busbar distributes via smooth weighted round-robin — roughly two of every three requests go to Claude and one to GPT-4o. If `claude-sonnet`'s breaker trips (on upstream 5xx, 429, timeout, or network errors), Busbar fails the request over to `gpt-4o` — provided the failure happens before the first byte of the response reaches your client. After the first byte, in-flight failover is no longer possible.
+With `weight: 2` on `claude-sonnet` and `weight: 1` on `gpt-4o`, Busbar distributes via smooth weighted round-robin, roughly two of every three requests go to Claude and one to GPT-4o. If `claude-sonnet`'s breaker trips (on upstream 5xx, 429, timeout, or network errors), Busbar fails the request over to `gpt-4o`, provided the failure happens before the first byte of the response reaches your client. After the first byte, in-flight failover is no longer possible.
 
 ### What "cross-protocol" means here
 
-`claude-sonnet` speaks Anthropic; `gpt-4o` speaks OpenAI. A client using OpenAI-format ingress (`/v1/chat/completions`) is making an OpenAI request. When Busbar routes that request to `claude-sonnet`, it translates the request from OpenAI to Anthropic format, and the response back — losslessly, through its intermediate representation. When it routes to `gpt-4o`, it passes through natively. Your client never needs to know.
+`claude-sonnet` speaks Anthropic; `gpt-4o` speaks OpenAI. A client using OpenAI-format ingress (`/v1/chat/completions`) is making an OpenAI request. When Busbar routes that request to `claude-sonnet`, it translates the request from OpenAI to Anthropic format, and the response back, losslessly, through its intermediate representation. When it routes to `gpt-4o`, it passes through natively. Your client never needs to know.
 
 ---
 
@@ -274,7 +274,7 @@ curl -s http://localhost:8080/metrics \
   -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN"
 ```
 
-Prometheus scrape exposition. Like `/stats`, `/metrics` is subject to the auth middleware (it is *not* auth-exempt — telemetry is a fingerprinting surface), so it requires a token under `token`/governance mode and is open under `none`/`passthrough`. Key metrics: `busbar_requests_total`, `busbar_upstream_failures_total`, `busbar_breaker_trips_total`, `busbar_request_duration_seconds`, `busbar_translations_total`.
+Prometheus scrape exposition. Like `/stats`, `/metrics` is subject to the auth middleware (it is *not* auth-exempt, telemetry is a fingerprinting surface), so it requires a token under `token`/governance mode and is open under `none`/`passthrough`. Key metrics: `busbar_requests_total`, `busbar_upstream_failures_total`, `busbar_breaker_trips_total`, `busbar_request_duration_seconds`, `busbar_translations_total`.
 
 ---
 
@@ -319,7 +319,7 @@ Busbar signs each outbound request with SigV4 (region parsed from the host); you
 **Bedrock ingress** (acting as a Bedrock endpoint for native AWS SDK clients) has two tracks:
 
 - **Without governance** (`auth.mode: passthrough` or `none`): Busbar does not verify the inbound SigV4 signature. The credential is forwarded upstream (passthrough) or ignored (none).
-- **With governance** (`auth.mode: token` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`src/auth.rs` `verify_bedrock_sigv4`). Mint a virtual key with `"issue_aws_credential": true` via `POST /admin/keys`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). Configure your Bedrock SDK with those credentials — Busbar verifies the signature, then enforces the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
+- **With governance** (`auth.mode: token` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`src/auth.rs` `verify_bedrock_sigv4`). Mint a virtual key with `"issue_aws_credential": true` via `POST /admin/keys`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). Configure your Bedrock SDK with those credentials: Busbar verifies the signature, then enforces the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
 
 ### Injecting `max_tokens` for cross-protocol calls
 
@@ -342,7 +342,7 @@ A caller-supplied `max_tokens` is always preserved; this only applies when the f
 Before taking Busbar out of dev mode:
 
 - [ ] Set `auth.mode: token` with at least one `client_tokens` entry (or enable governance for per-key virtual tokens)
-- [ ] Enable inbound TLS: add a `tls` block (`cert_file` + `key_file`) so the client↔Busbar hop is encrypted — and, for zero-trust deployments, set `client_ca_file` to require client certs (mTLS). See [`docs/operations.md#inbound-tls--mutual-tls-mtls`](operations.md#inbound-tls--mutual-tls-mtls)
+- [ ] Enable inbound TLS: add a `tls` block (`cert_file` + `key_file`) so the client↔Busbar hop is encrypted, and, for zero-trust deployments, set `client_ca_file` to require client certs (mTLS). See [`docs/operations.md#inbound-tls--mutual-tls-mtls`](operations.md#inbound-tls--mutual-tls-mtls)
 - [ ] Set `max_concurrent` on every model to a value your provider tier actually supports
 - [ ] Set `max_requests` to `-1` (unlimited lifetime budget) or a finite positive budget per model
 - [ ] Verify `/healthz` returns `200` and `/stats` shows all lanes `usable: true` before routing production traffic
@@ -353,8 +353,8 @@ Before taking Busbar out of dev mode:
 
 ## What's next
 
-- **Full config reference** — every field, default, and validation rule: [`docs/configuration.md`](configuration.md)
-- **Pools, breakers, and failover** — pool member weighting, breaker tuning, session affinity, context-length failover, exhaustion policies: [`docs/configuration.md#pools`](configuration.md#pools)
-- **Running in production** — TLS termination, systemd unit, Docker, `/stats` monitoring, breaker diagnosis: [`docs/operations.md`](operations.md)
-- **Governance** — virtual keys, per-key budgets and rate limits, the `/admin` API: [`docs/operations.md`](operations.md)
-- **Architecture** — how the IR works, the six-protocol model, why `f64` and not `f32`: [`docs/architecture.md`](architecture.md)
+- **Full config reference**: every field, default, and validation rule: [`docs/configuration.md`](configuration.md)
+- **Pools, breakers, and failover**: pool member weighting, breaker tuning, session affinity, context-length failover, exhaustion policies: [`docs/configuration.md#pools`](configuration.md#pools)
+- **Running in production**: TLS termination, systemd unit, Docker, `/stats` monitoring, breaker diagnosis: [`docs/operations.md`](operations.md)
+- **Governance**: virtual keys, per-key budgets and rate limits, the `/admin` API: [`docs/operations.md`](operations.md)
+- **Architecture**: how the IR works, the six-protocol model, why `f64` and not `f32`: [`docs/architecture.md`](architecture.md)

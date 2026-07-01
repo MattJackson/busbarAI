@@ -10,11 +10,11 @@ is [ADR-0002](adr/0002-circuit-breaker.md).
 All tests are **in-crate** and run under `cargo test`. There is no `tests/`
 directory of integration binaries. Two patterns:
 
-- **Per-module `#[cfg(test)] mod tests`** — unit tests next to the code they cover
+- **Per-module `#[cfg(test)] mod tests`**: unit tests next to the code they cover
   (`store.rs` breaker FSM, `breaker.rs` classification, `sigv4.rs` against AWS's
   published worked example, `governance.rs` key/budget/rate, `config.rs` parsing,
   `route.rs` affinity, `proto/*.rs` translation round-trips, etc.).
-- **The `test_support.rs` harness** — a shared `#[cfg(test)] mod test_support`
+- **The `test_support.rs` harness**: a shared `#[cfg(test)] mod test_support`
   with the `MockServer` mock-upstream and the bulk of the end-to-end forwarding
   tests.
 
@@ -36,7 +36,7 @@ responses ahead of time by pushing onto a shared `MockServerState`:
   `Billing { status, code, message }`, `Auth { status }`,
   `ServerError { status, body }`,
   `Sse { events, abort_at_index }` (the `abort_at_index` simulates a mid-stream
-  upstream abort — it sends N events then an SSE `error` frame with no `[DONE]`,
+  upstream abort: it sends N events then an SSE `error` frame with no `[DONE]`,
   exercising the after-first-byte path),
   `SseTransportError { ok_events }` (emits the `ok_events` real SSE frames then
   makes the body stream yield an `Err`, a true mid-stream **transport** failure
@@ -44,7 +44,7 @@ responses ahead of time by pushing onto a shared `MockServerState`:
   text frame), and
   `EventStream { frames, amzn_request_id }` (a native AWS binary
   `application/vnd.amazon.eventstream` body as a real Bedrock ConverseStream
-  backend emits — `frames` is the ordered `(event_type, json_payload)` sequence
+  backend emits: `frames` is the ordered `(event_type, json_payload)` sequence
   encoded via `eventstream::encode_frame`, and `amzn_request_id` is served as
   the `x-amzn-RequestId` header for testing same-protocol Bedrock passthrough).
 
@@ -72,7 +72,7 @@ delegates to `now_for_test()`:
   unset).
 
 So a cooldown test sets the clock, records a failure, advances the clock past the
-cooldown, and asserts the lane becomes usable again — all deterministically. The
+cooldown, and asserts the lane becomes usable again, all deterministically. The
 store also exposes `#[cfg(test)]` lane-indexed handles (`open_state`,
 `closed_state`, `open_state_with_retry_after`, `try_acquire_probe`, `clear_probe`,
 `record_outcome_error_with_time`, `record_outcome_success_with_time`) to seed the
@@ -162,21 +162,21 @@ async fn my_forwarding_test() {
 
 Patterns this enables:
 
-- **Failover** — give a pool two members backed by two `MockServer`s; push a
+- **Failover**: give a pool two members backed by two `MockServer`s; push a
   `ServerError`/`RateLimit` on the first and an `Ok` on the second; assert the
   request still 200s and the first lane's breaker moved.
-- **Cross-protocol** — set the lane's `protocol` to OpenAI and call with
+- **Cross-protocol**: set the lane's `protocol` to OpenAI and call with
   `ingress_protocol = "anthropic"`; assert the upstream `get_last_request_body`
   is OpenAI-shaped and the translated response preserves `model`.
-- **Streaming + after-first-byte** — push `MockResponse::Sse { abort_at_index:
+- **Streaming + after-first-byte**: push `MockResponse::Sse { abort_at_index:
   Some(n) }`; assert the client gets the first n events then an SSE `error` frame
   (no failover) and the breaker records the fault.
-- **Mid-stream transport error** — push `MockResponse::SseTransportError {
+- **Mid-stream transport error**: push `MockResponse::SseTransportError {
   ok_events }`; the body yields the real frames then an `Err`, exercising the
   after-first-byte mid-stream error path (`FirstByteBody`'s `Err` arm), which
   appends the ingress protocol's native mid-stream error frame after the
   already-sent frames.
-- **Bedrock ConverseStream passthrough** — push `MockResponse::EventStream {
+- **Bedrock ConverseStream passthrough**: push `MockResponse::EventStream {
   frames, amzn_request_id }` with a Bedrock-protocol lane and a Bedrock ingress;
   assert the same-protocol path relays the binary event-stream verbatim,
   preserves the `application/vnd.amazon.eventstream` content type, and forwards
@@ -188,7 +188,7 @@ Patterns this enables:
   same-protocol relay keys off the upstream Content-Type, not the URL. See
   `test_bedrock_same_protocol_stream_passthrough_forwards_upstream_request_id`
   in `src/route.rs` for the full pattern.
-- **on_exhausted** — populate `on_exhausted_cfgs` with `LeastBad` /
+- **on_exhausted**: populate `on_exhausted_cfgs` with `LeastBad` /
   `FallbackPool(..)` and pre-trip all members; assert the configured behavior
   (and loop-guarding for fallback chains).
 - **Reading body bytes** in assertions: collect the response body with

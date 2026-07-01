@@ -1,5 +1,5 @@
 ---
-// Busbar Privacy Policy — standalone Astro page matching homepage nav + footer styling.
+// Busbar Privacy Policy, standalone Astro page matching homepage nav + footer styling.
 import glyphPrimary from '../assets/busbar-primary.svg';
 import Nav from '../components/Nav.astro';
 
@@ -16,10 +16,10 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Privacy Policy — Busbar</title>
+    <title>Privacy Policy, Busbar</title>
     <meta
       name="description"
-      content="Privacy Policy for getbusbar.com. Busbar is a self-hosted LLM gateway — your prompts, keys, and traffic never leave your infrastructure."
+      content="Privacy Policy for getbusbar.com. Busbar is a self-hosted LLM gateway, your prompts, keys, and traffic never leave your infrastructure."
     />
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
@@ -56,7 +56,7 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
         <p>
           Busbar does not include telemetry that phones home to us. Any observability data
           (Prometheus metrics, OTLP traces) goes only to the endpoints you configure on your own
-          infrastructure — never to us.
+          infrastructure, never to us.
         </p>
 
         <h2>2. The getbusbar.com website</h2>
@@ -68,8 +68,8 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
         </p>
         <p>
           Because the site is served through GitHub Pages, GitHub may process standard web
-          server request metadata — such as IP addresses, browser user-agent strings, and
-          request timestamps — as part of delivering pages to you. This processing is governed
+          server request metadata, such as IP addresses, browser user-agent strings, and
+          request timestamps, as part of delivering pages to you. This processing is governed
           by{' '}
           <a href="https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement">
             GitHub's General Privacy Statement
@@ -305,7 +305,7 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
       @media (max-width: 640px) {
         body { overflow-x: hidden; }
         .nav-links { gap: 14px; }
-        .nav-links a.ghost, .nav-links a[href='/benchmark/'] { display: none; }
+        .nav-links a.ghost.nav-links a[href='/benchmark/'] { display: none; }
         .footer-cols { grid-template-columns: 1fr 1fr; }
         .legal-wrap { padding: 40px 16px 64px; }
         .legal-doc h1 { font-size: clamp(24px, 7vw, 36px); }

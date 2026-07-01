@@ -15,19 +15,19 @@
 ⚡ **Install:** `curl -fsSL https://getbusbar.com/install.sh | sh`  
 🤖 **Agent-readable:** [getbusbar.com/llms.txt](https://getbusbar.com/llms.txt)
 
-Busbar sits between your application and your LLM providers. Point any SDK — OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses — at one URL, and it routes, translates, and **keeps serving through provider failures**. It's a different class of tool than a proxy with a long model list.
+Busbar sits between your application and your LLM providers. Point any SDK: OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses, at one URL, and it routes, translates, and **keeps serving through provider failures**. It's a different class of tool than a proxy with a long model list.
 
-> **You define a model name and its backends. Busbar accepts _any_ input protocol — OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses — and routes and translates accordingly.** One model name, reachable by every client; you choose what runs behind it.
+> **You define a model name and its backends. Busbar accepts _any_ input protocol: OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses, and routes and translates accordingly.** One model name, reachable by every client; you choose what runs behind it.
 
-- **Speaks every protocol losslessly, both ways** — not flattened to OpenAI shape, so Anthropic thinking blocks, Gemini safety settings, and Bedrock tool use survive the hop. Use whatever SDK your code already speaks, reach every model, swap providers with a config edit.
-- **Fails over inside the request** — before your client sees a byte, even mid-stream, across protocol families. Not a 500 your user feels, not a 3am page.
-- **A circuit breaker on every provider connection** — classifies each error (provider outage, your bad request, context-length, hard auth/billing failure) and treats each differently instead of retrying into a wall.
-- **A programmable request path** — routing is the first *hook*: your policy steers each request by cost, latency, live concurrency, budget, or rate headroom — native, or your own logic via **webhook** (any language) or a sandboxed **Rhai script**. A broken or slow hook never blocks a request, and the same fail-safe machinery is built to carry PII-steering, audit, and guardrails.
-- **Encrypted, zero-trust transport, built in** — Busbar terminates TLS itself (cert + key in config, no reverse proxy). Turn on **mTLS** and only clients holding a certificate signed by your CA can connect *at all* — rejected at the handshake, before any HTTP or token check. Zero-trust without a service mesh.
+- **Speaks every protocol losslessly, both ways**: not flattened to OpenAI shape, so Anthropic thinking blocks, Gemini safety settings, and Bedrock tool use survive the hop. Use whatever SDK your code already speaks, reach every model, swap providers with a config edit.
+- **Fails over inside the request**: before your client sees a byte, even mid-stream, across protocol families. Not a 500 your user feels, not a 3am page.
+- **A circuit breaker on every provider connection**: classifies each error (provider outage, your bad request, context-length, hard auth/billing failure) and treats each differently instead of retrying into a wall.
+- **A programmable request path**: routing is the first *hook*: your policy steers each request by cost, latency, live concurrency, budget, or rate headroom, native, or your own logic via **webhook** (any language) or a sandboxed **Rhai script**. A broken or slow hook never blocks a request, and the same fail-safe machinery is built to carry PII-steering, audit, and guardrails.
+- **Encrypted, zero-trust transport, built in**: Busbar terminates TLS itself (cert + key in config, no reverse proxy). Turn on **mTLS** and only clients holding a certificate signed by your CA can connect *at all*, rejected at the handshake, before any HTTP or token check. Zero-trust without a service mesh.
 
-A single static Rust binary — no Python sidecar, no interpreter, no GC in the request path. Linux, macOS, Windows (Intel and ARM). Your keys, your network, your data path.
+A single static Rust binary, no Python sidecar, no interpreter, no GC in the request path. Linux, macOS, Windows (Intel and ARM). Your keys, your network, your data path.
 
-> **Status: 1.0.1** — stable. The HTTP API, configuration schema, and the six wire-protocol contracts are frozen under Semantic Versioning. Hardened across a multi-round security and correctness audit; releases ship a CycloneDX SBOM and a verifiable build-provenance attestation. AGPL-3.0.
+> **Status: 1.0.1**: stable. The HTTP API, configuration schema, and the six wire-protocol contracts are frozen under Semantic Versioning. Hardened across a multi-round security and correctness audit; releases ship a CycloneDX SBOM and a verifiable build-provenance attestation. AGPL-3.0.
 
 ---
 
@@ -44,23 +44,23 @@ Your code already speaks OpenAI (or Anthropic, or Gemini). Swap the base URL:
   client.chat.completions.create(model="fast", messages=[...])
 ```
 
-That request left as OpenAI, may have been served by Anthropic, and came back as OpenAI — translated losslessly both ways. If Anthropic returned a 429 mid-flight, Busbar rerouted to the next pool member before your client saw a single byte. **The model name is a config value, not a code dependency.**
+That request left as OpenAI, may have been served by Anthropic, and came back as OpenAI: translated losslessly both ways. If Anthropic returned a 429 mid-flight, Busbar rerouted to the next pool member before your client saw a single byte. **The model name is a config value, not a code dependency.**
 
 ---
 
 ## What's inside
 
-- **Six wire protocols**, lossless both ways — any client protocol reaches any pool → [Protocols](https://getbusbar.com/protocols/)
+- **Six wire protocols**, lossless both ways: any client protocol reaches any pool → [Protocols](https://getbusbar.com/protocols/)
 - **Fault-attributed circuit breaking** + **streaming-safe in-flight failover** → [Reliability](https://getbusbar.com/reliability/)
-- **Weighted pools** — smooth weighted round-robin, session affinity, per-lane concurrency → [Reliability](https://getbusbar.com/reliability/)
-- **Hooks — a programmable request path** — routing is hook #1: `weighted` / `cheapest` / `fastest` / `least_busy` / `usage` natively, plus operator-owned **webhook** and **Rhai script** policies. A policy sees per-member cost, latency, live concurrency, budget, and rate headroom — your logic, in any language, fail-safe (a timeout or error falls back, never blocks the request) → [Routing](https://getbusbar.com/routing/)
-- **Native TLS + optional mTLS** — Busbar terminates TLS itself (cert + key in config, no reverse proxy needed). Turn on mutual TLS to require a client certificate signed by your CA; clients without one are rejected at the handshake, before any HTTP or bearer-token check. TLS = encrypted and server-verified out of the box; mTLS = only your cert-holding clients can connect at all — zero-trust without a service mesh → [Security](https://getbusbar.com/security/)
-- **Governance** — virtual keys, budgets, RPM/TPM limits, spend tracking → [Governance](https://getbusbar.com/guides/governance/)
-- **Vetted provider catalog** — plus any provider on the six protocols in a few lines of YAML → [Providers](https://getbusbar.com/providers/)
-- **Security-hardened** — SSRF guards, constant-time auth, SHA-256 key storage, secrets never logged → [SECURITY.md](SECURITY.md)
-- **Observability** — Prometheus `/metrics` (per-key spend / budget / tokens, per-lane breaker state), OTLP traces, per-request audit webhook → [Configuration](https://getbusbar.com/configuration/)
+- **Weighted pools**: smooth weighted round-robin, session affinity, per-lane concurrency → [Reliability](https://getbusbar.com/reliability/)
+- **Hooks: a programmable request path**: routing is hook #1: `weighted` / `cheapest` / `fastest` / `least_busy` / `usage` natively, plus operator-owned **webhook** and **Rhai script** policies. A policy sees per-member cost, latency, live concurrency, budget, and rate headroom: your logic, in any language, fail-safe (a timeout or error falls back, never blocks the request) → [Routing](https://getbusbar.com/routing/)
+- **Native TLS + optional mTLS**: Busbar terminates TLS itself (cert + key in config, no reverse proxy needed). Turn on mutual TLS to require a client certificate signed by your CA; clients without one are rejected at the handshake, before any HTTP or bearer-token check. TLS = encrypted and server-verified out of the box; mTLS = only your cert-holding clients can connect at all: zero-trust without a service mesh → [Security](https://getbusbar.com/security/)
+- **Governance**: virtual keys, budgets, RPM/TPM limits, spend tracking → [Governance](https://getbusbar.com/guides/governance/)
+- **Vetted provider catalog**: plus any provider on the six protocols in a few lines of YAML → [Providers](https://getbusbar.com/providers/)
+- **Security-hardened**: SSRF guards, constant-time auth, SHA-256 key storage, secrets never logged → [SECURITY.md](SECURITY.md)
+- **Observability**: Prometheus `/metrics` (per-key spend / budget / tokens, per-lane breaker state), OTLP traces, per-request audit webhook → [Configuration](https://getbusbar.com/configuration/)
 
-Same arena as **LiteLLM** / **OpenRouter** — the difference is that Busbar is built reliability-first. → **[Why Busbar](https://getbusbar.com/why-busbar/)**
+Same arena as **LiteLLM** / **OpenRouter**: the difference is that Busbar is built reliability-first. → **[Why Busbar](https://getbusbar.com/why-busbar/)**
 
 ---
 
@@ -70,7 +70,7 @@ Same arena as **LiteLLM** / **OpenRouter** — the difference is that Busbar is 
 curl -fsSL https://getbusbar.com/install.sh | sh        # busbar + providers.yaml into ./
 ```
 
-A minimal `config.yaml` (keys come from env vars, named here — never written into config):
+A minimal `config.yaml` (keys come from env vars, named here: never written into config):
 
 ```yaml
 providers:
@@ -94,6 +94,6 @@ Full walkthrough → **[Getting Started](https://getbusbar.com/getting-started/)
 
 ## Docs & license
 
-Full documentation at **[getbusbar.com](https://getbusbar.com)** (agent-readable: [llms.txt](https://getbusbar.com/llms.txt)). Contributor docs — architecture, internals, ADRs — in [`docs/`](docs/).
+Full documentation at **[getbusbar.com](https://getbusbar.com)** (agent-readable: [llms.txt](https://getbusbar.com/llms.txt)). Contributor docs: architecture, internals, ADRs, in [`docs/`](docs/).
 
-Single Rust binary, MSRV 1.87. Contributions welcome ([CONTRIBUTING.md](CONTRIBUTING.md)). Licensed **AGPL-3.0-or-later** ([LICENSE](LICENSE)) — because Busbar runs as a network service, the AGPL §13 network-use clause applies.
+Single Rust binary, MSRV 1.87. Contributions welcome ([CONTRIBUTING.md](CONTRIBUTING.md)). Licensed **AGPL-3.0-or-later** ([LICENSE](LICENSE)), because Busbar runs as a network service, the AGPL §13 network-use clause applies.

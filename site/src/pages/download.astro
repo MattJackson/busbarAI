@@ -1,12 +1,12 @@
 ---
-// Busbar download page — standalone Astro page matching homepage nav + footer styling.
+// Busbar download page, standalone Astro page matching homepage nav + footer styling.
 // All binary links are STATIC, version-less GitHub "latest" asset URLs:
 //   …/releases/latest/download/busbar-<target>.tar.gz   (.zip for Windows)
 // so they always resolve to the newest release with no JavaScript or API calls.
 // The asset names are kept version-less by .github/workflows/release.yml (archive: busbar-$target).
 import glyphPrimary from '../assets/busbar-primary.svg';
 // Crate version, synced from the repo Cargo.toml into src/release.json by sync-docs.mjs
-// (runs before every dev/build). Importing keeps the read inside site/ — robust in astro build.
+// (runs before every dev/build). Importing keeps the read inside site/, robust in astro build.
 import release from '../release.json';
 import Nav from '../components/Nav.astro';
 
@@ -17,7 +17,7 @@ const version = release.version || '';
 
 const ORG = { '@context': 'https://schema.org', '@type': 'Organization', name: 'Busbar', url: 'https://getbusbar.com', logo: 'https://getbusbar.com/favicon.svg', sameAs: ['https://github.com/MattJackson/busbarAI'] };
 const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'Busbar', url: 'https://getbusbar.com' };
-const SOFTWARE = { '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Busbar', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows', offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }, url: 'https://getbusbar.com', description: 'The reliability and fidelity layer for multi-model AI traffic — lossless cross-protocol translation, fault-aware circuit breaking, and in-flight failover in one static Rust binary.' };
+const SOFTWARE = { '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Busbar', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows', offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }, url: 'https://getbusbar.com', description: 'The reliability and fidelity layer for multi-model AI traffic, lossless cross-protocol translation, fault-aware circuit breaking, and in-flight failover in one static Rust binary.' };
 
 // Each archive contains the single `busbar` binary. Targets mirror release.yml's matrix.
 const groups = [
@@ -55,7 +55,7 @@ const groups = [
     <title>Download Busbar</title>
     <meta
       name="description"
-      content="Download Busbar — one static Rust binary for Linux, macOS, and Windows (Intel and ARM). No runtime, no sidecar. Install with one command or grab the binary directly."
+      content="Download Busbar: one static Rust binary for Linux, macOS, and Windows (Intel and ARM). No runtime, no sidecar. Install with one command or grab the binary directly."
     />
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
@@ -72,7 +72,7 @@ const groups = [
       <div class="dl-head">
         <h1>Download Busbar</h1>
         <p class="dl-sub">
-          One static Rust binary — no runtime, no sidecar, no interpreter in the request path.
+          One static Rust binary, no runtime, no sidecar, no interpreter in the request path.
           Pick your platform below, or use the one-line installer.
         </p>
         {version && (
@@ -92,7 +92,7 @@ const groups = [
           <button class="dl-copy" data-copy="curl -fsSL https://getbusbar.com/install.sh | sh" aria-label="Copy install command">Copy</button>
         </div>
         <p class="dl-install-note">
-          Drops <code>busbar</code> and <code>providers.yaml</code> into the current directory —
+          Drops <code>busbar</code> and <code>providers.yaml</code> into the current directory,
           no sudo, no global install. Then follow <a href="/getting-started/">Getting Started</a>.
         </p>
       </section>
@@ -120,7 +120,7 @@ const groups = [
 
       <p class="dl-foot-note">
         Each archive contains the single <code>busbar</code> binary. You'll also need the
-        provider catalog — <a href="/providers.yaml">providers.yaml</a> — which the installer
+        provider catalog, <a href="/providers.yaml">providers.yaml</a>, which the installer
         fetches automatically. Builds are produced by the
         <a href={`${GITHUB}/actions/workflows/release.yml`}>release workflow</a> and attached to
         each tagged release. Source &amp; checksums: <a href={`${GITHUB}/releases/latest`}>latest release</a>.
@@ -272,8 +272,8 @@ const groups = [
       .dl-copy:hover { background: rgba(255,255,255,0.16); }
       .dl-install-note { font-size: 13.5px; color: var(--muted); margin: 14px 0 0; }
       .dl-install-note code { font-family: ui-monospace, monospace; font-size: 12.5px; background: #eef2f7; padding: 1px 5px; border-radius: 4px; color: var(--charcoal); }
-      .dl-install-note a, .dl-foot-note a { color: #4d7c0f; text-decoration: underline; text-underline-offset: 3px; }
-      .dl-install-note a:hover, .dl-foot-note a:hover { color: var(--slate); }
+      .dl-install-note a.dl-foot-note a { color: #4d7c0f; text-decoration: underline; text-underline-offset: 3px; }
+      .dl-install-note a:hover.dl-foot-note a:hover { color: var(--slate); }
 
       .dl-h2 { font-size: 20px; font-weight: 700; color: var(--slate); text-align: center; margin: 0 0 24px; }
       .dl-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; align-items: start; }
@@ -322,7 +322,7 @@ const groups = [
       @media (max-width: 640px) {
         body { overflow-x: hidden; }
         .nav-links { gap: 14px; }
-        .nav-links a.ghost, .nav-links a[href='/benchmark/'] { display: none; }
+        .nav-links a.ghost.nav-links a[href='/benchmark/'] { display: none; }
         .footer-cols { grid-template-columns: 1fr 1fr; }
         .dl-wrap { padding: 48px 16px 72px; }
         /* Install command row: stack code above copy button on narrow screens so

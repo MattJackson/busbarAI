@@ -1,7 +1,7 @@
 # Architecture
 
 This document traces a request end-to-end and explains the two seams that make
-busbar's thesis — *protocols, not providers* — work: the **superset IR** with its
+busbar's thesis, *protocols, not providers*, work: the **superset IR** with its
 `ProtocolReader` / `ProtocolWriter` traits, and the **two-stage failure-disposition
 pipeline**.
 
@@ -78,7 +78,7 @@ pipeline**.
 
 The route table (`src/main.rs` `build_router`, `src/route.rs`) determines the
 **ingress protocol** by path, not by sniffing the body. All six protocols are
-first-class ingress — one handler per protocol (Gemini's handler is reachable via
+first-class ingress, one handler per protocol (Gemini's handler is reachable via
 two path prefixes, `v1` and `v1beta`):
 
 - `POST /{name}/v1/messages` → ingress `anthropic`. `name` is a model or a pool.
@@ -97,9 +97,8 @@ two path prefixes, `v1` and `v1beta`):
   `bedrock`. The model is in the path; the streaming variant is selected by the
   endpoint suffix.
 
-This splits cleanly into **body-model protocols** (`openai`, `responses`, `cohere`
-— the model/pool lives in the request body) and **path-model protocols**
-(`anthropic`, `gemini`, `bedrock` — the model/pool lives in the URL). A small
+This splits cleanly into **body-model protocols** (`openai`, `responses`, `cohere`, the model/pool lives in the request body) and **path-model protocols**
+(`anthropic`, `gemini`, `bedrock`: the model/pool lives in the URL). A small
 injection shim normalises both into the same internal model/pool selection so the
 rest of the pipeline is protocol-agnostic.
 
@@ -111,7 +110,7 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
 `auth_middleware` (`src/auth.rs`) runs before routing:
 
 - `/healthz` is always open (liveness probes must not require a token).
-- `/metrics` is **not** exempted — Prometheus telemetry (lane/pool topology,
+- `/metrics` is **not** exempted, Prometheus telemetry (lane/pool topology,
   per-protocol counters, error rates) is an information-disclosure surface, so it
   goes through the same auth check as any other route. It requires a valid client
   token in `token` mode (or a virtual key under governance), and is admitted
@@ -126,7 +125,7 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
   passthrough forwarding.
 - **Bedrock ingress** has two modes depending on governance:
   - *Without governance* (`passthrough` or `none`): `extract_client_token` reads only bearer-style carriers and ignores the SigV4 header, which is forwarded upstream (passthrough) or ignored (none).
-  - *With governance* (`token` mode + `governance.enabled: true`): `src/auth.rs` `verify_bedrock_sigv4` intercepts requests that carry `Authorization: AWS4-HMAC-SHA256`, verifies the full SigV4 signature plus body-hash integrity (`x-amz-content-sha256`), and — on success — attaches the resolved virtual key's `GovCtx` so all governance checks apply. The AWS credential pair (`aws_access_key_id` + `aws_secret_access_key`) is minted via `POST /admin/keys` with `"issue_aws_credential": true`. Note: `src/sigv4.rs` provides signing primitives; the inbound verifier lives in `src/auth.rs`.
+  - *With governance* (`token` mode + `governance.enabled: true`): `src/auth.rs` `verify_bedrock_sigv4` intercepts requests that carry `Authorization: AWS4-HMAC-SHA256`, verifies the full SigV4 signature plus body-hash integrity (`x-amz-content-sha256`), and, on success, attaches the resolved virtual key's `GovCtx` so all governance checks apply. The AWS credential pair (`aws_access_key_id` + `aws_secret_access_key`) is minted via `POST /admin/keys` with `"issue_aws_credential": true`. Note: `src/sigv4.rs` provides signing primitives; the inbound verifier lives in `src/auth.rs`.
 
 ### 3. Governance checks
 
@@ -135,7 +134,7 @@ allowed-pools (`403`), budget (`429`, or `400` for Bedrock ingress), and rate
 limits (`429` + `Retry-After`) *before* forwarding. Budget exhaustion does **not**
 emit `402`: no upstream vendor returns `402` for an over-quota condition, so a
 `402` would be a router-side tell. Instead each ingress writer maps to its native
-quota shape — `429` (`insufficient_quota`) for OpenAI / Responses / Anthropic /
+quota shape: `429` (`insufficient_quota`) for OpenAI / Responses / Anthropic /
 Gemini / Cohere, and `400` (`ServiceQuotaExceededException`) for Bedrock. The flat
 per-request fee is charged at request completion;
 token-based spend is charged when the response stream completes (token-accurate
@@ -145,15 +144,15 @@ accounting). See [operations.md](operations.md).
 
 For a pool target, `forward_with_pool` (`src/forward.rs`) selects a member:
 
-1. **Affinity preference** — if a session header is present and the sticky member is
+1. **Affinity preference**: if a session header is present and the sticky member is
    usable, use it; otherwise fall through.
-2. **Exclusions** — configured `failover.exclusions` and already-tried lanes (across
+2. **Exclusions**: configured `failover.exclusions` and already-tried lanes (across
    failover hops) are removed from the candidate set.
-3. **SWRR** — `select_weighted` (`src/store.rs`) runs Nginx-style smooth weighted
+3. **SWRR**: `select_weighted` (`src/store.rs`) runs Nginx-style smooth weighted
    round-robin over the *usable* candidates, using per-pool `current_weight` state.
    A lane is usable only if it isn't dead, isn't out of lifetime budget, and its
    breaker cell admits it.
-4. **Concurrency** — the selected lane's semaphore permit is acquired (a lane at its
+4. **Concurrency**: the selected lane's semaphore permit is acquired (a lane at its
    `max_concurrent` cap is skipped/awaited).
 
 A direct/ad-hoc route is the degenerate case: a single-member candidate set of
@@ -179,14 +178,14 @@ byte-for-byte.
 `ProtocolReader` and `ProtocolWriter` (`src/proto/mod.rs`) are the per-protocol
 edges:
 
-- **`ProtocolReader`** — `read_request` (wire → IR), `read_response` /
+- **`ProtocolReader`**: `read_request` (wire → IR), `read_response` /
   `read_response_event(s)` (wire → IR, with stateful fan-out for flat streams like
   OpenAI's), and `extract_error` / `classify` (the breaker's Stage 1).
-- **`ProtocolWriter`** — `write_request` (IR → wire), `write_response` /
+- **`ProtocolWriter`**: `write_request` (IR → wire), `write_response` /
   `write_response_event` (IR → wire), `rewrite_model`, `upstream_path[_for[_stream]]`,
   and the **auth hooks**: `auth_headers(key)` for static headers and
   `sign_request(key, ctx)` for per-request signing (overridden by Bedrock for
-  SigV4). It also provides `probe_body` — a one-token request used by active health
+  SigV4). It also provides `probe_body`: a one-token request used by active health
   probes, so every protocol gets a valid probe for free.
 
 A `Protocol` bundles a name + reader + writer; the `ProtocolRegistry` resolves them
@@ -213,7 +212,7 @@ Stage 1b  normalize_raw_error(raw, provider.error_map) → CanonicalSignal (Stat
 Stage 2   classify_disposition(signal)                 → Disposition
 ```
 
-`Disposition` is matched **exhaustively** (a project invariant — no `_ =>` catch-all
+`Disposition` is matched **exhaustively** (a project invariant: no `_ =>` catch-all
 in breaker matches):
 
 | Disposition | Cause (StatusClass) | Lane effect | Request effect |
@@ -231,9 +230,9 @@ key failing, so it is relayed verbatim without touching lane health.
 
 On success, the response is streamed (SSE or Bedrock event-stream) or buffered:
 
-- **Same protocol** — passthrough; native usage accounting and provider-specific
+- **Same protocol**: passthrough; native usage accounting and provider-specific
   fields survive untouched.
-- **Cross protocol** — `StreamTranslate` (`src/proto/mod.rs`) composes
+- **Cross protocol**: `StreamTranslate` (`src/proto/mod.rs`) composes
   `egress.reader().read_response_events` with
   `ingress.writer().write_response_event`, re-framing each upstream event into the
   caller's wire format. It reassembles frames split across chunks, threads stream
@@ -243,10 +242,10 @@ On success, the response is streamed (SSE or Bedrock event-stream) or buffered:
   `message_stop` carries its own).
 
 In both cases a usage tap reads token counts from the response (protocol-agnostic
-extraction across all six wire shapes), and — when governance is on — charges the
+extraction across all six wire shapes), and, when governance is on, charges the
 resolved virtual key's budget at stream completion. Failover is only possible
 *before the first byte* reaches the client; a mid-stream upstream failure records
-the breaker fault and emits a native error in the caller's protocol — an SSE
+the breaker fault and emits a native error in the caller's protocol, an SSE
 `error` event for SSE clients, a binary `:message-type: exception` frame for
 Bedrock-ingress (AWS eventstream) clients.
 

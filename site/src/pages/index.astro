@@ -1,5 +1,5 @@
 ---
-// Busbar marketing homepage — a standalone Astro page (full design control),
+// Busbar marketing homepage, a standalone Astro page (full design control),
 // coexisting with the Starlight docs served at /getting-started/, /reliability/, etc.
 // src/pages/ takes routing precedence over the Starlight content collection, so this
 // owns "/" while every docs route is untouched.
@@ -13,25 +13,25 @@ const DOCS = '/why-busbar/';
 
 const ORG = { '@context': 'https://schema.org', '@type': 'Organization', name: 'Busbar', url: 'https://getbusbar.com', logo: 'https://getbusbar.com/favicon.svg', sameAs: ['https://github.com/MattJackson/busbarAI'] };
 const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'Busbar', url: 'https://getbusbar.com' };
-const SOFTWARE = { '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Busbar', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows', offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }, url: 'https://getbusbar.com', description: 'The reliability and fidelity layer for multi-model AI traffic — lossless cross-protocol translation, fault-aware circuit breaking, and in-flight failover in one static Rust binary.' };
+const SOFTWARE = { '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Busbar', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows', offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }, url: 'https://getbusbar.com', description: 'The reliability and fidelity layer for multi-model AI traffic, lossless cross-protocol translation, fault-aware circuit breaking, and in-flight failover in one static Rust binary.' };
 
 const protocols = ['OpenAI', 'Anthropic', 'Gemini', 'Bedrock', 'Cohere', 'Responses'];
 
 const features = [
   {
     title: 'Lossless cross-protocol translation',
-    body: 'Six wire protocols, native on both sides, bridged through one internal format rich enough to hold every protocol’s features. Anthropic thinking blocks, Gemini safety settings, and Bedrock tool use survive the hop — nothing is flattened to OpenAI shape.',
+    body: 'Six wire protocols, native on both sides, bridged through one internal format rich enough to hold every protocol’s features. Anthropic thinking blocks, Gemini safety settings, and Bedrock tool use survive the hop, nothing is flattened to OpenAI shape.',
     enables: 'Point whatever SDK your code already speaks at one URL, and reach every model through it.',
   },
   {
     title: 'Fault-aware failover & circuit breaking',
-    body: 'A circuit breaker on every provider lane classifies each error — provider outage, your bad request, context overflow, hard auth failure — and treats each differently instead of retrying into a wall. A failed lane reroutes mid-flight, before your client sees a single byte.',
+    body: 'A circuit breaker on every provider lane classifies each error, provider outage, your bad request, context overflow, hard auth failure, and treats each differently instead of retrying into a wall. A failed lane reroutes mid-flight, before your client sees a single byte.',
     enables: 'A flaky provider is pulled and probed back gently; a rate-limit storm on one lane never starves the healthy ones.',
   },
   {
     title: 'A programmable request path',
-    body: 'Routing is the first hook: a policy — built-in (<strong>weighted, cheapest, fastest, least_busy, usage</strong>), a webhook in any language, or a sandboxed Rhai script — inspects each request and decides who serves it, from per-member cost, latency, live concurrency, budget, and rate headroom. A slow or broken hook falls back, never blocks a request.',
-    enables: 'The same fail-safe machinery is built to carry <strong>PII-steering, audit, caching, and guardrails</strong> — your own logic on the request path, in any language.',
+    body: 'Routing is the first hook: a policy, built-in (<strong>weighted, cheapest, fastest, least_busy, usage</strong>), a webhook in any language, or a sandboxed Rhai script, inspects each request and decides who serves it, from per-member cost, latency, live concurrency, budget, and rate headroom. A slow or broken hook falls back, never blocks a request.',
+    enables: 'The same fail-safe machinery is built to carry <strong>PII-steering, audit, caching, and guardrails</strong>, your own logic on the request path, in any language.',
   },
   {
     title: 'Governance & hard budget caps',
@@ -40,13 +40,13 @@ const features = [
   },
   {
     title: 'Native TLS & mutual TLS',
-    body: 'Busbar terminates TLS itself — cert and key in config, no reverse proxy required. Turn on mTLS and a client must present a certificate signed by your CA; anyone without one is rejected at the handshake, before any bearer-token check is reached.',
+    body: 'Busbar terminates TLS itself, cert and key in config, no reverse proxy required. Turn on mTLS and a client must present a certificate signed by your CA; anyone without one is rejected at the handshake, before any bearer-token check is reached.',
     enables: 'Zero-trust ingress without standing up a service mesh.',
   },
   {
     title: 'A single Rust binary you own',
-    body: 'One static binary — no runtime, no sidecar, no interpreter in the request path — ships for Linux, macOS, and Windows (Intel and ARM). Provider keys live in one place; your app carries only a scoped token. Prometheus /metrics and OTLP traces built in.',
-    enables: 'Your infrastructure, your keys, your data path — rotating an upstream key is one restart, not a deploy sweep.',
+    body: 'One static binary, no runtime, no sidecar, no interpreter in the request path, ships for Linux, macOS, and Windows (Intel and ARM). Provider keys live in one place; your app carries only a scoped token. Prometheus /metrics and OTLP traces built in.',
+    enables: 'Your infrastructure, your keys, your data path, rotating an upstream key is one restart, not a deploy sweep.',
   },
 ];
 
@@ -92,15 +92,15 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Busbar — One endpoint. Every LLM protocol. Losslessly.</title>
+    <title>Busbar: One endpoint. Every LLM protocol. Losslessly.</title>
     <meta
       name="description"
-      content="Self-hosted LLM gateway in a single Rust binary. One endpoint speaks OpenAI, Anthropic, Gemini, Bedrock, Cohere, and Responses — routing to weighted pools, translating losslessly, and failing over through provider outages before your user sees a byte."
+      content="Self-hosted LLM gateway in a single Rust binary. One endpoint speaks OpenAI, Anthropic, Gemini, Bedrock, Cohere, and Responses, routing to weighted pools, translating losslessly, and failing over through provider outages before your user sees a byte."
     />
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <meta property="og:title" content="Busbar — One endpoint. Every LLM protocol. Losslessly." />
+    <meta property="og:title" content="Busbar: One endpoint. Every LLM protocol. Losslessly." />
     <meta
       property="og:description"
       content="The self-hosted LLM gateway in a single Rust binary. Speaks six wire protocols, routes to weighted pools, and fails over through outages."
@@ -125,7 +125,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           <h1>One endpoint.<br /><span class="accent">Every LLM protocol.</span><br />Losslessly.</h1>
           <p class="lede">
             Busbar sits between your application and every provider it calls. Point any SDK at one
-            URL — it routes to the backends you choose, translates across six wire protocols without
+            URL, it routes to the backends you choose, translates across six wire protocols without
             dropping a feature, and keeps serving through provider failures before your user sees a byte.
           </p>
           <div class="cta-row">
@@ -147,7 +147,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
             <pre><code set:html={heroCode}></code></pre>
           </div>
           <p class="demo-note">
-            Left as OpenAI, may have been served by Anthropic, came back as OpenAI — translated both
+            Left as OpenAI, may have been served by Anthropic, came back as OpenAI, translated both
             ways. If a lane returned 429 mid-flight, Busbar rerouted before your client saw a byte.
             <strong>The model name is a config value, not a code dependency.</strong>
           </p>
@@ -161,7 +161,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         <h2>Any protocol in. Any backend out.</h2>
         <p>
           You define a model name and the backends behind it. Busbar accepts <em>any</em> input
-          protocol — OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses — and routes and
+          protocol, OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses, and routes and
           translates accordingly. One model name, reachable by every client; you choose what runs
           behind it. It’s a different class of tool than a proxy with a long model list.
         </p>
@@ -460,7 +460,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         padding: 11px 14px; font-size: 13.5px; font-weight: 600; color: var(--charcoal);
         box-shadow: 0 1px 2px rgba(15,23,42,0.04);
       }
-      /* Provider tiles read as an OPEN SET of many — a stacked-deck depth distinguishes them
+      /* Provider tiles read as an OPEN SET of many, a stacked-deck depth distinguishes them
          from the exact six protocol boxes on the left (different kind of thing, not a 1:1 mirror). */
       .col-providers .node:not(.node-more) {
         box-shadow: 0 1px 2px rgba(15,23,42,0.04),
@@ -548,7 +548,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
 
       /* RESPONSIVE */
       @media (max-width: 900px) {
-        .hero-grid, .qs-grid { grid-template-columns: 1fr; gap: 40px; }
+        .hero-grid.qs-grid { grid-template-columns: 1fr; gap: 40px; }
         .feature-grid { grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(3, auto 1fr auto); }
         /* Diagram: collapse to vertical stack. Hide SVG connectors. */
         .diagram {
@@ -557,7 +557,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           padding: 32px 20px 32px;
         }
         .link-zone { display: none; }
-        /* col-label is position:absolute (bottom: calc(100% + 9px)) — on stacked layout that
+        /* col-label is position:absolute (bottom: calc(100% + 9px)), on stacked layout that
            would overlap the cell above. Convert to a normal flow label with margin instead. */
         .col { padding-top: 28px; }
         .col-label {
@@ -567,24 +567,24 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           margin-top: 0;
         }
         /* hook-line and hook-out are absolute, positioned below col-busbar. On stacked layout
-           they'd overflow the diagram. Hide them — the busbar-box text already conveys the info. */
-        .hook-line, .hook-out { display: none; }
+           they'd overflow the diagram. Hide them, the busbar-box text already conveys the info. */
+        .hook-line.hook-out { display: none; }
         .col-busbar { padding-bottom: 0; }
         .footer-inner { grid-template-columns: 1fr; gap: 32px; }
         .footer-cols { grid-template-columns: repeat(2, 1fr); }
       }
       @media (max-width: 640px) {
-        /* Body-level overflow guard — catches any stray element wider than viewport */
+        /* Body-level overflow guard, catches any stray element wider than viewport */
         body { overflow-x: hidden; }
         .nav-links { gap: 14px; }
-        .nav-links a.ghost, .nav-links a[href='/why-busbar/'], .nav-links a[href='/benchmark/'] { display: none; }
-        .feature-grid, .trust-grid, .footer-cols { grid-template-columns: 1fr; }
+        .nav-links a.ghost.nav-links a[href='/why-busbar/'].nav-links a[href='/benchmark/'] { display: none; }
+        .feature-grid.trust-grid.footer-cols { grid-template-columns: 1fr; }
         .feature-grid { grid-template-rows: repeat(6, auto 1fr auto); }
         .trust-grid { grid-template-columns: repeat(2, 1fr); }
         .hero-grid { padding: 48px 20px 44px; }
         /* Code cards: ensure long lines scroll inside box, not push page wide */
-        .code-card pre, .qs-block pre { overflow-x: auto; }
-        .code-card code, .qs-block code { white-space: pre; }
+        .code-card pre.qs-block pre { overflow-x: auto; }
+        .code-card code.qs-block code { white-space: pre; }
         /* Quickstart copy + steps stack was already 1-col from 900px media. Tighten padding. */
         .quickstart { padding: 56px 0; }
         .hero h1 { font-size: clamp(30px, 9vw, 42px); }

@@ -13,8 +13,8 @@ variables.
 |---|---|---|
 | `BUSBAR_PROVIDERS` | `/etc/busbar/providers.yaml` | Path to the provider catalog. |
 | `BUSBAR_CONFIG` | `/etc/busbar/config.yaml` | Path to the deployment config. |
-| Provider key vars | — | Named by each provider's `api_key_env` (e.g. `ANTHROPIC_KEY`). |
-| Token/secret vars | — | Anything referenced via `${VAR}` in either file (client tokens, admin token, …). |
+| Provider key vars |, | Named by each provider's `api_key_env` (e.g. `ANTHROPIC_KEY`). |
+| Token/secret vars |, | Anything referenced via `${VAR}` in either file (client tokens, admin token, …). |
 
 Startup is fail-loud: an unset `${VAR}`, an unknown provider reference, an unknown
 protocol or auth mode, or an invalid `on_exhausted` action stops the process with a
@@ -27,7 +27,7 @@ The HTTP client uses a 300s request timeout and pools up to 64 idle keep-alive c
 
 Busbar terminates TLS natively for the client↔Busbar hop. Add an optional `tls`
 block to `config.yaml`; when it is **absent**, Busbar serves plain HTTP exactly as
-before (no behavior change). When present, Busbar handles the TLS handshake itself —
+before (no behavior change). When present, Busbar handles the TLS handshake itself,
 no sidecar required.
 
 ```yaml
@@ -35,17 +35,17 @@ listen: "0.0.0.0:8443"
 tls:
   cert_file: /etc/busbar/tls/fullchain.pem  # PEM cert chain, leaf first
   key_file:  /etc/busbar/tls/privkey.pem    # PEM private key (PKCS#8 / PKCS#1 / SEC1)
-  # client_ca_file: /etc/busbar/tls/ca.pem  # OPTIONAL — see "Mutual TLS" below
+  # client_ca_file: /etc/busbar/tls/ca.pem  # OPTIONAL: see "Mutual TLS" below
 ```
 
 **Certificate & key formats.** `cert_file` is a PEM certificate chain with the leaf
-(server) certificate first, followed by any intermediates — exactly what most CAs
+(server) certificate first, followed by any intermediates: exactly what most CAs
 ship as `fullchain.pem`. `key_file` is the matching PEM private key in PKCS#8
 (`BEGIN PRIVATE KEY`), PKCS#1 (`BEGIN RSA PRIVATE KEY`), or SEC1
 (`BEGIN EC PRIVATE KEY`) encoding. Busbar advertises **http/1.1** over ALPN.
 
 **Fail-fast.** Any missing, unreadable, or unparseable cert/key/CA file stops the
-process at startup with a message naming the offending file — a misconfigured
+process at startup with a message naming the offending file: a misconfigured
 certificate can never silently downgrade or half-start the listener. Key bytes are
 never logged.
 
@@ -53,7 +53,7 @@ never logged.
 
 Set `client_ca_file` to a PEM CA bundle to require **mutual TLS**: every client must
 present a certificate that chains to that CA, or the TLS handshake is rejected before
-any request is processed. This is transport-level zero-trust — only holders of a
+any request is processed. This is transport-level zero-trust: only holders of a
 cert your CA signed can establish a connection at all, with no service mesh or
 external proxy. It composes with (and runs before) the normal `auth` token / virtual-key
 check. A client with a missing or wrong certificate is dropped at handshake; the
@@ -68,14 +68,14 @@ in-flight requests first, so a restart on rotation does not drop live traffic.
 
 **Reverse proxy alternative.** A TLS-terminating reverse proxy (nginx, Caddy,
 Envoy) in front of a plain-HTTP Busbar still works if you prefer to manage certs
-there — simply omit the `tls` block.
+there: simply omit the `tls` block.
 
 ### Connection-level hardening (slow-loris)
 
 When Busbar terminates TLS itself, the native listener bounds the request **header-read**
 phase (30 s) in addition to the TLS handshake, so a client that completes the handshake
 and then trickles request headers one byte at a time cannot pin a connection open
-indefinitely. This bound applies only to reading the request headers — it never limits a
+indefinitely. This bound applies only to reading the request headers: it never limits a
 streaming response, so long model completions are unaffected.
 
 The plain-HTTP listener (no `tls` block) does **not** apply a header-read timeout. For an
@@ -114,11 +114,11 @@ All metrics are Prometheus counters/histograms exposed at `/metrics`.
 | `busbar_key_tokens_total` | gauge | `key` | Tokens consumed by each virtual key in the current budget window. Only emitted when governance is enabled. |
 | `busbar_lane_state` | gauge | `pool`, `lane` | Circuit-breaker health per lane: `0` = Closed, `1` = HalfOpen, `2` = Open (tripped). Side-effect-free at scrape. |
 | `busbar_route_policy_selections_total` | counter | `pool`, `policy` | Requests where a routing policy (webhook/script/native) produced a usable ranked order. Only incremented on a successful `Order` outcome; abstains and on-error fallbacks are not counted. |
-| `busbar_webhook_logs_dropped_total` | counter | — | Request-log webhook deliveries shed because the in-flight delivery pool was saturated (a slow/unreachable webhook endpoint). A non-zero rate means request logs are being silently dropped — scale the endpoint or alert. |
-| `busbar_billing_truncated_total` | counter | — | Same-protocol non-stream responses whose body exceeded the translate-body cap, so the terminal `usage` frame was missed and the request billed zero tokens (the client still got a full response). A non-zero rate signals an over-cap billing gap. |
+| `busbar_webhook_logs_dropped_total` | counter |, | Request-log webhook deliveries shed because the in-flight delivery pool was saturated (a slow/unreachable webhook endpoint). A non-zero rate means request logs are being silently dropped, scale the endpoint or alert. |
+| `busbar_billing_truncated_total` | counter |, | Same-protocol non-stream responses whose body exceeded the translate-body cap, so the terminal `usage` frame was missed and the request billed zero tokens (the client still got a full response). A non-zero rate signals an over-cap billing gap. |
 
 `/metrics` requires a valid client token in `token` mode (or a virtual key under
-governance) — it is treated as an information-disclosure surface and goes through
+governance), it is treated as an information-disclosure surface and goes through
 the same auth check as other routes. Only `none`/`passthrough` mode admits scrapes
 unconditionally. Restrict it at the network layer (firewall, reverse proxy) if you
 need unauthenticated scraping under your threat model.
@@ -135,7 +135,7 @@ carries independent Open/Closed/HalfOpen state, streak, cooldown, and error wind
 each pool, so one pool's traffic tripping a lane does not bench it for the others.
 Direct/ad-hoc routes (`POST /{provider}/{model}`, `POST /{model}`) and `/stats` share a
 single lane-default cell. The concurrency limit and the `max_requests` lifetime budget
-are **not** per-pool — they cap the shared upstream, so they apply across every pool.
+are **not** per-pool, they cap the shared upstream, so they apply across every pool.
 A successful active health probe (it tests the shared upstream) clears the breaker in
 *every* cell for the lane.
 
@@ -153,12 +153,12 @@ A successful active health probe (it tests the shared upstream) clears the break
               probe succeeds
 ```
 
-- **Closed** — the lane serves traffic. A single upstream failure that does **not**
+- **Closed**: the lane serves traffic. A single upstream failure that does **not**
   meet the trip condition still arms a short cooldown (the lane is briefly skipped),
   but the breaker stays Closed.
-- **Open** — the lane is tripped and skipped during selection until its cooldown
+- **Open**: the lane is tripped and skipped during selection until its cooldown
   expires.
-- **HalfOpen** — on cooldown expiry, the next selection attempt transitions the lane
+- **HalfOpen**: on cooldown expiry, the next selection attempt transitions the lane
   to HalfOpen and admits **exactly one** probe request (single-flight via CAS). A
   successful probe completes recovery to Closed (streak/error window cleared); a
   failed probe reopens the lane with an escalated cooldown.
@@ -168,24 +168,24 @@ A successful active health probe (it tests the shared upstream) clears the break
 Configured per pool via `breaker.trip` (see
 [configuration.md](configuration.md#breaker)):
 
-- **`error_rate`** (default) — trips when the failure fraction over `window_secs`
+- **`error_rate`** (default): trips when the failure fraction over `window_secs`
   reaches `threshold` (default 0.5), but never before `min_requests` (default 5)
   outcomes have accrued in the window.
-- **`consecutive`** — trips on `consecutive_n` consecutive failures (default 3).
+- **`consecutive`**: trips on `consecutive_n` consecutive failures (default 3).
 
 ### Cooldown & backoff
 
 Cooldown grows exponentially with the consecutive failure streak, doubling from
 `base_cooldown_secs` up to `max_cooldown_secs`, with ±10% jitter once the streak is
-nonzero. A server `Retry-After` header is always honored as a **floor** — even if it
+nonzero. A server `Retry-After` header is always honored as a **floor**: even if it
 exceeds `max_cooldown_secs`. Defaults (no `breaker:` block): base 15s, max 120s.
 
 ### Hard-down vs transient
 
 - A **transient** fault (5xx/timeout/network/overload/rate-limit) drives the trip
-  evaluation and, on trip, opens the breaker — recoverable via the half-open probe.
+  evaluation and, on trip, opens the breaker: recoverable via the half-open probe.
 - A **hard-down** fault (billing/quota or auth) opens the breaker immediately with a
-  long *sticky* cooldown (30 min) rather than waiting for a trip threshold — it does
+  long *sticky* cooldown (30 min) rather than waiting for a trip threshold, it does
   **not** set a permanent `dead` flag, so it is still recoverable: a successful active
   probe (or organic half-open probe) brings it back. An **auth** hard-down also relays the
   error to the caller; a **billing** hard-down fails the request over to another
@@ -214,18 +214,18 @@ transient (which, on a Closed lane in `active` mode, can trip it out).
 
 For a single request, busbar will retry across pool members up to the failover
 `max_hops` (default 3) and within the `timeout_secs` budget (default 120). Failover is
-allowed **only before the first upstream byte reaches the client** — once streaming
+allowed **only before the first upstream byte reaches the client**: once streaming
 has started, a failure cannot fail over (the client holds a partial response); the
 lane records the breaker fault and the stream terminates with an SSE `error` event,
 and the client must retry.
 
 When all members are unusable, the pool's `on_exhausted` action decides:
 
-- `reject` / `status_503` (default) — `503` with `Retry-After` = soonest member's
+- `reject` / `status_503` (default): `503` with `Retry-After` = soonest member's
   cooldown expiry.
-- `least_bad` — serve the member whose cooldown expires soonest (degraded, logged
+- `least_bad`, serve the member whose cooldown expires soonest (degraded, logged
   loudly).
-- `fallback_pool:<name>` — route to another pool (loop-guarded).
+- `fallback_pool:<name>`, route to another pool (loop-guarded).
 
 If `outcome="exhausted"` (503) is climbing in `busbar_requests_total`, check
 `/stats` for dead/tripped lanes and consider a `fallback_pool` or `least_bad` policy
@@ -267,7 +267,7 @@ Create-key fields:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `name` | string | — | Required label. |
+| `name` | string |: | Required label. |
 | `allowed_pools` | list<string> | `[]` | Pools/models this key may target. Empty = all allowed. Violations → `403`. |
 | `max_budget_cents` | integer | none | Spend cap for the budget window; exceeded → `429` (or `400` for Bedrock ingress). |
 | `budget_period` | string | `total` | `total` (all-time), `daily` (UTC midnight), or `monthly` (UTC first-of-month). |
@@ -297,12 +297,12 @@ Create-key fields:
 
 | Symptom | Where to look |
 |---|---|
-| `503` on every request | `/stats` — are all lanes `dead` or in cooldown? Check `dead_reason`. |
+| `503` on every request | `/stats`, are all lanes `dead` or in cooldown? Check `dead_reason`. |
 | A lane stuck `dead` with `billing` reason | Upstream wallet/quota; the lane recovers on a successful probe once funded. Consider `health.mode: dead`. |
 | A lane stuck `dead` with `auth` reason | Wrong/expired key in the provider's `api_key_env`. |
 | `429` from busbar itself | A virtual key hit a limit. The body's `error.type` distinguishes the cause: `rate_limit_error` = RPM/TPM cap; `insufficient_quota` = over budget for its window (Bedrock ingress signals over-budget as `400` instead). Check `GET /admin/keys/{id}/usage`. |
 | `403` from busbar | The virtual key's `allowed_pools` doesn't include the target. |
 | Startup panic: "unset environment variable" | A `${VAR}` (possibly in a comment) isn't exported. |
 | Startup panic: "not found in providers.yaml" | A `config.yaml` provider name isn't in the catalog. |
-| Cross-protocol responses missing fields | Expected — only the modeled IR subset survives a cross-protocol hop; same-protocol routes are lossless. |
+| Cross-protocol responses missing fields | Expected, only the modeled IR subset survives a cross-protocol hop; same-protocol routes are lossless. |
 | High `busbar_failovers_total` for one lane | That backend is flapping; inspect its `busbar_upstream_failures_total` `disposition`. |

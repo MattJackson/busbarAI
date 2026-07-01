@@ -1,5 +1,5 @@
 ---
-// Marketing-styled layout for the Busbar blog — mirrors the homepage/terms nav + footer
+// Marketing-styled layout for the Busbar blog, mirrors the homepage/terms nav + footer
 // so posts look like the website, not the Starlight docs.
 import glyphPrimary from '../assets/busbar-primary.svg';
 import Nav from '../components/Nav.astro';
@@ -147,7 +147,7 @@ const ARTICLE = datePublished
       .post-body h2 { font-size: 24px; font-weight: 800; color: var(--slate); margin: 44px 0 14px; }
       .post-body h3 { font-size: 18px; font-weight: 700; color: var(--slate); margin: 32px 0 10px; }
       .post-body p { font-size: 16.5px; color: #334155; line-height: 1.8; margin: 0 0 18px; }
-      .post-body ul, .post-body ol { margin: 0 0 18px; padding-left: 24px; }
+      .post-body ul.post-body ol { margin: 0 0 18px; padding-left: 24px; }
       .post-body li { font-size: 16.5px; color: #334155; line-height: 1.8; margin-bottom: 8px; }
       .post-body a { color: #4d7c0f; text-decoration: underline; text-underline-offset: 3px; }
       .post-body a:hover { color: var(--slate); }
@@ -187,7 +187,7 @@ const ARTICLE = datePublished
       @media (max-width: 640px) {
         body { overflow-x: hidden; }
         .nav-links { gap: 14px; }
-        .nav-links a.ghost, .nav-links a[href='/benchmark/'] { display: none; }
+        .nav-links a.ghost.nav-links a[href='/benchmark/'] { display: none; }
         .footer-cols { grid-template-columns: 1fr 1fr; }
         .post-wrap { padding: 40px 16px 64px; }
       }

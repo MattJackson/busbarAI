@@ -1,4 +1,4 @@
-# Development — onboarding & workflow
+# Development, onboarding & workflow
 
 Developer-facing guide to building, testing, and extending busbar. For the
 operator/runtime view see [operations.md](operations.md) and
@@ -7,12 +7,12 @@ see [architecture.md](architecture.md); for the design deep-dive see
 [internals.md](internals.md) and the [ADRs](adr/).
 
 Contribution mechanics (PR checklist, formatting, the exhaustive-match invariant)
-live in [CONTRIBUTING.md](../CONTRIBUTING.md) — this doc covers the codebase map
+live in [CONTRIBUTING.md](../CONTRIBUTING.md), this doc covers the codebase map
 and the two common extension tasks.
 
 ---
 
-## Repo layout — `src/` module map
+## Repo layout, `src/` module map
 
 | Module | Owns |
 |---|---|
@@ -20,8 +20,8 @@ and the two common extension tasks.
 | `config.rs` | The deploy/provider/pool schema (`DeployCfg`, `ProviderDef`, `ProviderDeploy`, `ModelCfg`, `PoolCfg`, `PoolMember`, `FailoverCfg`, `AffinityCfg`, `BreakerCfg`, `HealthCfg`, `GovernanceCfg`, `ObservabilityCfg`, `OnExhausted`), `interpolate_env`, and `resolve()` (merge catalog def + deployment override). |
 | `config_validate.rs` | Post-resolve config validation (fail-loud diagnostics before lanes are built). |
 | `state.rs` | Runtime types: `Lane`, `WeightedLane`, `PoolRuntime`, and the `App` shared state. |
-| `route.rs` | Axum handlers — one per ingress protocol: `openai_ingress` (`/v1/chat/completions`), `cohere_ingress` (`/v2/chat`), `responses_ingress` (`/v1/responses`), `gemini_ingress` (`/v1/models/{*rest}` and `/v1beta/models/{*rest}` — both the stable `v1` and the `v1beta` path prefixes route to the same handler), `bedrock_converse` / `bedrock_converse_stream` (`/model/{model_id}/converse[-stream]`), `named` (`/{name}/v1/messages`), `adhoc` (`/{provider}/{model}/v1/messages`); governance pre-checks (allowed-pools/budget/rate); affinity-header resolution; `UsageSink` construction. |
-| `auth.rs` | `AuthMode` (none/token/passthrough), `AuthMiddleware`, the `auth_middleware` layer (open `/healthz` only — `/metrics` is auth-gated like other routes; admin-token guard for `/admin/*`, virtual-key resolution, passthrough token threading), constant-time token compare. |
+| `route.rs` | Axum handlers, one per ingress protocol: `openai_ingress` (`/v1/chat/completions`), `cohere_ingress` (`/v2/chat`), `responses_ingress` (`/v1/responses`), `gemini_ingress` (`/v1/models/{*rest}` and `/v1beta/models/{*rest}`, both the stable `v1` and the `v1beta` path prefixes route to the same handler), `bedrock_converse` / `bedrock_converse_stream` (`/model/{model_id}/converse[-stream]`), `named` (`/{name}/v1/messages`), `adhoc` (`/{provider}/{model}/v1/messages`); governance pre-checks (allowed-pools/budget/rate); affinity-header resolution; `UsageSink` construction. |
+| `auth.rs` | `AuthMode` (none/token/passthrough), `AuthMiddleware`, the `auth_middleware` layer (open `/healthz` only, `/metrics` is auth-gated like other routes; admin-token guard for `/admin/*`, virtual-key resolution, passthrough token threading), constant-time token compare. |
 | `forward.rs` | The forwarding engine: `forward` / `forward_with_pool` (selection → translate → sign → POST → classify → stream/failover), `RequestCtx` (deadline + exclusions + visited-pools), `FirstByteBody` (streaming body with the before-first-byte failover boundary + cross-protocol `StreamTranslate` wiring), `UsageSink`, `lane_auth_headers` (the `api-key` auth-adapter seam), and the `on_exhausted` handlers (`Status503`/`FallbackPool`/`LeastBad`). |
 | `breaker.rs` | The protocol-agnostic Stage 1b/2 classifier: `StatusClass`, `Disposition`, `RawUpstreamError`, `CanonicalSignal`, `normalize_raw_error`, `classify` (exhaustive). |
 | `store.rs` | The breaker FSM + lane state: `StateStore` trait, `InMemoryStore`, `LaneState`, `BreakerCell` / `BreakerCellAccess`, `OutcomeWindow`, SWRR `select_weighted`, the lane-default vs `_in(pool, …)` method split, `BreakerCfg`/`TripConfig`, test time injection (`set_now_for_test`/`now_for_test`). |
@@ -55,7 +55,7 @@ cargo fmt --all                               # format (rustfmt.toml in repo)
 The test suite is **in-crate**: a shared
 `#[cfg(test)] mod test_support` provides the `MockServer` harness, and each module
 carries its own `#[cfg(test)] mod tests`. There are no `tests/` integration
-binaries — everything runs under `cargo test`. See [testing.md](testing.md).
+binaries: everything runs under `cargo test`. See [testing.md](testing.md).
 
 ---
 
@@ -70,7 +70,7 @@ Busbar reads two YAML files, located via env vars:
 
 Both files support `${VAR}` interpolation expanded at load time; an unset
 referenced variable is a hard startup failure. Provider keys are supplied via the
-env vars named by each provider's `api_key_env` — never written into the files.
+env vars named by each provider's `api_key_env`, never written into the files.
 
 ```bash
 export BUSBAR_CLIENT_TOKEN=dev-token
@@ -90,25 +90,25 @@ A protocol is the unit of busbar's scope (the count to grow is **6**, not the
 provider count). To add one:
 
 1. **Implement `ProtocolReader`** (`src/proto/mod.rs` defines the trait):
-   - `read_request(body) -> IrRequest` — wire JSON → IR (ADR-0005 contract: model
+   - `read_request(body) -> IrRequest`: wire JSON → IR (ADR-0005 contract: model
      every field you can; stash adjacent fields in `IrRequest.extra`; hold
      `temperature` as the f64 it already is).
-   - `read_response(body) -> IrResponse` and `read_response_event(s)` — wire → IR.
+   - `read_response(body) -> IrResponse` and `read_response_event(s)`, wire → IR.
      For a flat stream, use the `&mut StreamDecodeState` to synthesize the IR's
      block boundaries (one chunk → `0..n` events); for a 1:1 stream, ignore it.
-   - `extract_error(status, body) -> RawUpstreamError` — Stage 1a: pull out the
+   - `extract_error(status, body) -> RawUpstreamError`, Stage 1a: pull out the
      HTTP status and any in-body `provider_code`.
-   - `classify` — the simple two-stage convenience wrapper.
+   - `classify`, the simple two-stage convenience wrapper.
    - `clone_box`.
 2. **Implement `ProtocolWriter`**:
    - `write_request(ir) -> Value`, `write_response(ir)`, `write_response_event(ir)`
-     — IR → wire.
-   - `rewrite_model(body, model)` — set the selected lane's model on the body.
+    : IR → wire.
+   - `rewrite_model(body, model)`, set the selected lane's model on the body.
    - `upstream_path` (+ optionally `upstream_path_for` / `upstream_path_for_stream`
      if the path embeds the model or differs for streaming, as Gemini's does).
    - `auth_headers(key)` for static headers; override `sign_request(key, ctx)` only
      if the protocol signs the whole request (as Bedrock does for SigV4).
-   - You get `probe_body` **for free** from the default impl — it serializes a
+   - You get `probe_body` **for free** from the default impl: it serializes a
      one-token IR request through your own `write_request`, so active health
      probing works with no extra code.
    - `clone_box`.
@@ -117,7 +117,7 @@ provider count). To add one:
    `StreamTranslate::new` flags if it has a non-SSE wire (like Bedrock's binary
    eventstream) or a special terminator.
 4. **IR contract:** the IR is a superset. If your protocol introduces a content
-   kind the IR can't represent, extend the `IrBlock` / event enums — and then every
+   kind the IR can't represent, extend the `IrBlock` / event enums: and then every
    other writer must handle the new variant (the exhaustive matches will tell you).
 5. **Test it** through the `MockServer` harness and the cross-protocol round-trip
    tests in `src/proto/mod.rs` (`test_probe_body_valid_for_all_protocols` already
@@ -130,7 +130,7 @@ the registry + IR + forward path are protocol-agnostic.
 
 ## Adding a new provider
 
-A provider is **just a catalog entry** — no code. Add it to `providers.yaml`:
+A provider is **just a catalog entry**: no code. Add it to `providers.yaml`:
 
 ```yaml
 my-provider:
@@ -167,7 +167,7 @@ Notes on the seams:
   (`billing`, `rate_limit`, `auth`, `server_error`, `timeout`, `network`,
   `overloaded`, `context_length`, `client_error`). The deployment's `error_map`
   in `config.yaml` merges over the catalog's.
-- **`path`** overrides the protocol's default upstream path verbatim — used by
+- **`path`** overrides the protocol's default upstream path verbatim: used by
   OpenAI-compatible providers that embed the API version in `base_url` and serve
   `/chat/completions` (no `/v1`), and by Azure (which carries `?api-version=` and
   the deployment in the path).
@@ -175,7 +175,7 @@ Notes on the seams:
   `forward.rs`): it sends an `api-key: <key>` header instead of the protocol's
   native auth (used by Azure OpenAI). For genuinely new auth shapes (e.g. an OAuth2
   token mint), the seam to extend is `ProtocolWriter::sign_request`, the same hook
-  Bedrock uses for SigV4 — see the roadmap in [roadmap.md](roadmap.md).
+  Bedrock uses for SigV4: see the roadmap in [roadmap.md](roadmap.md).
 
 `resolve()` (`src/config.rs`) merges the deployment over the catalog def; a
 `config.yaml` provider name not present in `providers.yaml` is a fail-loud startup
@@ -203,9 +203,9 @@ checklist as authoritative.
   Don't call `SystemTime::now()` directly in breaker-adjacent code.
 - **`#[cfg_attr(not(test), allow(dead_code))]`** marks the lane-default breaker
   methods that release code reaches only via the `_in` variants but tests exercise
-  directly — keep that pattern when adding parallel default/`_in` methods.
+  directly: keep that pattern when adding parallel default/`_in` methods.
 
 - **No `memchr` dependency.** Byte scanning (e.g. the SSE frame splitting and
   translation-body boundary scans) is done with plain slice iteration, not the
-  `memchr` crate. Keep it that way — don't add `memchr` (or pull it in transitively
+  `memchr` crate. Keep it that way, don't add `memchr` (or pull it in transitively
   for scanning) when a small hand-rolled scan will do.

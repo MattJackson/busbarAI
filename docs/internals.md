@@ -1,9 +1,9 @@
-# Internals — design deep-dive
+# Internals, design deep-dive
 
 Developer-facing companion to the public [architecture.md](architecture.md). That
 document traces a request end-to-end; this one digs into the *why* behind the
 three load-bearing seams: the superset IR, the per-(pool, lane) breaker store, and
-the two-stage disposition pipeline — plus the governance internals. Read the
+the two-stage disposition pipeline, plus the governance internals. Read the
 public doc first; this assumes it.
 
 Cross-references: [ADRs](adr/) · [development.md](development.md) ·
@@ -24,12 +24,12 @@ everything it models, and to make a same-protocol hop lossless for *everything*.
 - **What survives a cross-protocol hop:** `system`, `messages`, `tools`
   (name + description + JSON `input_schema`), `max_tokens`, `temperature`, the
   `stream` flag, and the block kinds in `IrBlock`:
-  - `Text { cache_control, citations }` — Anthropic `cache_control: ephemeral`
+  - `Text { cache_control, citations }`: Anthropic `cache_control: ephemeral`
     and citation arrays.
-  - `Thinking { signature }` — extended-thinking text and its signature.
+  - `Thinking { signature }`, extended-thinking text and its signature.
   - `ToolUse { id, name, input }`, `ToolResult { tool_use_id, content, is_error }`,
     `Image { media_type, data }`.
-  - `IrResponse.model` — the upstream-reported serving model, so a pooled
+  - `IrResponse.model`, the upstream-reported serving model, so a pooled
     cross-protocol response still names the member that served it.
 - **The `extra` map.** `IrRequest.extra` is a passthrough `Map` for fields adjacent
   to the modeled subset (e.g. `top_p`). A reader can stash unmodeled request
@@ -73,9 +73,9 @@ are split:
   `LaneState`: the concurrency semaphore (`max_concurrent`), the lifetime
   `max_requests` budget, the permanent `dead` flag, and the `ok`/`err`/
   `client_fault` counters. These cap or describe the **shared upstream**, so they
-  must not be per-pool — a concurrency cap that didn't aggregate across pools
+  must not be per-pool: a concurrency cap that didn't aggregate across pools
   wouldn't cap anything.
-- **Per (pool, lane)** — the **breaker FSM**: `breaker_state` (Closed/Open/
+- **Per (pool, lane)**: the **breaker FSM**: `breaker_state` (Closed/Open/
   HalfOpen), `streak`, `cooldown_until`, `probe_in_flight`, `err`, the
   `OutcomeWindow`, and SWRR `current_weight`. These live in a `BreakerCell`. The
   rationale: one pool's traffic tripping a lane should not bench that lane for
@@ -102,7 +102,7 @@ InMemoryStore {
 ```
 
 - `cell(pool, lane)` resolves the breaker cell. An **empty pool name** selects the
-  lane-default cell (`LaneState` itself) — used by direct/ad-hoc routes and
+  lane-default cell (`LaneState` itself): used by direct/ad-hoc routes and
   `/stats`. A **named pool** lazily creates a dedicated `BreakerCell` on first
   access, inheriting the lane's current known health (breaker state + pending
   cooldown + streak) so a pool whose first request arrives mid-cooldown respects
@@ -139,8 +139,8 @@ InMemoryStore {
   error can't dominate). `Consecutive` mode trips when `streak >= consecutive_n`.
 - **`compute_cooldown_with_retry_after`**: exponential backoff doubling from
   `base_cooldown_secs` to `max_cooldown_secs`, indexed by `streak`, with ±10%
-  jitter once `streak > 0`. A server `Retry-After` is honored as a **floor** —
-  `duration.max(retry_after)` — even beyond `max_cooldown_secs`.
+  jitter once `streak > 0`. A server `Retry-After` is honored as a **floor**,
+  `duration.max(retry_after)`: even beyond `max_cooldown_secs`.
 - **Hard-down** (`record_hard_down_for`) bypasses trip evaluation: it sets the
   cell to Open with a fixed sticky cooldown (`HARD_DOWN_COOLDOWN_SECS` = 1800s)
   and records a `dead_reason`, but deliberately does **not** set the lane-global
@@ -171,7 +171,7 @@ classification (401/403→Auth, 429→RateLimit, 408→Timeout, 529→Overloaded
 billing/quota with an idiosyncratic code can be canonicalized purely with YAML
 (`error_map`), no code.
 
-**Stage 2 outcome rules** (applied in the `forward.rs` disposition match — each arm
+**Stage 2 outcome rules** (applied in the `forward.rs` disposition match: each arm
 exhaustively re-matches `StatusClass`, using `unreachable!()` for classes that
 cannot reach that arm, so the compiler keeps the taxonomy honest):
 
@@ -192,7 +192,7 @@ failing, so `forward_with_pool` relays it without touching lane health (the
 
 Failover is allowed **only before the first upstream byte reaches the client**.
 After that, `FirstByteBody` (the streaming body wrapper) records the breaker fault
-and emits an SSE `error` event instead of retrying — the client already holds a
+and emits an SSE `error` event instead of retrying: the client already holds a
 partial response.
 
 ---
@@ -207,7 +207,7 @@ partial response.
 3. Winner = max `current_weight`.
 4. Winner: `current_weight -= total_weight` (sum over the healthy subset).
 
-For weights 5/1/1 the per-cycle order is `a a b a c a a` — proportional and
+For weights 5/1/1 the per-cycle order is `a a b a c a a`: proportional and
 smooth. `current_weight` is a per-cell `AtomicI64`, so each pool keeps its own
 rotation. Atomics are `Relaxed`; under heavy concurrency the smoothness is
 approximate, but eligibility filtering and long-run proportionality hold. See
@@ -233,7 +233,7 @@ approximate, but eligibility filtering and long-run proportionality hold. See
   `tokens/1000 * price_per_1k_tokens_cents` (charged at stream end from the usage
   tap). `is_over_budget` compares accumulated `spend_cents` to `max_budget_cents`.
 - **Rate windows.** RPM/TPM are **in-memory, fixed 60s** windows per key
-  (`RateState`), not persisted — single-node only. `check_rate` returns
+  (`RateState`), not persisted, single-node only. `check_rate` returns
   `Err(retry_after_secs)` (→ 429) when over RPM or TPM. TPM is enforced against
   tokens accrued *so far* in the window; since tokens are fed post-response from
   the usage tap, TPM reflects the prior responses' tokens.

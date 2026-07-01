@@ -1,5 +1,5 @@
 ---
-// Busbar Terms of Service — standalone Astro page matching homepage nav + footer styling.
+// Busbar Terms of Service, standalone Astro page matching homepage nav + footer styling.
 import glyphPrimary from '../assets/busbar-primary.svg';
 import Nav from '../components/Nav.astro';
 
@@ -17,7 +17,7 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Terms of Service — Busbar</title>
+    <title>Terms of Service, Busbar</title>
     <meta
       name="description"
       content="Terms of Service for the getbusbar.com website, operated by Merseyway LLC d/b/a Busbar."
@@ -48,7 +48,7 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
         <p>
           The Busbar software is open-source and licensed under the
           <a href={LICENSE}>GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)</a>.
-          These Terms cover your use of this website only — they do not modify or supplement
+          These Terms cover your use of this website only, they do not modify or supplement
           the AGPL license that governs your rights to use, copy, modify, and distribute the
           Busbar software. Your rights and obligations with respect to the software are
           determined solely by the AGPL-3.0-or-later license.
@@ -71,7 +71,7 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
         <p>
           To the maximum extent permitted by applicable law, Merseyway LLC and its officers,
           employees, and agents will not be liable for any indirect, incidental, special,
-          consequential, or punitive damages — including loss of profits, data, or goodwill —
+          consequential, or punitive damages, including loss of profits, data, or goodwill,
           arising out of or in connection with your use of (or inability to use) this website,
           even if we have been advised of the possibility of such damages.
         </p>
@@ -317,7 +317,7 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
       @media (max-width: 640px) {
         body { overflow-x: hidden; }
         .nav-links { gap: 14px; }
-        .nav-links a.ghost, .nav-links a[href='/benchmark/'] { display: none; }
+        .nav-links a.ghost.nav-links a[href='/benchmark/'] { display: none; }
         .footer-cols { grid-template-columns: 1fr 1fr; }
         .legal-wrap { padding: 40px 16px 64px; }
         .legal-doc h1 { font-size: clamp(24px, 7vw, 36px); }

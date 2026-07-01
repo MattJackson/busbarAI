@@ -5,7 +5,7 @@ import { glob } from 'astro/loaders';
 
 export const collections = {
   docs: defineCollection({ loader: docsLoader(), schema: docsSchema() }),
-  // Marketing blog — rendered by src/pages/blog/* with the site's own chrome (not Starlight docs).
+  // Marketing blog, rendered by src/pages/blog/* with the site's own chrome (not Starlight docs).
   blog: defineCollection({
     loader: glob({ pattern: '**/*.md', base: './src/content/blog' }),
     schema: z.object({

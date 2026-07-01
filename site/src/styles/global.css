@@ -8,7 +8,7 @@
  *   3. Add a body overflow-x guard as a last-resort safety net.
  */
 
-/* Table overflow — wrap every markdown/Starlight table in a scrollable container.
+/* Table overflow, wrap every markdown/Starlight table in a scrollable container.
    Starlight renders tables as plain <table> inside .sl-markdown-content.
    We use a display trick: tables become block-level with overflow scroll applied
    directly rather than a wrapper element (which would require JS). */
@@ -21,7 +21,7 @@
   border-collapse: collapse;
 }
 
-/* Code blocks — long lines must scroll inside the pre box, not the page. */
+/* Code blocks, long lines must scroll inside the pre box, not the page. */
 .sl-markdown-content pre,
 .expressive-code pre {
   overflow-x: auto;

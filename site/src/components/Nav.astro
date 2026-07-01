@@ -1,6 +1,6 @@
 ---
 // Single source of truth for the marketing-site header (homepage, blog, download,
-// legal). Import and drop <Nav /> at the top of the body — every page stays in sync.
+// legal). Import and drop <Nav /> at the top of the body, every page stays in sync.
 import glyphPrimary from '../assets/busbar-primary.svg';
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
@@ -16,7 +16,7 @@ try {
     const n = (await res.json()).stargazers_count;
     if (typeof n === 'number') starsLabel = n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
   }
-} catch { /* offline build — render without a count */ }
+} catch { /* offline build, render without a count */ }
 ---
 
 <header class="nav">
