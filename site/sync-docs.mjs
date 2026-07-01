@@ -65,11 +65,25 @@ console.log('published providers.yaml -> public/providers.yaml');
     if (lines[h1] === '') lines.splice(h1, 1);
   }
 
-  // Promote version headings: ## [x.y.z] — date  →  ## x.y.z — date
-  // This keeps them as H2 so they nest nicely under the page H1 and appear
-  // in the Starlight table of contents.
+  // Promote version headings and split the date onto its own styled line:
+  //   ## [x.y.z], 2026-06-30   ->   ## x.y.z
+  //                                 <p class="changelog-date">June 30, 2026</p>
+  // Keeps the version as a clean H2 (nests under the page H1, shows in the TOC),
+  // and renders the date beneath it in a smaller, muted font (see global.css).
   let body = lines.join('\n');
-  body = body.replace(/^## \[([^\]]+)\]/gm, '## $1');
+  body = body.replace(
+    /^## \[([^\]]+)\][,:]?\s*(\d{4}-\d{2}-\d{2})?.*$/gm,
+    (_m, ver, date) => {
+      if (!date) return `## ${ver}`;
+      const nice = new Date(date + 'T00:00:00Z').toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        timeZone: 'UTC',
+      });
+      return `## ${ver}\n\n<p class="changelog-date">${nice}</p>`;
+    },
+  );
 
   // Rewrite Keep-a-Changelog reference links at the bottom (e.g. [Unreleased]: https://...)
   // to plain text so they don't produce broken anchor links in the rendered page.

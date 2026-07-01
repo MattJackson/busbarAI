@@ -35,3 +35,12 @@
     overflow-x: hidden;
   }
 }
+
+/* Changelog: date on its own line beneath the version, small and muted. */
+.changelog-date {
+  margin: -0.4rem 0 1.2rem;
+  font-size: var(--sl-text-sm, 0.875rem);
+  color: var(--sl-color-gray-3);
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
