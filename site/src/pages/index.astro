@@ -121,7 +121,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
     <section class="hero">
       <div class="wrap hero-grid">
         <div class="hero-copy">
-          <div class="eyebrow">Self-hosted LLM gateway · single Rust binary</div>
+          <div class="eyebrow"><span class="eyebrow-full">Self-hosted LLM gateway · single Rust binary</span><span class="eyebrow-short">Self-hosted · single Rust binary</span></div>
           <h1>One endpoint.<br /><span class="accent">Every LLM protocol.</span><br />Losslessly.</h1>
           <p class="lede">
             Busbar sits between your application and every provider it calls. Point any SDK at one
@@ -405,6 +405,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         background: #fff; border: 1px solid var(--line); border-radius: 999px;
         padding: 5px 13px; margin-bottom: 22px;
       }
+      .eyebrow-short { display: none; }
       .hero h1 { font-size: clamp(38px, 5.4vw, 60px); font-weight: 800; letter-spacing: -0.035em; }
       .hero h1 .accent { color: #4d7c0f; }
       .lede { font-size: 18.5px; color: #334155; max-width: 36em; margin: 22px 0 30px; }
@@ -566,6 +567,13 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         .footer-cols { grid-template-columns: repeat(2, 1fr); }
       }
       @media (max-width: 640px) {
+        /* Shorter eyebrow so it stays on one clean line, and smaller code so the
+           samples fit without truncating at the card edge on common phones. */
+        .eyebrow-full { display: none; }
+        .eyebrow-short { display: inline; }
+        .code-card pre { padding: 18px 16px; }
+        .code-card code { font-size: 11px; }
+        .qs-block code { font-size: 12px; }
         .feature-grid { grid-template-columns: 1fr; grid-template-rows: repeat(6, auto 1fr auto); }
         .trust-grid { grid-template-columns: repeat(2, 1fr); }
         .hero-grid { padding: 48px 20px 44px; }
@@ -583,6 +591,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         .footer-base { flex-direction: column; gap: 6px; }
       }
       @media (max-width: 420px) {
+        .eyebrow { font-size: 11px; letter-spacing: 0.03em; }
         .wrap { padding: 0 16px; }
         .hero-grid { padding: 40px 16px 36px; }
         .diagram { padding: 24px 16px; }
