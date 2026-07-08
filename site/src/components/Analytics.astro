@@ -1,12 +1,17 @@
 ---
-// Privacy-friendly analytics by Plausible.
-// Included in the <head> of every custom (non-Starlight) page. Starlight docs
+// Privacy-friendly analytics by Plausible, self-hosted through a first-party
+// reverse proxy at getbusbar.com/relay/* (Cloudflare Worker "plausible-relay").
+// Serving the script and event endpoint from our own origin makes analytics
+// adblock-resistant — nothing in the browser ever touches plausible.io.
+// Included in the <head> of every custom (non-Starlight) page; Starlight docs
 // pages get the equivalent tags via the `head` array in astro.config.mjs.
 // `is:inline` keeps Astro from bundling/hoisting the snippet so it ships verbatim.
+// The `endpoint` in init() is required: the script defaults to plausible.io/api/event,
+// so without it events would bypass the proxy.
 ---
 
-<!-- Privacy-friendly analytics by Plausible -->
-<script is:inline async src="https://plausible.io/js/pa-Bzy5HbSMKIad_GF6O63BU.js"></script>
+<!-- Privacy-friendly analytics by Plausible (first-party proxy) -->
+<script is:inline async src="https://getbusbar.com/relay/js/script.js"></script>
 <script is:inline>
   window.plausible =
     window.plausible ||
@@ -18,5 +23,5 @@
     function (i) {
       plausible.o = i || {};
     };
-  plausible.init();
+  plausible.init({ endpoint: "https://getbusbar.com/relay/api/event" });
 </script>
