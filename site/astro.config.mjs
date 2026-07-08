@@ -13,6 +13,17 @@ export default defineConfig({
       logo: { src: './src/assets/busbar-glyph.svg', alt: 'Busbar' },
       customCss: ['./src/styles/global.css'],
       head: [
+        // Privacy-friendly analytics by Plausible (docs pages; custom pages get the
+        // equivalent via src/components/Analytics.astro).
+        {
+          tag: 'script',
+          attrs: { async: true, src: 'https://plausible.io/js/pa-Bzy5HbSMKIad_GF6O63BU.js' },
+        },
+        {
+          tag: 'script',
+          content:
+            'window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};plausible.init()',
+        },
         { tag: 'link', attrs: { rel: 'icon', href: '/favicon.ico', sizes: 'any' } },
         { tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/apple-touch-icon.png' } },
         { tag: 'meta', attrs: { property: 'og:image', content: 'https://getbusbar.com/og-card.png' } },

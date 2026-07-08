@@ -7,6 +7,7 @@ import glyphLime from '../assets/busbar-glyph-lime.svg';
 import glyphWhite from '../assets/busbar-glyph-white.svg';
 import glyphPrimary from '../assets/busbar-primary.svg';
 import Nav from '../components/Nav.astro';
+import Analytics from '../components/Analytics.astro';
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
 const DOCS = '/why-busbar/';
@@ -110,6 +111,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:image" content="https://getbusbar.com/og-card.png" />
     <meta name="color-scheme" content="light" />
+    <Analytics />
     <script type="application/ld+json" set:html={JSON.stringify(ORG)} />
     <script type="application/ld+json" set:html={JSON.stringify(WEBSITE)} />
     <script type="application/ld+json" set:html={JSON.stringify(SOFTWARE)} />

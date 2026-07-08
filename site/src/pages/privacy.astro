@@ -2,6 +2,7 @@
 // Busbar Privacy Policy, standalone Astro page matching homepage nav + footer styling.
 import glyphPrimary from '../assets/busbar-primary.svg';
 import Nav from '../components/Nav.astro';
+import Analytics from '../components/Analytics.astro';
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
 const DOCS = '/why-busbar/';
@@ -25,6 +26,7 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <meta name="color-scheme" content="light" />
+    <Analytics />
     <script type="application/ld+json" set:html={JSON.stringify(ORG)} />
     <script type="application/ld+json" set:html={JSON.stringify(WEBSITE)} />
   </head>

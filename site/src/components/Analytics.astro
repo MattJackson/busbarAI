@@ -1,0 +1,22 @@
+---
+// Privacy-friendly analytics by Plausible.
+// Included in the <head> of every custom (non-Starlight) page. Starlight docs
+// pages get the equivalent tags via the `head` array in astro.config.mjs.
+// `is:inline` keeps Astro from bundling/hoisting the snippet so it ships verbatim.
+---
+
+<!-- Privacy-friendly analytics by Plausible -->
+<script is:inline async src="https://plausible.io/js/pa-Bzy5HbSMKIad_GF6O63BU.js"></script>
+<script is:inline>
+  window.plausible =
+    window.plausible ||
+    function () {
+      (plausible.q = plausible.q || []).push(arguments);
+    };
+  plausible.init =
+    plausible.init ||
+    function (i) {
+      plausible.o = i || {};
+    };
+  plausible.init();
+</script>

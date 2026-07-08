@@ -9,6 +9,7 @@ import glyphPrimary from '../assets/busbar-primary.svg';
 // (runs before every dev/build). Importing keeps the read inside site/, robust in astro build.
 import release from '../release.json';
 import Nav from '../components/Nav.astro';
+import Analytics from '../components/Analytics.astro';
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
 const REL = `${GITHUB}/releases/latest/download`;
@@ -61,6 +62,7 @@ const groups = [
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <meta name="color-scheme" content="light" />
+    <Analytics />
     <script type="application/ld+json" set:html={JSON.stringify(ORG)} />
     <script type="application/ld+json" set:html={JSON.stringify(WEBSITE)} />
     <script type="application/ld+json" set:html={JSON.stringify(SOFTWARE)} />

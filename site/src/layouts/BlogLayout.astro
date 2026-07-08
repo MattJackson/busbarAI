@@ -3,6 +3,7 @@
 // so posts look like the website, not the Starlight docs.
 import glyphPrimary from '../assets/busbar-primary.svg';
 import Nav from '../components/Nav.astro';
+import Analytics from '../components/Analytics.astro';
 
 interface Props {
   title: string;
@@ -33,6 +34,7 @@ const ARTICLE = datePublished
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <meta name="color-scheme" content="light" />
+    <Analytics />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:type" content="article" />
