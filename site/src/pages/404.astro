@@ -1,0 +1,214 @@
+---
+// Busbar 404 page, standalone Astro page matching homepage nav + footer styling.
+// Astro builds this to /404.html, which GitHub Pages serves for any unknown path.
+import glyphPrimary from '../assets/busbar-primary.svg';
+import Nav from '../components/Nav.astro';
+import Analytics from '../components/Analytics.astro';
+
+const GITHUB = 'https://github.com/MattJackson/busbarAI';
+const YEAR = new Date().getFullYear();
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>404 — Page not found · Busbar</title>
+    <meta name="description" content="The page you were looking for could not be found." />
+    <meta name="robots" content="noindex" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="color-scheme" content="light" />
+    <Analytics />
+    <script is:inline>
+      // Record which broken/mistyped URL was hit, as a Plausible custom event.
+      window.plausible &&
+        window.plausible('404', { props: { path: location.pathname + location.search } });
+    </script>
+  </head>
+  <body>
+    <Nav />
+
+    <main class="legal-wrap">
+      <div class="nf-doc">
+        <p class="nf-code">404</p>
+        <h1>This page took a wrong route.</h1>
+        <p class="intro">
+          The page you were looking for doesn't exist or has moved. Busbar keeps traffic
+          flowing even when a backend disappears — this link, unfortunately, has no failover.
+        </p>
+        <div class="nf-actions">
+          <a class="nf-btn primary" href="/">Back to home</a>
+          <a class="nf-btn" href="/why-busbar/">Read the docs</a>
+          <a class="nf-btn" href="/download/">Download</a>
+        </div>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <div class="wrap footer-inner">
+        <div class="footer-brand">
+          <img src={glyphPrimary.src} alt="" width="26" height="26" />
+          <div>
+            <strong>Busbar</strong>
+            <span>The reliability layer for LLM traffic.</span>
+          </div>
+        </div>
+        <nav class="footer-cols">
+          <div>
+            <h4>Docs</h4>
+            <a href="/getting-started/">Getting Started</a>
+            <a href="/why-busbar/">Why Busbar</a>
+            <a href="/reliability/">Reliability</a>
+            <a href="/routing/">Routing</a>
+            <a href="/benchmark/">Benchmark</a>
+          </div>
+          <div>
+            <h4>Reference</h4>
+            <a href="/protocols/">Protocols</a>
+            <a href="/configuration/">Configuration</a>
+            <a href="/security/">Security</a>
+            <a href="/providers/">Providers</a>
+          </div>
+          <div>
+            <h4>Project</h4>
+            <a href={GITHUB}>GitHub</a>
+            <a href={`${GITHUB}/blob/main/LICENSE`}>License (AGPL-3.0)</a>
+            <a href="/llms.txt">llms.txt</a>
+          </div>
+          <div>
+            <h4>Legal</h4>
+            <a href="/privacy/">Privacy Policy</a>
+            <a href="/terms/">Terms of Service</a>
+          </div>
+        </nav>
+      </div>
+      <div class="wrap footer-base">
+        <span>© {YEAR} Merseyway LLC d/b/a Busbar · Licensed AGPL-3.0</span>
+        <span>One endpoint. Every LLM protocol. Losslessly.</span>
+      </div>
+    </footer>
+
+    <style is:global>
+      :root {
+        color-scheme: light;
+        --slate: #0f172a;
+        --charcoal: #1e293b;
+        --lime: #a3e635;
+        --ink: #0b1220;
+        --line: #e2e8f0;
+        --muted: #64748b;
+        --muted-d: #94a3b8;
+        --bg: #ffffff;
+        --bg-soft: #f8fafc;
+      }
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--slate);
+        font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+          Helvetica, Arial, sans-serif;
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+      .wrap { width: 100%; max-width: 1120px; margin: 0 auto; padding: 0 28px; }
+      a { color: inherit; text-decoration: none; }
+      h1, h2, h3, h4 { letter-spacing: -0.02em; line-height: 1.1; margin: 0; }
+
+      /* NAV */
+      .nav {
+        position: sticky; top: 0; z-index: 50;
+        background: rgba(255, 255, 255, 0.82);
+        backdrop-filter: saturate(180%) blur(12px);
+        border-bottom: 1px solid var(--line);
+      }
+      .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+      .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; letter-spacing: -0.01em; }
+      .nav-links { display: flex; align-items: center; gap: 26px; font-size: 14.5px; font-weight: 500; }
+      .nav-links a { color: var(--charcoal); transition: color 0.15s; }
+      .nav-links a:hover { color: var(--slate); }
+      .nav-links a.ghost { color: var(--muted); }
+
+      /* 404 CONTENT */
+      .legal-wrap {
+        min-height: calc(100vh - 64px - 200px);
+        padding: 96px 28px 96px;
+        background: var(--bg);
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+      }
+      .nf-doc { max-width: 640px; text-align: center; }
+      .nf-code {
+        font-size: 15px;
+        font-weight: 700;
+        color: #4d7c0f;
+        letter-spacing: 0.14em;
+        margin: 0 0 12px;
+      }
+      .nf-doc h1 {
+        font-size: clamp(28px, 5vw, 44px);
+        font-weight: 800;
+        margin: 0 0 20px;
+        color: var(--slate);
+      }
+      .nf-doc .intro {
+        font-size: 17px;
+        color: #334155;
+        line-height: 1.7;
+        margin: 0 0 32px;
+      }
+      .nf-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+      .nf-btn {
+        display: inline-flex; align-items: center;
+        padding: 11px 20px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        font-size: 14.5px; font-weight: 600;
+        color: var(--charcoal);
+        background: #fff;
+        transition: border-color 0.15s, color 0.15s;
+      }
+      .nf-btn:hover { border-color: var(--muted-d); color: var(--slate); }
+      .nf-btn.primary {
+        background: var(--slate);
+        color: #fff;
+        border-color: var(--slate);
+      }
+      .nf-btn.primary:hover { background: var(--ink); color: #fff; }
+
+      /* FOOTER */
+      .footer { background: #fff; padding: 64px 0 32px; border-top: 1px solid var(--line); }
+      .footer-inner { display: grid; grid-template-columns: 1fr 1.4fr; gap: 48px; padding-bottom: 40px; border-bottom: 1px solid var(--line); }
+      .footer-brand { display: flex; gap: 12px; align-items: flex-start; }
+      .footer-brand strong { display: block; font-size: 16px; }
+      .footer-brand span { font-size: 13.5px; color: var(--muted); }
+      .footer-cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 28px; }
+      .footer-cols h4 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 14px; }
+      .footer-cols a { display: block; font-size: 14px; color: var(--charcoal); padding: 4px 0; text-decoration: none; }
+      .footer-cols a:hover { color: var(--slate); }
+      .footer-base { display: flex; justify-content: space-between; padding-top: 24px; font-size: 13px; color: var(--muted); flex-wrap: wrap; gap: 10px; }
+
+      /* RESPONSIVE */
+      @media (max-width: 900px) {
+        .footer-inner { grid-template-columns: 1fr; gap: 32px; }
+        .footer-cols { grid-template-columns: repeat(2, 1fr); }
+      }
+      @media (max-width: 640px) {
+        html { overflow-x: clip; }
+        .nav-links { gap: 14px; }
+        .footer-cols { grid-template-columns: 1fr 1fr; }
+        .legal-wrap { padding: 56px 16px 64px; }
+      }
+      @media (max-width: 420px) {
+        .wrap { padding: 0 16px; }
+        .nav-links { gap: 10px; font-size: 13.5px; }
+      }
+    </style>
+  </body>
+</html>

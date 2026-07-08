@@ -190,6 +190,8 @@ const groups = [
           btn.addEventListener('click', function () {
             navigator.clipboard && navigator.clipboard.writeText(btn.dataset.copy);
             var t = btn.textContent; btn.textContent = 'Copied'; setTimeout(function () { btn.textContent = t; }, 1400);
+            // Custom Plausible goal: strong install-intent signal (copied the one-line installer).
+            window.plausible && window.plausible('Copy install command');
           });
         });
       })();
