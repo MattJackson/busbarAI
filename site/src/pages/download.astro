@@ -5,6 +5,7 @@
 // so they always resolve to the newest release with no JavaScript or API calls.
 // The asset names are kept version-less by .github/workflows/release.yml (archive: busbar-$target).
 import glyphPrimary from '../assets/busbar-primary.svg';
+import dockerMark from '../assets/docker.svg';
 // Crate version, synced from the repo Cargo.toml into src/release.json by sync-docs.mjs
 // (runs before every dev/build). Importing keeps the read inside site/, robust in astro build.
 import release from '../release.json';
@@ -86,22 +87,12 @@ const groups = [
         )}
       </div>
 
-      <!-- One-line installer (recommended) -->
-      <section class="dl-install">
-        <div class="dl-install-tag">Recommended · macOS &amp; Linux</div>
-        <div class="dl-cmd">
-          <code>curl -fsSL https://getbusbar.com/install.sh | sh</code>
-          <button class="dl-copy" data-copy="curl -fsSL https://getbusbar.com/install.sh | sh" aria-label="Copy install command">Copy</button>
-        </div>
-        <p class="dl-install-note">
-          Drops <code>busbar</code> and <code>providers.yaml</code> into the current directory,
-          no sudo, no global install. Then follow <a href="/getting-started/">Getting Started</a>.
-        </p>
-      </section>
-
       <!-- Docker -->
       <section class="dl-install">
-        <div class="dl-install-tag">Docker · multi-arch (amd64 + arm64)</div>
+        <a class="dl-install-tag dl-tag-link" href="https://hub.docker.com/r/getbusbar/busbar">
+          <img src={dockerMark.src} alt="" width="15" height="15" />
+          Docker · multi-arch (amd64 + arm64)
+        </a>
         <div class="dl-cmd">
           <code>docker pull getbusbar/busbar</code>
           <button class="dl-copy" data-copy="docker pull getbusbar/busbar" aria-label="Copy docker pull command">Copy</button>
@@ -112,6 +103,19 @@ const groups = [
           <code>latest</code>; images carry a verifiable build-provenance attestation
           (<a href="https://hub.docker.com/r/getbusbar/busbar">Docker Hub</a>, also on GHCR).
           Then follow <a href="/getting-started/">Getting Started</a> to configure and run it.
+        </p>
+      </section>
+
+      <!-- One-line installer -->
+      <section class="dl-install">
+        <div class="dl-install-tag">One-line install · macOS &amp; Linux</div>
+        <div class="dl-cmd">
+          <code>curl -fsSL https://getbusbar.com/install.sh | sh</code>
+          <button class="dl-copy" data-copy="curl -fsSL https://getbusbar.com/install.sh | sh" aria-label="Copy install command">Copy</button>
+        </div>
+        <p class="dl-install-note">
+          Drops <code>busbar</code> and <code>providers.yaml</code> into the current directory,
+          no sudo, no global install. Then follow <a href="/getting-started/">Getting Started</a>.
         </p>
       </section>
 
@@ -277,6 +281,11 @@ const groups = [
         display: inline-block; font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em;
         text-transform: uppercase; color: #4d7c0f; margin-bottom: 12px;
       }
+      .dl-tag-link {
+        display: inline-flex; align-items: center; gap: 6px; text-decoration: none;
+      }
+      .dl-tag-link:hover { color: var(--slate); }
+      .dl-tag-link img { display: block; }
       .dl-cmd {
         display: flex; align-items: center; justify-content: space-between; gap: 14px;
         background: var(--ink); border-radius: 10px; padding: 14px 16px;
