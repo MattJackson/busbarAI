@@ -31,6 +31,13 @@ on:
           release. Leave empty to publish only a `test` tag.
         required: false
         default: ""
+      retag_from:
+        description: >-
+          Point `latest` at an ALREADY-PUBLISHED version (e.g. 1.1.1) with a
+          manifest-only retag — no rebuild, and the immutable X.Y.Z tag is never
+          re-pushed. Skips the build. Leave empty for a normal build.
+        required: false
+        default: ""
 
 env:
   DOCKERHUB_IMAGE: getbusbar/busbar
@@ -43,9 +50,37 @@ permissions:
   attestations: write  # build-provenance attestation
 
 jobs:
+  # Manifest-only retag: point `latest` at an already-published version, no rebuild.
+  # Used when version tags are immutable — the immutable X.Y.Z is never re-pushed.
+  retag-latest:
+    name: point latest at ${{ inputs.retag_from }}
+    if: ${{ inputs.retag_from != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Retag latest -> ${{ inputs.retag_from }} (multi-arch preserved)
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "${DOCKERHUB_IMAGE}:latest" "${DOCKERHUB_IMAGE}:${{ inputs.retag_from }}"
+          docker buildx imagetools create -t "${GHCR_IMAGE}:latest"      "${GHCR_IMAGE}:${{ inputs.retag_from }}"
+          echo "latest now points at ${{ inputs.retag_from }}:"
+          docker buildx imagetools inspect "${DOCKERHUB_IMAGE}:latest" | grep -iE 'name|platform'
+
   # Static musl binaries, one per architecture, built on native runners (no QEMU).
   build-binaries:
     name: musl ${{ matrix.arch }}
+    if: ${{ inputs.retag_from == '' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
