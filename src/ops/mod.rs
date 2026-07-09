@@ -136,4 +136,31 @@ mod tests {
             None
         );
     }
+
+    /// The load-bearing invariant of the operations axis: the forward engine branches on the
+    /// *capabilities* a spec declares, never on an operation's *identity*. If this ever breaks —
+    /// someone adds `if op.name() == "embeddings"` or `match op.name() { ... }` to the engine —
+    /// then chat stops being just spec #1 and the "add an operation without touching the engine"
+    /// property is lost. Scan the engine source and fail loudly if an identity branch appears.
+    /// (`op.name()` used as a value — e.g. the tracing span field — is fine; only comparisons and
+    /// matches on it are forbidden.)
+    #[test]
+    fn engine_never_branches_on_operation_identity() {
+        let engine = include_str!("../forward.rs");
+        let forbidden = [
+            "op.name() ==",
+            "op.name()==",
+            "== op.name()",
+            "==op.name()",
+            "match op.name()",
+        ];
+        for pat in forbidden {
+            assert!(
+                !engine.contains(pat),
+                "src/forward.rs contains a forbidden operation-identity branch (`{pat}`). The \
+                 engine must read capabilities off the OpSpec, never branch on op.name(). Move \
+                 the differing behavior into a trait method on OpSpec instead."
+            );
+        }
+    }
 }
