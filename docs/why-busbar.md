@@ -73,7 +73,7 @@ OpenRouter is a hosted service. You send requests to `openrouter.ai`; they route
 
 **Where Busbar pulls ahead:**
 
-- **Your data stays in your infrastructure.** Every request through OpenRouter transits OpenRouter's servers. For applications with data residency requirements, PII handling obligations, or internal policies around third-party data access, this is a hard constraint. Busbar runs in your infrastructure. The only external traffic is the upstream provider calls you configure.
+- **Your data stays in your infrastructure.** Every request through OpenRouter goes through OpenRouter's servers. For applications with data residency requirements, PII handling obligations, or internal policies around third-party data access, this is a hard constraint. Busbar runs in your infrastructure. The only external traffic is the upstream provider calls you configure.
 - **No per-request markup.** OpenRouter charges a markup above provider list price. Busbar's only cost is the compute to run it; its single-binary footprint is negligible against LLM API costs.
 - **Configurable reliability semantics.** OpenRouter's failover behavior is opaque and fixed. Busbar's pool configuration, breaker parameters, failover deadlines, and exhaustion behavior (reject with 503, fall back to another pool, or send to the least-bad lane) are all explicit, observable, and operator-controlled.
 - **Virtual key governance.** OpenRouter has no mechanism for issuing scoped sub-keys to internal teams with independent budget caps and rate limits.

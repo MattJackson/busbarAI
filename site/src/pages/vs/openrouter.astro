@@ -26,7 +26,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
         <tr>
           <td>Where it runs</td>
           <td>Your infrastructure; the only external traffic is the provider calls you configure</td>
-          <td>Their servers; every prompt transits OpenRouter <a href="#references">[1]</a></td>
+          <td>Their servers; every prompt goes through OpenRouter <a href="#references">[1]</a></td>
         </tr>
         <tr>
           <td>Who holds provider keys</td>
@@ -36,7 +36,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
         <tr>
           <td>Pricing</td>
           <td>Free and open source; your compute</td>
-          <td>Provider list price passed through, no inference markup; 5.5% fee (min $0.80) on card credit purchases <a href="#references">[1]</a></td>
+          <td>Provider list price passed through, no inference markup; a percentage fee on credit purchases <a href="#references">[1]</a></td>
         </tr>
         <tr>
           <td>Who can see prompts</td>
@@ -74,7 +74,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
 
   <h2>The data path is the decision</h2>
   <p>
-    If prompts transiting a third party is acceptable for your application, OpenRouter is
+    If prompts passing through a third party is acceptable for your application, OpenRouter is
     excellent, and most of Busbar's argument doesn't apply to you. If you have data residency
     requirements, PII handling obligations, or internal policies around third-party data access,
     no toggle changes the architecture: OpenRouter is, in their own words, "a proxy that sends
@@ -89,9 +89,9 @@ import PageLayout from '../../layouts/PageLayout.astro';
 
   <h2>Fees, stated precisely</h2>
   <p>
-    OpenRouter passes through provider inference pricing with no markup, and charges a fee when
-    you buy credits: 5.5% with a minimum of $0.80 by card, 5% by crypto
-    <a href="#references">[1]</a>. That's their FAQ's own framing and we'll use it, because it's
+    OpenRouter passes through provider inference pricing with no markup, and charges a
+    percentage fee when you buy credits; their FAQ has the current rates
+    <a href="#references">[1]</a>. That's their own framing and we'll use it, because it's
     accurate.
   </p>
   <p>
