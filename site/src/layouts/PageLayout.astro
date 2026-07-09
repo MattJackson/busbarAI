@@ -31,6 +31,7 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <meta name="color-scheme" content="light" />
+    <link rel="canonical" href={new URL(Astro.url.pathname, "https://getbusbar.com")} />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:image" content="https://getbusbar.com/og-card.png" />

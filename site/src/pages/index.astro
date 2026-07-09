@@ -83,7 +83,8 @@ models:
     provider: anthropic
     max_concurrent: 10`;
 const qsRun = `export ANTHROPIC_KEY=sk-ant-...
-BUSBAR_PROVIDERS=./providers.yaml BUSBAR_CONFIG=./config.yaml busbar   <span class="cm"># serving on :8080</span>`;
+BUSBAR_PROVIDERS=./providers.yaml \\
+BUSBAR_CONFIG=./config.yaml busbar   <span class="cm"># serving on :8080</span>`;
 const qsRequest = `curl localhost:8080/v1/chat/completions \\
   -d '{"model":"claude-sonnet",
        "messages":[{"role":"user","content":"hi"}]}'`;
@@ -112,6 +113,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:image" content="https://getbusbar.com/og-card.png" />
     <meta name="color-scheme" content="light" />
+    <link rel="canonical" href={new URL(Astro.url.pathname, "https://getbusbar.com")} />
     <Analytics />
     <script type="application/ld+json" set:html={JSON.stringify(ORG)} />
     <script type="application/ld+json" set:html={JSON.stringify(WEBSITE)} />
