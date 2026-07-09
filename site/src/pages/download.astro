@@ -103,14 +103,15 @@ const groups = [
       <section class="dl-install">
         <div class="dl-install-tag">Docker · multi-arch (amd64 + arm64)</div>
         <div class="dl-cmd">
-          <code>docker run -d -p 8080:8080 -e ANTHROPIC_KEY -v "$PWD/config.yaml:/etc/busbar/config.yaml:ro" getbusbar/busbar</code>
-          <button class="dl-copy" data-copy='docker run -d -p 8080:8080 -e ANTHROPIC_KEY -v "$PWD/config.yaml:/etc/busbar/config.yaml:ro" getbusbar/busbar' aria-label="Copy docker run command">Copy</button>
+          <code>docker pull getbusbar/busbar</code>
+          <button class="dl-copy" data-copy="docker pull getbusbar/busbar" aria-label="Copy docker pull command">Copy</button>
         </div>
         <p class="dl-install-note">
           A <code>FROM scratch</code> image: the static binary plus the provider catalog, ~5 MB
           compressed. Pin <code>getbusbar/busbar:1</code>, <code>:1.1</code>, or an exact version;
           images are cosign-signed with build provenance
           (<a href="https://hub.docker.com/r/getbusbar/busbar">Docker Hub</a>, also on GHCR).
+          Then follow <a href="/getting-started/">Getting Started</a> to configure and run it.
         </p>
       </section>
 
