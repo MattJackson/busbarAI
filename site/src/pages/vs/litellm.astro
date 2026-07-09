@@ -88,9 +88,10 @@ import PageLayout from '../../layouts/PageLayout.astro';
     </table>
   </div>
   <p class="takeaway">
-    The short version: over 20× less added latency, and that's our worst published case
-    against their best. At the p99 tail, which is what your users actually feel, the gap
-    is more than 80×.
+    In plain terms: our worst published latency case beats their best by more than 20×,
+    and one Busbar vCPU moves about as many requests per second as 130 LiteLLM vCPUs
+    (9,750/s against ~73/s). Those are the same fact twice — less CPU spent per request
+    is where the extra requests come from.
   </p>
   <p class="note">
     Benchmark figures are each project's own published numbers on its own hardware, so read the
