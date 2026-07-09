@@ -101,6 +101,71 @@ pub(crate) async fn stats(
     Json(json!({ "pools": pools, "lanes": lanes })).into_response()
 }
 
+/// `GET /v1/models` — the OpenAI list-models surface. This is the first call an OpenAI SDK
+/// (`client.models.list()`) or a self-hosted UI (Open WebUI, LibreChat) makes to populate a
+/// model picker, so busbar answers it with every name a client can put in a request body:
+/// configured model entries AND pool names (a pool is a routable model from the client's
+/// point of view).
+///
+/// Governance-scoped with the same rules as `/stats`: a virtual key with a non-empty
+/// `allowed_pools` sees only its visible pools and the models reachable through them —
+/// the model list must not leak topology the pool ACL hides.
+pub(crate) async fn list_models(
+    State(app): State<Arc<App>>,
+    Extension(gov): Extension<GovCtx>,
+) -> Response {
+    let restricted = gov
+        .key
+        .as_ref()
+        .is_some_and(|k| !k.allowed_pools.is_empty());
+
+    let visible_pool = |name: &str| -> bool {
+        match gov.key.as_ref() {
+            Some(key) => pool_allowed(key, name),
+            None => true,
+        }
+    };
+
+    // Stable order: pools first, then direct models, each sorted — SDK consumers and UIs
+    // render this list directly, and a deterministic order diffs cleanly in tests and docs.
+    let mut names: Vec<&str> = app
+        .pools
+        .keys()
+        .filter(|n| visible_pool(n))
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+
+    let mut models: Vec<&str> = app
+        .by_model
+        .keys()
+        .filter(|m| {
+            if !restricted {
+                return true;
+            }
+            // A restricted key sees a direct model only if a visible pool routes to its lane
+            // (mirrors the /stats lane rule; pool-less lanes stay hidden from restricted keys).
+            let Some(&idx) = app.by_model.get(*m) else {
+                return false;
+            };
+            app.pools
+                .iter()
+                .filter(|(n, _)| visible_pool(n))
+                .any(|(_, wls)| wls.iter().any(|wl| wl.idx == idx))
+        })
+        .map(String::as_str)
+        .collect();
+    models.sort_unstable();
+    names.extend(models);
+    names.dedup();
+
+    let data: Vec<Value> = names
+        .iter()
+        .map(|id| json!({ "id": id, "object": "model", "created": 0, "owned_by": "busbar" }))
+        .collect();
+    Json(json!({ "object": "list", "data": data })).into_response()
+}
+
 pub(crate) async fn healthz(State(app): State<Arc<App>>) -> Response {
     let t = now();
     // Side-effect-FREE readiness check: `/healthz` is unauthenticated and high-frequency (k8s
@@ -231,5 +296,64 @@ mod tests {
         let pools = body["pools"].as_object().expect("pools object");
         assert!(pools.contains_key("pool-a") && pools.contains_key("pool-b"));
         assert_eq!(body["lanes"].as_array().expect("lanes array").len(), 3);
+    }
+
+    async fn models_ids(app: Arc<App>, gov: GovCtx) -> Vec<String> {
+        let resp = list_models(State(app), Extension(gov)).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect /v1/models body");
+        let body: Value = serde_json::from_slice(&bytes).expect("/v1/models body is JSON");
+        assert_eq!(body["object"], "list", "OpenAI list envelope");
+        body["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|m| {
+                assert_eq!(m["object"], "model", "OpenAI model object");
+                m["id"].as_str().expect("model id").to_string()
+            })
+            .collect()
+    }
+
+    /// `models.list()` is the first call an OpenAI SDK or a self-hosted UI makes. An
+    /// unrestricted caller sees every routable name: pools first, then direct models,
+    /// each sorted (a deterministic order UIs can render directly).
+    #[tokio::test]
+    async fn test_v1_models_lists_pools_and_models() {
+        let app = topology_app();
+        let ids = models_ids(app, GovCtx::default()).await;
+        assert_eq!(
+            ids,
+            ["pool-a", "pool-b", "model-a0", "model-a1", "model-b"],
+            "pools then models, each sorted"
+        );
+    }
+
+    /// Info-disclosure regression: a key restricted to `pool-a` must not enumerate
+    /// `pool-b` or its private model through the model list — same rule as /stats.
+    #[tokio::test]
+    async fn test_v1_models_restricted_key_sees_only_reachable_names() {
+        let app = topology_app();
+        let gov = GovCtx {
+            key: Some(vkey(&["pool-a"])),
+        };
+        let ids = models_ids(app, gov).await;
+        assert_eq!(
+            ids,
+            ["pool-a", "model-a0", "model-a1"],
+            "hidden pool and its private lane must not leak; got {ids:?}"
+        );
+    }
+
+    /// An empty `allowed_pools` key (operator default) sees the full list, like /stats.
+    #[tokio::test]
+    async fn test_v1_models_empty_allowed_pools_sees_all() {
+        let app = topology_app();
+        let gov = GovCtx {
+            key: Some(vkey(&[])),
+        };
+        let ids = models_ids(app, gov).await;
+        assert_eq!(ids.len(), 5);
     }
 }

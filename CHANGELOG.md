@@ -5,6 +5,24 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`GET /v1/models`**: the OpenAI list-models surface. Returns every routable name — configured
+  pools first, then model entries, each sorted. This is the first call `client.models.list()` and
+  self-hosted UIs (Open WebUI, LibreChat) make to build a model picker; it previously returned 404.
+  Governance-scoped like `/stats`: a virtual key restricted by `allowed_pools` sees only the pools
+  it may target and the models reachable through them.
+
+### Fixed
+
+- **`/metrics` is no longer empty before the first request.** The unlabeled counter family is
+  pre-registered at startup and per-lane `busbar_lane_state` gauges are now also emitted for
+  direct-model (pool-less) lanes — labeled with the model name as `pool`, matching the counter
+  convention — so a freshly booted gateway exposes a live exposition to Prometheus immediately.
+  Both issues were found by the user-emulated acceptance harness on its first run.
+
 ## [1.1.0], 2026-06-30
 
 ### Added

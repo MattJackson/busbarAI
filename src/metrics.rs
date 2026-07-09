@@ -152,6 +152,15 @@ pub(crate) fn init() {
     HANDLE.get_or_init(|| match PrometheusBuilder::new().install_recorder() {
         Ok(handle) => {
             describe();
+            // Pre-register the unlabeled counter so `/metrics` is non-empty from the first
+            // scrape. The exporter renders only touched metrics; without this, a freshly
+            // booted gateway that has served no traffic exposes an EMPTY body, and an
+            // operator wiring up Prometheus before sending traffic reasonably concludes
+            // the endpoint is broken (found by the acceptance harness, 2026-07-09).
+            // Only the unlabeled family is pre-touched: labeled families would require
+            // inventing label values, which the cardinality contract above forbids. The
+            // labeled gauges appear on the first scrape via `refresh_scrape_gauges`.
+            metrics::counter!(BILLING_TRUNCATED_TOTAL).absolute(0);
             Some(handle)
         }
         Err(e) => {
@@ -324,6 +333,32 @@ fn refresh_scrape_gauges(app: &App) {
             )
             .set(state_val);
         }
+    }
+
+    // Direct-model lanes (reachable via `by_model` routing, no pool required) get a lane-state
+    // gauge too, labeled with the model name as `pool` — the same convention the counters use
+    // for model-routed traffic (`forward::metric_pool_label`: empty pool name → model string),
+    // so gauge and counters PromQL-join. Cardinality: bounded by |configured models|, a startup
+    // constant. Without this, a pool-less config (the docs' minimal getting-started config)
+    // exposes NO lane gauges at all — a fresh boot rendered an empty /metrics (harness finding,
+    // 2026-07-09). The breaker cell is the lane-default `""` cell, matching model-routed
+    // fault attribution.
+    for (model, &lane_idx) in &app.by_model {
+        let snap = app.store.snapshot(lane_idx, now);
+        let cooldown = app.store.cooldown_remaining_in("", lane_idx, now);
+        let state_val: f64 = if snap.dead || (cooldown > 0 && !snap.usable) {
+            2.0
+        } else if cooldown > 0 {
+            1.0
+        } else {
+            0.0
+        };
+        metrics::gauge!(
+            LANE_STATE,
+            "pool" => model.clone(),
+            "lane" => app.lanes[lane_idx].model.clone()
+        )
+        .set(state_val);
     }
 }
 
