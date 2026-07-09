@@ -25,7 +25,10 @@ const DATA = catalog.providers;
     <div class="cb-pick">
       <div class="cb-searchrow">
         <input id="cb-search" type="search" placeholder="Model name — try kimi, glm, sonnet, llama…" autocomplete="off" />
-        <select id="cb-filter" aria-label="Filter by provider"></select>
+        <div class="cb-filterwrap">
+          <input id="cb-filter" type="search" placeholder="Provider (optional)" autocomplete="off" />
+          <div id="cb-filter-results" class="cb-results cb-overlay" hidden></div>
+        </div>
       </div>
       <div id="cb-results" class="cb-results" hidden></div>
 
@@ -130,17 +133,38 @@ const DATA = catalog.providers;
     provSel.appendChild(oc);
     provSel.addEventListener('change', () => { $('cb-custom-row').hidden = provSel.value !== '__custom'; });
 
-    // Provider filter beside the search box — optional, "" = all providers.
-    const filterSel = $('cb-filter');
-    const ghost = document.createElement('option');
-    ghost.value = ''; ghost.textContent = 'Provider (optional)';
-    filterSel.appendChild(ghost);
-    for (const [prov, p] of Object.entries(DATA)) {
-      const o = document.createElement('option');
-      o.value = prov; o.textContent = p.label === prov ? prov : `${p.label} (${prov})`;
-      filterSel.appendChild(o);
+    // Provider filter beside the search box — a combobox that mimics the model
+    // list: type to filter, styled scrollable results, verified badges, sorted
+    // verified-first then alphabetical. Empty = all providers.
+    let filterProv = '';
+    const filterInput = $('cb-filter');
+    const filterResults = $('cb-filter-results');
+    const PROVLIST = Object.entries(DATA)
+      .map(([prov, p]) => ({ prov, label: p.label, gen: !!p.gen, n: p.models.length }))
+      .sort((a, b) => (a.gen - b.gen) || a.label.localeCompare(b.label));
+    function showProvHits(q) {
+      filterResults.innerHTML = '';
+      const hits = PROVLIST.filter((p) => !q || p.label.toLowerCase().includes(q) || p.prov.toLowerCase().includes(q));
+      for (const p of hits) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'cb-hit';
+        b.innerHTML = `<strong>${p.label}</strong> <span>${p.n ? p.n + ' models' : 'free-text ids'} ${p.gen ? '' : '<i class="cb-badge cb-badge-ok">verified</i>'}</span>`;
+        b.addEventListener('click', () => {
+          filterProv = p.prov;
+          filterInput.value = p.label;
+          filterResults.hidden = true;
+          refreshList();
+        });
+        filterResults.appendChild(b);
+      }
+      filterResults.hidden = hits.length === 0;
     }
-    filterSel.addEventListener('change', () => { filterSel.classList.toggle('cb-filter-on', !!filterSel.value); refreshList(); });
+    filterInput.addEventListener('focus', () => showProvHits(''));
+    filterInput.addEventListener('input', () => {
+      if (!filterInput.value.trim()) { filterProv = ''; refreshList(); }
+      showProvHits(filterInput.value.trim().toLowerCase());
+    });
 
     function envFor(prov) {
       return ENV_OVERRIDE[prov] || (DATA[prov] && DATA[prov].env) || (prov.toUpperCase().replace(/[^A-Z0-9]/g, '_') + '_KEY');
@@ -311,7 +335,7 @@ const DATA = catalog.providers;
     }
     function refreshList() {
       const q = $('cb-search').value.trim().toLowerCase();
-      const f = $('cb-filter').value; // '' = all providers
+      const f = filterProv; // '' = all providers
       const pool = f ? INDEX.filter((m) => m.prov === f) : INDEX;
       if (q.length < 2) {
         // provider chosen, nothing typed: its whole list (newest first); else popular
@@ -331,7 +355,8 @@ const DATA = catalog.providers;
     $('cb-search').addEventListener('input', refreshList);
     $('cb-search').addEventListener('focus', refreshList);
     document.addEventListener('click', (e) => {
-      if (!results.contains(e.target) && e.target !== $('cb-search') && e.target !== $('cb-filter')) results.hidden = true;
+      if (!results.contains(e.target) && e.target !== $('cb-search') && e.target !== filterInput) results.hidden = true;
+      if (!filterResults.contains(e.target) && e.target !== filterInput) filterResults.hidden = true;
     });
 
     $('cb-add').addEventListener('click', () => {
@@ -383,12 +408,12 @@ const DATA = catalog.providers;
     .cb-results-head { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
       color: var(--muted); padding: 8px 12px 4px; background: #fff; }
     .cb-searchrow { display: flex; gap: 8px; }
-    .cb-searchrow input[type="search"] { flex: 1; }
-    .cb-searchrow select {
-      flex: 0 0 220px; font: inherit; font-size: 14.5px; padding: 9px 12px;
-      border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: #fff;
-    }
-    .cb-searchrow select.cb-filter-on { color: var(--slate); }
+    .cb-searchrow > input[type="search"] { flex: 1; }
+    .cb-filterwrap { position: relative; flex: 0 0 240px; }
+    .cb-filterwrap input { width: 100%; }
+    .cb-overlay { position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 30;
+      background: #fff; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08); }
+    @media (max-width: 640px) { .cb-searchrow { flex-wrap: wrap; } .cb-filterwrap { flex: 1 1 100%; } }
     .cb-pick input[type="search"], .cb-manual-row input, .cb-manual-row select, .cb-poolrow input {
       font: inherit; font-size: 14.5px; padding: 9px 12px; border: 1px solid var(--line);
       border-radius: 8px; width: 100%; box-sizing: border-box;
