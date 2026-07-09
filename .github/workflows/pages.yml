@@ -11,6 +11,9 @@ on:
       - 'CHANGELOG.md'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * *'   # daily rebake: star count and other build-time data stay fresh
+                           # for browsers whose shields block the client-side update
 
 permissions:
   contents: read

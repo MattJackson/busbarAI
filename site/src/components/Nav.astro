@@ -76,13 +76,23 @@ try {
 </style>
 
 <script is:inline>
-  fetch('https://api.github.com/repos/MattJackson/busbarAI', { headers: { Accept: 'application/vnd.github+json' } })
-    .then((r) => (r.ok ? r.json() : null))
-    .then((d) => {
-      if (!d || typeof d.stargazers_count !== 'number') return;
-      const n = d.stargazers_count;
+  // Same-origin /api/stars first (a Cloudflare Worker; content blockers like Brave
+  // Shields don't block same-origin requests), api.github.com as the fallback.
+  // Either returns { stargazers_count } (the worker mirrors the GitHub shape).
+  (async () => {
+    const apply = (n) => {
+      if (typeof n !== 'number') return false;
       const label = n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
       document.querySelectorAll('.star-link [data-star-count]').forEach((el) => { el.textContent = label; });
-    })
-    .catch(() => {});
+      return true;
+    };
+    try {
+      const r = await fetch('/api/stars');
+      if (r.ok && apply((await r.json()).stargazers_count)) return;
+    } catch { /* worker not deployed yet */ }
+    try {
+      const r = await fetch('https://api.github.com/repos/MattJackson/busbarAI', { headers: { Accept: 'application/vnd.github+json' } });
+      if (r.ok) apply((await r.json()).stargazers_count);
+    } catch { /* baked value stands */ }
+  })();
 </script>
