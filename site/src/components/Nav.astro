@@ -14,8 +14,7 @@ try {
   const res = await fetch('https://api.github.com/repos/MattJackson/busbarAI', { headers: ghHeaders });
   if (res.ok) {
     const n = (await res.json()).stargazers_count;
-    // Show the count only once it's social proof (>= 50); below that, plain GitHub icon.
-    if (typeof n === 'number' && n >= 50) starsLabel = n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+    if (typeof n === 'number') starsLabel = n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
   }
 } catch { /* offline build, render without a count */ }
 ---
@@ -82,7 +81,6 @@ try {
     .then((d) => {
       if (!d || typeof d.stargazers_count !== 'number') return;
       const n = d.stargazers_count;
-      if (n < 50) return; // count renders only once it's social proof
       const label = n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
       document.querySelectorAll('.star-link [data-star-count]').forEach((el) => { el.textContent = label; });
     })
