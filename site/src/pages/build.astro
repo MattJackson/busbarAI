@@ -83,8 +83,9 @@ const DATA = catalog.providers;
   </div>
 
   <p class="note">
-    Two tiers here. Providers in the <strong>shipped catalog</strong> (57, verified: endpoint shapes
-    tested, error dialects mapped) work with the default <code>providers.yaml</code>. Everything
+    Two tiers here. Providers in the <strong>shipped catalog</strong> (113, verified: endpoint shape
+    confirmed against each provider's own API docs, error dialects mapped where documented) work
+    with the default <code>providers.yaml</code>. Everything
     else is <strong>generated</strong> from a reviewed <a href="https://models.dev">models.dev</a>
     snapshot: Busbar speaks its language, but the entry is inferred, so verify it and add it to
     your <code>providers.yaml</code> (the pane below writes it for you). A model that isn't listed
@@ -104,6 +105,16 @@ const DATA = catalog.providers;
       xiaomi: 'MIMO_API_KEY',
       vultr: 'VULTR_SERVERLESS_INFERENCE_API_KEY',
       zhipuai: 'ZHIPUAI_API_KEY',
+      // wave 2 (2026-07-09)
+      ambient: 'AMBIENT_KEY',
+      anyapi: 'ANYAPI_KEY',
+      bailing: 'BAILING_API_KEY',
+      'cloudferro-sherlock': 'SHERLOCK_API_KEY',
+      crof: 'CROFAI_API_KEY',
+      dinference: 'DINFERENCE_KEY',
+      llmgateway: 'LLM_GATEWAY_API_KEY',
+      'stepfun-ai': 'STEP_API_KEY',
+      zenifra: 'ZENIFRA_AI_API_KEY',
     };
 
     // Flat search index

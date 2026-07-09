@@ -76,7 +76,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
         </tr>
         <tr>
           <td>Provider coverage</td>
-          <td>57 verified preconfigured, plus any provider on the six protocols via your own <code>providers.yaml</code></td>
+          <td>113 verified preconfigured, plus any provider on the six protocols via your own <code>providers.yaml</code></td>
           <td>100+ preconfigured out of the box</td>
         </tr>
         <tr>
@@ -223,7 +223,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
   <h2>Where LiteLLM is the right call</h2>
   <ul>
     <li><strong>You want an in-process Python router library</strong>, imported into your code rather than run as a network service. That's LiteLLM's home turf and the more natural fit.</li>
-    <li><strong>You want every provider preconfigured.</strong> LiteLLM ships 100+ catalog entries typed for you. With Busbar, a provider outside the verified catalog is a minute of YAML in your own <code>providers.yaml</code>; the genuine gap is only a wire format that is none of the six.</li>
+    <li><strong>You need a backend whose auth lives outside the six wire protocols.</strong> Azure OpenAI's per-deployment auth and Google Vertex AI have typed adapters in LiteLLM today; Busbar's auth-adapter seam for those backends is on the roadmap, not shipped.</li>
     <li><strong>You want a bundled dashboard.</strong> LiteLLM ships an admin UI; Busbar exposes Prometheus, OTLP, and an admin API, and expects you to point the dashboards you already run at it.</li>
     <li><strong>Deep Python-ecosystem integration matters to you</strong> (LangChain, LlamaIndex, and friends), though those frameworks also work with Busbar today: point their OpenAI or Anthropic client at Busbar's base URL and you keep your whole stack, with failover and translation underneath it.</li>
   </ul>

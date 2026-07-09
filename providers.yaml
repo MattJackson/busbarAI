@@ -66,18 +66,19 @@ together:
   error_map:
     rate_limit_exceeded: rate_limit
 
+# Fireworks signals errors by HTTP status only (docs.fireworks.ai/guides/inference-error-codes);
+# live error bodies carry gRPC-style codes (NOT_FOUND), so no JSON code map applies.
 fireworks:
   protocol: openai
   base_url: https://api.fireworks.ai/inference
-  error_map:
-    rate_limit_exceeded: rate_limit
+  error_map: {}
 
+# DeepSeek signals errors by HTTP status only (api-docs.deepseek.com/quick_start/error_codes):
+# 402 = insufficient balance, 429 = rate limit. No machine-readable code strings documented.
 deepseek:
   protocol: openai
   base_url: https://api.deepseek.com
-  error_map:
-    insufficient_quota: billing
-    rate_limit_exceeded: rate_limit
+  error_map: {}
 
 mistral:
   protocol: openai
@@ -91,11 +92,13 @@ xai:
   error_map:
     rate_limit_exceeded: rate_limit
 
+# Codes per openrouter.ai/docs/api/reference/errors-and-debugging: 402 payment_required
+# (insufficient credits), 429 rate_limit_exceeded.
 openrouter:
   protocol: openai
   base_url: https://openrouter.ai/api
   error_map:
-    insufficient_quota: billing
+    payment_required: billing
     rate_limit_exceeded: rate_limit
 
 cerebras:
@@ -110,14 +113,18 @@ deepinfra:
   # the appended path to avoid a doubled /v1.
   base_url: https://api.deepinfra.com/v1/openai
   path: /chat/completions
-  error_map:
-    rate_limit_exceeded: rate_limit
+  # DeepInfra signals rate limits as plain HTTP 429 (docs.deepinfra.com/account/rate-limits);
+  # no JSON code strings documented.
+  error_map: {}
 
+# Codes per platform.kimi.ai/docs/api/errors.md (Moonshot's own error types, not OpenAI's).
 moonshot:
   protocol: openai
   base_url: https://api.moonshot.ai
   error_map:
-    rate_limit_exceeded: rate_limit
+    rate_limit_reached_error: rate_limit
+    engine_overloaded_error: rate_limit
+    exceeded_current_quota_error: billing
 
 # Additional OpenAI-compatible providers (base_urls verified against provider docs). Most signal
 # errors via HTTP status (classified by the breaker), so error_map is empty; add billing/rate
@@ -143,20 +150,17 @@ hyperbolic:
   base_url: https://api.hyperbolic.xyz
   error_map: {}
 
+# novita.ai/docs/api-reference: base https://api.novita.ai/openai, standard /v1 path.
 novita:
   protocol: openai
-  base_url: https://api.novita.ai/v3/openai
-  path: /chat/completions
+  base_url: https://api.novita.ai/openai
   error_map: {}
 
+# Nebius AI Studio became Nebius Token Factory (Nov 2025); docs.tokenfactory.nebius.com
+# documents only the new host.
 nebius:
   protocol: openai
-  base_url: https://api.studio.nebius.ai
-  error_map: {}
-
-lambda:
-  protocol: openai
-  base_url: https://api.lambda.ai
+  base_url: https://api.tokenfactory.nebius.com
   error_map: {}
 
 featherless:
@@ -234,7 +238,7 @@ nano-gpt:
 
 publicai:
   protocol: openai
-  base_url: https://platform.publicai.co
+  base_url: https://api.publicai.co
   error_map: {}
 
 synthetic:
@@ -366,6 +370,400 @@ nearai:
   protocol: openai
   base_url: https://cloud-api.near.ai
   error_map: {}
+
+
+# --- Added 2026-07-09 (wave 2): docs-verified against each provider's own API documentation --
+
+# Evidence: doc-en.302.ai documents POST https://api.302.ai/v1/chat/completions, Bearer auth.
+302ai:
+  protocol: openai
+  base_url: https://api.302.ai
+  error_map: {}
+
+# Evidence: abacus.ai/help/developer-platform/route-llm/ gives base https://routellm.abacus.ai/v1, Bearer.
+abacus:
+  protocol: openai
+  base_url: https://routellm.abacus.ai
+  error_map: {}
+
+# Evidence: abliteration.ai/docs/openai-compatibility documents /v1/chat/completions, Bearer (ak_ keys).
+abliteration-ai:
+  protocol: openai
+  base_url: https://api.abliteration.ai
+  error_map: {}
+
+# Evidence: desktop.ambient.xyz/reference/api-endpoints/ shows curl to /v1/chat/completions with Bearer $AMBIENT_KEY.
+ambient:
+  protocol: openai
+  base_url: https://api.ambient.xyz
+  error_map: {}
+
+# Evidence: docs.anyapi.ai/guides/errors.md documents 402 budget_exceeded, 429 rate_limit_error.
+anyapi:
+  protocol: openai
+  base_url: https://api.anyapi.ai
+  error_map:
+    budget_exceeded: billing
+    rate_limit_error: rate_limit
+
+# Evidence: docs.auriko.ai/contract/error-codes enumerates all three codes.
+auriko:
+  protocol: openai
+  base_url: https://api.auriko.ai
+  error_map:
+    budget_exhausted: billing
+    insufficient_quota: billing
+    rate_limit_exceeded: rate_limit
+
+# Evidence: alipaytbox.yuque.com/sxs0ba/ling/api_chat documents POST https://api.ant-ling.com/v1/chat/completions, Bearer sk-studio- token.
+bailing:
+  protocol: openai
+  base_url: https://api.ant-ling.com
+  error_map: {}
+
+# Evidence: api.berget.ai/openapi.json lists /v1/chat/completions with HTTP bearer securityScheme.
+berget:
+  protocol: openai
+  base_url: https://api.berget.ai
+  error_map: {}
+
+# best-effort: codes from native API status reference, not the OpenAI shim
+# Evidence: docs.clarifai.com/compute/inference/open-ai/ documents base https://api.clarifai.com/v2/ext/openai/v1 with PAT as Bearer.
+clarifai:
+  protocol: openai
+  base_url: https://api.clarifai.com/v2/ext/openai
+  error_map:
+    "11003": rate_limit
+    "11004": rate_limit
+    "11005": rate_limit
+    "11006": billing
+    "11000": billing
+
+# Evidence: claudin.io/docs/clients/openai-compatible/ shows curl to https://api.claudin.io/v1/chat/completions, Bearer.
+claudinio:
+  protocol: openai
+  base_url: https://api.claudin.io
+  error_map: {}
+
+# Evidence: docs.sherlock.cloudferro.com/chat-completion-endpoint/ documents https://api-sherlock.cloudferro.com/openai/v1/chat/completions, Bearer $SHERLOCK_API_KEY.
+cloudferro-sherlock:
+  protocol: openai
+  base_url: https://api-sherlock.cloudferro.com/openai
+  error_map: {}
+
+# Evidence: docs.cortecs.ai/quickstart shows exact curl to https://api.cortecs.ai/v1/chat/completions, Bearer.
+cortecs:
+  protocol: openai
+  base_url: https://api.cortecs.ai
+  error_map: {}
+
+# Evidence: crof.ai/docs.md documents https://crof.ai/v1/chat/completions, Bearer (note: bare domain, no api. subdomain).
+crof:
+  protocol: openai
+  base_url: https://crof.ai
+  error_map: {}
+
+# Evidence: crossmodel.ai/docs/errors documents 402 insufficient_balance/no_wallet, 429 rate_limit_exceeded.
+crossmodel:
+  protocol: openai
+  base_url: https://api.crossmodel.ai
+  error_map:
+    insufficient_balance: billing
+    no_wallet: billing
+    rate_limit_exceeded: rate_limit
+
+# Evidence: dinference.com/docs documents base https://api.dinference.com/v1, /v1/chat/completions, DINFERENCE_KEY.
+dinference:
+  protocol: openai
+  base_url: https://api.dinference.com
+  error_map: {}
+
+# Evidence: docs.d.run/en/models/api-call documents MaaS base https://chat.d.run/v1, Bearer sk- key. (Dedicated instances use per-region hosts, e.g. sh-02.d.run.)
+drun:
+  protocol: openai
+  base_url: https://chat.d.run
+  error_map: {}
+
+# Evidence: docs.evroc.com/products/think/apis/v1/openapi.yaml - server https://models.think.evroc.com/v1, path /chat/completions, bearer. (Public beta; APIs may change.)
+evroc:
+  protocol: openai
+  base_url: https://models.think.evroc.com
+  error_map: {}
+
+# Evidence: docs.fastrouter.ai/api-reference/chat-completions - endpoint https://api.fastrouter.ai/api/v1/chat/completions (note extra /api segment).
+fastrouter:
+  protocol: openai
+  base_url: https://api.fastrouter.ai/api
+  error_map: {}
+
+# Evidence: docs.frogbot.ai/api-reference - base https://app.frogbot.ai/api/v1, Bearer $FROGBOT_API_KEY.
+frogbot:
+  protocol: openai
+  base_url: https://app.frogbot.ai/api
+  error_map: {}
+
+# error_map deliberately omitted: type "request_failed" is not unique to billing ("Insufficient credits"
+# arrives as HTTP 429 with type request_failed); message-matching would be needed for precision.
+# Evidence: docs.helicone.ai/gateway/integrations/codex.md uses base https://ai-gateway.helicone.ai/v1 with OpenAI clients.
+helicone:
+  protocol: openai
+  base_url: https://ai-gateway.helicone.ai
+  error_map: {}
+
+# Evidence: hpc-ai.com/doc .../Create-Chat-Completions/ documents https://api.hpc-ai.com/inference/v1/chat/completions, Bearer.
+hpc-ai:
+  protocol: openai
+  base_url: https://api.hpc-ai.com/inference
+  error_map: {}
+
+# Evidence: platform.iflow.cn/en/docs/api-reference (endpoint) + /docs/error-codes (codes; page also covers search API - verify at runtime).
+iflowcn:
+  protocol: openai
+  base_url: https://apis.iflow.cn
+  error_map:
+    "40303": rate_limit
+    "60400": billing
+
+# Evidence: docs.inceptron.io API Reference documents base https://api.inceptron.io/v1, Bearer INCEPTRON_API_KEY.
+inceptron:
+  protocol: openai
+  base_url: https://api.inceptron.io
+  error_map: {}
+
+# Evidence: docs.inference.net/api/api-quickstart.md - base https://api.inference.net/v1, Bearer INFERENCE_API_KEY.
+inference:
+  protocol: openai
+  base_url: https://api.inference.net
+  error_map: {}
+
+# Evidence: io.net/docs .../get-started-with-io-intelligence-api - endpoint https://api.intelligence.io.solutions/api/v1/chat/completions (note /api prefix and different domain from io.net).
+io-net:
+  protocol: openai
+  base_url: https://api.intelligence.io.solutions/api
+  error_map: {}
+
+# Evidence: docs.jiekou.ai/docs/models/reference-error-code.md + FAQ confirming /openai/v1/chat/completions form. (China mirror: api.highwayapi.ai/openai.)
+jiekou:
+  protocol: openai
+  base_url: https://api.jiekou.ai/openai
+  error_map:
+    NOT_ENOUGH_BALANCE: billing
+    RATE_LIMIT_EXCEEDED: rate_limit
+    TOKEN_LIMIT_EXCEEDED: rate_limit
+
+# Evidence: kenari.id/docs curl example POST https://kenari.id/v1/chat/completions, Bearer kn- keys, error codes enumerated.
+kenari:
+  protocol: openai
+  base_url: https://kenari.id
+  error_map:
+    insufficient_balance: billing
+    payg_limit_reached: billing
+    rate_limit_exceeded: rate_limit
+    plan_limit_reached: rate_limit
+
+# Evidence: kilo.ai/docs/gateway/api-reference - endpoint /api/gateway/chat/completions has NO /v1, so path override required. Only entry in this batch needing one.
+kilo:
+  protocol: openai
+  base_url: https://api.kilo.ai/api/gateway
+  path: /chat/completions
+  error_map: {}
+
+# Evidence: docs.getlilac.com/inference/chat-completions documents POST https://api.getlilac.com/v1/chat/completions, Bearer.
+lilac:
+  protocol: openai
+  base_url: https://api.getlilac.com
+  error_map: {}
+
+# Evidence: docs.llmgateway.io/resources/rate-limits - 429 with code rate_limit_exceeded; endpoint at /v1/chat/completions.
+llmgateway:
+  protocol: openai
+  base_url: https://api.llmgateway.io
+  error_map:
+    rate_limit_exceeded: rate_limit
+
+# Evidence: llmtr.com/docs/billing/ (402 insufficient_balance) + /docs/gateway/chat-completions/ (429 rate_limit_exceeded). Note: bare domain, no api. subdomain.
+llmtr:
+  protocol: openai
+  base_url: https://llmtr.com
+  error_map:
+    insufficient_balance: billing
+    rate_limit_exceeded: rate_limit
+
+# Evidence: docs.meganova.ai/inference-models/text-generation shows curl to https://api.meganova.ai/v1/chat/completions, Bearer.
+meganova:
+  protocol: openai
+  base_url: https://api.meganova.ai
+  error_map: {}
+
+# Evidence: docs.mixlayer.com/chat-completions documents https://models.mixlayer.ai/v1/chat/completions, Bearer $MIXLAYER_API_KEY. Note: host is models.mixlayer.AI, docs on mixlayer.COM.
+mixlayer:
+  protocol: openai
+  base_url: https://models.mixlayer.ai
+  error_map: {}
+
+# Evidence: moark.ai/docs .../text-comlpetion cites https://api.moark.ai/v1/chat/completions, Bearer access token.
+moark:
+  protocol: openai
+  base_url: https://api.moark.ai
+  error_map: {}
+
+# Evidence: modelscope.cn/docs/model-service/API-Inference/intro (verified via official OSS-hosted markdown) - base https://api-inference.modelscope.cn/v1, Bearer access token.
+modelscope:
+  protocol: openai
+  base_url: https://api-inference.modelscope.cn
+  error_map: {}
+
+# Evidence: portal.neuralwatt.com/docs/guides/error-handling; billing exhaustion is plain HTTP 402 (no JSON code).
+neuralwatt:
+  protocol: openai
+  base_url: https://api.neuralwatt.com
+  error_map:
+    concurrent_budget_exceeded: rate_limit
+    model_overloaded: rate_limit
+
+# Evidence: opencode.ai/docs/zen/ lists endpoint https://opencode.ai/zen/v1/chat/completions per model; live probe confirms Bearer.
+opencode:
+  protocol: openai
+  base_url: https://opencode.ai/zen
+  error_map: {}
+
+# Evidence: opencode.ai/docs/go/ documents https://opencode.ai/zen/go/v1/chat/completions, Bearer.
+opencode-go:
+  protocol: openai
+  base_url: https://opencode.ai/zen/go
+  error_map: {}
+
+# Evidence: docs.orcarouter.ai/operations/errors.md (403 insufficient_user_quota); 429s may have NO JSON body - map by HTTP status only.
+orcarouter:
+  protocol: openai
+  base_url: https://api.orcarouter.ai
+  error_map:
+    insufficient_user_quota: billing
+
+# Evidence: creator.poe.com/docs/external-applications/openai-compatible-api - 402 insufficient_credits, 429 rate_limit_error.
+poe:
+  protocol: openai
+  base_url: https://api.poe.com
+  error_map:
+    insufficient_credits: billing
+    rate_limit_error: rate_limit
+
+# Evidence: qhaigc.net/docs/api-reference/chat.md documents POST https://api.qhaigc.net/v1/chat/completions, Bearer sk-.
+qihang-ai:
+  protocol: openai
+  base_url: https://api.qhaigc.net
+  error_map: {}
+
+# Evidence: developer.qiniu.com/aitokenapi/13379 documents base https://api.qnaigc.com/v1, Bearer. Note: domain qnaigc.com, not qiniu.com.
+qiniu-ai:
+  protocol: openai
+  base_url: https://api.qnaigc.com
+  error_map: {}
+
+# Evidence: docs.regolo.ai/models/families/completions/ shows https://api.regolo.ai/v1/chat/completions, Bearer.
+regolo-ai:
+  protocol: openai
+  base_url: https://api.regolo.ai
+  error_map: {}
+
+# Evidence: docs.requesty.ai/api-reference/endpoint/chat-completions-create - POST https://router.requesty.ai/v1/chat/completions; errors normalized to HTTP statuses (402/412/429).
+requesty:
+  protocol: openai
+  base_url: https://router.requesty.ai
+  error_map: {}
+
+# Evidence: docs.stackit.cloud .../use-the-models/ - region-specific (eu01) base, Bearer portal token.
+stackit:
+  protocol: openai
+  base_url: https://api.openai-compat.model-serving.eu01.onstackit.cloud
+  error_map: {}
+
+# Evidence: platform.stepfun.ai/docs/en/api-reference/chat/chat-completion-create - Bearer $STEP_API_KEY; China alt api.stepfun.com. Errors are HTTP-status-only (402 billing, 429 rate).
+stepfun-ai:
+  protocol: openai
+  base_url: https://api.stepfun.ai
+  error_map: {}
+
+# Evidence: submodel.gitbook.io/docs/instagen/api-reference - base https://llm.submodel.ai/v1, Bearer.
+submodel:
+  protocol: openai
+  base_url: https://llm.submodel.ai
+  error_map: {}
+
+# caveat: codes from TokenHub control-plane docs, not data-plane
+# Evidence: intl.cloud.tencent.com/document/product/1300/80633 documents the exact endpoint. China region: tokenhub.tencentcloudmaas.com.
+tencent-tokenhub:
+  protocol: openai
+  base_url: https://tokenhub-intl.tencentcloudmaas.com
+  error_map:
+    LimitExceeded: rate_limit
+    RequestLimitExceeded: rate_limit
+    RequestLimitExceeded.UinLimitExceeded: rate_limit
+    RequestLimitExceeded.IPLimitExceeded: rate_limit
+
+# Evidence: thegrid.ai/docs/api-reference/consumption-api.md - POST https://api.thegrid.ai/v1/chat/completions, Bearer; billing=HTTP 402, rate=429 (no JSON codes for inference).
+the-grid-ai:
+  protocol: openai
+  base_url: https://api.thegrid.ai
+  error_map: {}
+
+# Evidence: docs.tinfoil.sh/sdk/direct-api-access.md documents https://inference.tinfoil.sh/v1/chat/completions, Bearer. (Direct HTTPS skips their attestation SDK - acceptable but note it.)
+tinfoil:
+  protocol: openai
+  base_url: https://inference.tinfoil.sh
+  error_map: {}
+
+# Evidence: trustedrouter.com/docs - base https://api.trustedrouter.com/v1, Bearer sk-tr- keys, TRUSTEDROUTER_API_KEY.
+trustedrouter:
+  protocol: openai
+  base_url: https://api.trustedrouter.com
+  error_map: {}
+
+# Evidence: app.umans.ai/offers/code/docs documents https://api.code.umans.ai/v1/chat/completions, Bearer sk- keys.
+umans-ai:
+  protocol: openai
+  base_url: https://api.code.umans.ai
+  error_map: {}
+
+# Evidence: docs.wafer.ai/errors.md enumerates all codes; endpoint https://pass.wafer.ai/v1/chat/completions, Bearer wfr_ keys.
+wafer.ai:
+  protocol: openai
+  base_url: https://pass.wafer.ai
+  error_map:
+    insufficient_credits: billing
+    concurrency_limit_exceeded: rate_limit
+    request_quota_exceeded: rate_limit
+    rate_limit_exceeded: rate_limit
+    backend_at_capacity: rate_limit
+    backend_overloaded: rate_limit
+
+# Evidence: xpersona.co/docs curl example POST https://www.xpersona.co/v1/chat/completions, Bearer $XPERSONA_API_KEY. Note: www host, no api. subdomain.
+xpersona:
+  protocol: openai
+  base_url: https://www.xpersona.co
+  error_map: {}
+
+# Evidence: docs.zeldoc.ai/use-zeldoc-anywhere/ shows exact curl to https://api.zeldoc.ai/v1/chat/completions, Bearer.
+zeldoc:
+  protocol: openai
+  base_url: https://api.zeldoc.ai
+  error_map: {}
+
+# Evidence: zenifra.com/ia documents https://ai.zenifra.com/v1/chat/completions, Bearer $ZENIFRA_AI_API_KEY.
+zenifra:
+  protocol: openai
+  base_url: https://ai.zenifra.com
+  error_map: {}
+
+# Evidence: zenmux.ai/docs/guide/advanced/error-codes.html (match on error "type" field); endpoint https://zenmux.ai/api/v1/chat/completions.
+zenmux:
+  protocol: openai
+  base_url: https://zenmux.ai/api
+  error_map:
+    insufficient_credit: billing
+    reject_no_credit: billing
+    quote_exceeded: billing
+    rate_limit: rate_limit
 
 # -- OpenAI Responses protocol (/v1/responses) ----------------------------------------------------
 # The newer stateful OpenAI surface, distinct from chat completions. Bearer auth + a fixed path.

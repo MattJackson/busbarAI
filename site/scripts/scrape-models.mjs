@@ -64,6 +64,64 @@ const MAP = {
   longcat: 'longcat',
   sakana: 'sakana',
   nearai: 'nearai',
+  // promoted to the verified catalog 2026-07-09 (docs-verified, wave 2)
+  '302ai': '302ai',
+  abacus: 'abacus',
+  'abliteration-ai': 'abliteration-ai',
+  ambient: 'ambient',
+  anyapi: 'anyapi',
+  auriko: 'auriko',
+  bailing: 'bailing',
+  berget: 'berget',
+  clarifai: 'clarifai',
+  claudinio: 'claudinio',
+  'cloudferro-sherlock': 'cloudferro-sherlock',
+  cortecs: 'cortecs',
+  crof: 'crof',
+  crossmodel: 'crossmodel',
+  dinference: 'dinference',
+  drun: 'drun',
+  evroc: 'evroc',
+  fastrouter: 'fastrouter',
+  frogbot: 'frogbot',
+  helicone: 'helicone',
+  'hpc-ai': 'hpc-ai',
+  iflowcn: 'iflowcn',
+  inceptron: 'inceptron',
+  inference: 'inference',
+  'io-net': 'io-net',
+  jiekou: 'jiekou',
+  kenari: 'kenari',
+  kilo: 'kilo',
+  lilac: 'lilac',
+  llmgateway: 'llmgateway',
+  llmtr: 'llmtr',
+  meganova: 'meganova',
+  mixlayer: 'mixlayer',
+  moark: 'moark',
+  modelscope: 'modelscope',
+  neuralwatt: 'neuralwatt',
+  opencode: 'opencode',
+  'opencode-go': 'opencode-go',
+  orcarouter: 'orcarouter',
+  poe: 'poe',
+  'qihang-ai': 'qihang-ai',
+  'qiniu-ai': 'qiniu-ai',
+  'regolo-ai': 'regolo-ai',
+  requesty: 'requesty',
+  stackit: 'stackit',
+  'stepfun-ai': 'stepfun-ai',
+  submodel: 'submodel',
+  'tencent-tokenhub': 'tencent-tokenhub',
+  'the-grid-ai': 'the-grid-ai',
+  tinfoil: 'tinfoil',
+  trustedrouter: 'trustedrouter',
+  'umans-ai': 'umans-ai',
+  'wafer.ai': 'wafer.ai',
+  xpersona: 'xpersona',
+  zeldoc: 'zeldoc',
+  zenifra: 'zenifra',
+  zenmux: 'zenmux',
 };
 
 const res = await fetch('https://models.dev/api.json');
@@ -119,12 +177,16 @@ for (const name of Object.keys(providers)) {
 // by the verified catalog. Busbar speaks the language, so these work — but their
 // error-code dialects are unmapped, and the generated yaml says so.
 const mapped = new Set(Object.keys(MAP));
+// Providers verified DEAD or unshippable - never offer them, even generated.
+// lambda: Inference API discontinued ~Sep 2025, api.lambda.ai is NXDOMAIN.
+// github-copilot: no public completion API; token exchange + ToS forbid gateway use.
+const DEAD = new Set(['lambda', 'github-copilot']);
 let gen = 0;
 // Regional/plan variants (alibaba-cn, xiaomi-token-plan-ams, *-coding-plan, …) are
 // distinct endpoints but pure noise in a picker; the plain provider represents them.
 const VARIANT = /-(cn|coding-plan|token-plan)(-|$)|-token-plan$/;
 for (const [mdId, p] of Object.entries(catalog)) {
-  if (mapped.has(mdId) || providers[mdId]) continue;
+  if (mapped.has(mdId) || providers[mdId] || DEAD.has(mdId)) continue;
   if (VARIANT.test(mdId)) continue;
   if (p.npm !== '@ai-sdk/openai-compatible' || !p.api) continue;
   const models = Object.values(p.models || {});
