@@ -57,7 +57,7 @@ That request left your app as OpenAI. It may have been served by Anthropic, and 
 - **Routing policies.** Five built-ins, or your own logic as a webhook or Rhai script. A policy sees each member's cost, latency, live concurrency, budget, and rate headroom, and a failing policy falls back instead of blocking → [Routing](https://getbusbar.com/routing/)
 - **Native TLS and optional mTLS**, terminated by Busbar itself, with no reverse proxy in front → [Security](https://getbusbar.com/security/)
 - **Governance** when you want it: virtual keys, budgets, RPM/TPM limits, spend tracking → [Governance](https://getbusbar.com/guides/governance/)
-- **A vetted provider catalog**, plus any provider on the six protocols in a few lines of YAML → [Providers](https://getbusbar.com/providers/)
+- **A verified provider catalog**, plus any provider on the six protocols in a few lines of YAML → [Providers](https://getbusbar.com/providers/)
 - **Hardening throughout**: SSRF guards, constant-time auth, SHA-256 key storage, secrets never logged → [SECURITY.md](SECURITY.md)
 - **Observability** over open standards: Prometheus `/metrics`, OTLP traces, a per-request audit webhook → [Configuration](https://getbusbar.com/configuration/)
 

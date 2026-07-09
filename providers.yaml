@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Matthew Jackson
 #
-# Vetted provider catalog for busbar.
+# Verified provider catalog for busbar.
 #
 # Each entry maps a provider NAME to its wire `protocol`, `base_url`, and an optional `error_map`
 # (provider-specific JSON error code -> canonical disposition: billing | rate_limit). Operators

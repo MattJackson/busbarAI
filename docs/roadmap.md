@@ -20,8 +20,8 @@ code. A client speaking any protocol can target any provider; busbar translates
 through its superset IR when the two differ.
 
 This is why the number to watch is the **protocol count (6)**, not the provider
-count. The shipped catalog is a *curated* convenience set of vetted hosted
-endpoints, vetted, not scraped, because each entry's error-code mappings feed
+count. The shipped catalog is a *curated* convenience set of verified hosted
+endpoints, verified, not scraped, because each entry's error-code mappings feed
 the breaker's fault attribution. An operator can point busbar at *any*
 OpenAI-compatible endpoint, including their own, with three lines of YAML and
 no wait for an "integration." We deliberately don't chase a giant provider count;
@@ -92,7 +92,7 @@ same pattern Bedrock established with SigV4 and Azure OpenAI (shipped in 0.14):
 - **Databricks Foundation Model APIs**: `openai` protocol with bearer auth, but
   the `base_url` is workspace-specific (`https://<workspace>/serving-endpoints`),
   so it is added by the operator as their own host rather than shipped in the
-  vetted catalog. Supportable today via a config entry + `path` override; will be
+  verified catalog. Supportable today via a config entry + `path` override; will be
   documented as a recipe.
 
 APIs and config are stable at 1.0.0 under Semantic Versioning, no breaking change without a major-version bump.

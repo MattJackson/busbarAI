@@ -87,6 +87,8 @@ cargo build --release      # binary at target/release/busbar
 
 ## Step 2: Write a minimal config
 
+Prefer clicking to typing? The [config builder](https://getbusbar.com/build/) generates this file: pick your models, copy the YAML, come back for Step 3.
+
 Busbar reads two YAML files:
 
 - `providers.yaml`: the shipped provider catalog (protocol, `base_url`, error maps). You almost never edit this. The one-line installer fetches it for you, or grab it from [getbusbar.com/providers.yaml](https://getbusbar.com/providers.yaml).

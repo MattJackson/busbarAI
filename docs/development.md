@@ -65,7 +65,7 @@ Busbar reads two YAML files, located via env vars:
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `BUSBAR_PROVIDERS` | `/etc/busbar/providers.yaml` | The vetted provider catalog (shipped). |
+| `BUSBAR_PROVIDERS` | `/etc/busbar/providers.yaml` | The verified provider catalog (shipped). |
 | `BUSBAR_CONFIG` | `/etc/busbar/config.yaml` | Your deployment. |
 
 Both files support `${VAR}` interpolation expanded at load time; an unset

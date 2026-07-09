@@ -88,7 +88,7 @@ Ordinary punctuation (`: / @ . - # "`) in env var values is allowed. Interpolati
 
 ## `providers.yaml`
 
-A map of provider name → `ProviderDef`. The shipped catalog is a curated set of vetted providers across the six supported protocols. You can add an entry for any OpenAI-compatible endpoint not already in the catalog.
+A map of provider name → `ProviderDef`. The shipped catalog is a curated set of verified providers across the six supported protocols. You can add an entry for any OpenAI-compatible endpoint not already in the catalog.
 
 ### Catalog fields
 

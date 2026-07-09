@@ -4,7 +4,7 @@ Busbar's thesis is **protocols, not providers**. It implements six wire protocol
 
 ## What a provider entry is
 
-Providers live in `providers.yaml` as a map of name → definition. The shipped catalog is a curated, vetted starting set; you add your own entries exactly the same way (or define one inline in `config.yaml`).
+Providers live in `providers.yaml` as a map of name → definition. The shipped catalog is a verified starting set; you add your own entries exactly the same way (or define one inline in `config.yaml`).
 
 | Field | Required | What it is |
 |---|---|---|
@@ -84,7 +84,7 @@ Two honest notes. First, "supported" here means *reachable in its full native fi
 
 HTTP-status failures (429, 5xx, 401, …) are classified by the circuit breaker automatically. But some providers signal **billing** or **rate-limit** conditions with their own JSON error codes: sometimes even inside a `200` body. `error_map` translates those codes into a disposition so the breaker reacts correctly: a `billing` failure becomes a sticky 30-minute hard-down, a `rate_limit` becomes a short transient cooldown.
 
-This is exactly why the shipped catalog is **vetted, not scraped**: a wrong mapping makes the breaker mis-classify a failure. When you add a provider, check its error documentation and map the billing/rate-limit codes; leave `error_map` empty if it only uses standard HTTP statuses.
+This is exactly why the shipped catalog is **verified, not scraped**: a wrong mapping makes the breaker mis-classify a failure. When you add a provider, check its error documentation and map the billing/rate-limit codes; leave `error_map` empty if it only uses standard HTTP statuses.
 
 ## Non-standard endpoints
 

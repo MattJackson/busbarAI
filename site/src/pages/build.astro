@@ -1,0 +1,403 @@
+---
+// Config builder: pick models, get a working config.yaml.
+// Data: src/models.json (committed snapshot scraped from models.dev — real
+// per-provider wire IDs) — never fetched at runtime. Free-text entry always
+// works because the model name is a config value.
+import PageLayout from '../layouts/PageLayout.astro';
+import catalog from '../models.json';
+
+const DATA = catalog.providers;
+---
+
+<PageLayout
+  title="Config builder — Busbar"
+  description="Pick your models, get a working Busbar config.yaml: providers, pools with weights and failover, env vars, and the run command."
+>
+  <p class="kicker">Config builder</p>
+  <h1>Pick models, get a config</h1>
+  <p class="intro">
+    Search the catalog or type any model id (the model name is a config value, so anything your
+    provider serves works). Add two or more and they become a weighted pool with automatic
+    failover. Keys stay in environment variables; the config never holds a secret.
+  </p>
+
+  <div class="cb">
+    <div class="cb-pick">
+      <input id="cb-search" type="search" placeholder="Search 900+ models — try kimi, glm, sonnet, llama…" autocomplete="off" />
+      <div id="cb-results" class="cb-results" hidden></div>
+
+      <details class="cb-manual">
+        <summary>Or add any model id by hand — including a custom endpoint</summary>
+        <div class="cb-manual-row">
+          <select id="cb-prov"></select>
+          <input id="cb-model" type="text" placeholder="model id, e.g. my-fine-tune-v2" />
+          <button id="cb-add" type="button">Add</button>
+        </div>
+        <div class="cb-manual-row" id="cb-custom-row" hidden>
+          <input id="cb-cname" type="text" placeholder="provider name, e.g. my-vllm" />
+          <input id="cb-curl" type="text" placeholder="base_url, e.g. https://llm.internal:8000/v1" />
+        </div>
+      </details>
+
+      <div id="cb-lanes" class="cb-lanes"></div>
+
+      <div class="cb-poolrow">
+        <label for="cb-pool">Pool name</label>
+        <input id="cb-pool" type="text" value="main" spellcheck="false" />
+        <span class="cb-hint">what your clients put in the <code>model</code> field</span>
+        <button id="cb-share" type="button" class="cb-reset cb-share">Share link</button>
+        <button id="cb-reset" type="button" class="cb-reset">Reset</button>
+      </div>
+    </div>
+
+    <div class="cb-out">
+      <div class="cb-block">
+        <div class="cb-block-head"><span>your pool, in all six languages</span><button class="cb-copy" data-for="out-req">Copy</button></div>
+        <div class="cb-tabs" id="cb-tabs"></div>
+        <pre id="out-req"></pre>
+      </div>
+      <div class="cb-block">
+        <div class="cb-block-head"><span>config.yaml</span><button class="cb-copy" data-for="out-config">Copy</button></div>
+        <pre id="out-config"></pre>
+      </div>
+      <div class="cb-block">
+        <div class="cb-block-head"><span>providers.yaml</span><button class="cb-copy" data-for="out-prov">Copy</button></div>
+        <pre id="out-prov"></pre>
+      </div>
+      <div class="cb-block">
+        <div class="cb-block-head"><span>environment</span><button class="cb-copy" data-for="out-env">Copy</button></div>
+        <pre id="out-env"></pre>
+      </div>
+      <div class="cb-block">
+        <div class="cb-block-head"><span>run</span><button class="cb-copy" data-for="out-runcmd">Copy</button></div>
+        <div class="cb-tabs" id="cb-run-tabs"></div>
+        <pre id="out-runcmd"></pre>
+      </div>
+    </div>
+  </div>
+
+  <p class="note">
+    Two tiers here. Providers in the <strong>shipped catalog</strong> (42, verified: endpoint shapes
+    tested, error dialects mapped) work with the default <code>providers.yaml</code>. Everything
+    else is <strong>generated</strong> from a reviewed <a href="https://models.dev">models.dev</a>
+    snapshot: Busbar speaks its language, but the entry is inferred, so verify it and add it to
+    your <code>providers.yaml</code> (the pane below writes it for you). A model that isn't listed
+    anywhere still works: type its id by hand. Bedrock credentials go in one variable as
+    <code>ACCESS_KEY_ID:SECRET_ACCESS_KEY</code>. Full reference:
+    <a href="/configuration/">Configuration</a> · <a href="/providers/">Adding a provider</a> ·
+    <a href="/pools/">Pools</a>.
+  </p>
+
+  <script define:vars={{ DATA }} is:inline>
+    const $ = (id) => document.getElementById(id);
+    const lanes = []; // {id, provider, weight}
+    const ENV_OVERRIDE = { bedrock: 'AWS_BEDROCK_CREDS' };
+
+    // Flat search index
+    const INDEX = [];
+    for (const [prov, p] of Object.entries(DATA)) {
+      for (const m of p.models) INDEX.push({ prov, provLabel: p.label, id: m.id, name: m.name, ctx: m.ctx, gen: !!p.gen });
+    }
+
+    // Provider dropdown for manual entry: every shipped-catalog provider, plus
+    // "custom" — busbar supports any provider on the six protocols, the catalog
+    // is just the built-ins.
+    const CUSTOM = {}; // name -> base_url
+    const provSel = $('cb-prov');
+    const gShipped = document.createElement('optgroup');
+    gShipped.label = 'In the shipped providers.yaml';
+    const gGen = document.createElement('optgroup');
+    gGen.label = 'Generated — needs adding to your providers.yaml';
+    for (const [prov, p] of Object.entries(DATA)) {
+      const o = document.createElement('option');
+      o.value = prov; o.textContent = `${p.label} (${prov})`;
+      (p.gen ? gGen : gShipped).appendChild(o);
+    }
+    provSel.appendChild(gShipped);
+    provSel.appendChild(gGen);
+    const oc = document.createElement('option');
+    oc.value = '__custom'; oc.textContent = 'Custom endpoint (OpenAI-compatible)…';
+    provSel.appendChild(oc);
+    provSel.addEventListener('change', () => { $('cb-custom-row').hidden = provSel.value !== '__custom'; });
+
+    function envFor(prov) {
+      return ENV_OVERRIDE[prov] || (DATA[prov] && DATA[prov].env) || (prov.toUpperCase().replace(/[^A-Z0-9]/g, '_') + '_KEY');
+    }
+
+    function providersYaml() {
+      const used = [...new Set(lanes.map((l) => l.provider))];
+      const extras = used.filter((n) => CUSTOM[n] || (DATA[n] && DATA[n].gen));
+      let y = extras.length
+        ? '# Includes entries NOT in the shipped catalog - use this file as your providers.yaml\n# (or append the marked entries to the shipped one: https://getbusbar.com/providers.yaml)\n\n'
+        : '# Every entry below is already in the shipped providers.yaml - if you use the shipped\n# catalog (installer/Docker default), nothing to add. Shown for a self-contained setup.\n\n';
+      for (const n of used) {
+        if (CUSTOM[n]) y += `${n}:\n  protocol: openai\n  base_url: ${CUSTOM[n]}\n\n`;
+        else if (DATA[n] && DATA[n].yaml) y += DATA[n].yaml + '\n\n';
+      }
+      return y.trimEnd() + '\n';
+    }
+
+    // Duplicate wire ids across providers get a provider-suffixed key + upstream_model
+    // (same model behind two providers in one failover pool — a busbar feature, shown off).
+    function laneKey(l) {
+      const dup = lanes.some((o) => o !== l && o.id === l.id);
+      return dup ? `${l.id}-${l.provider}` : l.id;
+    }
+
+    function yaml() {
+      const provs = [...new Set(lanes.map((l) => l.provider))];
+      const pool = ($('cb-pool').value.trim() || 'main');
+      let y = 'providers:\n';
+      for (const p of provs) y += `  ${p}:\n    api_key_env: ${envFor(p)}\n`;
+      y += '\nmodels:\n';
+      for (const l of lanes) {
+        const key = laneKey(l);
+        y += `  ${key}:\n    provider: ${l.provider}\n    max_concurrent: 10\n`;
+        if (key !== l.id) y += `    upstream_model: ${l.id}\n`;
+      }
+      y += `\npools:\n  ${pool}:\n    members:\n`;
+      for (const l of lanes) y += `      - target: ${laneKey(l)}\n        weight: ${l.weight}\n`;
+      y += '\nauth:\n  mode: token\n  client_tokens: ["${BUSBAR_CLIENT_TOKEN}"]\n';
+      return y;
+    }
+
+    // The same pool, called in each of the six protocols' own language.
+    const H = `-H 'content-type: application/json'`;
+    const REQ = {
+      OpenAI: (p) => `# any OpenAI SDK: base_url = http://localhost:8080\ncurl -s localhost:8080/v1/chat/completions \\\n  -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" \\\n  ${H} \\\n  -d '{"model":"${p}","messages":[{"role":"user","content":"Hello!"}]}'`,
+      Anthropic: (p) => `# Anthropic SDK: base_url = http://localhost:8080/${p}\ncurl -s localhost:8080/${p}/v1/messages \\\n  -H "x-api-key: $BUSBAR_CLIENT_TOKEN" \\\n  ${H} \\\n  -d '{"max_tokens":256,"messages":[{"role":"user","content":"Hello!"}]}'`,
+      Gemini: (p) => `# Google Gen AI SDK: api_endpoint = http://localhost:8080\ncurl -s "localhost:8080/v1beta/models/${p}:generateContent" \\\n  -H "x-goog-api-key: $BUSBAR_CLIENT_TOKEN" \\\n  ${H} \\\n  -d '{"contents":[{"role":"user","parts":[{"text":"Hello!"}]}]}'`,
+      Bedrock: (p) => `# boto3 signs with SigV4, so this one is Python, not curl\nimport boto3\nbedrock = boto3.client("bedrock-runtime",\n    region_name="us-east-1",\n    endpoint_url="http://localhost:8080")\nbedrock.converse(modelId="${p}",\n    messages=[{"role":"user","content":[{"text":"Hello!"}]}])\n\n# auth: governance-minted AWS credentials, or auth.mode: passthrough\n# details -> getbusbar.com/protocols/`,
+      Cohere: (p) => `# Cohere v2 SDK: base_url = http://localhost:8080\ncurl -s localhost:8080/v2/chat \\\n  -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" \\\n  ${H} \\\n  -d '{"model":"${p}","messages":[{"role":"user","content":"Hello!"}]}'`,
+      Responses: (p) => `# OpenAI Responses API\ncurl -s localhost:8080/v1/responses \\\n  -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" \\\n  ${H} \\\n  -d '{"model":"${p}","input":"Hello!"}'`,
+    };
+    function makeTabs(boxId, names, initial, onPick) {
+      let active = initial;
+      const box = $(boxId);
+      for (const name of names) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'cb-tab' + (name === active ? ' cb-tab-on' : '');
+        b.textContent = name;
+        b.addEventListener('click', () => {
+          active = name;
+          box.querySelectorAll('.cb-tab').forEach((t) => t.classList.toggle('cb-tab-on', t.textContent === name));
+          onPick(name);
+        });
+        box.appendChild(b);
+      }
+      return () => active;
+    }
+    const activeReqTab = makeTabs('cb-tabs', Object.keys(REQ), 'OpenAI', () => render());
+    const activeRunTab = makeTabs('cb-run-tabs', ['Docker', 'Binary'], 'Docker', () => render());
+
+    function render() {
+      const box = $('cb-lanes');
+      box.innerHTML = '';
+      lanes.forEach((l, i) => {
+        const row = document.createElement('div');
+        row.className = 'cb-lane';
+        const lb = CUSTOM[l.provider] ? '<i class="cb-badge cb-badge-gen">custom</i>'
+          : (DATA[l.provider] && DATA[l.provider].gen) ? '<i class="cb-badge cb-badge-gen">generated</i>'
+          : '<i class="cb-badge cb-badge-ok">verified</i>';
+        row.innerHTML = `<span class="cb-lane-id">${l.id}</span><span class="cb-lane-prov">${l.provider}</span>${lb}` +
+          `<label>weight <input type="number" min="1" value="${l.weight}" data-i="${i}" class="cb-w"></label>` +
+          `<button class="cb-x" data-i="${i}" aria-label="remove">×</button>`;
+        box.appendChild(row);
+      });
+      const empty = lanes.length === 0;
+      const pool = ($('cb-pool').value.trim() || 'main');
+      $('out-config').textContent = empty ? '# add a model above to start' : yaml();
+      $('out-prov').textContent = empty ? '' : providersYaml();
+      const envs = [...new Set(lanes.map((l) => envFor(l.provider)))];
+      $('out-env').textContent = empty ? '' :
+        envs.map((e) => e === 'AWS_BEDROCK_CREDS'
+          ? 'export AWS_BEDROCK_CREDS="ACCESS_KEY_ID:SECRET_ACCESS_KEY"'
+          : `export ${e}=...`).join('\n') + '\nexport BUSBAR_CLIENT_TOKEN=pick-a-token';
+      $('out-runcmd').textContent = empty ? '' : (activeRunTab() === 'Docker'
+        ? 'docker run -d -p 8080:8080 \\\n' +
+          envs.map((e) => `  -e ${e} \\\n`).join('') +
+          '  -e BUSBAR_CLIENT_TOKEN \\\n  -v "$PWD/config.yaml:/etc/busbar/config.yaml:ro" \\\n  -v "$PWD/providers.yaml:/etc/busbar/providers.yaml:ro" \\\n  getbusbar/busbar'
+        : '# binary from the one-line installer (or /download)\ncurl -fsSL https://getbusbar.com/install.sh | sh\nBUSBAR_PROVIDERS=./providers.yaml \\\nBUSBAR_CONFIG=./config.yaml ./busbar');
+      $('out-req').textContent = empty ? '' : REQ[activeReqTab()](pool);
+      syncHash();
+    }
+
+    function add(id, provider) {
+      if (!id) return;
+      if (lanes.some((l) => l.id === id && l.provider === provider)) return;
+      lanes.push({ id, provider, weight: 1 });
+      render();
+    }
+
+    // Shareable URLs: the whole design lives in the # fragment (never sent to any
+    // server), so a link IS the config. Restored on load, updated on every change.
+    function syncHash() {
+      const state = { p: $('cb-pool').value.trim() || 'main', l: lanes.map((l) => [l.id, l.provider, l.weight]), x: CUSTOM };
+      try {
+        const h = lanes.length ? '#c=' + encodeURIComponent(btoa(JSON.stringify(state))) : '';
+        history.replaceState(null, '', location.pathname + h);
+      } catch { /* non-ASCII free-text id: page still works, URL just isn't shareable */ }
+    }
+    function restoreHash() {
+      const m = location.hash.match(/^#c=(.+)$/);
+      if (!m) return;
+      try {
+        const s = JSON.parse(atob(decodeURIComponent(m[1])));
+        if (typeof s.p === 'string') $('cb-pool').value = s.p.slice(0, 64);
+        if (s.x && typeof s.x === 'object') for (const [n, u] of Object.entries(s.x)) {
+          if (typeof u === 'string' && /^https?:\/\//.test(u)) CUSTOM[String(n).slice(0, 64)] = u.slice(0, 256);
+        }
+        if (Array.isArray(s.l)) for (const [id, prov, w] of s.l) {
+          if (typeof id === 'string' && typeof prov === 'string') lanes.push({ id: id.slice(0, 128), provider: prov.slice(0, 64), weight: Math.max(1, +w || 1) });
+        }
+      } catch { /* malformed share link: start fresh */ }
+    }
+
+    // "Popular" = each major provider's newest chat model, shown before you type.
+    const POPULAR = (() => {
+      const order = ['anthropic', 'openai', 'gemini', 'deepseek', 'xai', 'moonshot', 'zai-api', 'dashscope', 'mistral', 'groq', 'cohere', 'bedrock'];
+      const skip = /embed|tts|whisper|image|dall|moderation|transcribe|audio|realtime/i;
+      const out = [];
+      for (const prov of order) {
+        const p = DATA[prov];
+        if (!p) continue;
+        const m = p.models.find((x) => !skip.test(x.id));
+        if (m) out.push({ prov, provLabel: p.label, id: m.id, name: m.name, ctx: m.ctx });
+      }
+      return out;
+    })();
+
+    // Search (popular list on focus, filtered hits once you type)
+    const results = $('cb-results');
+    function showHits(hits, heading) {
+      results.innerHTML = '';
+      if (heading && hits.length) {
+        const h = document.createElement('div');
+        h.className = 'cb-results-head';
+        h.textContent = heading;
+        results.appendChild(h);
+      }
+      for (const h of hits) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'cb-hit';
+        b.innerHTML = `<strong>${h.id}</strong> <span>${h.provLabel}${h.ctx ? ' · ' + Math.round(h.ctx / 1000) + 'k ctx' : ''} ${h.gen ? '<i class="cb-badge cb-badge-gen">generated</i>' : '<i class="cb-badge cb-badge-ok">verified</i>'}</span>`;
+        b.addEventListener('click', () => { add(h.id, h.prov); results.hidden = true; $('cb-search').value = ''; });
+        results.appendChild(b);
+      }
+      results.hidden = hits.length === 0;
+    }
+    function refreshList() {
+      const q = $('cb-search').value.trim().toLowerCase();
+      if (q.length < 2) { showHits(POPULAR, 'Popular right now'); return; }
+      showHits(INDEX.filter((m) => m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q)).slice(0, 12));
+    }
+    $('cb-search').addEventListener('input', refreshList);
+    $('cb-search').addEventListener('focus', refreshList);
+    document.addEventListener('click', (e) => {
+      if (!results.contains(e.target) && e.target !== $('cb-search')) results.hidden = true;
+    });
+
+    $('cb-add').addEventListener('click', () => {
+      let prov = provSel.value;
+      if (prov === '__custom') {
+        const name = $('cb-cname').value.trim().toLowerCase().replace(/[^a-z0-9._-]/g, '-');
+        const url = $('cb-curl').value.trim();
+        if (!name || !/^https?:\/\//.test(url)) return;
+        CUSTOM[name] = url;
+        prov = name;
+      }
+      add($('cb-model').value.trim(), prov);
+      $('cb-model').value = '';
+    });
+    $('cb-pool').addEventListener('input', render);
+    $('cb-lanes').addEventListener('input', (e) => {
+      if (e.target.classList.contains('cb-w')) { lanes[+e.target.dataset.i].weight = Math.max(1, +e.target.value || 1); render(); }
+    });
+    $('cb-lanes').addEventListener('click', (e) => {
+      if (e.target.classList.contains('cb-x')) { lanes.splice(+e.target.dataset.i, 1); render(); }
+    });
+    $('cb-reset').addEventListener('click', () => {
+      lanes.length = 0;
+      $('cb-pool').value = 'main';
+      $('cb-search').value = '';
+      $('cb-model').value = '';
+      results.hidden = true;
+      render();
+    });
+    $('cb-share').addEventListener('click', () => {
+      syncHash();
+      navigator.clipboard.writeText(location.href).then(() => {
+        const b = $('cb-share');
+        b.textContent = 'Link copied'; setTimeout(() => (b.textContent = 'Share link'), 1400);
+      });
+    });
+    document.querySelectorAll('.cb-copy').forEach((b) => b.addEventListener('click', () => {
+      navigator.clipboard.writeText($(b.dataset.for).textContent).then(() => {
+        b.textContent = 'Copied'; setTimeout(() => (b.textContent = 'Copy'), 1200);
+      });
+    }));
+
+    restoreHash();
+    render();
+  </script>
+
+  <style is:global>
+    .cb { display: flex; flex-direction: column; gap: 28px; margin: 8px 0 24px; }
+    .cb-results-head { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+      color: var(--muted); padding: 8px 12px 4px; background: #fff; }
+    .cb-pick input[type="search"], .cb-manual-row input, .cb-manual-row select, .cb-poolrow input {
+      font: inherit; font-size: 14.5px; padding: 9px 12px; border: 1px solid var(--line);
+      border-radius: 8px; width: 100%; box-sizing: border-box;
+    }
+    .cb-results { border: 1px solid var(--line); border-radius: 10px; margin-top: 6px; overflow: hidden; }
+    .cb-hit { display: flex; justify-content: space-between; gap: 10px; width: 100%; text-align: left;
+      font: inherit; font-size: 13.5px; padding: 8px 12px; background: #fff; border: 0;
+      border-bottom: 1px solid var(--line); cursor: pointer; }
+    .cb-hit:last-child { border-bottom: 0; }
+    .cb-hit:hover { background: var(--bg-soft); }
+    .cb-hit span { color: var(--muted); white-space: nowrap; }
+    .cb-manual { margin-top: 14px; font-size: 13.5px; color: var(--muted); }
+    .cb-manual-row { display: flex; gap: 8px; margin-top: 8px; }
+    .cb-manual-row select { flex: 0 0 44%; }
+    .cb-manual-row button, .cb-copy {
+      font: inherit; font-size: 13px; font-weight: 600; padding: 8px 14px; border-radius: 8px;
+      border: 1px solid var(--line); background: #fff; cursor: pointer;
+    }
+    .cb-manual-row button:hover, .cb-copy:hover { background: var(--bg-soft); }
+    .cb-lanes { margin-top: 16px; display: flex; flex-direction: column; gap: 8px; }
+    .cb-lane { display: flex; align-items: center; gap: 10px; border: 1px solid var(--line);
+      border-radius: 10px; padding: 8px 12px; font-size: 13.5px; }
+    .cb-lane-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 600; }
+    .cb-lane-prov { color: var(--muted); }
+    .cb-lane label { margin-left: auto; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+    .cb-lane input { width: 58px; font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; }
+    .cb-x { border: 0; background: none; font-size: 17px; color: var(--muted); cursor: pointer; }
+    .cb-x:hover { color: var(--slate); }
+    .cb-poolrow { display: flex; align-items: center; gap: 10px; margin-top: 16px; font-size: 13.5px; }
+    .cb-poolrow label { font-weight: 600; }
+    .cb-poolrow input { width: 130px; }
+    .cb-hint { color: var(--muted); }
+    .cb-reset { font: inherit; font-size: 13px; font-weight: 600; padding: 7px 13px;
+      border-radius: 8px; border: 1px solid var(--line); background: #fff; cursor: pointer; color: var(--muted); }
+    .cb-reset:hover { background: var(--bg-soft); color: var(--slate); }
+    .cb-share { margin-left: auto; }
+    .cb-badge { font-style: normal; font-size: 10px; font-weight: 700; letter-spacing: 0.05em;
+      text-transform: uppercase; padding: 2px 7px; border-radius: 99px; vertical-align: 1px; }
+    .cb-badge-ok { background: #ecfccb; color: #3f6212; }
+    .cb-badge-gen { background: var(--bg-soft); color: var(--muted); border: 1px solid var(--line); }
+    .cb-out { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+    .cb-block { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+    .cb-block-head { display: flex; justify-content: space-between; align-items: center;
+      padding: 8px 8px 8px 14px; background: var(--bg-soft); border-bottom: 1px solid var(--line);
+      font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #4d7c0f; }
+    .cb-block pre { margin: 0; padding: 14px 16px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12.5px; line-height: 1.6; background: var(--ink); color: #e2e8f0; overflow-x: auto; min-height: 20px; }
+    .cb-tabs { display: flex; gap: 4px; padding: 8px 10px; background: var(--bg-soft); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+    .cb-tab { font: inherit; font-size: 12.5px; font-weight: 600; padding: 5px 11px; border-radius: 7px;
+      border: 1px solid transparent; background: none; color: var(--muted); cursor: pointer; }
+    .cb-tab:hover { color: var(--slate); }
+    .cb-tab-on { background: #fff; border-color: var(--line); color: var(--slate); }
+  </style>
+</PageLayout>
