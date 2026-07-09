@@ -27,7 +27,7 @@ The only honest number is its *added* latency: the microseconds Busbar spends pa
 - **38 µs** (0.038 ms) for a small call
 - **84 µs** (0.084 ms) for a full 12k-token cross-protocol translation, Anthropic in and a different protocol out, both directions
 
-And the tail stays tight. p99.9 is only about **1.3 to 1.6 times the median**, because a no-GC request path has no pause to spike it. [Full methodology and per-protocol numbers.](/benchmark/)
+And the tail stays tight. p99.9 is only about **1.3 to 1.6 times the median**, because a no-GC request path has no pause to spike it. [Full methodology and per-protocol numbers.](/docs/benchmark/)
 
 ## How much throughput?
 

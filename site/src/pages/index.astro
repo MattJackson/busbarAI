@@ -10,7 +10,7 @@ import Nav from '../components/Nav.astro';
 import Analytics from '../components/Analytics.astro';
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
-const DOCS = '/why-busbar/';
+const DOCS = '/docs/why-busbar/';
 
 const ORG = { '@context': 'https://schema.org', '@type': 'Organization', name: 'Busbar', url: 'https://getbusbar.com', logo: 'https://getbusbar.com/favicon.svg', sameAs: ['https://github.com/MattJackson/busbarAI'] };
 const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'Busbar', url: 'https://getbusbar.com' };
@@ -134,7 +134,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
             dropping a feature, and keeps serving through provider failures before your user sees a byte.
           </p>
           <div class="cta-row">
-            <a href="/getting-started/" class="btn">Get started</a>
+            <a href="/docs/getting-started/" class="btn">Get started</a>
             <a href="/download/" class="btn btn-ghost">Download</a>
             <a href={DOCS} class="btn btn-text">Read the docs →</a>
           </div>
@@ -264,7 +264,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
             One command pulls the binary and the provider catalog. Write a minimal config, point an
             SDK at it, and you’re serving. No sudo, no runtime, no virtualenv.
           </p>
-          <a href="/getting-started/" class="btn">Full walkthrough →</a>
+          <a href="/docs/getting-started/" class="btn">Full walkthrough →</a>
         </div>
         <div class="qs-steps">
           <div class="qs-block">
@@ -312,25 +312,25 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         <nav class="footer-cols">
           <div>
             <h4>Docs</h4>
-            <a href="/getting-started/">Getting Started</a>
-            <a href="/why-busbar/">Why Busbar</a>
+            <a href="/docs/getting-started/">Getting Started</a>
+            <a href="/docs/why-busbar/">Why Busbar</a>
             <a href="/faq/">FAQ</a>
             <a href="/build/">Config builder</a>
-            <a href="/reliability/">Reliability</a>
-            <a href="/routing/">Routing</a>
-            <a href="/benchmark/">Benchmark</a>
+            <a href="/docs/reliability/">Reliability</a>
+            <a href="/docs/routing/">Routing</a>
+            <a href="/docs/benchmark/">Benchmark</a>
           </div>
           <div>
             <h4>Reference</h4>
-            <a href="/protocols/">Protocols</a>
-            <a href="/configuration/">Configuration</a>
-            <a href="/security/">Security</a>
-            <a href="/providers/">Providers</a>
+            <a href="/docs/protocols/">Protocols</a>
+            <a href="/docs/configuration/">Configuration</a>
+            <a href="/docs/security/">Security</a>
+            <a href="/docs/providers/">Providers</a>
           </div>
           <div>
             <h4>Project</h4>
             <a href="/download/">Download</a>
-            <a href="/changelog/">Changelog</a>
+            <a href="/docs/changelog/">Changelog</a>
             <a href={GITHUB}>GitHub</a>
             <a href={`${GITHUB}/blob/main/LICENSE`}>License (AGPL-3.0)</a>
             <a href="/llms.txt">llms.txt</a>

@@ -2,7 +2,7 @@
 
 Busbar attributes every upstream failure to a cause, benches only the lane at fault, and recovers it automatically with a single-flight probe. This page covers the breaker's scope, how failures are classified, the state machine, trip conditions, cooldown, and configuration.
 
-Cross-references: [Pools](/pools/) (structure) · [In-flight failover](/failover/) (what happens when a lane trips) · [Configuration](/configuration/) (field reference).
+Cross-references: [Pools](/docs/pools/) (structure) · [In-flight failover](/docs/failover/) (what happens when a lane trips) · [Configuration](/docs/configuration/) (field reference).
 
 ## Concepts: pools, lanes, and cells
 
@@ -48,7 +48,7 @@ Before the breaker records anything, every upstream outcome runs through a two-s
 | `TransientUpstream` | 5xx, 429, 408, 529, network error, timeout | Records a failure; drives trip evaluation. |
 | `HardDown` | 401, 403 (auth/billing); JSON codes mapped to `auth` or `billing` | Trips the lane immediately, regardless of window/streak, with a 30-minute sticky cooldown. |
 | `ClientFault` | 4xx other than 401/403/408/429 | Relayed verbatim; lane records nothing (the request was bad, not the upstream). |
-| `ContextLength` | Provider signals context-length exceeded. The built-in code detection applies on 400/413 only; an operator `error_map` mapping to `context_length` applies on any non-5xx status | No lane penalty; request fails over to a larger-context member (see [context-length failover](/failover/#context-length-failover)). |
+| `ContextLength` | Provider signals context-length exceeded. The built-in code detection applies on 400/413 only; an operator `error_map` mapping to `context_length` applies on any non-5xx status | No lane penalty; request fails over to a larger-context member (see [context-length failover](/docs/failover/#context-length-failover)). |
 
 One important guard: a `context_length` mapping in `error_map` is **suppressed on any 5xx**, so a provider returning 500 with a body that mentions `context_length` is still classified as `TransientUpstream`. This prevents a misconfigured or adversarial backend from masking an outage as a context-limit.
 

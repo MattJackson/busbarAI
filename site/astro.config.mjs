@@ -5,8 +5,29 @@ import starlightLlmsTxt from 'starlight-llms-txt';
 
 export default defineConfig({
   site: 'https://getbusbar.com',
-  // /docs must not 404 — it's the URL people guess. Lands on the docs entry point.
-  redirects: { '/docs': '/why-busbar/', '/docs/': '/why-busbar/' },
+  // Docs live under /docs/*. Old flat URLs redirect permanently so external links,
+  // search results, and the CHANGELOG's historical links keep working.
+  redirects: {
+    '/docs': '/docs/why-busbar/',
+    '/why-busbar': '/docs/why-busbar/',
+    '/getting-started': '/docs/getting-started/',
+    '/pools': '/docs/pools/',
+    '/routing': '/docs/routing/',
+    '/protocols': '/docs/protocols/',
+    '/reliability': '/docs/reliability/',
+    '/circuit-breaker': '/docs/circuit-breaker/',
+    '/failover': '/docs/failover/',
+    '/observability': '/docs/observability/',
+    '/providers': '/docs/providers/',
+    '/guides/governance': '/docs/guides/governance/',
+    '/security': '/docs/security/',
+    '/configuration': '/docs/configuration/',
+    '/benchmark': '/docs/benchmark/',
+    '/changelog': '/docs/changelog/',
+    // Never published at the old flat URLs, but published pages linked there anyway.
+    '/operations': '/docs/operations/',
+    '/architecture': '/docs/architecture/',
+  },
   integrations: [
     starlight({
       title: 'Busbar',
@@ -68,41 +89,43 @@ export default defineConfig({
         {
           label: 'Start here',
           items: [
-            { label: 'Why Busbar', slug: 'why-busbar' },
-            { label: 'Getting Started', slug: 'getting-started' },
+            { label: 'Why Busbar', slug: 'docs/why-busbar' },
+            { label: 'Getting Started', slug: 'docs/getting-started' },
           ],
         },
         {
           label: 'Core concepts',
           items: [
-            { label: 'Pools', slug: 'pools' },
-            { label: 'Routing Policies', slug: 'routing' },
-            { label: 'Protocols & Translation', slug: 'protocols' },
+            { label: 'Pools', slug: 'docs/pools' },
+            { label: 'Routing Policies', slug: 'docs/routing' },
+            { label: 'Protocols & Translation', slug: 'docs/protocols' },
           ],
         },
         {
           label: 'Reliability',
           items: [
-            { label: 'Overview', slug: 'reliability' },
-            { label: 'Circuit Breaker', slug: 'circuit-breaker' },
-            { label: 'In-flight Failover', slug: 'failover' },
-            { label: 'Health & Observability', slug: 'observability' },
+            { label: 'Overview', slug: 'docs/reliability' },
+            { label: 'Circuit Breaker', slug: 'docs/circuit-breaker' },
+            { label: 'In-flight Failover', slug: 'docs/failover' },
+            { label: 'Health & Observability', slug: 'docs/observability' },
           ],
         },
         {
           label: 'Operate',
           items: [
-            { label: 'Adding a Provider', slug: 'providers' },
-            { label: 'Governance', slug: 'guides/governance' },
-            { label: 'Security', slug: 'security' },
-            { label: 'Configuration', slug: 'configuration' },
+            { label: 'Adding a Provider', slug: 'docs/providers' },
+            { label: 'Governance', slug: 'docs/guides/governance' },
+            { label: 'Security', slug: 'docs/security' },
+            { label: 'Configuration', slug: 'docs/configuration' },
+            { label: 'Operations', slug: 'docs/operations' },
           ],
         },
         {
           label: 'Reference',
           items: [
-            { label: 'Benchmark', slug: 'benchmark' },
-            { label: 'Changelog', slug: 'changelog' },
+            { label: 'Architecture', slug: 'docs/architecture' },
+            { label: 'Benchmark', slug: 'docs/benchmark' },
+            { label: 'Changelog', slug: 'docs/changelog' },
           ],
         },
       ],

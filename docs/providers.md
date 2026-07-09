@@ -105,4 +105,4 @@ my-azure:
   auth: api-key
 ```
 
-See the [configuration reference](/configuration/) for every field and default.
+See the [configuration reference](/docs/configuration/) for every field and default.

@@ -2,7 +2,7 @@
 
 Busbar exposes its liveness, per-lane topology, and Prometheus metrics on three endpoints. This page documents each, plus the signals worth alerting on.
 
-Cross-references: [Circuit breaker](/circuit-breaker/) · [In-flight failover](/failover/) · [Configuration](/configuration/#observability).
+Cross-references: [Circuit breaker](/docs/circuit-breaker/) · [In-flight failover](/docs/failover/) · [Configuration](/docs/configuration/#observability).
 
 ## /healthz
 

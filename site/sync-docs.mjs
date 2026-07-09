@@ -7,7 +7,9 @@ import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const docsDir = join(here, '..', 'docs');
-const outDir = join(here, 'src', 'content', 'docs');
+// Nested under docs/ so every synced page routes at /docs/<slug>/ (Starlight
+// derives routes from the path under src/content/docs).
+const outDir = join(here, 'src', 'content', 'docs', 'docs');
 mkdirSync(outDir, { recursive: true });
 
 // slug -> { description } ; order is controlled by the sidebar in astro.config.mjs
@@ -22,6 +24,8 @@ const PAGES = {
   'circuit-breaker': 'Fault-attributed circuit breaking: scope, failure classification, the state machine, trip conditions, cooldown, and config.',
   'failover': 'In-flight failover: the first-byte boundary, failover budget, context-length failover, session affinity, and pool exhaustion.',
   'observability': 'Health, metrics, and observability endpoints: /healthz, /stats, /metrics, and the signals worth alerting on.',
+  'operations': 'Running Busbar in production: process configuration, TLS and mTLS, health and readiness, metrics to watch, the admin API, and troubleshooting.',
+  'architecture': 'A request traced end to end: the superset IR, the reader/writer seams behind protocols-not-providers, and failure disposition.',
 };
 
 const esc = (s) => s.replace(/"/g, '\\"');
@@ -40,15 +44,15 @@ for (const [slug, description] of Object.entries(PAGES)) {
   }
 
   let body = lines.join('\n');
-  // Rewrite inter-doc links: (foo.md) / (./foo.md) / (docs/foo.md) -> (/foo/) ; README -> /
+  // Rewrite inter-doc links: (foo.md) / (./foo.md) / (docs/foo.md) -> (/docs/foo/) ; README -> /
   body = body
     .replace(/\]\((?:\.\/)?(?:docs\/)?([a-z0-9-]+)\.md(#[^)]*)?\)/gi, (_m, name, hash) =>
-      name.toLowerCase() === 'readme' ? `](/${hash || ''})` : `](/${name}/${hash || ''})`)
+      name.toLowerCase() === 'readme' ? `](/${hash || ''})` : `](/docs/${name}/${hash || ''})`)
     .replace(/\]\(\.\.\/README\.md(#[^)]*)?\)/gi, (_m, hash) => `](/${hash || ''})`);
 
   const frontmatter = `---\ntitle: "${esc(title)}"\ndescription: "${esc(description)}"\n---\n\n`;
   writeFileSync(join(outDir, `${slug}.md`), frontmatter + body);
-  console.log(`synced docs/${slug}.md -> src/content/docs/${slug}.md  (title: ${title})`);
+  console.log(`synced docs/${slug}.md -> src/content/docs/docs/${slug}.md  (title: ${title})`);
 }
 
 // Publish the provider catalog under our own domain (served at /providers.yaml), so the
@@ -106,7 +110,7 @@ console.log('published providers.yaml -> public/providers.yaml');
   ].join('\n');
 
   writeFileSync(join(outDir, 'changelog.md'), frontmatter + body.trimStart());
-  console.log('synced CHANGELOG.md -> src/content/docs/changelog.md');
+  console.log('synced CHANGELOG.md -> src/content/docs/docs/changelog.md');
 }
 
 // Expose the crate version (from the repo Cargo.toml) to the site as src/release.json,

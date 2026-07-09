@@ -45,7 +45,7 @@ Pools are optional: you can route directly to a single model. But the moment you
 
 - **Pool** — a named group of lanes (what a client targets). Owns the selection policy, failover, and affinity.
 - **Lane** — one model at one provider (a `models:` entry). The unit of concurrency, lifetime budget, and circuit breaking.
-- **Cell** — the breaker state for a specific *(pool, lane)* pair. A lane that trips in pool A keeps serving in pool B, because each pool has its own cell. See [Circuit breaker](/circuit-breaker/) for the breaker deep-dive.
+- **Cell** — the breaker state for a specific *(pool, lane)* pair. A lane that trips in pool A keeps serving in pool B, because each pool has its own cell. See [Circuit breaker](/docs/circuit-breaker/) for the breaker deep-dive.
 
 ## How selection works
 
@@ -76,7 +76,7 @@ Every policy is documented in full, with worked examples, in the [Routing guide]
 | `policy` | object | none | Transport config; required for `webhook`/`script`. `url`, `script`/`script_file`, `timeout_ms`, `on_error` (`weighted`/`reject`/`first`). |
 | `affinity` | object | none | `mode: session` pins a session to a lane by `header_name` (default `x-session-id`). |
 
-See the [Routing guide](routing.md) for the `route`/`policy` details and every native policy, and [Circuit breaker](/circuit-breaker/#circuit-breaker-configuration) for the per-pool `breaker` block, and [In-flight failover](/failover/) for `failover` and `on_exhausted`.
+See the [Routing guide](routing.md) for the `route`/`policy` details and every native policy, and [Circuit breaker](/docs/circuit-breaker/#circuit-breaker-configuration) for the per-pool `breaker` block, and [In-flight failover](/docs/failover/) for `failover` and `on_exhausted`.
 
 **Member fields**
 
@@ -93,7 +93,7 @@ See the [Routing guide](routing.md) for the `route`/`policy` details and every n
 
 ## Multi-protocol pools
 
-**Multi-protocol pools**: members can span different providers and protocols. Busbar translates through its superset IR on cross-protocol hops (see [Protocols and translation](/protocols/#cross-protocol-translation)). A warning is logged at startup for heterogeneous pools because the IR models a common superset: same-protocol requests are byte-exact passthrough, but cross-protocol hops drop source-only fields that have no analog on the target (e.g. `logprobs`, `n`). For pools where all members speak the same protocol, there is no translation overhead and no field loss.
+**Multi-protocol pools**: members can span different providers and protocols. Busbar translates through its superset IR on cross-protocol hops (see [Protocols and translation](/docs/protocols/#cross-protocol-translation)). A warning is logged at startup for heterogeneous pools because the IR models a common superset: same-protocol requests are byte-exact passthrough, but cross-protocol hops drop source-only fields that have no analog on the target (e.g. `logprobs`, `n`). For pools where all members speak the same protocol, there is no translation overhead and no field loss.
 
 ## Recipes
 
@@ -110,7 +110,7 @@ pools:
 
 ### Same model, two providers (cross-provider failover)
 
-Run one real model behind two providers. The keys differ; `upstream_model` carries each provider's own model string. See [Configuration](/configuration/#models).
+Run one real model behind two providers. The keys differ; `upstream_model` carries each provider's own model string. See [Configuration](/docs/configuration/#models).
 
 ```yaml
 models:
@@ -150,4 +150,4 @@ pools:
 
 Choosing *which* member serves a request (cheapest, fastest, least busy, or your own webhook/Rhai logic) is a routing-policy concern, not a pool-shape one. Those recipes, with full worked examples, live in the [Routing guide](routing.md#full-examples).
 
-See the [Routing guide](routing.md) for the full policy contract and the signals each policy receives, and [Circuit breaker](/circuit-breaker/) / [In-flight failover](/failover/) for how the breaker and failover behave once a policy has chosen an order.
+See the [Routing guide](routing.md) for the full policy contract and the signals each policy receives, and [Circuit breaker](/docs/circuit-breaker/) / [In-flight failover](/docs/failover/) for how the breaker and failover behave once a policy has chosen an order.

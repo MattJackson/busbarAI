@@ -84,7 +84,7 @@ control. Each capability below has two views; read **What it does** for the why,
     # → 201 with the secret, shown once. Store it now; only its SHA-256 is kept.
     ```
 
-    To issue a key for a Bedrock-SDK client (inbound SigV4 auth), add `"issue_aws_credential": true`. The 201 response then also includes `aws_access_key_id` and `aws_secret_access_key`; both shown **once**. Configure your Bedrock SDK with those credentials; Busbar verifies the signature and enforces all governance controls. See [Bedrock ingress](/protocols/#bedrock).
+    To issue a key for a Bedrock-SDK client (inbound SigV4 auth), add `"issue_aws_credential": true`. The 201 response then also includes `aws_access_key_id` and `aws_secret_access_key`; both shown **once**. Configure your Bedrock SDK with those credentials; Busbar verifies the signature and enforces all governance controls. See [Bedrock ingress](/docs/protocols/#bedrock).
 
     By default, if the budget store errors during the admission check, Busbar fails open (requests proceed). Set `governance.budget_on_store_error: deny` in config to fail closed instead; requests are rejected on any store error, providing a hard budget guarantee for regulated deployments.
 

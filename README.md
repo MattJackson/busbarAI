@@ -51,17 +51,17 @@ That request left your app as OpenAI. It may have been served by Anthropic, and 
 
 ## What's inside
 
-- **Six wire protocols**, lossless in both directions; any client protocol reaches any pool → [Protocols](https://getbusbar.com/protocols/)
-- **Fault-attributed circuit breaking** and streaming-safe in-flight failover → [Reliability](https://getbusbar.com/reliability/)
-- **Weighted pools** with smooth weighted round-robin, session affinity, and per-lane concurrency caps → [Reliability](https://getbusbar.com/reliability/)
-- **Routing policies.** Five built-ins, or your own logic as a webhook or Rhai script. A policy sees each member's cost, latency, live concurrency, budget, and rate headroom, and a failing policy falls back instead of blocking → [Routing](https://getbusbar.com/routing/)
-- **Native TLS and optional mTLS**, terminated by Busbar itself, with no reverse proxy in front → [Security](https://getbusbar.com/security/)
-- **Governance** when you want it: virtual keys, budgets, RPM/TPM limits, spend tracking → [Governance](https://getbusbar.com/guides/governance/)
-- **A verified provider catalog**, plus any provider on the six protocols in a few lines of YAML → [Providers](https://getbusbar.com/providers/)
+- **Six wire protocols**, lossless in both directions; any client protocol reaches any pool → [Protocols](https://getbusbar.com/docs/protocols/)
+- **Fault-attributed circuit breaking** and streaming-safe in-flight failover → [Reliability](https://getbusbar.com/docs/reliability/)
+- **Weighted pools** with smooth weighted round-robin, session affinity, and per-lane concurrency caps → [Reliability](https://getbusbar.com/docs/reliability/)
+- **Routing policies.** Five built-ins, or your own logic as a webhook or Rhai script. A policy sees each member's cost, latency, live concurrency, budget, and rate headroom, and a failing policy falls back instead of blocking → [Routing](https://getbusbar.com/docs/routing/)
+- **Native TLS and optional mTLS**, terminated by Busbar itself, with no reverse proxy in front → [Security](https://getbusbar.com/docs/security/)
+- **Governance** when you want it: virtual keys, budgets, RPM/TPM limits, spend tracking → [Governance](https://getbusbar.com/docs/guides/governance/)
+- **A verified provider catalog**, plus any provider on the six protocols in a few lines of YAML → [Providers](https://getbusbar.com/docs/providers/)
 - **Hardening throughout**: SSRF guards, constant-time auth, SHA-256 key storage, secrets never logged → [SECURITY.md](SECURITY.md)
-- **Observability** over open standards: Prometheus `/metrics`, OTLP traces, a per-request audit webhook → [Configuration](https://getbusbar.com/configuration/)
+- **Observability** over open standards: Prometheus `/metrics`, OTLP traces, a per-request audit webhook → [Configuration](https://getbusbar.com/docs/configuration/)
 
-Busbar shares an arena with LiteLLM and OpenRouter, but it was built reliability-first, and the differences are bigger than a feature list. The honest comparison lives at **[Why Busbar](https://getbusbar.com/why-busbar/)**.
+Busbar shares an arena with LiteLLM and OpenRouter, but it was built reliability-first, and the differences are bigger than a feature list. The honest comparison lives at **[Why Busbar](https://getbusbar.com/docs/why-busbar/)**.
 
 ---
 
@@ -89,7 +89,7 @@ curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"fast","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-Full walkthrough → **[Getting Started](https://getbusbar.com/getting-started/)**
+Full walkthrough → **[Getting Started](https://getbusbar.com/docs/getting-started/)**
 
 ---
 

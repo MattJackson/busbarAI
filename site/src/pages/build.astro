@@ -90,8 +90,8 @@ const DATA = catalog.providers;
     your <code>providers.yaml</code> (the pane below writes it for you). A model that isn't listed
     anywhere still works: type its id by hand. Bedrock credentials go in one variable as
     <code>ACCESS_KEY_ID:SECRET_ACCESS_KEY</code>. Full reference:
-    <a href="/configuration/">Configuration</a> · <a href="/providers/">Adding a provider</a> ·
-    <a href="/pools/">Pools</a>.
+    <a href="/docs/configuration/">Configuration</a> · <a href="/docs/providers/">Adding a provider</a> ·
+    <a href="/docs/pools/">Pools</a>.
   </p>
 
   <script define:vars={{ DATA }} is:inline>
@@ -213,7 +213,7 @@ const DATA = catalog.providers;
       OpenAI: (p) => `# any OpenAI SDK: base_url = http://localhost:8080\ncurl -s localhost:8080/v1/chat/completions \\\n  -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" \\\n  ${H} \\\n  -d '{"model":"${p}","messages":[{"role":"user","content":"Hello!"}]}'`,
       Anthropic: (p) => `# Anthropic SDK: base_url = http://localhost:8080/${p}\ncurl -s localhost:8080/${p}/v1/messages \\\n  -H "x-api-key: $BUSBAR_CLIENT_TOKEN" \\\n  ${H} \\\n  -d '{"max_tokens":256,"messages":[{"role":"user","content":"Hello!"}]}'`,
       Gemini: (p) => `# Google Gen AI SDK: api_endpoint = http://localhost:8080\ncurl -s "localhost:8080/v1beta/models/${p}:generateContent" \\\n  -H "x-goog-api-key: $BUSBAR_CLIENT_TOKEN" \\\n  ${H} \\\n  -d '{"contents":[{"role":"user","parts":[{"text":"Hello!"}]}]}'`,
-      Bedrock: (p) => `# boto3 signs with SigV4, so this one is Python, not curl\nimport boto3\nbedrock = boto3.client("bedrock-runtime",\n    region_name="us-east-1",\n    endpoint_url="http://localhost:8080")\nbedrock.converse(modelId="${p}",\n    messages=[{"role":"user","content":[{"text":"Hello!"}]}])\n\n# auth: governance-minted AWS credentials, or auth.mode: passthrough\n# details -> getbusbar.com/protocols/`,
+      Bedrock: (p) => `# boto3 signs with SigV4, so this one is Python, not curl\nimport boto3\nbedrock = boto3.client("bedrock-runtime",\n    region_name="us-east-1",\n    endpoint_url="http://localhost:8080")\nbedrock.converse(modelId="${p}",\n    messages=[{"role":"user","content":[{"text":"Hello!"}]}])\n\n# auth: governance-minted AWS credentials, or auth.mode: passthrough\n# details -> getbusbar.com/docs/protocols/`,
       Cohere: (p) => `# Cohere v2 SDK: base_url = http://localhost:8080\ncurl -s localhost:8080/v2/chat \\\n  -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" \\\n  ${H} \\\n  -d '{"model":"${p}","messages":[{"role":"user","content":"Hello!"}]}'`,
       Responses: (p) => `# OpenAI Responses API\ncurl -s localhost:8080/v1/responses \\\n  -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" \\\n  ${H} \\\n  -d '{"model":"${p}","input":"Hello!"}'`,
     };

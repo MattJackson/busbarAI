@@ -34,7 +34,7 @@ import PageLayout from '../layouts/PageLayout.astro';
     your config value, not our release note. If you want a hosted aggregator's entire menu,
     OpenRouter itself is a catalog entry, so anything it serves is one lane away, with Busbar's
     failover and budgets on top. The full maker-to-language lookup lives on the
-    <a href="/providers/#who-speaks-what-the-model-landscape-as-a-lookup">providers page</a>, or
+    <a href="/docs/providers/#who-speaks-what-the-model-landscape-as-a-lookup">providers page</a>, or
     skip the reading: <a href="/build/">pick your models in the config builder</a> and copy the
     YAML.
   </p>
@@ -44,7 +44,7 @@ import PageLayout from '../layouts/PageLayout.astro';
     The catalog is a convenience, not a boundary. Any provider that speaks one of the six
     protocols, including any OpenAI-compatible endpoint and local runtimes like Ollama or vLLM,
     is a few lines in your own <code>providers.yaml</code>: a name, a <code>base_url</code>, the
-    env var holding its key. <a href="/providers/">Adding a provider</a> walks through it.
+    env var holding its key. <a href="/docs/providers/">Adding a provider</a> walks through it.
   </p>
   <p>
     The genuine gap is a provider whose wire format is none of the six. That needs new
@@ -116,7 +116,7 @@ import PageLayout from '../layouts/PageLayout.astro';
     different provider cannot resume another's generation. What Busbar does instead is record
     the fault against the lane and emit a clean, native-format error in your protocol, so your
     client library fails fast instead of hanging. The full boundary is documented at
-    <a href="/failover/">In-flight failover</a>.
+    <a href="/docs/failover/">In-flight failover</a>.
   </p>
 
   <h2>Do I need Redis or a database?</h2>

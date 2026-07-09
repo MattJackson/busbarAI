@@ -151,7 +151,7 @@ jobs:
             org.opencontainers.image.title=busbar
             org.opencontainers.image.description=The reliability layer for LLM traffic — one endpoint, six wire protocols, fault-attributed circuit breaking, in-flight failover.
             org.opencontainers.image.url=https://getbusbar.com
-            org.opencontainers.image.documentation=https://getbusbar.com/getting-started/
+            org.opencontainers.image.documentation=https://getbusbar.com/docs/getting-started/
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
       - name: Build and push

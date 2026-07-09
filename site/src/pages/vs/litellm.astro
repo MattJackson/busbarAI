@@ -92,7 +92,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
     latency and throughput rows as orders of magnitude, not a stopwatch. Busbar's harness is
     checked into the repo under <code>bench/</code>, and the opt-in <code>Server-Timing</code>
     header lets you measure Busbar's overhead on your own traffic instead of trusting either
-    table. <a href="/benchmark/">Full methodology.</a>
+    table. <a href="/docs/benchmark/">Full methodology.</a>
   </p>
 
   <h2>No privileged protocol</h2>
@@ -120,7 +120,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
     backend the pool selects, then re-encodes the streamed response as binary
     <code>application/vnd.amazon.eventstream</code> frames with valid CRC32 checksums, so boto3
     parses it as if Bedrock itself had answered. We haven't found this anywhere else.
-    <a href="/protocols/">How translation works.</a>
+    <a href="/docs/protocols/">How translation works.</a>
   </p>
   <p>
     What that means in practice: Busbar is valuable before the second provider exists. A team
@@ -141,7 +141,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
     and local provider exposes: Groq, Mistral, Together, DeepSeek, Fireworks, xAI, Ollama, vLLM,
     and most of the rest of the list. Any provider speaking one of the six is a few lines in your
     own <code>providers.yaml</code>: a name, a <code>base_url</code>, the env var holding its
-    key. <a href="/providers/">Adding a provider</a> takes about a minute, and you don't wait on
+    key. <a href="/docs/providers/">Adding a provider</a> takes about a minute, and you don't wait on
     us to do it.
   </p>
   <p>
@@ -173,7 +173,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
     herd. And a failing request reroutes to the next lane before your client sees a single byte,
     even on a streaming request. No Redis, no coordination layer, it's all in the binary; LiteLLM
     uses Redis to share cooldown state across multiple instances <a href="#references">[3]</a>.
-    <a href="/circuit-breaker/">The full state machine.</a>
+    <a href="/docs/circuit-breaker/">The full state machine.</a>
   </p>
 
   <h2>The gateway itself is basically free</h2>
@@ -190,7 +190,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
     (<code>observability.emit_server_timing: true</code>) and Busbar reports its own overhead on
     every response in a standard <code>Server-Timing</code> header, so you can check the number
     on your own traffic instead of trusting our benchmark.
-    <a href="/benchmark/">Benchmark and methodology.</a>
+    <a href="/docs/benchmark/">Benchmark and methodology.</a>
   </p>
 
   <h2>About LiteLLM's Rust rewrite</h2>
@@ -224,8 +224,8 @@ import PageLayout from '../../layouts/PageLayout.astro';
   <p>If that's your shape, use LiteLLM. It's a good tool and we say so without hedging.</p>
   <p>
     If the gateway is production infrastructure carrying all of your LLM traffic, that's the
-    problem Busbar was built for. <a href="/getting-started/">Get started in five minutes</a>,
-    or read <a href="/why-busbar/">why Busbar exists</a>.
+    problem Busbar was built for. <a href="/docs/getting-started/">Get started in five minutes</a>,
+    or read <a href="/docs/why-busbar/">why Busbar exists</a>.
   </p>
 
   <h2 id="references">References</h2>
@@ -240,7 +240,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
     <li><a href="https://docs.litellm.ai/docs/routing">LiteLLM routing and fallbacks</a>: retry-based fallbacks, <code>allowed_fails</code>, <code>cooldown_time</code>, per-exception retry policies, and Redis for tracking cooldown and usage state across instances.</li>
     <li><a href="https://docs.litellm.ai/docs/anthropic_unified">LiteLLM <code>/v1/messages</code></a>: Anthropic-format ingress routed through the LiteLLM router.</li>
     <li><a href="https://docs.litellm.ai/docs/pass_through/google_ai_studio">LiteLLM pass-through endpoints</a>: raw native-format routes forwarded to their provider, without fallbacks.</li>
-    <li><a href="/benchmark/">Busbar benchmark</a>: methodology, per-protocol numbers, and the reproduction steps; harness in the repo under <code>bench/</code>.</li>
+    <li><a href="/docs/benchmark/">Busbar benchmark</a>: methodology, per-protocol numbers, and the reproduction steps; harness in the repo under <code>bench/</code>.</li>
     <li><a href="https://docs.litellm.ai/blog/litellm-rust-launch">LiteLLM Rust launch post</a>: the Python problems in their words, the Rust-core numbers, the beta status and staged rollout through December 2026, and the Python sidecar for plugins.</li>
     <li><a href="/blog/busbar-in-numbers/">Busbar, in numbers</a>: memory, latency, and throughput measurements on the released binary, and how to reproduce them.</li>
     <li><a href="https://docs.litellm.ai/docs/bedrock_converse">LiteLLM Bedrock Converse endpoint</a> and <a href="https://docs.litellm.ai/docs/generateContent">generateContent endpoint</a>: routed native ingress that load-balances within its own provider's deployments.</li>

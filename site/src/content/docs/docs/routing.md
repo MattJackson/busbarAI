@@ -7,7 +7,7 @@ Every Busbar pool has a routing policy. The default (weighted smooth round-robin
 
 Routing is the first of Busbar's **Hooks**: a programmable request path. At a small number of points in the request lifecycle, an operator-supplied policy inspects the request and returns a decision, via one of three transports (native, webhook, or Rhai script). Routing is hook #1: it decides selection order. The same transport machinery (timeout, fallback, transparency header) carries every hook, so a broken or slow policy never blocks or fails a request.
 
-Cross-references: [Pools](/pools/) (how to define a pool and its members) · [Configuration](/configuration/) (full field reference) · [Reliability & Failover](/reliability/) (breaker, failover, and exhaustion behavior).
+Cross-references: [Pools](/docs/pools/) (how to define a pool and its members) · [Configuration](/docs/configuration/) (full field reference) · [Reliability & Failover](/docs/reliability/) (breaker, failover, and exhaustion behavior).
 
 ---
 

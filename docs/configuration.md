@@ -245,7 +245,7 @@ Declares which catalog providers this deployment uses and supplies the env var h
 | `path` | string | no | Catalog value | Override the upstream path. Must begin with `/`. |
 | `auth` | string | no | Catalog value | `bearer` or `api-key`. |
 | `health` | object | no | Catalog value | Override the catalog's health probe config. |
-| `allow_metadata_hosts` | list<string> | no | `[]` | Per-provider surgical exception: hosts/IPs to unblock from the cloud-metadata SSRF denylist for **this provider only**. See [Security: Provider upstreams & SSRF](/security/#the-control-matrix). |
+| `allow_metadata_hosts` | list<string> | no | `[]` | Per-provider surgical exception: hosts/IPs to unblock from the cloud-metadata SSRF denylist for **this provider only**. See [Security: Provider upstreams & SSRF](/docs/security/#the-control-matrix). |
 
 **Credential format by protocol:**
 
@@ -382,7 +382,7 @@ A pool spanning members that use different underlying protocols produces a start
 
 #### `route` and `policy`
 
-A pool's routing policy decides the **order** in which healthy members are tried. The default: `weighted` (SWRR), is zero-cost and unchanged from the pre-routing-policy baseline. Any other `route` value wires a pluggable policy that runs once per request, before the failover loop. The full guide, including external policies and signals, lives in the [routing guide](https://getbusbar.com/routing/).
+A pool's routing policy decides the **order** in which healthy members are tried. The default: `weighted` (SWRR), is zero-cost and unchanged from the pre-routing-policy baseline. Any other `route` value wires a pluggable policy that runs once per request, before the failover loop. The full guide, including external policies and signals, lives in the [routing guide](https://getbusbar.com/docs/routing/).
 
 ```yaml
 pools:
@@ -426,7 +426,7 @@ pools:
 | `webhook` | An operator HTTP sidecar. Busbar POSTs a request projection and waits for a ranked preference list, bounded by `policy.timeout_ms`. |
 | `script` | An embedded Rhai script (behind the `script-policy` cargo feature). Compiled at startup; evaluated per request in a sandboxed thread pool. |
 
-`route:` also accepts the bare native policy names `cheapest`, `fastest`, `least_busy`, and `usage` as shorthand for `route: native` + `policy.name: <name>`. See the [Routing guide](/routing/) for what each policy does.
+`route:` also accepts the bare native policy names `cheapest`, `fastest`, `least_busy`, and `usage` as shorthand for `route: native` + `policy.name: <name>`. See the [Routing guide](/docs/routing/) for what each policy does.
 
 **`policy` block fields:**
 
@@ -439,7 +439,7 @@ pools:
 | `script` | string | none | `script` | Inline Rhai source string. Exactly one of `script` or `script_file` is required when `route: script`. Mutually exclusive with `script_file`. |
 | `script_file` | string | none | `script` | Path to a Rhai script file on disk. Alternative to inline `script`. |
 
-The per-member `tier`, `cost_per_mtok`, and `tags` fields documented in [Members and weights](#members-and-weights) above feed these policies. See the [routing guide](https://getbusbar.com/routing/) for the native policy catalog, the webhook wire format, the Rhai script environment and sandbox limits, and the `x-busbar-route-policy` / `x-busbar-route-target` observability headers.
+The per-member `tier`, `cost_per_mtok`, and `tags` fields documented in [Members and weights](#members-and-weights) above feed these policies. See the [routing guide](https://getbusbar.com/docs/routing/) for the native policy catalog, the webhook wire format, the Rhai script environment and sandbox limits, and the `x-busbar-route-policy` / `x-busbar-route-target` observability headers.
 
 ---
 
@@ -706,7 +706,7 @@ See [operations.md](operations.md) for the full admin API payload schemas and vi
 
 ### `security`
 
-Optional. Extends or overrides the hardcoded cloud-metadata SSRF denylist. When absent, only the built-in denylist applies. See [Security: Provider upstreams & SSRF](https://getbusbar.com/security/) for the full threat model, the complete denylist, and worked examples.
+Optional. Extends or overrides the hardcoded cloud-metadata SSRF denylist. When absent, only the built-in denylist applies. See [Security: Provider upstreams & SSRF](https://getbusbar.com/docs/security/) for the full threat model, the complete denylist, and worked examples.
 
 ```yaml
 security:
