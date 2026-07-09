@@ -89,9 +89,9 @@ import PageLayout from '../../layouts/PageLayout.astro';
   </div>
   <p class="takeaway">
     In plain terms: our worst published latency case beats their best by more than 20×,
-    and one Busbar vCPU moves about as many requests per second as 130 LiteLLM vCPUs
-    (9,750/s against ~73/s). Those are the same fact twice — less CPU spent per request
-    is where the extra requests come from.
+    and one Busbar vCPU handles about as many requests per second as 130 LiteLLM vCPUs
+    (9,750/s against ~73/s). Both ratios measure the same thing: how much CPU a request
+    costs.
   </p>
   <p class="note">
     Benchmark figures are each project's own published numbers on its own hardware, so read the
