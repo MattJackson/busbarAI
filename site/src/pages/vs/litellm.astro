@@ -1,0 +1,238 @@
+---
+import PageLayout from '../../layouts/PageLayout.astro';
+---
+
+<PageLayout
+  title="Busbar vs LiteLLM"
+  description="An honest comparison for engineers deciding between Busbar and LiteLLM: protocol handling, failure behavior, runtime footprint, and when each is the right call."
+>
+  <p class="kicker">Comparison</p>
+  <h1>Busbar vs LiteLLM</h1>
+  <p class="intro">
+    Everybody evaluating Busbar knows LiteLLM, so this page is specific about what's actually
+    different. It isn't a feature list. LiteLLM is genuinely good at what it is: a Python-native
+    router with huge provider coverage. Busbar is a different kind of tool, and the difference
+    shows up in three places: how protocols are handled, what happens when a provider fails, and
+    what the gateway itself costs you at runtime. Every claim about LiteLLM below is cited to
+    their own documentation, and every claim about Busbar to ours.
+  </p>
+
+  <h2>The short version</h2>
+  <div class="cmp">
+    <table>
+      <thead>
+        <tr><th></th><th>Busbar</th><th>LiteLLM</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Core format</td>
+          <td>No privileged protocol: one internal superset format every protocol maps into and out of, so all six are first-class in both directions</td>
+          <td>OpenAI-shaped core; native-format ingress via per-protocol adapters <a href="#references">[4]</a></td>
+        </tr>
+        <tr>
+          <td>Native ingress + load balancing</td>
+          <td>All six protocols, simultaneously, on any pool</td>
+          <td>Anthropic <code>/v1/messages</code> goes through the router <a href="#references">[4]</a>; byte-exact native routes are pass-throughs that skip it <a href="#references">[5]</a></td>
+        </tr>
+        <tr>
+          <td>Bedrock SDK ingress</td>
+          <td>A signed boto3 client, load-balanced across non-Bedrock backends, response re-encoded as valid binary eventstream</td>
+          <td>Pass-through to Bedrock only <a href="#references">[5]</a></td>
+        </tr>
+        <tr>
+          <td>Failure classification</td>
+          <td>Fault-attributed: provider outage, auth/billing, client fault, and context-length each handled differently, per (pool, lane)</td>
+          <td>Exception hierarchy feeding retry counts and a cooldown timer <a href="#references">[3]</a></td>
+        </tr>
+        <tr>
+          <td>Recovery</td>
+          <td>Single-flight half-open probe, exponential backoff with jitter, <code>Retry-After</code> honored as a floor</td>
+          <td>Deployment returns when <code>cooldown_time</code> expires <a href="#references">[3]</a></td>
+        </tr>
+        <tr>
+          <td>Failover boundary</td>
+          <td>In-flight, before the first byte, across protocol families</td>
+          <td>Retry after the failed call returns <a href="#references">[3]</a></td>
+        </tr>
+        <tr>
+          <td>Runtime</td>
+          <td>One static Rust binary, ~9 MB on disk, ~4.5 MB resident</td>
+          <td>Python/Uvicorn workers + PostgreSQL + Redis 7.0+ in production <a href="#references">[2]</a></td>
+        </tr>
+        <tr>
+          <td>Added latency</td>
+          <td>Median tens of µs; under 100 µs even translating a 12k-token body cross-protocol <a href="#references">[6]</a></td>
+          <td>2 ms median, 8 ms p95, 13 ms p99, from their published benchmark <a href="#references">[1]</a></td>
+        </tr>
+        <tr>
+          <td>Throughput</td>
+          <td>19,505 req/s sustained on 2 pinned cores <a href="#references">[6]</a></td>
+          <td>~1,170 RPS across 4 instances of 4 vCPU / 8 GB, from their published benchmark <a href="#references">[1]</a></td>
+        </tr>
+        <tr>
+          <td>Provider coverage</td>
+          <td>Any provider speaking one of the six protocols, including every OpenAI-compatible endpoint, as a config entry in your own <code>providers.yaml</code>; a vetted catalog ships as the starting set</td>
+          <td>100+ providers preconfigured out of the box</td>
+        </tr>
+        <tr>
+          <td>Dashboard</td>
+          <td>Prometheus, OTLP, admin API; bring the Grafana you already run</td>
+          <td>Bundled admin UI</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">
+    Benchmark figures are each project's own published numbers on its own hardware, so read the
+    latency and throughput rows as orders of magnitude, not a stopwatch. Busbar's harness is
+    checked into the repo under <code>bench/</code>, and the opt-in <code>Server-Timing</code>
+    header lets you measure Busbar's overhead on your own traffic instead of trusting either
+    table. <a href="/benchmark/">Full methodology.</a>
+  </p>
+
+  <h2>No privileged protocol</h2>
+  <p>
+    LiteLLM's core normalizes everything into the OpenAI format, and its non-OpenAI ingress is a
+    set of adapters on top of that core <a href="#references">[4]</a>. Its byte-exact native
+    routes are pass-through endpoints that skip the router entirely, so on those routes you end
+    up picking between native protocol <em>or</em> load balancing and fallbacks
+    <a href="#references">[5]</a>.
+  </p>
+  <p>
+    Busbar doesn't make you pick, on any protocol. All six wire protocols (OpenAI, Anthropic,
+    Gemini, Bedrock, Cohere, Responses) are first-class in both directions, through one superset
+    intermediate representation: an internal format rich enough to hold every protocol's
+    features, which each protocol maps into and out of, so nothing is flattened to any vendor's
+    shape. When ingress and egress match, the body passes through byte-for-byte. An OpenAI SDK and a signed Bedrock SDK can hit the same pool at the same time,
+    each gets its own native response back, and failover works underneath both.
+  </p>
+  <p>
+    That Bedrock case is worth dwelling on, because it's the hardest one: Busbar verifies the
+    inbound AWS SigV4 signature, translates the Converse request through the IR to whichever
+    backend the pool selects, then re-encodes the streamed response as binary
+    <code>application/vnd.amazon.eventstream</code> frames with valid CRC32 checksums, so boto3
+    parses it as if Bedrock itself had answered. We haven't found this anywhere else.
+    <a href="/protocols/">How translation works.</a>
+  </p>
+  <p>
+    What that means in practice: Busbar is valuable before the second provider exists. A team
+    locked to Bedrock today (a BAA that covers AWS but not yet Anthropic, say) points boto3's
+    <code>endpoint_url</code> at Busbar and changes nothing else; same-protocol traffic passes
+    through byte-for-byte, and no new entity enters the data path, because Busbar runs in your
+    infrastructure. The day a direct Anthropic BAA lands, an Anthropic lane is one config edit,
+    and the application code never learns it happened. With LiteLLM, Bedrock-SDK ingress is a
+    pass-through to Bedrock only <a href="#references">[5]</a>, so that same migration starts
+    with rewriting your integrations.
+  </p>
+
+  <h2>100+ providers vs 6 protocols is not the same metric</h2>
+  <p>
+    The counts look lopsided until you notice they measure different things. A provider count
+    measures countries; protocols are languages. LiteLLM lists 100+ countries. Busbar speaks six
+    languages, and one of them, OpenAI-compatible, is the lingua franca that nearly every hosted
+    and local provider exposes: Groq, Mistral, Together, DeepSeek, Fireworks, xAI, Ollama, vLLM,
+    and most of the rest of the list. Any provider speaking one of the six is a few lines in your
+    own <code>providers.yaml</code>: a name, a <code>base_url</code>, the env var holding its
+    key. <a href="/providers/">Adding a provider</a> takes about a minute, and you don't wait on
+    us to do it.
+  </p>
+  <p>
+    So the genuine difference is narrower than the counts suggest. LiteLLM's catalog has the
+    entry <em>typed for you</em>; with Busbar you may type it yourself. The vetted catalog Busbar
+    ships is deliberately curated rather than scraped, because each entry's error-code mappings
+    feed the breaker's fault attribution. The one real gap is a provider whose wire format is
+    none of the six and compatible with none: that needs new translator code, and it's the single
+    case where you'd wait on anyone.
+  </p>
+
+  <h2>A real circuit breaker, not a cooldown timer</h2>
+  <p>
+    LiteLLM does classify errors: it maps provider failures into an exception hierarchy with
+    per-exception retry policies <a href="#references">[3]</a>. The difference is what
+    classification <em>drives</em>. There, it feeds retry counts and a cooldown timer; a
+    cooled-down deployment returns when the timer expires. Here, it feeds a state machine with
+    distinct dispositions:
+  </p>
+  <ul>
+    <li>A provider outage or rate-limit storm trips the lane and cools it down, honoring the provider's <code>Retry-After</code> as a floor.</li>
+    <li>An auth or billing failure is benched immediately with a 30-minute sticky cooldown, because retrying a revoked key into a wall helps nobody.</li>
+    <li>A client's bad request is relayed verbatim and never penalizes the lane, so a healthy backend is never ejected because a caller sent malformed input.</li>
+    <li>A context-length overflow fails over to a larger-context lane without recording a fault.</li>
+  </ul>
+  <p>
+    Breaker state is per pool, per lane, so a lane rate-limiting in one pool can still serve
+    another where it's healthy. Recovery is a single half-open probe request, not a thundering
+    herd. And a failing request reroutes to the next lane before your client sees a single byte,
+    even on a streaming request. No Redis, no coordination layer, it's all in the binary; LiteLLM
+    needs Redis to share cooldown state across its workers <a href="#references">[2]</a>.
+    <a href="/circuit-breaker/">The full state machine.</a>
+  </p>
+
+  <h2>The gateway itself is basically free</h2>
+  <p>
+    One static Rust binary, no interpreter, no garbage collector in the request path. Median
+    added latency is in the tens of microseconds, and stays under 100 µs even translating a
+    12k-token body between protocols in both directions <a href="#references">[6]</a>. LiteLLM's
+    own published benchmark reports 2 ms median and 13 ms p99 of proxy overhead
+    <a href="#references">[1]</a>: different harness, different hardware, but a different order
+    of magnitude too.
+  </p>
+  <p>
+    And you don't have to take either number on faith. Set one config flag
+    (<code>observability.emit_server_timing: true</code>) and Busbar reports its own overhead on
+    every response in a standard <code>Server-Timing</code> header, so you can check the number
+    on your own traffic instead of trusting our benchmark.
+    <a href="/benchmark/">Benchmark and methodology.</a>
+  </p>
+
+  <h2>About LiteLLM's Rust rewrite</h2>
+  <p>
+    LiteLLM is rebuilding its data plane in Rust, and their launch post says why in plain terms:
+    "Under real load, CPU and memory climb with concurrency, and pods get OOM-killed at the worst
+    time" <a href="#references">[7]</a>. We think they're right, and the move validates the
+    architecture Busbar shipped at 1.0: a compiled, no-GC gateway is what this job requires.
+  </p>
+  <p>
+    The differences that remain are worth stating precisely. Their Rust core is in early beta,
+    with a staged rollout planned through December 2026 <a href="#references">[7]</a>; Busbar has
+    been a single Rust binary since its first release, so there is no migration to wait for or
+    live through. Their plan keeps customer plugins (auth, guardrails, callbacks) in an optional
+    Python sidecar and long-tail providers on Python <a href="#references">[7]</a>; Busbar's
+    request path is one process end to end. And a Rust rewrite of an OpenAI-normalized gateway is
+    still an OpenAI-normalized gateway: the hub format, the adapters, and the pass-through split
+    don't change with the implementation language. On the numbers, their published Rust-core
+    overhead (~0.05 ms) lands in the same class as ours; memory (their 31.7 MB peak vs our
+    ~4.5 MB resident) and the single-binary deployment story remain architectural, not
+    implementation, differences <a href="#references">[7]</a>.
+  </p>
+
+  <h2>Where LiteLLM is the right call</h2>
+  <ul>
+    <li><strong>You want an in-process Python router library</strong>, imported into your code rather than run as a network service. That's LiteLLM's home turf and the more natural fit.</li>
+    <li><strong>You want every provider preconfigured.</strong> LiteLLM ships 100+ catalog entries typed for you. With Busbar, a provider outside the vetted catalog is a minute of YAML in your own <code>providers.yaml</code>; the genuine gap is only a wire format that is none of the six.</li>
+    <li><strong>You want a bundled dashboard.</strong> LiteLLM ships an admin UI; Busbar exposes Prometheus, OTLP, and an admin API, and expects you to point the dashboards you already run at it.</li>
+    <li><strong>Deep Python-ecosystem integration matters to you</strong> (LangChain, LlamaIndex, and friends), though those frameworks also work with Busbar today: point their OpenAI or Anthropic client at Busbar's base URL and you keep your whole stack, with failover and translation underneath it.</li>
+  </ul>
+  <p>If that's your shape, use LiteLLM. It's a good tool and we say so without hedging.</p>
+  <p>
+    If the gateway is production infrastructure carrying all of your LLM traffic, that's the
+    problem Busbar was built for. <a href="/getting-started/">Get started in five minutes</a>,
+    or read <a href="/why-busbar/">why Busbar exists</a>.
+  </p>
+
+  <h2 id="references">References</h2>
+  <p class="note">
+    Facts about LiteLLM checked against docs.litellm.ai on July 9, 2026. If something here is
+    out of date, <a href="https://github.com/MattJackson/busbarAI/issues">tell us</a> and we'll
+    fix it.
+  </p>
+  <ol>
+    <li><a href="https://docs.litellm.ai/docs/benchmarks">LiteLLM benchmarks</a>: 2 ms median / 8 ms p95 / 13 ms p99 "LiteLLM Overhead Duration"; ~1,170 RPS across 4 instances of 4 vCPU / 8 GB.</li>
+    <li><a href="https://docs.litellm.ai/docs/proxy/prod">LiteLLM production guide</a>: Uvicorn workers, PostgreSQL, Redis 7.0+ for multi-instance state.</li>
+    <li><a href="https://docs.litellm.ai/docs/routing">LiteLLM routing and fallbacks</a>: retry-based fallbacks, <code>allowed_fails</code>, <code>cooldown_time</code>, per-exception retry policies.</li>
+    <li><a href="https://docs.litellm.ai/docs/anthropic_unified">LiteLLM <code>/v1/messages</code></a>: Anthropic-format ingress routed through the LiteLLM router.</li>
+    <li><a href="https://docs.litellm.ai/docs/pass_through/google_ai_studio">LiteLLM pass-through endpoints</a>: native-format endpoints that forward to a single provider, without router features.</li>
+    <li><a href="/benchmark/">Busbar benchmark</a>: methodology, per-protocol numbers, and the reproduction steps; harness in the repo under <code>bench/</code>.</li>
+    <li><a href="https://docs.litellm.ai/blog/litellm-rust-launch">LiteLLM Rust launch post</a>: the Python problems in their words, the Rust-core numbers, the beta status and staged rollout through December 2026, and the Python sidecar for plugins.</li>
+  </ol>
+</PageLayout>

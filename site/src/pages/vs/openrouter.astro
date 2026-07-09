@@ -1,0 +1,147 @@
+---
+import PageLayout from '../../layouts/PageLayout.astro';
+---
+
+<PageLayout
+  title="Busbar vs OpenRouter"
+  description="Busbar and OpenRouter solve different problems: one API in front of many models, hosted by them, or run by you. Here's the honest comparison."
+>
+  <p class="kicker">Comparison</p>
+  <h1>Busbar vs OpenRouter</h1>
+  <p class="intro">
+    This comparison is easier than most, because Busbar and OpenRouter mostly don't compete.
+    OpenRouter is a hosted service: you send requests to their API, they route to providers and
+    bill you. Busbar is software you run: your infrastructure, your provider accounts, your data
+    path. The real question isn't which is better. It's which side of that line your requirements
+    put you on. Every claim about OpenRouter below is cited to their own documentation.
+  </p>
+
+  <h2>The short version</h2>
+  <div class="cmp">
+    <table>
+      <thead>
+        <tr><th></th><th>Busbar</th><th>OpenRouter</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Where it runs</td>
+          <td>Your infrastructure; the only external traffic is the provider calls you configure</td>
+          <td>Their servers; every prompt transits OpenRouter <a href="#references">[1]</a></td>
+        </tr>
+        <tr>
+          <td>Who holds provider keys</td>
+          <td>You, in your environment</td>
+          <td>Them; one OpenRouter key reaches everything</td>
+        </tr>
+        <tr>
+          <td>Pricing</td>
+          <td>Free, open source (AGPL); your compute</td>
+          <td>Provider list price passed through, no inference markup; 5.5% fee (min $0.80) on card credit purchases <a href="#references">[1]</a></td>
+        </tr>
+        <tr>
+          <td>Prompt logging</td>
+          <td>Prompts never leave your network</td>
+          <td>Zero logging unless you opt in, per their policy <a href="#references">[1]</a></td>
+        </tr>
+        <tr>
+          <td>Failover behavior</td>
+          <td>Operator-configured and observable: breaker thresholds, deadlines, hop caps, exhaustion policy</td>
+          <td>Automatic fallback to the next provider; the behavior is theirs to define <a href="#references">[1]</a></td>
+        </tr>
+        <tr>
+          <td>Ingress protocols</td>
+          <td>Six, native in both directions</td>
+          <td>OpenAI-compatible API</td>
+        </tr>
+        <tr>
+          <td>Scoped keys for teams</td>
+          <td>Virtual keys with budgets, RPM/TPM limits, and pool ACLs; AWS credentials mintable for Bedrock SDK clients</td>
+          <td>Account-level credits and key provisioning <a href="#references">[2]</a></td>
+        </tr>
+        <tr>
+          <td>Model catalog</td>
+          <td>You configure providers and pools</td>
+          <td>400+ models from 70+ providers, browsable marketplace <a href="#references">[2]</a></td>
+        </tr>
+        <tr>
+          <td>Operational burden</td>
+          <td>One binary and a YAML file</td>
+          <td>Zero</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>The data path is the decision</h2>
+  <p>
+    If prompts transiting a third party is acceptable for your application, OpenRouter is
+    excellent, and most of Busbar's argument doesn't apply to you. If you have data residency
+    requirements, PII handling obligations, or internal policies around third-party data access,
+    no toggle changes the architecture: OpenRouter is, in their own words, "a proxy that sends
+    your requests to the model provider" <a href="#references">[1]</a>, and every request goes
+    through their servers.
+  </p>
+  <p>
+    Busbar exists on the other side of that line. It runs where your application runs, holds
+    your provider keys in your environment, and the only outbound connections it makes are the
+    <code>base_url</code>s in your config.
+  </p>
+
+  <h2>Fees, stated precisely</h2>
+  <p>
+    OpenRouter passes through provider inference pricing with no markup, and charges a fee when
+    you buy credits: 5.5% with a minimum of $0.80 by card, 5% by crypto
+    <a href="#references">[1]</a>. That's their FAQ's own framing and we'll use it, because it's
+    accurate.
+  </p>
+  <p>
+    Busbar has no per-request or purchase economics at all. It's open source; the cost is the
+    compute you run it on, and at roughly 4.5 MB resident that's rounding error next to any LLM
+    bill.
+  </p>
+
+  <h2>Reliability you can configure vs reliability you inherit</h2>
+  <p>
+    OpenRouter's fallback is real: when a provider returns an error, it automatically moves to
+    the next one <a href="#references">[1]</a>. It's also fixed, and theirs. You don't set the
+    thresholds, you don't see the breaker state, and you can't change what happens when every
+    provider is down.
+  </p>
+  <p>
+    With Busbar, the failure machinery is explicit and yours: per-lane circuit breakers with
+    fault attribution, failover deadlines and hop caps, and a pool exhaustion policy you choose
+    (reject with a 503, spill to a fallback pool, or send to the least-bad lane). All of it is
+    observable through <code>/stats</code> and <code>/metrics</code>. When a provider melts down
+    at 3am, the difference is whether you can see and change what the router is doing.
+    <a href="/circuit-breaker/">How the breaker works.</a>
+  </p>
+
+  <h2>Where OpenRouter is the right call</h2>
+  <ul>
+    <li><strong>Prototyping.</strong> Nothing to deploy is a real feature when you're proving an idea.</li>
+    <li><strong>No infrastructure budget or appetite.</strong> You send HTTP, they run everything.</li>
+    <li><strong>One key for models you'd otherwise need separate accounts for.</strong> OpenRouter aggregates many hosts, so a niche or open-source model is one key away instead of one signup away. With Busbar you bring your own provider accounts.</li>
+    <li><strong>The marketplace.</strong> A browsable, price-comparable catalog of 400+ models, with routing informed by community usage data <a href="#references">[2]</a>. Busbar has no equivalent; you pick your providers and pools in config.</li>
+  </ul>
+  <p>
+    If that's your situation, use OpenRouter. Busbar would just be operational weight you don't
+    need yet.
+  </p>
+  <p>
+    When the prototype becomes production infrastructure, and the data path becomes a compliance
+    question, that's the problem Busbar was built for.
+    <a href="/getting-started/">Get started in five minutes</a>, or read
+    <a href="/why-busbar/">why Busbar exists</a>.
+  </p>
+
+  <h2 id="references">References</h2>
+  <p class="note">
+    Facts about OpenRouter checked against openrouter.ai on July 9, 2026. If something here is
+    out of date, <a href="https://github.com/MattJackson/busbarAI/issues">tell us</a> and we'll
+    fix it.
+  </p>
+  <ol>
+    <li><a href="https://openrouter.ai/docs/faq">OpenRouter FAQ</a>: credit purchase fees, pass-through inference pricing, logging policy, and fallback behavior.</li>
+    <li><a href="https://openrouter.ai">openrouter.ai</a>: model and provider counts, marketplace, and provisioning.</li>
+  </ol>
+</PageLayout>

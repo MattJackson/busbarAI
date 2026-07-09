@@ -1,0 +1,28 @@
+---
+// Starlight `SocialIcons` override: prepends the website's nav links (Blog, Download)
+// to the docs header so docs pages can reach the rest of the site, then renders the
+// default social icons (GitHub, Discord) after them.
+import Default from '@astrojs/starlight/components/SocialIcons.astro';
+---
+
+<a class="site-link" href="/blog/">Blog</a>
+<a class="site-link" href="/download/">Download</a>
+<Default><slot /></Default>
+
+<style>
+  .site-link {
+    color: var(--sl-color-gray-2);
+    font-size: var(--sl-text-sm);
+    font-weight: 500;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .site-link:hover {
+    color: var(--sl-color-white);
+  }
+  @media (max-width: 50rem) {
+    .site-link {
+      display: none;
+    }
+  }
+</style>

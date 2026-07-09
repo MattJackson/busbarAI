@@ -12,6 +12,9 @@ export default defineConfig({
       favicon: '/favicon.svg',
       logo: { src: './src/assets/busbar-glyph.svg', alt: 'Busbar' },
       customCss: ['./src/styles/global.css'],
+      // Docs header carries the website's nav links (Blog, Download) so docs
+      // pages can reach the rest of the site — see DocsHeaderLinks.astro.
+      components: { SocialIcons: './src/components/DocsHeaderLinks.astro' },
       head: [
         // Privacy-friendly analytics by Plausible, self-hosted through a first-party
         // proxy at /relay/* (adblock-resistant). Docs pages; custom pages get the

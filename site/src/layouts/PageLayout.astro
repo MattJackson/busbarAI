@@ -1,11 +1,19 @@
 ---
-// Busbar Privacy Policy, standalone Astro page matching homepage nav + footer styling.
+// Shared chrome for standalone website pages (FAQ, /vs/*): homepage nav + footer,
+// article typography with table support. Docs pages use Starlight; this is for
+// pages that are part of the website, not the documentation.
 import glyphPrimary from '../assets/busbar-primary.svg';
 import Nav from '../components/Nav.astro';
 import Analytics from '../components/Analytics.astro';
 
+interface Props {
+  title: string;
+  description: string;
+}
+
+const { title, description } = Astro.props;
+
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
-const DOCS = '/why-busbar/';
 const YEAR = new Date().getFullYear();
 
 const ORG = { '@context': 'https://schema.org', '@type': 'Organization', name: 'Busbar', url: 'https://getbusbar.com', logo: 'https://getbusbar.com/favicon.svg', sameAs: ['https://github.com/MattJackson/busbarAI'] };
@@ -17,15 +25,17 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Privacy Policy, Busbar</title>
-    <meta
-      name="description"
-      content="Privacy Policy for getbusbar.com. Busbar is a self-hosted LLM gateway, your prompts, keys, and traffic never leave your infrastructure."
-    />
+    <title>{title}</title>
+    <meta name="description" content={description} />
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <meta name="color-scheme" content="light" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:image" content="https://getbusbar.com/og-card.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content="https://getbusbar.com/og-card.png" />
     <Analytics />
     <script type="application/ld+json" set:html={JSON.stringify(ORG)} />
     <script type="application/ld+json" set:html={JSON.stringify(WEBSITE)} />
@@ -33,105 +43,10 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
   <body>
     <Nav />
 
-    <main class="legal-wrap">
-      <div class="legal-doc">
-        <p class="last-updated">Last updated: June 2026</p>
-        <h1>Privacy Policy</h1>
-        <p class="intro">
-          This Privacy Policy describes how <strong>Merseyway LLC d/b/a Busbar</strong>
-          ("Busbar", "we", "us", or "our") handles information in connection with the
-          <strong>getbusbar.com</strong> website. Our address is
-          30 N Gould St Ste R, Sheridan, WY 82801, USA.
-        </p>
-
-        <h2>1. The Busbar software does not send your data to us</h2>
-        <p>
-          Busbar is an open-source, self-hosted LLM gateway. When you run Busbar on your own
-          infrastructure, <strong>we do not receive, collect, store, or have any access to</strong>:
-        </p>
-        <ul>
-          <li>Your prompts or completions</li>
-          <li>Your LLM provider API keys or Busbar virtual keys</li>
-          <li>Your LLM traffic, request metadata, or model usage patterns</li>
-          <li>Any observability, tracing, or metrics data</li>
-        </ul>
-        <p>
-          Busbar does not include telemetry that phones home to us. Any observability data
-          (Prometheus metrics, OTLP traces) goes only to the endpoints you configure on your own
-          infrastructure, never to us.
-        </p>
-
-        <h2>2. The getbusbar.com website</h2>
-        <p>
-          The getbusbar.com website is a static site hosted on
-          <strong>GitHub Pages</strong> (operated by GitHub, Inc., a subsidiary of Microsoft). We
-          do not set tracking cookies, use third-party ad networks, or run behavioral tracking
-          tools on this website.
-        </p>
-        <p>
-          We use <strong>Plausible Analytics</strong> for privacy-friendly, aggregate page
-          analytics. Plausible is cookieless and does not collect or store any personal data or
-          personally identifiable information: it sets no cookies, does not track you across
-          websites or over time, and does not fingerprint your device. All data is aggregated and
-          contains no information that could identify an individual visitor. Analytics data is
-          processed within the EU. For details, see{' '}
-          <a href="https://plausible.io/data-policy">Plausible's Data Policy</a>.
-        </p>
-        <p>
-          Because the site is served through GitHub Pages, GitHub may process standard web
-          server request metadata, such as IP addresses, browser user-agent strings, and
-          request timestamps, as part of delivering pages to you. This processing is governed
-          by{' '}
-          <a href="https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement">
-            GitHub's General Privacy Statement
-          </a>
-          .
-        </p>
-        <p>
-          Site-wide search is powered by <strong>Pagefind</strong>, a client-side search library.
-          Your search queries are processed entirely in your browser and are never transmitted to
-          us or any third-party server.
-        </p>
-
-        <h2>3. Information you choose to send us</h2>
-        <p>
-          If you contact us by email or open an issue or discussion on our
-          <a href={GITHUB}>GitHub repository</a>, we will receive whatever information you
-          include in that message. We use this information solely to respond to your inquiry or
-          address the reported issue. We do not sell, rent, or share this information with third
-          parties for marketing purposes.
-        </p>
-
-        <h2>4. No sale of personal data</h2>
-        <p>
-          We do not sell personal information. We do not share personal information with
-          third-party advertisers.
-        </p>
-
-        <h2>5. Children</h2>
-        <p>
-          This website is not directed to children under 13 years of age, and we do not
-          knowingly collect personal information from children under 13.
-        </p>
-
-        <h2>6. Changes to this policy</h2>
-        <p>
-          We may update this Privacy Policy from time to time. The "Last updated" date at the
-          top of this page reflects the date of the most recent revision. Continued use of the
-          website after a revision constitutes acceptance of the updated policy.
-        </p>
-
-        <h2>7. Contact</h2>
-        <p>
-          For privacy-related questions or requests, contact us at:
-        </p>
-        <address>
-          <strong>Merseyway LLC d/b/a Busbar</strong><br />
-          Email: <a href="mailto:hello@getbusbar.com">hello@getbusbar.com</a><br />
-          30 N Gould St Ste R<br />
-          Sheridan, WY 82801, USA
-        </address>
-      </div>
+    <main class="page-wrap">
+      <article class="page-doc">
+        <slot />
+      </article>
     </main>
 
     <footer class="footer">
@@ -162,6 +77,8 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
           </div>
           <div>
             <h4>Project</h4>
+            <a href="/download/">Download</a>
+            <a href="/changelog/">Changelog</a>
             <a href={GITHUB}>GitHub</a>
             <a href={`${GITHUB}/blob/main/LICENSE`}>License (AGPL-3.0)</a>
             <a href="/llms.txt">llms.txt</a>
@@ -220,19 +137,18 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
       .nav-links { display: flex; align-items: center; gap: 26px; font-size: 14.5px; font-weight: 500; }
       .nav-links a { color: var(--charcoal); transition: color 0.15s; }
       .nav-links a:hover { color: var(--slate); }
-      .nav-links a.ghost { color: var(--muted); }
 
-      /* LEGAL CONTENT */
-      .legal-wrap {
+      /* PAGE CONTENT */
+      .page-wrap {
         min-height: calc(100vh - 64px - 200px);
         padding: 72px 28px 96px;
         background: var(--bg);
       }
-      .legal-doc {
-        max-width: 720px;
+      .page-doc {
+        max-width: 780px;
         margin: 0 auto;
       }
-      .last-updated {
+      .page-doc .kicker {
         font-size: 13px;
         color: var(--muted);
         margin: 0 0 14px;
@@ -240,13 +156,13 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
         letter-spacing: 0.04em;
         font-weight: 600;
       }
-      .legal-doc h1 {
+      .page-doc h1 {
         font-size: clamp(28px, 4vw, 42px);
         font-weight: 800;
         margin: 0 0 24px;
         color: var(--slate);
       }
-      .legal-doc .intro {
+      .page-doc .intro {
         font-size: 17px;
         color: #334155;
         line-height: 1.7;
@@ -254,48 +170,109 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
         padding-bottom: 32px;
         border-bottom: 1px solid var(--line);
       }
-      .legal-doc h2 {
-        font-size: 19px;
+      .page-doc h2 {
+        font-size: 22px;
         font-weight: 700;
         color: var(--slate);
-        margin: 40px 0 14px;
+        margin: 44px 0 14px;
       }
-      .legal-doc p {
+      .page-doc h3 {
+        font-size: 17px;
+        font-weight: 700;
+        color: var(--slate);
+        margin: 30px 0 10px;
+      }
+      .page-doc p {
         font-size: 15.5px;
         color: #334155;
         line-height: 1.75;
         margin: 0 0 16px;
       }
-      .legal-doc ul {
+      .page-doc ul {
         margin: 0 0 16px;
         padding-left: 22px;
       }
-      .legal-doc ul li {
+      .page-doc ul li {
         font-size: 15.5px;
         color: #334155;
         line-height: 1.75;
-        margin-bottom: 6px;
+        margin-bottom: 8px;
       }
-      .legal-doc a {
+      .page-doc ol {
+        margin: 0 0 16px;
+        padding-left: 22px;
+      }
+      .page-doc ol li {
+        font-size: 14.5px;
+        color: #334155;
+        line-height: 1.7;
+        margin-bottom: 8px;
+      }
+      .page-doc a {
         color: #4d7c0f;
         text-decoration: underline;
         text-underline-offset: 3px;
       }
-      .legal-doc a:hover {
-        color: var(--slate);
+      .page-doc a:hover { color: var(--slate); }
+      .page-doc strong { color: var(--slate); }
+      .page-doc code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.9em;
+        background: var(--bg-soft);
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        padding: 1px 5px;
+        color: var(--charcoal);
       }
-      .legal-doc address {
-        font-style: normal;
-        font-size: 15.5px;
-        color: #334155;
-        line-height: 1.9;
+      .page-doc .note {
+        font-size: 14px;
+        color: var(--muted);
+        line-height: 1.7;
         background: var(--bg-soft);
         border: 1px solid var(--line);
         border-radius: 10px;
-        padding: 18px 22px;
-        margin-top: 12px;
+        padding: 14px 18px;
+        margin: 0 0 16px;
       }
-      .legal-doc strong { color: var(--slate); }
+      .page-doc .note a { color: #4d7c0f; }
+
+      /* COMPARISON TABLE */
+      .page-doc .cmp {
+        overflow-x: auto;
+        margin: 0 0 16px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+      }
+      .page-doc table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+      .page-doc th {
+        text-align: left;
+        font-size: 12.5px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        background: var(--bg-soft);
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--line);
+        white-space: nowrap;
+      }
+      .page-doc td {
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--line);
+        color: #334155;
+        vertical-align: top;
+      }
+      .page-doc tr:last-child td { border-bottom: none; }
+      .page-doc td:first-child {
+        font-weight: 600;
+        color: var(--slate);
+        white-space: nowrap;
+      }
+      .page-doc td a { color: #4d7c0f; }
 
       /* FOOTER */
       .footer { background: #fff; padding: 64px 0 32px; border-top: 1px solid var(--line); }
@@ -318,9 +295,9 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
         html { overflow-x: clip; }
         .nav-links { gap: 14px; }
         .footer-cols { grid-template-columns: 1fr 1fr; }
-        .legal-wrap { padding: 40px 16px 64px; }
-        .legal-doc h1 { font-size: clamp(24px, 7vw, 36px); }
-        .legal-doc h2 { font-size: 17px; }
+        .page-wrap { padding: 40px 16px 64px; }
+        .page-doc h1 { font-size: clamp(24px, 7vw, 36px); }
+        .page-doc h2 { font-size: 19px; }
       }
       @media (max-width: 420px) {
         .wrap { padding: 0 16px; }

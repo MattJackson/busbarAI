@@ -1,0 +1,143 @@
+---
+import PageLayout from '../layouts/PageLayout.astro';
+---
+
+<PageLayout
+  title="FAQ — Busbar"
+  description="Straight answers to the questions we get most: comparisons, mid-stream failure, dependencies, provider coverage, and what the AGPL means for you."
+>
+  <p class="kicker">FAQ</p>
+  <h1>Frequently asked questions</h1>
+  <p class="intro">
+    Straight answers to the questions we get most. If yours isn't here, ask on
+    <a href="https://discord.gg/f5XtWw4NT">Discord</a> or open a
+    <a href="https://github.com/MattJackson/busbarAI/discussions">discussion</a>.
+  </p>
+
+  <h2>Which models does Busbar support?</h2>
+  <p>
+    All of them, and here's why that isn't a boast. Models are built by providers: Anthropic,
+    DeepSeek, Z.ai, Alibaba, Moonshot, xAI. Each provider speaks a language for reaching its
+    models: a wire protocol, and there are only about six in the world (OpenAI-compatible,
+    Anthropic, Gemini, Bedrock, Cohere, Responses). Busbar speaks all six. So it supports every
+    provider, and therefore every model, out of the box. There is no model list to be on,
+    because a model name in Busbar is a config value you define, pointed at whichever provider
+    serves it.
+  </p>
+  <p>
+    In practice: GPT and o-series (OpenAI), Gemini (Google), Claude (Anthropic or Bedrock),
+    Qwen (DashScope), DeepSeek, GLM (Z.ai), Mistral, Grok (xAI), Kimi (Moonshot), Command
+    (Cohere), and Llama on Groq, Together, Fireworks, and friends, via the 41 vetted providers
+    in the shipped catalog. Community fine-tunes ride the hosts that serve them: DeepInfra,
+    Novita, Featherless, and the other aggregators. And when a new model ships, there is
+    nothing to wait for: it works the moment its provider serves it, because the model name is
+    your config value, not our release note. If you want a hosted aggregator's entire menu,
+    OpenRouter itself is a catalog entry, so anything it serves is one lane away, with Busbar's
+    failover and budgets on top. The full maker-to-language lookup lives on the
+    <a href="/providers/#who-speaks-what-the-model-landscape-as-a-lookup">providers page</a>.
+  </p>
+
+  <h2>Provider X isn't in your catalog.</h2>
+  <p>
+    The catalog is a convenience, not a boundary. Any provider that speaks one of the six
+    protocols, including any OpenAI-compatible endpoint and local runtimes like Ollama or vLLM,
+    is a few lines in your own <code>providers.yaml</code>: a name, a <code>base_url</code>, the
+    env var holding its key. <a href="/providers/">Adding a provider</a> walks through it.
+  </p>
+  <p>
+    The genuine gap is a provider whose wire format is none of the six. That needs new
+    translator code, and it's the one case where you'd wait on us.
+  </p>
+
+  <h2>Why not just use LiteLLM?</h2>
+  <p>
+    If you want an in-process Python router library with a big preconfigured catalog, LiteLLM
+    is the right call, and we say so. On coverage itself the counts mislead: LiteLLM lists
+    providers, Busbar speaks protocols, and any provider on one of the six, including every
+    OpenAI-compatible endpoint, is a minute of YAML in your own <code>providers.yaml</code>. If
+    the gateway is production infrastructure carrying all of
+    your LLM traffic, the differences start to matter: no privileged protocol, a fault-attributed
+    circuit breaker, and a runtime footprint measured in microseconds and megabytes. The full
+    comparison, with their numbers cited to their docs, is at
+    <a href="/vs/litellm/">Busbar vs LiteLLM</a>.
+  </p>
+
+  <h2>Why not just use OpenRouter?</h2>
+  <p>
+    Different side of a different line. OpenRouter is hosted: every prompt transits their
+    servers, and that's fine for many teams and disqualifying for others. Busbar runs in your
+    infrastructure; the only external traffic is the provider calls you configure. The rest is
+    at <a href="/vs/openrouter/">Busbar vs OpenRouter</a>.
+  </p>
+
+  <h2>We're locked to one provider for compliance reasons. Why add a gateway now?</h2>
+  <p>
+    Because Busbar is valuable before the second provider exists. Say your data involves PHI and
+    your BAA covers AWS, so everything runs through Bedrock. Point your Bedrock SDK's
+    <code>endpoint_url</code> at Busbar today and change nothing else: same-protocol traffic
+    passes through byte-for-byte, and since Busbar runs in your infrastructure, no new entity
+    enters the data path. Your BAAs remain with your providers.
+  </p>
+  <p>
+    That bare passthrough is already a safer posture than calling the provider directly, before
+    you enable a single feature. Your provider key moves out of every app deployment and into one
+    process, so a leaked app credential is no longer a leaked provider account, and rotation is a
+    restart, not a deployment sweep. <code>max_concurrent</code> caps a runaway loop at your
+    ceiling instead of your bill. Every request becomes visible in <code>/metrics</code> and
+    <code>/stats</code> where direct SDK calls are invisible. And the request path is hardened:
+    SSRF-guarded upstreams, constant-time token checks, body caps, secrets never logged. We run
+    Busbar exactly this way ourselves: one provider, straight passthrough, no features enabled.
+  </p>
+  <p>
+    Turn on governance when you want more: per-team virtual keys with budget caps and rate
+    limits, spend tracked per key and queryable, and a per-request audit webhook. All of it on
+    your one provider, today.
+  </p>
+  <p>
+    Then the constraint moves, as constraints do: you sign a direct BAA with Anthropic, or a
+    cheaper model fits a workload, or a provider has a bad month. Adding that backend is a lane
+    in <code>config.yaml</code>. Your application code, written against the Bedrock SDK, never
+    changes and never learns which model answered. Without the gateway already in place, that
+    same day starts with rewriting every LLM integration you own. The endpoint swap is a
+    one-line change; the future it buys is free.
+  </p>
+
+  <h2>What happens if a provider fails mid-stream?</h2>
+  <p>
+    Before the first byte reaches your client, Busbar reroutes to the next lane in the pool,
+    even on a streaming request. That boundary covers most real failures: connection errors,
+    timeouts, rate limits, and 5xx responses all arrive before any content does.
+  </p>
+  <p>
+    After the first byte, no gateway can save the request, and you should distrust any that
+    claims otherwise: a stream is a stateful continuation, a byte sent cannot be unsent, and a
+    different provider cannot resume another's generation. What Busbar does instead is record
+    the fault against the lane and emit a clean, native-format error in your protocol, so your
+    client library fails fast instead of hanging. The full boundary is documented at
+    <a href="/failover/">In-flight failover</a>.
+  </p>
+
+  <h2>Do I need Redis or a database?</h2>
+  <p>
+    No. Breaker state, rate windows, and routing state live in the process. Governance, if you
+    enable it, uses an embedded SQLite file. There is nothing to provision, and "deploy" means
+    copying one ~9 MB binary and a YAML file.
+  </p>
+
+  <h2>What does the AGPL actually require from me?</h2>
+  <p>
+    Running unmodified Busbar inside your company, as a network service, triggers no obligation
+    to publish anything. Your configs, your prompts, and the applications that call Busbar are
+    yours; using a program over a network doesn't make your code a derivative of it.
+  </p>
+  <p>
+    The AGPL's network clause applies when you modify Busbar itself and let others use the
+    modified version over a network: then you must offer them the modified source. If your legal
+    team wants it in writing, that's
+    <a href="https://github.com/MattJackson/busbarAI/blob/main/LICENSE">§13 of the license</a>,
+    and this paragraph isn't legal advice.
+  </p>
+  <p>
+    Commercial licensing is available; <a href="mailto:hello@getbusbar.com">contact us</a>.
+  </p>
+</PageLayout>
