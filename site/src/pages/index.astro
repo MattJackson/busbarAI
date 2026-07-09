@@ -36,8 +36,8 @@ const features = [
   },
   {
     title: 'Governance & hard budget caps',
-    body: 'Issue virtual keys with daily, monthly, or all-time spend caps and per-key RPM/TPM limits. Restrict a key to specific model pools, cap staging independently of production, and revoke instantly. Usage is tracked per key and queryable via the admin API.',
-    enables: 'Cost control enforced at the gateway, not self-policed by callers.',
+    body: 'Issue virtual keys with daily, monthly, or all-time spend caps and per-key RPM/TPM limits. A request that would break its cap is rejected before it is forwarded: the budget check and the charge are one atomic operation, so a concurrent burst can’t race past the limit. Scope keys to pools, revoke instantly, query spend via the admin API.',
+    enables: 'Budgets enforced before the request runs, not discovered on the invoice.',
   },
   {
     title: 'Native TLS & mutual TLS',

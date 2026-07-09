@@ -6,8 +6,10 @@ description: Budgets, rate limits, spend tracking, and pool access; what they do
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 Governance gives you a control plane over **who** can use **which** models and **how much**.
-It's off by default; turn it on when you need budgets, rate limits, spend visibility, or access
-control. Each capability below has two views; read **What it does** for the why, flip to
+Enforcement happens **before the request is forwarded**: the budget check and the charge are a
+single atomic operation, and a request that would exceed its cap or RPM limit is rejected at
+the gate, not reconciled after the bill. It's off by default; turn it on when you need budgets,
+rate limits, spend visibility, or access control. Each capability below has two views; read **What it does** for the why, flip to
 **Configure it** for the exact YAML and commands.
 
 <svg viewBox="0 0 760 270" role="img" aria-label="A request carrying a virtual key passes through the governance gate, which checks the allowed-pools ACL, the budget cap, and the rate limit; if all pass the request reaches the pool and upstream, otherwise it is denied with a 403 or 429." style="width:100%;height:auto;max-width:760px;font-family:ui-sans-serif,system-ui,sans-serif;">

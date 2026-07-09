@@ -91,8 +91,9 @@ import PageLayout from '../layouts/PageLayout.astro';
   </p>
   <p>
     Turn on governance when you want more: per-team virtual keys with budget caps and rate
-    limits, spend tracked per key and queryable, and a per-request audit webhook. All of it on
-    your one provider, today.
+    limits, spend tracked per key and queryable, and a per-request audit webhook. Caps are
+    enforced before a request is forwarded, atomically, so a runaway loop stops at the limit
+    instead of showing up on the invoice. All of it on your one provider, today.
   </p>
   <p>
     Then the constraint moves, as constraints do: you sign a direct BAA with Anthropic, or a
