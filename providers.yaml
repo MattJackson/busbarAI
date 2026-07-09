@@ -9,16 +9,16 @@
 #
 # busbar's thesis is "protocols, not providers": it implements a small set of wire protocols
 # (anthropic, openai, gemini, bedrock, responses, cohere) losslessly, and any provider speaking one of
-# those protocols is just a catalog entry here — no new code. A client speaking any protocol can
+# those protocols is just a catalog entry here - no new code. A client speaking any protocol can
 # target any provider; busbar translates through its superset IR when they differ.
 #
 # Auth is a per-protocol seam, not a single scheme: most providers use `Authorization: Bearer <key>`,
 # gemini uses the `x-goog-api-key` header, and bedrock signs each request with AWS SigV4 (see below).
 # Future enterprise backends (Azure OpenAI, Google Vertex AI) plug into this same seam as auth
-# adapters — see docs/roadmap.md. HTTP-status errors (429/5xx/401/...) are classified by the circuit
+# adapters - see docs/roadmap.md. HTTP-status errors (429/5xx/401/...) are classified by the circuit
 # breaker without an error_map; error_map is only for provider-specific JSON codes.
 
-# ── Anthropic protocol (/v1/messages) ───────────────────────────────────────────────────────────
+# -- Anthropic protocol (/v1/messages) -----------------------------------------------------------
 anthropic:
   protocol: anthropic
   base_url: https://api.anthropic.com
@@ -34,7 +34,7 @@ z.ai:
     "1113": billing
     "1302": rate_limit
 
-# ── OpenAI Chat Completions protocol (/v1/chat/completions) ──────────────────────────────────────
+# -- OpenAI Chat Completions protocol (/v1/chat/completions) --------------------------------------
 # Any provider exposing an OpenAI-compatible chat-completions endpoint. The `base_url` is composed
 # with `/v1/chat/completions`; the entries below place each provider's prefix accordingly.
 openai:
@@ -249,7 +249,7 @@ wandb:
 
 # Azure OpenAI is the OpenAI chat-completions protocol behind a different auth shape: the `api-key`
 # header (not bearer), with the API version and deployment in the path. Its host and deployment are
-# per-resource, so it is not shipped as a live entry — copy this template into your config.yaml
+# per-resource, so it is not shipped as a live entry - copy this template into your config.yaml
 # providers map and fill in your values:
 #
 #   azure:
@@ -260,7 +260,7 @@ wandb:
 #     error_map: {}
 #     api_key_env: AZURE_OPENAI_KEY
 
-# ── OpenAI Responses protocol (/v1/responses) ────────────────────────────────────────────────────
+# -- OpenAI Responses protocol (/v1/responses) ----------------------------------------------------
 # The newer stateful OpenAI surface, distinct from chat completions. Bearer auth + a fixed path.
 responses:
   protocol: responses
@@ -269,7 +269,7 @@ responses:
     insufficient_quota: billing
     rate_limit_exceeded: rate_limit
 
-# ── Google Gemini protocol (generateContent) ─────────────────────────────────────────────────────
+# -- Google Gemini protocol (generateContent) -----------------------------------------------------
 # The path embeds the model and auth uses x-goog-api-key, both handled by the gemini protocol.
 gemini:
   protocol: gemini
@@ -277,10 +277,10 @@ gemini:
   error_map:
     RESOURCE_EXHAUSTED: rate_limit
 
-# ── AWS Bedrock protocol (Converse / ConverseStream) ─────────────────────────────────────────────
+# -- AWS Bedrock protocol (Converse / ConverseStream) ---------------------------------------------
 # Auth is native AWS SigV4: set this provider's api_key_env to the AWS credentials as
 # `ACCESS_KEY_ID:SECRET_ACCESS_KEY` or `ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN`. The region is
-# parsed from the base_url host (`bedrock-runtime.<region>.amazonaws.com`) — set it to your region.
+# parsed from the base_url host (`bedrock-runtime.<region>.amazonaws.com`) - set it to your region.
 # Streaming requests use ConverseStream; busbar decodes the binary
 # application/vnd.amazon.eventstream frames and translates them to the caller's protocol.
 bedrock:
@@ -290,7 +290,7 @@ bedrock:
     ThrottlingException: rate_limit
     ServiceQuotaExceededException: billing
 
-# ── Cohere v2 Chat protocol (/v2/chat) ───────────────────────────────────────────────────────────
+# -- Cohere v2 Chat protocol (/v2/chat) -----------------------------------------------------------
 # Cohere's Command family via the v2 Chat API. Bearer auth; the protocol targets /v2/chat. Errors
 # are signalled by HTTP status (classified by the breaker), so error_map is empty.
 cohere:
