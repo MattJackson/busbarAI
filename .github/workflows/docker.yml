@@ -8,12 +8,15 @@ name: Docker
 #   - workflow_dispatch: publish a `test` tag only — end-to-end pipeline check
 #     without cutting a release.
 #
-# Supply chain: images are signed with cosign (keyless OIDC) and carry a GitHub
-# build-provenance attestation, matching the release binaries. Verify with:
-#   cosign verify docker.io/getbusbar/busbar:<tag> \
+# Supply chain: both registries carry a GitHub build-provenance attestation
+# (stored by GitHub — no extra tags on the repo). Verify with:
+#   gh attestation verify oci://index.docker.io/getbusbar/busbar:<tag> --repo MattJackson/busbarAI
+# Cosign signatures are additionally pushed for the GHCR image only — cosign
+# stores signatures as sha256-*.sig tags, which we keep off the Docker Hub tag
+# list deliberately (clean public page; GHCR carries them for cosign users):
+#   cosign verify ghcr.io/mattjackson/busbar:<tag> \
 #     --certificate-identity-regexp 'https://github.com/MattJackson/busbarAI/\.github/workflows/docker\.yml@.*' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
-#   gh attestation verify oci://docker.io/getbusbar/busbar:<tag> --repo MattJackson/busbarAI
 
 on:
   push:
@@ -139,11 +142,10 @@ jobs:
           images: |
             ${{ env.DOCKERHUB_IMAGE }}
             ${{ env.GHCR_IMAGE }}
-          # version resolved → 1.2.3 / 1.2 / 1 / latest; bare dispatch → `test` only.
+          # version resolved → X.Y.Z + latest (exact pins only, no floating
+          # major/minor aliases — one consistent tag shape); bare dispatch → `test` only.
           tags: |
             type=semver,pattern={{version}},value=v${{ steps.ver.outputs.ver }},enable=${{ steps.ver.outputs.ver != '' }}
-            type=semver,pattern={{major}}.{{minor}},value=v${{ steps.ver.outputs.ver }},enable=${{ steps.ver.outputs.ver != '' }}
-            type=semver,pattern={{major}},value=v${{ steps.ver.outputs.ver }},enable=${{ steps.ver.outputs.ver != '' }}
             type=raw,value=test,enable=${{ steps.ver.outputs.ver == '' }}
           labels: |
             org.opencontainers.image.title=busbar
@@ -165,12 +167,13 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign images (keyless)
+      # GHCR only: cosign stores signatures as sha256-*.sig tags, which we keep
+      # off the Docker Hub tag list (clean public page). Hub verification runs
+      # through the GitHub build-provenance attestation instead.
+      - name: Sign GHCR image (keyless)
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
-        run: |
-          cosign sign --yes "${DOCKERHUB_IMAGE}@${DIGEST}"
-          cosign sign --yes "${GHCR_IMAGE}@${DIGEST}"
+        run: cosign sign --yes "${GHCR_IMAGE}@${DIGEST}"
 
       - name: Attest build provenance (Docker Hub)
         uses: actions/attest-build-provenance@v4
