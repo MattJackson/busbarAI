@@ -13,8 +13,8 @@ variables.
 |---|---|---|
 | `BUSBAR_PROVIDERS` | `/etc/busbar/providers.yaml` | Path to the provider catalog. |
 | `BUSBAR_CONFIG` | `/etc/busbar/config.yaml` | Path to the deployment config. |
-| Provider key vars |, | Named by each provider's `api_key_env` (e.g. `ANTHROPIC_KEY`). |
-| Token/secret vars |, | Anything referenced via `${VAR}` in either file (client tokens, admin token, …). |
+| Provider key vars | n/a | Named by each provider's `api_key_env` (e.g. `ANTHROPIC_KEY`). |
+| Token/secret vars | n/a | Anything referenced via `${VAR}` in either file (client tokens, admin token, …). |
 
 Startup is fail-loud: an unset `${VAR}`, an unknown provider reference, an unknown
 protocol or auth mode, or an invalid `on_exhausted` action stops the process with a
@@ -114,8 +114,8 @@ All metrics are Prometheus counters/histograms exposed at `/metrics`.
 | `busbar_key_tokens_total` | gauge | `key` | Tokens consumed by each virtual key in the current budget window. Only emitted when governance is enabled. |
 | `busbar_lane_state` | gauge | `pool`, `lane` | Circuit-breaker health per lane: `0` = Closed, `1` = HalfOpen, `2` = Open (tripped). Side-effect-free at scrape. |
 | `busbar_route_policy_selections_total` | counter | `pool`, `policy` | Requests where a routing policy (webhook/script/native) produced a usable ranked order. Only incremented on a successful `Order` outcome; abstains and on-error fallbacks are not counted. |
-| `busbar_webhook_logs_dropped_total` | counter |, | Request-log webhook deliveries shed because the in-flight delivery pool was saturated (a slow/unreachable webhook endpoint). A non-zero rate means request logs are being silently dropped, scale the endpoint or alert. |
-| `busbar_billing_truncated_total` | counter |, | Same-protocol non-stream responses whose body exceeded the translate-body cap, so the terminal `usage` frame was missed and the request billed zero tokens (the client still got a full response). A non-zero rate signals an over-cap billing gap. |
+| `busbar_webhook_logs_dropped_total` | counter | n/a | Request-log webhook deliveries shed because the in-flight delivery pool was saturated (a slow/unreachable webhook endpoint). A non-zero rate means request logs are being silently dropped, scale the endpoint or alert. |
+| `busbar_billing_truncated_total` | counter | n/a | Same-protocol non-stream responses whose body exceeded the translate-body cap, so the terminal `usage` frame was missed and the request billed zero tokens (the client still got a full response). A non-zero rate signals an over-cap billing gap. |
 
 `/metrics` requires a valid client token in `token` mode (or a virtual key under
 governance), it is treated as an information-disclosure surface and goes through
@@ -267,7 +267,7 @@ Create-key fields:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `name` | string |: | Required label. |
+| `name` | string | n/a | Required label. |
 | `allowed_pools` | list<string> | `[]` | Pools/models this key may target. Empty = all allowed. Violations → `403`. |
 | `max_budget_cents` | integer | none | Spend cap for the budget window; exceeded → `429` (or `400` for Bedrock ingress). |
 | `budget_period` | string | `total` | `total` (all-time), `daily` (UTC midnight), or `monthly` (UTC first-of-month). |

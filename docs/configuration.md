@@ -95,7 +95,7 @@ A map of provider name → `ProviderDef`. The shipped catalog is a curated set o
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `protocol` | string | no | `anthropic` | One of the six supported wire protocols: `anthropic`, `openai`, `gemini`, `bedrock`, `responses`, `cohere`. An unknown protocol is a startup error. |
-| `base_url` | string | **yes** |: | Scheme + host (+ optional path prefix). Must start with `https://` for external endpoints. An `http://` URL in the catalog is not blocked at parse time but will be rejected by the SSRF guard on deployment use. Trailing slash is trimmed. |
+| `base_url` | string | **yes** | n/a | Scheme + host (+ optional path prefix). Must start with `https://` for external endpoints. An `http://` URL in the catalog is not blocked at parse time but will be rejected by the SSRF guard on deployment use. Trailing slash is trimmed. |
 | `error_map` | map<string, string> | no | `{}` | Maps a provider-specific error **code string** (from the JSON error body) to a canonical disposition class. Valid values: `rate_limit`, `overloaded`, `server_error`, `timeout`, `network`, `auth`, `billing`, `client_error`, `context_length`. An unrecognized class value is a startup error. HTTP-status classification (401→auth, 429→rate_limit, 5xx→server_error, etc.) applies automatically without an `error_map`; this field is only for provider-specific JSON codes. |
 | `path` | string | no | Protocol's standard path | Overrides the upstream request path appended to `base_url`. Must begin with `/`. Use when the API version is in `base_url` and the endpoint path differs from the protocol default (e.g. `/chat/completions` without `/v1`). |
 | `auth` | string | no | Protocol's native auth | `bearer` (sends `Authorization: Bearer <key>`) or `api-key` (sends `api-key: <key>`, for Azure OpenAI). When unset, each protocol uses its native scheme: bearer for anthropic/openai/responses/cohere, `x-goog-api-key` for gemini, AWS SigV4 for bedrock. Setting `auth: api-key` forces the `api-key:` header regardless of protocol (rarely useful outside Azure OpenAI). |
@@ -208,7 +208,7 @@ auth:
 |---|---|---|---|---|
 | `mode` | string | no | `none` | `token`, `passthrough`, or `none` (case-insensitive). An unknown value is a startup error. |
 | `client_tokens` | list<string> | no | `[]` | Allowed bearer tokens (env-interpolated). Required to be non-empty when `mode: token`. All comparisons are constant-time (no timing oracle). |
-| `token` | string | no |, | **Removed in 1.0.0.** The `auth` block now rejects unknown keys, so setting `token:` is a hard parse error (`unknown field \`token\``): the gateway refuses to boot. Move its value into the `client_tokens` allowlist instead. |
+| `token` | string | no | n/a | **Removed in 1.0.0.** The `auth` block now rejects unknown keys, so setting `token:` is a hard parse error (`unknown field \`token\``): the gateway refuses to boot. Move its value into the `client_tokens` allowlist instead. |
 
 **Token extraction order (for `token` and `passthrough` modes):** `Authorization: Bearer`, then `x-api-key`, then `x-goog-api-key`. Blank values are treated as absent.
 
@@ -238,7 +238,7 @@ Declares which catalog providers this deployment uses and supplies the env var h
 
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `api_key_env` | string | **yes** |: | Name of the env var that holds the upstream API key or credential. Read once at boot. An unset or empty env var logs a startup warning; the lane starts but will fail upstream auth. |
+| `api_key_env` | string | **yes** | n/a | Name of the env var that holds the upstream API key or credential. Read once at boot. An unset or empty env var logs a startup warning; the lane starts but will fail upstream auth. |
 | `protocol` | string | no | Catalog value | Override the catalog protocol. Rarely needed. |
 | `base_url` | string | no | Catalog value | Override the upstream base URL. Must use `https://` for public/external hosts. Plain `http://` is permitted only for private or loopback hosts (e.g. a local Ollama or vLLM instance). Cloud-metadata hosts are blocked regardless of scheme (see SSRF guard). |
 | `error_map` | map<string, string> | no | `{}` merged onto catalog | Merged with the catalog's `error_map`; deployment entries win per code. |
@@ -282,8 +282,8 @@ A model is a **lane**: one model at one provider, with its own concurrency semap
 
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `provider` | string | **yes** |: | Must name a key in this file's `providers` map. |
-| `max_concurrent` | integer | **yes** |: | Maximum simultaneous in-flight requests for this lane (semaphore size). Must be ≥ 1. |
+| `provider` | string | **yes** | n/a | Must name a key in this file's `providers` map. |
+| `max_concurrent` | integer | **yes** | n/a | Maximum simultaneous in-flight requests for this lane (semaphore size). Must be ≥ 1. |
 | `max_requests` | integer | no | `-1` | Lifetime request budget. `-1` = unlimited. When the counter reaches `0` the lane is unusable. Must not be `0` (zero budget = permanently unusable = startup error). |
 | `default_max_tokens` | integer | no | `4096` | Injected **only** on a cross-protocol hop to a backend that requires `max_tokens` (Anthropic protocol) when the caller omitted it. Has no effect on same-protocol passthrough. Must be > 0 when set. |
 | `upstream_model` | string | no | the config key | The model id sent to the provider on the wire (request body for body-model protocols; URL path for path-model protocols like Bedrock/Gemini; and health probes). Defaults to the config key. Set it when the key can't be the wire id: most commonly to run the **same model behind two providers** (the keys must differ, but each needs its own provider-specific model string). Must be non-empty when set. Metrics, breaker cells, and logs still key off the config key, not this. |
@@ -365,7 +365,7 @@ pools:
 
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `target` | string | **yes** |: | Name of a model in `models`. Must be a configured model; a missing model is a startup error. |
+| `target` | string | **yes** | n/a | Name of a model in `models`. Must be a configured model; a missing model is a startup error. |
 | `weight` | integer | no | `1` | Relative selection share under smooth weighted round-robin (SWRR), computed over the currently healthy/usable members. Must be ≥ 1. `0` is a startup error. |
 | `context_max` | integer | no | none | This member's maximum context window (tokens). Used for [context-length failover](#context-length-failover). |
 | `tier` | string | no | none | Operator-declared routing tier label (e.g. `"primary"`, `"overflow"`, `"large"`, `"small"`). Inert for `route: weighted` pools. Exposed to webhook and script policies as the `tier` field on each candidate. See [`route` and `policy`](#route-and-policy). |
@@ -516,7 +516,7 @@ pools:
 | Field | Type | Default | Validation | Notes |
 |---|---|---|---|---|
 | `timeout_secs` | integer | `120` | Must be ≥ 1 | Wall-clock budget for the entire request across all hops. Exceeded → 503 immediately. (Renamed from `deadline_secs` in 1.0.0; the old key still loads via a serde alias.) |
-| `max_hops` | integer | `3` |: | Maximum number of failover hops for one request. A hop is one upstream attempt that fails before the first response byte. (Renamed from `cap` in 1.0.0; the old key still loads via a serde alias.) |
+| `max_hops` | integer | `3` | n/a | Maximum number of failover hops for one request. A hop is one upstream attempt that fails before the first response byte. (Renamed from `cap` in 1.0.0; the old key still loads via a serde alias.) |
 | `exclusions` | list<string> | none | Each entry must name a member of **this** pool | Model names that are **never** selected as a failover destination, primary or otherwise. Use to reserve a member for affinity-only use or to permanently exclude a degraded lane. |
 
 **Failover boundary: the first upstream byte.** Failover is only possible before the first byte of the upstream response reaches the client. Once streaming has begun (any SSE or event-stream byte sent to the client), an upstream failure cannot fail over. Busbar instead records the breaker penalty and emits an in-band SSE error event. The client is responsible for retrying at the application level.
@@ -670,13 +670,13 @@ governance:
 
 | Field | Type | Required | Default | Validation | Notes |
 |---|---|---|---|---|---|
-| `enabled` | bool | no | `false` |, | Master switch. |
-| `db_path` | string | no | `busbar-governance.db` |, | Path to the SQLite file. The directory must exist and be writable. |
+| `enabled` | bool | no | `false` | n/a | Master switch. |
+| `db_path` | string | no | `busbar-governance.db` | n/a | Path to the SQLite file. The directory must exist and be writable. |
 | `admin_token` | string | no | none (admin API disabled) | Must be non-empty (non-whitespace) when `enabled: true` | Guards the `/admin/keys` API. If absent when `enabled: true`, Busbar refuses to start (the admin API would be silently inaccessible). |
 | `price_per_request_cents` | integer | no | `1` | Negative values clamped to 0 | Flat per-request charge against each virtual key's budget (in cents). |
 | `price_per_1k_tokens_cents` | integer | no | `0` | Negative values clamped to 0 | Per-1,000-token charge (input + output tokens from response usage metadata). |
 | `budget_on_store_error` | string | no | `allow` | `allow` or `deny` | Behavior when the budget store errors during the atomic admission check-and-charge. `allow` (default) fails open, the request proceeds, preserving availability on a store hiccup. `deny` fails closed, the request is rejected, providing a hard budget guarantee for security/regulated deployments. A definitive over-budget result always rejects regardless of this setting. |
-| `sqlite_busy_timeout_ms` | integer | no | `5000` |, | SQLite `busy_timeout` (milliseconds) for the governance store under write contention. |
+| `sqlite_busy_timeout_ms` | integer | no | `5000` | n/a | SQLite `busy_timeout` (milliseconds) for the governance store under write contention. |
 | `rate_sweep_interval` | integer | no | `256` | Must be ≥ 1 | How often (every N admissions) the in-memory rate-limit map evicts idle entries. Correctness does not depend on it (per-key windows reset on lookup); it only bounds memory. `0` is rejected at startup. |
 
 **Budget spend per request:** `price_per_request_cents + (total_tokens / 1000) * price_per_1k_tokens_cents`.
