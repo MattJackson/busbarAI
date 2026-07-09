@@ -13,6 +13,7 @@
 
 📖 **Docs:** [getbusbar.com](https://getbusbar.com)  
 ⚡ **Install:** `curl -fsSL https://getbusbar.com/install.sh | sh`  
+🐳 **Docker:** [`getbusbar/busbar`](https://hub.docker.com/r/getbusbar/busbar) — `FROM scratch`, ~5 MB, multi-arch, cosign-signed  
 🤖 **Agent-readable:** [getbusbar.com/llms.txt](https://getbusbar.com/llms.txt)
 
 Busbar sits between your application and your LLM providers. Point any SDK: OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses, at one URL, and it routes, translates, and **keeps serving through provider failures**. It's a different class of tool than a proxy with a long model list.

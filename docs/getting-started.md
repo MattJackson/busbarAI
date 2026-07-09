@@ -66,6 +66,17 @@ chmod +x busbar
 ./busbar --version
 ```
 
+**Or use Docker** — a `FROM scratch` image (the static binary plus the provider catalog, ~5 MB compressed, amd64 + arm64), cosign-signed with build provenance:
+
+```bash
+docker run -d -p 8080:8080 \
+  -e ANTHROPIC_KEY \
+  -v "$PWD/config.yaml:/etc/busbar/config.yaml:ro" \
+  getbusbar/busbar
+```
+
+The provider catalog ships inside the image at `/etc/busbar/providers.yaml`, so you only mount `config.yaml` (written in [Step 2](#step-2-write-a-minimal-config)). Pin `getbusbar/busbar:1`, `:1.1`, or an exact version. If you enable governance, give it a writable volume (e.g. `-v busbar-data:/var/lib/busbar` with `db_path: /var/lib/busbar/governance.db`).
+
 **Or build from source** (requires Rust 1.87+):
 
 ```bash
