@@ -361,7 +361,16 @@ async fn main() {
     // `Lane.api_key` population reuse this value, so the warning and the captured key can never
     // diverge (and we don't read the same env var twice).
     let mut provider_api_keys: HashMap<String, String> = HashMap::new();
-    for (model, mc) in cfg.models {
+    // Build lanes in a DETERMINISTIC order (sorted by model name) rather than `cfg.models`'
+    // HashMap iteration order, which is randomized per process start. Lane index is assigned here
+    // (`by_model` → `lanes_data.len()`), so a random iteration order gave each lane a different
+    // index every boot — surfacing as non-reproducible `/stats` lane ordering and metric lane-series
+    // identity that shifts across restarts (a scrape/dashboard annoyance and a flaky-test source).
+    // Sorting makes the whole observable surface stable. (Mirrors the deterministic-resolution fix
+    // already applied to `model_context_max` below.)
+    let mut sorted_models: Vec<_> = cfg.models.into_iter().collect();
+    sorted_models.sort_by(|a, b| a.0.cmp(&b.0));
+    for (model, mc) in sorted_models {
         model_default_max_tokens.insert(model.clone(), mc.default_max_tokens);
         let provider_cfg = cfg.providers.get(&mc.provider).unwrap_or_else(|| {
             die(format!(

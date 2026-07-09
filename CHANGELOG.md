@@ -38,6 +38,10 @@ appear as a bold **Migration** item under **Changed**.
   direct-model (pool-less) lanes — labeled with the model name as `pool`, matching the counter
   convention — so a freshly booted gateway exposes a live exposition to Prometheus immediately.
   Both issues were found by the user-emulated acceptance harness on its first run.
+- **`/stats` output is now deterministic across restarts.** Lanes are built sorted by model
+  name (previously in `HashMap` iteration order, randomized per process), and `/stats` serializes
+  pools in sorted key order. The lane/pool ordering — and therefore metric lane-series identity —
+  is now stable boot to boot, so scrapes, dashboards, and tests are reproducible.
 
 ## [1.1.0], 2026-06-30
 

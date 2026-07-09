@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -45,7 +44,11 @@ pub(crate) async fn stats(
         }
     };
 
-    let pools: HashMap<&String, Vec<&str>> = app
+    // BTreeMap (not HashMap) so the serialized `pools` object has a stable, sorted key order —
+    // `app.pools` is a HashMap whose iteration order is randomized per process, which otherwise
+    // makes `/stats` output non-reproducible across restarts. Lane order is already deterministic
+    // (index order, and lane indices are now built sorted-by-model — see main.rs).
+    let pools: std::collections::BTreeMap<&String, Vec<&str>> = app
         .pools
         .iter()
         .filter(|(n, _)| visible_pool(n))
