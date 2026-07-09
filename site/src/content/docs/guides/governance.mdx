@@ -1,13 +1,13 @@
 ---
 title: Governance
-description: Budgets, rate limits, spend tracking, and pool access — what they do and how to turn them on.
+description: Budgets, rate limits, spend tracking, and pool access; what they do and how to turn them on.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 Governance gives you a control plane over **who** can use **which** models and **how much**.
 It's off by default; turn it on when you need budgets, rate limits, spend visibility, or access
-control. Each capability below has two views — read **What it does** for the why, flip to
+control. Each capability below has two views; read **What it does** for the why, flip to
 **Configure it** for the exact YAML and commands.
 
 <svg viewBox="0 0 760 270" role="img" aria-label="A request carrying a virtual key passes through the governance gate, which checks the allowed-pools ACL, the budget cap, and the rate limit; if all pass the request reaches the pool and upstream, otherwise it is denied with a 403 or 429." style="width:100%;height:auto;max-width:760px;font-family:ui-sans-serif,system-ui,sans-serif;">
@@ -44,12 +44,12 @@ control. Each capability below has two views — read **What it does** for the w
 
 <Tabs>
   <TabItem label="What it does">
-    Busbar issues **virtual keys** — scoped bearer tokens your applications present instead of a raw
+    Busbar issues **virtual keys**: scoped bearer tokens your applications present instead of a raw
     client token. Each key carries its own **budget** (a spend cap over a `total`, `daily`, or
     `monthly` window) and its own **spend tracking** (running spend, tokens, and requests).
 
     Spend is computed from a price you set: a flat charge per request, plus a per-1,000-token charge
-    accrued from each response's usage. The flat per-request fee is an **atomic hard cap** — charged
+    accrued from each response's usage. The flat per-request fee is an **atomic hard cap**: charged
     in a single conditional UPSERT, so concurrent requests cannot race past the budget; only a single
     admitted request's post-response token cost can marginally overshoot. By default Busbar fails
     *open* on a store error rather than dropping your traffic (set `budget_on_store_error: deny` to
@@ -59,7 +59,7 @@ control. Each capability below has two views — read **What it does** for the w
     and deployment to self-police. A staging key can be capped at a monthly budget; a production key
     runs uncapped. Secrets are stored only as SHA-256 hashes and shown in plaintext exactly once.
 
-    *Scope: control is per **key**. Busbar doesn't model users, teams, or per-model budgets — the
+    *Scope: control is per **key**. Busbar doesn't model users, teams, or per-model budgets; the
     virtual key is your unit of control.*
   </TabItem>
   <TabItem label="Configure it">
@@ -68,13 +68,13 @@ control. Each capability below has two views — read **What it does** for the w
     ```yaml
     governance:
       enabled: true
-      admin_token: "${BUSBAR_ADMIN_TOKEN}"   # guards /admin; required when enabled — boot fails if unset/blank
+      admin_token: "${BUSBAR_ADMIN_TOKEN}"   # guards /admin; required when enabled; boot fails if unset/blank
       price_per_request_cents: 1             # flat charge per request (default 1)
       price_per_1k_tokens_cents: 20          # + per 1k input+output tokens (default 0)
       db_path: busbar-governance.db          # SQLite store (default)
     ```
 
-    Mint a key — budget and period are set at creation:
+    Mint a key; budget and period are set at creation:
 
     ```bash
     curl -s http://localhost:8080/admin/keys \
@@ -84,9 +84,9 @@ control. Each capability below has two views — read **What it does** for the w
     # → 201 with the secret, shown once. Store it now; only its SHA-256 is kept.
     ```
 
-    To issue a key for a Bedrock-SDK client (inbound SigV4 auth), add `"issue_aws_credential": true`. The 201 response then also includes `aws_access_key_id` and `aws_secret_access_key` — both shown **once**. Configure your Bedrock SDK with those credentials; Busbar verifies the signature and enforces all governance controls. See [Bedrock ingress](/protocols/#bedrock).
+    To issue a key for a Bedrock-SDK client (inbound SigV4 auth), add `"issue_aws_credential": true`. The 201 response then also includes `aws_access_key_id` and `aws_secret_access_key`; both shown **once**. Configure your Bedrock SDK with those credentials; Busbar verifies the signature and enforces all governance controls. See [Bedrock ingress](/protocols/#bedrock).
 
-    By default, if the budget store errors during the admission check, Busbar fails open (requests proceed). Set `governance.budget_on_store_error: deny` in config to fail closed instead — requests are rejected on any store error, providing a hard budget guarantee for regulated deployments.
+    By default, if the budget store errors during the admission check, Busbar fails open (requests proceed). Set `governance.budget_on_store_error: deny` in config to fail closed instead; requests are rejected on any store error, providing a hard budget guarantee for regulated deployments.
 
     Check spend any time; raise a budget with `PATCH`, revoke with `DELETE`:
 
@@ -103,11 +103,11 @@ control. Each capability below has two views — read **What it does** for the w
 <Tabs>
   <TabItem label="What it does">
     Each virtual key can carry a **requests-per-minute (RPM)** and a **tokens-per-minute (TPM)** cap.
-    RPM is enforced **precisely** — the counter increments synchronously on admission. TPM is
+    RPM is enforced **precisely**: the counter increments synchronously on admission. TPM is
     best-effort under concurrency, since token counts are known only after the response.
 
     **Why it matters:** you can rate-limit an internal tool independently of the production path, or
-    keep a noisy batch job from starving interactive traffic — per key, without writing limiter code.
+    keep a noisy batch job from starving interactive traffic; per key, without writing limiter code.
   </TabItem>
   <TabItem label="Configure it">
     Set limits at key creation (or update them later). Omit a field to leave it unlimited:
@@ -126,7 +126,7 @@ control. Each capability below has two views — read **What it does** for the w
 <Tabs>
   <TabItem label="What it does">
     A key's **`allowed_pools`** list restricts which pools it may target. An empty list means all
-    pools are allowed. Access is scoped to **pools** — the named routing targets you define — not to
+    pools are allowed. Access is scoped to **pools**: the named routing targets you define; not to
     individual models or named access groups.
 
     **Why it matters:** a cheap-staging key can be locked to a low-cost pool; a partner key can be

@@ -12,8 +12,8 @@ Everyone files an LLM gateway under "multi-provider failover," so teams with one
 
 Straight passthrough. One provider, same protocol in and out, byte-for-byte, nothing enabled. That configuration already changed my security posture the day I switched to it:
 
-- **The provider key moved out of every app deployment** and into one process. My applications carry a Busbar token I can revoke instantly. A leaked app credential is no longer a leaked provider account, and rotating the real key is a restart, not a hunt through deployments.
-- **A runaway loop hits my ceiling, not my bill.** `max_concurrent` is a hard cap on concurrency per model. An agent stuck in a retry spiral gets a queue, not a credit card.
+- **The provider key moved out of every app deployment** and into one process. My applications carry a Busbar token I can revoke instantly. A leaked app credential is no longer a leaked provider account, and rotating the real key takes one restart.
+- **A runaway loop hits my ceiling, not my bill.** `max_concurrent` is a hard cap on concurrency per model. An agent stuck in a retry spiral gets queued at the cap.
 - **The traffic became visible.** Direct SDK calls are invisible; through Busbar, every request shows up in `/metrics` and `/stats`, and the circuit breaker classifies failures by default. A provider degradation is a graph, not a surprise.
 - **The request path got stricter for free**: SSRF-guarded upstream URLs, constant-time token comparison, request-body caps, secrets never logged.
 

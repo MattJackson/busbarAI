@@ -83,8 +83,8 @@ import PageLayout from '../layouts/PageLayout.astro';
   <p>
     That bare passthrough is already a safer posture than calling the provider directly, before
     you enable a single feature. Your provider key moves out of every app deployment and into one
-    process, so a leaked app credential is no longer a leaked provider account, and rotation is a
-    restart, not a deployment sweep. <code>max_concurrent</code> caps a runaway loop at your
+    process, so a leaked app credential is no longer a leaked provider account, and rotating the real
+    key takes one restart. <code>max_concurrent</code> caps a runaway loop at your
     ceiling instead of your bill. Every request becomes visible in <code>/metrics</code> and
     <code>/stats</code> where direct SDK calls are invisible. And the request path is hardened:
     SSRF-guarded upstreams, constant-time token checks, body caps, secrets never logged. We run

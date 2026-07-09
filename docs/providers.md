@@ -1,6 +1,6 @@
 # Adding a provider
 
-Busbar's thesis is **protocols, not providers**. It implements six wire protocols losslessly; a *provider* is just a catalog entry that says which protocol it speaks and where it lives. Adding one is config, not code, and it's *your* config. Any provider that speaks one of the six protocols, `anthropic`, `openai`, `gemini`, `bedrock`, `responses`, `cohere`, is a few lines of YAML. No new code, no pull request to Busbar, no waiting on an "integration."
+Busbar's thesis is **protocols, not providers**. It implements six wire protocols losslessly; a *provider* is just a catalog entry that says which protocol it speaks and where it lives. Adding one is a config entry you write yourself; no code changes hands. Any provider that speaks one of the six protocols, `anthropic`, `openai`, `gemini`, `bedrock`, `responses`, `cohere`, is a few lines of YAML. No new code, no pull request to Busbar, no waiting on an "integration."
 
 ## What a provider entry is
 

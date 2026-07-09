@@ -60,7 +60,7 @@ Busbar fails over inside the request, before your client sees a byte, even mid-s
 
 ## What do you actually deploy?
 
-One file. A single static Rust binary, about **9 MB** on disk, with no Python sidecar, no interpreter, and no GC in the request path. Linux and macOS on Intel and ARM, Windows on Intel. Your keys, your network, your data path. No v2, no migration, nothing to wait for.
+One file. A single static Rust binary, about **9 MB** on disk, with nothing interpreted and nothing garbage-collected in the request path. Linux and macOS on Intel and ARM, Windows on Intel. Your keys never leave your network. No v2, no migration, nothing to wait for.
 
 ## Where to start
 

@@ -16,10 +16,10 @@ authorTitle: "Founder, Busbar"
 
 ## Still one binary
 
-Everything above ships as a single static Rust binary. No Python sidecar, no interpreter, no GC in the request path. Linux and macOS on Intel and ARM, Windows on Intel. Your keys, your network, your data path.
+Everything above ships as a single static Rust binary. No interpreter and no garbage collector anywhere in the request path. Linux and macOS on Intel and ARM, Windows on Intel. Your keys stay on your network.
 
 ## What's next
 
-1.0 is the foundation, not the finish line. From here the work is depth: more providers, richer routing policy, deeper observability, on top of a surface that no longer moves. The reliability and fidelity guarantees are the part I care most about keeping honest, and they're now locked in.
+From here the work is depth: more providers, richer routing policy, deeper observability, on top of a surface that no longer moves. The reliability and fidelity guarantees are the part I care most about keeping honest, and they're now locked in.
 
 Get it at **[getbusbar.com](https://getbusbar.com)**. If you're running multi-provider LLM traffic in production, I'd love to talk. I'm taking on design partners.

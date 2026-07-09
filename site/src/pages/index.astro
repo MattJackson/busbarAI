@@ -21,18 +21,18 @@ const protocols = ['OpenAI', 'Anthropic', 'Gemini', 'Bedrock', 'Cohere', 'Respon
 const features = [
   {
     title: 'Lossless cross-protocol translation',
-    body: 'Six wire protocols, native on both sides, bridged through one internal format rich enough to hold every protocol’s features. Anthropic thinking blocks, structured-output schemas, and Bedrock tool use survive the hop, nothing is flattened to OpenAI shape.',
+    body: 'Six wire protocols, native on both sides, bridged through one internal format rich enough to hold every protocol’s features. Anthropic thinking blocks, structured-output schemas, and Bedrock tool use survive the hop. Nothing gets flattened to OpenAI shape.',
     enables: 'Point whatever SDK your code already speaks at one URL, and reach every model through it.',
   },
   {
     title: 'Fault-aware failover & circuit breaking',
-    body: 'A circuit breaker on every provider lane classifies each error, provider outage, your bad request, context overflow, hard auth failure, and treats each differently instead of retrying into a wall. A failed lane reroutes mid-flight, before your client sees a single byte.',
+    body: 'A circuit breaker on every provider lane knows whose fault each failure was (a provider outage, your bad request, a context overflow, a revoked key) and treats each one differently instead of retrying into a wall. A failed lane reroutes mid-flight, before your client sees a single byte.',
     enables: 'A flaky provider is pulled and probed back gently; a rate-limit storm on one lane never starves the healthy ones.',
   },
   {
     title: 'A programmable request path',
-    body: 'Routing is the first hook: a policy, built-in (<strong>weighted, cheapest, fastest, least_busy, usage</strong>), a webhook in any language, or a sandboxed Rhai script, inspects each request and decides who serves it, from per-member cost, latency, live concurrency, budget, and rate headroom. A slow or broken hook falls back, never blocks a request.',
-    enables: 'The same fail-safe machinery is built to carry <strong>PII-steering, audit, and guardrails</strong>, your own logic on the request path, in any language.',
+    body: 'Routing is the first hook. Pick a built-in policy (weighted, cheapest, fastest, least_busy, usage) or bring your own as a webhook in any language, or as a sandboxed Rhai script. Policies see each member’s cost, latency, live concurrency, budget, and rate headroom. A slow or broken hook falls back; it never blocks a request.',
+    enables: 'The same fail-safe machinery is built to carry PII-steering, audit, and guardrails: your own logic on the request path, in any language.',
   },
   {
     title: 'Governance & hard budget caps',
@@ -41,13 +41,13 @@ const features = [
   },
   {
     title: 'Native TLS & mutual TLS',
-    body: 'Busbar terminates TLS itself, cert and key in config, no reverse proxy required. Turn on mTLS and a client must present a certificate signed by your CA; anyone without one is rejected at the handshake, before any bearer-token check is reached.',
+    body: 'Busbar terminates TLS itself (cert and key in config, no reverse proxy required). Turn on mTLS and a client must present a certificate signed by your CA; anyone without one is rejected at the handshake, before any bearer-token check is reached.',
     enables: 'Zero-trust ingress without standing up a service mesh.',
   },
   {
     title: 'A single Rust binary you own',
-    body: 'One static binary, no runtime, no sidecar, no interpreter in the request path, ships for Linux and macOS (Intel and ARM) and Windows (Intel). Provider keys move out of every app deployment into one place; your app carries only a Busbar token. Prometheus /metrics and OTLP traces built in.',
-    enables: 'Your infrastructure, your keys, your data path, rotating an upstream key is one restart, not a deploy sweep.',
+    body: 'One static binary with no runtime, no sidecar, and no interpreter in the request path. It ships for Linux and macOS (Intel and ARM) and Windows (Intel). Provider keys move out of every app deployment into one place; your app carries only a Busbar token. Prometheus /metrics and OTLP traces built in.',
+    enables: 'Your infrastructure, your keys, your data path. Rotating an upstream key is one restart, not a deploy sweep.',
   },
 ];
 
@@ -166,9 +166,9 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         <h2>Any protocol in. Any backend out.</h2>
         <p>
           You define a model name and the backends behind it. Busbar accepts <em>any</em> input
-          protocol, OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses, and routes and
+          protocol (OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses) and routes and
           translates accordingly. One model name, reachable by every client; you choose what runs
-          behind it. It’s a different class of tool than a proxy with a long model list. There is
+          behind it. This is not another proxy with a long model list. There is
           no privileged protocol and no model list to be on: providers speak about six languages
           between them, Busbar speaks all six, so a new model works the day it ships. <strong>The
           model name is a config value, not a release note.</strong> See for yourself:

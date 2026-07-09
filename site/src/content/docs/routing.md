@@ -1,11 +1,11 @@
 ---
 title: "Routing Policies"
-description: "Swap a pool's selection strategy with one field — weighted, cheapest, fastest, least-busy natively, or your own logic via webhook or Rhai script."
+description: "Swap a pool's selection strategy with one field: weighted, cheapest, fastest, least-busy natively, or your own logic via webhook or Rhai script."
 ---
 
-Every Busbar pool has a routing policy. The default — weighted smooth round-robin (SWRR) — costs nothing and is the right choice for most pools. When you need a different selection strategy, you swap in a policy with one field: `route:`. Everything else in Busbar — the circuit breaker, failover loop, concurrency semaphore, session affinity — is unchanged. The policy only determines the order in which healthy candidates are tried.
+Every Busbar pool has a routing policy. The default (weighted smooth round-robin (SWRR)) costs nothing and is the right choice for most pools. When you need a different selection strategy, you swap in a policy with one field: `route:`. Everything else in Busbar (the circuit breaker, failover loop, concurrency semaphore, session affinity) is unchanged. The policy only determines the order in which healthy candidates are tried.
 
-Routing is the first of Busbar's **Hooks** — a programmable request path. At a small number of points in the request lifecycle, an operator-supplied policy inspects the request and returns a decision, via one of three transports (native, webhook, or Rhai script). Routing is hook #1: it decides selection order. The same transport machinery — timeout, fallback, transparency header — carries every hook, so a broken or slow policy never blocks or fails a request.
+Routing is the first of Busbar's **Hooks**: a programmable request path. At a small number of points in the request lifecycle, an operator-supplied policy inspects the request and returns a decision, via one of three transports (native, webhook, or Rhai script). Routing is hook #1: it decides selection order. The same transport machinery (timeout, fallback, transparency header) carries every hook, so a broken or slow policy never blocks or fails a request.
 
 Cross-references: [Pools](/pools/) (how to define a pool and its members) · [Configuration](/configuration/) (full field reference) · [Reliability & Failover](/reliability/) (breaker, failover, and exhaustion behavior).
 
@@ -37,9 +37,9 @@ Cross-references: [Pools](/pools/) (how to define a pool and its members) · [Co
 
 ## The model: policy as ranked preference
 
-A routing policy does one thing: given the current request and the set of healthy candidates, it returns an **ordered preference list**. Busbar's existing failover loop walks that list — trying the first candidate, then the second if the first fails, and so on — using the circuit breaker at every step to skip any lane that is tripped, at capacity, or already tried this request.
+A routing policy does one thing: given the current request and the set of healthy candidates, it returns an **ordered preference list**. Busbar's existing failover loop walks that list (trying the first candidate, then the second if the first fails, and so on) using the circuit breaker at every step to skip any lane that is tripped, at capacity, or already tried this request.
 
-The design consequence: **a policy ranks; the breaker decides health.** A policy cannot resurrect a tripped lane, and a policy that omits a healthy lane does not strand it — omitted candidates are appended to the end of the preference list, not excluded. A broken policy (timeout, error, empty response) falls back to weighted SWRR rather than failing the request.
+The design consequence: **a policy ranks; the breaker decides health.** A policy cannot resurrect a tripped lane, and a policy that omits a healthy lane does not strand it; omitted candidates are appended to the end of the preference list, not excluded. A broken policy (timeout, error, empty response) falls back to weighted SWRR rather than failing the request.
 
 Every pool has exactly one `route:` value. `weighted` is both the default and the zero-overhead case: pools without a `route:` field run today's unchanged SWRR code, with no projection built and no policy object constructed. Adding a policy to a pool adds no overhead to pools that do not use one.
 
@@ -51,8 +51,8 @@ The sequence for every request routed to a non-weighted pool:
 
 1. **Policy runs once, before the failover loop.** It receives the healthy candidate set (as a projected read-only view) and returns a ranked list of candidate indices.
 2. **The failover loop walks the ranked list.** It tries candidates in the policy's preferred order, skipping any that are tripped, at capacity, or already tried (`request_ctx.excluded`).
-3. **Candidates not in the ranked list are tried last.** If the policy emits a subset of candidates, the omitted ones are appended after the ranked set in an unspecified order. They are reachable — a policy can never permanently exclude a healthy lane.
-4. **On policy failure, SWRR takes over.** A timeout or error causes Busbar to fall back to the pool's `on_error` behavior (default: SWRR), as if no policy were configured. An explicit **abstain** is different: it always falls straight through to SWRR regardless of `on_error` — abstaining is "no opinion," not a failure.
+3. **Candidates not in the ranked list are tried last.** If the policy emits a subset of candidates, the omitted ones are appended after the ranked set in an unspecified order. They are reachable; a policy can never permanently exclude a healthy lane.
+4. **On policy failure, SWRR takes over.** A timeout or error causes Busbar to fall back to the pool's `on_error` behavior (default: SWRR), as if no policy were configured. An explicit **abstain** is different: it always falls straight through to SWRR regardless of `on_error`; abstaining is "no opinion," not a failure.
 
 This composition means a policy's job is deliberately narrow. You declare a preference; Busbar's existing reliability machinery handles the rest.
 
@@ -100,7 +100,7 @@ Native policies are compiled into Busbar and have no runtime dependencies. They 
 
 `policy.name: weighted`
 
-The default selection strategy when no `route:` is set. Uses Nginx-style smooth weighted round-robin (SWRR) across healthy members, proportional to each member's `weight` field. Setting `route: native` and `policy.name: weighted` gives byte-identical behavior to omitting `route:` entirely — it always abstains, letting the inline SWRR path handle selection.
+The default selection strategy when no `route:` is set. Uses Nginx-style smooth weighted round-robin (SWRR) across healthy members, proportional to each member's `weight` field. Setting `route: native` and `policy.name: weighted` gives byte-identical behavior to omitting `route:` entirely; it always abstains, letting the inline SWRR path handle selection.
 
 Use `weighted` explicitly only when you want to name the policy in config for documentation clarity. There is no behavioral difference from the absent-`route:` default.
 
@@ -143,7 +143,7 @@ This is a good choice when your members have meaningfully different tail latenci
 
 `policy.name: least_busy`
 
-Prefers the member with the most available concurrency headroom — the lane with the most free slots in its semaphore. Unlike `fastest`, `least_busy` always has data (concurrency is always known) and never abstains.
+Prefers the member with the most available concurrency headroom; the lane with the most free slots in its semaphore. Unlike `fastest`, `least_busy` always has data (concurrency is always known) and never abstains.
 
 Signal: free concurrency permits on each lane's semaphore at decision time.
 
@@ -159,7 +159,7 @@ Prefers the member with the most remaining rate-limit headroom (RPM/TPM headroom
 
 ## The routing signals
 
-Every policy — native and external — sees the same projection of each candidate:
+Every policy (native and external) sees the same projection of each candidate:
 
 | Signal | Field | Available now | Notes |
 |---|---|---|---|
@@ -175,12 +175,12 @@ External policies (webhook, script) also receive the request projection. The web
 |---|---|---|---|---|
 | Pool | `pool` | Yes | Yes | Pool name the request is being routed through. |
 | Ingress protocol | `ingress_protocol` | Yes | Yes | One of: `anthropic`, `openai`, `gemini`, `bedrock`, `cohere`, `responses`. |
-| Requested model | `requested_model` | — | Yes | Model the caller asked for; `()` if absent. Not in webhook payload. |
+| Requested model | `requested_model` |; | Yes | Model the caller asked for; `()` if absent. Not in webhook payload. |
 | Message count | `message_count` | Yes | Yes | Number of messages in the conversation. |
 | Has tools | `has_tools` | Yes | Yes | Boolean; `true` when at least one tool is declared. |
-| Tool count | `tool_count` | — | Yes | Number of tools declared. Not in webhook payload. |
-| Request size | `total_chars` | Yes | Yes | Sum of all text chars across system + messages. v1 size signal — not a token count. Rule of thumb: ~4 chars/token. |
-| System size | `system_chars` | — | Yes | System-prompt text chars only. Not in webhook payload. |
+| Tool count | `tool_count` |; | Yes | Number of tools declared. Not in webhook payload. |
+| Request size | `total_chars` | Yes | Yes | Sum of all text chars across system + messages. v1 size signal; not a token count. Rule of thumb: ~4 chars/token. |
+| System size | `system_chars` |; | Yes | System-prompt text chars only. Not in webhook payload. |
 | Max tokens | `max_tokens` | Yes | Yes | Caller's requested output token limit; `null`/`()` if unset. |
 | Streaming | `stream` | Yes | Yes | Whether the request is a streaming call. |
 
@@ -190,17 +190,17 @@ Token counts are not available pre-dispatch. The upstream response carries token
 
 ## External policies
 
-External policies let you run routing logic outside Busbar — in any language, with access to any data Busbar cannot see. Busbar sends a lightweight request projection to your policy endpoint and receives a ranked candidate list back. The same timeout, fallback, and safety machinery applies as for native policies: a slow or broken external policy never fails a request.
+External policies let you run routing logic outside Busbar; in any language, with access to any data Busbar cannot see. Busbar sends a lightweight request projection to your policy endpoint and receives a ranked candidate list back. The same timeout, fallback, and safety machinery applies as for native policies: a slow or broken external policy never fails a request.
 
 ### webhook
 
 `route: webhook`
 
-Busbar POSTs a JSON payload to your operator-supplied sidecar URL before each request's failover loop. The sidecar returns a ranked list of candidate indices. The URL is operator-config-only — never derived from a request header or body.
+Busbar POSTs a JSON payload to your operator-supplied sidecar URL before each request's failover loop. The sidecar returns a ranked list of candidate indices. The URL is operator-config-only; never derived from a request header or body.
 
-**Timeout and fallback.** The request is bounded by `policy.timeout_ms` (default 150 ms). On timeout, non-200 response, or malformed JSON, Busbar applies `on_error` (default: `weighted` — fall back to SWRR). A broken sidecar is indistinguishable from no policy. Concurrency is bounded by `policy.timeout_ms` and the HTTP client's connection pool — there is no separate in-flight cap on routing webhook calls.
+**Timeout and fallback.** The request is bounded by `policy.timeout_ms` (default 150 ms). On timeout, non-200 response, or malformed JSON, Busbar applies `on_error` (default: `weighted`; fall back to SWRR). A broken sidecar is indistinguishable from no policy. Concurrency is bounded by `policy.timeout_ms` and the HTTP client's connection pool; there is no separate in-flight cap on routing webhook calls.
 
-**URL security.** The sidecar URL allows loopback (`127.0.0.1`, `localhost`) — routing sidecars are commonly co-located processes. RFC-1918, link-local, CGNAT, and cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`, etc.) are blocked regardless.
+**URL security.** The sidecar URL allows loopback (`127.0.0.1`, `localhost`); routing sidecars are commonly co-located processes. RFC-1918, link-local, CGNAT, and cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`, etc.) are blocked regardless.
 
 **Request payload (Busbar → sidecar):**
 
@@ -245,21 +245,21 @@ Busbar POSTs a JSON payload to your operator-supplied sidecar URL before each re
 ```
 
 Field notes:
-- `request.pool` — the pool name the request is being routed through.
-- `request.ingress_protocol` — one of `anthropic`, `openai`, `gemini`, `bedrock`, `cohere`, `responses`.
-- `request.max_tokens` — `null` if the caller did not set an output-token limit.
-- `candidates[*].tier` — `null` if not set on the member config.
-- `candidates[*].cost_per_mtok` — `null` if not declared on the member.
-- `candidates[*].latency_ms` — `null` until the lane has served at least one request.
-- `candidates[*].budget_remaining` — `null` = unlimited (`max_requests: -1`).
-- `candidates[*].rate_headroom` — remaining RPM/TPM headroom as a fraction; `null` when governance is disabled or the lane has no rate limit.
-- `context.budget_remaining` — always `null` in 1.0: the per-key governance budget is intentionally not fed to the routing seam. Use per-member `budget_remaining` for lane-level capacity.
+- `request.pool`; the pool name the request is being routed through.
+- `request.ingress_protocol`; one of `anthropic`, `openai`, `gemini`, `bedrock`, `cohere`, `responses`.
+- `request.max_tokens`; `null` if the caller did not set an output-token limit.
+- `candidates[*].tier`; `null` if not set on the member config.
+- `candidates[*].cost_per_mtok`; `null` if not declared on the member.
+- `candidates[*].latency_ms`; `null` until the lane has served at least one request.
+- `candidates[*].budget_remaining`; `null` = unlimited (`max_requests: -1`).
+- `candidates[*].rate_headroom`; remaining RPM/TPM headroom as a fraction; `null` when governance is disabled or the lane has no rate limit.
+- `context.budget_remaining`; always `null` in 1.0: the per-key governance budget is intentionally not fed to the routing seam. Use per-member `budget_remaining` for lane-level capacity.
 
-> The payload contains only the request projection — no prompt text, no message bodies. Busbar never sends request content to any external sink.
+> The payload contains only the request projection; no prompt text, no message bodies. Busbar never sends request content to any external sink.
 
 **Response payload (sidecar → Busbar):**
 
-Ranked preference — most preferred first:
+Ranked preference; most preferred first:
 ```json
 { "order": [1, 0] }
 ```
@@ -271,12 +271,12 @@ Or abstain (fall back to `on_error`):
 
 Rules:
 - `order` is the only ranking key. Unknown `idx` values are dropped; duplicates are deduplicated preserving first-seen order.
-- Omitted candidates are demoted, not excluded — the failover loop can still reach them after the ranked set is exhausted.
+- Omitted candidates are demoted, not excluded; the failover loop can still reach them after the ranked set is exhausted.
 - An absent or empty `order` (including a bare `{}`) is treated as abstain.
 - `abstain: true` explicitly signals no preference; the `order` field is ignored if present alongside it.
 - Any non-2xx response, malformed JSON, or timeout applies `on_error` (same as abstain for the default `on_error: weighted`).
 
-**Transparency.** Every response with a non-default routing policy carries two headers: `x-busbar-route-policy` (the policy name) and `x-busbar-route-target` (the chosen lane model) — for example `x-busbar-route-policy: webhook` and `x-busbar-route-target: claude-sonnet`.
+**Transparency.** Every response with a non-default routing policy carries two headers: `x-busbar-route-policy` (the policy name) and `x-busbar-route-target` (the chosen lane model); for example `x-busbar-route-policy: webhook` and `x-busbar-route-target: claude-sonnet`.
 
 ### script (Rhai)
 
@@ -288,13 +288,13 @@ An embedded [Rhai](https://rhai.rs) script, compiled at startup and evaluated pe
 
 **Script environment.** The script receives three injected variables:
 
-- `req` — a map with the request projection fields:
+- `req`; a map with the request projection fields:
   - `pool` (string), `ingress_protocol` (string), `requested_model` (string or `()`)
   - `message_count` (int), `tool_count` (int), `has_tools` (bool)
   - `total_chars` (int), `system_chars` (int)
   - `max_tokens` (int or `()` if unset), `stream` (bool)
 
-- `candidates` — an array of maps, one per candidate, each with:
+- `candidates`; an array of maps, one per candidate, each with:
   - `idx` (int), `model` (string), `provider` (string)
   - `weight` (int), `context_max` (int or `()` if unset)
   - `tier` (string or `()` if unset)
@@ -303,8 +303,8 @@ An embedded [Rhai](https://rhai.rs) script, compiled at startup and evaluated pe
   - `rate_headroom` (float or `()` when governance is off or the lane has no rate limit)
   - `tags` (array of strings)
 
-- `ctx` — a map with routing context:
-  - `pool` (string), `budget_remaining` (always `()` in 1.0 — not fed to the routing seam)
+- `ctx`; a map with routing context:
+  - `pool` (string), `budget_remaining` (always `()` in 1.0; not fed to the routing seam)
 
 Optional/absent values are `()` (Rhai unit), not `null`. Test with `== ()` or default with `??`.
 
@@ -328,12 +328,12 @@ preferred.map(|c| c.idx)
 - Max string size: 8 KB
 - Max array length: 4,096 entries
 - Max map entries: 1,024
-- No module resolver — `import` statements always fail
+- No module resolver; `import` statements always fail
 - No file, network, or process host functions registered
 
 A script that exceeds any limit errors and the result is coerced via `on_error`. The script evaluates synchronously against a shared pre-compiled AST (compiled once at config load, not per request).
 
-Scripts are operator-config only — never client-supplied.
+Scripts are operator-config only; never client-supplied.
 
 ---
 
@@ -497,8 +497,8 @@ pools:
 
 **Response headers.** Every request with a non-default routing policy emits two headers (`src/forward.rs` constants `HDR_ROUTE_POLICY` and `HDR_ROUTE_TARGET`):
 
-- `x-busbar-route-policy: <policy>` — the policy name that made the decision (e.g. `webhook`, `cheapest`)
-- `x-busbar-route-target: <chosen-lane-model>` — the model of the chosen lane (e.g. `claude-sonnet`, `gpt-4o-mini`)
+- `x-busbar-route-policy: <policy>`; the policy name that made the decision (e.g. `webhook`, `cheapest`)
+- `x-busbar-route-target: <chosen-lane-model>`; the model of the chosen lane (e.g. `claude-sonnet`, `gpt-4o-mini`)
 
 | Example headers | Meaning |
 |---|---|

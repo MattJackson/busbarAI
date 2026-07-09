@@ -1,8 +1,8 @@
 # Getting Started with Busbar
 
-Busbar is a self-hosted LLM gateway: a single static Rust binary that sits between your application and your LLM providers. Point any SDK at it, OpenAI, Anthropic, Gemini, Cohere, Bedrock, or the OpenAI Responses API, and Busbar routes each request to the provider (or pool of providers) you configured, translating between wire protocols when the ingress and egress differ.
+Busbar is a self-hosted LLM gateway: a single static Rust binary that sits between your application and your LLM providers. Point any SDK at it (OpenAI, Anthropic, Gemini, Cohere, Bedrock, or the OpenAI Responses API) and Busbar routes each request to the provider (or pool of providers) you configured, translating between wire protocols when the ingress and egress differ.
 
-It does the same job as LiteLLM or OpenRouter, one API in front of every model and provider, and goes further: it speaks six provider protocols natively (so any vendor's SDK can point at it, not just OpenAI-shaped ones), ships as one binary with no Python runtime and no third party in your data path, and gives you per-(pool, lane) circuit breaking with in-flight failover. You run it in your own infra and it holds your keys.
+It does the same job as LiteLLM or OpenRouter (one API in front of every model and provider) and goes further: it speaks six provider protocols natively (so any vendor's SDK can point at it, not just OpenAI-shaped ones), ships as one binary with no Python runtime and no third party in your data path, and gives you per-(pool, lane) circuit breaking with in-flight failover. You run it in your own infra and it holds your keys.
 
 This guide takes you from zero to a working request in about five minutes.
 
@@ -50,7 +50,7 @@ This guide takes you from zero to a working request in about five minutes.
 
 ## Step 1: Get the binary
 
-**One-line install** (macOS / Linux), detects your platform, downloads the latest release binary *and* the provider catalog into the current directory, and prints the next steps:
+**One-line install** (macOS / Linux). It detects your platform, downloads the latest release binary *and* the provider catalog into the current directory, and prints the next steps:
 
 ```bash
 curl -fsSL https://getbusbar.com/install.sh | sh
@@ -58,7 +58,7 @@ curl -fsSL https://getbusbar.com/install.sh | sh
 
 Drops `busbar` and `providers.yaml` where you run it (no sudo). To install onto your PATH instead: `BUSBAR_INSTALL_DIR=/usr/local/bin curl -fsSL https://getbusbar.com/install.sh | sh`.
 
-**Or download manually**: grab the archive for your platform from the [latest release](https://github.com/MattJackson/busbarAI/releases/latest) (Linux `x86_64`/`aarch64`, macOS Intel/Apple Silicon, Windows `x86_64`), plus the provider catalog from [getbusbar.com/providers.yaml](https://getbusbar.com/providers.yaml). The binary is self-contained, no runtime, no virtualenv, no dependencies:
+**Or download manually**: grab the archive for your platform from the [latest release](https://github.com/MattJackson/busbarAI/releases/latest) (Linux `x86_64`/`aarch64`, macOS Intel/Apple Silicon, Windows `x86_64`), plus the provider catalog from [getbusbar.com/providers.yaml](https://getbusbar.com/providers.yaml). The binary is self-contained (no runtime, no virtualenv, no dependencies):
 
 ```bash
 tar -xzf busbar-*.tar.gz   # extracts the `busbar` binary
@@ -66,7 +66,7 @@ chmod +x busbar
 ./busbar --version
 ```
 
-**Or use Docker** — a `FROM scratch` image (the static binary plus the provider catalog, ~5 MB compressed, amd64 + arm64), cosign-signed with build provenance:
+**Or use Docker**: a `FROM scratch` image (the static binary plus the provider catalog, ~5 MB compressed, amd64 + arm64), cosign-signed with build provenance:
 
 ```bash
 docker run -d -p 8080:8080 \
@@ -94,7 +94,7 @@ Busbar reads two YAML files:
 - `providers.yaml`: the shipped provider catalog (protocol, `base_url`, error maps). You almost never edit this. The one-line installer fetches it for you, or grab it from [getbusbar.com/providers.yaml](https://getbusbar.com/providers.yaml).
 - `config.yaml`, your deployment: which providers to activate, their key env-var names, your models, and optionally pools.
 
-**Important, keys are never written into config.** `api_key_env` names the *environment variable* that holds a provider's key; Busbar reads the key from there at startup. (Separately, `${VAR}` tokens elsewhere in `config.yaml` are also expanded from the environment at load time.) An unset referenced variable is a loud startup failure, not a silent skip.
+**Important: keys are never written into config.** `api_key_env` names the *environment variable* that holds a provider's key; Busbar reads the key from there at startup. (Separately, `${VAR}` tokens elsewhere in `config.yaml` are also expanded from the environment at load time.) An unset referenced variable is a loud startup failure, not a silent skip.
 
 ### Minimal `config.yaml` (one provider, one model, no auth)
 
@@ -398,8 +398,8 @@ Before taking Busbar out of dev mode:
 
 ## What's next
 
-- **Full config reference**: every field, default, and validation rule: [`docs/configuration.md`](configuration.md)
-- **Pools, breakers, and failover**: pool member weighting, breaker tuning, session affinity, context-length failover, exhaustion policies: [`docs/configuration.md#pools`](configuration.md#pools)
-- **Running in production**: TLS termination, systemd unit, Docker, `/stats` monitoring, breaker diagnosis: [`docs/operations.md`](operations.md)
-- **Governance**: virtual keys, per-key budgets and rate limits, the `/admin` API: [`docs/operations.md`](operations.md)
-- **Architecture**: how the IR works, the six-protocol model, why `f64` and not `f32`: [`docs/architecture.md`](architecture.md)
+- **Full config reference**: every field, default, and validation rule ([`docs/configuration.md`](configuration.md))
+- **Pools, breakers, and failover**: weighting, breaker tuning, session affinity, context-length failover, and exhaustion policies ([`docs/configuration.md#pools`](configuration.md#pools))
+- **Running in production**: TLS termination, systemd, Docker, `/stats` monitoring, and breaker diagnosis ([`docs/operations.md`](operations.md))
+- **Governance**: virtual keys, per-key budgets and rate limits, and the `/admin` API ([`docs/operations.md`](operations.md))
+- **Architecture**: how the IR works, the six-protocol model, and why `f64` instead of `f32` ([`docs/architecture.md`](architecture.md))

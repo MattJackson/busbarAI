@@ -72,7 +72,7 @@ Already-tried lanes are accumulated in an `excluded` set across hops for the lif
 
 ## Context-length failover
 
-When a request is too large for a member (the provider returns a context-length error), Busbar does not penalize the lane, it was healthy, the request simply did not fit. Instead, it excludes from this request's candidate set any member whose declared `context_max` is ≤ the failed lane's, then retries to a larger (or unknown-context) member.
+When a request is too large for a member (the provider returns a context-length error), Busbar does not penalize the lane: it was healthy; the request simply did not fit. Instead, it excludes from this request's candidate set any member whose declared `context_max` is ≤ the failed lane's, then retries to a larger (or unknown-context) member.
 
 ```yaml
 pools:
@@ -103,7 +103,7 @@ pools:
       header_name: x-session-id    # default
 ```
 
-When a request carries `x-session-id: <value>`, Busbar pins that session to a specific member. If the pinned member is unavailable (tripped, at-capacity, or excluded), affinity is ignored and normal SWRR selection runs, affinity is a preference, not a guarantee. The client receives no signal that the pin was broken.
+When a request carries `x-session-id: <value>`, Busbar pins that session to a specific member. If the pinned member is unavailable (tripped, at-capacity, or excluded), affinity is ignored and normal SWRR selection runs, affinity is a preference, and an unhealthy member releases it. The client receives no signal that the pin was broken.
 
 `session` is the only supported `mode`. `header_name` defaults to `x-session-id`.
 
