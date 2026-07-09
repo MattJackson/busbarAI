@@ -5,7 +5,7 @@ All notable changes to Busbar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.1], 2026-07-09
 
 ### Added
 
@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   direct-model (pool-less) lanes — labeled with the model name as `pool`, matching the counter
   convention — so a freshly booted gateway exposes a live exposition to Prometheus immediately.
   Both issues were found by the user-emulated acceptance harness on its first run.
+
+### Changed (internal)
+
+- **Operations are now a first-class axis of the forward engine.** The request path is generic
+  over an operation spec (`OpSpec`) rather than hardcoding chat's assumptions (stream intent,
+  upstream path, usage extraction, affinity, egress `Accept`). Chat is spec #1 and its behavior is
+  byte-for-byte unchanged — the full test suite passes unmodified. This is groundwork: it lets a
+  future release add non-chat operations (embeddings, moderations, images, audio) as small spec
+  files with no change to the reliability engine. No user-visible behavior change.
 
 ## [1.1.0], 2026-06-30
 
