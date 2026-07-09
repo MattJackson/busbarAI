@@ -26,13 +26,13 @@ import PageLayout from '../../layouts/PageLayout.astro';
       <tbody>
         <tr>
           <td>Core format</td>
-          <td>No privileged protocol: one internal superset format every protocol maps into and out of, so all six are first-class in both directions</td>
+          <td>Superset core; all six protocols first-class, no privileged one</td>
           <td>OpenAI-shaped core; native-format ingress via per-protocol adapters <a href="#references">[4]</a></td>
         </tr>
         <tr>
           <td>Native ingress + load balancing</td>
-          <td>All six protocols, simultaneously, on any pool</td>
-          <td>Anthropic <code>/v1/messages</code> goes through the router <a href="#references">[4]</a>; byte-exact native routes are pass-throughs that skip it <a href="#references">[5]</a></td>
+          <td>Every protocol routes through pools with failover</td>
+          <td>Anthropic <code>/v1/messages</code> routes <a href="#references">[4]</a>; byte-exact native routes skip the router <a href="#references">[5]</a></td>
         </tr>
         <tr>
           <td>Bedrock SDK ingress</td>
@@ -56,23 +56,28 @@ import PageLayout from '../../layouts/PageLayout.astro';
         </tr>
         <tr>
           <td>Runtime</td>
-          <td>One static Rust binary, ~9 MB on disk, ~4.5 MB resident</td>
+          <td>One static Rust binary; nothing else to run</td>
           <td>Python/Uvicorn workers + PostgreSQL + Redis 7.0+ in production <a href="#references">[2]</a></td>
         </tr>
         <tr>
           <td>Added latency</td>
-          <td>Median tens of µs; under 100 µs even translating a 12k-token body cross-protocol <a href="#references">[6]</a></td>
+          <td>0.038 ms median, 0.045 ms p99 (small call); 0.084 ms median, 0.158 ms p99 translating a 12k-token body cross-protocol, from our published benchmark <a href="#references">[6]</a></td>
           <td>2 ms median, 8 ms p95, 13 ms p99, from their published benchmark <a href="#references">[1]</a></td>
         </tr>
         <tr>
+          <td>Memory</td>
+          <td>~4.5 MB under load, from our published numbers <a href="#references">[8]</a></td>
+          <td>~359 MB peak (Python), ~31.7 MB (Rust core, beta), from their published numbers <a href="#references">[7]</a></td>
+        </tr>
+        <tr>
           <td>Throughput</td>
-          <td>19,505 req/s sustained on 2 pinned cores <a href="#references">[6]</a></td>
-          <td>~1,170 RPS across 4 instances of 4 vCPU / 8 GB, from their published benchmark <a href="#references">[1]</a></td>
+          <td>19,505 req/s on 2 vCPUs (~9,750 per vCPU), from our published benchmark <a href="#references">[6]</a></td>
+          <td>~1,170 req/s on 16 vCPUs total (~73 per vCPU), from their published benchmark <a href="#references">[1]</a></td>
         </tr>
         <tr>
           <td>Provider coverage</td>
-          <td>Any provider speaking one of the six protocols, including every OpenAI-compatible endpoint, as a config entry in your own <code>providers.yaml</code>; a vetted catalog ships as the starting set</td>
-          <td>100+ providers preconfigured out of the box</td>
+          <td>41 vetted preconfigured, plus any provider on the six protocols via your own <code>providers.yaml</code></td>
+          <td>100+ preconfigured out of the box</td>
         </tr>
         <tr>
           <td>Dashboard</td>
@@ -234,5 +239,6 @@ import PageLayout from '../../layouts/PageLayout.astro';
     <li><a href="https://docs.litellm.ai/docs/pass_through/google_ai_studio">LiteLLM pass-through endpoints</a>: native-format endpoints that forward to a single provider, without router features.</li>
     <li><a href="/benchmark/">Busbar benchmark</a>: methodology, per-protocol numbers, and the reproduction steps; harness in the repo under <code>bench/</code>.</li>
     <li><a href="https://docs.litellm.ai/blog/litellm-rust-launch">LiteLLM Rust launch post</a>: the Python problems in their words, the Rust-core numbers, the beta status and staged rollout through December 2026, and the Python sidecar for plugins.</li>
+    <li><a href="/blog/busbar-in-numbers/">Busbar, in numbers</a>: memory, latency, and throughput measurements on the released binary, and how to reproduce them.</li>
   </ol>
 </PageLayout>
