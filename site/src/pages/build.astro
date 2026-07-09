@@ -291,7 +291,20 @@ const DATA = catalog.providers;
     function refreshList() {
       const q = $('cb-search').value.trim().toLowerCase();
       if (q.length < 2) { showHits(POPULAR, 'Popular right now'); return; }
-      showHits(INDEX.filter((m) => m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q)).slice(0, 12));
+      // Rank so the maker's own endpoint isn't buried under aggregators that
+      // resell its models: provider-name match first, then id-prefix matches.
+      const scored = [];
+      for (const m of INDEX) {
+        const id = m.id.toLowerCase(), name = m.name.toLowerCase();
+        const provHit = m.prov.toLowerCase().includes(q) || m.provLabel.toLowerCase().includes(q);
+        if (!provHit && !id.includes(q) && !name.includes(q)) continue;
+        let s = 0;
+        if (provHit) s -= 4;
+        if (id.startsWith(q) || name.startsWith(q)) s -= 2;
+        scored.push([s, m]);
+      }
+      scored.sort((a, b) => a[0] - b[0]);
+      showHits(scored.slice(0, 16).map(([, m]) => m));
     }
     $('cb-search').addEventListener('input', refreshList);
     $('cb-search').addEventListener('focus', refreshList);
