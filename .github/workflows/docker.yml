@@ -20,6 +20,14 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Publish as this version (e.g. 1.1.0) with the full semver tag cascade +
+          latest. Only use when the dispatched ref is source-identical to that
+          release. Leave empty to publish only a `test` tag.
+        required: false
+        default: ""
 
 env:
   DOCKERHUB_IMAGE: getbusbar/busbar
@@ -115,6 +123,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The version being published: the pushed v* tag, or the workflow_dispatch
+      # `version` input. Empty (bare dispatch) → publish only a `test` tag.
+      - name: Resolve version
+        id: ver
+        run: |
+          VER="${{ inputs.version }}"
+          if [ -z "$VER" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then VER="$GITHUB_REF_NAME"; fi
+          echo "ver=${VER#v}" >> "$GITHUB_OUTPUT"
+
       - name: Compute tags and labels
         id: meta
         uses: docker/metadata-action@v5
@@ -122,12 +139,12 @@ jobs:
           images: |
             ${{ env.DOCKERHUB_IMAGE }}
             ${{ env.GHCR_IMAGE }}
-          # v* tag → 1.2.3 / 1.2 / 1 / latest; manual dispatch → `test` only.
+          # version resolved → 1.2.3 / 1.2 / 1 / latest; bare dispatch → `test` only.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=test,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=semver,pattern={{version}},value=v${{ steps.ver.outputs.ver }},enable=${{ steps.ver.outputs.ver != '' }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ steps.ver.outputs.ver }},enable=${{ steps.ver.outputs.ver != '' }}
+            type=semver,pattern={{major}},value=v${{ steps.ver.outputs.ver }},enable=${{ steps.ver.outputs.ver != '' }}
+            type=raw,value=test,enable=${{ steps.ver.outputs.ver == '' }}
           labels: |
             org.opencontainers.image.title=busbar
             org.opencontainers.image.description=The reliability layer for LLM traffic — one endpoint, six wire protocols, fault-attributed circuit breaking, in-flight failover.
