@@ -785,6 +785,10 @@ struct FirstByteBody<S, P> {
     /// framing decision off the upstream CT (which on a cross-protocol reframe describes the egress,
     /// not the client) was the bug.
     ingress_protocol: Box<str>,
+    /// The operation this response belongs to. Drives whether the non-stream body is buffered for
+    /// usage extraction (`taps_nonstream_usage`) and how usage is read from it (`extract_usage`).
+    /// Chat reads the egress reader's IR usage; a flat-fee op taps nothing.
+    op: crate::ops::Op,
     /// True when the INGRESS client decodes a binary `application/vnd.amazon.eventstream` body (a
     /// native AWS SDK Bedrock client). A mid-stream error must then be a BINARY exception frame, not
     /// an SSE `event: error` text frame — writing SSE text into a binary eventstream body yields an
@@ -842,6 +846,7 @@ where
         inner: S,
         is_sse: bool,
         ingress_protocol: &str,
+        op: crate::ops::Op,
         permit: P,
         app: Arc<App>,
         lane_idx: usize,
@@ -864,6 +869,7 @@ where
                 .map(|p| p.writer().ingress_is_eventstream())
                 .unwrap_or(false),
             ingress_protocol: Box::from(ingress_protocol),
+            op,
             permit: Some(permit),
             app: Some(app),
             lane_idx,
@@ -926,7 +932,10 @@ where
                     // and (b) the unknown-protocol fallback (`new_same_proto` returned `None`), which has
                     // no reader to drive the IR and therefore no usage source. The bytes always stream to
                     // the client unchanged; for (a) we retain a bounded copy for IR-based billing below.
-                    if !this.is_sse {
+                    // Only buffer when the operation actually taps usage from the body. Chat and the
+                    // token-billed ops do; a flat-fee op (or a large-binary response) skips the copy
+                    // entirely — the bytes still relay verbatim below, unbuffered.
+                    if !this.is_sse && this.op.taps_nonstream_usage() {
                         // SAME-PROTOCOL NON-STREAM `application/json` passthrough (Change A path #4): the
                         // non-stream analog of B's read-for-IR-emit-verbatim. The body relays verbatim,
                         // but a bounded copy is retained so the stream-end arm can run the egress reader
@@ -1207,11 +1216,12 @@ where
                         if let Some(t) = this.translate.as_ref() {
                             t.usage().cloned()
                         } else if !this.is_sse && !this.nonstream_buf.is_empty() {
+                            // Same-protocol non-stream body relayed verbatim; the operation reads
+                            // usage from the reassembled bytes. Chat runs the egress reader and
+                            // reports IR usage (byte-identical to the previous inline read); a
+                            // flat-fee op returns None and bills nothing.
                             let buf = std::mem::take(&mut this.nonstream_buf);
-                            crate::proto::protocol_for(&this.ingress_protocol)
-                                .zip(crate::json::parse::<Value>(&buf).ok())
-                                .and_then(|(p, v)| p.reader().read_response(&v).ok())
-                                .map(|ir| ir.usage)
+                            this.op.extract_usage(&this.ingress_protocol, &buf)
                         } else {
                             None
                         };
@@ -2147,6 +2157,7 @@ pub(crate) async fn forward_with_pool(
     pool_name: &str,
     affinity_key: Option<&str>,
     ingress_protocol: &str,
+    op: crate::ops::Op,
     usage_sink: Option<UsageSink>,
 ) -> Response {
     let v: Value = match crate::json::parse(&body) {
@@ -2170,6 +2181,7 @@ pub(crate) async fn forward_with_pool(
         pool_name,
         affinity_key,
         ingress_protocol,
+        op,
         usage_sink,
     )
     .await
@@ -2186,7 +2198,7 @@ pub(crate) async fn forward_with_pool(
 #[tracing::instrument(
     name = "forward",
     skip_all,
-    fields(pool = %pool_name, ingress = %ingress_protocol)
+    fields(pool = %pool_name, ingress = %ingress_protocol, op = op.name())
 )]
 pub(crate) async fn forward_with_pool_parsed(
     app: Arc<App>,
@@ -2197,6 +2209,11 @@ pub(crate) async fn forward_with_pool_parsed(
     pool_name: &str,
     affinity_key: Option<&str>,
     ingress_protocol: &str,
+    // A request's identity is (operation, protocol): `ingress_protocol` is the wire language,
+    // `op` is the kind of work. Everything below is the engine carrying that pair through pool
+    // selection, failover, the breaker, and billing. The engine reads only capabilities off the
+    // spec, never its identity; `crate::ops::CHAT` reproduces today's behavior byte-for-byte.
+    op: crate::ops::Op,
     usage_sink: Option<UsageSink>,
 ) -> Response {
     // `v` is the PRISTINE parsed request body (parsed once by the caller). Never mutated after this
@@ -2208,7 +2225,9 @@ pub(crate) async fn forward_with_pool_parsed(
 
     // capture the caller's stream intent from the ingress body BEFORE any cross-protocol
     // translation rewrites `v` (Gemini routes streaming requests to a different upstream endpoint).
-    let wants_stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    // Delegated to the operation: chat reads the OpenAI-family `stream` boolean (byte-identical to
+    // the previous inline read); a non-streaming op always returns false.
+    let wants_stream = op.wants_stream(&v);
 
     // Gemini ingress streaming WITHOUT `?alt=sse`: the native client expects a JSON-array streamed
     // body, not SSE. The route layer signals this via a router shim key (read here; stripped from the
@@ -2218,18 +2237,20 @@ pub(crate) async fn forward_with_pool_parsed(
     // in its own fully-controlled body would have its SSE stream silently reframed as a JSON array
     // under `Content-Type: application/json` — undecodable by the official SDK and a router behavior
     // no native backend exhibits. False for every other protocol and for the `?alt=sse` gemini variant.
-    let gemini_json_array = crate::proto::protocol_for(ingress_protocol)
-        .map(|p| p.writer().uses_array_stream_shim() && p.writer().wants_array_stream(&v))
-        .unwrap_or(false);
+    // Additionally gated on `op.streaming()`: a non-streaming operation never frames a JSON-array
+    // stream (chat streams, so this is a no-op for chat — `true && x == x`).
+    let gemini_json_array = op.streaming()
+        && crate::proto::protocol_for(ingress_protocol)
+            .map(|p| p.writer().uses_array_stream_shim() && p.writer().wants_array_stream(&v))
+            .unwrap_or(false);
 
-    // Derive affinity key early (before any mutations to v)
+    // Derive affinity key early (before any mutations to v). When no affinity header was supplied,
+    // fall back to the operation's body-derived key: chat uses the top-level `system` string
+    // (byte-identical to the previous inline read); other ops default to no body affinity.
     let affinity_key_str: Option<String> = if let Some(k) = affinity_key {
         Some(k.to_string())
     } else {
-        v.get("system")
-            .and_then(|s| s.as_str())
-            .filter(|s| !s.is_empty())
-            .map(String::from)
+        op.body_affinity_key(&v).map(String::from)
     };
 
     // Before-first-byte failover boundary:
@@ -2393,6 +2414,7 @@ pub(crate) async fn forward_with_pool_parsed(
                     caller_token,
                     &mut request_ctx,
                     ingress_protocol,
+                    op,
                     usage_sink.clone(),
                 )
                 .await;
@@ -2484,10 +2506,25 @@ pub(crate) async fn forward_with_pool_parsed(
 
         // per-request auth (SigV4 for Bedrock; static for others) needs the host/path/body.
         let writer = app.lanes[i].protocol.writer();
-        let url_path = match &app.lanes[i].path {
-            // Provider-configured path override (e.g. version-in-base-url providers).
-            Some(p) => p.clone(),
-            None => writer.upstream_path_for_stream(app.lanes[i].wire_model(), wants_stream),
+        // The operation resolves its own upstream path from this lane: chat delegates to the
+        // writer's stream-aware default (honoring any provider `path` override) — byte-identical to
+        // the previous inline logic. `None` means this lane's protocol does not speak this
+        // operation; unreachable for chat (every protocol speaks it), and impossible once the
+        // router filters candidates by operation support, but the engine still bails safely rather
+        // than dispatch to a wrong path — releasing any single-flight probe this lane won so it
+        // cannot wedge HalfOpen (same contract as the re-parse/translate guards above).
+        let url_path = match op.upstream_path(&app.lanes[i], wants_stream) {
+            Some(p) => p,
+            None => {
+                app.store.release_probe_in(pool_name, i);
+                drop(permit);
+                return ingress_error(
+                    ingress_protocol,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    KIND_API_ERROR,
+                    "We received an unexpected internal error. Please try again.",
+                );
+            }
         };
         // SigV4 signs over the URI-encoded canonical path, so the wire request MUST be sent over the
         // SAME encoding or AWS rejects with SignatureDoesNotMatch (e.g. a Bedrock modelId carrying
@@ -2514,10 +2551,11 @@ pub(crate) async fn forward_with_pool_parsed(
             // writer vtable (`ProtocolWriter::egress_user_agent`) — `writer` is already resolved above.
             .header(USER_AGENT, writer.egress_user_agent())
             // Native-SDK Accept for the egress protocol (eventstream/json/SSE by stream intent). A
-            // native SDK always sends one; omitting it is a backend-side proxy fingerprint. Dispatched
-            // through the writer vtable (`ProtocolWriter::egress_accept`) so no `"bedrock"` branch
-            // lives here. Not part of SigV4 SignedHeaders, so no signature impact.
-            .header(ACCEPT, writer.egress_accept(wants_stream))
+            // native SDK always sends one; omitting it is a backend-side proxy fingerprint. The
+            // operation chooses it: chat defers to the writer vtable (`ProtocolWriter::egress_accept`,
+            // byte-identical to before) so no `"bedrock"` branch lives here; an op with a non-JSON
+            // response chooses its own. Not part of SigV4 SignedHeaders, so no signature impact.
+            .header(ACCEPT, op.egress_accept(writer, wants_stream))
             .body(payload);
         // reqwest's per-request `.timeout()` bounds the ENTIRE request lifecycle, INCLUDING reading
         // the response body. For a STREAMING response that body is a long-lived generation stream
@@ -3334,6 +3372,7 @@ pub(crate) async fn forward_with_pool_parsed(
                     upstream_stream,
                     is_sse,
                     ingress_protocol,
+                    op,
                     permit,
                     app.clone(),
                     i,
@@ -3398,6 +3437,7 @@ pub(crate) async fn forward_with_pool_parsed(
         caller_token,
         &mut request_ctx,
         ingress_protocol,
+        op,
         usage_sink,
     )
     .await
@@ -3435,6 +3475,7 @@ async fn handle_exhaustion_for_pool(
     caller_token: Option<&str>,
     request_ctx: &mut RequestCtx,
     ingress_protocol: &str,
+    op: crate::ops::Op,
     usage_sink: Option<UsageSink>,
 ) -> Response {
     // Cycle-guard fix (LOW #22): mark the ORIGINATING pool visited here, BEFORE the mode lookup —
@@ -3464,6 +3505,7 @@ async fn handle_exhaustion_for_pool(
                 fallback_pool,
                 request_ctx,
                 ingress_protocol,
+                op,
                 usage_sink,
             )
             .await
@@ -3478,6 +3520,7 @@ async fn handle_exhaustion_for_pool(
                 request_ctx,
                 pool_name,
                 ingress_protocol,
+                op,
                 usage_sink,
             )
             .await
@@ -3543,6 +3586,7 @@ async fn forward_once(
     // a single-flight HalfOpen probe on it, so recording on `""` left the pool cell wedged HalfOpen +
     // `probe_in_flight` forever. An empty `pool` means the lane-default cell (direct/ad-hoc routes).
     pool: &str,
+    op: crate::ops::Op,
     usage_sink: Option<UsageSink>,
 ) -> Result<Response, ()> {
     // Re-parse body for per-lane model rewriting.
@@ -3626,9 +3670,20 @@ async fn forward_once(
 
     // per-request auth (SigV4 for Bedrock; static otherwise).
     let writer = app.lanes[i].protocol.writer();
-    let url_path = match &app.lanes[i].path {
-        Some(p) => p.clone(),
-        None => writer.upstream_path_for_stream(app.lanes[i].wire_model(), wants_stream),
+    let url_path = match op.upstream_path(&app.lanes[i], wants_stream) {
+        Some(p) => p,
+        None => {
+            // Unreachable for chat; the router filters unsupported lanes before the degraded path
+            // is reached. Bail safely, releasing any single-flight probe this lane won (same probe
+            // contract as forward_once's other pre-dispatch guards).
+            app.store.release_probe_in(pool, i);
+            return Ok(ingress_error(
+                ingress_protocol,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                KIND_API_ERROR,
+                "We received an unexpected internal error. Please try again.",
+            ));
+        }
     };
     // Sign and send the SAME path encoding — see `sign_and_wire_path_parts` (mirrors the main forward
     // path): it returns the SigV4 canonical_uri (query stripped) alongside the wire path, so the
@@ -3653,7 +3708,7 @@ async fn forward_once(
         .header(USER_AGENT, writer.egress_user_agent())
         // Native-SDK Accept for the egress protocol (mirrors the main forward path). Dispatched
         // through the writer vtable (`ProtocolWriter::egress_accept`) — no `"bedrock"` branch here.
-        .header(ACCEPT, writer.egress_accept(wants_stream))
+        .header(ACCEPT, op.egress_accept(writer, wants_stream))
         .body(payload);
     // See the main forward path: reqwest's `.timeout()` bounds the whole body read, so applying the
     // failover deadline to a STREAMING request truncates a healthy long generation at that wall-clock
@@ -4027,6 +4082,7 @@ async fn forward_once(
                 upstream_stream,
                 is_sse,
                 ingress_protocol,
+                op,
                 permit,
                 app.clone(),
                 i,
@@ -4111,6 +4167,7 @@ async fn handle_fallback_pool(
     pool_name: &str,
     request_ctx: &mut RequestCtx,
     ingress_protocol: &str,
+    op: crate::ops::Op,
     usage_sink: Option<UsageSink>,
 ) -> Response {
     // Deadline propagated across hops.
@@ -4165,6 +4222,7 @@ async fn handle_fallback_pool(
                 caller_token,
                 request_ctx,
                 ingress_protocol,
+                op,
                 usage_sink,
             ))
             .await;
@@ -4184,6 +4242,7 @@ async fn handle_fallback_pool(
             // CAS-won the single-flight HalfOpen probe on) — record this attempt's breaker outcome
             // against THAT cell, not the default `""` cell.
             pool_name,
+            op,
             // Clone per attempt: a transient transport failure retries the next member, so the sink
             // must survive into the next loop iteration; only a successful stream consumes it.
             usage_sink.clone(),
@@ -4211,6 +4270,7 @@ async fn handle_least_bad(
     request_ctx: &RequestCtx,
     pool: &str,
     ingress_protocol: &str,
+    op: crate::ops::Op,
     usage_sink: Option<UsageSink>,
 ) -> Response {
     let Some(soonest_idx) = find_soonest_cooldown(&app.store, cands, now, pool) else {
@@ -4241,6 +4301,7 @@ async fn handle_least_bad(
         // The least-bad member was selected via this pool's cell (`find_soonest_cooldown` /
         // `cooldown_remaining_in(pool, …)`), so record its breaker outcome against the POOL cell.
         pool,
+        op,
         usage_sink,
     )
     .await
@@ -6326,6 +6387,7 @@ mod ingress_indistinguishability_tests {
             "pa",
             None,
             "anthropic",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -6443,6 +6505,7 @@ mod ingress_indistinguishability_tests {
             "pa",
             None,
             "anthropic",
+            crate::ops::CHAT,
             sink,
         )
         .await;
@@ -6541,6 +6604,7 @@ mod ingress_indistinguishability_tests {
             inner,
             false, // is_sse: same-protocol NON-STREAM application/json
             "openai",
+            crate::ops::CHAT,
             (),
             app.clone(),
             0,
@@ -6649,6 +6713,7 @@ mod ingress_indistinguishability_tests {
             "pa",
             None,
             "openai",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -6726,6 +6791,7 @@ mod ingress_indistinguishability_tests {
             "pg",
             None,
             "gemini",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -6808,6 +6874,7 @@ mod ingress_indistinguishability_tests {
             "pa",
             None,
             "bedrock",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -6879,6 +6946,7 @@ mod ingress_indistinguishability_tests {
             "pa",
             None,
             "anthropic",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -6952,6 +7020,7 @@ data: {"type":"message_stop"}"#
             "ps",
             None,
             "anthropic",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -7014,6 +7083,7 @@ data: {"type":"message_stop"}"#
             "pc",
             None,
             "anthropic",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -7064,6 +7134,7 @@ data: {"type":"message_stop"}"#
             "missingpool",
             None,
             "openai",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -7146,6 +7217,7 @@ data: {"type":"message_stop"}"#
             "leastbad",
             None,
             "openai",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -7239,6 +7311,7 @@ data: {"type":"message_stop"}"#
             "leastbad",
             None,
             "openai",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -7323,6 +7396,7 @@ data: {"type":"message_stop"}"#
             "leastbad",
             None,
             "bedrock",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -7399,7 +7473,7 @@ data: {"type":"message_stop"}"#
             "pa",
             None,
             "anthropic",
-            None,
+            crate::ops::CHAT, None,
         )
         .await;
 
@@ -7478,7 +7552,7 @@ data: {"type":"message_stop"}"#
             "pa",
             None,
             "anthropic",
-            None,
+            crate::ops::CHAT, None,
         )
         .await;
 
@@ -7533,6 +7607,7 @@ data: {"type":"message_stop"}"#
                 "missingpool",
                 None,
                 ingress,
+                crate::ops::CHAT,
                 None,
             )
             .await;
@@ -7597,6 +7672,7 @@ data: {"type":"message_stop"}"#
             "pb",
             None,
             "bedrock",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -7681,6 +7757,7 @@ data: {"type":"message_stop"}"#
             "pg",
             None,
             "gemini",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -7767,6 +7844,7 @@ data: {"type":"message_stop"}"#
             "leastbad-g",
             None,
             "gemini",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -7852,6 +7930,7 @@ data: {"type":"message_stop"}"#
             "pc",
             None,
             "anthropic",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -7932,6 +8011,7 @@ data: {"type":"message_stop"}"#
             "p",
             None,
             "openai",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -8011,6 +8091,7 @@ data: {"type":"message_stop"}"#
             inner,
             true, // is_sse: streaming path
             "anthropic",
+            crate::ops::CHAT,
             (), // permit: a unit placeholder is sufficient for the Stream bounds
             app.clone(),
             0,
@@ -8103,6 +8184,7 @@ data: {"type":"message_stop"}"#
             inner,
             false, // is_sse: NON-streaming same-protocol passthrough (application/json)
             "openai",
+            crate::ops::CHAT,
             (), // permit placeholder
             app.clone(),
             0,
@@ -8248,6 +8330,7 @@ data: {"type":"message_stop"}"#
             inner,
             true, // is_sse: streaming cross-protocol path
             "anthropic",
+            crate::ops::CHAT,
             (),
             app.clone(),
             0,
@@ -8359,6 +8442,7 @@ data: {"type":"message_stop"}"#
                 inner,
                 true,
                 "anthropic",
+                crate::ops::CHAT,
                 (),
                 app.clone(),
                 0,
@@ -8463,6 +8547,7 @@ data: {"type":"message_stop"}"#
                 inner,
                 true,
                 "anthropic",
+                crate::ops::CHAT,
                 (),
                 app.clone(),
                 0,
@@ -8568,6 +8653,7 @@ mod forward_once_pool_cell_tests {
             "primary",
             None,
             "anthropic",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -8635,6 +8721,7 @@ mod forward_once_pool_cell_tests {
             "primary",
             None,
             "anthropic",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -8717,6 +8804,7 @@ mod forward_once_pool_cell_tests {
             "primary",
             None,
             "anthropic",
+            crate::ops::CHAT,
             None,
         )
         .await;
@@ -8827,6 +8915,7 @@ mod forward_once_pool_cell_tests {
             "A",
             None,
             "anthropic",
+            crate::ops::CHAT,
             None,
         )
         .await;

@@ -11,7 +11,7 @@
 
 use serde_json::Value;
 
-use super::{OpSpec, Translation};
+use super::OpSpec;
 use crate::proto::ProtocolWriter;
 use crate::state::Lane;
 
@@ -28,11 +28,9 @@ impl OpSpec for ChatOp {
 
     fn wants_stream(&self, body: &Value) -> bool {
         // Relocated from forward.rs: the caller's stream intent from the OpenAI-family body.
-        body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false)
-    }
-
-    fn translation(&self) -> Translation {
-        Translation::CrossProtocolIr
+        body.get("stream")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false)
     }
 
     fn body_affinity_key<'a>(&self, body: &'a Value) -> Option<&'a str> {

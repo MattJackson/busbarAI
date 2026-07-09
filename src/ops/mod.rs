@@ -39,21 +39,14 @@ pub(crate) mod chat;
 /// A `&'static` handle to an operation spec, threaded through the forward engine.
 pub(crate) type Op = &'static dyn OpSpec;
 
-/// How an operation's request/response bodies may cross protocol boundaries.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Translation {
-    /// Candidate lanes are restricted to the ingress protocol; a cross-protocol hop cannot occur.
-    /// Every non-chat operation is this in v1 — the seam for per-op cross-protocol IR (e.g. an
-    /// OpenAI embeddings request served by a Gemini `:embedContent` lane) is the single dispatch
-    /// on `OpSpec::translation()` at the `translate_request_cross_protocol` call site.
-    SameProtocolOnly,
-    /// Full superset-IR translation — today's chat pipeline: any ingress protocol may be served by
-    /// any egress lane, translating losslessly through the IR in both directions.
-    CrossProtocolIr,
-}
-
 /// A first-class operation. The forward engine consumes only this trait and never names an
 /// operation; each concrete op lives in its own file under `src/ops/`.
+///
+/// The trait surface is exactly what the engine wires today (chat-only). The additional axes an
+/// operation needs to be non-chat — cross-protocol translation capability, the `(protocol × op)`
+/// support matrix and candidate-lane filtering, opaque (non-JSON) request/response bodies — land
+/// alongside the operations that first exercise them, so the engine never carries a capability no
+/// registered operation uses.
 pub(crate) trait OpSpec: Send + Sync {
     /// Stable identifier — a bounded metric label, the `paths:` config key, and the docs name.
     /// e.g. `"chat"`, `"embeddings"`.
@@ -74,11 +67,6 @@ pub(crate) trait OpSpec: Send + Sync {
         false
     }
 
-    /// This operation's cross-protocol translation capability. Default: [`Translation::SameProtocolOnly`].
-    fn translation(&self) -> Translation {
-        Translation::SameProtocolOnly
-    }
-
     /// A session-affinity key derived from the request body when no affinity header is present.
     /// Default: `None`. Chat overrides with the top-level `system` string (Anthropic-shaped).
     fn body_affinity_key<'a>(&self, _body: &'a Value) -> Option<&'a str> {
@@ -91,13 +79,6 @@ pub(crate) trait OpSpec: Send + Sync {
     /// carries its own per-operation path override, so provider-specific overrides stay
     /// spec-contained. `None` for chat is impossible — every protocol speaks chat.
     fn upstream_path(&self, lane: &Lane, wants_stream: bool) -> Option<String>;
-
-    /// Convenience: does `lane` support this operation? Derived from [`OpSpec::upstream_path`].
-    /// For [`Translation::SameProtocolOnly`] ops the router also checks protocol equality; this
-    /// method answers only the matrix-cell question.
-    fn supports(&self, lane: &Lane, wants_stream: bool) -> bool {
-        self.upstream_path(lane, wants_stream).is_some()
-    }
 
     /// Should the non-stream response body be buffered so [`OpSpec::extract_usage`] can read it?
     /// Default: `false` — an op that never bills tokens (moderations) and an op whose response is
@@ -123,41 +104,24 @@ pub(crate) trait OpSpec: Send + Sync {
     }
 }
 
-/// The closed operation registry — the queryable matrix. `list_models`, config validation, and the
-/// router resolve against this slice; a matrix-pinning test iterates it.
+/// The chat operation — spec #1, and the only operation the engine registers today. Threaded
+/// through the forward path as the concrete [`Op`]. Embeddings/moderations/images/audio join as
+/// their own spec files, and a registry over them lands with the router that enumerates ops.
 pub(crate) static CHAT: Op = &chat::ChatOp;
-
-/// Every registered operation. Chat-only in 1.1.1; embeddings/moderations/images/audio join in 1.2
-/// as pure additions to this slice plus their own spec files — no engine change.
-pub(crate) static ALL: &[Op] = &[CHAT];
-
-/// Resolve an operation by its stable name. Returns `None` for an unregistered name.
-pub(crate) fn op_for(name: &str) -> Option<Op> {
-    ALL.iter().copied().find(|o| o.name() == name)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn registry_lookup_roundtrips() {
-        assert_eq!(op_for("chat").map(|o| o.name()), Some("chat"));
-        assert!(op_for("nonesuch").is_none());
-        // Every registered op has a unique, non-empty name.
-        let mut seen = std::collections::HashSet::new();
-        for op in ALL {
-            assert!(!op.name().is_empty(), "op name must be non-empty");
-            assert!(seen.insert(op.name()), "duplicate op name: {}", op.name());
-        }
-    }
-
-    #[test]
     fn chat_declares_its_capabilities() {
         let chat = CHAT;
+        assert_eq!(chat.name(), "chat");
         assert!(chat.streaming(), "chat streams");
-        assert_eq!(chat.translation(), Translation::CrossProtocolIr);
-        assert!(chat.taps_nonstream_usage(), "chat bills tokens from the body");
+        assert!(
+            chat.taps_nonstream_usage(),
+            "chat bills tokens from the body"
+        );
         assert!(
             chat.wants_stream(&serde_json::json!({"stream": true})),
             "chat reads the stream boolean"
@@ -167,6 +131,9 @@ mod tests {
             chat.body_affinity_key(&serde_json::json!({"system": "you are helpful"})),
             Some("you are helpful")
         );
-        assert_eq!(chat.body_affinity_key(&serde_json::json!({"system": ""})), None);
+        assert_eq!(
+            chat.body_affinity_key(&serde_json::json!({"system": ""})),
+            None
+        );
     }
 }
