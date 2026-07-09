@@ -18,7 +18,7 @@
 //   POST /v1/models/<model>:<action>       Gemini-format ingress (stable v1 alias)
 //   POST /v1beta/models/<model>:<action>   Gemini-format ingress (v1beta)
 //   POST /model/<modelId>/converse[-stream] Bedrock Converse / ConverseStream ingress
-//   GET  /v1/models                        OpenAI list-models (configured models + pools)
+//   GET  /v1/models  /v1beta/models        list models (dialect by protocol fingerprint)
 //   GET  /stats  /healthz  /metrics
 //
 // Each model is a "lane" with its own concurrency semaphore, optional lifetime request budget, and
@@ -173,7 +173,7 @@ ENDPOINTS (once running, listen address from config.yaml `listen`):
     POST /v1beta/models/<model>:<action>   Gemini-format ingress
     POST /model/<modelId>/converse         Bedrock Converse ingress
     POST /model/<modelId>/converse-stream  Bedrock Converse streaming ingress
-    GET  /v1/models                        OpenAI list-models (models + pools)
+    GET  /v1/models  /v1beta/models        list models (answers in the caller's dialect)
     GET  /stats  /healthz  /metrics
 
 Docs: https://getbusbar.com   ·   Source: https://github.com/MattJackson/busbarAI",
@@ -993,6 +993,7 @@ fn build_router_with_limits(
         // OpenAI list-models: SDKs call `models.list()` first; UIs build pickers from it.
         // Governance-scoped like /stats (restricted keys see only their reachable names).
         .route("/v1/models", get(handlers::list_models))
+        .route("/v1beta/models", get(handlers::list_models_v1beta))
         // Cohere v2 + OpenAI Responses ingress: model+stream in the body (body-model protocols).
         .route("/v2/chat", post(route::cohere_ingress))
         .route("/v1/responses", post(route::responses_ingress))

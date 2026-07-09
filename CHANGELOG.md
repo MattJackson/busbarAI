@@ -9,11 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`GET /v1/models`**: the OpenAI list-models surface. Returns every routable name — configured
-  pools first, then model entries, each sorted. This is the first call `client.models.list()` and
-  self-hosted UIs (Open WebUI, LibreChat) make to build a model picker; it previously returned 404.
-  Governance-scoped like `/stats`: a virtual key restricted by `allowed_pools` sees only the pools
-  it may target and the models reachable through them.
+- **`GET /v1/models` and `GET /v1beta/models`**: the list-models surface. Returns every routable
+  name — configured pools first, then model entries, each sorted. This is the first call
+  `client.models.list()` and self-hosted UIs (Open WebUI, LibreChat) make to build a model picker;
+  it previously returned 404. Three protocols put list-models on the same noun, so busbar answers
+  in the **caller's dialect** by protocol fingerprint: an `anthropic-version` header gets the
+  Anthropic envelope, `x-goog-api-key` or the `/v1beta` path gets Gemini's, otherwise OpenAI's —
+  the same names rendered three ways. Governance-scoped like `/stats`: a virtual key restricted by
+  `allowed_pools` sees only the pools it may target and the models reachable through them.
 
 ### Fixed
 

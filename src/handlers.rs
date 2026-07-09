@@ -113,6 +113,38 @@ pub(crate) async fn stats(
 pub(crate) async fn list_models(
     State(app): State<Arc<App>>,
     Extension(gov): Extension<GovCtx>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    list_models_dialect(app, gov, &headers, false)
+}
+
+/// `GET /v1beta/models` — the same list in Gemini's dialect (their SDK's discovery path).
+pub(crate) async fn list_models_v1beta(
+    State(app): State<Arc<App>>,
+    Extension(gov): Extension<GovCtx>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    list_models_dialect(app, gov, &headers, true)
+}
+
+/// Three protocols put their list-models endpoint on the same noun, each with its own
+/// envelope: OpenAI and Anthropic share `GET /v1/models` outright, and Gemini lists at
+/// `GET /v1(beta)/models`. Primary (POST) surfaces are disjoint by path, so this is the
+/// one place busbar disambiguates callers by PROTOCOL FINGERPRINT instead:
+///
+/// - `anthropic-version` header — the Anthropic API requires it, so their SDK always
+///   sends it -> Anthropic envelope
+/// - `x-goog-api-key` header or the /v1beta path -> Gemini envelope
+/// - otherwise -> OpenAI envelope (the compatible ecosystem's default; Cohere's SDK
+///   carries no reliable fingerprint and receives this shape, documented)
+///
+/// The list itself is the same data in every dialect: the names a client may put in a
+/// request body. No privileged protocol - the data is one, the rendering is the caller's.
+fn list_models_dialect(
+    app: Arc<App>,
+    gov: GovCtx,
+    headers: &axum::http::HeaderMap,
+    gemini_path: bool,
 ) -> Response {
     let restricted = gov
         .key
@@ -159,6 +191,39 @@ pub(crate) async fn list_models(
     names.extend(models);
     names.dedup();
 
+    if headers.contains_key("anthropic-version") {
+        let data: Vec<Value> = names
+            .iter()
+            .map(|id| {
+                json!({
+                    "type": "model",
+                    "id": id,
+                    "display_name": id,
+                    "created_at": "1970-01-01T00:00:00Z"
+                })
+            })
+            .collect();
+        return Json(json!({
+            "data": data,
+            "has_more": false,
+            "first_id": names.first(),
+            "last_id": names.last(),
+        }))
+        .into_response();
+    }
+    if gemini_path || headers.contains_key("x-goog-api-key") {
+        let models: Vec<Value> = names
+            .iter()
+            .map(|id| {
+                json!({
+                    "name": format!("models/{id}"),
+                    "displayName": id,
+                    "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
+                })
+            })
+            .collect();
+        return Json(json!({ "models": models })).into_response();
+    }
     let data: Vec<Value> = names
         .iter()
         .map(|id| json!({ "id": id, "object": "model", "created": 0, "owned_by": "busbar" }))
@@ -299,7 +364,7 @@ mod tests {
     }
 
     async fn models_ids(app: Arc<App>, gov: GovCtx) -> Vec<String> {
-        let resp = list_models(State(app), Extension(gov)).await;
+        let resp = list_models(State(app), Extension(gov), axum::http::HeaderMap::new()).await;
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("collect /v1/models body");
@@ -355,5 +420,47 @@ mod tests {
         };
         let ids = models_ids(app, gov).await;
         assert_eq!(ids.len(), 5);
+    }
+
+    async fn models_body(app: Arc<App>, headers: axum::http::HeaderMap, beta: bool) -> Value {
+        let resp = if beta {
+            list_models_v1beta(State(app), Extension(GovCtx::default()), headers).await
+        } else {
+            list_models(State(app), Extension(GovCtx::default()), headers).await
+        };
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect body");
+        serde_json::from_slice(&bytes).expect("JSON body")
+    }
+
+    /// The Anthropic SDK always sends `anthropic-version` (their API requires it) — the
+    /// same path answers in the Anthropic list envelope for those callers.
+    #[tokio::test]
+    async fn test_v1_models_anthropic_fingerprint_gets_anthropic_envelope() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        let body = models_body(topology_app(), headers, false).await;
+        assert_eq!(body["has_more"], false, "Anthropic list envelope");
+        let first = &body["data"][0];
+        assert_eq!(first["type"], "model");
+        assert_eq!(first["id"], "pool-a");
+        assert!(body.get("object").is_none(), "no OpenAI envelope fields");
+    }
+
+    /// Gemini callers (x-goog-api-key header, or the /v1beta path their SDK uses) get the
+    /// Gemini models envelope with `models/<id>` resource names.
+    #[tokio::test]
+    async fn test_v1_models_gemini_fingerprint_gets_gemini_envelope() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-goog-api-key", "k".parse().unwrap());
+        let body = models_body(topology_app(), headers, false).await;
+        assert_eq!(body["models"][0]["name"], "models/pool-a");
+
+        let beta = models_body(topology_app(), axum::http::HeaderMap::new(), true).await;
+        assert_eq!(
+            beta["models"][0]["name"], "models/pool-a",
+            "/v1beta path implies Gemini"
+        );
     }
 }
