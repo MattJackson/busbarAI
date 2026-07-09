@@ -204,7 +204,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
     LiteLLM is rebuilding its data plane in Rust, and their launch post says why in plain terms:
     "Under real load, CPU and memory climb with concurrency, and pods get OOM-killed at the worst
     time" <a href="#references">[7]</a>. We think they're right, and the move validates the
-    architecture Busbar shipped at 1.0: a compiled, no-GC gateway is what this job requires.
+    architecture Busbar has shipped since day one: a compiled, no-GC gateway is what this job requires.
   </p>
   <p>
     The differences that remain are worth stating precisely. Their Rust core is in early beta,
