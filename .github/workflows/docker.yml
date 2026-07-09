@@ -1,0 +1,170 @@
+name: Docker
+
+# Build and publish the busbar container image (Docker Hub + GHCR) as a multi-arch
+# manifest (linux/amd64 + linux/arm64), FROM scratch over static musl binaries.
+#
+# Triggers:
+#   - v* tags: publish with the semver tag cascade (X.Y.Z, X.Y, X, latest)
+#   - workflow_dispatch: publish a `test` tag only — end-to-end pipeline check
+#     without cutting a release.
+#
+# Supply chain: images are signed with cosign (keyless OIDC) and carry a GitHub
+# build-provenance attestation, matching the release binaries. Verify with:
+#   cosign verify docker.io/getbusbar/busbar:<tag> \
+#     --certificate-identity-regexp 'https://github.com/MattJackson/busbarAI/\.github/workflows/docker\.yml@.*' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#   gh attestation verify oci://docker.io/getbusbar/busbar:<tag> --repo MattJackson/busbarAI
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  DOCKERHUB_IMAGE: getbusbar/busbar
+  GHCR_IMAGE: ghcr.io/mattjackson/busbar
+
+permissions:
+  contents: read
+  packages: write      # push to GHCR
+  id-token: write      # keyless cosign signing
+  attestations: write  # build-provenance attestation
+
+jobs:
+  # Static musl binaries, one per architecture, built on native runners (no QEMU).
+  build-binaries:
+    name: musl ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build static binary
+        env:
+          # musl-gcc drives both the C compiles (bundled SQLite) and the final link.
+          CC: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          file "target/${{ matrix.target }}/release/busbar"
+          # Fail loudly if the binary is not fully static — FROM scratch has no loader.
+          if ldd "target/${{ matrix.target }}/release/busbar" 2>&1 | grep -qv 'not a dynamic\|statically linked'; then
+            echo "binary is dynamically linked; refusing to ship in FROM scratch" && exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: busbar-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/busbar
+          if-no-files-found: error
+
+  publish:
+    name: build & push image
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Stage binaries into build context
+        uses: actions/download-artifact@v4
+        with:
+          pattern: busbar-*
+          path: staged
+
+      - name: Arrange per-arch layout
+        run: |
+          mkdir -p binaries/amd64 binaries/arm64
+          mv staged/busbar-amd64/busbar binaries/amd64/busbar
+          mv staged/busbar-arm64/busbar binaries/arm64/busbar
+          chmod +x binaries/amd64/busbar binaries/arm64/busbar
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.DOCKERHUB_IMAGE }}
+            ${{ env.GHCR_IMAGE }}
+          # v* tag → 1.2.3 / 1.2 / 1 / latest; manual dispatch → `test` only.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=test,enable=${{ github.event_name == 'workflow_dispatch' }}
+          labels: |
+            org.opencontainers.image.title=busbar
+            org.opencontainers.image.description=The reliability layer for LLM traffic — one endpoint, six wire protocols, fault-attributed circuit breaking, in-flight failover.
+            org.opencontainers.image.url=https://getbusbar.com
+            org.opencontainers.image.documentation=https://getbusbar.com/getting-started/
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign images (keyless)
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          cosign sign --yes "${DOCKERHUB_IMAGE}@${DIGEST}"
+          cosign sign --yes "${GHCR_IMAGE}@${DIGEST}"
+
+      - name: Attest build provenance (Docker Hub)
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: index.docker.io/${{ env.DOCKERHUB_IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: false
+
+      - name: Attest build provenance (GHCR)
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.GHCR_IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

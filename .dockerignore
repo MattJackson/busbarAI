@@ -1,0 +1,4 @@
+# Image copies only prebuilt binaries/ + providers.yaml; keep the build context minimal.
+*
+!binaries/
+!providers.yaml
