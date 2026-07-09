@@ -27,17 +27,17 @@ import PageLayout from '../../layouts/PageLayout.astro';
         <tr>
           <td>Core format</td>
           <td>Superset core; all six protocols first-class, no privileged one</td>
-          <td>OpenAI-shaped core; native-format ingress via per-protocol adapters <a href="#references">[4]</a></td>
+          <td>OpenAI-shaped core <a href="#references">[7]</a>; native ingress built endpoint by endpoint <a href="#references">[4]</a></td>
         </tr>
         <tr>
           <td>Native ingress + load balancing</td>
           <td>Every protocol routes through pools with failover</td>
-          <td>Anthropic <code>/v1/messages</code> routes <a href="#references">[4]</a>; byte-exact native routes skip the router <a href="#references">[5]</a></td>
+          <td><code>/v1/messages</code> routes cross-provider <a href="#references">[4]</a>; Gemini/Bedrock native routes stay within their provider <a href="#references">[9]</a>; raw pass-throughs bypass fallbacks <a href="#references">[5]</a></td>
         </tr>
         <tr>
           <td>Bedrock SDK ingress</td>
           <td>A signed boto3 client, load-balanced across non-Bedrock backends, response re-encoded as valid binary eventstream</td>
-          <td>Pass-through to Bedrock only <a href="#references">[5]</a></td>
+          <td>boto3 <code>/converse</code> and <code>/invoke</code> load-balance across Bedrock deployments only; no cross-provider egress <a href="#references">[9]</a></td>
         </tr>
         <tr>
           <td>Failure classification</td>
@@ -57,7 +57,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
         <tr>
           <td>Runtime</td>
           <td>One static Rust binary; nothing else to run</td>
-          <td>Python/Uvicorn workers + PostgreSQL + Redis 7.0+ in production <a href="#references">[2]</a></td>
+          <td>Python/Uvicorn workers + PostgreSQL <a href="#references">[2]</a>; Redis for multi-instance state <a href="#references">[3]</a></td>
         </tr>
         <tr>
           <td>Added latency</td>
@@ -97,11 +97,14 @@ import PageLayout from '../../layouts/PageLayout.astro';
 
   <h2>No privileged protocol</h2>
   <p>
-    LiteLLM's core normalizes everything into the OpenAI format, and its non-OpenAI ingress is a
-    set of adapters on top of that core <a href="#references">[4]</a>. Its byte-exact native
-    routes are pass-through endpoints that skip the router entirely, so on those routes you end
-    up picking between native protocol <em>or</em> load balancing and fallbacks
-    <a href="#references">[5]</a>.
+    LiteLLM's core normalizes everything into the OpenAI format ("one OpenAI-compatible API,"
+    in their own words <a href="#references">[7]</a>), and its native-format ingress is built
+    endpoint by endpoint on top of that core. Where an endpoint has been built, it routes:
+    Anthropic <code>/v1/messages</code> reaches other providers <a href="#references">[4]</a>,
+    while the Gemini and Bedrock native endpoints load-balance within their own provider
+    <a href="#references">[9]</a>. The raw pass-through routes forward without fallbacks
+    <a href="#references">[5]</a>. What you don't get, on any of them, is what the six-protocol
+    matrix gives by construction: any native ingress reaching any backend.
   </p>
   <p>
     Busbar doesn't make you pick, on any protocol. All six wire protocols (OpenAI, Anthropic,
@@ -125,9 +128,9 @@ import PageLayout from '../../layouts/PageLayout.astro';
     <code>endpoint_url</code> at Busbar and changes nothing else; same-protocol traffic passes
     through byte-for-byte, and no new entity enters the data path, because Busbar runs in your
     infrastructure. The day a direct Anthropic BAA lands, an Anthropic lane is one config edit,
-    and the application code never learns it happened. With LiteLLM, Bedrock-SDK ingress is a
-    pass-through to Bedrock only <a href="#references">[5]</a>, so that same migration starts
-    with rewriting your integrations.
+    and the application code never learns it happened. With LiteLLM, Bedrock-SDK ingress
+    load-balances across Bedrock deployments only <a href="#references">[9]</a>, so that same
+    migration starts with rewriting your integrations.
   </p>
 
   <h2>100+ providers vs 6 protocols is not the same metric</h2>
@@ -160,7 +163,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
   </p>
   <ul>
     <li>A provider outage or rate-limit storm trips the lane and cools it down, honoring the provider's <code>Retry-After</code> as a floor.</li>
-    <li>An auth or billing failure is benched immediately with a 30-minute sticky cooldown, because retrying a revoked key into a wall helps nobody.</li>
+    <li>An auth or billing failure is benched immediately with a sticky cooldown (30 minutes by default), because retrying a revoked key into a wall helps nobody.</li>
     <li>A client's bad request is relayed verbatim and never penalizes the lane, so a healthy backend is never ejected because a caller sent malformed input.</li>
     <li>A context-length overflow fails over to a larger-context lane without recording a fault.</li>
   </ul>
@@ -169,7 +172,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
     another where it's healthy. Recovery is a single half-open probe request, not a thundering
     herd. And a failing request reroutes to the next lane before your client sees a single byte,
     even on a streaming request. No Redis, no coordination layer, it's all in the binary; LiteLLM
-    needs Redis to share cooldown state across its workers <a href="#references">[2]</a>.
+    uses Redis to share cooldown state across multiple instances <a href="#references">[3]</a>.
     <a href="/circuit-breaker/">The full state machine.</a>
   </p>
 
@@ -204,8 +207,8 @@ import PageLayout from '../../layouts/PageLayout.astro';
     live through. Their plan keeps customer plugins (auth, guardrails, callbacks) in an optional
     Python sidecar and long-tail providers on Python <a href="#references">[7]</a>; Busbar's
     request path is one process end to end. And a Rust rewrite of an OpenAI-normalized gateway is
-    still an OpenAI-normalized gateway: the hub format, the adapters, and the pass-through split
-    don't change with the implementation language. On the numbers, their published Rust-core
+    still an OpenAI-normalized gateway: the hub format, the endpoint-by-endpoint native ingress,
+    and the pass-through split don't change with the implementation language. On the numbers, their published Rust-core
     overhead (~0.05 ms) lands in the same class as ours; memory (their 31.7 MB peak vs our
     ~4.5 MB resident) and the single-binary deployment story remain architectural, not
     implementation, differences <a href="#references">[7]</a>.
@@ -233,12 +236,13 @@ import PageLayout from '../../layouts/PageLayout.astro';
   </p>
   <ol>
     <li><a href="https://docs.litellm.ai/docs/benchmarks">LiteLLM benchmarks</a>: 2 ms median / 8 ms p95 / 13 ms p99 "LiteLLM Overhead Duration"; ~1,170 RPS across 4 instances of 4 vCPU / 8 GB.</li>
-    <li><a href="https://docs.litellm.ai/docs/proxy/prod">LiteLLM production guide</a>: Uvicorn workers, PostgreSQL, Redis 7.0+ for multi-instance state.</li>
-    <li><a href="https://docs.litellm.ai/docs/routing">LiteLLM routing and fallbacks</a>: retry-based fallbacks, <code>allowed_fails</code>, <code>cooldown_time</code>, per-exception retry policies.</li>
+    <li><a href="https://docs.litellm.ai/docs/proxy/prod">LiteLLM production guide</a>: Uvicorn workers, PostgreSQL, deployment guidance, Redis version requirements.</li>
+    <li><a href="https://docs.litellm.ai/docs/routing">LiteLLM routing and fallbacks</a>: retry-based fallbacks, <code>allowed_fails</code>, <code>cooldown_time</code>, per-exception retry policies, and Redis for tracking cooldown and usage state across instances.</li>
     <li><a href="https://docs.litellm.ai/docs/anthropic_unified">LiteLLM <code>/v1/messages</code></a>: Anthropic-format ingress routed through the LiteLLM router.</li>
-    <li><a href="https://docs.litellm.ai/docs/pass_through/google_ai_studio">LiteLLM pass-through endpoints</a>: native-format endpoints that forward to a single provider, without router features.</li>
+    <li><a href="https://docs.litellm.ai/docs/pass_through/google_ai_studio">LiteLLM pass-through endpoints</a>: raw native-format routes forwarded to their provider, without fallbacks.</li>
     <li><a href="/benchmark/">Busbar benchmark</a>: methodology, per-protocol numbers, and the reproduction steps; harness in the repo under <code>bench/</code>.</li>
     <li><a href="https://docs.litellm.ai/blog/litellm-rust-launch">LiteLLM Rust launch post</a>: the Python problems in their words, the Rust-core numbers, the beta status and staged rollout through December 2026, and the Python sidecar for plugins.</li>
     <li><a href="/blog/busbar-in-numbers/">Busbar, in numbers</a>: memory, latency, and throughput measurements on the released binary, and how to reproduce them.</li>
+    <li><a href="https://docs.litellm.ai/docs/bedrock_converse">LiteLLM Bedrock Converse endpoint</a> and <a href="https://docs.litellm.ai/docs/generateContent">generateContent endpoint</a>: routed native ingress that load-balances within its own provider's deployments.</li>
   </ol>
 </PageLayout>
