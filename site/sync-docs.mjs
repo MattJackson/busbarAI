@@ -63,7 +63,13 @@ console.log('published providers.yaml -> public/providers.yaml');
 // Sync CHANGELOG.md from repo root into Starlight as /changelog/.
 // The repo CHANGELOG.md is the single source of truth — never hand-edit the generated file.
 {
-  const raw = readFileSync(join(here, '..', 'CHANGELOG.md'), 'utf8');
+  let raw = readFileSync(join(here, '..', 'CHANGELOG.md'), 'utf8');
+
+  // The published changelog NEVER shows an "Unreleased" section — visitors see shipped versions
+  // only. A dev may keep an `## [Unreleased]` block in CHANGELOG.md to stage notes; strip it here
+  // (everything from that heading up to the next `## ` version heading) so it can't reach the site.
+  raw = raw.replace(/^## \[Unreleased\][^\n]*\n(?:(?!^## )[\s\S])*?(?=^## |\Z)/im, '');
+
   const lines = raw.split('\n');
 
   // Drop the leading # H1 ("# Changelog") — Starlight renders the title from frontmatter.
