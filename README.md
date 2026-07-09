@@ -19,13 +19,13 @@ Busbar sits between your application and your LLM providers. Point any SDK: Open
 
 > **You define a model name and its backends. Busbar accepts _any_ input protocol: OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses, and routes and translates accordingly.** One model name, reachable by every client; you choose what runs behind it.
 
-- **Speaks every protocol losslessly, both ways**: not flattened to OpenAI shape, so Anthropic thinking blocks, Gemini safety settings, and Bedrock tool use survive the hop. Use whatever SDK your code already speaks, reach every model, swap providers with a config edit.
+- **Speaks every protocol losslessly, both ways**: not flattened to OpenAI shape, so Anthropic thinking blocks, structured-output schemas, and Bedrock tool use survive the hop. Use whatever SDK your code already speaks, reach every model, swap providers with a config edit.
 - **Fails over inside the request**: before your client sees a byte, even mid-stream, across protocol families. Not a 500 your user feels, not a 3am page.
 - **A circuit breaker on every provider connection**: classifies each error (provider outage, your bad request, context-length, hard auth/billing failure) and treats each differently instead of retrying into a wall.
 - **A programmable request path**: routing is the first *hook*: your policy steers each request by cost, latency, live concurrency, budget, or rate headroom, native, or your own logic via **webhook** (any language) or a sandboxed **Rhai script**. A broken or slow hook never blocks a request, and the same fail-safe machinery is built to carry PII-steering, audit, and guardrails.
 - **Encrypted, zero-trust transport, built in**: Busbar terminates TLS itself (cert + key in config, no reverse proxy). Turn on **mTLS** and only clients holding a certificate signed by your CA can connect *at all*, rejected at the handshake, before any HTTP or token check. Zero-trust without a service mesh.
 
-A single static Rust binary, no Python sidecar, no interpreter, no GC in the request path. Linux, macOS, Windows (Intel and ARM). Your keys, your network, your data path.
+A single static Rust binary, no Python sidecar, no interpreter, no GC in the request path. Linux and macOS (Intel and ARM), Windows (Intel). Your keys, your network, your data path.
 
 > **Status: 1.1.0**: stable. The HTTP API, configuration schema, and the six wire-protocol contracts are frozen under Semantic Versioning. Hardened across a multi-round security and correctness audit; releases ship a CycloneDX SBOM and a verifiable build-provenance attestation. AGPL-3.0.
 

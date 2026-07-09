@@ -21,7 +21,7 @@ const protocols = ['OpenAI', 'Anthropic', 'Gemini', 'Bedrock', 'Cohere', 'Respon
 const features = [
   {
     title: 'Lossless cross-protocol translation',
-    body: 'Six wire protocols, native on both sides, bridged through one internal format rich enough to hold every protocol’s features. Anthropic thinking blocks, Gemini safety settings, and Bedrock tool use survive the hop, nothing is flattened to OpenAI shape.',
+    body: 'Six wire protocols, native on both sides, bridged through one internal format rich enough to hold every protocol’s features. Anthropic thinking blocks, structured-output schemas, and Bedrock tool use survive the hop, nothing is flattened to OpenAI shape.',
     enables: 'Point whatever SDK your code already speaks at one URL, and reach every model through it.',
   },
   {
@@ -32,7 +32,7 @@ const features = [
   {
     title: 'A programmable request path',
     body: 'Routing is the first hook: a policy, built-in (<strong>weighted, cheapest, fastest, least_busy, usage</strong>), a webhook in any language, or a sandboxed Rhai script, inspects each request and decides who serves it, from per-member cost, latency, live concurrency, budget, and rate headroom. A slow or broken hook falls back, never blocks a request.',
-    enables: 'The same fail-safe machinery is built to carry <strong>PII-steering, audit, caching, and guardrails</strong>, your own logic on the request path, in any language.',
+    enables: 'The same fail-safe machinery is built to carry <strong>PII-steering, audit, and guardrails</strong>, your own logic on the request path, in any language.',
   },
   {
     title: 'Governance & hard budget caps',
@@ -46,7 +46,7 @@ const features = [
   },
   {
     title: 'A single Rust binary you own',
-    body: 'One static binary, no runtime, no sidecar, no interpreter in the request path, ships for Linux, macOS, and Windows (Intel and ARM). Provider keys live in one place; your app carries only a scoped token. Prometheus /metrics and OTLP traces built in.',
+    body: 'One static binary, no runtime, no sidecar, no interpreter in the request path, ships for Linux and macOS (Intel and ARM) and Windows (Intel). Provider keys move out of every app deployment into one place; your app carries only a Busbar token. Prometheus /metrics and OTLP traces built in.',
     enables: 'Your infrastructure, your keys, your data path, rotating an upstream key is one restart, not a deploy sweep.',
   },
 ];
@@ -292,6 +292,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
             <h4>Docs</h4>
             <a href="/getting-started/">Getting Started</a>
             <a href="/why-busbar/">Why Busbar</a>
+            <a href="/faq/">FAQ</a>
             <a href="/reliability/">Reliability</a>
             <a href="/routing/">Routing</a>
             <a href="/benchmark/">Benchmark</a>

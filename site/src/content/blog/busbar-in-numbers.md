@@ -52,7 +52,7 @@ We won't call Busbar "the fastest gateway in existence," because we haven't benc
 
 ## Does it speak my API?
 
-Natively, in both directions. Six wire protocols (OpenAI, OpenAI Responses, Anthropic, Gemini, Amazon Bedrock, Cohere) through a superset intermediate representation. We do not flatten everything to one vendor's shape, so native features survive the hop: Anthropic thinking blocks, Gemini safety settings, Bedrock tool use. Point a Bedrock SDK at Busbar and reach an Anthropic backend, losslessly, streaming included. This is the one thing a Rust rewrite of an OpenAI-normalized gateway still won't give you.
+Natively, in both directions. Six wire protocols (OpenAI, OpenAI Responses, Anthropic, Gemini, Amazon Bedrock, Cohere) through a superset intermediate representation. We do not flatten everything to one vendor's shape, so native features survive the hop: Anthropic thinking blocks, structured-output schemas, Bedrock tool use. Point a Bedrock SDK at Busbar and reach an Anthropic backend, losslessly, streaming included. This is the one thing a Rust rewrite of an OpenAI-normalized gateway still won't give you.
 
 ## And when a provider fails?
 
@@ -60,7 +60,7 @@ Busbar fails over inside the request, before your client sees a byte, even mid-s
 
 ## What do you actually deploy?
 
-One file. A single static Rust binary, about **9 MB** on disk, with no Python sidecar, no interpreter, and no GC in the request path. Linux, macOS, Windows, on Intel and ARM. Your keys, your network, your data path. No v2, no migration, nothing to wait for.
+One file. A single static Rust binary, about **9 MB** on disk, with no Python sidecar, no interpreter, and no GC in the request path. Linux and macOS on Intel and ARM, Windows on Intel. Your keys, your network, your data path. No v2, no migration, nothing to wait for.
 
 ## Where to start
 

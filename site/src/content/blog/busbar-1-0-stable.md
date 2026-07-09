@@ -16,7 +16,7 @@ authorTitle: "Founder, Busbar"
 
 ## Still one binary
 
-Everything above ships as a single static Rust binary. No Python sidecar, no interpreter, no GC in the request path. Linux, macOS, Windows, on Intel and ARM. Your keys, your network, your data path.
+Everything above ships as a single static Rust binary. No Python sidecar, no interpreter, no GC in the request path. Linux and macOS on Intel and ARM, Windows on Intel. Your keys, your network, your data path.
 
 ## What's next
 
