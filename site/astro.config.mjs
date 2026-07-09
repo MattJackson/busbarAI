@@ -5,6 +5,8 @@ import starlightLlmsTxt from 'starlight-llms-txt';
 
 export default defineConfig({
   site: 'https://getbusbar.com',
+  // /docs must not 404 — it's the URL people guess. Lands on the docs entry point.
+  redirects: { '/docs': '/why-busbar/', '/docs/': '/why-busbar/' },
   integrations: [
     starlight({
       title: 'Busbar',
