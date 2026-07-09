@@ -8312,4 +8312,172 @@ mod tests {
             .count();
         assert_eq!(starts, stops, "unbalanced block events: {events:?}");
     }
+
+    /// Each `IrToolChoice` variant must round-trip through Gemini's native
+    /// `toolConfig.functionCallingConfig` shape (the tool-selection directive is a headline
+    /// cross-protocol control — ir.rs:82): AUTO↔Auto, NONE↔None, ANY↔Required, and
+    /// ANY+allowedFunctionNames:[n]↔Tool{n}. A dropped/degraded directive silently reverts forced tool
+    /// use to the target's default on the seam.
+    #[test]
+    fn tool_choice_variants_round_trip_via_function_calling_config() {
+        let cases = [
+            (crate::ir::IrToolChoice::Auto, "AUTO", None),
+            (crate::ir::IrToolChoice::None, "NONE", None),
+            (crate::ir::IrToolChoice::Required, "ANY", None),
+            (
+                crate::ir::IrToolChoice::Tool {
+                    name: "get_weather".to_string(),
+                },
+                "ANY",
+                Some("get_weather"),
+            ),
+        ];
+        for (variant, expect_mode, expect_name) in cases {
+            // WRITE: the union projects to the native functionCallingConfig object.
+            let wire = write_gemini_tool_choice(&variant);
+            assert_eq!(
+                wire.pointer("/mode").and_then(|m| m.as_str()),
+                Some(expect_mode),
+                "mode mismatch for {variant:?}"
+            );
+            if let Some(name) = expect_name {
+                assert_eq!(
+                    wire.pointer("/allowedFunctionNames/0")
+                        .and_then(|n| n.as_str()),
+                    Some(name)
+                );
+            } else {
+                assert!(
+                    wire.get("allowedFunctionNames").is_none(),
+                    "no allowedFunctionNames expected for {variant:?}"
+                );
+            }
+            // READ back through the native toolConfig shape reproduces the same union.
+            let tool_config = serde_json::json!({"functionCallingConfig": wire});
+            assert_eq!(
+                read_gemini_tool_choice(Some(&tool_config)),
+                Some(variant.clone()),
+                "round-trip failed for {variant:?}"
+            );
+        }
+    }
+
+    /// A multi-name `allowedFunctionNames` (a SUBSET restriction the IR cannot express) must relax to
+    /// `Required` (call SOME tool — a true superset), NOT fabricate a stricter single-tool constraint
+    /// the request never made.
+    #[test]
+    fn tool_choice_multi_allowed_names_relaxes_to_required() {
+        let tool_config = serde_json::json!({
+            "functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["a", "b"]}
+        });
+        assert_eq!(
+            read_gemini_tool_choice(Some(&tool_config)),
+            Some(crate::ir::IrToolChoice::Required),
+            "a 2-name allow-list has no IR analog; must degrade to Required, not Tool{{first}}"
+        );
+    }
+
+    /// An UNKNOWN native `finishReason` (a future/novel Gemini token) maps to `IrStopReason::Other`
+    /// (ir.rs:186 — no String payload), and on egress `Other` degrades to the honest native `OTHER`
+    /// enum member, never an off-spec upper-cased token a strict client rejects.
+    #[test]
+    fn unknown_finish_reason_maps_to_other_and_writes_native_other() {
+        assert_eq!(
+            map_gemini_finish_reason("SOME_FUTURE_REASON"),
+            crate::ir::IrStopReason::Other
+        );
+        // Egress: Other -> the valid native OTHER member.
+        assert_eq!(
+            write_gemini_stop_reason(crate::ir::IrStopReason::Other),
+            GEMINI_FINISH_OTHER
+        );
+        // MALFORMED_FUNCTION_CALL is a modeled abnormal stop -> Error (not Other).
+        assert_eq!(
+            map_gemini_finish_reason(GEMINI_FINISH_MALFORMED_FUNCTION_CALL),
+            crate::ir::IrStopReason::Error
+        );
+    }
+
+    /// cachedContentTokenCount NORMALIZATION, WRITE side (the read side is covered by
+    /// `test_cached_content_token_count_reads_into_cache_read`): the IR stores UNCACHED input, so the
+    /// writer must ADD the cached prefix BACK to re-derive Gemini's TOTAL `promptTokenCount` and
+    /// re-emit `cachedContentTokenCount`. Pins the inverse of the read normalization (ir.rs:457).
+    #[test]
+    fn write_response_reconstructs_prompt_token_count_with_cached() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
+            usage: crate::ir::IrUsage {
+                input_tokens: 20,
+                output_tokens: 5,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(80),
+            },
+            model: Some("gemini-2.0-flash".to_string()),
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = {
+            let w = GeminiWriter;
+            w.write_response(&resp)
+        };
+        let um = out.get("usageMetadata").expect("usageMetadata present");
+        assert_eq!(
+            um.get(FIELD_PROMPT_TOKEN_COUNT),
+            Some(&serde_json::json!(100)),
+            "promptTokenCount must re-add cached: uncached(20) + cached(80) = 100"
+        );
+        assert_eq!(
+            um.get(FIELD_CACHED_CONTENT_TOKEN_COUNT),
+            Some(&serde_json::json!(80))
+        );
+        assert_eq!(
+            um.get(FIELD_CANDIDATES_TOKEN_COUNT),
+            Some(&serde_json::json!(5))
+        );
+        // totalTokenCount is emitted (model present -> cross-protocol boundary signal): 100 + 5.
+        assert_eq!(
+            um.get(FIELD_TOTAL_TOKEN_COUNT),
+            Some(&serde_json::json!(105))
+        );
+    }
+
+    /// A system prompt must survive read→IR→write: Gemini's `systemInstruction.parts[]` reads into
+    /// `IrRequest.system` and writes back to the same native container (the system prompt is a headline
+    /// cross-protocol feature).
+    #[test]
+    fn system_instruction_round_trips_through_ir_system() {
+        let body = serde_json::json!({
+            "systemInstruction": {"parts": [{"text": "You are terse."}]},
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        });
+        let ir = GeminiReader.read_request(&body).expect("read_request");
+        assert_eq!(
+            ir.system.len(),
+            1,
+            "systemInstruction must feed IrRequest.system"
+        );
+        match &ir.system[0] {
+            crate::ir::IrBlock::Text { text, .. } => assert_eq!(text, "You are terse."),
+            other => panic!("expected a Text system block, got {other:?}"),
+        }
+        // WRITE re-emits the native systemInstruction.parts[] container.
+        let out = {
+            let w = GeminiWriter;
+            w.write_request(&ir)
+        };
+        assert_eq!(
+            out.pointer("/systemInstruction/parts/0/text")
+                .and_then(|t| t.as_str()),
+            Some("You are terse."),
+            "IrRequest.system must write back to systemInstruction.parts[]"
+        );
+    }
 }

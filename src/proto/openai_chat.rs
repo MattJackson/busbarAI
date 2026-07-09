@@ -6073,4 +6073,221 @@ mod tests {
             assert!(a.contains(k), "modeled key set must contain {k}");
         }
     }
+
+    /// Non-stream `read_response` cache-token NORMALIZATION (ir.rs:457): OpenAI's `prompt_tokens` is a
+    /// TOTAL that INCLUDES the cached prefix, so the reader must SUBTRACT `cached_tokens` to leave
+    /// `input_tokens` UNCACHED and store the cached count additively in `cache_read_input_tokens`.
+    /// This is the OpenAI-family half of the normalization (opposite of Anthropic/Bedrock, whose
+    /// cache fields are already additive and stored as-is).
+    #[test]
+    fn read_response_subtracts_cached_prefix_from_prompt_tokens() {
+        let body = serde_json::json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1_700_000_000_u64,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": FINISH_STOP
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 5,
+                "total_tokens": 105,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }
+        });
+        let resp = OpenAiReader.read_response(&body).expect("read_response");
+        assert_eq!(
+            resp.usage.input_tokens, 20,
+            "input_tokens must be prompt_tokens(100) MINUS cached(80) = 20 (uncached)"
+        );
+        assert_eq!(resp.usage.cache_read_input_tokens, Some(80));
+        assert_eq!(resp.usage.output_tokens, 5);
+        assert_eq!(resp.usage.cache_creation_input_tokens, None);
+        // billable_tokens re-sums to the original wire total input (20 + 80) + output 5 = 105.
+        assert_eq!(resp.usage.billable_tokens(), 105);
+    }
+
+    /// The write side RECONSTRUCTS the native wire shape: it must ADD the cached prefix BACK onto the
+    /// uncached IR `input_tokens` to re-derive OpenAI's TOTAL `prompt_tokens`, and re-emit
+    /// `prompt_tokens_details.cached_tokens`. Pins the exact inverse of the read normalization so a
+    /// read→write round-trip reproduces the original `prompt_tokens`.
+    #[test]
+    fn write_response_reconstructs_prompt_tokens_total_with_cached_details() {
+        let resp = crate::ir::IrResponse {
+            role: IrRole::Assistant,
+            content: vec![text_block("hi")],
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
+            usage: IrUsage {
+                input_tokens: 20,
+                output_tokens: 5,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(80),
+            },
+            model: Some("gpt-4o".to_string()),
+            id: Some("chatcmpl-abc".to_string()),
+            created: Some(1_700_000_000),
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = OpenAiWriter.write_response(&resp);
+        assert_eq!(
+            out["usage"]["prompt_tokens"],
+            serde_json::json!(100),
+            "prompt_tokens must re-add the cached prefix: uncached(20) + cached(80) = 100"
+        );
+        assert_eq!(out["usage"]["completion_tokens"], serde_json::json!(5));
+        assert_eq!(out["usage"]["total_tokens"], serde_json::json!(105));
+        assert_eq!(
+            out["usage"]["prompt_tokens_details"]["cached_tokens"],
+            serde_json::json!(80)
+        );
+    }
+
+    /// A cache-free response must NOT emit a spurious `prompt_tokens_details` object — matching the
+    /// native OpenAI shape (the details object appears only when a cache read occurred).
+    #[test]
+    fn write_response_omits_cached_details_when_no_cache_read() {
+        let mut resp = crate::ir::IrResponse {
+            role: IrRole::Assistant,
+            content: vec![text_block("hi")],
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
+            usage: IrUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: Some("gpt-4o".to_string()),
+            id: Some("chatcmpl-x".to_string()),
+            created: Some(1),
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let out = OpenAiWriter.write_response(&resp);
+        assert_eq!(out["usage"]["prompt_tokens"], serde_json::json!(7));
+        assert!(
+            out["usage"].get("prompt_tokens_details").is_none(),
+            "no cache read means no prompt_tokens_details object"
+        );
+        // And a Some(0) cache read still emits the details object with 0 (native shape carries it).
+        resp.usage.cache_read_input_tokens = Some(0);
+        let out2 = OpenAiWriter.write_response(&resp);
+        assert_eq!(
+            out2["usage"]["prompt_tokens_details"]["cached_tokens"],
+            serde_json::json!(0)
+        );
+    }
+
+    /// A `response_format` json_schema directive must round-trip read→IR→write byte-faithful: the
+    /// nested `{type:"json_schema", json_schema:{name,schema,strict,description}}` OpenAI shape reads
+    /// into the typed `IrResponseFormat` and writes back to the same nested shape (the canonicalized
+    /// carrier that stops a foreign shape from being echoed cross-protocol — ir.rs:348).
+    #[test]
+    fn response_format_json_schema_round_trips() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"]
+        });
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "Person",
+                    "schema": schema,
+                    "strict": true,
+                    "description": "a person"
+                }
+            }
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        let rf = ir
+            .response_format
+            .as_ref()
+            .expect("response_format must canonicalize into the typed IR");
+        assert!(rf.json);
+        assert_eq!(rf.name.as_deref(), Some("Person"));
+        assert_eq!(rf.strict, Some(true));
+        assert_eq!(rf.description.as_deref(), Some("a person"));
+        assert_eq!(rf.schema.as_ref(), Some(&schema));
+        // It must NOT linger in `extra` (that would double-emit / leak the source shape cross-hop).
+        assert!(!ir.extra.contains_key("response_format"));
+
+        // WRITE re-emits the native nested json_schema shape.
+        let out = OpenAiWriter.write_request(&ir);
+        assert_eq!(
+            out["response_format"]["type"],
+            serde_json::json!("json_schema")
+        );
+        assert_eq!(
+            out["response_format"]["json_schema"]["name"],
+            serde_json::json!("Person")
+        );
+        assert_eq!(out["response_format"]["json_schema"]["schema"], schema);
+        assert_eq!(
+            out["response_format"]["json_schema"]["strict"],
+            serde_json::json!(true)
+        );
+    }
+
+    /// An UNKNOWN native `finish_reason` (a token OpenAI may add after this build) reads to
+    /// `IrStopReason::Other` (ir.rs:186 — no String payload, nothing foreign to carry), and on egress
+    /// `Other` degrades to the SDK-safe `stop` rather than leaking an off-enum value a strict client
+    /// SDK rejects.
+    #[test]
+    fn read_response_unknown_finish_reason_maps_to_other_and_degrades_to_stop() {
+        assert_eq!(
+            read_openai_stop_reason("some_future_reason"),
+            crate::ir::IrStopReason::Other
+        );
+        let body = serde_json::json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "some_future_reason"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let resp = OpenAiReader.read_response(&body).expect("read_response");
+        assert_eq!(resp.stop_reason, Some(crate::ir::IrStopReason::Other));
+        let out = OpenAiWriter.write_response(&resp);
+        assert_eq!(
+            out["choices"][0]["finish_reason"],
+            serde_json::json!("stop"),
+            "Other must degrade to the safe stop default, never leak the foreign token"
+        );
+    }
+
+    /// Multi-element `stop` must emit as a JSON ARRAY on the wire (not a bare string), and an empty
+    /// `stop` vec must be OMITTED entirely (ir.rs:57 — a request that never carried stops must not
+    /// gain a spurious empty `stop` on translation).
+    #[test]
+    fn write_request_stop_sequences_array_and_empty_omitted() {
+        let mut req = test_ir_request();
+        req.stop = vec![".".to_string(), "!".to_string()];
+        let out = OpenAiWriter.write_request(&req);
+        assert_eq!(
+            out["stop"],
+            serde_json::json!([".", "!"]),
+            "multi-element stop must serialize as an array"
+        );
+
+        // Empty stop → no `stop` key emitted.
+        let mut empty = test_ir_request();
+        empty.stop = vec![];
+        let out_empty = OpenAiWriter.write_request(&empty);
+        assert!(
+            out_empty.get("stop").is_none(),
+            "an empty stop vec must be omitted, not emitted as []"
+        );
+    }
 }

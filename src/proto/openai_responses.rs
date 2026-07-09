@@ -9471,4 +9471,207 @@ mod tests {
             "streamed terminal re-emits cached_tokens: {payload}"
         );
     }
+
+    /// Non-stream `read_response` cache-token NORMALIZATION (ir.rs:457): the Responses API's
+    /// `input_tokens` is a TOTAL that INCLUDES the cached prefix, so the reader SUBTRACTS
+    /// `input_tokens_details.cached_tokens` to leave `input_tokens` UNCACHED and stores the cached
+    /// count additively in `cache_read_input_tokens` (the OpenAI-family convention).
+    #[test]
+    fn read_response_subtracts_cached_prefix_from_input_tokens() {
+        let body = serde_json::json!({
+            "id": "resp_abc",
+            "object": OBJ_RESPONSE,
+            "created_at": 1_700_000_000_u64,
+            "status": STATUS_COMPLETED,
+            "model": "gpt-4o",
+            "output": [{
+                "type": ITEM_TYPE_MESSAGE,
+                "role": "assistant",
+                "content": [{"type": CONTENT_TYPE_OUTPUT_TEXT, "text": "hi"}]
+            }],
+            "usage": {
+                "input_tokens": 150,
+                "output_tokens": 5,
+                "input_tokens_details": {"cached_tokens": 100}
+            }
+        });
+        let resp = ResponsesReader.read_response(&body).expect("read_response");
+        assert_eq!(
+            resp.usage.input_tokens, 50,
+            "input_tokens must be wire input(150) MINUS cached(100) = 50 (uncached)"
+        );
+        assert_eq!(resp.usage.cache_read_input_tokens, Some(100));
+        assert_eq!(resp.usage.output_tokens, 5);
+        // billable re-sums to the original wire input total (50 + 100) + output 5 = 155.
+        assert_eq!(resp.usage.billable_tokens(), 155);
+    }
+
+    /// The write side RECONSTRUCTS the wire shape: it ADDS the cached prefix BACK onto the uncached IR
+    /// `input_tokens` to re-derive the Responses TOTAL `input_tokens`, and re-emits the FLAT
+    /// `input_tokens_details.cached_tokens`. Pins the exact inverse of the read normalization.
+    #[test]
+    fn write_response_reconstructs_input_tokens_total_with_cached_details() {
+        let resp = crate::ir::IrResponse {
+            role: crate::ir::IrRole::Assistant,
+            content: vec![crate::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            }],
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
+            usage: crate::ir::IrUsage {
+                input_tokens: 50,
+                output_tokens: 5,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(100),
+            },
+            model: Some("gpt-4o".to_string()),
+            id: Some("resp_abc".to_string()),
+            created: Some(1_700_000_000),
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let writer = ResponsesWriter;
+        let out = writer.write_response(&resp);
+        assert_eq!(
+            out["usage"]["input_tokens"],
+            serde_json::json!(150),
+            "input_tokens must re-add the cached prefix: uncached(50) + cached(100) = 150"
+        );
+        assert_eq!(out["usage"]["output_tokens"], serde_json::json!(5));
+        assert_eq!(
+            out["usage"]["input_tokens_details"]["cached_tokens"],
+            serde_json::json!(100)
+        );
+    }
+
+    /// `incomplete_details.reason` normalization must be EXHAUSTIVE (ir.rs:186): `max_output_tokens`→
+    /// MaxTokens, `content_filter`→Safety, `refusal`→Refusal, and any unknown/future reason→Other (no
+    /// String payload). Pins the whole codec plus its egress inverse (MaxTokens/Safety render the turn
+    /// `incomplete`; everything else is `completed`).
+    #[test]
+    fn incomplete_reason_codec_is_exhaustive() {
+        use crate::ir::IrStopReason as S;
+        assert_eq!(
+            read_responses_incomplete_reason(INCOMPLETE_REASON_MAX_OUTPUT),
+            S::MaxTokens
+        );
+        assert_eq!(
+            read_responses_incomplete_reason(INCOMPLETE_REASON_CONTENT_FILTER),
+            S::Safety
+        );
+        assert_eq!(read_responses_incomplete_reason("refusal"), S::Refusal);
+        assert_eq!(
+            read_responses_incomplete_reason("some_future_reason"),
+            S::Other
+        );
+
+        // Egress: only MaxTokens/Safety render `incomplete`; the reason projects to the native token.
+        assert_eq!(write_responses_status(S::MaxTokens), STATUS_INCOMPLETE);
+        assert_eq!(write_responses_status(S::Safety), STATUS_INCOMPLETE);
+        assert_eq!(write_responses_status(S::ToolUse), STATUS_COMPLETED);
+        assert_eq!(write_responses_status(S::EndTurn), STATUS_COMPLETED);
+        assert_eq!(
+            write_responses_incomplete_reason(S::MaxTokens),
+            INCOMPLETE_REASON_MAX_OUTPUT
+        );
+        assert_eq!(
+            write_responses_incomplete_reason(S::Safety),
+            INCOMPLETE_REASON_CONTENT_FILTER
+        );
+        assert_eq!(
+            write_responses_incomplete_reason(S::Other),
+            INCOMPLETE_REASON_OTHER
+        );
+    }
+
+    /// A full `read_response` with `status:"incomplete"` + `incomplete_details.reason:"content_filter"`
+    /// surfaces `IrStopReason::Safety`, and a `max_output_tokens` reason surfaces `MaxTokens` — the
+    /// truncation/moderation signal lives in `incomplete_details`, not the flat status.
+    #[test]
+    fn read_response_incomplete_details_promote_stop_reason() {
+        let mk = |reason: &str| {
+            serde_json::json!({
+                "id": "resp_x",
+                "object": OBJ_RESPONSE,
+                "created_at": 1,
+                "status": STATUS_INCOMPLETE,
+                "model": "gpt-4o",
+                "incomplete_details": {"reason": reason},
+                "output": [{
+                    "type": ITEM_TYPE_MESSAGE,
+                    "role": "assistant",
+                    "content": [{"type": CONTENT_TYPE_OUTPUT_TEXT, "text": "partial"}]
+                }],
+                "usage": {"input_tokens": 3, "output_tokens": 1}
+            })
+        };
+        assert_eq!(
+            ResponsesReader
+                .read_response(&mk(INCOMPLETE_REASON_CONTENT_FILTER))
+                .expect("read")
+                .stop_reason,
+            Some(crate::ir::IrStopReason::Safety)
+        );
+        assert_eq!(
+            ResponsesReader
+                .read_response(&mk(INCOMPLETE_REASON_MAX_OUTPUT))
+                .expect("read")
+                .stop_reason,
+            Some(crate::ir::IrStopReason::MaxTokens)
+        );
+    }
+
+    /// A `response_format` json_schema round-trips read→IR→write through the Responses FLAT
+    /// `text.format` shape (name/schema/strict/description sit BESIDE `type`, not nested under
+    /// `json_schema` like OpenAI Chat). The IR canonicalizes it so the two OpenAI-family wire shapes
+    /// stay isolated and neither leaks cross-protocol (ir.rs:348).
+    #[test]
+    fn text_format_json_schema_flat_round_trips() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"]
+        });
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "text": {"format": {
+                "type": "json_schema",
+                "name": "Answer",
+                "schema": schema,
+                "strict": true,
+                "description": "an answer"
+            }}
+        });
+        let ir = ResponsesReader.read_request(&body).expect("read_request");
+        let rf = ir
+            .response_format
+            .as_ref()
+            .expect("text.format canonicalizes into the typed IR");
+        assert!(rf.json);
+        assert_eq!(rf.name.as_deref(), Some("Answer"));
+        assert_eq!(rf.strict, Some(true));
+        assert_eq!(rf.description.as_deref(), Some("an answer"));
+        assert_eq!(rf.schema.as_ref(), Some(&schema));
+
+        // WRITE re-emits the FLAT Responses text.format shape (fields beside type, not nested).
+        let writer = ResponsesWriter;
+        let out = writer.write_request(&ir);
+        let fmt = out
+            .pointer("/text/format")
+            .expect("text.format must be emitted");
+        assert_eq!(
+            fmt.get("type").and_then(|t| t.as_str()),
+            Some("json_schema")
+        );
+        assert_eq!(fmt.get("name").and_then(|n| n.as_str()), Some("Answer"));
+        assert_eq!(fmt.get("schema"), Some(&schema));
+        assert_eq!(fmt.get("strict").and_then(|s| s.as_bool()), Some(true));
+        // The FLAT shape must NOT nest under a json_schema key (that is the Chat-Completions shape).
+        assert!(
+            fmt.get("json_schema").is_none(),
+            "Responses text.format is FLAT — must not nest under json_schema: {out}"
+        );
+    }
 }

@@ -8493,4 +8493,197 @@ mod tests {
             "second call must emit ZERO metadata deltas (the !emitted guard suppresses the duplicate); got {second:?}"
         );
     }
+
+    /// F4 coalescing (headline Bedrock behavior): Converse requires STRICTLY ALTERNATING
+    /// user/assistant turns — two consecutive same-role messages are a 400 ValidationException. An IR
+    /// with `[Assistant(tool_use), Tool(result1), Tool(result2)]` maps the two Tool turns to "user"
+    /// role and MUST coalesce them into ONE user message so the wire alternates assistant,user.
+    #[test]
+    fn consecutive_tool_result_turns_coalesce_into_single_user_message() {
+        let req = crate::ir::IrRequest {
+            messages: vec![
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::User,
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "run both tools".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                },
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::Assistant,
+                    content: vec![crate::ir::IrBlock::ToolUse {
+                        id: "t1".to_string(),
+                        name: "a".to_string(),
+                        input: serde_json::json!({}),
+                        cache_control: None,
+                    }],
+                },
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::Tool,
+                    content: vec![crate::ir::IrBlock::ToolResult {
+                        tool_use_id: "t1".to_string(),
+                        content: vec![crate::ir::IrBlock::Text {
+                            text: "r1".to_string(),
+                            cache_control: None,
+                            citations: Vec::new(),
+                        }],
+                        is_error: false,
+                        cache_control: None,
+                    }],
+                },
+                crate::ir::IrMessage {
+                    role: crate::ir::IrRole::Tool,
+                    content: vec![crate::ir::IrBlock::ToolResult {
+                        tool_use_id: "t2".to_string(),
+                        content: vec![crate::ir::IrBlock::Text {
+                            text: "r2".to_string(),
+                            cache_control: None,
+                            citations: Vec::new(),
+                        }],
+                        is_error: false,
+                        cache_control: None,
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+        let out = BedrockWriter.write_request(&req);
+        let msgs = out
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .expect("messages array");
+        // user, assistant, user — the two Tool turns coalesced into ONE trailing user message.
+        let roles: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user"],
+            "consecutive same-role (tool→user) turns must coalesce to keep strict alternation: {out}"
+        );
+        // The coalesced final user message carries BOTH tool results.
+        let last_content = msgs
+            .last()
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+            .expect("last content array");
+        assert_eq!(
+            last_content.len(),
+            2,
+            "both tool_result blocks must land in the single coalesced user turn: {out}"
+        );
+    }
+
+    /// An UNKNOWN native `stopReason` maps to `IrStopReason::Other` on read (ir.rs:186), and `Other`
+    /// degrades to the safe `end_turn` on egress — a foreign token is never carried into Converse's
+    /// closed `stopReason` enum. Pins the full read_response→write_response degradation.
+    #[test]
+    fn unknown_stop_reason_maps_to_other_and_degrades_to_end_turn() {
+        assert_eq!(
+            stop_reason_map("some_future_reason"),
+            crate::ir::IrStopReason::Other
+        );
+        let body = serde_json::json!({
+            "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+            "stopReason": "some_future_reason",
+            "usage": {"inputTokens": 3, "outputTokens": 1, "totalTokens": 4}
+        });
+        let resp = BedrockReader.read_response(&body).expect("read_response");
+        assert_eq!(resp.stop_reason, Some(crate::ir::IrStopReason::Other));
+        let out = BedrockWriter.write_response(&resp);
+        assert_eq!(
+            out.get("stopReason").and_then(|v| v.as_str()),
+            Some("end_turn"),
+            "Other must degrade to end_turn, never leak the foreign token into Converse's enum"
+        );
+    }
+
+    /// Bedrock cache tokens are ALREADY ADDITIVE (ir.rs:457): unlike OpenAI/Gemini (which subtract the
+    /// cached prefix out of the input total), the Bedrock reader stores `cacheReadInputTokens` /
+    /// `cacheWriteInputTokens` AS-IS and does NOT reduce `inputTokens` by them. This pins that
+    /// `input_tokens` is the raw wire value and `billable_tokens` sums all four additively.
+    #[test]
+    fn cache_usage_is_additive_input_not_reduced() {
+        let body = serde_json::json!({
+            "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15,
+                "cacheReadInputTokens": 1000,
+                "cacheWriteInputTokens": 200
+            }
+        });
+        let resp = BedrockReader.read_response(&body).expect("read_response");
+        assert_eq!(
+            resp.usage.input_tokens, 10,
+            "Bedrock inputTokens stored AS-IS (additive convention), NOT reduced by cache reads"
+        );
+        assert_eq!(resp.usage.cache_read_input_tokens, Some(1000));
+        assert_eq!(resp.usage.cache_creation_input_tokens, Some(200));
+        // Additive sum: 10 + 5 + 1000 + 200.
+        assert_eq!(resp.usage.billable_tokens(), 1215);
+
+        // Round-trip: write re-emits the native additive fields under AWS's spellings.
+        let out = BedrockWriter.write_response(&resp);
+        assert_eq!(
+            out.pointer("/usage/cacheReadInputTokens")
+                .and_then(|v| v.as_u64()),
+            Some(1000)
+        );
+        assert_eq!(
+            out.pointer("/usage/cacheWriteInputTokens")
+                .and_then(|v| v.as_u64()),
+            Some(200)
+        );
+        assert_eq!(
+            out.pointer("/usage/inputTokens").and_then(|v| v.as_u64()),
+            Some(10)
+        );
+    }
+
+    /// `write_response_exception` (the Bedrock-INGRESS stream error path) must fold every error class
+    /// onto ONE of the FIVE legal ConverseStream exception-union members, never a request-level name a
+    /// native AWS stream decoder can't match. Pins the class→member mapping so a mid-stream error
+    /// reaches a Bedrock client as a typed, decodable exception.
+    #[test]
+    fn write_response_exception_folds_to_stream_union_members() {
+        let mk = |class| crate::proto::IrError {
+            class,
+            provider_signal: None,
+            retry_after: None,
+        };
+        let cases = [
+            (StatusClass::RateLimit, "ThrottlingException"),
+            (StatusClass::Overloaded, "ServiceUnavailableException"),
+            (StatusClass::ClientError, "ValidationException"),
+            (StatusClass::ContextLength, "ValidationException"),
+            (StatusClass::Timeout, "ModelStreamErrorException"),
+            (StatusClass::Auth, "InternalServerException"),
+            (StatusClass::Billing, "InternalServerException"),
+            (StatusClass::ServerError, "InternalServerException"),
+            (StatusClass::Network, "InternalServerException"),
+        ];
+        for (class, expect) in cases {
+            let (name, _msg) = BedrockWriter
+                .write_response_exception(&mk(class))
+                .expect("Bedrock always returns Some for a stream exception");
+            assert_eq!(name, expect, "class {class:?} must fold to {expect}");
+        }
+        // The message prefers the upstream provider_signal when present.
+        let err = crate::proto::IrError {
+            class: StatusClass::RateLimit,
+            provider_signal: Some("slow down".to_string()),
+            retry_after: None,
+        };
+        let (name, msg) = BedrockWriter.write_response_exception(&err).unwrap();
+        assert_eq!(name, "ThrottlingException");
+        assert_eq!(
+            msg, "slow down",
+            "message prefers the upstream provider_signal"
+        );
+    }
 }

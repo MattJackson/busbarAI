@@ -5850,4 +5850,189 @@ mod anthropic_hardening_tests {
             "Anthropic-shaped streamed citation must round-trip BYTE-EXACT via raw"
         );
     }
+
+    /// An Anthropic `cache_control` breakpoint placed ON a `tool_use` block must survive
+    /// read→IR→write byte-for-byte. The IR carries it on `IrBlock::ToolUse.cache_control` (ir.rs:292)
+    /// precisely so this Anthropic-native prefix-cache breakpoint is not silently dropped (a cache-hit
+    /// cost/latency regression on the same-protocol path).
+    #[test]
+    fn cache_control_on_tool_use_block_round_trips() {
+        let block = serde_json::json!({
+            "type": STOP_TOOL_USE,
+            "id": "toolu_01abc",
+            "name": "get_weather",
+            "input": {"location": "SF"},
+            "cache_control": {"type": CACHE_KIND_EPHEMERAL}
+        });
+        let ir = read_block(&block).expect("tool_use block with cache_control parses");
+        match &ir {
+            crate::ir::IrBlock::ToolUse {
+                id,
+                name,
+                input,
+                cache_control,
+            } => {
+                assert_eq!(id, "toolu_01abc");
+                assert_eq!(name, "get_weather");
+                assert_eq!(input, &serde_json::json!({"location": "SF"}));
+                assert!(
+                    cache_control.is_some(),
+                    "cache_control on tool_use must be captured in the IR, not dropped"
+                );
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+        // WRITE: the breakpoint re-emits in Anthropic's native `{type:"ephemeral"}` shape.
+        let out = write_block(&ir);
+        assert_eq!(
+            out.pointer("/cache_control/type").and_then(|t| t.as_str()),
+            Some("ephemeral"), // golden wire-contract literal (kept bare on purpose)
+            "cache_control must re-emit on the tool_use block"
+        );
+        assert_eq!(out.get("id").and_then(|v| v.as_str()), Some("toolu_01abc"));
+    }
+
+    /// An Anthropic `cache_control` breakpoint on a `tool_result` block must survive
+    /// read→IR→write. Anthropic places breakpoints on tool_result to cache the (often large) result
+    /// content (ir.rs:302); the IR field `IrBlock::ToolResult.cache_control` keeps it cross-hop.
+    #[test]
+    fn cache_control_on_tool_result_block_round_trips() {
+        let block = serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_01abc",
+            "content": [{"type": "text", "text": "72F and sunny"}],
+            "is_error": false,
+            "cache_control": {"type": CACHE_KIND_EPHEMERAL}
+        });
+        let ir = read_block(&block).expect("tool_result block with cache_control parses");
+        match &ir {
+            crate::ir::IrBlock::ToolResult {
+                tool_use_id,
+                cache_control,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "toolu_01abc");
+                assert!(!is_error);
+                assert!(
+                    cache_control.is_some(),
+                    "cache_control on tool_result must be captured, not dropped"
+                );
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        let out = write_block(&ir);
+        assert_eq!(
+            out.pointer("/cache_control/type").and_then(|t| t.as_str()),
+            Some("ephemeral"), // golden wire-contract literal (kept bare on purpose)
+            "cache_control must re-emit on the tool_result block"
+        );
+    }
+
+    /// A `cache_control` breakpoint on a tool DEFINITION (`tools[].cache_control`) round-trips through
+    /// `IrTool.cache_control` (ir.rs:449). Anthropic caches the large tool schemas as a prefix; the
+    /// breakpoint was being dropped every hop before this field existed.
+    #[test]
+    fn cache_control_on_tool_definition_round_trips() {
+        let tool = serde_json::json!({
+            "name": "get_weather",
+            "description": "Get weather",
+            "input_schema": {"type": "object", "properties": {}},
+            "cache_control": {"type": CACHE_KIND_EPHEMERAL}
+        });
+        let ir = read_tool(&tool).expect("tool with cache_control parses");
+        assert_eq!(ir.name, "get_weather");
+        assert!(
+            ir.cache_control.is_some(),
+            "cache_control on a tool definition must be captured in IrTool"
+        );
+        let out = write_tool(&ir);
+        assert_eq!(
+            out.pointer("/cache_control/type").and_then(|t| t.as_str()),
+            Some("ephemeral"), // golden wire-contract literal (kept bare on purpose)
+            "cache_control must re-emit on the tool definition"
+        );
+    }
+
+    /// Full non-stream response round-trip for an UNKNOWN native `stop_reason`: the reader maps a
+    /// token it does not model (here a plausible future `max_tokens_reached` variant spelling) to
+    /// `IrStopReason::Other`, and the writer degrades `Other` to the safe `end_turn` default — a
+    /// foreign token is NEVER echoed into a strict client's closed enum (the bug class ir.rs:186
+    /// documents).
+    #[test]
+    fn read_write_response_unknown_stop_reason_degrades_to_end_turn() {
+        let body = serde_json::json!({
+            "id": "msg_01xyz",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-4-8",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "some_future_reason",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 3, "output_tokens": 1}
+        });
+        let ir = AnthropicReader.read_response(&body).expect("read_response");
+        assert_eq!(
+            ir.stop_reason,
+            Some(crate::ir::IrStopReason::Other),
+            "an unmodeled native stop_reason must map to Other (never carried verbatim)"
+        );
+        let out = AnthropicWriter.write_response(&ir);
+        assert_eq!(
+            out.get("stop_reason").and_then(|v| v.as_str()),
+            Some("end_turn"), // golden wire-contract literal (kept bare on purpose)
+            "Other must degrade to the safe end_turn default on egress, never leak the foreign token"
+        );
+    }
+
+    /// Anthropic's `usage` cache fields are ADDITIVE (ir.rs:457): the reader stores
+    /// `cache_creation_input_tokens`/`cache_read_input_tokens` AS-IS (unlike OpenAI/Gemini, which
+    /// subtract the cached prefix out of the input total). This pins that a non-stream response
+    /// carries the wire cache counts through unchanged and that `input_tokens` is NOT reduced by them.
+    #[test]
+    fn read_response_cache_usage_is_additive_not_subtracted() {
+        let body = serde_json::json!({
+            "id": "msg_01xyz",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-4-8",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": STOP_END_TURN,
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 200,
+                "cache_read_input_tokens": 1000
+            }
+        });
+        let ir = AnthropicReader.read_response(&body).expect("read_response");
+        // Wire values stored verbatim — Anthropic input is already the UNCACHED count, so no subtract.
+        assert_eq!(
+            ir.usage.input_tokens, 10,
+            "Anthropic input_tokens stored as-is (already uncached)"
+        );
+        assert_eq!(ir.usage.output_tokens, 5);
+        assert_eq!(ir.usage.cache_creation_input_tokens, Some(200));
+        assert_eq!(ir.usage.cache_read_input_tokens, Some(1000));
+        // billable_tokens sums all four additively: 10 + 5 + 200 + 1000.
+        assert_eq!(ir.usage.billable_tokens(), 1215);
+
+        // WRITE re-emits the additive cache fields on the same-protocol egress.
+        let out = AnthropicWriter.write_response(&ir);
+        assert_eq!(
+            out.pointer("/usage/cache_creation_input_tokens")
+                .and_then(|v| v.as_u64()),
+            Some(200)
+        );
+        assert_eq!(
+            out.pointer("/usage/cache_read_input_tokens")
+                .and_then(|v| v.as_u64()),
+            Some(1000)
+        );
+        assert_eq!(
+            out.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
+            Some(10)
+        );
+    }
 }

@@ -6072,4 +6072,180 @@ mod tests {
             "url image must emit its raw URL verbatim"
         );
     }
+
+    /// Cohere's `finish_reason` codec: the generic infra-failure `ERROR` maps to `IrStopReason::Error`
+    /// (distinct from the content-moderation `ERROR_TOXIC` → `Safety`), and it re-emits as `ERROR` on
+    /// egress — `Error` is a first-class IR reason (ir.rs:211) so an upstream infra stop is not
+    /// conflated with a safety block. Also pins that an unmodeled token degrades to `Other` on read
+    /// and `COMPLETE` on write (never leaked verbatim into Cohere's closed enum).
+    #[test]
+    fn finish_reason_error_and_unknown_codec() {
+        use crate::ir::IrStopReason as S;
+        // ERROR (infra) vs ERROR_TOXIC (moderation) must NOT be conflated.
+        assert_eq!(read_cohere_stop_reason(COHERE_FINISH_ERROR), S::Error);
+        assert_eq!(
+            read_cohere_stop_reason(COHERE_FINISH_ERROR_TOXIC),
+            S::Safety
+        );
+        // Error round-trips back to the native ERROR token.
+        assert_eq!(write_cohere_stop_reason(S::Error), COHERE_FINISH_ERROR);
+        // An unmodeled native token degrades to Other on read...
+        assert_eq!(read_cohere_stop_reason("SOME_FUTURE_REASON"), S::Other);
+        // ...and Other (plus the no-analog Refusal/PauseTurn) degrades to COMPLETE on egress.
+        assert_eq!(write_cohere_stop_reason(S::Other), COHERE_FINISH_COMPLETE);
+        assert_eq!(write_cohere_stop_reason(S::Refusal), COHERE_FINISH_COMPLETE);
+        assert_eq!(
+            write_cohere_stop_reason(S::PauseTurn),
+            COHERE_FINISH_COMPLETE
+        );
+    }
+
+    /// A full non-stream `read_response` carrying `finish_reason: "ERROR"` surfaces
+    /// `IrStopReason::Error` (an upstream-error terminated generation, ir.rs:211), and a
+    /// `write_response` re-emits the native `ERROR` token — so a Cohere infra stop survives the seam.
+    #[test]
+    fn read_write_response_error_finish_reason_round_trips() {
+        let body = serde_json::json!({
+            "id": "c-123",
+            "finish_reason": COHERE_FINISH_ERROR,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+            "usage": {"tokens": {"input_tokens": 4, "output_tokens": 0}}
+        });
+        let resp = CohereReader.read_response(&body).expect("read_response");
+        assert_eq!(resp.stop_reason, Some(crate::ir::IrStopReason::Error));
+        let writer = CohereWriter;
+        let out = writer.write_response(&resp);
+        assert_eq!(
+            out.get("finish_reason").and_then(|v| v.as_str()),
+            Some("ERROR") // golden wire-contract literal (kept bare on purpose)
+        );
+    }
+
+    /// The `tool_choice` union maps to Cohere v2's uppercase native strings: `Required`→`REQUIRED`,
+    /// `None`→`NONE`, `Auto`→omitted (the v2 default). A targeted `Tool{name}` has NO Cohere analog
+    /// (no named-tool choice in v2) and degrades to `REQUIRED` — preserving the load-bearing "must
+    /// call a tool" intent rather than silently dropping to auto.
+    #[test]
+    fn tool_choice_maps_to_cohere_native_strings() {
+        let mk = |tc: Option<crate::ir::IrToolChoice>| {
+            let mut req = crate::ir::IrRequest {
+                messages: vec![crate::ir::IrMessage {
+                    role: crate::ir::IrRole::User,
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "hi".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                }],
+                ..Default::default()
+            };
+            req.tool_choice = tc;
+            let writer = CohereWriter;
+            writer.write_request(&req)
+        };
+        assert_eq!(
+            mk(Some(crate::ir::IrToolChoice::Required))
+                .get("tool_choice")
+                .and_then(|v| v.as_str()),
+            Some("REQUIRED")
+        );
+        assert_eq!(
+            mk(Some(crate::ir::IrToolChoice::None))
+                .get("tool_choice")
+                .and_then(|v| v.as_str()),
+            Some("NONE")
+        );
+        // A specific tool degrades to REQUIRED (documented lossy-by-target — v2 has no named choice).
+        assert_eq!(
+            mk(Some(crate::ir::IrToolChoice::Tool {
+                name: "f".to_string()
+            }))
+            .get("tool_choice")
+            .and_then(|v| v.as_str()),
+            Some("REQUIRED")
+        );
+        // Auto is the default and is OMITTED (a request that never forced a tool gains no directive).
+        assert!(
+            mk(Some(crate::ir::IrToolChoice::Auto))
+                .get("tool_choice")
+                .is_none(),
+            "Auto must be omitted, not emitted"
+        );
+        assert!(mk(None).get("tool_choice").is_none());
+    }
+
+    /// A `response_format` json_schema round-trips read→IR→write. Cohere's native shape puts the
+    /// schema DIRECTLY under `json_schema` (not nested under `.schema` like OpenAI); the reader
+    /// canonicalizes it into the typed `IrResponseFormat` and the writer re-emits Cohere's shape — so
+    /// a same-protocol structured-output request stays faithful and a cross-protocol one cannot leak a
+    /// foreign shape (ir.rs:348).
+    #[test]
+    fn response_format_json_schema_round_trips_cohere_shape() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+        });
+        let body = serde_json::json!({
+            "model": "command-r",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object", "json_schema": schema}
+        });
+        let ir = CohereReader.read_request(&body).expect("read_request");
+        let rf = ir
+            .response_format
+            .as_ref()
+            .expect("response_format canonicalizes into the typed IR");
+        assert!(rf.json, "json_object must set json=true");
+        assert_eq!(
+            rf.schema.as_ref(),
+            Some(&schema),
+            "the schema sits directly under json_schema in Cohere's shape"
+        );
+        // It must NOT linger in extra.
+        assert!(!ir.extra.contains_key("response_format"));
+
+        // WRITE re-emits Cohere's native json_object + json_schema shape (schema directly under key).
+        let writer = CohereWriter;
+        let out = writer.write_request(&ir);
+        assert_eq!(
+            out.pointer("/response_format/type")
+                .and_then(|t| t.as_str()),
+            Some("json_object")
+        );
+        assert_eq!(out.pointer("/response_format/json_schema"), Some(&schema));
+    }
+
+    /// Cohere v2 has NO `n`/`num_generations` parameter (it was a v1 field, removed in v2 — ir.rs:46).
+    /// Even when the IR carries `n`, the writer must NOT emit it, and the reader never sets it — so a
+    /// cross-protocol request carrying `n` does not produce an invalid Cohere body.
+    #[test]
+    fn n_candidate_count_never_emitted_on_cohere() {
+        let mut req = crate::ir::IrRequest {
+            messages: vec![crate::ir::IrMessage {
+                role: crate::ir::IrRole::User,
+                content: vec![crate::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                }],
+            }],
+            ..Default::default()
+        };
+        req.n = Some(3);
+        let writer = CohereWriter;
+        let out = writer.write_request(&req);
+        assert!(
+            out.get("n").is_none() && out.get("num_generations").is_none(),
+            "Cohere v2 models no n/num_generations; it must never be emitted: {out}"
+        );
+
+        // And the reader never sets `n` from a Cohere body.
+        let body = serde_json::json!({
+            "model": "command-r",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let ir = CohereReader.read_request(&body).expect("read_request");
+        assert_eq!(ir.n, None, "the Cohere reader must never populate n");
+    }
 }
