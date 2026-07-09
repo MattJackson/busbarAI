@@ -260,6 +260,113 @@ wandb:
 #     error_map: {}
 #     api_key_env: AZURE_OPENAI_KEY
 
+
+# --- Added 2026-07-09: docs-verified against each provider's own API documentation ---------------
+
+# DigitalOcean Gradient serverless inference.
+digitalocean:
+  protocol: openai
+  base_url: https://inference.do-ai.run
+  error_map:
+    too_many_requests: rate_limit
+
+# GitHub Models inference endpoint (no /v1 segment in the documented path).
+github-models:
+  protocol: openai
+  base_url: https://models.github.ai/inference
+  path: /chat/completions
+  error_map: {}
+
+# Hugging Face Inference Providers router.
+huggingface:
+  protocol: openai
+  base_url: https://router.huggingface.co
+  error_map: {}
+
+# SiliconFlow international endpoint. The mainland-China host is api.siliconflow.cn.
+siliconflow:
+  protocol: openai
+  base_url: https://api.siliconflow.com
+  error_map: {}
+
+# Upstage Solar.
+upstage:
+  protocol: openai
+  base_url: https://api.upstage.ai
+  error_map: {}
+
+# StepFun international endpoint. The mainland-China host is api.stepfun.com.
+stepfun:
+  protocol: openai
+  base_url: https://api.stepfun.ai
+  error_map: {}
+
+# Zhipu bigmodel.cn (mainland-China GLM API; the international surface is z.ai, above).
+# Numeric JSON codes per their error reference: 1113 arrears / 1309 plan expired,
+# 1302/1305/1308/1310/1313 rate and usage limits.
+zhipuai:
+  protocol: openai
+  base_url: https://open.bigmodel.cn/api/paas/v4
+  path: /chat/completions
+  error_map:
+    "1113": billing
+    "1309": billing
+    "1302": rate_limit
+    "1305": rate_limit
+    "1308": rate_limit
+    "1310": rate_limit
+    "1313": rate_limit
+
+# Xiaomi MiMo. Their documented key env convention is MIMO_API_KEY.
+xiaomi:
+  protocol: openai
+  base_url: https://api.xiaomimimo.com
+  error_map: {}
+
+# Vultr serverless inference.
+vultr:
+  protocol: openai
+  base_url: https://api.vultrinference.com
+  error_map: {}
+
+# Ollama Cloud.
+ollama-cloud:
+  protocol: openai
+  base_url: https://ollama.com
+  error_map: {}
+
+# Inception Labs (Mercury diffusion LLMs).
+inception:
+  protocol: openai
+  base_url: https://api.inceptionlabs.ai
+  error_map: {}
+
+# Morph (code-apply models).
+morph:
+  protocol: openai
+  base_url: https://api.morphllm.com
+  error_map: {}
+
+# Meituan LongCat. The documented endpoint already ends in /v1/chat/completions.
+longcat:
+  protocol: openai
+  base_url: https://api.longcat.chat/openai
+  error_map:
+    insufficient_quota: billing
+    rate_limit_exceeded: rate_limit
+
+# Sakana AI (fugu models).
+sakana:
+  protocol: openai
+  base_url: https://api.sakana.ai
+  error_map: {}
+
+# NEAR AI cloud.
+nearai:
+  protocol: openai
+  base_url: https://cloud-api.near.ai
+  error_map: {}
+
 # -- OpenAI Responses protocol (/v1/responses) ----------------------------------------------------
 # The newer stateful OpenAI surface, distinct from chat completions. Bearer auth + a fixed path.
 responses:

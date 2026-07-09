@@ -48,6 +48,22 @@ const MAP = {
   synthetic: 'synthetic',
   wandb: 'wandb',
   llama: 'meta-llama',
+  // promoted to the verified catalog 2026-07-09 (docs-verified, wave 1)
+  digitalocean: 'digitalocean',
+  'github-models': 'github-models',
+  huggingface: 'huggingface',
+  siliconflow: 'siliconflow',
+  upstage: 'upstage',
+  stepfun: 'stepfun',
+  zhipuai: 'zhipuai',
+  xiaomi: 'xiaomi',
+  vultr: 'vultr',
+  'ollama-cloud': 'ollama-cloud',
+  inception: 'inception',
+  morph: 'morph',
+  longcat: 'longcat',
+  sakana: 'sakana',
+  nearai: 'nearai',
 };
 
 const res = await fetch('https://models.dev/api.json');
