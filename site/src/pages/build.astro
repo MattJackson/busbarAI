@@ -91,7 +91,14 @@ const DATA = catalog.providers;
   <script define:vars={{ DATA }} is:inline>
     const $ = (id) => document.getElementById(id);
     const lanes = []; // {id, provider, weight}
-    const ENV_OVERRIDE = { bedrock: 'AWS_BEDROCK_CREDS' };
+    // Corrections where the models.dev env label differs from the provider's own
+    // documented convention (found by the verification campaign).
+    const ENV_OVERRIDE = {
+      bedrock: 'AWS_BEDROCK_CREDS',
+      xiaomi: 'MIMO_API_KEY',
+      vultr: 'VULTR_SERVERLESS_INFERENCE_API_KEY',
+      zhipuai: 'ZHIPUAI_API_KEY',
+    };
 
     // Flat search index
     const INDEX = [];
@@ -304,7 +311,7 @@ const DATA = catalog.providers;
         scored.push([s, m]);
       }
       scored.sort((a, b) => a[0] - b[0]);
-      showHits(scored.slice(0, 16).map(([, m]) => m));
+      showHits(scored.slice(0, 80).map(([, m]) => m));
     }
     $('cb-search').addEventListener('input', refreshList);
     $('cb-search').addEventListener('focus', refreshList);
@@ -364,7 +371,7 @@ const DATA = catalog.providers;
       font: inherit; font-size: 14.5px; padding: 9px 12px; border: 1px solid var(--line);
       border-radius: 8px; width: 100%; box-sizing: border-box;
     }
-    .cb-results { border: 1px solid var(--line); border-radius: 10px; margin-top: 6px; overflow: hidden; }
+    .cb-results { border: 1px solid var(--line); border-radius: 10px; margin-top: 6px; overflow-y: auto; max-height: 340px; }
     .cb-hit { display: flex; justify-content: space-between; gap: 10px; width: 100%; text-align: left;
       font: inherit; font-size: 13.5px; padding: 8px 12px; background: #fff; border: 0;
       border-bottom: 1px solid var(--line); cursor: pointer; }

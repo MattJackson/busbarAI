@@ -104,8 +104,12 @@ for (const name of Object.keys(providers)) {
 // error-code dialects are unmapped, and the generated yaml says so.
 const mapped = new Set(Object.keys(MAP));
 let gen = 0;
+// Regional/plan variants (alibaba-cn, xiaomi-token-plan-ams, *-coding-plan, …) are
+// distinct endpoints but pure noise in a picker; the plain provider represents them.
+const VARIANT = /-(cn|coding-plan|token-plan)(-|$)|-token-plan$/;
 for (const [mdId, p] of Object.entries(catalog)) {
   if (mapped.has(mdId) || providers[mdId]) continue;
+  if (VARIANT.test(mdId)) continue;
   if (p.npm !== '@ai-sdk/openai-compatible' || !p.api) continue;
   const models = Object.values(p.models || {});
   if (!models.length) continue;
