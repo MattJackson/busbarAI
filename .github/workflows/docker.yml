@@ -70,12 +70,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Retag latest -> ${{ inputs.retag_from }} (multi-arch preserved)
+        env:
+          V: ${{ inputs.retag_from }}
         run: |
           set -euo pipefail
-          docker buildx imagetools create -t "${DOCKERHUB_IMAGE}:latest" "${DOCKERHUB_IMAGE}:${{ inputs.retag_from }}"
-          docker buildx imagetools create -t "${GHCR_IMAGE}:latest"      "${GHCR_IMAGE}:${{ inputs.retag_from }}"
-          echo "latest now points at ${{ inputs.retag_from }}:"
-          docker buildx imagetools inspect "${DOCKERHUB_IMAGE}:latest" | grep -iE 'name|platform'
+          # Docker Hub: point latest at the (immutable) version. Idempotent.
+          docker buildx imagetools create -t "${DOCKERHUB_IMAGE}:latest" "${DOCKERHUB_IMAGE}:${V}"
+          # GHCR may be MISSING this version if a prior combined build-push aborted mid-way
+          # (e.g. Docker Hub tag-immutability rejected `latest` before GHCR finished). Mirror the
+          # version from Docker Hub into GHCR (cross-registry manifest copy, no rebuild), then move
+          # GHCR latest onto it. `imagetools create` is a no-op-safe overwrite if it already exists.
+          docker buildx imagetools create -t "${GHCR_IMAGE}:${V}" "${DOCKERHUB_IMAGE}:${V}"
+          docker buildx imagetools create -t "${GHCR_IMAGE}:latest" "${GHCR_IMAGE}:${V}"
+          echo "== Docker Hub latest =="; docker buildx imagetools inspect "${DOCKERHUB_IMAGE}:latest" | grep -iE 'name|platform'
+          echo "== GHCR ${V} =="; docker buildx imagetools inspect "${GHCR_IMAGE}:${V}" | grep -iE 'name|platform'
 
   # Static musl binaries, one per architecture, built on native runners (no QEMU).
   build-binaries:
