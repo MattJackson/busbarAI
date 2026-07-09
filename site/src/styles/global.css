@@ -59,3 +59,12 @@
     width: auto;
   }
 }
+
+/* Ultra-wide screens: with the content pinned against the sidebar, the leftover
+   width all lands on the right. Let the content column grow into it so long
+   tables and code blocks get the room, keeping a sane right margin. */
+@media (min-width: 110em) {
+  :root {
+    --sl-content-width: 85rem;
+  }
+}
