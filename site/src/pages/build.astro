@@ -23,7 +23,10 @@ const DATA = catalog.providers;
 
   <div class="cb">
     <div class="cb-pick">
-      <input id="cb-search" type="search" placeholder="Search 900+ models — try kimi, glm, sonnet, llama…" autocomplete="off" />
+      <div class="cb-searchrow">
+        <input id="cb-search" type="search" placeholder="Model name — try kimi, glm, sonnet, llama…" autocomplete="off" />
+        <select id="cb-filter" aria-label="Filter by provider"></select>
+      </div>
       <div id="cb-results" class="cb-results" hidden></div>
 
       <details class="cb-manual">
@@ -126,6 +129,18 @@ const DATA = catalog.providers;
     oc.value = '__custom'; oc.textContent = 'Custom endpoint (OpenAI-compatible)…';
     provSel.appendChild(oc);
     provSel.addEventListener('change', () => { $('cb-custom-row').hidden = provSel.value !== '__custom'; });
+
+    // Provider filter beside the search box — optional, "" = all providers.
+    const filterSel = $('cb-filter');
+    const ghost = document.createElement('option');
+    ghost.value = ''; ghost.textContent = 'Provider (optional)';
+    filterSel.appendChild(ghost);
+    for (const [prov, p] of Object.entries(DATA)) {
+      const o = document.createElement('option');
+      o.value = prov; o.textContent = p.label === prov ? prov : `${p.label} (${prov})`;
+      filterSel.appendChild(o);
+    }
+    filterSel.addEventListener('change', () => { filterSel.classList.toggle('cb-filter-on', !!filterSel.value); refreshList(); });
 
     function envFor(prov) {
       return ENV_OVERRIDE[prov] || (DATA[prov] && DATA[prov].env) || (prov.toUpperCase().replace(/[^A-Z0-9]/g, '_') + '_KEY');
@@ -296,26 +311,27 @@ const DATA = catalog.providers;
     }
     function refreshList() {
       const q = $('cb-search').value.trim().toLowerCase();
-      if (q.length < 2) { showHits(POPULAR, 'Popular right now'); return; }
-      // Rank so the maker's own endpoint isn't buried under aggregators that
-      // resell its models: provider-name match first, then id-prefix matches.
+      const f = $('cb-filter').value; // '' = all providers
+      const pool = f ? INDEX.filter((m) => m.prov === f) : INDEX;
+      if (q.length < 2) {
+        // provider chosen, nothing typed: its whole list (newest first); else popular
+        showHits(f ? pool.slice(0, 300) : POPULAR, f ? '' : 'Popular right now');
+        return;
+      }
+      // search matches MODEL ids/names only; the provider field handles providers
       const scored = [];
-      for (const m of INDEX) {
+      for (const m of pool) {
         const id = m.id.toLowerCase(), name = m.name.toLowerCase();
-        const provHit = m.prov.toLowerCase().includes(q) || m.provLabel.toLowerCase().includes(q);
-        if (!provHit && !id.includes(q) && !name.includes(q)) continue;
-        let s = 0;
-        if (provHit) s -= 4;
-        if (id.startsWith(q) || name.startsWith(q)) s -= 2;
-        scored.push([s, m]);
+        if (!id.includes(q) && !name.includes(q)) continue;
+        scored.push([(id.startsWith(q) || name.startsWith(q)) ? -1 : 0, m]);
       }
       scored.sort((a, b) => a[0] - b[0]);
-      showHits(scored.slice(0, 80).map(([, m]) => m));
+      showHits(scored.slice(0, 300).map(([, m]) => m));
     }
     $('cb-search').addEventListener('input', refreshList);
     $('cb-search').addEventListener('focus', refreshList);
     document.addEventListener('click', (e) => {
-      if (!results.contains(e.target) && e.target !== $('cb-search')) results.hidden = true;
+      if (!results.contains(e.target) && e.target !== $('cb-search') && e.target !== $('cb-filter')) results.hidden = true;
     });
 
     $('cb-add').addEventListener('click', () => {
@@ -366,6 +382,13 @@ const DATA = catalog.providers;
     .cb { display: flex; flex-direction: column; gap: 28px; margin: 8px 0 24px; }
     .cb-results-head { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
       color: var(--muted); padding: 8px 12px 4px; background: #fff; }
+    .cb-searchrow { display: flex; gap: 8px; }
+    .cb-searchrow input[type="search"] { flex: 1; }
+    .cb-searchrow select {
+      flex: 0 0 220px; font: inherit; font-size: 14.5px; padding: 9px 12px;
+      border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: #fff;
+    }
+    .cb-searchrow select.cb-filter-on { color: var(--slate); }
     .cb-pick input[type="search"], .cb-manual-row input, .cb-manual-row select, .cb-poolrow input {
       font: inherit; font-size: 14.5px; padding: 9px 12px; border: 1px solid var(--line);
       border-radius: 8px; width: 100%; box-sizing: border-box;
