@@ -14,7 +14,7 @@ const DOCS = '/docs/why-busbar/';
 
 const ORG = { '@context': 'https://schema.org', '@type': 'Organization', name: 'Busbar', url: 'https://getbusbar.com', logo: 'https://getbusbar.com/favicon.svg', sameAs: ['https://github.com/MattJackson/busbarAI'] };
 const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'Busbar', url: 'https://getbusbar.com' };
-const SOFTWARE = { '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Busbar', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows', offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }, url: 'https://getbusbar.com', description: 'The reliability and fidelity layer for multi-model AI traffic, lossless cross-protocol translation, fault-aware circuit breaking, and in-flight failover in one static Rust binary.' };
+const SOFTWARE = { '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Busbar', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows', offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }, url: 'https://getbusbar.com', description: 'The self-hosted control plane for LLM traffic: lossless cross-protocol translation, fault-aware circuit breaking, and in-flight failover in one static Rust binary.' };
 
 const protocols = ['OpenAI', 'Anthropic', 'Gemini', 'Bedrock', 'Cohere', 'Responses'];
 
@@ -129,9 +129,10 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           <div class="eyebrow"><span class="eyebrow-full">The self-hosted LLM control plane · single Rust binary</span><span class="eyebrow-short">Self-hosted · single Rust binary</span></div>
           <h1>One endpoint.<br /><span class="accent">Every LLM protocol.</span><br />Losslessly.</h1>
           <p class="lede">
-            Busbar sits between your application and every provider it calls. Point any SDK at one
-            URL, it routes to the backends you choose, translates across six wire protocols without
-            dropping a feature, and keeps serving through provider failures before your user sees a byte.
+            Busbar is the control plane between your application and every provider it calls.
+            Point any SDK at one URL: it routes to the backends you choose, translates across six
+            wire protocols without dropping a feature, and keeps serving through provider failures
+            before your user sees a byte.
           </p>
           <div class="cta-row">
             <a href="/docs/getting-started/" class="btn">Get started</a>

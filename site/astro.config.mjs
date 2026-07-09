@@ -78,7 +78,7 @@ export default defineConfig({
         starlightLlmsTxt({
           projectName: 'Busbar',
           description:
-            'Self-hosted LLM gateway in a single Rust binary. One endpoint accepts any of six wire protocols (OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses), routes to weighted pools of backends, translates losslessly between protocols, and keeps serving through provider failures via fault-attributed circuit breaking and in-flight failover.',
+            'Self-hosted LLM gateway and control plane in a single Rust binary. One endpoint accepts any of six wire protocols (OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses), routes to weighted pools of backends, translates losslessly between protocols, and keeps serving through provider failures via fault-attributed circuit breaking and in-flight failover.',
         }),
       ],
       social: [

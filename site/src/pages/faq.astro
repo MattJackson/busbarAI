@@ -50,6 +50,21 @@ import PageLayout from '../layouts/PageLayout.astro';
     translator code, and it's the one case where you'd wait on us.
   </p>
 
+  <h2 id="control-plane">Is Busbar a gateway or a control plane?</h2>
+  <p>
+    Both names fit, and the difference matters. A gateway forwards traffic. A control plane
+    decides: whose fault a failure was, whether the request is inside its budget and rate limit,
+    which pool member should serve it, and whether to fail over mid-flight. Busbar makes those
+    decisions in your infrastructure, before the request is forwarded, at a cost of about 38
+    microseconds.
+  </p>
+  <p>
+    One test separates the two words from marketing: a control plane that lives in your data
+    path had better cost nothing to pass through, and every one of its decisions had better
+    work air-gapped. Busbar passes both. It is a single Rust binary with no hosted tier behind
+    it; there is no feature that requires phoning home to us.
+  </p>
+
   <h2>Why not just use LiteLLM?</h2>
   <p>
     If you want an in-process Python router library with a big preconfigured catalog, LiteLLM
