@@ -25,7 +25,7 @@ So even if nothing ever went wrong, I'd keep it there. But something went wrong.
 
 My provider had a bad day, as every provider eventually does. Here's the part that matters: **the provider I failed over to did not exist in my stack when the outage started.** I opened a Z.ai account, added it to Busbar's config, and flipped traffic. It speaks the OpenAI-compatible protocol, so "integrating" it was a few lines of YAML: a name, a base URL, an env var for the key.
 
-Downtime, as seen by the application: none. Code changes: none. The app was written against one provider's SDK and still is. It has no idea anything happened, because the model name it calls is a config value in Busbar, not a dependency in the code.
+The outage ended for my app the moment the config flipped. No redeploy, no code change, no emergency pull request: the recovery was an edit to a YAML file, not an engineering project. The app was written against one provider's SDK and still is. It has no idea anything happened, because the model name it calls is a config value in Busbar, not a dependency in the code.
 
 That's the thing the "failover" framing undersells. Failover between two configured providers is table stakes. What I actually used was the ability to *manufacture* a second provider mid-incident, because the gateway was already holding the seam where providers plug in.
 
