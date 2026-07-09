@@ -55,6 +55,7 @@ const trust = [
   { k: 'One binary', v: 'No Python runtime' },
   { k: 'Hardened', v: 'SSRF guards · constant-time auth' },
   { k: 'Cross-platform', v: 'Linux · macOS · Windows · ARM' },
+  { k: 'Measured', v: '38 µs added latency · verifiable per-request' },
 ];
 
 // Code blocks rendered via set:html so literal { } braces aren't parsed as Astro expressions.
@@ -165,7 +166,10 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           You define a model name and the backends behind it. Busbar accepts <em>any</em> input
           protocol, OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses, and routes and
           translates accordingly. One model name, reachable by every client; you choose what runs
-          behind it. It’s a different class of tool than a proxy with a long model list.
+          behind it. It’s a different class of tool than a proxy with a long model list. There is
+          no privileged protocol and no model list to be on: providers speak about six languages
+          between them, Busbar speaks all six, so a new model works the day it ships. <strong>The
+          model name is a config value, not a release note.</strong>
         </p>
       </div>
     </section>
@@ -230,6 +234,21 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
             <p class="enables"><span>Enables</span> <span set:html={f.enables}></span></p>
           </article>
         ))}
+      </div>
+    </section>
+
+    <!-- ONE PROVIDER TODAY -->
+    <section class="core wrap">
+      <div class="core-inner">
+        <h2>Already committed to one provider?</h2>
+        <p>
+          Busbar pays for itself before the second provider exists. Run it as a straight
+          passthrough and your posture improves the same day: the provider key moves out of every
+          app deployment, a runaway loop hits your cap instead of your bill, and every request
+          shows up in your metrics. When the constraint moves, a new backend is a config lane, not
+          a rewrite. <a href="/faq/#one-provider">Why add a gateway now</a> · <a
+          href="/blog/valuable-before-the-second-provider/">the day it paid off</a>
+        </p>
       </div>
     </section>
 
@@ -448,6 +467,8 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       .core h2 { font-size: clamp(28px, 3.4vw, 40px); font-weight: 800; }
       .core p { font-size: 19px; color: #334155; margin-top: 20px; }
       .core em { color: var(--slate); font-style: normal; font-weight: 600; text-decoration: underline; text-decoration-color: var(--lime); text-decoration-thickness: 2px; text-underline-offset: 3px; }
+      .core p a { color: #4d7c0f; text-decoration: underline; text-underline-offset: 3px; }
+      .core p a:hover { color: var(--slate); }
 
       .section-title { font-size: clamp(24px, 3vw, 34px); font-weight: 800; margin-bottom: 38px; }
 
@@ -533,7 +554,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
 
       /* TRUST */
       .trust { background: var(--bg-soft); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 44px 0; }
-      .trust-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+      .trust-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; }
       .trust-item { text-align: center; }
       .trust-k { font-size: 18px; font-weight: 800; color: var(--slate); letter-spacing: -0.01em; }
       .trust-v { font-size: 13px; color: var(--muted); margin-top: 4px; }

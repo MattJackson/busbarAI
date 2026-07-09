@@ -42,47 +42,11 @@ Then the constraint moves, as constraints do. A team whose compliance posture lo
 
 ---
 
-## Honest comparison: Busbar vs LiteLLM vs OpenRouter
+## How Busbar compares
 
-These are not the same tool. The right choice depends on what you are actually optimizing for.
+The detailed comparisons live on their own pages, with every claim about the other tools cited to their own documentation and re-checked against it: **[Busbar vs LiteLLM](https://getbusbar.com/vs/litellm/)** and **[Busbar vs OpenRouter](https://getbusbar.com/vs/openrouter/)**.
 
-### LiteLLM
-
-LiteLLM is a Python library and optional proxy that normalizes many providers to an OpenAI-shaped interface. It is widely used, well-documented, and has a large ecosystem.
-
-**Where LiteLLM fits:** teams that are already Python-native, want a broad provider surface immediately (LiteLLM covers more providers than Busbar's current catalog), and need integration with Python ML tooling.
-
-**Where Busbar pulls ahead:**
-
-- **Native cross-protocol translation, not OpenAI normalization.** LiteLLM maps everything to the OpenAI schema and back. Busbar instead translates through a superset intermediate representation that every protocol reader maps into and every writer maps out of, with deliberate fidelity choices: `temperature` is stored as `f64` (not `f32`) to avoid round-trip precision loss, and source-protocol `extra` fields (such as OpenAI's `logprobs` or `n`) are cleared before forwarding rather than leaked to a foreign backend. You can point a Bedrock SDK at Busbar and have it route to an Anthropic backend, or vice versa, with translation in both directions: including streaming, where Busbar re-frames events into each client's native format (SSE for OpenAI/Anthropic/Gemini/Cohere/Responses, binary `application/vnd.amazon.eventstream` for Bedrock).
-- **No Python runtime in your request path.** LiteLLM's proxy is a Python process. It carries the startup time, memory footprint, and GIL constraints of a Python async server. Busbar is a single static Rust binary with no runtime dependencies. You deploy a file.
-- **Per-(pool, lane) circuit breakers, not per-request retries.** Busbar's circuit breaker tracks error rate or consecutive failures per lane per pool over a sliding window, trips independently per (pool, lane) combination, enforces exponential backoff with decorrelated jitter, and applies a hard-down disposition for auth/billing failures that persists (30-minute sticky cooldown) until a recovery probe succeeds. A lane that is rate-limiting in pool A can still serve traffic in pool B if it is healthy there. Client (4xx) errors are relayed verbatim and never penalize the lane.
-- **Ingress-side protocol flexibility.** Your existing Anthropic SDK, OpenAI SDK, Gemini SDK, Cohere SDK, or Bedrock SDK can point at Busbar with a one-line base URL change. LiteLLM's proxy accepts OpenAI-format requests; other protocol SDKs require adaptation.
-
-**Where LiteLLM still leads:**
-
-- **Out-of-the-box support for a provider on an exotic wire format.** Any provider that speaks one of the six protocols, OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses, is a few lines of YAML you add yourself ([Adding a provider](/providers/)), and Busbar hand-verifies the ones it ships because their error-code mappings drive the breaker's fault attribution. So "not in the catalog" almost never means "can't use it." The genuine gap is a provider whose wire format is *none* of the six and compatible with none, that needs a new protocol reader.
-- **Deep Python ecosystem integration** (LangChain, LlamaIndex, etc.): though since Busbar speaks those SDKs' native protocols, you reach it through them anyway, just at the HTTP layer rather than as a Python import.
-- **A bundled admin dashboard**: LiteLLM ships a hosted UI; Busbar doesn't. Observability instead runs through open standards: Prometheus `/metrics`, OTLP traces, and the admin API, so you point the dashboards you already run (Grafana and the like) at Busbar rather than a proprietary one.
-
-### OpenRouter
-
-OpenRouter is a hosted service. You send requests to `openrouter.ai`; they route to providers and bill you. You do not run anything.
-
-**Where OpenRouter fits:** prototyping, teams with no infrastructure budget, or use cases where third-party data routing is acceptable.
-
-**Where Busbar pulls ahead:**
-
-- **Your data stays in your infrastructure.** Every request through OpenRouter goes through OpenRouter's servers. For applications with data residency requirements, PII handling obligations, or internal policies around third-party data access, this is a hard constraint. Busbar runs in your infrastructure. The only external traffic is the upstream provider calls you configure.
-- **No per-request markup.** OpenRouter charges a markup above provider list price. Busbar's only cost is the compute to run it; its single-binary footprint is negligible against LLM API costs.
-- **Configurable reliability semantics.** OpenRouter's failover behavior is opaque and fixed. Busbar's pool configuration, breaker parameters, failover deadlines, and exhaustion behavior (reject with 503, fall back to another pool, or send to the least-bad lane) are all explicit, observable, and operator-controlled.
-- **Virtual key governance.** OpenRouter has no mechanism for issuing scoped sub-keys to internal teams with independent budget caps and rate limits.
-
-**Where OpenRouter still leads:**
-
-- **Zero operational burden**: you send HTTP, they run everything. Real, but the gap is thin: Busbar's "operations" is a single static binary with no runtime, no dependencies, and no database to provision, `./busbar` plus a config file. There's *something* to run; there just isn't much to it.
-- **A model marketplace with automatic provider picking**: a hosted catalog to browse and price-compare models, plus routing that chooses a provider for you based on community usage data. With Busbar, you pick the providers and pools yourself, in config.
-- **One key for models you'd otherwise need separate accounts for**: OpenRouter aggregates many hosts, so you can reach a niche or open-source model through a single OpenRouter key instead of signing up with each provider. With Busbar you bring your own provider accounts, so you can reach anything those providers offer: but you do need the account or endpoint for each.
+The short version. LiteLLM is a Python-native router with a big preconfigured catalog; if you want an in-process Python library, it's the right call. Busbar is a different kind of tool: no privileged protocol (all six first-class, in both directions), a fault-attributed circuit breaker rather than a cooldown timer, and a gateway whose own cost is measured in microseconds and megabytes. OpenRouter is a hosted service, and the deciding question is whether prompts passing through a third party is acceptable for your application: if it is, OpenRouter is excellent; if it isn't, Busbar runs in your infrastructure and nothing enters the data path but the providers you configure.
 
 ---
 

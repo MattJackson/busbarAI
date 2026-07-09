@@ -175,7 +175,10 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
         font-weight: 700;
         color: var(--slate);
         margin: 44px 0 14px;
+        /* sticky nav is 64px; anchored headings land below it, not under it */
+        scroll-margin-top: 84px;
       }
+      .page-doc h3 { scroll-margin-top: 84px; }
       .page-doc h3 {
         font-size: 17px;
         font-weight: 700;
