@@ -1582,7 +1582,6 @@ impl ProtocolWriter for CohereWriter {
                     if let crate::ir::IrBlock::ToolResult {
                         tool_use_id,
                         content,
-                        is_error: _,
                         ..
                     } = block
                     {

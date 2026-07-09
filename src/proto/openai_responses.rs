@@ -2614,7 +2614,6 @@ impl ProtocolWriter for ResponsesWriter {
                             crate::ir::IrBlock::ToolResult {
                                 tool_use_id,
                                 content,
-                                is_error: _,
                                 ..
                             } => {
                                 // Concatenate adjacent text blocks WITHOUT a separator: a space
@@ -2721,7 +2720,6 @@ impl ProtocolWriter for ResponsesWriter {
                         if let crate::ir::IrBlock::ToolResult {
                             tool_use_id,
                             content,
-                            is_error: _,
                             ..
                         } = block
                         {

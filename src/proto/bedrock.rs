@@ -2738,9 +2738,7 @@ impl ProtocolWriter for BedrockWriter {
 
     fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, serde_json::Value)> {
         match ev {
-            IrStreamEvent::MessageStart {
-                role: _, usage: _, ..
-            } => Some((
+            IrStreamEvent::MessageStart { .. } => Some((
                 ET_MESSAGE_START.to_string(),
                 serde_json::json!({ "role": "assistant" }),
             )),

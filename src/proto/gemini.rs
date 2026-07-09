@@ -2064,7 +2064,6 @@ impl ProtocolWriter for GeminiWriter {
                     crate::ir::IrBlock::ToolResult {
                         tool_use_id,
                         content,
-                        is_error: _,
                         ..
                     } => {
                         // ToolResult → functionResponse{name, response}. Resolve the REAL function
