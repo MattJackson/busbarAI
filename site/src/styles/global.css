@@ -44,3 +44,18 @@
   font-weight: 500;
   letter-spacing: 0.01em;
 }
+
+/* Docs on wide screens: Starlight splits the leftover width evenly around the
+   content column, which opens a dead gap between the sidebar and the text.
+   Keep the content against the sidebar; the "On this page" rail follows it,
+   and the spare width all lands on the right. */
+@media (min-width: 72em) {
+  .main-pane.main-pane {
+    --sl-content-margin-inline: 0 auto;
+    width: min(100%, calc(var(--sl-content-width) + 2 * var(--sl-content-pad-x)));
+  }
+  .right-sidebar-container.right-sidebar-container {
+    flex: 1;
+    width: auto;
+  }
+}
