@@ -114,7 +114,7 @@ const DATA = catalog.providers;
     const gShipped = document.createElement('optgroup');
     gShipped.label = 'In the shipped providers.yaml';
     const gGen = document.createElement('optgroup');
-    gGen.label = 'Unverified — needs adding to your providers.yaml';
+    gGen.label = 'Needs adding to your providers.yaml';
     for (const [prov, p] of Object.entries(DATA)) {
       const o = document.createElement('option');
       o.value = prov; o.textContent = `${p.label} (${prov})`;
@@ -204,8 +204,7 @@ const DATA = catalog.providers;
       lanes.forEach((l, i) => {
         const row = document.createElement('div');
         row.className = 'cb-lane';
-        const lb = CUSTOM[l.provider] ? '<i class="cb-badge cb-badge-gen">custom</i>'
-          : (DATA[l.provider] && DATA[l.provider].gen) ? '<i class="cb-badge cb-badge-gen">unverified</i>'
+        const lb = (CUSTOM[l.provider] || (DATA[l.provider] && DATA[l.provider].gen)) ? ''
           : '<i class="cb-badge cb-badge-ok">verified</i>';
         row.innerHTML = `<span class="cb-lane-id">${l.id}</span><span class="cb-lane-prov">${l.provider}</span>${lb}` +
           `<label>weight <input type="number" min="1" value="${l.weight}" data-i="${i}" class="cb-w"></label>` +
@@ -289,7 +288,7 @@ const DATA = catalog.providers;
         const b = document.createElement('button');
         b.type = 'button';
         b.className = 'cb-hit';
-        b.innerHTML = `<strong>${h.id}</strong> <span>${h.provLabel}${h.ctx ? ' · ' + Math.round(h.ctx / 1000) + 'k ctx' : ''} ${h.gen ? '<i class="cb-badge cb-badge-gen">unverified</i>' : '<i class="cb-badge cb-badge-ok">verified</i>'}</span>`;
+        b.innerHTML = `<strong>${h.id}</strong> <span>${h.provLabel}${h.ctx ? ' · ' + Math.round(h.ctx / 1000) + 'k ctx' : ''} ${h.gen ? '' : '<i class="cb-badge cb-badge-ok">verified</i>'}</span>`;
         b.addEventListener('click', () => { add(h.id, h.prov); results.hidden = true; $('cb-search').value = ''; });
         results.appendChild(b);
       }
