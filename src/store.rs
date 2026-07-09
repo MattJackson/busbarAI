@@ -5512,11 +5512,13 @@ mod tests {
     #[test]
     fn test_streak_zero_base_cooldown_is_jittered_and_desynced() {
         set_now_for_test(5_000);
-        // Two lanes → two distinct default cells (distinct cell addresses feed the FNV seed).
-        let store = Arc::new(InMemoryStore::new(vec![
-            make_lane_data(0, 10),
-            make_lane_data(1, 10),
-        ]));
+        // Several lanes → several distinct default cells (distinct cell addresses feed the FNV
+        // seed). The jitter band around base=200 holds only ~41 distinct values, so any TWO cells
+        // collide by chance ~2.4% of the time; sampling 8 makes an all-collide false failure
+        // astronomically unlikely while still proving desync.
+        let store = Arc::new(InMemoryStore::new(
+            (0..8).map(|i| make_lane_data(i, 10)).collect(),
+        ));
         // Sub-threshold cfg: high consecutive_n / min_requests so a single failure NEVER trips — it
         // takes the sub-threshold cooldown arm with streak just bumped to... no: streak==0 base is
         // exercised directly via the cooldown-compute helper. Use a base >= 10 so the ±10% band is a
@@ -5528,26 +5530,24 @@ mod tests {
             trip: TripConfig::default(),
         };
 
-        let c0 = store.get_lane(0).clone();
-        let c1 = store.get_lane(1).clone();
-        // Both fresh: streak == 0.
-        assert_eq!(c0.streak().load(Ordering::Relaxed), 0);
-        assert_eq!(c1.streak().load(Ordering::Relaxed), 0);
+        let cooldowns: Vec<u64> = (0..8)
+            .map(|i| {
+                let c = store.get_lane(i).clone();
+                // Fresh: streak == 0.
+                assert_eq!(c.streak().load(Ordering::Relaxed), 0);
+                InMemoryStore::compute_cooldown_with_retry_after(c.as_ref(), 5_000, &cfg, None, 0)
+            })
+            .collect();
 
-        let d0 =
-            InMemoryStore::compute_cooldown_with_retry_after(c0.as_ref(), 5_000, &cfg, None, 0);
-        let d1 =
-            InMemoryStore::compute_cooldown_with_retry_after(c1.as_ref(), 5_000, &cfg, None, 0);
-
-        // Jitter applied → at least one differs from the un-jittered base (200), and the two cells
-        // desync from each other.
-        assert_ne!(
-            d0, d1,
-            "two streak==0 cells with the same base must get DIFFERENT (jittered, desynced) cooldowns (A3)"
+        // Jitter applied → the cells desync: with 8 independent per-cell seeds, they must not all
+        // land on the same value.
+        assert!(
+            cooldowns.iter().any(|d| *d != cooldowns[0]),
+            "8 streak==0 cells with the same base must not all get the SAME cooldown; jitter/desync (A3) is not applying: {cooldowns:?}"
         );
-        for d in [d0, d1] {
+        for d in &cooldowns {
             assert!(
-                (100..=100_000).contains(&d),
+                (100..=100_000).contains(d),
                 "jittered streak==0 cooldown must stay within [base/2, max]; got {d}"
             );
         }
