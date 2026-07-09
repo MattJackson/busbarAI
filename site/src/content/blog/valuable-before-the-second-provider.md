@@ -1,6 +1,6 @@
 ---
 title: "Valuable before the second provider exists"
-description: "Everyone files a gateway under multi-provider failover, so single-provider teams think it isn't for them. Backwards. I run Busbar as a straight passthrough in front of one provider, and when that provider went down, the second provider took minutes to exist."
+description: "Why a gateway earns its keep with one provider: key custody, hard caps, and real metrics on day one — plus an option you can exercise mid-incident."
 date: 2026-07-09
 author: "Matthew Jackson"
 authorTitle: "Founder, Busbar"
