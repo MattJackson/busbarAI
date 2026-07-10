@@ -845,6 +845,10 @@ impl ProtocolReader for GeminiReader {
                 // already pushed BlockStart(s). Mirror the finishReason path (~793-802) exactly so
                 // the IR stream stays balanced; without this the open BlockStart events never get a
                 // matching BlockStop, producing an unbalanced stream downstream.
+                if state.thinking_block_open {
+                    state.thinking_block_open = false;
+                    out.push(IrStreamEvent::BlockStop { index: 0 });
+                }
                 if state.text_block_open {
                     state.text_block_open = false;
                     let ti = state.text_index.take().unwrap_or(0);
@@ -914,14 +918,66 @@ impl ProtocolReader for GeminiReader {
                         // per-chunk local, so indices stay stable across the multiple SSE chunks of
                         // a single response.
                         for part in parts_arr {
+                            // A `thought: true` part is streamed REASONING, not answer text (the
+                            // same D4 rule the buffered reader applies). Route it to a Thinking
+                            // block at index 0 ahead of the answer, mirroring the OpenAI reader's
+                            // reasoning handling — without this arm a Gemini backend's thinking
+                            // LEAKED INTO THE ANSWER TEXT on every cross-protocol stream (caught by
+                            // the harness's reasoning-STREAM rows). Same gate as the OpenAI reader:
+                            // once the answer phase has begun, index 0 is taken and a stray late
+                            // thought part is dropped rather than corrupting block pairing.
+                            if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
+                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                    if !text.is_empty()
+                                        && !state.text_block_open
+                                        && state.open_tools.is_empty()
+                                    {
+                                        state.reasoning_seen = true;
+                                        if !state.thinking_block_open {
+                                            state.thinking_block_open = true;
+                                            out.push(IrStreamEvent::BlockStart {
+                                                index: 0,
+                                                block: crate::ir::IrBlockMeta::Thinking,
+                                            });
+                                        }
+                                        out.push(IrStreamEvent::BlockDelta {
+                                            index: 0,
+                                            delta: crate::ir::IrDelta::ThinkingDelta(
+                                                text.to_string(),
+                                            ),
+                                        });
+                                        if let Some(sig) = part
+                                            .get("thoughtSignature")
+                                            .and_then(|v| v.as_str())
+                                        {
+                                            out.push(IrStreamEvent::BlockDelta {
+                                                index: 0,
+                                                delta: crate::ir::IrDelta::SignatureDelta(
+                                                    sig.to_string(),
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
                             // Text block. The text block claims the next free IR index BY ORDER OF
-                            // FIRST APPEARANCE (the count of tool blocks already opened), NOT a
-                            // hardcoded 0. A tool that arrives before the first text part takes 0 and
-                            // text takes the next slot, so the two never collide on an index regardless
-                            // of Gemini's part ordering; the index is then stable for the whole stream.
+                            // FIRST APPEARANCE (a thinking block when present owns 0, then the
+                            // count of tool blocks already opened), NOT a hardcoded 0. A tool that
+                            // arrives before the first text part takes the first free slot and
+                            // text takes the next, so blocks never collide on an index regardless
+                            // of Gemini's part ordering; the index is then stable for the stream.
                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                 if !text.is_empty() {
-                                    let ti = state.text_index.unwrap_or(state.open_tools.len());
+                                    let offset = usize::from(state.reasoning_seen);
+                                    let ti = state
+                                        .text_index
+                                        .unwrap_or(offset + state.open_tools.len());
+                                    if state.thinking_block_open {
+                                        state.thinking_block_open = false;
+                                        out.push(IrStreamEvent::BlockStop { index: 0 });
+                                    }
                                     if !state.text_block_open {
                                         state.text_block_open = true;
                                         state.text_index = Some(ti);
@@ -968,8 +1024,9 @@ impl ProtocolReader for GeminiReader {
                                     // text-before-tool → text takes 0, tools take 1.. . Recorded in
                                     // `open_tools` so the finishReason handler emits a matching
                                     // BlockStop for every tool block.
+                                    let offset = usize::from(state.reasoning_seen);
                                     let text_base = usize::from(state.text_index.is_some());
-                                    let ir_idx = text_base + state.open_tools.len();
+                                    let ir_idx = offset + text_base + state.open_tools.len();
                                     state.open_tools.insert(ir_idx);
 
                                     // A zero-arg Gemini `functionCall` either omits `args` or sends
@@ -1082,8 +1139,14 @@ impl ProtocolReader for GeminiReader {
                     stop_reason = crate::ir::IrStopReason::ToolUse;
                 }
 
-                // Close text block first if open, at the index it actually claimed (not a hardcoded
-                // 0 — a tool may have taken 0 ahead of it).
+                // Close a still-open thinking block first (a thinking-only stream never opens a
+                // text block, so the finish path is the only closer).
+                if state.thinking_block_open {
+                    state.thinking_block_open = false;
+                    out.push(IrStreamEvent::BlockStop { index: 0 });
+                }
+                // Close text block next if open, at the index it actually claimed (not a hardcoded
+                // 0 — a thinking block or tool may have taken 0 ahead of it).
                 if state.text_block_open {
                     state.text_block_open = false;
                     let ti = state.text_index.take().unwrap_or(0);

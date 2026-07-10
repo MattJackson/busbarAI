@@ -110,6 +110,15 @@ not a special case.
   operations meter on their natural axis. A pricing engine that turns these units into cost
   is planned for 1.3.
 
+### Fixed
+
+- **Gemini streamed thinking no longer leaks into answer text on cross-protocol streams.**
+  The Gemini stream reader routed `thought: true` parts into the answer text, so a Gemini
+  backend's streamed reasoning was concatenated into the visible reply for every
+  cross-protocol client (the buffered path was already correct). Thought parts now stream
+  as proper thinking blocks (signature included) with balanced block framing on every
+  terminal path. Caught by the new offline streaming-reasoning harness rows.
+
 ## [1.1.1], 2026-07-09
 
 ### Added
