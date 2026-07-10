@@ -41,13 +41,12 @@ mod admin;
 mod auth;
 mod billing;
 mod breaker;
-mod cells;
 mod config;
 mod config_validate;
+mod endpoints;
 mod eventstream;
 mod forward;
 mod governance;
-mod handler;
 mod handlers;
 mod health;
 mod ir;
@@ -59,7 +58,6 @@ mod metrics;
 mod net_guard;
 mod observability;
 mod operation;
-mod ops;
 mod proto;
 mod route;
 mod router;
@@ -983,8 +981,8 @@ fn build_router_with_limits(
     emit_server_timing: bool,
 ) -> Router {
     let router = Router::new()
-        .route("/stats", get(handlers::stats))
-        .route("/healthz", get(handlers::healthz))
+        .route("/stats", get(endpoints::stats))
+        .route("/healthz", get(endpoints::healthz))
         .route("/metrics", get(metrics::handler))
         // virtual-key management API (admin-token guarded in auth_middleware).
         .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
@@ -997,8 +995,8 @@ fn build_router_with_limits(
         // health/metrics/stats above, and the named/adhoc conveniences below.
         // OpenAI list-models: SDKs call `models.list()` first; UIs build pickers from it.
         // Governance-scoped like /stats (restricted keys see only their reachable names).
-        .route("/v1/models", get(handlers::list_models))
-        .route("/v1beta/models", get(handlers::list_models_v1beta))
+        .route("/v1/models", get(endpoints::list_models))
+        .route("/v1beta/models", get(endpoints::list_models_v1beta))
         .route("/{name}/v1/messages", post(route::named))
         .route("/{provider}/{model}/v1/messages", post(route::adhoc))
         // EVERY protocol endpoint — chat and the 1.2 operations, all six dialects — flows through the

@@ -788,7 +788,7 @@ struct FirstByteBody<S, P> {
     /// The operation this response belongs to. Drives whether the non-stream body is buffered for
     /// usage extraction (`taps_nonstream_usage`) and how usage is read from it (`extract_usage`).
     /// Chat reads the egress reader's IR usage; a flat-fee op taps nothing.
-    op: crate::ops::Op,
+    op: crate::handlers::Op,
     /// True when the INGRESS client decodes a binary `application/vnd.amazon.eventstream` body (a
     /// native AWS SDK Bedrock client). A mid-stream error must then be a BINARY exception frame, not
     /// an SSE `event: error` text frame — writing SSE text into a binary eventstream body yields an
@@ -846,7 +846,7 @@ where
         inner: S,
         is_sse: bool,
         ingress_protocol: &str,
-        op: crate::ops::Op,
+        op: crate::handlers::Op,
         permit: P,
         app: Arc<App>,
         lane_idx: usize,
@@ -2202,7 +2202,7 @@ pub(crate) async fn forward_operation(
     pool_name: &str,
     ingress_protocol: &str,
     operation: crate::operation::Operation,
-    cell: &dyn crate::handler::OperationHandler,
+    cell: &dyn crate::handlers::OperationHandler,
     accept: &'static str,
 ) -> Response {
     for wl in &cands {
@@ -2213,7 +2213,7 @@ pub(crate) async fn forward_operation(
         // mistranslation. Same-protocol (egress == ingress) skips straight to verbatim passthrough below.
         let egress_proto = app.lanes[i].protocol.name();
         if egress_proto != ingress_protocol {
-            let egress_rh = crate::cells::request_handler(egress_proto);
+            let egress_rh = crate::handlers::request_handler(egress_proto);
             match egress_rh.and_then(|h| h.operation_handler(operation)) {
                 None => {
                     return ingress_error(
@@ -2254,7 +2254,7 @@ pub(crate) async fn forward_operation(
                     // Routing owns the path: apply the lane override, else ask the EGRESS protocol's
                     // RequestHandler to render it from resolved primitives (never the Lane).
                     let e_path = app.lanes[i].path.clone().unwrap_or_else(|| {
-                        egress_rh.upstream_path(&crate::handler::EgressCtx {
+                        egress_rh.upstream_path(&crate::handlers::EgressCtx {
                             operation,
                             model: app.lanes[i].wire_model(),
                             stream: false,
@@ -2336,9 +2336,9 @@ pub(crate) async fn forward_operation(
         let base = &app.lanes[i].base_url;
         // Same-protocol passthrough: lane override, else this protocol's RequestHandler renders the path.
         let url_path = app.lanes[i].path.clone().unwrap_or_else(|| {
-            crate::cells::request_handler(ingress_protocol)
+            crate::handlers::request_handler(ingress_protocol)
                 .map(|rh| {
-                    rh.upstream_path(&crate::handler::EgressCtx {
+                    rh.upstream_path(&crate::handlers::EgressCtx {
                         operation,
                         model: app.lanes[i].wire_model(),
                         stream: false,
@@ -2419,7 +2419,7 @@ pub(crate) async fn forward_with_pool(
     pool_name: &str,
     affinity_key: Option<&str>,
     ingress_protocol: &str,
-    op: crate::ops::Op,
+    op: crate::handlers::Op,
     usage_sink: Option<UsageSink>,
 ) -> Response {
     let v: Value = match crate::json::parse(&body) {
@@ -2474,8 +2474,8 @@ pub(crate) async fn forward_with_pool_parsed(
     // A request's identity is (operation, protocol): `ingress_protocol` is the wire language,
     // `op` is the kind of work. Everything below is the engine carrying that pair through pool
     // selection, failover, the breaker, and billing. The engine reads only capabilities off the
-    // spec, never its identity; `crate::ops::CHAT` reproduces today's behavior byte-for-byte.
-    op: crate::ops::Op,
+    // spec, never its identity; `crate::handlers::CHAT` reproduces today's behavior byte-for-byte.
+    op: crate::handlers::Op,
     usage_sink: Option<UsageSink>,
 ) -> Response {
     // `v` is the PRISTINE parsed request body (parsed once by the caller). Never mutated after this
@@ -3737,7 +3737,7 @@ async fn handle_exhaustion_for_pool(
     caller_token: Option<&str>,
     request_ctx: &mut RequestCtx,
     ingress_protocol: &str,
-    op: crate::ops::Op,
+    op: crate::handlers::Op,
     usage_sink: Option<UsageSink>,
 ) -> Response {
     // Cycle-guard fix (LOW #22): mark the ORIGINATING pool visited here, BEFORE the mode lookup —
@@ -3848,7 +3848,7 @@ async fn forward_once(
     // a single-flight HalfOpen probe on it, so recording on `""` left the pool cell wedged HalfOpen +
     // `probe_in_flight` forever. An empty `pool` means the lane-default cell (direct/ad-hoc routes).
     pool: &str,
-    op: crate::ops::Op,
+    op: crate::handlers::Op,
     usage_sink: Option<UsageSink>,
 ) -> Result<Response, ()> {
     // Re-parse body for per-lane model rewriting.
@@ -4429,7 +4429,7 @@ async fn handle_fallback_pool(
     pool_name: &str,
     request_ctx: &mut RequestCtx,
     ingress_protocol: &str,
-    op: crate::ops::Op,
+    op: crate::handlers::Op,
     usage_sink: Option<UsageSink>,
 ) -> Response {
     // Deadline propagated across hops.
@@ -4532,7 +4532,7 @@ async fn handle_least_bad(
     request_ctx: &RequestCtx,
     pool: &str,
     ingress_protocol: &str,
-    op: crate::ops::Op,
+    op: crate::handlers::Op,
     usage_sink: Option<UsageSink>,
 ) -> Response {
     let Some(soonest_idx) = find_soonest_cooldown(&app.store, cands, now, pool) else {
@@ -6649,7 +6649,7 @@ mod ingress_indistinguishability_tests {
             "pa",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -6767,7 +6767,7 @@ mod ingress_indistinguishability_tests {
             "pa",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             sink,
         )
         .await;
@@ -6866,7 +6866,7 @@ mod ingress_indistinguishability_tests {
             inner,
             false, // is_sse: same-protocol NON-STREAM application/json
             "openai",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             (),
             app.clone(),
             0,
@@ -6975,7 +6975,7 @@ mod ingress_indistinguishability_tests {
             "pa",
             None,
             "openai",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -7053,7 +7053,7 @@ mod ingress_indistinguishability_tests {
             "pg",
             None,
             "gemini",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -7136,7 +7136,7 @@ mod ingress_indistinguishability_tests {
             "pa",
             None,
             "bedrock",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -7208,7 +7208,7 @@ mod ingress_indistinguishability_tests {
             "pa",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -7282,7 +7282,7 @@ data: {"type":"message_stop"}"#
             "ps",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -7345,7 +7345,7 @@ data: {"type":"message_stop"}"#
             "pc",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -7396,7 +7396,7 @@ data: {"type":"message_stop"}"#
             "missingpool",
             None,
             "openai",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -7479,7 +7479,7 @@ data: {"type":"message_stop"}"#
             "leastbad",
             None,
             "openai",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -7573,7 +7573,7 @@ data: {"type":"message_stop"}"#
             "leastbad",
             None,
             "openai",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -7658,7 +7658,7 @@ data: {"type":"message_stop"}"#
             "leastbad",
             None,
             "bedrock",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -7735,7 +7735,7 @@ data: {"type":"message_stop"}"#
             "pa",
             None,
             "anthropic",
-            crate::ops::CHAT, None,
+            crate::handlers::CHAT, None,
         )
         .await;
 
@@ -7814,7 +7814,7 @@ data: {"type":"message_stop"}"#
             "pa",
             None,
             "anthropic",
-            crate::ops::CHAT, None,
+            crate::handlers::CHAT, None,
         )
         .await;
 
@@ -7869,7 +7869,7 @@ data: {"type":"message_stop"}"#
                 "missingpool",
                 None,
                 ingress,
-                crate::ops::CHAT,
+                crate::handlers::CHAT,
                 None,
             )
             .await;
@@ -7934,7 +7934,7 @@ data: {"type":"message_stop"}"#
             "pb",
             None,
             "bedrock",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -8019,7 +8019,7 @@ data: {"type":"message_stop"}"#
             "pg",
             None,
             "gemini",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -8106,7 +8106,7 @@ data: {"type":"message_stop"}"#
             "leastbad-g",
             None,
             "gemini",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -8192,7 +8192,7 @@ data: {"type":"message_stop"}"#
             "pc",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -8273,7 +8273,7 @@ data: {"type":"message_stop"}"#
             "p",
             None,
             "openai",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -8353,7 +8353,7 @@ data: {"type":"message_stop"}"#
             inner,
             true, // is_sse: streaming path
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             (), // permit: a unit placeholder is sufficient for the Stream bounds
             app.clone(),
             0,
@@ -8446,7 +8446,7 @@ data: {"type":"message_stop"}"#
             inner,
             false, // is_sse: NON-streaming same-protocol passthrough (application/json)
             "openai",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             (), // permit placeholder
             app.clone(),
             0,
@@ -8592,7 +8592,7 @@ data: {"type":"message_stop"}"#
             inner,
             true, // is_sse: streaming cross-protocol path
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             (),
             app.clone(),
             0,
@@ -8704,7 +8704,7 @@ data: {"type":"message_stop"}"#
                 inner,
                 true,
                 "anthropic",
-                crate::ops::CHAT,
+                crate::handlers::CHAT,
                 (),
                 app.clone(),
                 0,
@@ -8809,7 +8809,7 @@ data: {"type":"message_stop"}"#
                 inner,
                 true,
                 "anthropic",
-                crate::ops::CHAT,
+                crate::handlers::CHAT,
                 (),
                 app.clone(),
                 0,
@@ -8915,7 +8915,7 @@ mod forward_once_pool_cell_tests {
             "primary",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -8983,7 +8983,7 @@ mod forward_once_pool_cell_tests {
             "primary",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -9066,7 +9066,7 @@ mod forward_once_pool_cell_tests {
             "primary",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -9177,7 +9177,7 @@ mod forward_once_pool_cell_tests {
             "A",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;

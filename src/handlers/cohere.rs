@@ -4,7 +4,7 @@
 //! Cohere `RequestHandler` + cells (design §6/§7). Embeddings via `/v2/embed`.
 #![allow(dead_code)]
 
-use crate::handler::{
+use crate::handlers::{
     CodecError, EgressCtx, IngressReject, OperationHandler, RequestHandler, WireBody,
 };
 use crate::ir::embeddings::{EmbInput, EmbeddingItem, EmbeddingsResp, EncFmt, VectorData};
@@ -23,7 +23,7 @@ impl RequestHandler for CohereRequestHandler {
     fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler> {
         match op {
             Operation::Embeddings => Some(&EMB),
-            Operation::Chat => Some(&crate::cells::chat::CHAT_HANDLER),
+            Operation::Chat => Some(&crate::handlers::chat::CHAT_HANDLER),
             _ => None,
         }
     }

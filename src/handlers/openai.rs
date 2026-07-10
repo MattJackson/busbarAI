@@ -9,7 +9,7 @@
 //! added here as they're built.
 #![allow(dead_code)]
 
-use crate::handler::{
+use crate::handlers::{
     CodecError, EgressCtx, IngressReject, OperationHandler, RequestHandler, WireBody,
 };
 use crate::ir::moderation::{ModerationInput, ModerationReq, ModerationResp, ModerationResult};
@@ -38,7 +38,7 @@ impl RequestHandler for OpenAiRequestHandler {
             Operation::Image => Some(&IMAGE),
             Operation::Transcription => Some(&TRANSCRIPTION),
             Operation::Speech => Some(&SPEECH),
-            Operation::Chat => Some(&crate::cells::chat::CHAT_HANDLER),
+            Operation::Chat => Some(&crate::handlers::chat::CHAT_HANDLER),
         }
     }
     fn upstream_path(&self, ctx: &EgressCtx) -> String {

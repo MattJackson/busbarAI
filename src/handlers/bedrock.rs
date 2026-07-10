@@ -4,7 +4,7 @@
 //! Bedrock `RequestHandler` + cells (design §6/§7). Embeddings first (Titan, via InvokeModel).
 #![allow(dead_code)]
 
-use crate::handler::{
+use crate::handlers::{
     CodecError, EgressCtx, IngressReject, OperationHandler, RequestHandler, WireBody,
 };
 use crate::ir::embeddings::{EmbInput, EmbeddingItem, EmbeddingsResp, EncFmt, VectorData};
@@ -25,7 +25,7 @@ impl RequestHandler for BedrockRequestHandler {
         match op {
             Operation::Embeddings => Some(&EMB),
             Operation::Image => Some(&IMG),
-            Operation::Chat => Some(&crate::cells::chat::CHAT_HANDLER),
+            Operation::Chat => Some(&crate::handlers::chat::CHAT_HANDLER),
             _ => None, // genuine gaps stay None → no-cell 404
         }
     }

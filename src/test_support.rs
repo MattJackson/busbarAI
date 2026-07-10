@@ -771,7 +771,7 @@ mod tests {
             "",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             usage_sink,
         )
         .await
@@ -955,7 +955,7 @@ mod tests {
             "pa",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -1232,7 +1232,7 @@ mod tests {
                 "pc",
                 None,
                 "anthropic",
-                crate::ops::CHAT,
+                crate::handlers::CHAT,
                 None,
             )
             .await;
@@ -1249,7 +1249,7 @@ mod tests {
             "pc",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -1350,7 +1350,7 @@ mod tests {
                 "pe",
                 None,
                 "anthropic",
-                crate::ops::CHAT,
+                crate::handlers::CHAT,
                 None,
             )
             .await;
@@ -4038,7 +4038,7 @@ mod tests {
             "leastbad",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -4112,7 +4112,7 @@ mod tests {
             "leastbad",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -4173,7 +4173,7 @@ mod tests {
             "p",
             None,
             "openai",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -4247,7 +4247,7 @@ mod tests {
                 "leastbad",
                 None,
                 "anthropic",
-                crate::ops::CHAT,
+                crate::handlers::CHAT,
                 None,
             )
             .await;
@@ -4338,7 +4338,7 @@ mod tests {
             "pool_a",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -4414,7 +4414,7 @@ mod tests {
             "primary",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -4491,7 +4491,7 @@ mod tests {
             "sticky-test",
             Some("session-abc"),
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -4514,7 +4514,7 @@ mod tests {
             "sticky-test",
             Some("session-abc"),
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -4543,7 +4543,7 @@ mod tests {
             "sticky-test",
             Some("session-xyz"),
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -4652,7 +4652,7 @@ mod tests {
             "failover-test",
             Some("session-abc"),
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -4827,7 +4827,7 @@ mod tests {
             "system-test",
             None, // No header - should derive from system block
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -4849,7 +4849,7 @@ mod tests {
             "system-test",
             None, // No header - should derive from system block
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -5170,7 +5170,7 @@ mod tests {
             "m",
             None,
             "openai",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -5412,7 +5412,7 @@ mod tests {
             "m",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -5457,7 +5457,7 @@ mod tests {
             "m",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -5527,7 +5527,7 @@ mod tests {
             "m",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -5872,7 +5872,7 @@ mod tests {
             "default",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;
@@ -5931,7 +5931,7 @@ mod tests {
             "default",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::handlers::CHAT,
             None,
         )
         .await;

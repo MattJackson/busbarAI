@@ -736,7 +736,7 @@ async fn forward_resolved(
             model,
             affinity_key,
             proto,
-            crate::ops::chat(proto),
+            crate::handlers::chat(proto),
             usage_sink(app, gov, charged_at),
         )
         .await;
@@ -766,7 +766,7 @@ async fn forward_resolved(
             "",
             None,
             proto,
-            crate::ops::chat(proto),
+            crate::handlers::chat(proto),
             usage_sink(app, gov, charged_at),
         )
         .await;
@@ -851,7 +851,7 @@ async fn operation_ingress(
     let started = Instant::now();
     let charged_at = crate::store::now();
 
-    let Some(rh) = crate::cells::request_handler(proto) else {
+    let Some(rh) = crate::handlers::request_handler(proto) else {
         return finish_rejected(
             app,
             gov,
@@ -1029,7 +1029,7 @@ pub(crate) async fn protocol_dispatch(
         }
         "bedrock" => {
             // axum's Path extractor percent-decoded {model_id} before the collapse; match it.
-            let model = crate::cells::request_handler("bedrock")
+            let model = crate::handlers::request_handler("bedrock")
                 .and_then(|rh| rh.path_model(&path))
                 .map(|m| crate::observability::percent_decode(&m))
                 .unwrap_or_default();
@@ -1078,7 +1078,7 @@ pub(crate) async fn protocol_dispatch(
         // Anthropic SDK pointed at busbar root works like every other dialect; the named/adhoc
         // prefix routes remain for URL-pinned model selection.)
         _ => {
-            let op = crate::cells::request_handler(proto)
+            let op = crate::handlers::request_handler(proto)
                 .and_then(|rh| rh.resolve_operation(&path, &body));
             match op {
                 Some(crate::operation::Operation::Chat) => match proto {
@@ -1140,7 +1140,7 @@ pub(crate) async fn bedrock_invoke(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(operation) = crate::cells::request_handler("bedrock")
+    let Some(operation) = crate::handlers::request_handler("bedrock")
         .and_then(|rh| rh.resolve_operation(uri.path(), &body))
     else {
         return ingress_error(
@@ -1294,7 +1294,7 @@ pub(crate) async fn gemini_ingress(
     // to say "this is embeddings / image / audio / chat" (design: Router picks the protocol; the
     // RequestHandler decides the operation and hands off to its OperationHandler). Chat falls
     // through to the existing streaming chat path below.
-    if let Some(op) = crate::cells::request_handler("gemini")
+    if let Some(op) = crate::handlers::request_handler("gemini")
         .and_then(|rh| rh.resolve_operation(uri.path(), &body))
         .filter(|op| *op != crate::operation::Operation::Chat)
     {
@@ -1571,7 +1571,7 @@ pub(crate) async fn named(
             &name,
             affinity_key,
             "anthropic",
-            crate::ops::chat("anthropic"),
+            crate::handlers::chat("anthropic"),
             usage_sink(&app, &gov, charged_at),
         )
         .await;
@@ -1588,7 +1588,7 @@ pub(crate) async fn named(
             "",
             None,
             "anthropic",
-            crate::ops::chat("anthropic"),
+            crate::handlers::chat("anthropic"),
             usage_sink(&app, &gov, charged_at),
         )
         .await;
@@ -1651,7 +1651,7 @@ pub(crate) async fn adhoc(
                 "",
                 None,
                 "anthropic",
-                crate::ops::chat("anthropic"),
+                crate::handlers::chat("anthropic"),
                 usage_sink(&app, &gov, charged_at),
             )
             .await;

@@ -181,7 +181,7 @@ mod tests {
         ];
         for (path, headers, expect) in cases {
             let got = protocol_id(path, &hm(headers)).and_then(|proto| {
-                crate::cells::request_handler(proto)
+                crate::handlers::request_handler(proto)
                     .and_then(|rh| rh.resolve_operation(path, b""))
                     .map(|op| (proto, op))
             });
@@ -207,7 +207,7 @@ mod tests {
         for (path, body, (want_proto, want_op)) in body_cases {
             let proto = protocol_id(path, &hm(&[])).expect(path);
             assert_eq!(proto, *want_proto, "protocol for {path:?}");
-            let op = crate::cells::request_handler(proto)
+            let op = crate::handlers::request_handler(proto)
                 .and_then(|rh| rh.resolve_operation(path, body))
                 .expect(path);
             assert_eq!(op, *want_op, "operation for {path:?} with body");

@@ -17,7 +17,7 @@
 //! through the non-stream bridge.
 #![allow(dead_code)]
 
-use crate::handler::{CodecError, IngressReject, OperationHandler, WireBody};
+use crate::handlers::{CodecError, IngressReject, OperationHandler, WireBody};
 use crate::ir::variant::{IrReq, IrResp};
 use crate::ir::IrUsage;
 use crate::proto::ProtocolWriter;
@@ -28,7 +28,7 @@ use serde_json::Value;
 pub(crate) struct ChatHandler;
 
 /// The shared handle every protocol's `RequestHandler` returns for `Operation::Chat`, and the cell
-/// behind `crate::ops::CHAT`.
+/// behind `crate::handlers::CHAT`.
 pub(crate) static CHAT_HANDLER: ChatHandler = ChatHandler;
 
 impl OperationHandler for ChatHandler {

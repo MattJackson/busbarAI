@@ -5,7 +5,7 @@
 //! operations stay `None` = no-cell 404. Chat dispatches through the same registry as every op.
 #![allow(dead_code)]
 
-use crate::handler::{EgressCtx, OperationHandler, RequestHandler};
+use crate::handlers::{EgressCtx, OperationHandler, RequestHandler};
 use crate::operation::Operation;
 
 pub(crate) struct ResponsesRequestHandler;
@@ -16,7 +16,7 @@ impl RequestHandler for ResponsesRequestHandler {
     }
     fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler> {
         match op {
-            Operation::Chat => Some(&crate::cells::chat::CHAT_HANDLER),
+            Operation::Chat => Some(&crate::handlers::chat::CHAT_HANDLER),
             _ => None,
         }
     }

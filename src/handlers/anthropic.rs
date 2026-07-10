@@ -6,7 +6,7 @@
 //! every other operation.
 #![allow(dead_code)]
 
-use crate::handler::{EgressCtx, OperationHandler, RequestHandler};
+use crate::handlers::{EgressCtx, OperationHandler, RequestHandler};
 use crate::operation::Operation;
 
 pub(crate) struct AnthropicRequestHandler;
@@ -17,7 +17,7 @@ impl RequestHandler for AnthropicRequestHandler {
     }
     fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler> {
         match op {
-            Operation::Chat => Some(&crate::cells::chat::CHAT_HANDLER),
+            Operation::Chat => Some(&crate::handlers::chat::CHAT_HANDLER),
             _ => None, // no embeddings/images/audio → no-cell 404 in the caller's dialect
         }
     }

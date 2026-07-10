@@ -1,21 +1,90 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! The `RequestHandler` and `OperationHandler` trait contracts (design-operations-oop.md §6).
+//! The protocol handlers — the design's middle, in one module (design-operations-oop.md §6/§7):
 //!
-//! NOT to be confused with `handlers.rs` (the axum route functions). Per the design these live under
-//! `handlers/request/`; consolidating the physical layout is deferred (a minor, cosmetic move) — the
-//! contracts and their behavior are what matter for correctness.
+//! `Router → RequestHandler → OperationHandler → IR`
 //!
+//! - [`RequestHandler`] — ONE per protocol (`openai.rs`, `anthropic.rs`, …). Dumb and
+//!   protocol-specific: reads path+body to decide WHICH operation a request asks for
+//!   (`resolve_operation`), owns the `(protocol, operation) → path template` (`upstream_path`), and
+//!   holds its row of the support matrix (`operation_handler`; `None` = the no-cell 404).
 //! - [`OperationHandler`] — ONE per (protocol × operation) cell. A pure codec: wire ↔ IR, both
-//!   directions. It never routes, fails over, checks auth, bills, or knows another protocol exists.
-//!   Stateless and unit-testable in isolation. The cell exists iff its protocol serves its operation
-//!   (§3): an absent cell IS the no-cell 404.
-//! - [`RequestHandler`] — ONE per protocol. Owns the dialect and holds its operation cells (its row of
-//!   the support matrix). `operation_handler(op) == None` is the no-cell 404 site.
+//!   directions, plus the operation-capability surface the engine reads. It never routes, fails
+//!   over, checks auth, bills, or knows another protocol exists.
+//! - [`OpDispatch`] — the thin `(operation, cell)` handle the streaming engine threads; no behavior
+//!   of its own. [`request_handler`] is the registry the catch-all dispatch resolves through.
 //!
-//! Foundation contracts; `dead_code` allowed until the Router/seam wiring consumes them (P3/P4).
+//! Adding a protocol: a Router ID line, a `RequestHandler` impl here, its cells. Adding an
+//! operation: a cell + a line in each `RequestHandler` that speaks it. Nothing else moves.
 #![allow(dead_code)]
+
+pub(crate) mod anthropic;
+pub(crate) mod bedrock;
+pub(crate) mod chat;
+pub(crate) mod cohere;
+pub(crate) mod gemini;
+pub(crate) mod openai;
+pub(crate) mod responses;
+
+static OPENAI: openai::OpenAiRequestHandler = openai::OpenAiRequestHandler;
+static BEDROCK: bedrock::BedrockRequestHandler = bedrock::BedrockRequestHandler;
+static COHERE: cohere::CohereRequestHandler = cohere::CohereRequestHandler;
+static GEMINI: gemini::GeminiRequestHandler = gemini::GeminiRequestHandler;
+static ANTHROPIC: anthropic::AnthropicRequestHandler = anthropic::AnthropicRequestHandler;
+static RESPONSES: responses::ResponsesRequestHandler = responses::ResponsesRequestHandler;
+
+/// The protocol's `RequestHandler`, by name (matches `router` / `proto::Protocol::name()`). All six
+/// protocols are registered (every one speaks chat); a registered handler may still return `None`
+/// from `operation_handler` for an op it lacks — that IS the no-cell 404.
+pub(crate) fn request_handler(protocol: &str) -> Option<&'static dyn RequestHandler> {
+    match protocol {
+        "openai" => Some(&OPENAI),
+        "bedrock" => Some(&BEDROCK),
+        "cohere" => Some(&COHERE),
+        "gemini" => Some(&GEMINI),
+        "anthropic" => Some(&ANTHROPIC),
+        "responses" => Some(&RESPONSES),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use crate::operation::Operation;
+
+    #[test]
+    fn registry_resolves_openai_and_its_moderation_cell() {
+        let h = request_handler("openai").expect("openai handler registered");
+        assert_eq!(h.protocol_name(), "openai");
+        assert!(h.operation_handler(Operation::Moderation).is_some());
+        assert!(
+            request_handler("zzz-unknown").is_none(),
+            "unknown protocol → None"
+        );
+    }
+
+    #[test]
+    fn every_protocol_serves_chat_via_its_request_handler() {
+        // Chat is operation #1, reached through the SAME registry as every other op. All six
+        // protocols resolve a handler and a chat cell — the unified dispatch, no special path.
+        for proto in [
+            "openai",
+            "anthropic",
+            "gemini",
+            "bedrock",
+            "cohere",
+            "responses",
+        ] {
+            let h = request_handler(proto).expect("protocol registered");
+            assert!(
+                h.operation_handler(Operation::Chat).is_some(),
+                "{proto} must serve chat via operation_handler(Chat)"
+            );
+        }
+    }
+}
 
 use crate::ir::variant::{IrReq, IrResp};
 use crate::ir::IrUsage;
@@ -163,7 +232,7 @@ pub(crate) trait RequestHandler: Send + Sync {
 }
 
 #[cfg(test)]
-mod tests {
+mod contract_tests {
     use super::*;
 
     // A trivial cell + handler prove the trait objects are object-safe and the no-cell lookup works.
@@ -231,5 +300,138 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+
+use crate::state::Lane;
+
+/// A `(operation, cell)` dispatch handle, threaded through the forward engine by value (`Copy`). The
+/// engine reads operation behavior off it without ever naming an operation.
+#[derive(Clone, Copy)]
+pub(crate) struct OpDispatch {
+    pub(crate) operation: Operation,
+    pub(crate) cell: &'static dyn OperationHandler,
+}
+
+/// The engine's operation handle. (Kept as `Op` so the engine's signatures read unchanged.)
+pub(crate) type Op = OpDispatch;
+
+impl OpDispatch {
+    /// Stable identifier — a bounded metric label / tracing span field. VALUE use only; the engine
+    /// must never compare or `match` on it (that would be an operation-identity branch).
+    pub(crate) fn name(&self) -> &'static str {
+        self.operation.name()
+    }
+    pub(crate) fn streaming(&self) -> bool {
+        self.cell.streaming()
+    }
+    pub(crate) fn wants_stream(&self, body: &Value) -> bool {
+        self.cell.wants_stream(body)
+    }
+    pub(crate) fn body_affinity_key<'a>(&self, body: &'a Value) -> Option<&'a str> {
+        self.cell.body_affinity_key(body)
+    }
+    pub(crate) fn taps_nonstream_usage(&self) -> bool {
+        self.cell.taps_usage()
+    }
+    pub(crate) fn extract_usage(&self, ingress_protocol: &str, body: &[u8]) -> Option<IrUsage> {
+        self.cell.extract_usage(ingress_protocol, body)
+    }
+    pub(crate) fn egress_accept(
+        &self,
+        writer: &dyn ProtocolWriter,
+        wants_stream: bool,
+    ) -> &'static str {
+        self.cell.egress_accept(writer, wants_stream)
+    }
+    /// The (protocol × operation) upstream path: lane override, else the lane's protocol
+    /// `RequestHandler` renders it from resolved primitives (never the `Lane`). `None` only if the
+    /// protocol has no registered handler — impossible for chat (all six are registered).
+    pub(crate) fn upstream_path(&self, lane: &Lane, wants_stream: bool) -> Option<String> {
+        if let Some(p) = &lane.path {
+            return Some(p.clone());
+        }
+        crate::handlers::request_handler(lane.protocol.name()).map(|rh| {
+            rh.upstream_path(&EgressCtx {
+                operation: self.operation,
+                model: lane.wire_model(),
+                stream: wants_stream,
+            })
+        })
+    }
+}
+
+/// Chat — operation #1. A const handle to the shared chat cell, for tests and as the resolver's
+/// fallback. Prefer [`chat`] on the request path so the RequestHandler actually decides the cell.
+pub(crate) const CHAT: Op = OpDispatch {
+    operation: Operation::Chat,
+    cell: &crate::handlers::chat::CHAT_HANDLER,
+};
+
+/// Resolve the chat dispatch THROUGH the registry — the same path every other operation takes:
+/// `request_handler(protocol).operation_handler(Chat)`. This is how "the RequestHandler decides which
+/// OperationHandler handles the request" is honored for chat too, not just the JSON ops. Every protocol
+/// is registered and serves chat, so the fallback is unreachable (kept for total-safety, not behavior).
+pub(crate) fn chat(protocol: &str) -> Op {
+    crate::handlers::request_handler(protocol)
+        .and_then(|rh| rh.operation_handler(Operation::Chat))
+        .map(|cell| OpDispatch {
+            operation: Operation::Chat,
+            cell,
+        })
+        .unwrap_or(CHAT)
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn chat_declares_its_capabilities() {
+        let chat = CHAT;
+        assert_eq!(chat.name(), "chat");
+        assert!(chat.streaming(), "chat streams");
+        assert!(
+            chat.taps_nonstream_usage(),
+            "chat bills tokens from the body"
+        );
+        assert!(
+            chat.wants_stream(&serde_json::json!({"stream": true})),
+            "chat reads the stream boolean"
+        );
+        assert!(!chat.wants_stream(&serde_json::json!({})));
+        assert_eq!(
+            chat.body_affinity_key(&serde_json::json!({"system": "you are helpful"})),
+            Some("you are helpful")
+        );
+        assert_eq!(
+            chat.body_affinity_key(&serde_json::json!({"system": ""})),
+            None
+        );
+    }
+
+    /// The load-bearing invariant of the operations axis: the forward engine branches on the
+    /// *capabilities* a cell declares, never on an operation's *identity*. If someone adds
+    /// `if op.name() == "embeddings"` or `match op.name() { ... }` to the engine, chat stops being
+    /// just operation #1 and the "add an operation without touching the engine" property is lost.
+    /// (`op.name()` used as a value — a tracing span field — is fine; only comparisons/matches are
+    /// forbidden.)
+    #[test]
+    fn engine_never_branches_on_operation_identity() {
+        let engine = include_str!("../forward.rs");
+        let forbidden = [
+            "op.name() ==",
+            "op.name()==",
+            "== op.name()",
+            "==op.name()",
+            "match op.name()",
+        ];
+        for pat in forbidden {
+            assert!(
+                !engine.contains(pat),
+                "src/forward.rs contains a forbidden operation-identity branch (`{pat}`). The \
+                 engine must read capabilities off the cell, never branch on op.name()."
+            );
+        }
     }
 }

@@ -4,7 +4,7 @@
 //! Gemini `RequestHandler` + cells (design §6/§7). Embeddings via `models/{id}:embedContent`.
 #![allow(dead_code)]
 
-use crate::handler::{
+use crate::handlers::{
     CodecError, EgressCtx, IngressReject, OperationHandler, RequestHandler, WireBody,
 };
 use crate::ir::audio::{SpeechResp, TranscriptionResp};
@@ -31,7 +31,7 @@ impl RequestHandler for GeminiRequestHandler {
             Operation::Image => Some(&IMG),
             Operation::Transcription => Some(&TRANSCRIPTION),
             Operation::Speech => Some(&SPEECH),
-            Operation::Chat => Some(&crate::cells::chat::CHAT_HANDLER),
+            Operation::Chat => Some(&crate::handlers::chat::CHAT_HANDLER),
             _ => None,
         }
     }
