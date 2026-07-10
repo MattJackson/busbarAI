@@ -906,7 +906,7 @@ async fn operation_ingress(
         _ => "application/json",
     };
     let resp = crate::forward::forward_operation(
-        app.clone(), cands, body, req_ct, caller_token, pool_name, proto, cell, accept,
+        app.clone(), cands, body, req_ct, caller_token, pool_name, proto, operation, cell, accept,
     )
     .await;
     finish(app, gov, proto, &model, started, charged_at, resp)

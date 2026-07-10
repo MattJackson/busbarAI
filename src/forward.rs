@@ -2159,11 +2159,37 @@ pub(crate) async fn forward_operation(
     caller_token: Option<&str>,
     pool_name: &str,
     ingress_protocol: &str,
+    operation: crate::operation::Operation,
     cell: &dyn crate::handler::OperationHandler,
     accept: &'static str,
 ) -> Response {
     for wl in &cands {
         let i = wl.idx;
+        // Egress dimension (design §3): if the egress lane speaks a DIFFERENT protocol, it must have a
+        // cell for this operation. No cell → no-cell 404 in the CALLER's dialect (e.g. images→anthropic).
+        // A cell present but no cross-protocol IR bridge yet → fail LOUD (501), never a silent
+        // mistranslation. Same-protocol (egress == ingress) skips straight to verbatim passthrough below.
+        let egress_proto = app.lanes[i].protocol.name();
+        if egress_proto != ingress_protocol {
+            match crate::cells::request_handler(egress_proto).and_then(|h| h.operation_handler(operation)) {
+                None => {
+                    return ingress_error(
+                        ingress_protocol,
+                        StatusCode::NOT_FOUND,
+                        KIND_NOT_FOUND,
+                        "This model does not support that operation.",
+                    );
+                }
+                Some(_egress_cell) => {
+                    return ingress_error(
+                        ingress_protocol,
+                        StatusCode::NOT_IMPLEMENTED,
+                        KIND_API_ERROR,
+                        "Cross-protocol translation for this operation is not yet available.",
+                    );
+                }
+            }
+        }
         // Concurrency permit; a busy/cooling lane yields None → try the next candidate.
         let Some(_permit) = app.store.try_acquire(i) else {
             continue;
