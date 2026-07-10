@@ -10,7 +10,7 @@ const DATA = catalog.providers;
 ---
 
 <PageLayout
-  title="Config builder — Busbar"
+  title="Config builder · Busbar"
   description="Pick your models, get a working Busbar config.yaml: providers, pools with weights and failover, env vars, and the run command."
 >
   <p class="kicker">Config builder</p>
@@ -24,7 +24,7 @@ const DATA = catalog.providers;
   <div class="cb">
     <div class="cb-pick">
       <div class="cb-searchrow">
-        <input id="cb-search" type="search" placeholder="Model name — try kimi, glm, sonnet, llama…" autocomplete="off" />
+        <input id="cb-search" type="search" placeholder="Model name: try kimi, glm, sonnet, llama…" autocomplete="off" />
         <div class="cb-filterwrap">
           <input id="cb-filter" type="search" placeholder="Provider (optional)" autocomplete="off" />
           <div id="cb-filter-results" class="cb-results cb-overlay" hidden></div>
@@ -33,7 +33,7 @@ const DATA = catalog.providers;
       <div id="cb-results" class="cb-results" hidden></div>
 
       <details class="cb-manual">
-        <summary>Or add any model id by hand — including a custom endpoint</summary>
+        <summary>Or add any model id by hand, including a custom endpoint</summary>
         <div class="cb-manual-row">
           <select id="cb-prov"></select>
           <input id="cb-model" type="text" placeholder="model id, e.g. my-fine-tune-v2" />

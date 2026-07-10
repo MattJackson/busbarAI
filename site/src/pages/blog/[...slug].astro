@@ -10,7 +10,9 @@ export async function getStaticPaths() {
 const { post } = Astro.props;
 const { Content } = await render(post);
 const fmt = (d: Date) =>
-  d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  // timeZone: 'UTC' — frontmatter `date: YYYY-MM-DD` parses as UTC midnight; without it a
+  // build machine west of UTC renders every post one day early.
+  d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
 ---
 
 <BlogLayout

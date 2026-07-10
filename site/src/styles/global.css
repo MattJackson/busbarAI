@@ -8,6 +8,37 @@
  *   3. Add a body overflow-x guard as a last-resort safety net.
  */
 
+/* BRAND ACCENT: replace Starlight's default purple/indigo accent with the Busbar
+   palette (deep green #4d7c0f, lime #a3e635, ink #0f172a) in BOTH color schemes.
+   Starlight derives links, the active sidebar item, "On this page" highlights,
+   focus rings, badges, and the Pagefind search accent from these three tokens,
+   so overriding them here removes the default purple everywhere at once.
+   Starlight defines dark-mode values on :root and light-mode values on
+   [data-theme='light']; we mirror that structure. */
+:root {
+  /* dark mode */
+  --sl-color-accent-low: #1e2a12;   /* dark lime-tinted surface (current page pill, banners) */
+  --sl-color-accent: #4d7c0f;       /* brand deep green */
+  --sl-color-accent-high: #bef264;  /* light lime text/icons on dark */
+}
+:root[data-theme='light'] {
+  --sl-color-accent-low: #ecfccb;   /* lime-100 surface */
+  --sl-color-accent: #4d7c0f;       /* brand deep green (links, active states) */
+  --sl-color-accent-high: #35510b;  /* deep green text on light */
+}
+
+/* SITE TITLE: Starlight colors the header wordmark with the accent; the brand
+   lockup is the glyph-in-ink-circle logo plus an ink wordmark (matching the
+   marketing nav, which uses #0f172a). Dark mode keeps the wordmark light via
+   Starlight's flipped white token. */
+.site-title {
+  color: var(--sl-color-white);
+  font-weight: 700;
+}
+:root[data-theme='light'] .site-title {
+  color: #0f172a;
+}
+
 /* Table overflow, wrap every markdown/Starlight table in a scrollable container.
    Starlight renders tables as plain <table> inside .sl-markdown-content.
    We use a display trick: tables become block-level with overflow scroll applied
@@ -34,6 +65,26 @@
   body {
     overflow-x: hidden;
   }
+}
+
+/* Inline code inside HEADINGS (reference docs use `key`-style H2-H5 everywhere,
+   e.g. configuration.md's "### `models`"). Starlight's default inline-code pill
+   (grey background, padding, own font-size) reads fine in body text but looks
+   oversized and mismatched at heading scale. Inside a heading we keep the mono
+   family so it still reads as code, but size it relative to the heading, inherit
+   the heading's weight, and drop the pill so it sits on the heading's line. Body
+   text and table-cell inline code are untouched (selector is heading-scoped). */
+.sl-markdown-content h1 code,
+.sl-markdown-content h2 code,
+.sl-markdown-content h3 code,
+.sl-markdown-content h4 code,
+.sl-markdown-content h5 code {
+  font-size: 0.85em;
+  font-weight: inherit;
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
 }
 
 /* Changelog: date on its own line beneath the version, small and muted. */

@@ -9,37 +9,37 @@ import Nav from '../components/Nav.astro';
 import Analytics from '../components/Analytics.astro';
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
-const DOCS = '/docs/why-busbar/';
 
 const ORG = { '@context': 'https://schema.org', '@type': 'Organization', name: 'Busbar', url: 'https://getbusbar.com', logo: 'https://getbusbar.com/favicon.svg', sameAs: ['https://github.com/MattJackson/busbarAI'] };
 const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'Busbar', url: 'https://getbusbar.com' };
-const SOFTWARE = { '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Busbar', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows', offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }, url: 'https://getbusbar.com', description: 'Your AI control plane: a single self-hosted Rust binary between your applications and every AI provider — lossless cross-protocol translation, fault-attributed circuit breaking, and in-flight streaming-safe failover, running in your own infrastructure.' };
+const SOFTWARE = { '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Busbar', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows', offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }, url: 'https://getbusbar.com', description: 'Your AI Control Plane: a single self-hosted Rust binary between your applications and every AI provider, with lossless cross-protocol translation, fault-attributed circuit breaking, and in-flight streaming-safe failover, running in your own infrastructure.' };
 
 const protocols = ['OpenAI', 'Anthropic', 'Gemini', 'Bedrock', 'Cohere', 'Responses'];
+const capabilities = ['Chat', 'Embeddings', 'Images', 'Audio', 'Moderations'];
 
 const features = [
   {
-    title: 'Lossless cross-protocol translation',
+    title: 'Translate: lossless across six protocols',
     body: 'Six wire protocols, native on both sides, bridged through one internal format rich enough to hold every protocol’s features. Anthropic thinking blocks, structured-output schemas, and Bedrock tool use survive the hop. Nothing gets flattened to OpenAI shape.',
     enables: 'Point whatever SDK your code already speaks at one URL, and reach every model through it.',
   },
   {
-    title: 'Fault-aware failover & circuit breaking',
+    title: 'Failover: fault-aware, with circuit breaking',
     body: 'A circuit breaker on every provider lane knows whose fault each failure was (a provider outage, your bad request, a context overflow, a revoked key) and treats each one differently instead of retrying into a wall. A failed lane reroutes mid-flight, before your client sees a single byte.',
     enables: 'A flaky provider is pulled and probed back gently; a rate-limit storm on one lane never starves the healthy ones.',
   },
   {
-    title: 'A programmable request path',
+    title: 'Route: a programmable request path',
     body: 'Routing is the first hook. Pick a built-in policy (weighted, cheapest, fastest, least_busy, usage) or bring your own as a webhook in any language, or as a sandboxed Rhai script. Policies see each member’s cost, latency, live concurrency, budget, and rate headroom. A slow or broken hook falls back; it never blocks a request.',
     enables: 'The same fail-safe machinery is built to carry PII-steering, audit, and guardrails: your own logic on the request path, in any language.',
   },
   {
-    title: 'Governance & hard budget caps',
+    title: 'Governance: virtual keys & hard budget caps',
     body: 'Issue virtual keys with daily, monthly, or all-time spend caps and per-key RPM/TPM limits. A request that would break its cap is rejected before it is forwarded: the budget check and the charge are one atomic operation, so a concurrent burst can’t race past the limit. Scope keys to pools, revoke instantly, query spend via the admin API.',
     enables: 'Budgets enforced before the request runs, not discovered on the invoice.',
   },
   {
-    title: 'Native TLS & mutual TLS',
+    title: 'Security: native TLS & mutual TLS',
     body: 'Busbar terminates TLS itself (cert and key in config, no reverse proxy required). Turn on mTLS and a client must present a certificate signed by your CA; anyone without one is rejected at the handshake, before any bearer-token check is reached.',
     enables: 'Zero-trust ingress without standing up a service mesh.',
   },
@@ -58,19 +58,123 @@ const trust = [
 ];
 
 // Code blocks rendered via set:html so literal { } braces aren't parsed as Astro expressions.
-const heroCode = `<span class="cm"># Already speak OpenAI? Just swap the base URL.</span>
-<span class="del">- client = OpenAI(api_key=OPENAI_KEY)</span>
-<span class="add">+ client = OpenAI(</span>
-<span class="add">+     api_key=BUSBAR_TOKEN,</span>
-<span class="add">+     base_url=<span class="str">"http://busbar:8080"</span>,</span>
-<span class="add">+ )</span>
+// The adopt section rotates through the six wire protocols busbar speaks. Snippets are
+// authored as plain text and highlighted by `hl` (diff lines, comments, strings) into the
+// same span classes (.cm/.del/.add/.str) the code card has always used.
+const hl = (src: string) =>
+  src
+    .split('\n')
+    .map((line) => {
+      const esc = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const t = esc.trimStart();
+      if (t.startsWith('#')) return `<span class="cm">${esc}</span>`;
+      const str = esc.replace(/"([^"]*)"/g, '<span class="str">"$1"</span>');
+      if (t.startsWith('-')) return `<span class="del">${str}</span>`;
+      if (t.startsWith('+')) return `<span class="add">${str}</span>`;
+      return str;
+    })
+    .join('\n');
 
-  <span class="cm"># "fast" = a pool you define in config:</span>
-  <span class="cm"># 80% Claude / 20% GPT-4o, Gemini on failover.</span>
+// One slide per protocol. The "served by" provider varies so every slide shows a
+// different cross-protocol pair. All snippets are the real SDK's two-line swap.
+const adoptSlides = [
+  {
+    copy: `Already speak <strong class="adopt-proto">OpenAI</strong>? Point the SDK at busbar and pick a pool by name. The request, left as OpenAI, may have been served by Anthropic and came back as OpenAI, translated both ways.`,
+    code: hl(`# Already speak OpenAI? Just swap the base URL.
+- client = OpenAI(api_key=OPENAI_KEY)
++ client = OpenAI(
++     api_key=BUSBAR_TOKEN,
++     base_url="http://busbar:8080",
++ )
+
+  # "fast" = a pool you define in config:
+  # 80% Claude / 20% GPT-4o, Gemini on failover.
   client.chat.completions.create(
-      model=<span class="str">"fast"</span>,
-      messages=[{<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: <span class="str">"Hi!"</span>}],
-  )`;
+      model="fast",
+      messages=[{"role": "user", "content": "Hi!"}],
+  )`),
+  },
+  {
+    copy: `Already speak <strong class="adopt-proto">Anthropic</strong>? Point the Anthropic SDK at busbar and pick a pool by name. The request, left as Anthropic, may have been served by OpenAI and came back as Anthropic, translated both ways.`,
+    code: hl(`# Already speak Anthropic? Just swap the base URL.
+- client = Anthropic(api_key=ANTHROPIC_KEY)
++ client = Anthropic(
++     api_key=BUSBAR_TOKEN,
++     base_url="http://busbar:8080",
++ )
+
+  # "fast" = a pool you define in config:
+  # 80% Claude / 20% GPT-4o, Gemini on failover.
+  client.messages.create(
+      model="fast", max_tokens=1024,
+      messages=[{"role": "user", "content": "Hi!"}],
+  )`),
+  },
+  {
+    copy: `Already speak <strong class="adopt-proto">Gemini</strong>? Point the google-genai SDK at busbar and pick a pool by name. The request, left as Gemini, may have been served by Bedrock and came back as Gemini, translated both ways.`,
+    code: hl(`# Already speak Gemini? Just swap the base URL.
+- client = genai.Client(api_key=GEMINI_KEY)
++ client = genai.Client(
++     api_key=BUSBAR_TOKEN,
++     http_options={"base_url": "http://busbar:8080"},
++ )
+
+  # "fast" = a pool you define in config:
+  # 80% Claude / 20% GPT-4o, Gemini on failover.
+  client.models.generate_content(
+      model="fast",
+      contents="Hi!",
+  )`),
+  },
+  {
+    copy: `Already speak <strong class="adopt-proto">Amazon Bedrock</strong>? Point boto3 at busbar and pick a pool by name. The request, left as Bedrock, may have been served by Anthropic and came back as Bedrock, translated both ways.`,
+    code: hl(`# Already speak Bedrock? Just swap the endpoint.
+- bedrock = boto3.client("bedrock-runtime")
++ bedrock = boto3.client(
++     "bedrock-runtime",
++     endpoint_url="http://busbar:8080",
++ )
+
+  # "fast" = a pool you define in config:
+  # 80% Claude / 20% GPT-4o, Gemini on failover.
+  bedrock.converse(
+      modelId="fast",
+      messages=[{"role": "user", "content": [{"text": "Hi!"}]}],
+  )`),
+  },
+  {
+    copy: `Already speak <strong class="adopt-proto">Cohere</strong>? Point the Cohere SDK at busbar and pick a pool by name. The request, left as Cohere, may have been served by Gemini and came back as Cohere, translated both ways.`,
+    code: hl(`# Already speak Cohere? Just swap the base URL.
+- co = cohere.ClientV2(api_key=COHERE_KEY)
++ co = cohere.ClientV2(
++     api_key=BUSBAR_TOKEN,
++     base_url="http://busbar:8080",
++ )
+
+  # "fast" = a pool you define in config:
+  # 80% Claude / 20% GPT-4o, Gemini on failover.
+  co.chat(
+      model="fast",
+      messages=[{"role": "user", "content": "Hi!"}],
+  )`),
+  },
+  {
+    copy: `On the <strong class="adopt-proto">OpenAI Responses</strong> API? Same SDK, same two lines. The request, left as a Responses call, may have been served by Cohere and came back as Responses, translated both ways.`,
+    code: hl(`# The Responses API? Same swap, same client.
+- client = OpenAI(api_key=OPENAI_KEY)
++ client = OpenAI(
++     api_key=BUSBAR_TOKEN,
++     base_url="http://busbar:8080",
++ )
+
+  # "fast" = a pool you define in config:
+  # 80% Claude / 20% GPT-4o, Gemini on failover.
+  client.responses.create(
+      model="fast",
+      input="Hi!",
+  )`),
+  },
+];
 
 const qsInstall = `curl -fsSL https://getbusbar.com/install.sh | sh`;
 const qsConfig = `providers:
@@ -94,18 +198,18 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Busbar: Your AI control plane. Self-hosted, single Rust binary.</title>
+    <title>Busbar: Your AI Control Plane. Self-hosted, single Rust binary.</title>
     <meta
       name="description"
-      content="Your AI control plane. Busbar is a single self-hosted Rust binary between your applications and every AI provider — routing, lossless cross-protocol translation, and in-flight failover, all in your own infrastructure. Nothing phones home."
+      content="Your AI Control Plane. Busbar is a single self-hosted Rust binary between your applications and every AI provider: routing, lossless cross-protocol translation, and in-flight failover, all in your own infrastructure. Nothing phones home."
     />
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <meta property="og:title" content="Busbar: Your AI control plane." />
+    <meta property="og:title" content="Busbar: Your AI Control Plane." />
     <meta
       property="og:description"
-      content="Your AI control plane, self-hosted in a single Rust binary. Sits between your applications and every AI provider — routing, lossless translation, and in-flight failover, all in your own infrastructure."
+      content="Your AI Control Plane, self-hosted in a single Rust binary. Sits between your applications and every AI provider: routing, lossless translation, and in-flight failover, all in your own infrastructure."
     />
     <meta property="og:image" content="https://getbusbar.com/og-card.png" />
     <meta property="og:url" content="https://getbusbar.com/" />
@@ -125,22 +229,26 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
     <section class="hero">
       <div class="wrap hero-lead">
         <!-- BEAT 1: the business claim, in words -->
-        <div class="eyebrow">AI control plane · self-hosted · single Rust binary</div>
-        <h1>Your <span class="accent">AI&nbsp;control&nbsp;plane</span></h1>
+        <div class="eyebrow">The fastest performing AI Control Plane · 100% Rust · every provider &amp; capability</div>
+        <h1>Your <span class="accent">AI&nbsp;Control&nbsp;Plane</span></h1>
         <p class="lede">
           Busbar is a single binary you run in your own infrastructure, sitting between your
-          applications and every AI provider. One endpoint to route and fail over across
-          providers, enforce hard budget caps, provision or revoke access, and see every
-          request’s cost, latency, and traffic — all on your own compute.
+          applications and every AI provider. One endpoint to route and fail over chat,
+          embeddings, images, and audio across providers, enforce hard budget caps, provision or revoke access, and see every
+          request’s cost, latency, and traffic.
         </p>
       </div>
 
       <!-- BEAT 2: the "how it works" diagram — any client · 6 protocols → busbar →
-           any provider backend. Above the fold. -->
+           any provider backend. Above the fold. The capability strip leads into it. -->
       <div class="wrap">
+        <div class="cap-row" aria-label="Supported capabilities">
+          {capabilities.map((c) => <span class="cap">{c}</span>)}
+        </div>
+
         <div class="diagram hero-diagram">
           <div class="col col-clients">
-            <div class="col-label">Any client · 6 protocols</div>
+            <div class="col-label">Any client · 6 protocols · 5 capabilities</div>
             <div class="node">OpenAI · Anthropic</div>
             <div class="node">Gemini · Bedrock</div>
             <div class="node">Cohere · Responses</div>
@@ -159,7 +267,10 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
             <div class="busbar-box">
               <div class="bb-title"><img src={glyphWhite.src} alt="" width="22" height="22" /> Busbar</div>
               <div class="bb-tags">
-                <span>translate</span><span>route</span><span>failover</span><span>govern</span>
+                <span>Translate</span><span>Route</span><span>Failover</span>
+              </div>
+              <div class="bb-tags">
+                <span>Governance</span><span>Security</span><span>Observability</span>
               </div>
               <div class="bb-sub">one endpoint · :8080</div>
             </div>
@@ -183,39 +294,42 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           </div>
         </div>
 
-        <!-- CTA row: below the diagram -->
+        <div class="proto-row" aria-label="Supported protocols">
+          {protocols.map((p) => <span class="proto">{p}</span>)}
+        </div>
+
+        <!-- CTA row closes the hero, below the provider strip -->
         <div class="cta-row">
           <a href="/docs/getting-started/" class="btn">Get started</a>
           <a href="/download/" class="btn btn-ghost">Download</a>
-          <a href={DOCS} class="btn btn-text">Read the docs →</a>
-        </div>
-
-        <div class="proto-row" aria-label="Supported protocols">
-          {protocols.map((p) => <span class="proto">{p}</span>)}
         </div>
       </div>
     </section>
 
-    <!-- BEAT 3: adoption is a two-line swap (the code diff, demoted from the lead) -->
-    <section class="adopt wrap">
+    <!-- BEAT 3: adoption is a two-line swap (the code diff, demoted from the lead).
+         Rotates automatically through the six wire protocols (15s, wraps forever,
+         pauses on hover/focus, static under prefers-reduced-motion). All six slides
+         are server-rendered — first visible, rest hidden — so the no-JS/SEO fallback
+         is intact; the inline script at the end of the body only advances slides. -->
+    <section class="adopt wrap" id="adopt">
       <div class="adopt-grid">
         <div class="adopt-copy">
           <h2>Adopting it is a two-line swap.</h2>
-          <p>
-            Already speak OpenAI? Point the SDK at busbar and pick a pool by name. The request
-            below, left as OpenAI, may have been served by Anthropic and came back as OpenAI —
-            translated both ways.
-          </p>
+          {adoptSlides.map((s, i) => (
+            <p class:list={['adopt-slide', { 'is-active': i === 0 }]} data-adopt-copy={i} set:html={s.copy} />
+          ))}
           <p class="adopt-kicker"><strong>The model name is a config value, not a code dependency.</strong></p>
         </div>
         <div class="hero-demo">
-          <div class="code-card">
-            <div class="code-head">
-              <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-              <span class="code-file">app.py</span>
+          {adoptSlides.map((s, i) => (
+            <div class:list={['code-card', 'adopt-slide', { 'is-active': i === 0 }]} data-adopt-code={i}>
+              <div class="code-head">
+                <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+                <span class="code-file">app.py</span>
+              </div>
+              <pre><code set:html={s.code}></code></pre>
             </div>
-            <pre><code set:html={heroCode}></code></pre>
-          </div>
+          ))}
         </div>
       </div>
     </section>
@@ -225,7 +339,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       <div class="wrap">
         <p>
           A control plane you rent is still someone else’s. Busbar is one static binary in your
-          infrastructure — <strong>inspect it, pin it, run it air-gapped.</strong> Nothing has to
+          infrastructure: <strong>inspect it, pin it, run it air-gapped.</strong> Nothing has to
           leave your network.
         </p>
       </div>
@@ -237,7 +351,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         <h2>No model list to be on.</h2>
         <p>
           Busbar isn’t another proxy with a curated model catalog. You define a model name and the
-          backends behind it — there’s no privileged protocol and no allowlist to wait for.
+          backends behind it. There’s no privileged protocol and no allowlist to wait for.
           Providers speak about six languages between them; Busbar speaks all six, so
           <strong>a new model works the day it ships, not the day we add it.</strong> See for
           yourself: <a href="/build/">pick your models, get the config</a>.
@@ -268,7 +382,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           passthrough and your posture improves the same day: the provider key moves out of every
           app deployment, a runaway loop hits your cap instead of your bill, and every request
           shows up in your metrics. When the constraint moves, a new backend is a config lane, not
-          a rewrite. <a href="/faq/#one-provider">Why add a gateway now</a> · <a
+          a rewrite. <a href="/faq/#one-provider">Why add a control plane now</a> · <a
           href="/blog/valuable-before-the-second-provider/">the day it paid off</a>
         </p>
       </div>
@@ -331,7 +445,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           <img src={glyphPrimary.src} alt="" width="26" height="26" />
           <div>
             <strong>Busbar</strong>
-            <span>The reliability layer for LLM traffic.</span>
+            <span>Your AI Control Plane.</span>
           </div>
         </div>
         <nav class="footer-cols">
@@ -369,7 +483,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       </div>
       <div class="wrap footer-base">
         <span>© {new Date().getFullYear()} Merseyway LLC d/b/a Busbar</span>
-        <span>One endpoint. Every LLM protocol. Losslessly.</span>
+        <span>One endpoint. Every protocol, every capability. Losslessly.</span>
       </div>
     </footer>
 
@@ -448,7 +562,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       }
       /* Beat 1 is a centered column: the slogan reads as a category definition, centered.
          Kept compact so the diagram (beat 2) lands above the fold. */
-      .hero-lead { max-width: 48rem; margin: 0 auto; padding-top: 56px; padding-bottom: 4px; text-align: center; }
+      .hero-lead { max-width: 48rem; margin: 0 auto; padding-top: 56px; padding-bottom: 0; text-align: center; }
       .eyebrow {
         display: inline-block; font-size: 12.5px; font-weight: 600; letter-spacing: 0.04em;
         text-transform: uppercase; color: var(--muted);
@@ -469,14 +583,29 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       .hero h1 .accent { color: #4d7c0f; }
       .lede { font-size: 18.5px; color: #334155; max-width: 38em; margin: 22px auto 4px; }
 
-      /* CTA row sits below the diagram, centered. */
-      .cta-row { display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; margin-top: 24px; }
-      .proto-row { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 22px; padding-bottom: 78px; }
+      /* CTA row closes the hero (providers strip above it, so it carries the hero's
+         bottom padding), centered. Tight rhythm: the strips hug the diagram so the
+         whole hero reads as one composed unit. */
+      .cta-row { display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; margin-top: 18px; padding-bottom: 60px; }
+      .proto-row { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 14px; }
       .proto {
         font-size: 12.5px; font-weight: 600; color: var(--charcoal);
         background: #fff; border: 1px solid var(--line); border-radius: 7px; padding: 5px 11px;
       }
       .proto::before { content: '●'; color: var(--lime); font-size: 9px; margin-right: 7px; vertical-align: 1.5px; }
+      /* Capability strip: sits between the subheadline and the diagram — same pill
+         language as .proto but a second tone (lime-tinted chips, deep-green dots) so
+         capabilities and protocols read as two axes bracketing the diagram. The
+         diagram's own 14px top margin supplies the air below it. */
+      .cap-row {
+        display: flex; flex-wrap: wrap; justify-content: center; align-items: center;
+        gap: 8px; margin-top: 10px;
+      }
+      .cap {
+        font-size: 12.5px; font-weight: 600; color: var(--charcoal);
+        background: #f7fee7; border: 1px solid #d9f99d; border-radius: 7px; padding: 5px 11px;
+      }
+      .cap::before { content: '●'; color: #4d7c0f; font-size: 9px; margin-right: 7px; vertical-align: 1.5px; }
 
       /* HERO DIAGRAM (beat 2): the "how it works" grid, above the fold.
          `.diagram` supplies its own frame; here we just cap width, center, and
@@ -496,6 +625,16 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       /* The payoff line stands on its own, a touch larger, with a lime rule to set it apart. */
       .adopt-kicker { font-size: 18px; margin-top: 20px; padding-left: 14px; border-left: 3px solid var(--lime); }
       .adopt-kicker strong { color: var(--slate); font-weight: 700; }
+      /* Protocol rotation: slides are server-rendered with only the first visible, so
+         no-JS/SEO sees slide one and crawlers see all six. The provider name in each
+         slide's opening question carries the page's deep-green accent. */
+      .adopt-proto { color: #4d7c0f; font-weight: 700; }
+      .adopt-slide { display: none; }
+      .adopt-slide.is-active { display: block; }
+      @media (prefers-reduced-motion: no-preference) {
+        .adopt-slide.is-active { animation: adopt-fade 0.45s ease; }
+      }
+      @keyframes adopt-fade { from { opacity: 0; } to { opacity: 1; } }
 
       /* SOVEREIGNTY band (beat 4 — the P3/P4 hammer) */
       .sovereignty { padding: 56px 0; }
@@ -524,8 +663,11 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       .code-card code { font-size: 12.5px; line-height: 1.5; color: #cbd5e1; white-space: pre; }
       .code-card .cm { color: #64748b; }
       .code-card .str { color: #a3e635; }
-      .code-card .del { color: #f87171; display: block; }
-      .code-card .add { color: #bef264; display: block; }
+      /* del/add are inline: hl() joins lines with \n and the code element is
+         white-space:pre, so the newlines are the sole line breaks. (display:block
+         here would add an empty line per diff row — block box + trailing \n.) */
+      .code-card .del { color: #f87171; }
+      .code-card .add { color: #bef264; }
       .demo-note { font-size: 13.5px; color: var(--muted); margin: 18px 4px 0; line-height: 1.6; }
       .demo-note strong { color: var(--slate); font-weight: 600; }
 
@@ -571,7 +713,10 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         box-shadow: 0 18px 40px -16px rgba(15,23,42,0.5);
       }
       .bb-title { display: flex; align-items: center; justify-content: center; gap: 9px; color: #fff; font-weight: 700; font-size: 18px; }
+      /* Two balanced rows of three pillar blocks: Translate · Route · Failover /
+         Governance · Security · Observability. */
       .bb-tags { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin: 16px 0 12px; }
+      .bb-tags + .bb-tags { margin-top: -6px; }
       .bb-tags span { font-size: 11.5px; font-weight: 600; color: var(--slate); background: var(--lime); border-radius: 6px; padding: 4px 9px; }
       .bb-sub { color: var(--muted-d); font-size: 12px; font-family: ui-monospace, monospace; }
       .link-zone { position: relative; }
@@ -675,7 +820,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         .feature-grid { grid-template-columns: 1fr; grid-template-rows: repeat(6, auto 1fr auto); }
         .trust-grid { grid-template-columns: repeat(2, 1fr); }
         .hero-lead { padding-top: 44px; }
-        .proto-row { padding-bottom: 44px; }
+        .cta-row { padding-bottom: 40px; }
         .quickstart { padding: 56px 0; }
         .core { padding: 64px 20px; }
         .core p { font-size: 17px; }
@@ -698,5 +843,43 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         .trust-grid { grid-template-columns: 1fr; }
       }
     </style>
+
+    <script>
+      // Protocol rotation for the "two-line swap" section. Progressive enhancement:
+      // the HTML ships with slide 0 active (the no-JS/SEO fallback); this script
+      // jumps to a RANDOM slide on load, then advances in order every 15s with
+      // modulo wraparound, forever. Paused while hovered or focused; under
+      // prefers-reduced-motion it never auto-rotates (the random slide stays
+      // static — a one-time swap at load, not motion).
+      const section = document.getElementById('adopt');
+      const copies = Array.from(document.querySelectorAll<HTMLElement>('[data-adopt-copy]'));
+      const codes = Array.from(document.querySelectorAll<HTMLElement>('[data-adopt-code]'));
+      if (section && copies.length) {
+        const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
+        let current = 0;
+        let timer: ReturnType<typeof setInterval> | null = null;
+        const show = (i: number) => {
+          current = i;
+          copies.forEach((el, j) => el.classList.toggle('is-active', j === i));
+          codes.forEach((el, j) => el.classList.toggle('is-active', j === i));
+        };
+        const stop = () => {
+          if (timer !== null) { clearInterval(timer); timer = null; }
+        };
+        const start = () => {
+          if (reduced.matches || timer !== null) return;
+          timer = setInterval(() => show((current + 1) % copies.length), 15000);
+        };
+        section.addEventListener('mouseenter', stop);
+        section.addEventListener('mouseleave', start);
+        section.addEventListener('focusin', stop);
+        section.addEventListener('focusout', (e) => {
+          if (!section.contains(e.relatedTarget as Node | null)) start();
+        });
+        reduced.addEventListener('change', () => (reduced.matches ? stop() : start()));
+        show(Math.floor(Math.random() * copies.length));
+        start();
+      }
+    </script>
   </body>
 </html>

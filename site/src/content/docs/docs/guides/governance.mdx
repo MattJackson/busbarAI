@@ -53,9 +53,9 @@ rate limits, spend visibility, or access control. Each capability below has two 
     Spend is computed from a price you set: a flat charge per request, plus a per-1,000-token charge
     accrued from each response's usage. The flat per-request fee is an **atomic hard cap**: charged
     in a single conditional UPSERT, so concurrent requests cannot race past the budget; only a single
-    admitted request's post-response token cost can marginally overshoot. By default Busbar fails
-    *open* on a store error rather than dropping your traffic (set `budget_on_store_error: deny` to
-    fail closed).
+    admitted request's post-response token cost can marginally overshoot. If the budget store itself
+    errors, Busbar fails *open* by default (your traffic keeps flowing) and can be configured to fail
+    closed.
 
     **Why it matters:** you get per-key cost attribution and caps without trusting every developer
     and deployment to self-police. A staging key can be capped at a monthly budget; a production key
@@ -86,11 +86,14 @@ rate limits, spend visibility, or access control. Each capability below has two 
     # → 201 with the secret, shown once. Store it now; only its SHA-256 is kept.
     ```
 
-    To issue a key for a Bedrock-SDK client (inbound SigV4 auth), add `"issue_aws_credential": true`. The 201 response then also includes `aws_access_key_id` and `aws_secret_access_key`; both shown **once**. Configure your Bedrock SDK with those credentials; Busbar verifies the signature and enforces all governance controls. See [Bedrock ingress](/docs/protocols/#bedrock).
+    For a Bedrock-SDK client (inbound SigV4 auth), add `"issue_aws_credential": true` to the same
+    request; details under [Mint a key](#mint-a-key).
 
-    By default, if the budget store errors during the admission check, Busbar fails open (requests proceed). Set `governance.budget_on_store_error: deny` in config to fail closed instead; requests are rejected on any store error, providing a hard budget guarantee for regulated deployments.
+    The fail-open default lives in config too: set `governance.budget_on_store_error: deny` to
+    reject requests on any budget-store error, a hard budget guarantee for regulated deployments.
 
-    Check spend any time; raise a budget with `PATCH`, revoke with `DELETE`:
+    Check spend any time (the full key lifecycle, `PATCH` and `DELETE` included, is under
+    [Admin API](#admin-api)):
 
     ```bash
     curl -s http://localhost:8080/admin/keys/<id>/usage \
@@ -170,7 +173,7 @@ curl -s -X POST http://localhost:8080/admin/keys \
 
 Response includes `id` (`vk_<16hex>`), `secret` (`sk-bb-<32hex>`, **shown once**), and all attributes. Store the secret immediately.
 
-To also issue an AWS credential pair for Bedrock-SDK clients, add `"issue_aws_credential": true` to the request body. The 201 response then additionally includes `aws_access_key_id` and `aws_secret_access_key`: both shown **once** and never returned by any subsequent read API. Configure your Bedrock SDK with those credentials; Busbar verifies the inbound SigV4 signature and enforces the key's governance controls. See [Bedrock ingress](protocols.md#bedrock).
+To also issue an AWS credential pair for Bedrock-SDK clients, add `"issue_aws_credential": true` to the request body. The 201 response then additionally includes `aws_access_key_id` and `aws_secret_access_key`: both shown **once** and never returned by any subsequent read API. Configure your Bedrock SDK with those credentials; Busbar verifies the inbound SigV4 signature and enforces the key's governance controls. See [Bedrock ingress](/docs/protocols/#bedrock).
 
 Create-key field validation: `budget_period` must be `total`, `daily`, or `monthly` (400 otherwise); `max_budget_cents` must be ≥ 0; `rpm_limit` and `tpm_limit` must each be ≥ 1 when set. `allowed_pools` that name no configured pool logs a warning but does not fail.
 

@@ -1,6 +1,6 @@
 ---
 title: "Busbar, in numbers"
-description: "A fast, lightweight, single-binary AI gateway isn't my roadmap. It's what shipped. Straight answers on memory, latency, throughput, reproducibility, and what you actually deploy."
+description: "A fast, lightweight, single-binary AI control plane isn't my roadmap. It's what shipped. Straight answers on memory, latency, throughput, reproducibility, and what you actually deploy."
 date: 2026-07-01
 author: "Matthew Jackson"
 authorTitle: "Founder, Busbar"
@@ -35,7 +35,7 @@ Saturating two pinned cores, Busbar sustained **19,505 req/s** (about 9,750 per 
 
 ## Are these benchmarks reproducible?
 
-Yes. The overhead harness (a mock upstream, the gateway, and a load client that times each request in microseconds) is checked in under `bench/`, and Busbar can report its own added latency in-band on every response via the opt-in `Server-Timing` header. You don't have to trust my number. You can read Busbar's overhead on your own traffic, in production, per request. That's the number that can't be cherry-picked.
+Yes. The overhead harness (a mock upstream, Busbar, and a load client that times each request in microseconds) is checked in under `bench/`, and Busbar can report its own added latency in-band on every response via the opt-in `Server-Timing` header. You don't have to trust my number. You can read Busbar's overhead on your own traffic, in production, per request. That's the number that can't be cherry-picked.
 
 ## How does Busbar compare?
 

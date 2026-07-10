@@ -14,11 +14,11 @@ mkdirSync(outDir, { recursive: true });
 
 // slug -> { description } ; order is controlled by the sidebar in astro.config.mjs
 const PAGES = {
-  'getting-started': 'Install Busbar, write a minimal config, and make your first request — end to end.',
+  'getting-started': 'Install Busbar, write a minimal config, and make your first request, end to end.',
   'why-busbar': 'The case for Busbar: the problems it solves, what it enables, and how it compares.',
-  'configuration': 'Full configuration reference — every key, default, and validation rule.',
+  'configuration': 'Full configuration reference: every key, default, and validation rule.',
   'protocols': 'The six wire protocols and lossless cross-protocol translation.',
-  'providers': 'How to add any provider that speaks one of the six protocols — a config entry, no code.',
+  'providers': 'How to add any provider that speaks one of the six protocols: a config entry, no code.',
   'pools': 'What a pool is, how member selection and failover work, the full config reference, and copy-paste recipes.',
   'reliability': 'How Busbar keeps serving through provider failures: the reliability layers, tied together with one worked example.',
   'circuit-breaker': 'Fault-attributed circuit breaking: scope, failure classification, the state machine, trip conditions, cooldown, and config.',
@@ -69,6 +69,16 @@ console.log('published providers.yaml -> public/providers.yaml');
   // only. A dev may keep an `## [Unreleased]` block in CHANGELOG.md to stage notes; strip it here
   // (everything from that heading up to the next `## ` version heading) so it can't reach the site.
   raw = raw.replace(/^## \[Unreleased\][^\n]*\n(?:(?!^## )[\s\S])*?(?=^## |\Z)/im, '');
+
+  // The published changelog shows 1.0.0 and later only. Pre-1.0 history (0.x releases, the
+  // 1.0.0-rc.* candidates, and the Early-development block) stays in the repo CHANGELOG.md as the
+  // source of truth but is hidden from the site: everything from the first pre-1.0 heading to the
+  // end is dropped (only the Keep-a-Changelog reference links follow it, and those are removed
+  // below anyway).
+  {
+    const pre = raw.match(/^## \[(?:0\.|1\.0\.0-rc\.|Early development)/m);
+    if (pre) raw = raw.slice(0, pre.index).trimEnd() + '\n';
+  }
 
   const lines = raw.split('\n');
 

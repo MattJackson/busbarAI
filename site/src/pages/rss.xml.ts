@@ -8,7 +8,7 @@ import { getCollection } from 'astro:content';
 const SITE = 'https://getbusbar.com';
 const TITLE = 'Busbar';
 const DESCRIPTION =
-  'Notes from Busbar on AI-gateway reliability, fidelity, and performance.';
+  'Notes from Busbar on AI control-plane reliability, fidelity, and performance.';
 
 const esc = (s: string) =>
   s

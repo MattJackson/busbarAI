@@ -31,9 +31,9 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'Busbar',
-      tagline: 'The reliability layer for LLM traffic',
+      tagline: 'Your AI Control Plane',
       favicon: '/favicon.svg',
-      logo: { src: './src/assets/busbar-glyph.svg', alt: 'Busbar' },
+      logo: { src: './src/assets/busbar-primary.svg', alt: 'Busbar' },
       customCss: ['./src/styles/global.css'],
       // Docs header carries the website's nav links (Blog, Download) so docs
       // pages can reach the rest of the site — see DocsHeaderLinks.astro.
@@ -78,7 +78,7 @@ export default defineConfig({
         starlightLlmsTxt({
           projectName: 'Busbar',
           description:
-            'Self-hosted LLM gateway and control plane in a single Rust binary. One endpoint accepts any of six wire protocols (OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses), routes to weighted pools of backends, translates losslessly between protocols, and keeps serving through provider failures via fault-attributed circuit breaking and in-flight failover.',
+            'Your AI Control Plane: self-hosted, in a single Rust binary. One endpoint accepts any of six wire protocols (OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses), routes to weighted pools of backends, translates losslessly between protocols, and keeps serving through provider failures via fault-attributed circuit breaking and in-flight failover.',
         }),
       ],
       social: [
@@ -97,7 +97,7 @@ export default defineConfig({
           label: 'Core concepts',
           items: [
             { label: 'Pools', slug: 'docs/pools' },
-            { label: 'Routing Policies', slug: 'docs/routing' },
+            { label: 'Routing', slug: 'docs/routing' },
             { label: 'Protocols & Translation', slug: 'docs/protocols' },
           ],
         },
@@ -106,8 +106,8 @@ export default defineConfig({
           items: [
             { label: 'Overview', slug: 'docs/reliability' },
             { label: 'Circuit Breaker', slug: 'docs/circuit-breaker' },
-            { label: 'In-flight Failover', slug: 'docs/failover' },
-            { label: 'Health & Observability', slug: 'docs/observability' },
+            { label: 'Failover', slug: 'docs/failover' },
+            { label: 'Observability', slug: 'docs/observability' },
           ],
         },
         {

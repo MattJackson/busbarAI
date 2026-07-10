@@ -3,7 +3,7 @@ import PageLayout from '../layouts/PageLayout.astro';
 ---
 
 <PageLayout
-  title="FAQ — Busbar"
+  title="FAQ · Busbar"
   description="Straight answers to the questions we get most: comparisons, mid-stream failure, dependencies, provider coverage, and what the AGPL means for you."
 >
   <p class="kicker">FAQ</p>
@@ -52,11 +52,12 @@ import PageLayout from '../layouts/PageLayout.astro';
 
   <h2 id="control-plane">Is Busbar a gateway or a control plane?</h2>
   <p>
-    Both names fit, and the difference matters. A gateway forwards traffic. A control plane
-    decides: whose fault a failure was, whether the request is inside its budget and rate limit,
-    which pool member should serve it, and whether to fail over mid-flight. Busbar makes those
-    decisions in your infrastructure, before the request is forwarded, at a cost of about 38
-    microseconds.
+    A control plane, and the difference matters. A gateway forwards LLM traffic. A control
+    plane decides: whose fault a failure was, whether the request is inside its budget and rate
+    limit, which pool member should serve it, and whether to fail over mid-flight. Busbar is an
+    AI control plane: it makes those decisions in your infrastructure, before the request is
+    forwarded, at a cost of about 38 microseconds. And it covers more than LLMs: chat,
+    embeddings, images, audio, and moderations, across every provider.
   </p>
   <p>
     One test separates the two words from marketing: a control plane that lives in your data
@@ -72,8 +73,8 @@ import PageLayout from '../layouts/PageLayout.astro';
     is the right call, and we say so. On coverage itself the counts mislead: LiteLLM lists
     providers, Busbar speaks protocols, and any provider on one of the six, including every
     OpenAI-compatible endpoint, is a minute of YAML in your own <code>providers.yaml</code>. If
-    the gateway is production infrastructure carrying all of
-    your LLM traffic, the differences start to matter: no privileged protocol, a fault-attributed
+    this layer is production infrastructure carrying all of
+    your AI traffic, the differences start to matter: no privileged protocol, a fault-attributed
     circuit breaker, and a runtime footprint measured in microseconds and megabytes. The full
     comparison, with their numbers cited to their docs, is at
     <a href="/vs/litellm/">Busbar vs LiteLLM</a>.
@@ -87,7 +88,7 @@ import PageLayout from '../layouts/PageLayout.astro';
     at <a href="/vs/openrouter/">Busbar vs OpenRouter</a>.
   </p>
 
-  <h2 id="one-provider">We're locked to one provider for compliance reasons. Why add a gateway now?</h2>
+  <h2 id="one-provider">We're locked to one provider for compliance reasons. Why add a control plane now?</h2>
   <p>
     Because Busbar is valuable before the second provider exists. Say your data involves PHI and
     your BAA covers AWS, so everything runs through Bedrock. Point your Bedrock SDK's
@@ -115,7 +116,7 @@ import PageLayout from '../layouts/PageLayout.astro';
     Then the constraint moves, as constraints do: you sign a direct BAA with Anthropic, or a
     cheaper model fits a workload, or a provider has a bad month. Adding that backend is a lane
     in <code>config.yaml</code>. Your application code, written against the Bedrock SDK, never
-    changes and never learns which model answered. Without the gateway already in place, that
+    changes and never learns which model answered. Without the control plane already in place, that
     same day starts with rewriting every LLM integration you own. The endpoint swap is a
     one-line change; the future it buys is free.
   </p>
@@ -127,7 +128,7 @@ import PageLayout from '../layouts/PageLayout.astro';
     timeouts, rate limits, and 5xx responses all arrive before any content does.
   </p>
   <p>
-    After the first byte, no gateway can save the request, and you should distrust any that
+    After the first byte, no gateway or control plane can save the request, and you should distrust any that
     claims otherwise: a stream is a stateful continuation, a byte sent cannot be unsent, and a
     different provider cannot resume another's generation. What Busbar does instead is record
     the fault against the lane and emit a clean, native-format error in your protocol, so your

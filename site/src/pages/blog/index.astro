@@ -6,16 +6,18 @@ const posts = (await getCollection('blog')).sort(
   (a, b) => b.data.date.valueOf() - a.data.date.valueOf(),
 );
 const fmt = (d: Date) =>
-  d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  // timeZone: 'UTC' — frontmatter `date: YYYY-MM-DD` parses as UTC midnight; without it a
+  // build machine west of UTC renders every post one day early.
+  d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
 ---
 
 <BlogLayout
   title="Blog · Busbar"
-  description="Notes from the Busbar team on AI-gateway reliability, fidelity, and performance."
+  description="Notes from the Busbar team on AI control-plane reliability, fidelity, and performance."
 >
   <div class="post-list">
     <h1>Blog</h1>
-    <p class="list-lede">Notes from the team on AI-gateway reliability, fidelity, and performance.</p>
+    <p class="list-lede">Notes from the team on AI control-plane reliability, fidelity, and performance.</p>
     {
       posts.map((p) => (
         <a class="post-card" href={`/blog/${p.id}/`}>

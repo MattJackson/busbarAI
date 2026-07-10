@@ -1,6 +1,6 @@
 ---
 title: "Valuable before the second provider exists"
-description: "Why a gateway earns its keep with one provider: key custody, hard caps, and real metrics on day one — plus an option you can exercise mid-incident."
+description: "Why a control plane earns its keep with one provider: key custody, hard caps, and real metrics on day one, plus an option you can exercise mid-incident."
 date: 2026-07-09
 author: "Matthew Jackson"
 authorTitle: "Founder, Busbar"
@@ -27,7 +27,7 @@ My provider had a bad day, as every provider eventually does. Here's the part th
 
 The outage ended for my app the moment the config flipped. No redeploy, no code change, no emergency pull request: the recovery was an edit to a YAML file, not an engineering project. The app was written against one provider's SDK and still is. It has no idea anything happened, because the model name it calls is a config value in Busbar, not a dependency in the code.
 
-That's the thing the "failover" framing undersells. Failover between two configured providers is table stakes. What I actually used was the ability to *manufacture* a second provider mid-incident, because the gateway was already holding the seam where providers plug in.
+That's the thing the "failover" framing undersells. Failover between two configured providers is table stakes. What I actually used was the ability to *manufacture* a second provider mid-incident, because Busbar was already holding the seam where providers plug in.
 
 ## The compliance version of the same story
 
@@ -35,7 +35,7 @@ A prospect told me recently: we only use Bedrock, our data involves PHI, and unl
 
 Same answer. Point the Bedrock SDK's `endpoint_url` at Busbar today and change nothing else. Same-protocol traffic passes through byte-for-byte, and because Busbar runs in your own infrastructure, no new entity enters the PHI path; your BAAs stay exactly where they are. You get the key custody, the caps, and the visibility now. And the day a direct BAA lands, or a cheaper model fits a workload, that backend is a new lane in `config.yaml`. Your application, written against the Bedrock SDK, never changes and never learns which model answered.
 
-Without the gateway already in place, that day starts with rewriting every LLM integration you own. With it, the migration you'll eventually want is a config edit you've already paid for.
+Without the control plane already in place, that day starts with rewriting every LLM integration you own. With it, the migration you'll eventually want is a config edit you've already paid for.
 
 ## The option is the product
 

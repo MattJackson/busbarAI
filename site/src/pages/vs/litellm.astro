@@ -4,17 +4,19 @@ import PageLayout from '../../layouts/PageLayout.astro';
 
 <PageLayout
   title="Busbar vs LiteLLM"
-  description="An honest comparison for engineers deciding between Busbar and LiteLLM: protocol handling, failure behavior, runtime footprint, and when each is the right call."
+  description="LiteLLM is an AI gateway. Busbar is an AI control plane. An honest comparison for engineers: protocol handling, failure behavior, runtime footprint, and when each is the right call."
 >
   <p class="kicker">Comparison</p>
   <h1>Busbar vs LiteLLM</h1>
   <p class="intro">
     Everybody evaluating Busbar knows LiteLLM, so this page is specific about what's actually
-    different. It isn't a feature list. LiteLLM is genuinely good at what it is: a Python-native
-    router with huge provider coverage. Busbar is a different kind of tool, a control plane in a
-    single Rust binary, and the difference
+    different. It isn't a feature list. LiteLLM is genuinely good at what it is: an AI gateway, a
+    Python-native router with huge provider coverage. Busbar is a different kind of tool: an AI
+    control plane in a single Rust binary. It covers more than LLMs (chat, embeddings, images,
+    audio, and moderations across every provider) and does more than route (failover, breakers,
+    governance, observability). The difference
     shows up in three places: how protocols are handled, what happens when a provider fails, and
-    what the gateway itself costs you at runtime. Every claim about LiteLLM below is cited to
+    what the layer itself costs you at runtime. Every claim about LiteLLM below is cited to
     their own documentation, and every claim about Busbar to ours.
   </p>
 
@@ -81,7 +83,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
           <td>100+ preconfigured out of the box</td>
         </tr>
         <tr>
-          <td>Dashboard</td>
+          <td>Observability</td>
           <td>Prometheus, OTLP, admin API; bring the Grafana you already run</td>
           <td>Bundled admin UI</td>
         </tr>
@@ -183,7 +185,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
     <a href="/docs/circuit-breaker/">The full state machine.</a>
   </p>
 
-  <h2>The gateway itself is basically free</h2>
+  <h2>The control plane itself is basically free</h2>
   <p>
     One static Rust binary, no interpreter, no garbage collector in the request path. Median
     added latency is in the tens of microseconds, and stays under 100 µs even translating a
@@ -205,7 +207,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
     LiteLLM is rebuilding its data plane in Rust, and their launch post says why in plain terms:
     "Under real load, CPU and memory climb with concurrency, and pods get OOM-killed at the worst
     time" <a href="#references">[7]</a>. We think they're right, and the move validates the
-    architecture Busbar has shipped since day one: a compiled, no-GC gateway is what this job requires.
+    architecture Busbar has shipped since day one: a compiled, no-GC data plane is what this job requires.
   </p>
   <p>
     The differences that remain are worth stating precisely. Their Rust core is in early beta,
@@ -230,8 +232,9 @@ import PageLayout from '../../layouts/PageLayout.astro';
   </ul>
   <p>If that's your shape, use LiteLLM. It's a good tool and we say so without hedging.</p>
   <p>
-    If the gateway is production infrastructure carrying all of your LLM traffic, that's the
-    problem Busbar was built for. <a href="/docs/getting-started/">Get started in five minutes</a>,
+    If this layer is production infrastructure carrying all of your AI traffic, you need a
+    control plane, not just a gateway, and that's the problem Busbar was built for.
+    <a href="/docs/getting-started/">Get started in five minutes</a>,
     or read <a href="/docs/why-busbar/">why Busbar exists</a>.
   </p>
 

@@ -4,15 +4,18 @@ import PageLayout from '../../layouts/PageLayout.astro';
 
 <PageLayout
   title="Busbar vs OpenRouter"
-  description="Busbar and OpenRouter solve different problems: one API in front of many models, hosted by them, or run by you. Here's the honest comparison."
+  description="OpenRouter is a hosted router: one API in front of many models, run on their servers. Busbar is an AI control plane you run. Here's the honest comparison."
 >
   <p class="kicker">Comparison</p>
   <h1>Busbar vs OpenRouter</h1>
   <p class="intro">
     This comparison is easier than most, because Busbar and OpenRouter mostly don't compete.
-    OpenRouter is a hosted service: you send requests to their API, they route to providers and
-    bill you. Busbar is a control plane you run: your infrastructure, your provider accounts, your data
-    path. The real question isn't which is better. It's which side of that line your requirements
+    OpenRouter is a hosted router: you send requests to their API, they route to providers and
+    bill you. Busbar is an AI control plane you run: your infrastructure, your provider accounts,
+    your data path. And it does more than route: pools with weighted balancing, failover,
+    breakers, governance with virtual keys, budgets, and rate limits, and cost and latency
+    observability, across chat, embeddings, images, audio, and moderations, not just LLMs. The
+    real question isn't which is better. It's which side of that line your requirements
     put you on. Every claim about OpenRouter below is cited to their own documentation.
   </p>
 
@@ -54,7 +57,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
           <td>OpenAI-compatible API</td>
         </tr>
         <tr>
-          <td>Scoped keys for teams</td>
+          <td>Governance</td>
           <td>Virtual keys with budgets, RPM/TPM limits, and pool ACLs; AWS credentials mintable for Bedrock SDK clients</td>
           <td>Account-level credits and key provisioning <a href="#references">[2]</a></td>
         </tr>
@@ -112,7 +115,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
     fault attribution, failover deadlines and hop caps, and a pool exhaustion policy you choose
     (reject with a 503, spill to a fallback pool, or send to the least-bad lane). All of it is
     observable through <code>/stats</code> and <code>/metrics</code>. When a provider melts down
-    at 3am, the difference is whether you can see and change what the router is doing.
+    at 3am, the difference is whether you can see and change what your control plane is doing.
     <a href="/docs/circuit-breaker/">How the breaker works.</a>
   </p>
 
@@ -129,7 +132,8 @@ import PageLayout from '../../layouts/PageLayout.astro';
   </p>
   <p>
     When the prototype becomes production infrastructure, and the data path becomes a compliance
-    question, that's the problem Busbar was built for.
+    question, you need more than a hosted router. You need a control plane you can see, change,
+    and run yourself. That's the problem Busbar was built for.
     <a href="/docs/getting-started/">Get started in five minutes</a>, or read
     <a href="/docs/why-busbar/">why Busbar exists</a>.
   </p>
