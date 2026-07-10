@@ -4964,12 +4964,15 @@ mod tests {
         let body_bytes = Bytes::from(serde_json::to_vec(&req_body).unwrap());
 
         // Call openai_ingress handler directly
-        let response = route::openai_ingress(
-            State(app),
-            axum::extract::Extension(crate::governance::GovCtx::default()),
-            axum::extract::Extension(crate::auth::CallerToken::default()),
-            HeaderMap::new(),
+        let response = route::operation_ingress(
+            &app,
+            &crate::governance::GovCtx::default(),
+            &crate::auth::CallerToken::default(),
+            &HeaderMap::new(),
             body_bytes,
+            "openai",
+            crate::operation::Operation::Chat,
+            None,
         )
         .await;
 
@@ -5027,12 +5030,15 @@ mod tests {
         });
         let body_bytes = Bytes::from(serde_json::to_vec(&req_body).unwrap());
 
-        let response = route::openai_ingress(
-            State(app),
-            axum::extract::Extension(crate::governance::GovCtx::default()),
-            axum::extract::Extension(crate::auth::CallerToken::default()),
-            HeaderMap::new(),
+        let response = route::operation_ingress(
+            &app,
+            &crate::governance::GovCtx::default(),
+            &crate::auth::CallerToken::default(),
+            &HeaderMap::new(),
             body_bytes,
+            "openai",
+            crate::operation::Operation::Chat,
+            None,
         )
         .await;
 
@@ -5108,12 +5114,15 @@ mod tests {
         });
         let body_bytes = Bytes::from(serde_json::to_vec(&req_body).unwrap());
 
-        let response = route::openai_ingress(
-            State(app),
-            axum::extract::Extension(crate::governance::GovCtx::default()),
-            axum::extract::Extension(crate::auth::CallerToken::default()),
-            HeaderMap::new(),
+        let response = route::operation_ingress(
+            &app,
+            &crate::governance::GovCtx::default(),
+            &crate::auth::CallerToken::default(),
+            &HeaderMap::new(),
             body_bytes,
+            "openai",
+            crate::operation::Operation::Chat,
+            None,
         )
         .await;
 
@@ -5243,12 +5252,15 @@ mod tests {
             .build();
 
         let body = json!({"model": "glm-4.5", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 15});
-        let resp = route::openai_ingress(
-            State(app),
-            axum::extract::Extension(crate::governance::GovCtx::default()),
-            axum::extract::Extension(crate::auth::CallerToken::default()),
-            axum::http::HeaderMap::new(),
+        let resp = route::operation_ingress(
+            &app,
+            &crate::governance::GovCtx::default(),
+            &crate::auth::CallerToken::default(),
+            &axum::http::HeaderMap::new(),
             Bytes::from(body.to_string()),
+            "openai",
+            crate::operation::Operation::Chat,
+            None,
         )
         .await;
         assert_eq!(resp.status().as_u16(), 200);
@@ -5301,12 +5313,15 @@ mod tests {
         }
         let app = TestApp::new().lane(spec).build();
 
-        let resp = route::openai_ingress(
-            State(app),
-            axum::extract::Extension(crate::governance::GovCtx::default()),
-            axum::extract::Extension(crate::auth::CallerToken::default()),
-            axum::http::HeaderMap::new(),
+        let resp = route::operation_ingress(
+            &app,
+            &crate::governance::GovCtx::default(),
+            &crate::auth::CallerToken::default(),
+            &axum::http::HeaderMap::new(),
             Bytes::from(request_body.to_string()),
+            "openai",
+            crate::operation::Operation::Chat,
+            None,
         )
         .await;
         assert_eq!(

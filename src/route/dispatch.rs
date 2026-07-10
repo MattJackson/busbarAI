@@ -5,7 +5,7 @@
 //! protocol → that protocol's `RequestHandler` decides the operation → its OperationHandler). Holds
 //! `protocol_dispatch` (the axum fallback), the generic `operation_ingress` for the 1.2 operations,
 //! and the bedrock InvokeModel arm. A child of `route` so it shares the ingress core's private
-//! helpers (`finish*`, `governance_guard`, chat cores) without widening their visibility.
+//! helpers (`finish*`, `governance_guard`) without widening their visibility.
 
 use super::*;
 
@@ -251,7 +251,7 @@ pub(crate) async fn operation_resolved(
 ///
 /// Gemini and Bedrock delegate to their protocol arms wholesale (path-model parsing, streaming
 /// variants, native unsupported-action envelopes live there); the body-model protocols split here:
-/// chat → the chat ingress core, 1.2 operations → `operation_ingress`. Unknown paths/methods keep the
+/// every operation → `operation_ingress` (the universal core). Unknown paths/methods keep the
 /// pre-collapse fallback shaping (native 404/405 envelopes, no proxy tells).
 pub(crate) async fn protocol_dispatch(
     State(app): State<Arc<App>>,
@@ -362,7 +362,7 @@ pub(crate) async fn protocol_dispatch(
                 )
             }
         }
-        // Body-model protocols: the RequestHandler names the operation; chat → chat core, 1.2 ops →
+        // Body-model protocols: the RequestHandler names the operation; every operation →
         // the generic operation ingress. (`anthropic` bare `/v1/messages` is served here — an
         // Anthropic SDK pointed at busbar root works like every other dialect; the named/adhoc
         // prefix routes remain for URL-pinned model selection.)
@@ -370,39 +370,9 @@ pub(crate) async fn protocol_dispatch(
             let op = crate::handlers::request_handler(proto)
                 .and_then(|rh| rh.resolve_operation(&path, &body));
             match op {
-                Some(crate::operation::Operation::Chat) => match proto {
-                    "openai" => {
-                        openai_ingress(
-                            State(app),
-                            axum::extract::Extension(gov),
-                            axum::extract::Extension(caller),
-                            headers,
-                            body,
-                        )
-                        .await
-                    }
-                    "cohere" => {
-                        cohere_ingress(
-                            State(app),
-                            axum::extract::Extension(gov),
-                            axum::extract::Extension(caller),
-                            headers,
-                            body,
-                        )
-                        .await
-                    }
-                    "responses" => {
-                        responses_ingress(
-                            State(app),
-                            axum::extract::Extension(gov),
-                            axum::extract::Extension(caller),
-                            headers,
-                            body,
-                        )
-                        .await
-                    }
-                    _ => ingress_body_model(&app, &gov, &caller, &headers, body, proto).await,
-                },
+                // EVERY operation — chat included — takes the same universal ingress. No chat
+                // match, no chat cores: body-model dialects resolve the model from the body inside
+                // `operation_ingress`, exactly like embeddings or speech.
                 Some(op) => {
                     operation_ingress(&app, &gov, &caller, &headers, body, proto, op, None).await
                 }

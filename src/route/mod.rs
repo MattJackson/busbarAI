@@ -457,93 +457,57 @@ fn ingress_error(proto: &str, status: StatusCode, kind: &str, message: &str) -> 
     crate::forward::ingress_error(proto, status, kind, message)
 }
 
-/// Shared ingress core for the BODY-MODEL protocols (`openai`, `cohere`, `responses`): the model
-/// lives in the request body's `"model"` field and stream intent in `"stream"`. Parses the body,
-/// extracts the model, runs the governance guards (pool-allowed / budget / rate), resolves the
-/// target against `app.pools` then `app.by_model`, and forwards through `forward_with_pool` with
-/// the given ingress `proto` so cross-protocol translation (request + response) happens for free.
-/// Factored out of `openai_ingress` so every body-model protocol shares one implementation — the
-/// only difference between them is the `proto` literal and the native error envelope.
-async fn ingress_body_model(
+/// CHAT IS A STANDARD OPERATION: thin adapter over the universal `operation_resolved` core — the
+/// same path every operation takes from the moment the model is known. Kept only so the path-model
+/// routing arms (gemini/bedrock, which resolve model+stream from the URL and inject shims into the
+/// body bytes) keep a stable call shape; the chat OperationHandler resolves through the registry
+/// like any other.
+#[allow(clippy::too_many_arguments)]
+async fn forward_resolved(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
-    caller: &crate::auth::CallerToken,
+    proto: &'static str,
+    model: &str,
     headers: &HeaderMap,
     body: Bytes,
-    proto: &'static str,
+    v: Value,
+    caller_token: Option<&str>,
+    started: Instant,
+    charged_at: u64,
+    gemini_api_version: Option<&str>,
 ) -> Response {
-    let caller_token = caller.0.as_deref();
-    let started = Instant::now();
-    // Wall-clock epoch pinned ONCE at header-arrival; reused for BOTH the flat per-request fee
-    // (`budget_check` → `try_charge_request_within_budget`) and the token fee (`UsageSink::charged_at` → `record_tokens`) so
-    // a streaming request's two charges share one rate-limit/budget window (#29).
-    let charged_at = crate::store::now();
-    let v: Value = match crate::json::parse(&body) {
-        Ok(v) => v,
-        Err(_) => {
-            // Log a SANITIZED note for operators (just the byte length), never the parser's raw error:
-            // with sonic-rs it embeds a fragment of the malformed body, which can contain secrets/PII.
-            // The client gets only the generic, vendor-plausible message.
-            tracing::debug!(detail = %crate::json::parse_err_log(body.len()), "request body JSON parse failed");
-            // Pre-routing failures (the model was never resolved) must still be counted in
-            // REQUESTS_TOTAL / REQUEST_DURATION_SECONDS and fire the request-log webhook, the same
-            // observability invariant the governance rejections and the model-miss 404s enforce. A
-            // raw early-return made every malformed-body request invisible to Prometheus and the
-            // webhook. The model is unresolved here, so stamp the bounded `"unresolved"` sentinel as
-            // the `pool` label (metrics.rs), never a raw client string.
-            return finish_rejected(
-                app,
-                gov,
+    let Some(op_handler) = crate::handlers::request_handler(proto)
+        .and_then(|rh| rh.operation_handler(crate::operation::Operation::Chat))
+    else {
+        return finish_rejected(
+            app,
+            gov,
+            proto,
+            crate::forward::POOL_LABEL_UNRESOLVED,
+            started,
+            charged_at,
+            ingress_error(
                 proto,
-                crate::forward::POOL_LABEL_UNRESOLVED,
-                started,
-                charged_at,
-                ingress_error(
-                    proto,
-                    StatusCode::BAD_REQUEST,
-                    crate::forward::KIND_INVALID_REQUEST,
-                    "We could not parse the JSON body of your request.",
-                ),
-            );
-        }
+                StatusCode::NOT_FOUND,
+                crate::forward::KIND_NOT_FOUND,
+                "This endpoint does not support that operation.",
+            ),
+        );
     };
-
-    let model = match v.get("model").and_then(|m| m.as_str()) {
-        Some(m) if !m.is_empty() => m.to_string(),
-        _ => {
-            // Missing/empty model is a pre-routing failure: route through `finish_rejected` (bounded
-            // `"unresolved"` label) so it is observable in metrics + the webhook — never charged.
-            return finish_rejected(
-                app,
-                gov,
-                proto,
-                crate::forward::POOL_LABEL_UNRESOLVED,
-                started,
-                charged_at,
-                ingress_error(
-                    proto,
-                    StatusCode::BAD_REQUEST,
-                    crate::forward::KIND_INVALID_REQUEST,
-                    "Missing required parameter: 'model'.",
-                ),
-            );
-        }
-    };
-
-    forward_resolved(
+    operation_resolved(
         app,
         gov,
         proto,
-        &model,
+        crate::operation::Operation::Chat,
+        op_handler,
+        model,
         headers,
         body,
-        v,
+        Some(v),
         caller_token,
         started,
         charged_at,
-        // Body-model protocols (openai/cohere/responses) are never gemini, so the model-not-found
-        // 404 uses the canonical OpenAI-style message.
-        None,
+        gemini_api_version,
     )
     .await
 }
@@ -695,107 +659,8 @@ async fn ingress_path_model(
     .await
 }
 
-/// The common tail shared by both ingress cores: run the governance guards, resolve `model`
-/// against `app.pools` then `app.by_model`, forward through `forward_with_pool` with `proto`, and
-/// `finish`. A miss on both maps is a protocol-shaped 404.
-///
-/// `gemini_api_version` is `Some("v1"|"v1beta")` only for the gemini ingress (threaded down from
-/// `gemini_ingress`, which derives it from the request path); it shapes the model-not-found 404
-/// message into Gemini's native vocabulary. Every other protocol passes `None` and gets the
-/// canonical OpenAI-style copy (see `not_found_message`).
-#[allow(clippy::too_many_arguments)]
-async fn forward_resolved(
-    app: &Arc<App>,
-    gov: &crate::governance::GovCtx,
-    proto: &'static str,
-    model: &str,
-    headers: &HeaderMap,
-    body: Bytes,
-    v: Value,
-    caller_token: Option<&str>,
-    started: Instant,
-    charged_at: u64,
-    gemini_api_version: Option<&str>,
-) -> Response {
-    // CHAT IS A STANDARD OPERATION: this is now a thin adapter over the universal
-    // `operation_resolved` core — the same code path every operation takes. It exists only to keep
-    // the chat routing arms' (body-model / path-model) call shape stable; the chat OperationHandler
-    // resolves through the registry like any other.
-    let Some(op_handler) = crate::handlers::request_handler(proto)
-        .and_then(|rh| rh.operation_handler(crate::operation::Operation::Chat))
-    else {
-        return finish_rejected(
-            app,
-            gov,
-            proto,
-            crate::forward::POOL_LABEL_UNRESOLVED,
-            started,
-            charged_at,
-            ingress_error(
-                proto,
-                StatusCode::NOT_FOUND,
-                crate::forward::KIND_NOT_FOUND,
-                "This endpoint does not support that operation.",
-            ),
-        );
-    };
-    operation_resolved(
-        app,
-        gov,
-        proto,
-        crate::operation::Operation::Chat,
-        op_handler,
-        model,
-        headers,
-        body,
-        Some(v),
-        caller_token,
-        started,
-        charged_at,
-        gemini_api_version,
-    )
-    .await
-}
-// POST /v1/chat/completions — OpenAI-style ingress: model comes from the body. Routes through
-// `forward_with_pool` with ingress protocol "openai", so a request whose model resolves to a
-// non-OpenAI lane is translated both ways (request and response) via the IR — cross-protocol works.
-#[tracing::instrument(name = "openai_ingress", skip_all)]
-pub(crate) async fn openai_ingress(
-    State(app): State<Arc<App>>,
-    axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
-    axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    ingress_body_model(&app, &gov, &caller, &headers, body, "openai").await
-}
-
 mod dispatch;
 pub(crate) use dispatch::{operation_ingress, operation_resolved, protocol_dispatch};
-
-// POST /v2/chat — Cohere v2 ingress: model + stream live in the body, exactly like OpenAI.
-#[tracing::instrument(name = "cohere_ingress", skip_all)]
-pub(crate) async fn cohere_ingress(
-    State(app): State<Arc<App>>,
-    axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
-    axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    ingress_body_model(&app, &gov, &caller, &headers, body, "cohere").await
-}
-
-// POST /v1/responses — OpenAI Responses-API ingress: model + stream live in the body.
-#[tracing::instrument(name = "responses_ingress", skip_all)]
-pub(crate) async fn responses_ingress(
-    State(app): State<Arc<App>>,
-    axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
-    axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    ingress_body_model(&app, &gov, &caller, &headers, body, "responses").await
-}
 
 // POST /v1beta/models/*rest — Gemini ingress. The native path packs MODEL and ACTION into the last
 // segment with a colon: `/v1beta/models/{model}:{action}`. axum cannot split on a `:` inside a
@@ -1606,13 +1471,15 @@ mod tests {
         // A malformed-JSON request on the SAME key fails pre-routing (model never resolved) → 400.
         let caller = crate::auth::CallerToken(None);
         let headers = HeaderMap::new();
-        let resp = futures::executor::block_on(ingress_body_model(
+        let resp = futures::executor::block_on(operation_ingress(
             &app,
             &gov,
             &caller,
             &headers,
             Bytes::from_static(b"{ this is not valid json"),
             "openai",
+            crate::operation::Operation::Chat,
+            None,
         ));
         assert_eq!(
             resp.status(),
