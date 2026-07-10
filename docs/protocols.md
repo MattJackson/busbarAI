@@ -490,7 +490,7 @@ Two things can happen to a field on a cross-protocol hop:
 
 | Sent by | Field | Cross-protocol fate | What changes |
 |---|---|---|---|
-| OpenAI | `logprobs`, `top_logprobs` | dropped at seam | no per-token probabilities |
+| OpenAI | `logprobs`, `top_logprobs` | **carried to Gemini** (`responseLogprobs`/`logprobs`), and the response data comes back in the caller's shape, streaming included; dropped toward backends with no logprobs concept (Anthropic, Bedrock) | per-token probabilities work across the OpenAI/Gemini pair |
 | OpenAI | `logit_bias` | dropped at seam | token steering unavailable (token IDs are tokenizer-specific anyway) |
 | OpenAI | `store`, `metadata`, `service_tier` | dropped at seam | bookkeeping and tier hints only |
 | OpenAI | `stream_options` | dropped at seam | usage-in-stream hint lost |
@@ -508,7 +508,7 @@ Two things can happen to a field on a cross-protocol hop:
 | Responses | `previous_response_id` | dropped at seam | conversation state lives at OpenAI; a foreign backend answers without that context |
 | Responses | `store`, `reasoning`, `truncation`, `include`, `metadata` | dropped at seam | reasoning-effort hint and bookkeeping lost |
 
-Two fields that LOOK protocol-specific actually have an exact analog on the other side, so Busbar carries them instead of dropping them (measured, both directions): OpenAI `user` travels as Anthropic `metadata.user_id` (the same end-user identifier), and OpenAI `parallel_tool_calls` travels as Anthropic `tool_choice.disable_parallel_tool_use` (the same switch, inverted). A generic OpenAI `metadata` object still drops (Anthropic's metadata only holds `user_id`).
+Some fields that LOOK protocol-specific actually have an exact analog on the other side, so Busbar carries them instead of dropping them (measured, both directions): OpenAI `user` travels as Anthropic `metadata.user_id` (the same end-user identifier), OpenAI `parallel_tool_calls` travels as Anthropic `tool_choice.disable_parallel_tool_use` (the same switch, inverted), and **logprobs cross the OpenAI/Gemini pair in full**: the ask (`logprobs`/`top_logprobs` ↔ `generationConfig.responseLogprobs`/`logprobs`) travels one way and the per-token data (`choices[].logprobs.content[]` ↔ `candidates[].logprobsResult`) travels back, buffered and streaming. Cohere's logprobs stay same-protocol-only: its wire shape carries bare token IDs under Cohere's own tokenizer, which cannot honestly fill another protocol's token-string shape. A generic OpenAI `metadata` object still drops (Anthropic's metadata only holds `user_id`).
 
 The rule of thumb that falls out of the table: **statefulness, grounding, and safety configuration do not cross protocols**, because they are references to machinery that only exists at one vendor. If your request depends on `safetySettings`, `guardrailConfig`, `documents`, or `previous_response_id`, route it to a same-protocol backend (pin the pool, or use `exclusions`/direct routing), where all of it survives byte-for-byte. Sampling periphery (`logit_bias`, `top_k`, `seed`) degrades gracefully: the request still works, that one knob just does not exist over there.
 

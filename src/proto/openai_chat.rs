@@ -239,6 +239,84 @@ const BASE62: &[u8; 62] = crate::proto::BASE62_ALPHABET;
 /// which yields an exactly-uniform draw over 0..62. Discards are rare (8/256 ≈ 3.1%), so we refill the
 /// entropy buffer on demand rather than over-allocating up front; on a `getrandom` failure the loop
 /// stops and the remaining slots keep their '0' fill, preserving the panic-free contract.
+/// OpenAI's `logprobs` object (`{content: [{token, logprob, bytes, top_logprobs[]}]}`) → the
+/// neutral IR entries. `bytes` is preserved verbatim when present (a token can be a partial UTF-8
+/// fragment, so the byte array is the only faithful carrier).
+fn read_openai_logprobs(v: Option<&serde_json::Value>) -> Vec<crate::ir::IrTokenLogprob> {
+    let entries = match v
+        .and_then(|lp| lp.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let read_bytes = |e: &serde_json::Value| -> Option<Vec<u8>> {
+        e.get("bytes")?.as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|b| b.as_u64().and_then(|b| u8::try_from(b).ok()))
+                .collect()
+        })
+    };
+    entries
+        .iter()
+        .filter_map(|e| {
+            Some(crate::ir::IrTokenLogprob {
+                token: e.get("token")?.as_str()?.to_string(),
+                logprob: e.get("logprob")?.as_f64()?,
+                bytes: read_bytes(e),
+                top: e
+                    .get("top_logprobs")
+                    .and_then(|t| t.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|t| {
+                                Some(crate::ir::IrTopLogprob {
+                                    token: t.get("token")?.as_str()?.to_string(),
+                                    logprob: t.get("logprob")?.as_f64()?,
+                                    bytes: read_bytes(t),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// Neutral IR logprobs → OpenAI's `logprobs` object. `bytes` is synthesized from the token's UTF-8
+/// encoding when the source protocol (Gemini) carries none — the same value OpenAI itself returns
+/// for a whole-token UTF-8 string.
+fn write_openai_logprobs(lps: &[crate::ir::IrTokenLogprob]) -> serde_json::Value {
+    let content: Vec<serde_json::Value> = lps
+        .iter()
+        .map(|lp| {
+            let bytes = lp
+                .bytes
+                .clone()
+                .unwrap_or_else(|| lp.token.as_bytes().to_vec());
+            let top: Vec<serde_json::Value> = lp
+                .top
+                .iter()
+                .map(|t| {
+                    let b = t
+                        .bytes
+                        .clone()
+                        .unwrap_or_else(|| t.token.as_bytes().to_vec());
+                    serde_json::json!({"token": t.token, "logprob": t.logprob, "bytes": b})
+                })
+                .collect();
+            serde_json::json!({
+                "token": lp.token,
+                "logprob": lp.logprob,
+                "bytes": bytes,
+                "top_logprobs": top
+            })
+        })
+        .collect();
+    serde_json::json!({ "content": content })
+}
+
 fn synth_completion_id() -> String {
     // Largest multiple of 62 that fits in a u8; bytes >= this are rejected to keep the draw uniform.
     const BASE62_REJECT_FLOOR: u8 = crate::proto::BASE62_REJECT_THRESHOLD; // 4 * 62
@@ -308,6 +386,9 @@ fn modeled_request_keys() -> &'static std::collections::HashSet<&'static str> {
             // `tool_choice.disable_parallel_tool_use`), so they must not ALSO ride `extra`.
             "user",
             "parallel_tool_calls",
+            // Carried cross-protocol to Gemini's `generationConfig.responseLogprobs`/`logprobs`.
+            "logprobs",
+            "top_logprobs",
         ]
         .into_iter()
         .collect()
@@ -684,7 +765,17 @@ impl ProtocolReader for OpenAiReader {
             .map(|s| s.to_string());
         let parallel_tool_calls = obj.get("parallel_tool_calls").and_then(|v| v.as_bool());
 
+        // Logprobs ask, carried first-class so it reaches a Gemini backend as
+        // `generationConfig.responseLogprobs`/`logprobs` (and back).
+        let logprobs = obj.get("logprobs").and_then(|v| v.as_bool());
+        let top_logprobs = obj
+            .get("top_logprobs")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
+
         Ok(crate::ir::IrRequest {
+            logprobs,
+            top_logprobs,
             user,
             parallel_tool_calls,
             system: system_blocks,
@@ -811,6 +902,27 @@ impl ProtocolReader for OpenAiReader {
             out.push(IrStreamEvent::BlockDelta {
                 index: text_index,
                 delta: crate::ir::IrDelta::TextDelta(content.to_string()),
+            });
+        }
+
+        // 3b. Per-chunk logprobs ride the CHOICE (not the delta): `choices[].logprobs.content[]`
+        //     alongside the content delta. Carry them as a LogprobsDelta on the text block's index
+        //     so a foreign-dialect stream (e.g. a Gemini client) can re-emit them natively. A
+        //     logprobs-only chunk (no content) still opens the text block so the delta has a block
+        //     to attach to.
+        let lp_entries = read_openai_logprobs(choice0.and_then(|c| c.get("logprobs")));
+        if !lp_entries.is_empty() {
+            if !state.text_block_open {
+                state.text_block_open = true;
+                state.text_index = Some(text_index);
+                out.push(IrStreamEvent::BlockStart {
+                    index: text_index,
+                    block: crate::ir::IrBlockMeta::Text,
+                });
+            }
+            out.push(IrStreamEvent::BlockDelta {
+                index: state.text_index.unwrap_or(text_index),
+                delta: crate::ir::IrDelta::LogprobsDelta(lp_entries),
             });
         }
 
@@ -1189,7 +1301,12 @@ impl ProtocolReader for OpenAiReader {
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        // Per-token logprobs from the first choice, carried neutrally so a foreign-dialect caller
+        // (e.g. Gemini) receives them in its own shape.
+        let logprobs = read_openai_logprobs(choices[0].get("logprobs"));
+
         Ok(crate::ir::IrResponse {
+            logprobs,
             role: crate::ir::IrRole::Assistant,
             content,
             stop_reason,
@@ -1804,6 +1921,14 @@ impl ProtocolWriter for OpenAiWriter {
                 serde_json::json!(parallel),
             );
         }
+        // The logprobs ask in OpenAI's native spelling (a Gemini `responseLogprobs`/`logprobs`
+        // arrives here via the IR).
+        if let Some(logprobs) = req.logprobs {
+            out.insert("logprobs".to_string(), serde_json::json!(logprobs));
+        }
+        if let Some(top_logprobs) = req.top_logprobs {
+            out.insert("top_logprobs".to_string(), serde_json::json!(top_logprobs));
+        }
         if let Some(response_format) = &req.response_format {
             out.insert(
                 "response_format".to_string(),
@@ -1992,6 +2117,27 @@ impl ProtocolWriter for OpenAiWriter {
                     // rather than emit a non-native frame. The citation is preserved in the IR and
                     // re-emitted by any protocol that models streaming citations.
                     None
+                }
+                crate::ir::IrDelta::LogprobsDelta(lps) => {
+                    // Streamed logprobs (e.g. a Gemini backend's per-chunk `logprobsResult`) in
+                    // OpenAI's native chunk shape: `choices[].logprobs.content[]` alongside an
+                    // empty delta. The SDK accumulates logprobs from chunks independently of
+                    // content text, so a logprobs-only chunk parses cleanly. An empty vec carries
+                    // nothing and emits no chunk.
+                    if lps.is_empty() {
+                        None
+                    } else {
+                        let chunk_obj = serde_json::json!({
+                            "object": OBJ_CHUNK,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "logprobs": write_openai_logprobs(lps),
+                                "finish_reason": null
+                            }]
+                        });
+                        Some(("".to_string(), chunk_obj))
+                    }
                 }
             },
             IrStreamEvent::BlockStop { .. } => None,
@@ -2284,6 +2430,15 @@ impl ProtocolWriter for OpenAiWriter {
         let mut choice_obj = serde_json::Map::new();
         choice_obj.insert("index".to_string(), serde_json::json!(0));
         choice_obj.insert("message".to_string(), message_obj);
+        // Carried per-token logprobs (e.g. from a Gemini backend's `logprobsResult`) in OpenAI's
+        // native choice shape. Only emitted when the backend actually produced them: an absent
+        // `logprobs` key matches what OpenAI returns when they were not requested.
+        if !resp.logprobs.is_empty() {
+            choice_obj.insert(
+                "logprobs".to_string(),
+                write_openai_logprobs(&resp.logprobs),
+            );
+        }
         choice_obj.insert("finish_reason".to_string(), finish_reason);
         choices_array.push(serde_json::Value::Object(choice_obj));
 
@@ -2652,6 +2807,8 @@ mod tests {
     #[test]
     fn write_request_tool_result_multi_text_concatenates_without_separator() {
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -2694,6 +2851,8 @@ mod tests {
     #[test]
     fn write_request_emits_max_tokens_from_modeled_cap() {
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -2823,6 +2982,8 @@ mod tests {
     #[test]
     fn write_request_omits_token_cap_when_absent() {
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -2856,6 +3017,8 @@ mod tests {
     #[test]
     fn write_request_keeps_tool_use_on_user_message() {
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -2904,6 +3067,8 @@ mod tests {
     #[test]
     fn write_request_pure_tool_result_message_emits_only_flat_entries() {
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -2950,6 +3115,8 @@ mod tests {
     #[test]
     fn write_request_tool_role_mixed_content_not_dropped() {
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -3028,6 +3195,8 @@ mod tests {
     #[test]
     fn write_request_tool_result_on_user_message_emits_tool_message() {
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -3078,6 +3247,7 @@ mod tests {
     #[test]
     fn write_response_joins_text_blocks_and_keeps_tool_calls() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![
                 text_block("Hello "),
@@ -3115,6 +3285,7 @@ mod tests {
     #[test]
     fn write_response_content_null_when_no_text() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![IrBlock::ToolUse {
                 id: "c1".to_string(),
@@ -3247,6 +3418,7 @@ mod tests {
         // IR with no identity (cross-protocol: backend supplied none) must still emit a
         // protocol-correct id ("chatcmpl-...") and a created timestamp, without panicking.
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![text_block("hello")],
             stop_reason: Some(crate::ir::IrStopReason::EndTurn),
@@ -3289,6 +3461,7 @@ mod tests {
         // chat.completion schema requires a non-nullable `model` string, so the writer must emit a
         // present, non-null fallback (never omit the key).
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![text_block("hi")],
             stop_reason: Some(crate::ir::IrStopReason::EndTurn),
@@ -3319,6 +3492,7 @@ mod tests {
     fn write_response_preserves_upstream_model_over_fallback() {
         // A same-protocol passthrough must keep the upstream model verbatim, not the fallback.
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![text_block("hi")],
             stop_reason: Some(crate::ir::IrStopReason::EndTurn),
@@ -3459,6 +3633,7 @@ mod tests {
     #[test]
     fn write_response_total_tokens_saturates_on_overflow() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![text_block("x")],
             stop_reason: Some(crate::ir::IrStopReason::EndTurn),
@@ -3528,6 +3703,8 @@ mod tests {
     #[test]
     fn write_request_tool_call_only_assistant_has_null_content() {
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -3771,6 +3948,8 @@ mod tests {
     #[test]
     fn write_request_non_text_system_block_does_not_vanish_silently() {
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![
@@ -3964,6 +4143,8 @@ mod tests {
         // Gemini/Anthropic tool result rides on a non-Tool message), so this asserts both: the content
         // array carries only the text block, and a separate tool message carries the result.
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -4019,6 +4200,8 @@ mod tests {
     #[test]
     fn write_request_thinking_block_dropped_from_message_content() {
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -4255,6 +4438,7 @@ mod tests {
         // A cross-protocol response whose upstream provided no stop reason (stop_reason: None) must
         // still carry a `finish_reason` KEY, serialized as JSON null — never omitted.
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![text_block("partial")],
             stop_reason: None,
@@ -4297,6 +4481,7 @@ mod tests {
         ];
         for (stop_reason, want) in cases {
             let resp = crate::ir::IrResponse {
+                logprobs: Vec::new(),
                 role: IrRole::Assistant,
                 content: vec![text_block("x")],
                 stop_reason,
@@ -5060,6 +5245,8 @@ mod tests {
         description: Option<&str>,
     ) -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5247,6 +5434,7 @@ mod tests {
     fn write_response_safety_round_trips_to_content_filter() {
         // The canonical `safety` token must serialize back to OpenAI's native `content_filter`.
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![text_block("hi")],
             stop_reason: Some(crate::ir::IrStopReason::Safety),
@@ -5445,6 +5633,8 @@ mod tests {
     fn write_request_string_tool_arguments_emitted_verbatim() {
         let raw = "not-json {oops".to_string();
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5485,6 +5675,7 @@ mod tests {
     fn write_response_string_tool_arguments_emitted_verbatim() {
         let raw = "not-json {oops".to_string();
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![crate::ir::IrBlock::ToolUse {
                 id: "call_1".to_string(),
@@ -5746,6 +5937,8 @@ mod tests {
     /// Minimal valid `IrRequest` for writer-side tool_choice/temperature tests.
     fn test_ir_request() -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5973,6 +6166,8 @@ mod tests {
     fn test_write_request_file_id_image_dropped_not_corrupted() {
         let writer = OpenAiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -6041,6 +6236,8 @@ mod tests {
     fn test_write_request_image_s3_dropped_not_corrupted() {
         let writer = OpenAiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -6128,6 +6325,8 @@ mod tests {
             "response_format",
             "user",
             "parallel_tool_calls",
+            "logprobs",
+            "top_logprobs",
         ] {
             assert!(a.contains(k), "modeled key set must contain {k}");
         }
@@ -6176,6 +6375,7 @@ mod tests {
     #[test]
     fn write_response_reconstructs_prompt_tokens_total_with_cached_details() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![text_block("hi")],
             stop_reason: Some(crate::ir::IrStopReason::EndTurn),
@@ -6210,6 +6410,7 @@ mod tests {
     #[test]
     fn write_response_omits_cached_details_when_no_cache_read() {
         let mut resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![text_block("hi")],
             stop_reason: Some(crate::ir::IrStopReason::EndTurn),

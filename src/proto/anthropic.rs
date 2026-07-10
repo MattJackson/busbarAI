@@ -542,6 +542,8 @@ impl ProtocolReader for AnthropicReader {
         // mark a block redacted, so the old `__busbar` sentinel forgery vector is structurally closed.)
 
         Ok(crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user,
             parallel_tool_calls,
             system: system_blocks,
@@ -860,6 +862,7 @@ impl ProtocolReader for AnthropicReader {
             .map(String::from);
 
         Ok(crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role,
             content,
             stop_reason,
@@ -2202,6 +2205,8 @@ impl ProtocolWriter for AnthropicWriter {
                     // A streamed redacted-reasoning delta (opaque encrypted bytes) has no Anthropic
                     // streaming-delta analog — emit nothing for this frame.
                     IrDelta::RedactedReasoningDelta(_) => return None,
+                    // Anthropic has no logprobs concept at all — lossy-by-target, emit nothing.
+                    IrDelta::LogprobsDelta(_) => return None,
                     // L2-5 STREAMING citation: re-emit each carried citation as its own native
                     // `content_block_delta`/`citations_delta` event (the native wire carries ONE
                     // `citation` per delta). `write_citation` re-emits a byte-exact Anthropic `raw`
@@ -3129,6 +3134,7 @@ mod anthropic_hardening_tests {
     #[test]
     fn cross_protocol_write_synthesizes_valid_unique_id() {
         let make = || crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "x".to_string(),
@@ -3176,6 +3182,7 @@ mod anthropic_hardening_tests {
     #[test]
     fn write_response_synthesizes_id_when_neither_id_nor_created() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![],
             stop_reason: None,
@@ -4142,6 +4149,7 @@ mod anthropic_hardening_tests {
     #[test]
     fn write_response_keeps_unsigned_thinking_block() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Thinking {
                 text: "visible reasoning".to_string(),
@@ -4313,6 +4321,7 @@ mod anthropic_hardening_tests {
     #[test]
     fn write_response_emits_model_even_when_none() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![],
             stop_reason: None,
@@ -4340,6 +4349,7 @@ mod anthropic_hardening_tests {
     #[test]
     fn write_response_preserves_present_model() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![],
             stop_reason: None,
@@ -4451,6 +4461,7 @@ mod anthropic_hardening_tests {
     #[test]
     fn write_response_emits_null_stop_sequence_when_absent() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hi".to_string(),
@@ -4488,6 +4499,7 @@ mod anthropic_hardening_tests {
     #[test]
     fn write_response_emits_matched_stop_sequence_string() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![],
             stop_reason: Some(crate::ir::IrStopReason::StopSequence),
@@ -4794,6 +4806,8 @@ mod anthropic_hardening_tests {
     #[test]
     fn write_request_never_emits_system_role_message() {
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5172,6 +5186,7 @@ mod anthropic_hardening_tests {
     #[test]
     fn test_anthropic_safety_stop_reason_maps_to_end_turn() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![],
             stop_reason: Some(crate::ir::IrStopReason::Safety),
@@ -5499,6 +5514,7 @@ mod anthropic_hardening_tests {
     #[test]
     fn thinking_block_with_signature_survives_response_egress() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![
                 crate::ir::IrBlock::Thinking {
@@ -5554,6 +5570,8 @@ mod anthropic_hardening_tests {
     fn test_write_request_file_id_image_dropped_not_corrupted() {
         let writer = AnthropicWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -5622,6 +5640,8 @@ mod anthropic_hardening_tests {
     fn test_write_request_image_s3_dropped_not_corrupted() {
         let writer = AnthropicWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],

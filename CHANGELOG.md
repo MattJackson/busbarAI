@@ -37,6 +37,16 @@ not a special case.
   always floored by the request's remaining `failover.timeout_secs`. `0` is a startup
   error. Observable as `disposition="attempt_timeout"` on `busbar_upstream_failures_total`
   and `reason="attempt_timeout"` on `busbar_failovers_total`.
+- **Cross-protocol logprobs (OpenAI ↔ Gemini), buffered and streaming.** Per-token log
+  probabilities are now a first-class IR concept. The ask crosses the seam in either
+  direction (OpenAI `logprobs`/`top_logprobs` ↔ Gemini
+  `generationConfig.responseLogprobs`/`logprobs`) and the response data comes back in the
+  caller's own shape (`choices[].logprobs.content[]` ↔ `candidates[].logprobsResult`,
+  including chosen tokens, top alternatives, and synthesized UTF-8 `bytes` where OpenAI's
+  shape requires them), on buffered responses and per-chunk in streams. Backends with no
+  logprobs concept (Anthropic, Bedrock) never receive the ask; Cohere logprobs stay
+  same-protocol-only (its wire shape carries bare token IDs under its own tokenizer).
+  Live-validated against real OpenAI from a Gemini-dialect client, buffered and streaming.
 - **Two new cross-protocol carries: `user` and `parallel_tool_calls`.** OpenAI's `user`
   and Anthropic's `metadata.user_id` are the same end-user identifier; OpenAI's
   `parallel_tool_calls` and Anthropic's `tool_choice.disable_parallel_tool_use` are the

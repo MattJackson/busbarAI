@@ -659,6 +659,18 @@ impl ProtocolReader for GeminiReader {
         // `generationConfig` in `extra`, so Gemini→Gemini stays byte-identical regardless. `None`
         // when neither sub-field is present so a plain request gains no spurious response_format.
         let response_format = read_gemini_response_format(obj.get("generationConfig"));
+        // Logprobs ask, promoted like seed/penalties above: Gemini spells the boolean
+        // `generationConfig.responseLogprobs` and the top-count `generationConfig.logprobs`
+        // (0-20). Carried first-class so an OpenAI backend receives `logprobs`/`top_logprobs`.
+        let logprobs = obj
+            .get("generationConfig")
+            .and_then(|gc| gc.get("responseLogprobs"))
+            .and_then(|v| v.as_bool());
+        let top_logprobs = obj
+            .get("generationConfig")
+            .and_then(|gc| gc.get("logprobs"))
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
         // Promote Gemini's native `toolConfig.functionCallingConfig` into the IR `tool_choice` union
         // (PF-H1) so a forced / targeted directive survives the cross-protocol seam instead of
@@ -712,6 +724,8 @@ impl ProtocolReader for GeminiReader {
         }
 
         Ok(crate::ir::IrRequest {
+            logprobs,
+            top_logprobs,
             user: None,
             parallel_tool_calls: None,
             system: system_blocks,
@@ -1007,6 +1021,28 @@ impl ProtocolReader for GeminiReader {
                 });
             }
 
+            // 2c. STREAMING logprobs. Gemini carries a chunk's per-token logprobs at the candidate
+            // level (`candidates[].logprobsResult`), parallel to the content parts of that chunk.
+            // Same anchoring rule as the citations arm above: the delta attaches to the active text
+            // block's index (opening it if no text part has arrived yet) so an OpenAI-dialect
+            // stream can re-emit them as `choices[].logprobs.content[]`.
+            let stream_logprobs = read_gemini_logprobs(candidate.get("logprobsResult"));
+            if !stream_logprobs.is_empty() {
+                let ti = state.text_index.unwrap_or(state.open_tools.len());
+                if !state.text_block_open {
+                    state.text_block_open = true;
+                    state.text_index = Some(ti);
+                    out.push(IrStreamEvent::BlockStart {
+                        index: ti,
+                        block: crate::ir::IrBlockMeta::Text,
+                    });
+                }
+                out.push(IrStreamEvent::BlockDelta {
+                    index: ti,
+                    delta: crate::ir::IrDelta::LogprobsDelta(stream_logprobs),
+                });
+            }
+
             // 3. finishReason → close blocks + MessageDelta + MessageStop
             if let Some(finish_reason_val) =
                 candidate.get(FIELD_FINISH_REASON).and_then(|r| r.as_str())
@@ -1087,6 +1123,7 @@ impl ProtocolReader for GeminiReader {
                     .and_then(|i| i.as_str())
                     .map(String::from);
                 return Ok(crate::ir::IrResponse {
+                    logprobs: Vec::new(),
                     role: crate::ir::IrRole::Assistant,
                     content: Vec::new(),
                     stop_reason: Some(prompt_block_stop_reason(block_reason)),
@@ -1266,7 +1303,12 @@ impl ProtocolReader for GeminiReader {
             .and_then(|i| i.as_str())
             .map(String::from);
 
+        // Per-token logprobs from the candidate's `logprobsResult`, carried neutrally so an
+        // OpenAI-dialect caller receives them as `choices[].logprobs.content[]`.
+        let logprobs = read_gemini_logprobs(candidate.get("logprobsResult"));
+
         Ok(crate::ir::IrResponse {
+            logprobs,
             role: crate::ir::IrRole::Assistant,
             content,
             stop_reason,
@@ -1382,6 +1424,77 @@ fn synth_tool_call_id(call_index: usize, function_name: &str) -> String {
     call_index.hash(&mut hasher);
     function_name.hash(&mut hasher);
     format!("call_{:016x}", hasher.finish())
+}
+
+/// Gemini's `logprobsResult` — two PARALLEL arrays, `chosenCandidates[i]` (the generated token at
+/// position i) and `topCandidates[i].candidates[]` (the alternatives at that position) — zipped
+/// into the neutral IR entries. Gemini carries no byte arrays (`bytes: None`; an OpenAI writer
+/// synthesizes them from UTF-8).
+fn read_gemini_logprobs(v: Option<&serde_json::Value>) -> Vec<crate::ir::IrTokenLogprob> {
+    let chosen = match v
+        .and_then(|lr| lr.get("chosenCandidates"))
+        .and_then(|c| c.as_array())
+    {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let tops = v
+        .and_then(|lr| lr.get("topCandidates"))
+        .and_then(|c| c.as_array());
+    chosen
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            Some(crate::ir::IrTokenLogprob {
+                token: c.get("token")?.as_str()?.to_string(),
+                logprob: c.get("logProbability")?.as_f64()?,
+                bytes: None,
+                top: tops
+                    .and_then(|t| t.get(i))
+                    .and_then(|t| t.get("candidates"))
+                    .and_then(|c| c.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|t| {
+                                Some(crate::ir::IrTopLogprob {
+                                    token: t.get("token")?.as_str()?.to_string(),
+                                    logprob: t.get("logProbability")?.as_f64()?,
+                                    bytes: None,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// Neutral IR logprobs → Gemini's `logprobsResult` (chosen + top parallel arrays). `topCandidates`
+/// is emitted only when at least one position carries alternatives, matching Gemini's own omission
+/// of the array when `logprobs` (the top-count) was not requested.
+fn write_gemini_logprobs_result(lps: &[crate::ir::IrTokenLogprob]) -> serde_json::Value {
+    let chosen: Vec<serde_json::Value> = lps
+        .iter()
+        .map(|lp| serde_json::json!({"token": lp.token, "logProbability": lp.logprob}))
+        .collect();
+    let mut obj = serde_json::json!({ "chosenCandidates": chosen });
+    if lps.iter().any(|lp| !lp.top.is_empty()) {
+        let tops: Vec<serde_json::Value> = lps
+            .iter()
+            .map(|lp| {
+                serde_json::json!({
+                    "candidates": lp
+                        .top
+                        .iter()
+                        .map(|t| serde_json::json!({"token": t.token, "logProbability": t.logprob}))
+                        .collect::<Vec<serde_json::Value>>()
+                })
+            })
+            .collect();
+        obj["topCandidates"] = serde_json::json!(tops);
+    }
+    obj
 }
 
 /// Normalize Gemini's native `toolConfig.functionCallingConfig` into the IR `tool_choice` union
@@ -2289,6 +2402,14 @@ impl ProtocolWriter for GeminiWriter {
                 serde_json::json!(frequency_penalty),
             );
         }
+        // The logprobs ask in Gemini's native spellings (an OpenAI `logprobs`/`top_logprobs`
+        // arrives here via the IR): boolean `responseLogprobs`, top-count `logprobs`.
+        if let Some(logprobs) = req.logprobs {
+            gen_config.insert("responseLogprobs".to_string(), serde_json::json!(logprobs));
+        }
+        if let Some(top_logprobs) = req.top_logprobs {
+            gen_config.insert("logprobs".to_string(), serde_json::json!(top_logprobs));
+        }
         if let Some(presence_penalty) = req.presence_penalty {
             gen_config.insert(
                 "presencePenalty".to_string(),
@@ -2654,6 +2775,23 @@ impl ProtocolWriter for GeminiWriter {
                         ))
                     }
                 }
+                crate::ir::IrDelta::LogprobsDelta(lps) => {
+                    // Streamed logprobs (e.g. an OpenAI backend's per-chunk `logprobs.content[]`)
+                    // in Gemini's native chunk shape: a candidate carrying only `logprobsResult`.
+                    // An empty vec carries nothing and emits no frame.
+                    if lps.is_empty() {
+                        None
+                    } else {
+                        Some((
+                            "".to_string(),
+                            serde_json::json!({
+                                "candidates": [{
+                                    "logprobsResult": write_gemini_logprobs_result(lps)
+                                }]
+                            }),
+                        ))
+                    }
+                }
             },
 
             // BlockStop → FLUSH the open tool block as a single native `{name, args}` part. This is
@@ -2949,6 +3087,12 @@ impl ProtocolWriter for GeminiWriter {
             candidate["citationMetadata"] = serde_json::json!({
                 "citationSources": citation_sources
             });
+        }
+        // Carried per-token logprobs (e.g. from an OpenAI backend's `choices[].logprobs`) in
+        // Gemini's native candidate shape. Only emitted when the backend produced them, matching
+        // Gemini's own omission when `responseLogprobs` was not requested.
+        if !resp.logprobs.is_empty() {
+            candidate["logprobsResult"] = write_gemini_logprobs_result(&resp.logprobs);
         }
         let mut out = serde_json::json!({
             "candidates": [candidate]
@@ -3757,6 +3901,8 @@ mod tests {
     fn test_write_request_image_s3_dropped_not_corrupted() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -4413,6 +4559,7 @@ mod tests {
         let writer = GeminiWriter;
         for foreign in [S::Refusal, S::Error, S::Other] {
             let ir = crate::ir::IrResponse {
+                logprobs: Vec::new(),
                 role: crate::ir::IrRole::Assistant,
                 content: vec![crate::ir::IrBlock::Text {
                     text: "x".to_string(),
@@ -4467,6 +4614,7 @@ mod tests {
     fn test_response_identity_cross_protocol_emits_foreign_id() {
         let writer = GeminiWriter;
         let ir = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hello".to_string(),
@@ -4502,6 +4650,7 @@ mod tests {
     fn test_response_identity_none_id_is_omitted_not_fabricated() {
         let writer = GeminiWriter;
         let ir = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hi".to_string(),
@@ -4605,6 +4754,8 @@ mod tests {
     fn test_write_request_omits_stream_field() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -4724,6 +4875,8 @@ mod tests {
     fn test_write_request_thinking_only_turn_survives_with_placeholder() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -4816,6 +4969,8 @@ mod tests {
     fn test_write_request_null_tool_result_coerced_to_struct() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -4875,6 +5030,8 @@ mod tests {
     fn test_write_request_scalar_tool_result_coerced_to_struct() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5007,6 +5164,8 @@ mod tests {
     fn test_write_request_tool_result_plaintext_wrapped_not_dropped() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5066,6 +5225,8 @@ mod tests {
     fn test_write_request_tool_result_json_passthrough() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5111,6 +5272,7 @@ mod tests {
     fn test_response_identity_cross_protocol_synthesizes_id_when_created_set() {
         let writer = GeminiWriter;
         let ir = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hi".to_string(),
@@ -5807,6 +5969,8 @@ mod tests {
             serde_json::json!({"maxOutputTokens": 100, "responseMimeType": "text/plain"}),
         );
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5920,6 +6084,7 @@ mod tests {
     fn test_write_response_includes_total_token_count_cross_protocol() {
         let writer = GeminiWriter;
         let ir = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hi".to_string(),
@@ -5964,6 +6129,7 @@ mod tests {
     fn test_write_response_omits_total_token_count_same_protocol() {
         let writer = GeminiWriter;
         let ir = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hi".to_string(),
@@ -5995,6 +6161,7 @@ mod tests {
     fn test_write_response_total_token_count_saturates() {
         let writer = GeminiWriter;
         let ir = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: Vec::new(),
             stop_reason: Some(crate::ir::IrStopReason::EndTurn),
@@ -6031,6 +6198,7 @@ mod tests {
     fn test_write_response_includes_total_token_count_when_only_model_present() {
         let writer = GeminiWriter;
         let ir = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hi".to_string(),
@@ -6073,6 +6241,7 @@ mod tests {
     fn test_write_response_model_only_total_token_count_saturates() {
         let writer = GeminiWriter;
         let ir = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: Vec::new(),
             stop_reason: Some(crate::ir::IrStopReason::EndTurn),
@@ -6166,6 +6335,7 @@ mod tests {
     fn test_write_response_tool_use_maps_to_stop() {
         let writer = GeminiWriter;
         let ir = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::ToolUse {
                 id: "call_1".to_string(),
@@ -6232,6 +6402,8 @@ mod tests {
     fn test_write_request_image_url_sentinel_emits_file_data() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -6278,6 +6450,8 @@ mod tests {
     fn test_write_request_base64_image_still_inline_data() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -6603,6 +6777,8 @@ mod tests {
     fn test_tool_role_maps_to_user_for_function_response() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -6662,6 +6838,8 @@ mod tests {
     fn test_assistant_tool_use_stays_model_role() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -6882,6 +7060,8 @@ mod tests {
         let writer = GeminiWriter;
         let synthetic_id = "call_00000000deadbeef".to_string();
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -6960,6 +7140,8 @@ mod tests {
     fn test_write_request_same_protocol_function_response_name_falls_back_to_id() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -7183,6 +7365,8 @@ mod tests {
         // write_request path
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -7221,6 +7405,7 @@ mod tests {
 
         // write_response path
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![block],
             stop_reason: Some(crate::ir::IrStopReason::ToolUse),
@@ -7257,6 +7442,7 @@ mod tests {
     fn test_tool_use_object_input_passes_through_unchanged() {
         let writer = GeminiWriter;
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::ToolUse {
                 id: "call_1".to_string(),
@@ -7540,6 +7726,8 @@ mod tests {
     /// field(s) under test so the assertion targets exactly one gap.
     fn base_ir_request() -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -8439,6 +8627,7 @@ mod tests {
     #[test]
     fn write_response_reconstructs_prompt_token_count_with_cached() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hi".to_string(),
@@ -8512,6 +8701,187 @@ mod tests {
                 .and_then(|t| t.as_str()),
             Some("You are terse."),
             "IrRequest.system must write back to systemInstruction.parts[]"
+        );
+    }
+}
+
+#[cfg(test)]
+mod logprobs_carry_tests {
+    //! Cross-protocol logprobs (OpenAI<->Gemini): the ask (request) and the data (response,
+    //! buffered AND streaming) must cross the seam in both directions via the neutral IR.
+    use crate::proto::Protocol;
+
+    fn gemini_body_with_logprobs() -> serde_json::Value {
+        serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Hi"}]},
+                "finishReason": "STOP",
+                "logprobsResult": {
+                    "chosenCandidates": [
+                        {"token": "Hi", "logProbability": -0.031},
+                        {"token": "!", "logProbability": -0.87}
+                    ],
+                    "topCandidates": [
+                        {"candidates": [
+                            {"token": "Hi", "logProbability": -0.031},
+                            {"token": "Hello", "logProbability": -3.5}
+                        ]},
+                        {"candidates": [
+                            {"token": "!", "logProbability": -0.87},
+                            {"token": ".", "logProbability": -1.2}
+                        ]}
+                    ]
+                }
+            }],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2}
+        })
+    }
+
+    /// Gemini backend -> OpenAI caller (buffered): `logprobsResult` becomes
+    /// `choices[0].logprobs.content[]`, chosen+top zipped, bytes synthesized from UTF-8.
+    #[test]
+    fn gemini_logprobs_reach_openai_caller() {
+        let ir = Protocol::gemini()
+            .reader()
+            .read_response(&gemini_body_with_logprobs())
+            .expect("parses");
+        assert_eq!(ir.logprobs.len(), 2);
+        assert_eq!(ir.logprobs[0].token, "Hi");
+        assert_eq!(ir.logprobs[0].top.len(), 2);
+
+        let out = Protocol::openai().writer().write_response(&ir);
+        let content = &out["choices"][0]["logprobs"]["content"];
+        assert_eq!(content[0]["token"], "Hi");
+        assert_eq!(content[0]["logprob"], -0.031);
+        assert_eq!(content[0]["bytes"], serde_json::json!([72, 105])); // "Hi" UTF-8
+        assert_eq!(content[0]["top_logprobs"][1]["token"], "Hello");
+        assert_eq!(content[1]["token"], "!");
+    }
+
+    /// OpenAI backend -> Gemini caller (buffered): `choices[0].logprobs.content[]` becomes
+    /// `candidates[0].logprobsResult` with parallel chosen/top arrays.
+    #[test]
+    fn openai_logprobs_reach_gemini_caller() {
+        let body = serde_json::json!({
+            "id": "chatcmpl-x", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hi"},
+                "logprobs": {"content": [
+                    {"token": "Hi", "logprob": -0.05, "bytes": [72, 105],
+                     "top_logprobs": [{"token": "Hi", "logprob": -0.05, "bytes": [72, 105]}]}
+                ]},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+        });
+        let ir = Protocol::openai()
+            .reader()
+            .read_response(&body)
+            .expect("parses");
+        assert_eq!(ir.logprobs.len(), 1);
+        assert_eq!(ir.logprobs[0].bytes.as_deref(), Some(&[72u8, 105][..]));
+
+        let out = Protocol::gemini().writer().write_response(&ir);
+        let lr = &out["candidates"][0]["logprobsResult"];
+        assert_eq!(lr["chosenCandidates"][0]["token"], "Hi");
+        assert_eq!(lr["chosenCandidates"][0]["logProbability"], -0.05);
+        assert_eq!(lr["topCandidates"][0]["candidates"][0]["token"], "Hi");
+    }
+
+    /// A response WITHOUT logprobs gains nothing on translation in either direction.
+    #[test]
+    fn absence_gains_nothing() {
+        let mut body = gemini_body_with_logprobs();
+        body["candidates"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("logprobsResult");
+        let ir = Protocol::gemini().reader().read_response(&body).unwrap();
+        assert!(ir.logprobs.is_empty());
+        let out = Protocol::openai().writer().write_response(&ir);
+        assert!(
+            out["choices"][0].get("logprobs").is_none(),
+            "no logprobs from the backend -> no logprobs key emitted: {out}"
+        );
+    }
+
+    /// STREAMING, Gemini backend -> OpenAI caller: a chunk's `logprobsResult` becomes an OpenAI
+    /// chunk carrying `choices[0].logprobs.content[]` (alongside the text delta's own chunk).
+    #[test]
+    fn gemini_stream_logprobs_reach_openai_caller() {
+        let chunk = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Hi"}]},
+                "logprobsResult": {
+                    "chosenCandidates": [{"token": "Hi", "logProbability": -0.031}]
+                }
+            }]
+        });
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = Protocol::gemini()
+            .reader()
+            .read_response_events("", &chunk, &mut state);
+        let lp_event = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    e,
+                    crate::ir::IrStreamEvent::BlockDelta {
+                        delta: crate::ir::IrDelta::LogprobsDelta(_),
+                        ..
+                    }
+                )
+            })
+            .expect("a LogprobsDelta must be decoded from the chunk");
+
+        let openai = Protocol::openai();
+        let (_, frame) = openai
+            .writer()
+            .write_response_event(lp_event)
+            .expect("openai writer must emit a logprobs chunk");
+        assert_eq!(frame["choices"][0]["logprobs"]["content"][0]["token"], "Hi");
+        assert_eq!(frame["choices"][0]["delta"], serde_json::json!({}));
+    }
+
+    /// STREAMING, OpenAI backend -> Gemini caller: a chunk's `choices[0].logprobs` becomes a
+    /// Gemini chunk candidate carrying `logprobsResult`.
+    #[test]
+    fn openai_stream_logprobs_reach_gemini_caller() {
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-x", "object": "chat.completion.chunk", "created": 1, "model": "m",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "Hi"},
+                "logprobs": {"content": [{"token": "Hi", "logprob": -0.05}]},
+                "finish_reason": null
+            }]
+        });
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = Protocol::openai()
+            .reader()
+            .read_response_events("", &chunk, &mut state);
+        let lp_event = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    e,
+                    crate::ir::IrStreamEvent::BlockDelta {
+                        delta: crate::ir::IrDelta::LogprobsDelta(_),
+                        ..
+                    }
+                )
+            })
+            .expect("a LogprobsDelta must be decoded from the chunk");
+
+        let gemini = Protocol::gemini();
+        let (_, frame) = gemini
+            .writer()
+            .write_response_event(lp_event)
+            .expect("gemini writer must emit a logprobsResult chunk");
+        assert_eq!(
+            frame["candidates"][0]["logprobsResult"]["chosenCandidates"][0]["token"],
+            "Hi"
         );
     }
 }

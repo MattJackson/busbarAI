@@ -712,6 +712,8 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     fn probe_body(&self, model: &str) -> Vec<u8> {
         use crate::ir::{IrBlock, IrMessage, IrRequest, IrRole};
         let ir = IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -4838,6 +4840,7 @@ mod stream_translate_tests {
         ] {
             let name = proto.name().to_string();
             let resp = crate::ir::IrResponse {
+                logprobs: Vec::new(),
                 role: crate::ir::IrRole::Assistant,
                 content: vec![crate::ir::IrBlock::Text {
                     text: text.to_string(),
@@ -5682,6 +5685,7 @@ mod stream_translate_tests {
     #[test]
     fn redacted_reasoning_drops_on_writers_without_a_native_form() {
         let ir = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Thinking {
                 text: "OPAQUEENCRYPTEDBYTES".to_string(),
@@ -9162,6 +9166,7 @@ mod stop_reason_matrix_tests {
 
     fn resp(reason: IrStopReason) -> IrResponse {
         IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![IrBlock::Text {
                 text: "x".to_string(),

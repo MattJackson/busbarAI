@@ -4724,9 +4724,12 @@ mod cross_protocol_extra_tests {
     use crate::proto::Protocol;
 
     /// Structural class fix: on a CROSS-protocol request hop the source-protocol-only passthrough
-    /// keys swept into `IrRequest.extra` (e.g. OpenAI `logprobs`/`top_logprobs`/`n`) must NOT reach
-    /// the foreign egress backend body. The seam in `forward_with_pool` clears `ir.extra` before the
-    /// egress `write_request`; this mirrors that exact sequence (reader → clear → writer).
+    /// keys swept into `IrRequest.extra` (e.g. OpenAI `logit_bias`) must NOT reach the foreign
+    /// egress backend body. The seam in `forward_with_pool` clears `ir.extra` before the egress
+    /// `write_request`; this mirrors that exact sequence (reader → clear → writer).
+    /// (`logprobs`/`top_logprobs` are now FIRST-CLASS IR fields — carried to protocols that model
+    /// them (Gemini) and never emitted by ones that don't (Anthropic) — so this test asserts both
+    /// halves of the new contract too.)
     #[test]
     fn cross_protocol_strips_source_only_extra_keys() {
         let body = serde_json::json!({
@@ -4734,38 +4737,53 @@ mod cross_protocol_extra_tests {
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 16,
             "logprobs": true,
-            "top_logprobs": 5
+            "top_logprobs": 5,
+            "logit_bias": {"50256": -100}
         });
         let openai = Protocol::openai();
         let mut ir = openai.reader().read_request(&body).expect("read");
-        // Sanity: the reader DID sweep the source-only keys into extra. (`n` is now a first-class IR
-        // field, not an extra key, so it is no longer covered by this extra-stripping test — its
-        // cross-protocol behavior is covered by the per-protocol sampling tests.)
-        assert!(ir.extra.contains_key("logprobs"));
-        assert!(ir.extra.contains_key("top_logprobs"));
+        // logit_bias (token IDs are tokenizer-specific, unmappable) still rides extra;
+        // logprobs/top_logprobs are promoted out of it.
+        assert!(ir.extra.contains_key("logit_bias"));
+        assert!(!ir.extra.contains_key("logprobs"));
+        assert!(!ir.extra.contains_key("top_logprobs"));
+        assert_eq!(ir.logprobs, Some(true));
+        assert_eq!(ir.top_logprobs, Some(5));
 
         // The cross-protocol seam clears extra before handing to the foreign writer.
         ir.extra.clear();
+        // Anthropic has no logprobs concept: its writer must not emit any spelling of it.
         let anthropic = Protocol::anthropic();
         let out = anthropic.writer().write_request(&ir);
         let obj = out.as_object().expect("object body");
         assert!(
             !obj.contains_key("logprobs"),
-            "OpenAI logprobs must not leak onto an Anthropic backend body"
+            "logprobs must not leak onto an Anthropic backend body"
         );
         assert!(!obj.contains_key("top_logprobs"));
-        // The modeled fields still translate across.
+        assert!(!obj.contains_key("logit_bias"));
         assert!(obj.contains_key("messages"));
+
+        // Gemini DOES model it: the ask arrives in Gemini's native generationConfig spellings.
+        let gemini = Protocol::gemini();
+        let gout = gemini.writer().write_request(&ir);
+        assert_eq!(
+            gout["generationConfig"]["responseLogprobs"],
+            serde_json::json!(true),
+            "the logprobs ask must carry to Gemini as responseLogprobs"
+        );
+        assert_eq!(gout["generationConfig"]["logprobs"], serde_json::json!(5));
     }
 
-    /// SAME-protocol passthrough keeps `extra` intact (lossless): the seam only clears on a
-    /// cross-protocol hop, so an openai→openai round-trip must still carry `logprobs`.
+    /// SAME-protocol openai→openai must still carry `logprobs` (now via the first-class IR field
+    /// rather than `extra`) and the genuinely-unmapped `logit_bias` (still via `extra`).
     #[test]
     fn same_protocol_passthrough_preserves_extra_keys() {
         let body = serde_json::json!({
             "model": "gpt-4o",
             "messages": [{"role": "user", "content": "hi"}],
             "logprobs": true,
+            "logit_bias": {"50256": -100},
             "n": 3
         });
         let openai = Protocol::openai();
@@ -4776,7 +4794,11 @@ mod cross_protocol_extra_tests {
         assert_eq!(
             obj.get("logprobs"),
             Some(&serde_json::json!(true)),
-            "same-protocol openai→openai must preserve logprobs (lossless passthrough)"
+            "same-protocol openai→openai must preserve logprobs"
+        );
+        assert_eq!(
+            obj.get("logit_bias"),
+            Some(&serde_json::json!({"50256": -100}))
         );
         assert_eq!(obj.get("n"), Some(&serde_json::json!(3)));
     }
@@ -4794,6 +4816,7 @@ mod bedrock_eventstream_tests {
     #[test]
     fn buffered_response_wraps_into_converse_stream_frames() {
         let ir = IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![IrBlock::Text {
                 text: "hello world".to_string(),
@@ -4852,6 +4875,7 @@ mod bedrock_eventstream_tests {
     #[test]
     fn buffered_tool_use_wraps_into_converse_stream_tool_frames() {
         let ir = IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![IrBlock::ToolUse {
                 id: "toolu_abc123".to_string(),
@@ -4919,6 +4943,7 @@ mod bedrock_eventstream_tests {
     #[test]
     fn buffered_multi_block_assigns_distinct_monotonic_content_block_indices() {
         let ir = IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![
                 IrBlock::Text {
@@ -5028,6 +5053,7 @@ mod bedrock_eventstream_tests {
     #[test]
     fn buffered_tool_use_with_absent_stop_reason_defaults_to_tool_use() {
         let ir = IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![IrBlock::ToolUse {
                 id: "toolu_xyz".to_string(),
@@ -5068,6 +5094,7 @@ mod bedrock_eventstream_tests {
     #[test]
     fn buffered_text_only_with_absent_stop_reason_defaults_to_end_turn() {
         let ir = IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![IrBlock::Text {
                 text: "All done.".to_string(),
@@ -5105,6 +5132,7 @@ mod bedrock_eventstream_tests {
     #[test]
     fn buffered_explicit_stop_reason_overrides_content_default() {
         let ir = IrResponse {
+            logprobs: Vec::new(),
             role: IrRole::Assistant,
             content: vec![IrBlock::ToolUse {
                 id: "toolu_xyz".to_string(),

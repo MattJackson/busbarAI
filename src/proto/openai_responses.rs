@@ -825,6 +825,8 @@ impl ProtocolReader for ResponsesReader {
         }
 
         Ok(crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: system_blocks,
@@ -1672,6 +1674,7 @@ impl ProtocolReader for ResponsesReader {
         let created = obj.get("created_at").and_then(|c| c.as_u64());
 
         Ok(crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content,
             stop_reason,
@@ -3102,6 +3105,9 @@ impl ProtocolWriter for ResponsesWriter {
                 // citation stays in the IR and is re-emitted by protocols that model streaming
                 // citations). No panic on this otherwise-unhandled variant.
                 crate::ir::IrDelta::CitationsDelta(_) => None,
+                // Responses streaming logprobs (inside `output_text` events) are out of the 1.2
+                // OpenAI<->Gemini scope; dropped rather than emitted in a non-native shape.
+                crate::ir::IrDelta::LogprobsDelta(_) => None,
             },
 
             IrStreamEvent::BlockStop { index } => {
@@ -3709,6 +3715,8 @@ mod tests {
     #[test]
     fn write_request_drops_top_k_with_warn() {
         let mk = |top_k: Option<u32>| crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -3754,6 +3762,8 @@ mod tests {
     #[test]
     fn test_write_request() {
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![crate::ir::IrBlock::Text {
@@ -4002,6 +4012,8 @@ mod tests {
     #[test]
     fn test_roundtrip_identity() {
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![crate::ir::IrBlock::Text {
@@ -4238,6 +4250,7 @@ mod tests {
     #[test]
     fn test_write_response_function_call_item_has_native_id() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             id: Some("resp_x".to_string()),
             model: Some("gpt-4o".to_string()),
@@ -4373,6 +4386,7 @@ mod tests {
     #[test]
     fn test_write_response_preserves_text_after_tool_order() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             id: Some("resp_order".to_string()),
             model: Some("gpt-4o".to_string()),
@@ -4558,6 +4572,7 @@ mod tests {
     fn test_cross_protocol_write_synthesizes_valid_id() {
         let writer = ResponsesWriter;
         let make_ir = || crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "answer".to_string(),
@@ -5234,6 +5249,8 @@ mod tests {
     #[test]
     fn test_tool_only_assistant_turn_no_empty_message_wrapper() {
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5295,6 +5312,8 @@ mod tests {
     #[test]
     fn test_assistant_text_then_tool_call_order() {
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5617,6 +5636,8 @@ mod tests {
 
         // Tool-role path.
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5652,6 +5673,8 @@ mod tests {
 
         // Assistant-role inline tool_result path.
         let req = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5753,6 +5776,7 @@ mod tests {
 
         // Non-streaming write_response path.
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "ok".to_string(),
@@ -5879,6 +5903,8 @@ mod tests {
         let payload = "QUJDMTIzKz0=";
         let media_type = "image/jpeg";
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5952,6 +5978,8 @@ mod tests {
 
         // Round-trip through the writer reconstructs the exact original image_url.
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -5990,6 +6018,8 @@ mod tests {
     #[test]
     fn test_write_request_emits_stream() {
         let make = |stream: bool| crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -8216,6 +8246,7 @@ mod tests {
     #[test]
     fn test_write_response_emits_model_fallback() {
         let make_resp = |model: Option<String>| crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hi".to_string(),
@@ -8339,6 +8370,7 @@ mod tests {
     #[test]
     fn test_write_response_emits_error_null_for_completed_and_incomplete() {
         let make_resp = |stop: crate::ir::IrStopReason| crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hi".to_string(),
@@ -9019,6 +9051,8 @@ mod tests {
     /// individual tests can set just the one knob under test.
     fn empty_ir_request() -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: Vec::new(),
@@ -9536,6 +9570,7 @@ mod tests {
     #[test]
     fn write_response_reconstructs_input_tokens_total_with_cached_details() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hi".to_string(),

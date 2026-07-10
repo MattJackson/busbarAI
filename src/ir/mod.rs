@@ -59,6 +59,14 @@ pub(crate) struct IrRequest {
     /// Cohere reader/writer correctly omit `n` (like Anthropic/Bedrock/Responses). `u32`: a
     /// non-negative count. `None` == absent — never emitted.
     pub(crate) n: Option<u32>,
+    /// Per-token log-probability request (OpenAI `logprobs: bool`; Gemini
+    /// `generationConfig.responseLogprobs`). First-class so the ask carries between the two
+    /// protocols that model it; writers with no analog (Anthropic/Bedrock) never emit it. The
+    /// RESPONSE data rides [`IrResponse::logprobs`] / [`IrDelta::LogprobsDelta`]. `None` == absent.
+    pub(crate) logprobs: Option<bool>,
+    /// How many top-alternative tokens to return per position (OpenAI `top_logprobs` 0–20; Gemini
+    /// `generationConfig.logprobs`). `None` == absent.
+    pub(crate) top_logprobs: Option<u32>,
     /// Structured-output / response-format directive — canonicalized into the typed
     /// [`IrResponseFormat`] on read (NOT a raw protocol-shaped `Value`), so a writer can only project
     /// it into its OWN native shape and can never echo a foreign one. `None` == absent, never emitted.
@@ -264,6 +272,34 @@ pub(crate) struct IrResponse {
     pub(crate) system_fingerprint: Option<String>,
     /// Anthropic's `stop_sequence` (the matched stop string, or `null`). Default `None`.
     pub(crate) stop_sequence: Option<String>,
+    /// Per-token log probabilities for the generated text, in generation order (OpenAI
+    /// `choices[].logprobs.content`; Gemini `candidates[].logprobsResult`, chosen + top candidates
+    /// zipped). Empty == the backend sent none (nothing emitted). Carried protocol-neutrally so a
+    /// Gemini backend's logprobs reach an OpenAI-dialect caller in its own shape, and vice versa.
+    pub(crate) logprobs: Vec<IrTokenLogprob>,
+}
+
+/// One generated token's log probability, plus the top alternatives at that position. The neutral
+/// pivot between OpenAI's `{token, logprob, bytes, top_logprobs[]}` entries and Gemini's
+/// `logprobsResult.{chosenCandidates[i], topCandidates[i].candidates[]}` pair of parallel arrays.
+/// `bytes` is OpenAI-only fidelity (a token can be a partial UTF-8 fragment); a writer that needs
+/// bytes and has none synthesizes them from the token's UTF-8 encoding.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct IrTokenLogprob {
+    pub(crate) token: String,
+    pub(crate) logprob: f64,
+    pub(crate) bytes: Option<Vec<u8>>,
+    /// Top alternative tokens at this position (may include the chosen token itself, per both
+    /// vendors' semantics). Empty when the caller did not ask for alternatives.
+    pub(crate) top: Vec<IrTopLogprob>,
+}
+
+/// One alternative token candidate inside [`IrTokenLogprob::top`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct IrTopLogprob {
+    pub(crate) token: String,
+    pub(crate) logprob: f64,
+    pub(crate) bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -540,6 +576,12 @@ pub(crate) enum IrDelta {
     /// shape simply don't emit it (no panic, no corrupt output). Carried inside
     /// `IrStreamEvent::BlockDelta`, attached to the active text block's index.
     CitationsDelta(Vec<IrCitation>),
+    /// STREAMING per-token log probabilities, attached to the active text block's index (the same
+    /// additive pattern as `CitationsDelta`). The OpenAI reader maps a chunk's
+    /// `choices[].logprobs.content[]` here; the Gemini reader maps a chunk candidate's
+    /// `logprobsResult`. Writers that model streaming logprobs (OpenAI, Gemini) re-emit natively;
+    /// protocols with no shape for it simply don't emit it.
+    LogprobsDelta(Vec<IrTokenLogprob>),
 }
 
 /// Per-request decode state for stateful stream fan-out.

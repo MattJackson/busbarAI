@@ -911,6 +911,8 @@ impl ProtocolReader for CohereReader {
         }
 
         Ok(crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: system_blocks,
@@ -1341,6 +1343,7 @@ impl ProtocolReader for CohereReader {
             .or_else(|| Some(synthesize_cohere_id()));
 
         Ok(crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content,
             stop_reason,
@@ -1932,6 +1935,8 @@ impl ProtocolWriter for CohereWriter {
                 // a non-native frame. The citation is preserved in the IR for protocols that model
                 // streaming citations.
                 crate::ir::IrDelta::CitationsDelta(_) => None,
+                // Cohere v2 has no cross-protocol logprobs shape (token IDs only); dropped.
+                crate::ir::IrDelta::LogprobsDelta(_) => None,
             },
 
             IrStreamEvent::BlockStop { index } => {
@@ -2193,6 +2198,8 @@ mod tests {
     #[test]
     fn test_write_request() {
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![crate::ir::IrBlock::Text {
@@ -2292,6 +2299,8 @@ mod tests {
     #[test]
     fn test_read_request_roundtrip() {
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -2534,6 +2543,7 @@ mod tests {
     #[test]
     fn test_write_response_preserves_parallel_tool_calls() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![
                 crate::ir::IrBlock::ToolUse {
@@ -2590,6 +2600,8 @@ mod tests {
     #[test]
     fn test_write_request_sole_tooluse_omits_empty_content() {
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -2637,6 +2649,8 @@ mod tests {
     #[test]
     fn test_write_request_text_block_shapes() {
         let single = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -2820,6 +2834,7 @@ mod tests {
     #[test]
     fn test_cross_protocol_write_synthesizes_valid_id() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hello".to_string(),
@@ -3017,6 +3032,7 @@ mod tests {
     #[test]
     fn test_safety_finish_reason_writes_error_toxic_non_stream() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "moderated".to_string(),
@@ -3121,6 +3137,7 @@ mod tests {
         // Write-back round-trips: IR `error` -> native `ERROR`; IR `safety` -> native `ERROR_TOXIC`.
         let writer = CohereWriter;
         let err_resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: Vec::new(),
             stop_reason: Some(crate::ir::IrStopReason::Error),
@@ -3431,6 +3448,7 @@ mod tests {
     #[test]
     fn test_write_response_tool_calls_nested_and_roundtrip() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![
                 crate::ir::IrBlock::Text {
@@ -3967,6 +3985,8 @@ mod tests {
     #[test]
     fn test_write_request_stream_field_conditional() {
         let base = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -4141,6 +4161,8 @@ mod tests {
     #[test]
     fn test_tool_role_text_alongside_result_not_dropped() {
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -4201,6 +4223,8 @@ mod tests {
     #[test]
     fn test_tool_result_multi_block_content_joins_without_space() {
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -4255,6 +4279,8 @@ mod tests {
     #[test]
     fn test_tool_role_text_without_result_not_dropped() {
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -4303,6 +4329,8 @@ mod tests {
     #[test]
     fn test_tool_role_multi_text_without_result_is_string() {
         let ir = crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
@@ -5436,6 +5464,7 @@ mod tests {
     #[test]
     fn test_write_response_stop_sequence_maps_to_stop_sequence() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hi".to_string(),
@@ -5469,6 +5498,7 @@ mod tests {
     #[test]
     fn test_write_response_end_turn_maps_to_complete() {
         let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
             role: crate::ir::IrRole::Assistant,
             content: vec![crate::ir::IrBlock::Text {
                 text: "hi".to_string(),
@@ -5844,6 +5874,8 @@ mod tests {
     /// round-trip tests below.
     fn ir_with_tool_choice(tc: Option<crate::ir::IrToolChoice>) -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            logprobs: None,
+            top_logprobs: None,
             user: None,
             parallel_tool_calls: None,
             system: vec![],
