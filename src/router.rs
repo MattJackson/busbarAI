@@ -61,7 +61,7 @@ pub(crate) fn protocol_id(path: &str, h: &HeaderMap) -> Option<&'static str> {
     if path.ends_with("/v2/chat") || path.ends_with("/v1/chat") {
         return Some("cohere");
     }
-    if path.ends_with("/v2/embed") {
+    if path.ends_with("/v2/embed") || path.ends_with("/v2/rerank") {
         return Some("cohere");
     }
     if path.ends_with("/v1/responses") {
@@ -151,6 +151,7 @@ mod tests {
             ("/v1/audio/speech", &[], Some(("openai", Operation::Speech))),
             ("/v2/chat", &[], Some(("cohere", Operation::Chat))),
             ("/v2/embed", &[], Some(("cohere", Operation::Embeddings))),
+            ("/v2/rerank", &[], Some(("cohere", Operation::Rerank))),
             ("/v1/responses", &[], Some(("responses", Operation::Chat))),
             // anthropic ingress: mandatory header wins even though path is model-prefixed
             (

@@ -19,6 +19,7 @@ pub(crate) struct BedrockRequestHandler;
 static CHAT: crate::handlers::chat::ChatOperation = crate::handlers::chat::ChatOperation("bedrock");
 static EMB: BedrockEmbeddings = BedrockEmbeddings;
 static IMG: BedrockImage = BedrockImage;
+static RERANK: BedrockRerank = BedrockRerank;
 
 impl RequestHandler for BedrockRequestHandler {
     fn protocol_name(&self) -> &'static str {
@@ -28,6 +29,7 @@ impl RequestHandler for BedrockRequestHandler {
         match op {
             Operation::Embeddings => Some(&EMB),
             Operation::Image => Some(&IMG),
+            Operation::Rerank => Some(&RERANK),
             Operation::Chat => Some(&CHAT),
             _ => None, // genuine gaps stay None → no-handler 404
         }
@@ -59,6 +61,11 @@ impl RequestHandler for BedrockRequestHandler {
             }
             if has(b"inputText") {
                 return Some(Operation::Embeddings);
+            }
+            // Rerank models (cohere.rerank-*, amazon.rerank-*) take {query, documents} — no
+            // other InvokeModel body carries both keys.
+            if has(b"\"query\"") && has(b"\"documents\"") {
+                return Some(Operation::Rerank);
             }
         }
         None
@@ -232,6 +239,77 @@ impl OperationHandler for BedrockEmbeddings {
         let mut body = json!({ "embedding": floats });
         if let Some(u) = &r.usage {
             body["inputTextTokenCount"] = json!(u.input);
+        }
+        WireBody::json(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
+    }
+}
+
+/// Bedrock rerank models (`cohere.rerank-*`, `amazon.rerank-*`) via `/model/{id}/invoke`:
+/// `{query, documents[], top_n?, api_version}` → `{results: [{index, relevance_score}]}` — the
+/// same result shape as Cohere's own `/v2/rerank`, so translation between the two is exact. The
+/// model rides the URL (path-model protocol); `api_version: 2` is required by the cohere.rerank
+/// models and harmless to amazon.rerank.
+struct BedrockRerank;
+
+impl OperationHandler for BedrockRerank {
+    fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
+        let wire: Value =
+            serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
+        let query = wire
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let documents = crate::handlers::cohere::rerank_documents_pub(wire.get("documents"));
+        if query.is_empty() || documents.is_empty() {
+            return Err(IngressReject::BadRequest(
+                "rerank request requires `query` and `documents`".into(),
+            ));
+        }
+        Ok(IrReq::Rerank(crate::ir::rerank::RerankReq {
+            // Path-model protocol: the model arrives via the URL and routing calls `set_model`.
+            model: String::new(),
+            query,
+            documents,
+            top_n: wire.get("top_n").and_then(Value::as_u64).map(|n| n as u32),
+            ..Default::default()
+        }))
+    }
+    fn write_request(&self, ir: &IrReq) -> Bytes {
+        let IrReq::Rerank(r) = ir else {
+            return Bytes::new();
+        };
+        let mut body = json!({
+            "query": r.query,
+            "documents": r.documents,
+            "api_version": 2,
+        });
+        if let Some(n) = r.top_n {
+            body["top_n"] = json!(n);
+        }
+        Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
+    }
+    fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
+        let v: Value =
+            serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
+        Ok(IrResp::Rerank(crate::ir::rerank::RerankResp {
+            id: v.get("id").and_then(Value::as_str).map(str::to_string),
+            results: crate::handlers::cohere::read_rerank_results(v.get("results")),
+            ..Default::default()
+        }))
+    }
+    fn write_response(&self, ir: &IrResp) -> WireBody {
+        let IrResp::Rerank(r) = ir else {
+            return WireBody::json(Bytes::new());
+        };
+        let results: Vec<Value> = r
+            .results
+            .iter()
+            .map(|x| json!({"index": x.index, "relevance_score": x.relevance_score}))
+            .collect();
+        let mut body = json!({ "results": results });
+        if let Some(id) = &r.id {
+            body["id"] = json!(id);
         }
         WireBody::json(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
     }

@@ -323,7 +323,7 @@ response = bedrock.converse(
 
 ## Operations: more than chat
 
-Since 1.2, chat is one of five operations. Embeddings, moderations, image generation, and audio (transcription, speech-to-English translation, and text-to-speech) all run through the same lossless translation layer, in both directions, errors and usage accounting included. A client speaking one protocol can call any operation on a backend speaking another, wherever both sides support it.
+Since 1.2, chat is one of six operations. Embeddings, moderations, image generation, audio (transcription, speech-to-English translation, and text-to-speech), and rerank all run through the same lossless translation layer, in both directions, errors and usage accounting included. A client speaking one protocol can call any operation on a backend speaking another, wherever both sides support it.
 
 There is nothing to configure. A lane or pool serves whichever operations its protocol supports; you call the operation's surface instead of the chat surface, with the same model or pool name.
 
@@ -336,6 +336,7 @@ There is nothing to configure. A lane or pool serves whichever operations its pr
 | Moderations | ✓ | — | — | — | — | — |
 | Image generation | ✓ | — | ✓ | ✓ | — | — |
 | Audio (transcription and speech) | ✓ | — | ✓ | — | — | — |
+| Rerank | — | — | — | ✓ | ✓ | — |
 
 The matrix reads both ways: a checked cell means that protocol speaks the operation as a client dialect (ingress) and as a backend (egress). Any checked ingress can route to any checked egress on the same row; Busbar translates between them.
 
@@ -347,8 +348,8 @@ Each protocol keeps its own real wire surface for each operation, exactly as its
 |---|---|
 | openai | `/v1/embeddings`, `/v1/moderations`, `/v1/images/generations`, `/v1/audio/transcriptions` (and `/v1/audio/translations`), `/v1/audio/speech` |
 | gemini | `:embedContent` (and `:batchEmbedContents`) for embeddings, `:predict` for images; audio rides `:generateContent`, split by body (`responseModalities: ["AUDIO"]` is text-to-speech, an inline audio part is transcription) |
-| bedrock | Converse is chat; `/model/{id}/invoke` multiplexes by body (`textToImageParams` is image generation, `inputText` is embeddings) |
-| cohere | `/v2/embed` |
+| bedrock | Converse is chat; `/model/{id}/invoke` multiplexes by body (`textToImageParams` is image generation, `inputText` is embeddings, `query` + `documents` is rerank) |
+| cohere | `/v2/embed`, `/v2/rerank` |
 
 ### Calling an operation a backend lacks
 

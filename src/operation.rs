@@ -11,8 +11,8 @@
 //! Foundation type; `dead_code` allowed until the Router/IR wiring lands.
 #![allow(dead_code)]
 
-/// The six semantic operations busbar 1.2 speaks. Closed set — adding one is a compile error at every
-/// exhaustive match (the removability/symmetry gate, §9).
+/// The seven semantic operations busbar 1.2 speaks. Closed set — adding one is a compile error at
+/// every exhaustive match (the removability/symmetry gate, §9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Operation {
     Chat,
@@ -21,6 +21,7 @@ pub(crate) enum Operation {
     Image,
     Transcription,
     Speech,
+    Rerank,
 }
 
 impl Operation {
@@ -33,6 +34,7 @@ impl Operation {
             Operation::Image => "image",
             Operation::Transcription => "transcription",
             Operation::Speech => "speech",
+            Operation::Rerank => "rerank",
         }
     }
 }
@@ -50,6 +52,7 @@ mod tests {
             Operation::Image,
             Operation::Transcription,
             Operation::Speech,
+            Operation::Rerank,
         ];
         let names: Vec<_> = all.iter().map(|o| o.name()).collect();
         // all distinct

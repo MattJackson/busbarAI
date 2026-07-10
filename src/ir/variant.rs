@@ -29,6 +29,7 @@ pub(crate) enum IrReq {
     Image(ImageReq),
     Transcription(TranscriptionReq),
     Speech(SpeechReq),
+    Rerank(crate::ir::rerank::RerankReq),
 }
 
 impl IrReq {
@@ -41,6 +42,7 @@ impl IrReq {
             IrReq::Image(_) => Operation::Image,
             IrReq::Transcription(_) => Operation::Transcription,
             IrReq::Speech(_) => Operation::Speech,
+            IrReq::Rerank(_) => Operation::Rerank,
         }
     }
 
@@ -50,6 +52,7 @@ impl IrReq {
             IrReq::Chat(r) => r.stream,
             IrReq::Transcription(r) => r.stream,
             IrReq::Speech(r) => r.stream,
+            IrReq::Rerank(_) => false,
             IrReq::Embeddings(_) | IrReq::Moderation(_) | IrReq::Image(_) => false,
         }
     }
@@ -92,7 +95,8 @@ impl IrReq {
             | IrReq::Moderation(_)
             | IrReq::Image(_)
             | IrReq::Transcription(_)
-            | IrReq::Speech(_) => {}
+            | IrReq::Speech(_)
+            | IrReq::Rerank(_) => {}
         }
     }
 
@@ -109,6 +113,7 @@ impl IrReq {
             IrReq::Image(r) => r.model = model.to_string(),
             IrReq::Transcription(r) => r.model = model.to_string(),
             IrReq::Speech(r) => r.model = model.to_string(),
+            IrReq::Rerank(r) => r.model = model.to_string(),
         }
     }
 }
@@ -122,6 +127,7 @@ pub(crate) enum IrResp {
     Image(ImageResp),
     Transcription(TranscriptionResp),
     Speech(SpeechResp),
+    Rerank(crate::ir::rerank::RerankResp),
 }
 
 /// Resolved primitives for [`IrReq::prepare_for_egress`] — never a `Lane` or config handle.
@@ -163,7 +169,8 @@ impl IrResp {
             | IrResp::Moderation(_)
             | IrResp::Image(_)
             | IrResp::Transcription(_)
-            | IrResp::Speech(_) => {}
+            | IrResp::Speech(_)
+            | IrResp::Rerank(_) => {}
         }
     }
 
@@ -181,7 +188,8 @@ impl IrResp {
             | IrResp::Moderation(_)
             | IrResp::Image(_)
             | IrResp::Transcription(_)
-            | IrResp::Speech(_) => None,
+            | IrResp::Speech(_)
+            | IrResp::Rerank(_) => None,
         }
     }
 
@@ -193,6 +201,7 @@ impl IrResp {
             IrResp::Image(_) => Operation::Image,
             IrResp::Transcription(_) => Operation::Transcription,
             IrResp::Speech(_) => Operation::Speech,
+            IrResp::Rerank(_) => Operation::Rerank,
         }
     }
 
@@ -213,6 +222,7 @@ impl IrResp {
             IrResp::Image(r) => r.billing(),
             IrResp::Transcription(r) => r.billing(),
             IrResp::Speech(r) => r.billing(),
+            IrResp::Rerank(r) => r.billing(),
         }
     }
 }

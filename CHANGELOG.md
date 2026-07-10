@@ -11,9 +11,9 @@ appear as a bold **Migration** item under **Changed**.
 
 ## [1.2.0], 2026-07-10
 
-Busbar now speaks more than chat. Four new operations land on top of chat:
-**Embeddings**, **Moderations**, **Image generation**, and **Audio** (transcription and
-speech). Every one is **cross-protocol**, carried by the same lossless translation that
+Busbar now speaks more than chat. Five new operations land on top of chat:
+**Embeddings**, **Moderations**, **Image generation**, **Audio** (transcription and
+speech), and **Rerank**. Every one is **cross-protocol**, carried by the same lossless translation that
 already carried chat. A Gemini client can call embeddings on an Amazon Bedrock backend,
 an OpenAI client can route images and audio to Google Gemini, and every answer comes back
 in the caller's own dialect. The round trip is lossless in both directions, errors
@@ -60,6 +60,13 @@ not a special case.
 - **Image generation, cross-protocol.** An OpenAI-dialect image request routes to
   **OpenAI**, **Google Gemini** (Imagen), or **Amazon Bedrock** (Titan) and comes back in
   the caller's dialect.
+- **Rerank (`/v2/rerank` and Bedrock rerank models), cross-protocol.** The sixth
+  operation: **Cohere** v2 rerank and **Amazon Bedrock** rerank models (via
+  `InvokeModel`, detected by the `query` + `documents` body) translate exactly in both
+  directions — the two wires share the same result shape (`index` +
+  `relevance_score`), so a Cohere-dialect client can rerank on a Bedrock backend and
+  vice versa, with pools, failover, and breakers like every other operation. The other
+  four protocols ship no rerank surface and answer with the standard dialect-native 404.
 - **Audio, cross-protocol.** **Transcription** (speech-to-text, including
   speech-to-English translation) and **Speech** (text-to-speech) against **OpenAI** and
   **Google Gemini** backends, translated to and from the caller's dialect like every other
@@ -68,7 +75,6 @@ not a special case.
   backend does not implement (e.g. image generation on an Anthropic backend) returns a
   well-formed 404 **in the caller's own protocol dialect**: never a crash, never a
   malformed body, and never taking the lane down for other traffic.
-
 - **Cross-protocol reasoning/thinking carry (opt-in per lane).** The reasoning ask now
   translates between the three protocols that model it: OpenAI `reasoning_effort` /
   Responses `reasoning.effort` (words), Anthropic `thinking.budget_tokens` and Gemini

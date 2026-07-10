@@ -53,6 +53,8 @@ impl RequestHandler for GeminiRequestHandler {
                 format!("/v1beta/models/{m}:{verb}")
             }
             Operation::Moderation => format!("/v1beta/models/{m}:generateContent"),
+            // Unreachable in practice: gemini has no rerank handler, so Rerank never reaches here.
+            Operation::Rerank => format!("/v1beta/models/{m}:generateContent"),
         }
     }
     fn resolve_operation(&self, path: &str, body: &[u8]) -> Option<Operation> {

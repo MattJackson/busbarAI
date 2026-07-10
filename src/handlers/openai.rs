@@ -42,6 +42,8 @@ impl RequestHandler for OpenAiRequestHandler {
             Operation::Transcription => Some(&TRANSCRIPTION),
             Operation::Speech => Some(&SPEECH),
             Operation::Chat => Some(&CHAT),
+            // OpenAI ships no rerank surface — the standard no-handler 404.
+            Operation::Rerank => None,
         }
     }
     fn upstream_path(&self, ctx: &EgressCtx) -> String {
@@ -52,6 +54,8 @@ impl RequestHandler for OpenAiRequestHandler {
             Operation::Image => "/v1/images/generations".into(),
             Operation::Transcription => "/v1/audio/transcriptions".into(),
             Operation::Speech => "/v1/audio/speech".into(),
+            // Unreachable in practice: no handler above means Rerank never reaches egress here.
+            Operation::Rerank => "/v1/rerank".into(),
         }
     }
     fn resolve_operation(&self, path: &str, _body: &[u8]) -> Option<Operation> {
