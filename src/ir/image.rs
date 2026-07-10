@@ -41,12 +41,12 @@ pub(crate) struct ImageReq {
     pub(crate) negative_prompt: Option<String>,
     pub(crate) n: Option<u32>,
     // --- geometry: three mutually-exclusive provider conventions, kept parallel (lossless) ---
-    pub(crate) size: Option<ImageSize>,       // OpenAI/Titan/SDXL
-    pub(crate) aspect_ratio: Option<String>,  // Google, Stable Image ("16:9")
+    pub(crate) size: Option<ImageSize>,      // OpenAI/Titan/SDXL
+    pub(crate) aspect_ratio: Option<String>, // Google, Stable Image ("16:9")
     pub(crate) image_size_tier: Option<String>, // Imagen ("1K"/"2K")
     // --- quality / style / output ---
-    pub(crate) quality: Option<String>,       // standard|hd|low|medium|high|premium|auto
-    pub(crate) style: Option<String>,         // dall-e-3 vivid/natural; SDXL style_preset
+    pub(crate) quality: Option<String>, // standard|hd|low|medium|high|premium|auto
+    pub(crate) style: Option<String>,   // dall-e-3 vivid/natural; SDXL style_preset
     pub(crate) response_format: Option<String>, // url|b64_json (only dall-e honors; else b64)
     pub(crate) output_format: Option<String>, // png|jpeg|webp
     pub(crate) output_compression: Option<u8>,
@@ -56,10 +56,10 @@ pub(crate) struct ImageReq {
     pub(crate) steps: Option<u32>,          // SDXL
     pub(crate) background: Option<String>,  // transparent|opaque|auto (gpt-image-1)
     // --- edit / img2img inputs ---
-    pub(crate) input_images: Vec<String>,   // b64 / data-URI (edits up to 16; variation 1)
-    pub(crate) mask: Option<String>,        // b64 mask (dall-e-2 edits; Titan)
+    pub(crate) input_images: Vec<String>, // b64 / data-URI (edits up to 16; variation 1)
+    pub(crate) mask: Option<String>,      // b64 mask (dall-e-2 edits; Titan)
     pub(crate) mask_prompt: Option<String>, // Titan text mask
-    pub(crate) strength: Option<f32>,       // img2img / similarityStrength
+    pub(crate) strength: Option<f32>,     // img2img / similarityStrength
     // --- safety / provenance / misc ---
     pub(crate) person_generation: Option<String>,
     pub(crate) moderation: Option<String>,
@@ -116,7 +116,10 @@ mod tests {
             model: "imagen-3".into(),
             aspect_ratio: Some("16:9".into()),
             image_size_tier: Some("2K".into()),
-            size: Some(ImageSize::Wh { width: 1024, height: 1024 }),
+            size: Some(ImageSize::Wh {
+                width: 1024,
+                height: 1024,
+            }),
             ..Default::default()
         };
         // all three can be set — a codec picks its provider's convention without losing the others.
@@ -126,23 +129,38 @@ mod tests {
     #[test]
     fn billing_prefers_tokens_else_per_image() {
         let tokenized = ImageResp {
-            usage: Some(TokenUsage { input: 5, output: 272, ..Default::default() }),
+            usage: Some(TokenUsage {
+                input: 5,
+                output: 272,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert!(matches!(tokenized.billing(), Some(Billing::Tokens(_))));
 
         let per_image = ImageResp {
-            cost_basis: Some(CostBasis { count: 2, size: Some("1024x1024".into()), quality: Some("hd".into()) }),
+            cost_basis: Some(CostBasis {
+                count: 2,
+                size: Some("1024x1024".into()),
+                quality: Some("hd".into()),
+            }),
             ..Default::default()
         };
-        assert!(matches!(per_image.billing(), Some(Billing::Images { count: 2, .. })));
+        assert!(matches!(
+            per_image.billing(),
+            Some(Billing::Images { count: 2, .. })
+        ));
 
         assert!(ImageResp::default().billing().is_none());
     }
 
     #[test]
     fn variation_op_needs_no_prompt() {
-        let req = ImageReq { op: ImageOp::Variation, input_images: vec!["b64data".into()], ..Default::default() };
+        let req = ImageReq {
+            op: ImageOp::Variation,
+            input_images: vec!["b64data".into()],
+            ..Default::default()
+        };
         assert_eq!(req.op, ImageOp::Variation);
         assert!(req.prompt.is_none());
     }

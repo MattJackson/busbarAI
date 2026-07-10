@@ -120,14 +120,24 @@ mod tests {
 
     #[test]
     fn transcription_translation_folds_via_target_language() {
-        let transcribe = TranscriptionReq { model: "whisper-1".into(), ..Default::default() };
-        assert!(transcribe.target_language.is_none(), "no target = transcribe");
+        let transcribe = TranscriptionReq {
+            model: "whisper-1".into(),
+            ..Default::default()
+        };
+        assert!(
+            transcribe.target_language.is_none(),
+            "no target = transcribe"
+        );
         let translate = TranscriptionReq {
             model: "whisper-1".into(),
             target_language: Some("en".into()),
             ..Default::default()
         };
-        assert_eq!(translate.target_language.as_deref(), Some("en"), "target set = translate");
+        assert_eq!(
+            translate.target_language.as_deref(),
+            Some("en"),
+            "target set = translate"
+        );
     }
 
     #[test]
@@ -152,6 +162,9 @@ mod tests {
             ..Default::default()
         };
         assert!(resp.audio.is_some());
-        assert!(matches!(resp.billing(), Some(Billing::Characters { count: 11 })));
+        assert!(matches!(
+            resp.billing(),
+            Some(Billing::Characters { count: 11 })
+        ));
     }
 }

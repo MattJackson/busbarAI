@@ -42,10 +42,18 @@ pub(crate) struct DroppedField {
 
 impl DroppedField {
     pub(crate) fn no_analog(field: impl Into<String>, egress: impl Into<String>) -> Self {
-        Self { field: field.into(), egress: egress.into(), reason: DropReason::NoTargetAnalog }
+        Self {
+            field: field.into(),
+            egress: egress.into(),
+            reason: DropReason::NoTargetAnalog,
+        }
     }
     pub(crate) fn source_only(field: impl Into<String>, egress: impl Into<String>) -> Self {
-        Self { field: field.into(), egress: egress.into(), reason: DropReason::SourceOnlyExtra }
+        Self {
+            field: field.into(),
+            egress: egress.into(),
+            reason: DropReason::SourceOnlyExtra,
+        }
     }
 }
 
@@ -60,7 +68,10 @@ mod tests {
             .or_default()
             .insert("logprobs".into(), Value::Bool(true));
         assert!(e["openai"].contains_key("logprobs"));
-        assert!(!e.contains_key("anthropic"), "a foreign protocol's namespace is absent, not merged");
+        assert!(
+            !e.contains_key("anthropic"),
+            "a foreign protocol's namespace is absent, not merged"
+        );
     }
 
     #[test]

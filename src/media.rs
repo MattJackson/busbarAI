@@ -29,8 +29,16 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(B64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
         out.push(B64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 { B64_ALPHABET[((n >> 6) & 0x3f) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64_ALPHABET[(n & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            B64_ALPHABET[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64_ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -111,8 +119,8 @@ pub(crate) struct ImageOutput {
     pub(crate) url: Option<String>,
     pub(crate) mime_type: Option<String>,
     pub(crate) revised_prompt: Option<String>, // dall-e-3
-    pub(crate) seed: Option<u64>,               // SDXL / Stable Image
-    pub(crate) finish_reason: Option<String>,   // SUCCESS / CONTENT_FILTERED / "Filter reason: …"
+    pub(crate) seed: Option<u64>,              // SDXL / Stable Image
+    pub(crate) finish_reason: Option<String>,  // SUCCESS / CONTENT_FILTERED / "Filter reason: …"
 }
 
 impl ImageOutput {
@@ -132,12 +140,22 @@ mod tests {
         let l16 = MediaBlob {
             payload: MediaPayload::B64("AA==".into()),
             mime_type: "audio/L16;codec=pcm;rate=24000".into(),
-            pcm: Some(PcmParams { sample_rate: 24000, channels: 1, bit_depth: 16 }),
+            pcm: Some(PcmParams {
+                sample_rate: 24000,
+                channels: 1,
+                bit_depth: 16,
+            }),
         };
         assert!(l16.is_well_formed());
 
-        let l16_missing = MediaBlob { pcm: None, ..l16.clone() };
-        assert!(!l16_missing.is_well_formed(), "raw PCM without params is silently lossy");
+        let l16_missing = MediaBlob {
+            pcm: None,
+            ..l16.clone()
+        };
+        assert!(
+            !l16_missing.is_well_formed(),
+            "raw PCM without params is silently lossy"
+        );
 
         let mp3 = MediaBlob {
             payload: MediaPayload::Bytes(Bytes::from_static(b"\xff\xfb")),

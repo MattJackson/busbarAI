@@ -60,10 +60,16 @@ mod tests {
                 .into_iter()
                 .collect(),
         };
-        let resp = ModerationResp { results: vec![r], ..Default::default() };
+        let resp = ModerationResp {
+            results: vec![r],
+            ..Default::default()
+        };
         assert!(resp.results[0].flagged);
         assert_eq!(resp.results[0].category_scores["violence"], 0.97);
-        assert_eq!(resp.results[0].applied_input_types["violence"], vec!["text".to_string()]);
+        assert_eq!(
+            resp.results[0].applied_input_types["violence"],
+            vec!["text".to_string()]
+        );
     }
 
     #[test]

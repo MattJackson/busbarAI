@@ -56,7 +56,11 @@ impl OpDispatch {
     pub(crate) fn extract_usage(&self, ingress_protocol: &str, body: &[u8]) -> Option<IrUsage> {
         self.cell.extract_usage(ingress_protocol, body)
     }
-    pub(crate) fn egress_accept(&self, writer: &dyn ProtocolWriter, wants_stream: bool) -> &'static str {
+    pub(crate) fn egress_accept(
+        &self,
+        writer: &dyn ProtocolWriter,
+        wants_stream: bool,
+    ) -> &'static str {
         self.cell.egress_accept(writer, wants_stream)
     }
     /// The (protocol × operation) upstream path: lane override, else the lane's protocol
@@ -90,7 +94,10 @@ pub(crate) const CHAT: Op = OpDispatch {
 pub(crate) fn chat(protocol: &str) -> Op {
     crate::cells::request_handler(protocol)
         .and_then(|rh| rh.operation_handler(Operation::Chat))
-        .map(|cell| OpDispatch { operation: Operation::Chat, cell })
+        .map(|cell| OpDispatch {
+            operation: Operation::Chat,
+            cell,
+        })
         .unwrap_or(CHAT)
 }
 
@@ -103,7 +110,10 @@ mod tests {
         let chat = CHAT;
         assert_eq!(chat.name(), "chat");
         assert!(chat.streaming(), "chat streams");
-        assert!(chat.taps_nonstream_usage(), "chat bills tokens from the body");
+        assert!(
+            chat.taps_nonstream_usage(),
+            "chat bills tokens from the body"
+        );
         assert!(
             chat.wants_stream(&serde_json::json!({"stream": true})),
             "chat reads the stream boolean"
@@ -113,7 +123,10 @@ mod tests {
             chat.body_affinity_key(&serde_json::json!({"system": "you are helpful"})),
             Some("you are helpful")
         );
-        assert_eq!(chat.body_affinity_key(&serde_json::json!({"system": ""})), None);
+        assert_eq!(
+            chat.body_affinity_key(&serde_json::json!({"system": ""})),
+            None
+        );
     }
 
     /// The load-bearing invariant of the operations axis: the forward engine branches on the

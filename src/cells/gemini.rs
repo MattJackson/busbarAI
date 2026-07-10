@@ -4,7 +4,9 @@
 //! Gemini `RequestHandler` + cells (design §6/§7). Embeddings via `models/{id}:embedContent`.
 #![allow(dead_code)]
 
-use crate::handler::{CodecError, EgressCtx, IngressReject, OperationHandler, RequestHandler, WireBody};
+use crate::handler::{
+    CodecError, EgressCtx, IngressReject, OperationHandler, RequestHandler, WireBody,
+};
 use crate::ir::audio::{SpeechResp, TranscriptionResp};
 use crate::ir::embeddings::{EmbInput, EmbeddingItem, EmbeddingsResp, EncFmt, VectorData};
 use crate::ir::variant::{IrReq, IrResp};
@@ -40,7 +42,11 @@ impl RequestHandler for GeminiRequestHandler {
             Operation::Image => format!("/v1beta/models/{m}:predict"),
             // Chat + audio understanding/TTS all ride generateContent (stream-aware for chat/audio).
             Operation::Chat | Operation::Transcription | Operation::Speech => {
-                let verb = if ctx.stream { "streamGenerateContent" } else { "generateContent" };
+                let verb = if ctx.stream {
+                    "streamGenerateContent"
+                } else {
+                    "generateContent"
+                };
                 format!("/v1beta/models/{m}:{verb}")
             }
             Operation::Moderation => format!("/v1beta/models/{m}:generateContent"),
@@ -70,21 +76,30 @@ impl RequestHandler for GeminiRequestHandler {
                 if audio_out {
                     return Some(Operation::Speech);
                 }
-                let audio_in = v.pointer("/contents/0/parts").and_then(Value::as_array).is_some_and(|parts| {
-                    parts.iter().any(|p| {
-                        p.get("inline_data")
-                            .or_else(|| p.get("inlineData"))
-                            .and_then(|d| d.get("mime_type").or_else(|| d.get("mimeType")))
-                            .and_then(Value::as_str)
-                            .is_some_and(|m| m.starts_with("audio/"))
-                    })
-                });
+                let audio_in = v
+                    .pointer("/contents/0/parts")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|p| {
+                            p.get("inline_data")
+                                .or_else(|| p.get("inlineData"))
+                                .and_then(|d| d.get("mime_type").or_else(|| d.get("mimeType")))
+                                .and_then(Value::as_str)
+                                .is_some_and(|m| m.starts_with("audio/"))
+                        })
+                    });
                 if audio_in {
                     return Some(Operation::Transcription);
                 }
             }
         }
         Some(Operation::Chat)
+    }
+    fn path_model(&self, path: &str) -> Option<String> {
+        // `/{v1,v1beta}/models/{model}:{action}` — model is the last segment up to the LAST colon.
+        let rest = path.split("/models/").nth(1)?;
+        let (model, _action) = rest.rsplit_once(':')?;
+        (!model.is_empty()).then(|| model.to_string())
     }
 }
 
@@ -106,7 +121,10 @@ impl OperationHandler for GeminiTranscription {
                 if let Some(d) = inline {
                     audio = Some(MediaBlob {
                         payload: MediaPayload::B64(
-                            d.get("data").and_then(Value::as_str).unwrap_or_default().to_string(),
+                            d.get("data")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
                         ),
                         mime_type: d
                             .get("mime_type")
@@ -122,7 +140,9 @@ impl OperationHandler for GeminiTranscription {
             }
         }
         let Some(audio) = audio else {
-            return Err(IngressReject::BadRequest("transcription requires an inline_data audio part".into()));
+            return Err(IngressReject::BadRequest(
+                "transcription requires an inline_data audio part".into(),
+            ));
         };
         Ok(IrReq::Transcription(crate::ir::audio::TranscriptionReq {
             audio: Some(audio),
@@ -131,7 +151,9 @@ impl OperationHandler for GeminiTranscription {
         }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
-        let IrReq::Transcription(r) = ir else { return Bytes::new() };
+        let IrReq::Transcription(r) = ir else {
+            return Bytes::new();
+        };
         let (mime, data) = match &r.audio {
             Some(blob) => {
                 let d = match &blob.payload {
@@ -158,7 +180,8 @@ impl OperationHandler for GeminiTranscription {
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
     }
     fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
-        let v: Value = serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
+        let v: Value =
+            serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
         let text = v
             .pointer("/candidates/0/content/parts")
             .and_then(Value::as_array)
@@ -172,16 +195,28 @@ impl OperationHandler for GeminiTranscription {
             .unwrap_or_default();
         let usage = v.get("usageMetadata").map(|u| {
             crate::billing::Billing::Tokens(crate::billing::TokenUsage {
-                input: u.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0),
-                output: u.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0),
+                input: u
+                    .get("promptTokenCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                output: u
+                    .get("candidatesTokenCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
                 ..Default::default()
             })
         });
-        Ok(IrResp::Transcription(TranscriptionResp { text, usage, ..Default::default() }))
+        Ok(IrResp::Transcription(TranscriptionResp {
+            text,
+            usage,
+            ..Default::default()
+        }))
     }
     /// IR → gemini candidates response (gemini as INGRESS): transcript text as the model turn.
     fn write_response(&self, ir: &IrResp) -> WireBody {
-        let IrResp::Transcription(r) = ir else { return WireBody::json(Bytes::new()) };
+        let IrResp::Transcription(r) = ir else {
+            return WireBody::json(Bytes::new());
+        };
         let mut body = json!({
             "candidates": [{
                 "content": { "parts": [{ "text": r.text }], "role": "model" },
@@ -212,21 +247,33 @@ impl OperationHandler for GeminiSpeech {
             .pointer("/contents/0/parts")
             .and_then(Value::as_array)
             .map(|parts| {
-                parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("")
+                parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("")
             })
             .unwrap_or_default();
         if input.is_empty() {
-            return Err(IngressReject::BadRequest("speech requires a text part".into()));
+            return Err(IngressReject::BadRequest(
+                "speech requires a text part".into(),
+            ));
         }
         let voice = wire
             .pointer("/generationConfig/speechConfig/voiceConfig/prebuiltVoiceConfig/voiceName")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        Ok(IrReq::Speech(crate::ir::audio::SpeechReq { input, voice, ..Default::default() }))
+        Ok(IrReq::Speech(crate::ir::audio::SpeechReq {
+            input,
+            voice,
+            ..Default::default()
+        }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
-        let IrReq::Speech(r) = ir else { return Bytes::new() };
+        let IrReq::Speech(r) = ir else {
+            return Bytes::new();
+        };
         let mut speech_config = json!({
             "voiceConfig": { "prebuiltVoiceConfig": { "voiceName": r.voice } }
         });
@@ -257,7 +304,11 @@ impl OperationHandler for GeminiSpeech {
                     bit_depth: 16,
                 });
                 return Ok(IrResp::Speech(SpeechResp {
-                    audio: Some(MediaBlob { payload: MediaPayload::B64(data.to_string()), mime_type: mime, pcm }),
+                    audio: Some(MediaBlob {
+                        payload: MediaPayload::B64(data.to_string()),
+                        mime_type: mime,
+                        pcm,
+                    }),
                     ..Default::default()
                 }));
             }
@@ -274,7 +325,9 @@ impl OperationHandler for GeminiSpeech {
     /// IR → gemini TTS response (gemini as INGRESS): inline base64 audio as the model turn. Real
     /// Gemini answers TTS in JSON (`inlineData`), never raw binary — the caller's dialect rules.
     fn write_response(&self, ir: &IrResp) -> WireBody {
-        let IrResp::Speech(r) = ir else { return WireBody::json(Bytes::new()) };
+        let IrResp::Speech(r) = ir else {
+            return WireBody::json(Bytes::new());
+        };
         let (data, mime) = match &r.audio {
             Some(blob) => {
                 let d = match &blob.payload {
@@ -310,14 +363,25 @@ impl OperationHandler for GeminiImage {
                 .pointer("/instances/0/prompt")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            n: params.get("sampleCount").and_then(Value::as_u64).map(|n| n as u32),
-            aspect_ratio: params.get("aspectRatio").and_then(Value::as_str).map(str::to_string),
-            person_generation: params.get("personGeneration").and_then(Value::as_str).map(str::to_string),
+            n: params
+                .get("sampleCount")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32),
+            aspect_ratio: params
+                .get("aspectRatio")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            person_generation: params
+                .get("personGeneration")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             ..Default::default()
         }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
-        let IrReq::Image(r) = ir else { return Bytes::new() };
+        let IrReq::Image(r) = ir else {
+            return Bytes::new();
+        };
         let body = json!({
             "instances": [{ "prompt": r.prompt.clone().unwrap_or_default() }],
             "parameters": { "sampleCount": r.n.unwrap_or(1) },
@@ -325,25 +389,37 @@ impl OperationHandler for GeminiImage {
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
     }
     fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
-        let v: Value = serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
+        let v: Value =
+            serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
         let images = v
             .get("predictions")
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
                     .map(|p| crate::media::ImageOutput {
-                        b64: p.get("bytesBase64Encoded").and_then(Value::as_str).map(str::to_string),
-                        mime_type: p.get("mimeType").and_then(Value::as_str).map(str::to_string),
+                        b64: p
+                            .get("bytesBase64Encoded")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        mime_type: p
+                            .get("mimeType")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                         ..Default::default()
                     })
                     .collect()
             })
             .unwrap_or_default();
-        Ok(IrResp::Image(crate::ir::image::ImageResp { images, ..Default::default() }))
+        Ok(IrResp::Image(crate::ir::image::ImageResp {
+            images,
+            ..Default::default()
+        }))
     }
     /// IR → Imagen `:predict` response (gemini as INGRESS): `predictions[].bytesBase64Encoded`.
     fn write_response(&self, ir: &IrResp) -> WireBody {
-        let IrResp::Image(r) = ir else { return WireBody::json(Bytes::new()) };
+        let IrResp::Image(r) = ir else {
+            return WireBody::json(Bytes::new());
+        };
         let predictions: Vec<Value> = r
             .images
             .iter()
@@ -375,23 +451,40 @@ impl OperationHandler for GeminiEmbeddings {
             .pointer("/content/parts")
             .and_then(Value::as_array)
             .map(|parts| {
-                parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("")
+                parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("")
             })
             .unwrap_or_default();
         if text.is_empty() {
-            return Err(IngressReject::BadRequest("embedContent requires `content.parts[].text`".into()));
+            return Err(IngressReject::BadRequest(
+                "embedContent requires `content.parts[].text`".into(),
+            ));
         }
         Ok(IrReq::Embeddings(crate::ir::embeddings::EmbeddingsReq {
             input: EmbInput::Text(vec![text]),
-            task_type: wire.get("taskType").and_then(Value::as_str).map(str::to_string),
-            title: wire.get("title").and_then(Value::as_str).map(str::to_string),
-            dimensions: wire.get("outputDimensionality").and_then(Value::as_u64).map(|d| d as u32),
+            task_type: wire
+                .get("taskType")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            title: wire
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            dimensions: wire
+                .get("outputDimensionality")
+                .and_then(Value::as_u64)
+                .map(|d| d as u32),
             encoding_formats: vec![EncFmt::Float],
             ..Default::default()
         }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
-        let IrReq::Embeddings(r) = ir else { return Bytes::new() };
+        let IrReq::Embeddings(r) = ir else {
+            return Bytes::new();
+        };
         let text = match &r.input {
             EmbInput::Text(v) => v.first().cloned().unwrap_or_default(),
             _ => String::new(),
@@ -400,24 +493,42 @@ impl OperationHandler for GeminiEmbeddings {
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
     }
     fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
-        let v: Value = serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
+        let v: Value =
+            serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
         let mut item = EmbeddingItem::default();
-        if let Some(f) = v.get("embedding").and_then(|e| e.get("values")).and_then(Value::as_array) {
+        if let Some(f) = v
+            .get("embedding")
+            .and_then(|e| e.get("values"))
+            .and_then(Value::as_array)
+        {
             item.vectors.insert(
                 EncFmt::Float,
-                VectorData::Float(f.iter().filter_map(|x| x.as_f64().map(|n| n as f32)).collect()),
+                VectorData::Float(
+                    f.iter()
+                        .filter_map(|x| x.as_f64().map(|n| n as f32))
+                        .collect(),
+                ),
             );
         }
         let usage = v
             .get("usageMetadata")
             .and_then(|u| u.get("promptTokenCount"))
             .and_then(Value::as_u64)
-            .map(|n| crate::billing::TokenUsage { input: n, ..Default::default() });
-        Ok(IrResp::Embeddings(EmbeddingsResp { embeddings: vec![item], usage, ..Default::default() }))
+            .map(|n| crate::billing::TokenUsage {
+                input: n,
+                ..Default::default()
+            });
+        Ok(IrResp::Embeddings(EmbeddingsResp {
+            embeddings: vec![item],
+            usage,
+            ..Default::default()
+        }))
     }
     /// IR → gemini `:embedContent` response (gemini as INGRESS): `{"embedding":{"values":[..]}}`.
     fn write_response(&self, ir: &IrResp) -> WireBody {
-        let IrResp::Embeddings(r) = ir else { return WireBody::json(Bytes::new()) };
+        let IrResp::Embeddings(r) = ir else {
+            return WireBody::json(Bytes::new());
+        };
         let values: Vec<f32> = r
             .embeddings
             .first()

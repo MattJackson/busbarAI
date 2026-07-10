@@ -2128,7 +2128,10 @@ mod sigv4_path_tests {
     fn sigv4_canonical_double_encodes_bedrock_colon_path() {
         let (wire, canonical) =
             sign_and_wire_path_parts("/model/amazon.titan-embed-text-v2:0/invoke");
-        assert_eq!(wire, "/model/amazon.titan-embed-text-v2%3A0/invoke", "wire = single-encoded");
+        assert_eq!(
+            wire, "/model/amazon.titan-embed-text-v2%3A0/invoke",
+            "wire = single-encoded"
+        );
         assert_eq!(
             canonical, "/model/amazon.titan-embed-text-v2%253A0/invoke",
             "SigV4 canonical = double-encoded (non-S3 rule)"
@@ -2230,11 +2233,17 @@ pub(crate) async fn forward_operation(
                     };
                     // The cell owns the wire format: hand it raw bytes + the request content-type and let
                     // it parse (JSON, multipart, …). The engine never inspects the body.
-                    let mut ir_req = match cell.read_request(body.as_ref(), req_content_type.to_str().unwrap_or("")) {
+                    let mut ir_req = match cell
+                        .read_request(body.as_ref(), req_content_type.to_str().unwrap_or(""))
+                    {
                         Ok(ir) => ir,
                         Err(_) => {
-                            return ingress_error(ingress_protocol, StatusCode::BAD_REQUEST,
-                                KIND_INVALID_REQUEST, "We could not process the content of your request.")
+                            return ingress_error(
+                                ingress_protocol,
+                                StatusCode::BAD_REQUEST,
+                                KIND_INVALID_REQUEST,
+                                "We could not process the content of your request.",
+                            )
                         }
                     };
                     // The egress wire must carry the LANE's wire model, never the caller's busbar
@@ -2284,16 +2293,23 @@ pub(crate) async fn forward_operation(
                                 Ok(bytes) => {
                                     if !status.is_success() {
                                         // Never translate an error body; surface an ingress-native error.
-                                        return ingress_error(ingress_protocol, status, KIND_API_ERROR,
-                                            "The upstream provider returned an error.");
+                                        return ingress_error(
+                                            ingress_protocol,
+                                            status,
+                                            KIND_API_ERROR,
+                                            "The upstream provider returned an error.",
+                                        );
                                     }
                                     app.store.record_success_in(pool_name, i);
                                     let ir_resp = match egress_cell.read_response(&bytes) {
                                         Ok(ir) => ir,
                                         Err(_) => {
-                                            return ingress_error(ingress_protocol,
-                                                StatusCode::BAD_GATEWAY, KIND_API_ERROR,
-                                                "We could not read the upstream response.")
+                                            return ingress_error(
+                                                ingress_protocol,
+                                                StatusCode::BAD_GATEWAY,
+                                                KIND_API_ERROR,
+                                                "We could not read the upstream response.",
+                                            )
                                         }
                                     };
                                     // The cell chose the caller-dialect wire AND its content-type
@@ -2357,8 +2373,8 @@ pub(crate) async fn forward_operation(
             .timeout(std::time::Duration::from_secs(30));
         match req.send().await {
             Ok(resp) => {
-                let status = StatusCode::from_u16(resp.status().as_u16())
-                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                let status =
+                    StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 let up_ctype = resp
                     .headers()
                     .get(CONTENT_TYPE)

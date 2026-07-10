@@ -193,8 +193,10 @@ fn split_otlp_credentials(endpoint: &str) -> (String, Option<reqwest::header::He
 }
 
 /// Percent-decode a URL component to its raw UTF-8 string, leaving any byte that is not a valid
-/// `%XX` escape (or invalid UTF-8) untouched so a credential is never silently corrupted.
-fn percent_decode(s: &str) -> String {
+/// `%XX` escape (or invalid UTF-8) untouched so a credential is never silently corrupted. Also used
+/// by the protocol catch-all to decode path-model segments (axum's `Path` extractor decoded them
+/// before the collapse; the raw-path dispatch must match).
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

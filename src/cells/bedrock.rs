@@ -4,7 +4,9 @@
 //! Bedrock `RequestHandler` + cells (design §6/§7). Embeddings first (Titan, via InvokeModel).
 #![allow(dead_code)]
 
-use crate::handler::{CodecError, EgressCtx, IngressReject, OperationHandler, RequestHandler, WireBody};
+use crate::handler::{
+    CodecError, EgressCtx, IngressReject, OperationHandler, RequestHandler, WireBody,
+};
 use crate::ir::embeddings::{EmbInput, EmbeddingItem, EmbeddingsResp, EncFmt, VectorData};
 use crate::ir::variant::{IrReq, IrResp};
 use crate::operation::Operation;
@@ -31,7 +33,11 @@ impl RequestHandler for BedrockRequestHandler {
         match ctx.operation {
             // Chat uses the Converse API (stream-aware); embeddings/images use InvokeModel.
             Operation::Chat => {
-                let verb = if ctx.stream { "converse-stream" } else { "converse" };
+                let verb = if ctx.stream {
+                    "converse-stream"
+                } else {
+                    "converse"
+                };
                 format!("/model/{}/{verb}", ctx.model)
             }
             _ => format!("/model/{}/invoke", ctx.model),
@@ -54,6 +60,12 @@ impl RequestHandler for BedrockRequestHandler {
         }
         None
     }
+    fn path_model(&self, path: &str) -> Option<String> {
+        // `/model/{model}/{converse|converse-stream|invoke}` — the middle segment.
+        let rest = path.strip_prefix("/model/")?;
+        let (model, _verb) = rest.rsplit_once('/')?;
+        (!model.is_empty()).then(|| model.to_string())
+    }
 }
 
 /// Amazon Titan Image Generator via `/model/{id}/invoke`. prompt in → `images[]` (b64) out.
@@ -66,18 +78,35 @@ impl OperationHandler for BedrockImage {
         let wire: Value =
             serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
         let params = wire.get("textToImageParams").cloned().unwrap_or_default();
-        let cfg = wire.get("imageGenerationConfig").cloned().unwrap_or_default();
+        let cfg = wire
+            .get("imageGenerationConfig")
+            .cloned()
+            .unwrap_or_default();
         Ok(IrReq::Image(crate::ir::image::ImageReq {
-            prompt: params.get("text").and_then(Value::as_str).map(str::to_string),
-            negative_prompt: params.get("negativeText").and_then(Value::as_str).map(str::to_string),
-            n: cfg.get("numberOfImages").and_then(Value::as_u64).map(|n| n as u32),
+            prompt: params
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            negative_prompt: params
+                .get("negativeText")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            n: cfg
+                .get("numberOfImages")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32),
             seed: cfg.get("seed").and_then(Value::as_u64),
-            guidance_scale: cfg.get("cfgScale").and_then(Value::as_f64).map(|f| f as f32),
+            guidance_scale: cfg
+                .get("cfgScale")
+                .and_then(Value::as_f64)
+                .map(|f| f as f32),
             ..Default::default()
         }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
-        let IrReq::Image(r) = ir else { return Bytes::new() };
+        let IrReq::Image(r) = ir else {
+            return Bytes::new();
+        };
         let body = json!({
             "taskType": "TEXT_IMAGE",
             "textToImageParams": { "text": r.prompt.clone().unwrap_or_default() },
@@ -86,22 +115,31 @@ impl OperationHandler for BedrockImage {
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
     }
     fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
-        let v: Value = serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
+        let v: Value =
+            serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
         let images = v
             .get("images")
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
                     .filter_map(|b| b.as_str())
-                    .map(|b| crate::media::ImageOutput { b64: Some(b.to_string()), ..Default::default() })
+                    .map(|b| crate::media::ImageOutput {
+                        b64: Some(b.to_string()),
+                        ..Default::default()
+                    })
                     .collect()
             })
             .unwrap_or_default();
-        Ok(IrResp::Image(crate::ir::image::ImageResp { images, ..Default::default() }))
+        Ok(IrResp::Image(crate::ir::image::ImageResp {
+            images,
+            ..Default::default()
+        }))
     }
     /// IR → Titan image response (bedrock as INGRESS): `{"images": ["<b64>", …]}`.
     fn write_response(&self, ir: &IrResp) -> WireBody {
-        let IrResp::Image(r) = ir else { return WireBody::json(Bytes::new()) };
+        let IrResp::Image(r) = ir else {
+            return WireBody::json(Bytes::new());
+        };
         let images: Vec<&str> = r.images.iter().filter_map(|i| i.b64.as_deref()).collect();
         WireBody::json(Bytes::from(
             serde_json::to_vec(&json!({ "images": images })).unwrap_or_default(),
@@ -119,18 +157,25 @@ impl OperationHandler for BedrockEmbeddings {
         let wire: Value =
             serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
         let Some(text) = wire.get("inputText").and_then(Value::as_str) else {
-            return Err(IngressReject::BadRequest("invoke embeddings requires `inputText`".into()));
+            return Err(IngressReject::BadRequest(
+                "invoke embeddings requires `inputText`".into(),
+            ));
         };
         Ok(IrReq::Embeddings(crate::ir::embeddings::EmbeddingsReq {
             input: EmbInput::Text(vec![text.to_string()]),
-            dimensions: wire.get("dimensions").and_then(Value::as_u64).map(|d| d as u32),
+            dimensions: wire
+                .get("dimensions")
+                .and_then(Value::as_u64)
+                .map(|d| d as u32),
             normalize: wire.get("normalize").and_then(Value::as_bool),
             encoding_formats: vec![EncFmt::Float],
             ..Default::default()
         }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
-        let IrReq::Embeddings(r) = ir else { return Bytes::new() };
+        let IrReq::Embeddings(r) = ir else {
+            return Bytes::new();
+        };
         let text = match &r.input {
             EmbInput::Text(v) => v.first().cloned().unwrap_or_default(), // Titan takes a single inputText
             _ => String::new(),
@@ -142,23 +187,37 @@ impl OperationHandler for BedrockEmbeddings {
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
     }
     fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
-        let v: Value = serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
+        let v: Value =
+            serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
         let mut item = EmbeddingItem::default();
         if let Some(f) = v.get("embedding").and_then(Value::as_array) {
             item.vectors.insert(
                 EncFmt::Float,
-                VectorData::Float(f.iter().filter_map(|x| x.as_f64().map(|n| n as f32)).collect()),
+                VectorData::Float(
+                    f.iter()
+                        .filter_map(|x| x.as_f64().map(|n| n as f32))
+                        .collect(),
+                ),
             );
         }
         let usage = v
             .get("inputTextTokenCount")
             .and_then(Value::as_u64)
-            .map(|n| crate::billing::TokenUsage { input: n, ..Default::default() });
-        Ok(IrResp::Embeddings(EmbeddingsResp { embeddings: vec![item], usage, ..Default::default() }))
+            .map(|n| crate::billing::TokenUsage {
+                input: n,
+                ..Default::default()
+            });
+        Ok(IrResp::Embeddings(EmbeddingsResp {
+            embeddings: vec![item],
+            usage,
+            ..Default::default()
+        }))
     }
     /// IR → Titan embeddings response (bedrock as INGRESS): `embedding` + `inputTextTokenCount`.
     fn write_response(&self, ir: &IrResp) -> WireBody {
-        let IrResp::Embeddings(r) = ir else { return WireBody::json(Bytes::new()) };
+        let IrResp::Embeddings(r) = ir else {
+            return WireBody::json(Bytes::new());
+        };
         let floats: Vec<f32> = r
             .embeddings
             .first()

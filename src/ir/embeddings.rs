@@ -59,11 +59,11 @@ pub(crate) struct EmbeddingsReq {
     pub(crate) title: Option<String>,      // Gemini RETRIEVAL_DOCUMENT
     pub(crate) dimensions: Option<u32>,    // OpenAI/Cohere/Gemini/Titan (one canonical field)
     pub(crate) encoding_formats: Vec<EncFmt>, // Vec: Cohere/Titan may request several at once
-    pub(crate) truncate: Option<String>,   // NONE/START/END (Cohere/Bedrock); Gemini autoTruncate maps here
-    pub(crate) max_tokens: Option<u32>,    // Cohere
-    pub(crate) normalize: Option<bool>,    // Titan v2
-    pub(crate) user: Option<String>,       // OpenAI
-    pub(crate) priority: Option<i32>,      // Cohere
+    pub(crate) truncate: Option<String>, // NONE/START/END (Cohere/Bedrock); Gemini autoTruncate maps here
+    pub(crate) max_tokens: Option<u32>,  // Cohere
+    pub(crate) normalize: Option<bool>,  // Titan v2
+    pub(crate) user: Option<String>,     // OpenAI
+    pub(crate) priority: Option<i32>,    // Cohere
     pub(crate) extra: SourceScopedExtra,
 }
 
@@ -101,9 +101,14 @@ mod tests {
 
     #[test]
     fn response_carries_multiple_typed_vectors_losslessly() {
-        let mut item = EmbeddingItem { index: 0, ..Default::default() };
-        item.vectors.insert(EncFmt::Float, VectorData::Float(vec![0.1, 0.2]));
-        item.vectors.insert(EncFmt::Int8, VectorData::Int(vec![1, 2]));
+        let mut item = EmbeddingItem {
+            index: 0,
+            ..Default::default()
+        };
+        item.vectors
+            .insert(EncFmt::Float, VectorData::Float(vec![0.1, 0.2]));
+        item.vectors
+            .insert(EncFmt::Int8, VectorData::Int(vec![1, 2]));
         // Both encodings coexist — a flat Vec<f32> would drop the int8 vector.
         assert_eq!(item.vectors.len(), 2);
         assert!(matches!(item.vectors[&EncFmt::Int8], VectorData::Int(_)));
@@ -123,7 +128,10 @@ mod tests {
     #[test]
     fn billing_maps_token_usage_or_none() {
         let resp = EmbeddingsResp {
-            usage: Some(TokenUsage { input: 11, ..Default::default() }),
+            usage: Some(TokenUsage {
+                input: 11,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert!(matches!(resp.billing(), Some(Billing::Tokens(_))));

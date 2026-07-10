@@ -9,7 +9,9 @@
 //! added here as they're built.
 #![allow(dead_code)]
 
-use crate::handler::{CodecError, EgressCtx, IngressReject, OperationHandler, RequestHandler, WireBody};
+use crate::handler::{
+    CodecError, EgressCtx, IngressReject, OperationHandler, RequestHandler, WireBody,
+};
 use crate::ir::moderation::{ModerationInput, ModerationReq, ModerationResp, ModerationResult};
 use crate::ir::variant::{IrReq, IrResp};
 use crate::operation::Operation;
@@ -59,7 +61,9 @@ impl RequestHandler for OpenAiRequestHandler {
             Some(Operation::Moderation)
         } else if path.contains("/v1/images/") {
             Some(Operation::Image)
-        } else if path.ends_with("/v1/audio/transcriptions") || path.ends_with("/v1/audio/translations") {
+        } else if path.ends_with("/v1/audio/transcriptions")
+            || path.ends_with("/v1/audio/translations")
+        {
             Some(Operation::Transcription)
         } else if path.ends_with("/v1/audio/speech") {
             Some(Operation::Speech)
@@ -120,20 +124,28 @@ fn parse_multipart<'a>(body: &'a [u8], content_type: &str) -> Vec<MultipartField
     for w in positions.windows(2) {
         let seg = &body[w[0] + dl..w[1]];
         let seg = seg.strip_prefix(b"\r\n").unwrap_or(seg);
-        let Some(hpos) = find_sub(seg, b"\r\n\r\n") else { continue };
+        let Some(hpos) = find_sub(seg, b"\r\n\r\n") else {
+            continue;
+        };
         let headers = String::from_utf8_lossy(&seg[..hpos]);
         let mut value = &seg[hpos + 4..];
         if value.ends_with(b"\r\n") {
             value = &value[..value.len() - 2];
         }
-        let Some(name) = header_attr(&headers, "name") else { continue };
+        let Some(name) = header_attr(&headers, "name") else {
+            continue;
+        };
         let content_type = headers.lines().find_map(|l| {
             let l = l.trim();
             l.strip_prefix("Content-Type:")
                 .or_else(|| l.strip_prefix("content-type:"))
                 .map(|v| v.trim().to_string())
         });
-        fields.push(MultipartField { name, content_type, value });
+        fields.push(MultipartField {
+            name,
+            content_type,
+            value,
+        });
     }
     fields
 }
@@ -148,7 +160,9 @@ impl OperationHandler for OpenAiTranscription {
         for f in &fields {
             match f.name.as_str() {
                 "model" => req.model = String::from_utf8_lossy(f.value).trim().to_string(),
-                "language" => req.source_language = Some(String::from_utf8_lossy(f.value).trim().to_string()),
+                "language" => {
+                    req.source_language = Some(String::from_utf8_lossy(f.value).trim().to_string())
+                }
                 "prompt" => req.prompt = Some(String::from_utf8_lossy(f.value).into_owned()),
                 "response_format" => {
                     req.response_format = Some(String::from_utf8_lossy(f.value).trim().to_string())
@@ -156,7 +170,10 @@ impl OperationHandler for OpenAiTranscription {
                 "file" => {
                     req.audio = Some(MediaBlob {
                         payload: MediaPayload::Bytes(Bytes::copy_from_slice(f.value)),
-                        mime_type: f.content_type.clone().unwrap_or_else(|| "application/octet-stream".into()),
+                        mime_type: f
+                            .content_type
+                            .clone()
+                            .unwrap_or_else(|| "application/octet-stream".into()),
                         pcm: None,
                     })
                 }
@@ -164,14 +181,18 @@ impl OperationHandler for OpenAiTranscription {
             }
         }
         if req.audio.is_none() {
-            return Err(IngressReject::BadRequest("transcription requires a file part".into()));
+            return Err(IngressReject::BadRequest(
+                "transcription requires a file part".into(),
+            ));
         }
         Ok(IrReq::Transcription(req))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
         // OpenAI-as-egress rebuilds the multipart form (fixed boundary — no randomness needed). Not on
         // the harness path (openai is always ingress there); kept for cross-protocol symmetry.
-        let IrReq::Transcription(r) = ir else { return Bytes::new() };
+        let IrReq::Transcription(r) = ir else {
+            return Bytes::new();
+        };
         let boundary = "----busbaraudioMIME";
         let mut out: Vec<u8> = Vec::new();
         let mut push_field = |name: &str, val: &str| {
@@ -197,15 +218,25 @@ impl OperationHandler for OpenAiTranscription {
         // gpt-4o-transcribe models TOKENS — captured from the live API (2026-07-10). Both → Billing.
         let (text, usage) = match serde_json::from_slice::<Value>(wire) {
             Ok(v) => {
-                let text = v.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+                let text = v
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 (text, v.get("usage").and_then(parse_transcription_usage))
             }
             Err(_) => (String::from_utf8_lossy(wire).into_owned(), None),
         };
-        Ok(IrResp::Transcription(TranscriptionResp { text, usage, ..Default::default() }))
+        Ok(IrResp::Transcription(TranscriptionResp {
+            text,
+            usage,
+            ..Default::default()
+        }))
     }
     fn write_response(&self, ir: &IrResp) -> WireBody {
-        let IrResp::Transcription(r) = ir else { return WireBody::json(Bytes::new()) };
+        let IrResp::Transcription(r) = ir else {
+            return WireBody::json(Bytes::new());
+        };
         let mut body = json!({ "text": r.text });
         // Surface the billable usage in OpenAI's own transcription shape — duration or tokens.
         match &r.usage {
@@ -225,9 +256,10 @@ impl OperationHandler for OpenAiTranscription {
 /// OpenAI transcription `usage` → `Billing`: `{type:"duration",seconds}` (whisper) or a token shape.
 fn parse_transcription_usage(u: &Value) -> Option<Billing> {
     match u.get("type").and_then(Value::as_str) {
-        Some("duration") => {
-            u.get("seconds").and_then(Value::as_f64).map(|seconds| Billing::Duration { seconds })
-        }
+        Some("duration") => u
+            .get("seconds")
+            .and_then(Value::as_f64)
+            .map(|seconds| Billing::Duration { seconds }),
         _ => u.get("input_tokens").and_then(Value::as_u64).map(|input| {
             Billing::Tokens(crate::billing::TokenUsage {
                 input,
@@ -245,18 +277,31 @@ impl OperationHandler for OpenAiSpeech {
     fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
         let wire: Value =
             serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
-        let get = |k: &str| wire.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+        let get = |k: &str| {
+            wire.get(k)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
         Ok(IrReq::Speech(SpeechReq {
             input: get("input"),
             model: get("model"),
             voice: get("voice"),
-            response_format: wire.get("response_format").and_then(Value::as_str).map(str::to_string),
-            instructions: wire.get("instructions").and_then(Value::as_str).map(str::to_string),
+            response_format: wire
+                .get("response_format")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            instructions: wire
+                .get("instructions")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             ..Default::default()
         }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
-        let IrReq::Speech(r) = ir else { return Bytes::new() };
+        let IrReq::Speech(r) = ir else {
+            return Bytes::new();
+        };
         let mut body = json!({ "model": r.model, "input": r.input, "voice": r.voice });
         if let Some(f) = &r.response_format {
             body["response_format"] = json!(f);
@@ -275,8 +320,12 @@ impl OperationHandler for OpenAiSpeech {
         }))
     }
     fn write_response(&self, ir: &IrResp) -> WireBody {
-        let IrResp::Speech(r) = ir else { return WireBody::json(Bytes::new()) };
-        let Some(blob) = &r.audio else { return WireBody::json(Bytes::new()) };
+        let IrResp::Speech(r) = ir else {
+            return WireBody::json(Bytes::new());
+        };
+        let Some(blob) = &r.audio else {
+            return WireBody::json(Bytes::new());
+        };
         let bytes = match &blob.payload {
             MediaPayload::Bytes(b) => b.clone(),
             MediaPayload::B64(s) => base64_decode(s).unwrap_or_default(),
@@ -288,25 +337,39 @@ impl OperationHandler for OpenAiSpeech {
 
 // -------------------------------------------------- embeddings cell (real codec, cross-protocol)
 
-use crate::ir::embeddings::{EmbInput, EmbeddingItem, EmbeddingsReq, EmbeddingsResp, EncFmt, VectorData};
+use crate::ir::embeddings::{
+    EmbInput, EmbeddingItem, EmbeddingsReq, EmbeddingsResp, EncFmt, VectorData,
+};
 
 struct OpenAiEmbeddings;
 
 impl OperationHandler for OpenAiEmbeddings {
-
     /// openai embeddings wire → IR (used when openai is the INGRESS of a cross-protocol call).
     fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
         let wire: Value =
             serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
-        let model = wire.get("model").and_then(Value::as_str).unwrap_or_default().to_string();
+        let model = wire
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let input = match wire.get("input") {
             Some(Value::String(s)) => EmbInput::Text(vec![s.clone()]),
-            Some(Value::Array(a)) => {
-                EmbInput::Text(a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            Some(Value::Array(a)) => EmbInput::Text(
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect(),
+            ),
+            _ => {
+                return Err(IngressReject::BadRequest(
+                    "embeddings request missing `input`".into(),
+                ))
             }
-            _ => return Err(IngressReject::BadRequest("embeddings request missing `input`".into())),
         };
-        let dimensions = wire.get("dimensions").and_then(Value::as_u64).map(|d| d as u32);
+        let dimensions = wire
+            .get("dimensions")
+            .and_then(Value::as_u64)
+            .map(|d| d as u32);
         let encoding_formats = match wire.get("encoding_format").and_then(Value::as_str) {
             Some("base64") => vec![EncFmt::Base64],
             _ => vec![EncFmt::Float],
@@ -323,7 +386,9 @@ impl OperationHandler for OpenAiEmbeddings {
 
     /// IR → openai embeddings wire (used when openai is the EGRESS).
     fn write_request(&self, ir: &IrReq) -> Bytes {
-        let IrReq::Embeddings(r) = ir else { return Bytes::new() };
+        let IrReq::Embeddings(r) = ir else {
+            return Bytes::new();
+        };
         let input = match &r.input {
             EmbInput::Text(v) if v.len() == 1 => json!(v[0]),
             EmbInput::Text(v) => json!(v),
@@ -338,7 +403,8 @@ impl OperationHandler for OpenAiEmbeddings {
 
     /// openai embeddings response wire → IR (used when openai is the EGRESS).
     fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
-        let v: Value = serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
+        let v: Value =
+            serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
         let embeddings = v
             .get("data")
             .and_then(Value::as_array)
@@ -346,15 +412,24 @@ impl OperationHandler for OpenAiEmbeddings {
                 arr.iter()
                     .enumerate()
                     .map(|(idx, d)| {
-                        let index = d.get("index").and_then(Value::as_u64).unwrap_or(idx as u64) as usize;
-                        let mut item = EmbeddingItem { index, ..Default::default() };
+                        let index =
+                            d.get("index").and_then(Value::as_u64).unwrap_or(idx as u64) as usize;
+                        let mut item = EmbeddingItem {
+                            index,
+                            ..Default::default()
+                        };
                         if let Some(f) = d.get("embedding").and_then(Value::as_array) {
                             item.vectors.insert(
                                 EncFmt::Float,
-                                VectorData::Float(f.iter().filter_map(|x| x.as_f64().map(|n| n as f32)).collect()),
+                                VectorData::Float(
+                                    f.iter()
+                                        .filter_map(|x| x.as_f64().map(|n| n as f32))
+                                        .collect(),
+                                ),
                             );
                         } else if let Some(b) = d.get("embedding").and_then(Value::as_str) {
-                            item.vectors.insert(EncFmt::Base64, VectorData::Base64(b.to_string()));
+                            item.vectors
+                                .insert(EncFmt::Base64, VectorData::Base64(b.to_string()));
                         }
                         item
                     })
@@ -376,7 +451,9 @@ impl OperationHandler for OpenAiEmbeddings {
 
     /// IR → openai embeddings response wire (used when openai is the INGRESS — the caller's dialect).
     fn write_response(&self, ir: &IrResp) -> WireBody {
-        let IrResp::Embeddings(r) = ir else { return WireBody::json(Bytes::new()) };
+        let IrResp::Embeddings(r) = ir else {
+            return WireBody::json(Bytes::new());
+        };
         let data: Vec<Value> = r
             .embeddings
             .iter()
@@ -418,25 +495,47 @@ impl OperationHandler for OpenAiImage {
             if s == "auto" {
                 Some(ImageSize::Auto)
             } else {
-                s.split_once('x')
-                    .and_then(|(w, h)| Some(ImageSize::Wh { width: w.parse().ok()?, height: h.parse().ok()? }))
+                s.split_once('x').and_then(|(w, h)| {
+                    Some(ImageSize::Wh {
+                        width: w.parse().ok()?,
+                        height: h.parse().ok()?,
+                    })
+                })
             }
         });
         Ok(IrReq::Image(ImageReq {
             op: ImageOp::Generate,
-            model: wire.get("model").and_then(Value::as_str).unwrap_or_default().to_string(),
-            prompt: wire.get("prompt").and_then(Value::as_str).map(str::to_string),
+            model: wire
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            prompt: wire
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             n: wire.get("n").and_then(Value::as_u64).map(|n| n as u32),
             size,
-            quality: wire.get("quality").and_then(Value::as_str).map(str::to_string),
-            style: wire.get("style").and_then(Value::as_str).map(str::to_string),
-            response_format: wire.get("response_format").and_then(Value::as_str).map(str::to_string),
+            quality: wire
+                .get("quality")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            style: wire
+                .get("style")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            response_format: wire
+                .get("response_format")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             user: wire.get("user").and_then(Value::as_str).map(str::to_string),
             ..Default::default()
         }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
-        let IrReq::Image(r) = ir else { return Bytes::new() };
+        let IrReq::Image(r) = ir else {
+            return Bytes::new();
+        };
         let mut body = json!({ "model": r.model });
         if let Some(p) = &r.prompt {
             body["prompt"] = json!(p);
@@ -450,16 +549,23 @@ impl OperationHandler for OpenAiImage {
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
     }
     fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
-        let v: Value = serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
+        let v: Value =
+            serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
         let images = v
             .get("data")
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
                     .map(|d| ImageOutput {
-                        b64: d.get("b64_json").and_then(Value::as_str).map(str::to_string),
+                        b64: d
+                            .get("b64_json")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                         url: d.get("url").and_then(Value::as_str).map(str::to_string),
-                        revised_prompt: d.get("revised_prompt").and_then(Value::as_str).map(str::to_string),
+                        revised_prompt: d
+                            .get("revised_prompt")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                         ..Default::default()
                     })
                     .collect()
@@ -472,7 +578,9 @@ impl OperationHandler for OpenAiImage {
         }))
     }
     fn write_response(&self, ir: &IrResp) -> WireBody {
-        let IrResp::Image(r) = ir else { return WireBody::json(Bytes::new()) };
+        let IrResp::Image(r) = ir else {
+            return WireBody::json(Bytes::new());
+        };
         let data: Vec<Value> = r
             .images
             .iter()
@@ -491,7 +599,8 @@ impl OperationHandler for OpenAiImage {
             })
             .collect();
         WireBody::json(Bytes::from(
-            serde_json::to_vec(&json!({ "created": r.created.unwrap_or(0), "data": data })).unwrap_or_default(),
+            serde_json::to_vec(&json!({ "created": r.created.unwrap_or(0), "data": data }))
+                .unwrap_or_default(),
         ))
     }
 }
@@ -501,7 +610,6 @@ impl OperationHandler for OpenAiImage {
 struct OpenAiModeration;
 
 impl OperationHandler for OpenAiModeration {
-
     fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
         let wire: Value =
             serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
@@ -511,7 +619,11 @@ impl OperationHandler for OpenAiModeration {
             .unwrap_or_default()
             .to_string();
         let input = parse_input(wire.get("input"))?;
-        Ok(IrReq::Moderation(ModerationReq { model, input, extra: BTreeMap::new() }))
+        Ok(IrReq::Moderation(ModerationReq {
+            model,
+            input,
+            extra: BTreeMap::new(),
+        }))
     }
 
     fn write_request(&self, ir: &IrReq) -> Bytes {
@@ -592,7 +704,9 @@ fn parse_input(v: Option<&Value>) -> Result<Vec<ModerationInput>, IngressReject>
                 _ => Err(IngressReject::BadRequest("invalid input item".into())),
             })
             .collect(),
-        _ => Err(IngressReject::BadRequest("moderation request missing `input`".into())),
+        _ => Err(IngressReject::BadRequest(
+            "moderation request missing `input`".into(),
+        )),
     }
 }
 
@@ -606,7 +720,9 @@ fn input_to_value(input: &[ModerationInput]) -> Value {
             .iter()
             .map(|i| match i {
                 ModerationInput::Text(t) => json!({ "type": "text", "text": t }),
-                ModerationInput::ImageUrl(u) => json!({ "type": "image_url", "image_url": { "url": u } }),
+                ModerationInput::ImageUrl(u) => {
+                    json!({ "type": "image_url", "image_url": { "url": u } })
+                }
             })
             .collect(),
     )
@@ -618,15 +734,22 @@ fn parse_result(v: &Value) -> ModerationResult {
         categories: obj_map(v.get("categories"), |x| x.as_bool()),
         category_scores: obj_map(v.get("category_scores"), |x| x.as_f64()),
         applied_input_types: obj_map(v.get("category_applied_input_types"), |x| {
-            x.as_array()
-                .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+            x.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
         }),
     }
 }
 
 fn obj_map<T>(v: Option<&Value>, f: impl Fn(&Value) -> Option<T>) -> BTreeMap<String, T> {
     v.and_then(Value::as_object)
-        .map(|o| o.iter().filter_map(|(k, val)| f(val).map(|t| (k.clone(), t))).collect())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, val)| f(val).map(|t| (k.clone(), t)))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -657,7 +780,9 @@ mod tests {
     fn moderation_request_round_trips_openai_shape() {
         let cell = OpenAiModeration;
         let wire = json!({ "model": "omni-moderation-latest", "input": "hello" });
-        let ir = cell.read_request(&serde_json::to_vec(&wire).unwrap(), "application/json").unwrap();
+        let ir = cell
+            .read_request(&serde_json::to_vec(&wire).unwrap(), "application/json")
+            .unwrap();
         let back: Value = serde_json::from_slice(&cell.write_request(&ir)).unwrap();
         assert_eq!(back["model"], "omni-moderation-latest");
         assert_eq!(back["input"], "hello"); // single text → bare string, round-tripped
@@ -685,8 +810,12 @@ mod tests {
         let cell = OpenAiTranscription;
         let wire = br#"{"text":"Hello there?","usage":{"type":"duration","seconds":1}}"#;
         let ir = cell.read_response(wire).unwrap();
-        let IrResp::Transcription(ref r) = ir else { panic!("expected transcription IR") };
-        assert!(matches!(r.usage, Some(Billing::Duration { seconds }) if (seconds - 1.0).abs() < 1e-9));
+        let IrResp::Transcription(ref r) = ir else {
+            panic!("expected transcription IR")
+        };
+        assert!(
+            matches!(r.usage, Some(Billing::Duration { seconds }) if (seconds - 1.0).abs() < 1e-9)
+        );
         let back: Value = serde_json::from_slice(&cell.write_response(&ir).bytes).unwrap();
         assert_eq!(back["text"], "Hello there?");
         assert_eq!(back["usage"]["type"], "duration");

@@ -1,39 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! The ingress Router (design-operations-oop.md §6, the 1.2 lynchpin): resolve `(path, headers)` to
-//! the ingress `(protocol, operation)` the client is speaking. Ordered ladder — order is load-bearing
-//! (M2). Signature is `(path, headers)` only; any body-level disambiguation is the chosen
-//! RequestHandler's job. Returns `None` for non-operation paths (health, `/v1/models`, unknown) —
-//! those keep their existing routes.
+//! The ingress Router (design-operations-oop.md §6, the 1.2 lynchpin): DUMB protocol identification.
+//! `(path, headers)` → which protocol dialect the client is speaking — that is the Router's ENTIRE
+//! job. Which OPERATION the request asks for is the chosen `RequestHandler`'s decision
+//! (`resolve_operation(path, body)` — it may need the body; the Router never sees one). Returns
+//! `None` for non-protocol paths (health, admin, unknown) — those keep their explicit routes.
 //!
-//! NB: this is `router` (protocol/operation resolution), distinct from `routing` (load-balancing
-//! policy). Keep the names apart.
+//! Adding a protocol touches exactly three places: an ID line here, a `RequestHandler`, and its
+//! `OperationHandler` cells. Nothing else.
 //!
-//! Foundation; `dead_code` allowed until the seam consumes it (P4).
+//! NB: this is `router` (protocol identification), distinct from `routing` (load-balancing policy).
 #![allow(dead_code)]
 
-use crate::operation::Operation;
 use axum::http::HeaderMap;
-
-/// The resolved ingress identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Route {
-    pub(crate) protocol: &'static str,
-    pub(crate) operation: Operation,
-}
-
-/// `(path, headers)` → `(protocol, operation)`, or `None` if the path is not one of the six operations.
-pub(crate) fn resolve(path: &str, headers: &HeaderMap) -> Option<Route> {
-    let operation = resolve_operation(path)?;
-    let protocol = resolve_protocol(path, headers)?;
-    Some(Route { protocol, operation })
-}
 
 /// The ingress protocol. Ladder (order load-bearing, M2): mandatory-unique auth header → Gemini path
 /// verb → path discriminator. A `(path, header)` pattern claimed by two protocols must be a registry
 /// error at load time (enforced elsewhere), never a silent first-match.
-fn resolve_protocol(path: &str, h: &HeaderMap) -> Option<&'static str> {
+pub(crate) fn protocol_id(path: &str, h: &HeaderMap) -> Option<&'static str> {
     // 1. mandatory-unique auth headers (unambiguous regardless of path)
     if h.get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -52,7 +37,15 @@ fn resolve_protocol(path: &str, h: &HeaderMap) -> Option<&'static str> {
         || path.contains(":streamGenerateContent")
         || path.contains(":embedContent")
         || path.contains(":batchEmbedContents")
+        || path.contains(":predict")
     {
+        return Some("gemini");
+    }
+    // 2b. The Gemini models wildcard surface: everything under `/v1{,beta}/models/{rest}` goes to the
+    // gemini ARM even when the action is unknown or absent — that arm owns the ambiguity envelopes
+    // (a colon-less `/v1/models/{id}` is an OpenAI `model.retrieve`; an unknown `:action` gets the
+    // native Gemini unsupported-action error). Mirrors the pre-collapse wildcard routes exactly.
+    if path.starts_with("/v1/models/") || path.starts_with("/v1beta/models/") {
         return Some("gemini");
     }
     // 3. path discriminator (bearer trio + everyone else)
@@ -62,6 +55,9 @@ fn resolve_protocol(path: &str, h: &HeaderMap) -> Option<&'static str> {
     if path.ends_with("/v2/chat") || path.ends_with("/v1/chat") {
         return Some("cohere");
     }
+    if path.ends_with("/v2/embed") {
+        return Some("cohere");
+    }
     if path.ends_with("/v1/responses") {
         return Some("responses");
     }
@@ -69,6 +65,9 @@ fn resolve_protocol(path: &str, h: &HeaderMap) -> Option<&'static str> {
         return Some("anthropic");
     }
     if path.contains("/converse") {
+        return Some("bedrock");
+    }
+    if path.starts_with("/model/") && path.ends_with("/invoke") {
         return Some("bedrock");
     }
     // OpenAI-family JSON/audio/image ops
@@ -82,38 +81,9 @@ fn resolve_protocol(path: &str, h: &HeaderMap) -> Option<&'static str> {
     None
 }
 
-/// The operation, by path suffix (semantic, endpoint-count-agnostic §1b). Translation folds into
-/// transcription; image edit/variation fold into Image (the `op` discriminant is read from the body
-/// by the cell, not here).
-fn resolve_operation(path: &str) -> Option<Operation> {
-    if path.contains("/embeddings") || path.contains(":embedContent") || path.contains(":batchEmbedContents") {
-        return Some(Operation::Embeddings);
-    }
-    if path.contains("/moderations") {
-        return Some(Operation::Moderation);
-    }
-    if path.contains("/images/") {
-        return Some(Operation::Image);
-    }
-    if path.contains("/audio/transcriptions") || path.contains("/audio/translations") {
-        return Some(Operation::Transcription);
-    }
-    if path.contains("/audio/speech") {
-        return Some(Operation::Speech);
-    }
-    if path.contains("/chat/completions")
-        || path.contains("/v1/messages")
-        || path.contains("/v2/chat")
-        || path.ends_with("/v1/chat")
-        || path.contains("/v1/responses")
-        || path.contains(":generateContent")
-        || path.contains(":streamGenerateContent")
-        || path.contains("/converse")
-    {
-        return Some(Operation::Chat);
-    }
-    None
-}
+// NOTE: operation resolution deliberately does NOT live here. The Router identifies the protocol;
+// the chosen `RequestHandler::resolve_operation(path, body)` decides the operation (it may need the
+// body — Gemini's generateContent and Bedrock's InvokeModel are body-disambiguated).
 
 #[cfg(test)]
 mod tests {
@@ -128,46 +98,126 @@ mod tests {
         h
     }
 
-    /// The resolver table (design §6 test obligation): (path, headers) → (protocol, operation),
-    /// including collision defaults and the ordering (an Anthropic request to a shared path must not
-    /// fall through to OpenAI).
+    /// The resolver table (design §6 test obligation), exercised through the REAL two-step pipeline:
+    /// Router IDs the protocol, then that protocol's `RequestHandler::resolve_operation` decides the
+    /// operation. Includes collision defaults and the ordering (an Anthropic request to a shared path
+    /// must not fall through to OpenAI).
     #[test]
     fn resolver_table() {
+        use crate::operation::Operation;
         // (path, headers, expected (protocol, operation)) — aliased to keep the type readable.
-        type ResolverCase =
-            (&'static str, &'static [(&'static str, &'static str)], Option<(&'static str, Operation)>);
+        type ResolverCase = (
+            &'static str,
+            &'static [(&'static str, &'static str)],
+            Option<(&'static str, Operation)>,
+        );
         let cases: &[ResolverCase] = &[
-            ("/v1/chat/completions", &[], Some(("openai", Operation::Chat))),
-            ("/v1/embeddings", &[], Some(("openai", Operation::Embeddings))),
-            ("/v1/moderations", &[], Some(("openai", Operation::Moderation))),
-            ("/v1/images/generations", &[], Some(("openai", Operation::Image))),
-            ("/v1/audio/transcriptions", &[], Some(("openai", Operation::Transcription))),
-            ("/v1/audio/translations", &[], Some(("openai", Operation::Transcription))),
+            (
+                "/v1/chat/completions",
+                &[],
+                Some(("openai", Operation::Chat)),
+            ),
+            (
+                "/v1/embeddings",
+                &[],
+                Some(("openai", Operation::Embeddings)),
+            ),
+            (
+                "/v1/moderations",
+                &[],
+                Some(("openai", Operation::Moderation)),
+            ),
+            (
+                "/v1/images/generations",
+                &[],
+                Some(("openai", Operation::Image)),
+            ),
+            (
+                "/v1/audio/transcriptions",
+                &[],
+                Some(("openai", Operation::Transcription)),
+            ),
+            (
+                "/v1/audio/translations",
+                &[],
+                Some(("openai", Operation::Transcription)),
+            ),
             ("/v1/audio/speech", &[], Some(("openai", Operation::Speech))),
             ("/v2/chat", &[], Some(("cohere", Operation::Chat))),
+            ("/v2/embed", &[], Some(("cohere", Operation::Embeddings))),
             ("/v1/responses", &[], Some(("responses", Operation::Chat))),
             // anthropic ingress: mandatory header wins even though path is model-prefixed
-            ("/claude-3/v1/messages", &[("anthropic-version", "2023-06-01")], Some(("anthropic", Operation::Chat))),
+            (
+                "/claude-3/v1/messages",
+                &[("anthropic-version", "2023-06-01")],
+                Some(("anthropic", Operation::Chat)),
+            ),
             // gemini via header
-            ("/v1beta/models/x:generateContent", &[("x-goog-api-key", "k")], Some(("gemini", Operation::Chat))),
+            (
+                "/v1beta/models/x:generateContent",
+                &[("x-goog-api-key", "k")],
+                Some(("gemini", Operation::Chat)),
+            ),
             // gemini via path verb (no header)
-            ("/v1beta/models/x:embedContent", &[], Some(("gemini", Operation::Embeddings))),
-            // bedrock via SigV4 auth
-            ("/model/m/converse", &[("authorization", "AWS4-HMAC-SHA256 Credential=x")], Some(("bedrock", Operation::Chat))),
+            (
+                "/v1beta/models/x:embedContent",
+                &[],
+                Some(("gemini", Operation::Embeddings)),
+            ),
+            (
+                "/v1beta/models/x:predict",
+                &[],
+                Some(("gemini", Operation::Image)),
+            ),
+            // bedrock via SigV4 auth; InvokeModel op comes from the BODY (see body cases below)
+            (
+                "/model/m/converse",
+                &[("authorization", "AWS4-HMAC-SHA256 Credential=x")],
+                Some(("bedrock", Operation::Chat)),
+            ),
             // non-operation paths → None
             ("/v1/models", &[], None),
             ("/healthz", &[], None),
         ];
         for (path, headers, expect) in cases {
-            let got = resolve(path, &hm(headers)).map(|r| (r.protocol, r.operation));
+            let got = protocol_id(path, &hm(headers)).and_then(|proto| {
+                crate::cells::request_handler(proto)
+                    .and_then(|rh| rh.resolve_operation(path, b""))
+                    .map(|op| (proto, op))
+            });
             assert_eq!(got, *expect, "path {path:?} headers {headers:?}");
+        }
+
+        // BODY-disambiguated cases (the RequestHandler needs more than the path):
+        let body_cases: &[(&str, &[u8], (&str, Operation))] = &[
+            ("/model/m/invoke", br#"{"inputText":"hi"}"#, ("bedrock", Operation::Embeddings)),
+            ("/model/m/invoke", br#"{"taskType":"TEXT_IMAGE","textToImageParams":{"text":"x"}}"#,
+             ("bedrock", Operation::Image)),
+            ("/v1beta/models/x:generateContent",
+             br#"{"contents":[{"parts":[{"inline_data":{"mime_type":"audio/wav","data":"AA=="}}]}]}"#,
+             ("gemini", Operation::Transcription)),
+            ("/v1beta/models/x:generateContent",
+             br#"{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"responseModalities":["AUDIO"]}}"#,
+             ("gemini", Operation::Speech)),
+            // an inline IMAGE part is multimodal CHAT, not audio
+            ("/v1beta/models/x:generateContent",
+             br#"{"contents":[{"parts":[{"inline_data":{"mime_type":"image/png","data":"AA=="}}]}]}"#,
+             ("gemini", Operation::Chat)),
+        ];
+        for (path, body, (want_proto, want_op)) in body_cases {
+            let proto = protocol_id(path, &hm(&[])).expect(path);
+            assert_eq!(proto, *want_proto, "protocol for {path:?}");
+            let op = crate::cells::request_handler(proto)
+                .and_then(|rh| rh.resolve_operation(path, body))
+                .expect(path);
+            assert_eq!(op, *want_op, "operation for {path:?} with body");
         }
     }
 
     #[test]
     fn mandatory_header_beats_path_ordering() {
         // an Anthropic request to a path that also looks bearer-ish must resolve Anthropic, not fall through.
-        let r = resolve("/v1/messages", &hm(&[("anthropic-version", "2023-06-01")])).unwrap();
-        assert_eq!(r.protocol, "anthropic");
+        let p = protocol_id("/v1/messages", &hm(&[("anthropic-version", "2023-06-01")])).unwrap();
+        assert_eq!(p, "anthropic");
     }
 }

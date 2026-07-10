@@ -34,14 +34,20 @@ pub(crate) struct WireBody {
 impl WireBody {
     /// JSON body — the common case.
     pub(crate) fn json(bytes: Bytes) -> Self {
-        Self { bytes, content_type: axum::http::HeaderValue::from_static("application/json") }
+        Self {
+            bytes,
+            content_type: axum::http::HeaderValue::from_static("application/json"),
+        }
     }
     /// A body with an explicit content-type (e.g. audio speech). Falls back to octet-stream if the
     /// content-type string is not a valid header value.
     pub(crate) fn typed(bytes: Bytes, content_type: &str) -> Self {
         let content_type = axum::http::HeaderValue::from_str(content_type)
             .unwrap_or_else(|_| axum::http::HeaderValue::from_static("application/octet-stream"));
-        Self { bytes, content_type }
+        Self {
+            bytes,
+            content_type,
+        }
     }
 }
 
@@ -142,6 +148,13 @@ pub(crate) trait RequestHandler: Send + Sync {
     /// `None` ⇒ the path is not an operation this protocol serves.
     fn resolve_operation(&self, path: &str, body: &[u8]) -> Option<Operation>;
 
+    /// The model named in the PATH, for path-model dialects (gemini `models/{m}:action`, bedrock
+    /// `/model/{m}/...`). `None` (the default) for body-model dialects — the dispatch then reads the
+    /// JSON body `model` / multipart form instead.
+    fn path_model(&self, _path: &str) -> Option<String> {
+        None
+    }
+
     /// The `(protocol, operation) → path template` map: this protocol's upstream URL for the operation
     /// in `ctx`, built from RESOLVED PRIMITIVES ([`EgressCtx`]) — never the `Lane`. One `match op` per
     /// protocol. Routing applies any `lane.path` override BEFORE calling this (so this is the default).
@@ -189,7 +202,8 @@ mod tests {
             }
         }
         fn resolve_operation(&self, path: &str, _body: &[u8]) -> Option<Operation> {
-            path.ends_with("/v1/moderations").then_some(Operation::Moderation)
+            path.ends_with("/v1/moderations")
+                .then_some(Operation::Moderation)
         }
     }
 
@@ -206,7 +220,16 @@ mod tests {
 
     #[test]
     fn sub_op_reject_carries_op_and_model() {
-        let r = IngressReject::UnsupportedSubOp { op: Operation::Image, model: "gpt-image-1".into() };
-        assert!(matches!(r, IngressReject::UnsupportedSubOp { op: Operation::Image, .. }));
+        let r = IngressReject::UnsupportedSubOp {
+            op: Operation::Image,
+            model: "gpt-image-1".into(),
+        };
+        assert!(matches!(
+            r,
+            IngressReject::UnsupportedSubOp {
+                op: Operation::Image,
+                ..
+            }
+        ));
     }
 }

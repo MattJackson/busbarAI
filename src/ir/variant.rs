@@ -124,7 +124,10 @@ mod tests {
         assert!(!IrReq::Embeddings(Default::default()).wants_stream());
         assert!(!IrReq::Moderation(Default::default()).wants_stream());
         assert!(!IrReq::Image(Default::default()).wants_stream());
-        let s = SpeechReq { stream: true, ..Default::default() };
+        let s = SpeechReq {
+            stream: true,
+            ..Default::default()
+        };
         assert!(IrReq::Speech(s).wants_stream());
         assert!(!IrReq::Speech(SpeechReq::default()).wants_stream());
     }
@@ -138,17 +141,26 @@ mod tests {
         ));
         // embeddings → tokens
         let e = EmbeddingsResp {
-            usage: Some(TokenUsage { input: 5, ..Default::default() }),
+            usage: Some(TokenUsage {
+                input: 5,
+                ..Default::default()
+            }),
             ..Default::default()
         };
-        assert!(matches!(IrResp::Embeddings(e).usage(), Some(Billing::Tokens(_))));
+        assert!(matches!(
+            IrResp::Embeddings(e).usage(),
+            Some(Billing::Tokens(_))
+        ));
         // image with no usage/cost_basis → None
         assert!(IrResp::Image(Default::default()).usage().is_none());
     }
 
     #[test]
     fn operation_tag_matches_variant_both_directions() {
-        assert_eq!(IrReq::Image(Default::default()).operation(), Operation::Image);
+        assert_eq!(
+            IrReq::Image(Default::default()).operation(),
+            Operation::Image
+        );
         assert_eq!(
             IrResp::Transcription(Default::default()).operation(),
             Operation::Transcription

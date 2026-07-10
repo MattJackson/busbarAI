@@ -781,7 +781,7 @@ fn proto_for_path(path: &str) -> &'static str {
 /// attaching the `x-amzn-*` headers when the inferred protocol is Bedrock so the response is
 /// indistinguishable from a real vendor 404/405. Shared by [`fallback_handler`] (404, unmatched
 /// path) and [`method_not_allowed_handler`] (405, wrong method on a valid path).
-fn fallback_error_response(
+pub(crate) fn fallback_error_response(
     path: &str,
     status: axum::http::StatusCode,
     kind: &str,
@@ -816,21 +816,8 @@ fn fallback_error_response(
     resp
 }
 
-/// 404 fallback: an unmatched path. A real vendor backend answers an unknown route with its native
-/// JSON error envelope, never axum's empty body — so reshape to the inferred protocol's `not_found`
-/// shape (see [`fallback_error_response`]).
-async fn fallback_handler(uri: axum::http::Uri) -> axum::response::Response {
-    fallback_error_response(
-        uri.path(),
-        axum::http::StatusCode::NOT_FOUND,
-        // CANONICAL kind: `not_found_error` (matches `route.rs`'s 404s and what every writer expects).
-        // The previous `not_found` passed through the OpenAI writer verbatim, so a 404 on an
-        // OpenAI-inferred path emitted `{"error":{"type":"not_found"}}` — a non-canonical type that
-        // breaks native SDK exception mapping and is a distinguishability tell.
-        crate::admin::ERR_TYPE_NOT_FOUND,
-        "the requested resource was not found",
-    )
-}
+// NOTE: the 404 fallback handler is superseded by `route::protocol_dispatch`, which owns the
+// catch-all and reproduces the same native-envelope 404 shaping for non-protocol paths.
 
 /// 405 fallback: a valid ingress path hit with the wrong method (e.g. GET on a POST-only ingress).
 /// axum's built-in 405 is an `Allow`-header-only empty body; reshape to the protocol-native envelope
@@ -1006,46 +993,20 @@ fn build_router_with_limits(
             axum::routing::delete(admin::delete_key).patch(admin::update_key),
         )
         .route("/admin/keys/{id}/usage", get(admin::key_usage))
-        .route("/v1/chat/completions", post(route::openai_ingress))
-        // 1.2 operations (OpenAI-family ingress): embeddings/moderations/images/audio, dispatched
-        // through the four-trait operation pipeline (router → cell → forward_operation).
-        .route("/v1/embeddings", post(route::openai_embeddings))
-        .route("/v1/moderations", post(route::openai_moderations))
-        .route("/v1/images/generations", post(route::openai_images))
-        .route("/v1/audio/transcriptions", post(route::openai_transcriptions))
-        .route("/v1/audio/speech", post(route::openai_speech))
+        // busbar's OWN API keeps explicit routes (it is not a protocol dialect): discovery, admin,
+        // health/metrics/stats above, and the named/adhoc conveniences below.
         // OpenAI list-models: SDKs call `models.list()` first; UIs build pickers from it.
         // Governance-scoped like /stats (restricted keys see only their reachable names).
         .route("/v1/models", get(handlers::list_models))
         .route("/v1beta/models", get(handlers::list_models_v1beta))
-        // Cohere v2 + OpenAI Responses ingress: model+stream in the body (body-model protocols).
-        .route("/v2/chat", post(route::cohere_ingress))
-        .route("/v2/embed", post(route::cohere_embeddings))
-        .route("/v1/responses", post(route::responses_ingress))
-        // Gemini ingress: model+action packed into the last path segment with a colon. axum can't
-        // split on a `:` inside a segment, so capture the tail with a wildcard and split in-handler.
-        // Both the stable `v1` and the `v1beta` surfaces are wire-identical for generateContent /
-        // streamGenerateContent; the google-generativeai / Gen AI SDKs use either, so a client pinned
-        // to the stable `v1` endpoint must also resolve here rather than fall through to a bare 404.
-        .route("/v1/models/{*rest}", post(route::gemini_ingress))
-        .route("/v1beta/models/{*rest}", post(route::gemini_ingress))
-        // Bedrock Converse ingress: model in the path, stream selected by the endpoint suffix.
-        .route("/model/{model_id}/converse", post(route::bedrock_converse))
-        .route(
-            "/model/{model_id}/converse-stream",
-            post(route::bedrock_converse_stream),
-        )
-        // Bedrock InvokeModel ingress (1.2 ops): the bedrock RequestHandler reads the body to decide
-        // the operation (Titan embeddings vs Titan image).
-        .route("/model/{model_id}/invoke", post(route::bedrock_invoke))
         .route("/{name}/v1/messages", post(route::named))
         .route("/{provider}/{model}/v1/messages", post(route::adhoc))
-        // Global fallback for unmatched paths (404) and wrong-method hits on a valid path (405).
-        // axum's built-in responses are an EMPTY body (404) or an `Allow`-header-only 405 — both bare
-        // text that a native vendor SDK cannot decode and that fingerprint busbar as a router/proxy.
-        // Reshape into the inferred ingress protocol's native JSON error envelope so a client probing
-        // an unsupported edge still sees a vendor-shaped error.
-        .fallback(fallback_handler)
+        // EVERY protocol endpoint — chat and the 1.2 operations, all six dialects — flows through the
+        // catch-all: Router (dumb protocol ID from path+headers) → that protocol's RequestHandler
+        // (reads path+body, decides the operation) → its OperationHandler cell. Adding a protocol or
+        // an operation never touches this file. Unknown paths / wrong methods keep the pre-collapse
+        // native-envelope 404/405 shaping (no bare-proxy tells).
+        .fallback(route::protocol_dispatch)
         // Wrong-method hits on a VALID path (axum's built-in 405) get the same native-envelope
         // treatment as the 404 fallback above.
         .method_not_allowed_fallback(method_not_allowed_handler)

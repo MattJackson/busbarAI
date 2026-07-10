@@ -853,16 +853,34 @@ async fn operation_ingress(
 
     let Some(rh) = crate::cells::request_handler(proto) else {
         return finish_rejected(
-            app, gov, proto, crate::forward::POOL_LABEL_UNRESOLVED, started, charged_at,
-            ingress_error(proto, StatusCode::NOT_FOUND, crate::forward::KIND_NOT_FOUND,
-                "This protocol does not support that operation."),
+            app,
+            gov,
+            proto,
+            crate::forward::POOL_LABEL_UNRESOLVED,
+            started,
+            charged_at,
+            ingress_error(
+                proto,
+                StatusCode::NOT_FOUND,
+                crate::forward::KIND_NOT_FOUND,
+                "This protocol does not support that operation.",
+            ),
         );
     };
     let Some(cell) = rh.operation_handler(operation) else {
         return finish_rejected(
-            app, gov, proto, crate::forward::POOL_LABEL_UNRESOLVED, started, charged_at,
-            ingress_error(proto, StatusCode::NOT_FOUND, crate::forward::KIND_NOT_FOUND,
-                "This endpoint does not support that operation."),
+            app,
+            gov,
+            proto,
+            crate::forward::POOL_LABEL_UNRESOLVED,
+            started,
+            charged_at,
+            ingress_error(
+                proto,
+                StatusCode::NOT_FOUND,
+                crate::forward::KIND_NOT_FOUND,
+                "This endpoint does not support that operation.",
+            ),
         );
     };
 
@@ -877,15 +895,26 @@ async fn operation_ingress(
     } else {
         crate::json::parse(&body)
             .ok()
-            .and_then(|v: serde_json::Value| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+            .and_then(|v: serde_json::Value| {
+                v.get("model").and_then(|m| m.as_str()).map(str::to_string)
+            })
     };
     let model = match model {
         Some(m) if !m.is_empty() => m,
         _ => {
             return finish_rejected(
-                app, gov, proto, crate::forward::POOL_LABEL_UNRESOLVED, started, charged_at,
-                ingress_error(proto, StatusCode::BAD_REQUEST, crate::forward::KIND_INVALID_REQUEST,
-                    "Missing required parameter: 'model'."),
+                app,
+                gov,
+                proto,
+                crate::forward::POOL_LABEL_UNRESOLVED,
+                started,
+                charged_at,
+                ingress_error(
+                    proto,
+                    StatusCode::BAD_REQUEST,
+                    crate::forward::KIND_INVALID_REQUEST,
+                    "Missing required parameter: 'model'.",
+                ),
             );
         }
     };
@@ -900,9 +929,18 @@ async fn operation_ingress(
         (vec![WeightedLane { idx: i, weight: 1 }], "")
     } else {
         return finish(
-            app, gov, proto, pool_label(app, &model), started, charged_at,
-            ingress_error(proto, StatusCode::NOT_FOUND, crate::forward::KIND_NOT_FOUND,
-                &not_found_message(&model, None)),
+            app,
+            gov,
+            proto,
+            pool_label(app, &model),
+            started,
+            charged_at,
+            ingress_error(
+                proto,
+                StatusCode::NOT_FOUND,
+                crate::forward::KIND_NOT_FOUND,
+                &not_found_message(&model, None),
+            ),
         );
     };
 
@@ -915,33 +953,180 @@ async fn operation_ingress(
         _ => "application/json",
     };
     let resp = crate::forward::forward_operation(
-        app.clone(), cands, body, req_ct, caller_token, pool_name, proto, operation, cell, accept,
+        app.clone(),
+        cands,
+        body,
+        req_ct,
+        caller_token,
+        pool_name,
+        proto,
+        operation,
+        cell,
+        accept,
     )
     .await;
     finish(app, gov, proto, &model, started, charged_at, resp)
 }
 
-macro_rules! op_ingress_handler {
-    ($name:ident, $proto:literal, $op:expr) => {
-        pub(crate) async fn $name(
-            State(app): State<Arc<App>>,
-            axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
-            axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
-            headers: HeaderMap,
-            body: Bytes,
-        ) -> Response {
-            operation_ingress(&app, &gov, &caller, &headers, body, $proto, $op, None).await
-        }
-    };
-}
+// (The per-operation axum wrappers are gone: the protocol catch-all `protocol_dispatch` resolves the
+// operation via the RequestHandler and calls `operation_ingress` directly.)
 
-op_ingress_handler!(openai_moderations, "openai", crate::operation::Operation::Moderation);
-op_ingress_handler!(openai_embeddings, "openai", crate::operation::Operation::Embeddings);
-op_ingress_handler!(openai_images, "openai", crate::operation::Operation::Image);
-op_ingress_handler!(openai_transcriptions, "openai", crate::operation::Operation::Transcription);
-op_ingress_handler!(openai_speech, "openai", crate::operation::Operation::Speech);
-// POST /v2/embed — Cohere v2 embeddings ingress: model lives in the body, like /v2/chat.
-op_ingress_handler!(cohere_embeddings, "cohere", crate::operation::Operation::Embeddings);
+/// THE PROTOCOL CATCH-ALL (design: web server listens for anything). One axum fallback replaces the
+/// per-path protocol routes: the Router does DUMB protocol identification from (path, headers); the
+/// identified protocol's RequestHandler reads path+body and decides the operation; the operation's
+/// cell does the rest. `main.rs` keeps explicit routes ONLY for busbar's own API (health/metrics/
+/// admin/discovery + the named/adhoc conveniences) — a new protocol touches the Router ID ladder, a
+/// RequestHandler, and its cells, never this dispatch and never `main.rs`.
+///
+/// Gemini and Bedrock delegate to their protocol arms wholesale (path-model parsing, streaming
+/// variants, native unsupported-action envelopes live there); the body-model protocols split here:
+/// chat → the chat ingress core, 1.2 operations → `operation_ingress`. Unknown paths/methods keep the
+/// pre-collapse fallback shaping (native 404/405 envelopes, no proxy tells).
+pub(crate) async fn protocol_dispatch(
+    State(app): State<Arc<App>>,
+    OriginalUri(uri): OriginalUri,
+    method: axum::http::Method,
+    axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
+    axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let path = uri.path().to_string();
+    let Some(proto) = crate::router::protocol_id(&path, &headers) else {
+        // Not a protocol endpoint: the pre-collapse 404 fallback shape (native envelope by path).
+        return crate::fallback_error_response(
+            &path,
+            StatusCode::NOT_FOUND,
+            crate::admin::ERR_TYPE_NOT_FOUND,
+            "the requested resource was not found",
+        );
+    };
+    if method != axum::http::Method::POST {
+        // A protocol endpoint hit with the wrong method: the pre-collapse 405 shape.
+        return crate::fallback_error_response(
+            &path,
+            StatusCode::METHOD_NOT_ALLOWED,
+            crate::admin::ERR_TYPE_INVALID_REQUEST,
+            "method not allowed for this resource",
+        );
+    }
+    match proto {
+        // Path-model protocols keep their full arms (streaming variants, native action errors).
+        "gemini" => {
+            // axum's {*rest} wildcard percent-decoded the tail before the collapse; match it.
+            let rest =
+                crate::observability::percent_decode(path.split("/models/").nth(1).unwrap_or(""));
+            gemini_ingress(
+                State(app),
+                Path(rest),
+                OriginalUri(uri),
+                axum::extract::Extension(gov),
+                axum::extract::Extension(caller),
+                headers,
+                body,
+            )
+            .await
+        }
+        "bedrock" => {
+            // axum's Path extractor percent-decoded {model_id} before the collapse; match it.
+            let model = crate::cells::request_handler("bedrock")
+                .and_then(|rh| rh.path_model(&path))
+                .map(|m| crate::observability::percent_decode(&m))
+                .unwrap_or_default();
+            if path.ends_with("/converse") {
+                bedrock_converse(
+                    State(app),
+                    Path(model),
+                    axum::extract::Extension(gov),
+                    axum::extract::Extension(caller),
+                    headers,
+                    body,
+                )
+                .await
+            } else if path.ends_with("/converse-stream") {
+                bedrock_converse_stream(
+                    State(app),
+                    Path(model),
+                    axum::extract::Extension(gov),
+                    axum::extract::Extension(caller),
+                    headers,
+                    body,
+                )
+                .await
+            } else if path.ends_with("/invoke") {
+                bedrock_invoke(
+                    State(app),
+                    Path(model),
+                    OriginalUri(uri),
+                    axum::extract::Extension(gov),
+                    axum::extract::Extension(caller),
+                    headers,
+                    body,
+                )
+                .await
+            } else {
+                crate::fallback_error_response(
+                    &path,
+                    StatusCode::NOT_FOUND,
+                    crate::admin::ERR_TYPE_NOT_FOUND,
+                    "the requested resource was not found",
+                )
+            }
+        }
+        // Body-model protocols: the RequestHandler names the operation; chat → chat core, 1.2 ops →
+        // the generic operation ingress. (`anthropic` bare `/v1/messages` is served here — an
+        // Anthropic SDK pointed at busbar root works like every other dialect; the named/adhoc
+        // prefix routes remain for URL-pinned model selection.)
+        _ => {
+            let op = crate::cells::request_handler(proto)
+                .and_then(|rh| rh.resolve_operation(&path, &body));
+            match op {
+                Some(crate::operation::Operation::Chat) => match proto {
+                    "openai" => {
+                        openai_ingress(
+                            State(app),
+                            axum::extract::Extension(gov),
+                            axum::extract::Extension(caller),
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                    "cohere" => {
+                        cohere_ingress(
+                            State(app),
+                            axum::extract::Extension(gov),
+                            axum::extract::Extension(caller),
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                    "responses" => {
+                        responses_ingress(
+                            State(app),
+                            axum::extract::Extension(gov),
+                            axum::extract::Extension(caller),
+                            headers,
+                            body,
+                        )
+                        .await
+                    }
+                    _ => ingress_body_model(&app, &gov, &caller, &headers, body, proto).await,
+                },
+                Some(op) => {
+                    operation_ingress(&app, &gov, &caller, &headers, body, proto, op, None).await
+                }
+                None => crate::fallback_error_response(
+                    &path,
+                    StatusCode::NOT_FOUND,
+                    crate::admin::ERR_TYPE_NOT_FOUND,
+                    "the requested resource was not found",
+                ),
+            }
+        }
+    }
+}
 
 /// POST /model/{model_id}/invoke — Bedrock `InvokeModel` ingress. The path names the model; the
 /// bedrock RequestHandler reads the BODY and decides the operation (`textToImageParams` ⇒ image,
@@ -965,7 +1150,17 @@ pub(crate) async fn bedrock_invoke(
             "InvokeModel body is not a supported operation (expected inputText or textToImageParams).",
         );
     };
-    operation_ingress(&app, &gov, &caller, &headers, body, "bedrock", operation, Some(model_id)).await
+    operation_ingress(
+        &app,
+        &gov,
+        &caller,
+        &headers,
+        body,
+        "bedrock",
+        operation,
+        Some(model_id),
+    )
+    .await
 }
 
 // POST /v2/chat — Cohere v2 ingress: model + stream live in the body, exactly like OpenAI.
@@ -1103,8 +1298,17 @@ pub(crate) async fn gemini_ingress(
         .and_then(|rh| rh.resolve_operation(uri.path(), &body))
         .filter(|op| *op != crate::operation::Operation::Chat)
     {
-        return operation_ingress(&app, &gov, &caller, &headers, body, "gemini", op, Some(model.to_string()))
-            .await;
+        return operation_ingress(
+            &app,
+            &gov,
+            &caller,
+            &headers,
+            body,
+            "gemini",
+            op,
+            Some(model.to_string()),
+        )
+        .await;
     }
 
     // Only the two generate actions are proxied (see the route doc above). Any other action is an

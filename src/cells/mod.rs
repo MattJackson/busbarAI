@@ -51,14 +51,24 @@ mod tests {
         let h = request_handler("openai").expect("openai handler registered");
         assert_eq!(h.protocol_name(), "openai");
         assert!(h.operation_handler(Operation::Moderation).is_some());
-        assert!(request_handler("zzz-unknown").is_none(), "unknown protocol → None");
+        assert!(
+            request_handler("zzz-unknown").is_none(),
+            "unknown protocol → None"
+        );
     }
 
     #[test]
     fn every_protocol_serves_chat_via_its_request_handler() {
         // Chat is operation #1, reached through the SAME registry as every other op. All six
         // protocols resolve a handler and a chat cell — the unified dispatch, no special path.
-        for proto in ["openai", "anthropic", "gemini", "bedrock", "cohere", "responses"] {
+        for proto in [
+            "openai",
+            "anthropic",
+            "gemini",
+            "bedrock",
+            "cohere",
+            "responses",
+        ] {
             let h = request_handler(proto).expect("protocol registered");
             assert!(
                 h.operation_handler(Operation::Chat).is_some(),

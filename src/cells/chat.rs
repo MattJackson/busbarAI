@@ -42,12 +42,16 @@ impl OperationHandler for ChatHandler {
     }
     fn wants_stream(&self, body: &Value) -> bool {
         // The caller's stream intent from the OpenAI-family body.
-        body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false)
+        body.get("stream")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false)
     }
     fn body_affinity_key<'a>(&self, body: &'a Value) -> Option<&'a str> {
         // Top-level `system` string as the body-derived affinity key (no header present). Empty
         // strings do not pin affinity.
-        body.get("system").and_then(|s| s.as_str()).filter(|s| !s.is_empty())
+        body.get("system")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
     }
     fn extract_usage(&self, ingress_protocol: &str, body: &[u8]) -> Option<IrUsage> {
         // Run the egress reader (== ingress on the same-protocol usage tap) over the reassembled body
@@ -65,14 +69,17 @@ impl OperationHandler for ChatHandler {
 
     fn read_request(&self, _body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
         Err(IngressReject::BadRequest(
-            "chat translates through the streaming engine (proto reader/writer), not the bridge".into(),
+            "chat translates through the streaming engine (proto reader/writer), not the bridge"
+                .into(),
         ))
     }
     fn write_request(&self, _ir: &IrReq) -> Bytes {
         Bytes::new()
     }
     fn read_response(&self, _wire: &[u8]) -> Result<IrResp, CodecError> {
-        Err(CodecError::Malformed("chat uses the streaming engine, not the non-stream bridge".into()))
+        Err(CodecError::Malformed(
+            "chat uses the streaming engine, not the non-stream bridge".into(),
+        ))
     }
     fn write_response(&self, _ir: &IrResp) -> WireBody {
         WireBody::json(Bytes::new())
