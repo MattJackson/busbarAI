@@ -61,6 +61,7 @@ mod operation;
 mod ops;
 mod proto;
 mod route;
+mod router;
 mod routing;
 mod sigv4;
 mod state;
