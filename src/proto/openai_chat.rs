@@ -304,6 +304,10 @@ fn modeled_request_keys() -> &'static std::collections::HashSet<&'static str> {
             "seed",
             "n",
             "response_format",
+            // Carried cross-protocol to their Anthropic analogs (`metadata.user_id` /
+            // `tool_choice.disable_parallel_tool_use`), so they must not ALSO ride `extra`.
+            "user",
+            "parallel_tool_calls",
         ]
         .into_iter()
         .collect()
@@ -672,7 +676,17 @@ impl ProtocolReader for OpenAiReader {
         // the cross-protocol seam instead of degrading to `auto`. Read it from the native shape here.
         let tool_choice = read_openai_tool_choice(obj.get("tool_choice"));
 
+        // Cross-protocol carries with an Anthropic analog: `user` <-> `metadata.user_id`,
+        // `parallel_tool_calls` <-> `!tool_choice.disable_parallel_tool_use`.
+        let user = obj
+            .get("user")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let parallel_tool_calls = obj.get("parallel_tool_calls").and_then(|v| v.as_bool());
+
         Ok(crate::ir::IrRequest {
+            user,
+            parallel_tool_calls,
             system: system_blocks,
             messages,
             tools,
@@ -1779,6 +1793,17 @@ impl ProtocolWriter for OpenAiWriter {
         if let Some(n) = req.n {
             out.insert("n".to_string(), serde_json::json!(n));
         }
+        // The Anthropic-analog carries, re-emitted in OpenAI's native spelling (an Anthropic
+        // `metadata.user_id` arrives here as `user`; `disable_parallel_tool_use` arrives inverted).
+        if let Some(user) = &req.user {
+            out.insert("user".to_string(), serde_json::json!(user));
+        }
+        if let Some(parallel) = req.parallel_tool_calls {
+            out.insert(
+                "parallel_tool_calls".to_string(),
+                serde_json::json!(parallel),
+            );
+        }
         if let Some(response_format) = &req.response_format {
             out.insert(
                 "response_format".to_string(),
@@ -2627,6 +2652,8 @@ mod tests {
     #[test]
     fn write_request_tool_result_multi_text_concatenates_without_separator() {
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![IrMessage {
                 role: IrRole::Tool,
@@ -2667,6 +2694,8 @@ mod tests {
     #[test]
     fn write_request_emits_max_tokens_from_modeled_cap() {
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![IrMessage {
                 role: IrRole::User,
@@ -2794,6 +2823,8 @@ mod tests {
     #[test]
     fn write_request_omits_token_cap_when_absent() {
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![IrMessage {
                 role: IrRole::User,
@@ -2825,6 +2856,8 @@ mod tests {
     #[test]
     fn write_request_keeps_tool_use_on_user_message() {
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![IrMessage {
                 role: IrRole::User,
@@ -2871,6 +2904,8 @@ mod tests {
     #[test]
     fn write_request_pure_tool_result_message_emits_only_flat_entries() {
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![IrMessage {
                 role: IrRole::Tool,
@@ -2915,6 +2950,8 @@ mod tests {
     #[test]
     fn write_request_tool_role_mixed_content_not_dropped() {
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![IrMessage {
                 role: IrRole::Tool,
@@ -2991,6 +3028,8 @@ mod tests {
     #[test]
     fn write_request_tool_result_on_user_message_emits_tool_message() {
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![IrMessage {
                 role: IrRole::User,
@@ -3489,6 +3528,8 @@ mod tests {
     #[test]
     fn write_request_tool_call_only_assistant_has_null_content() {
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![IrMessage {
                 role: IrRole::Assistant,
@@ -3730,6 +3771,8 @@ mod tests {
     #[test]
     fn write_request_non_text_system_block_does_not_vanish_silently() {
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![
                 text_block("be terse"),
                 IrBlock::Image {
@@ -3921,6 +3964,8 @@ mod tests {
         // Gemini/Anthropic tool result rides on a non-Tool message), so this asserts both: the content
         // array carries only the text block, and a separate tool message carries the result.
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![IrMessage {
                 role: IrRole::Assistant,
@@ -3974,6 +4019,8 @@ mod tests {
     #[test]
     fn write_request_thinking_block_dropped_from_message_content() {
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![IrMessage {
                 role: IrRole::Assistant,
@@ -5013,6 +5060,8 @@ mod tests {
         description: Option<&str>,
     ) -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: Vec::new(),
             tools: vec![crate::ir::IrTool {
@@ -5396,6 +5445,8 @@ mod tests {
     fn write_request_string_tool_arguments_emitted_verbatim() {
         let raw = "not-json {oops".to_string();
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![IrMessage {
                 role: IrRole::Assistant,
@@ -5695,6 +5746,8 @@ mod tests {
     /// Minimal valid `IrRequest` for writer-side tool_choice/temperature tests.
     fn test_ir_request() -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![IrMessage {
                 role: IrRole::User,
@@ -5920,6 +5973,8 @@ mod tests {
     fn test_write_request_file_id_image_dropped_not_corrupted() {
         let writer = OpenAiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -5986,6 +6041,8 @@ mod tests {
     fn test_write_request_image_s3_dropped_not_corrupted() {
         let writer = OpenAiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -6069,6 +6126,8 @@ mod tests {
             "seed",
             "n",
             "response_format",
+            "user",
+            "parallel_tool_calls",
         ] {
             assert!(a.contains(k), "modeled key set must contain {k}");
         }

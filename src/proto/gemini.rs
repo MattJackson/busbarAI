@@ -712,6 +712,8 @@ impl ProtocolReader for GeminiReader {
         }
 
         Ok(crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: system_blocks,
             messages,
             tools,
@@ -3755,6 +3757,8 @@ mod tests {
     fn test_write_request_image_s3_dropped_not_corrupted() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -4601,6 +4605,8 @@ mod tests {
     fn test_write_request_omits_stream_field() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -4718,6 +4724,8 @@ mod tests {
     fn test_write_request_thinking_only_turn_survives_with_placeholder() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![
                 crate::ir::IrMessage {
@@ -4808,6 +4816,8 @@ mod tests {
     fn test_write_request_null_tool_result_coerced_to_struct() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Tool,
@@ -4865,6 +4875,8 @@ mod tests {
     fn test_write_request_scalar_tool_result_coerced_to_struct() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Tool,
@@ -4995,6 +5007,8 @@ mod tests {
     fn test_write_request_tool_result_plaintext_wrapped_not_dropped() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -5052,6 +5066,8 @@ mod tests {
     fn test_write_request_tool_result_json_passthrough() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -5791,6 +5807,8 @@ mod tests {
             serde_json::json!({"maxOutputTokens": 100, "responseMimeType": "text/plain"}),
         );
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -6214,6 +6232,8 @@ mod tests {
     fn test_write_request_image_url_sentinel_emits_file_data() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -6258,6 +6278,8 @@ mod tests {
     fn test_write_request_base64_image_still_inline_data() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -6581,6 +6603,8 @@ mod tests {
     fn test_tool_role_maps_to_user_for_function_response() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Tool,
@@ -6638,6 +6662,8 @@ mod tests {
     fn test_assistant_tool_use_stays_model_role() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Assistant,
@@ -6856,6 +6882,8 @@ mod tests {
         let writer = GeminiWriter;
         let synthetic_id = "call_00000000deadbeef".to_string();
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![
                 // Assistant turn: the tool CALL carries a synthetic id, real name `get_weather`.
@@ -6932,6 +6960,8 @@ mod tests {
     fn test_write_request_same_protocol_function_response_name_falls_back_to_id() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Tool,
@@ -7153,6 +7183,8 @@ mod tests {
         // write_request path
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Assistant,
@@ -7508,6 +7540,8 @@ mod tests {
     /// field(s) under test so the assertion targets exactly one gap.
     fn base_ir_request() -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,

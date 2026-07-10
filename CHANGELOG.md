@@ -37,6 +37,13 @@ not a special case.
   always floored by the request's remaining `failover.timeout_secs`. `0` is a startup
   error. Observable as `disposition="attempt_timeout"` on `busbar_upstream_failures_total`
   and `reason="attempt_timeout"` on `busbar_failovers_total`.
+- **Two new cross-protocol carries: `user` and `parallel_tool_calls`.** OpenAI's `user`
+  and Anthropic's `metadata.user_id` are the same end-user identifier; OpenAI's
+  `parallel_tool_calls` and Anthropic's `tool_choice.disable_parallel_tool_use` are the
+  same switch, inverted. Both are now first-class in the IR and translate between the two
+  protocols in both directions instead of being dropped at the seam. The documented
+  field-survival table (docs/protocols.md) is now measured against real egress capture,
+  not asserted.
 - **Moderations (`/v1/moderations`), cross-protocol.** Content-classification requests
   translate through the IR and return in the caller's dialect, so a moderation call is not
   pinned to one vendor's endpoint.

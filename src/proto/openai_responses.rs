@@ -825,6 +825,8 @@ impl ProtocolReader for ResponsesReader {
         }
 
         Ok(crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: system_blocks,
             messages,
             tools,
@@ -3707,6 +3709,8 @@ mod tests {
     #[test]
     fn write_request_drops_top_k_with_warn() {
         let mk = |top_k: Option<u32>| crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -3750,6 +3754,8 @@ mod tests {
     #[test]
     fn test_write_request() {
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![crate::ir::IrBlock::Text {
                 text: "You are helpful.".to_string(),
                 cache_control: None,
@@ -3996,6 +4002,8 @@ mod tests {
     #[test]
     fn test_roundtrip_identity() {
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![crate::ir::IrBlock::Text {
                 text: "You are helpful.".to_string(),
                 cache_control: None,
@@ -5226,6 +5234,8 @@ mod tests {
     #[test]
     fn test_tool_only_assistant_turn_no_empty_message_wrapper() {
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Assistant,
@@ -5285,6 +5295,8 @@ mod tests {
     #[test]
     fn test_assistant_text_then_tool_call_order() {
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Assistant,
@@ -5605,6 +5617,8 @@ mod tests {
 
         // Tool-role path.
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Tool,
@@ -5638,6 +5652,8 @@ mod tests {
 
         // Assistant-role inline tool_result path.
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Assistant,
@@ -5863,6 +5879,8 @@ mod tests {
         let payload = "QUJDMTIzKz0=";
         let media_type = "image/jpeg";
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -5934,6 +5952,8 @@ mod tests {
 
         // Round-trip through the writer reconstructs the exact original image_url.
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -5970,6 +5990,8 @@ mod tests {
     #[test]
     fn test_write_request_emits_stream() {
         let make = |stream: bool| crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -8997,6 +9019,8 @@ mod tests {
     /// individual tests can set just the one knob under test.
     fn empty_ir_request() -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: Vec::new(),
             tools: Vec::new(),

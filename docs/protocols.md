@@ -492,8 +492,7 @@ Two things can happen to a field on a cross-protocol hop:
 |---|---|---|---|
 | OpenAI | `logprobs`, `top_logprobs` | dropped at seam | no per-token probabilities |
 | OpenAI | `logit_bias` | dropped at seam | token steering unavailable (token IDs are tokenizer-specific anyway) |
-| OpenAI | `store`, `metadata`, `user`, `service_tier` | dropped at seam | bookkeeping and tier hints only |
-| OpenAI | `parallel_tool_calls` | dropped at seam | tool-call parallelism hint lost |
+| OpenAI | `store`, `metadata`, `service_tier` | dropped at seam | bookkeeping and tier hints only |
 | OpenAI | `stream_options` | dropped at seam | usage-in-stream hint lost |
 | OpenAI | `seed`, `frequency_penalty`, `presence_penalty` | IR-carried; dropped by targets without the knob (e.g. Anthropic) | sampling reproducibility/penalties unavailable on that backend |
 | Anthropic | `top_k` | IR-carried; dropped by targets without the knob (e.g. OpenAI) | top-k sampling unavailable on that backend |
@@ -508,6 +507,8 @@ Two things can happen to a field on a cross-protocol hop:
 | Bedrock | `additionalModelRequestFields`, `performanceConfig`, `promptVariables` | dropped at seam | model-specific escape hatches lost |
 | Responses | `previous_response_id` | dropped at seam | conversation state lives at OpenAI; a foreign backend answers without that context |
 | Responses | `store`, `reasoning`, `truncation`, `include`, `metadata` | dropped at seam | reasoning-effort hint and bookkeeping lost |
+
+Two fields that LOOK protocol-specific actually have an exact analog on the other side, so Busbar carries them instead of dropping them (measured, both directions): OpenAI `user` travels as Anthropic `metadata.user_id` (the same end-user identifier), and OpenAI `parallel_tool_calls` travels as Anthropic `tool_choice.disable_parallel_tool_use` (the same switch, inverted). A generic OpenAI `metadata` object still drops (Anthropic's metadata only holds `user_id`).
 
 The rule of thumb that falls out of the table: **statefulness, grounding, and safety configuration do not cross protocols**, because they are references to machinery that only exists at one vendor. If your request depends on `safetySettings`, `guardrailConfig`, `documents`, or `previous_response_id`, route it to a same-protocol backend (pin the pool, or use `exclusions`/direct routing), where all of it survives byte-for-byte. Sampling periphery (`logit_bias`, `top_k`, `seed`) degrades gracefully: the request still works, that one knob just does not exist over there.
 

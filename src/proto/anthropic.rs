@@ -489,6 +489,21 @@ impl ProtocolReader for AnthropicReader {
         // Anthropic `tool_choice` is an object: {type:"auto"|"any"|"tool"|"none", name?}. Normalize
         // into the IR union so forced/targeted tool use survives the cross-protocol seam.
         let tool_choice = read_anthropic_tool_choice(obj.get("tool_choice"));
+        // `disable_parallel_tool_use` rides INSIDE Anthropic's tool_choice object; normalize it
+        // inverted ("parallel allowed?") so it carries to OpenAI's top-level `parallel_tool_calls`.
+        let parallel_tool_calls = obj
+            .get("tool_choice")
+            .and_then(|tc| tc.get("disable_parallel_tool_use"))
+            .and_then(|v| v.as_bool())
+            .map(|disabled| !disabled);
+        // `metadata.user_id` is Anthropic's spelling of OpenAI's `user`; promote it so it carries
+        // across the seam. The `metadata` object itself still rides `extra` (unmodeled), keeping
+        // same-protocol fidelity byte-exact.
+        let user = obj
+            .get("metadata")
+            .and_then(|m| m.get("user_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Collect unmodeled top-level keys into `extra`. The set of modeled keys is a static,
@@ -527,6 +542,8 @@ impl ProtocolReader for AnthropicReader {
         // mark a block redacted, so the old `__busbar` sentinel forgery vector is structurally closed.)
 
         Ok(crate::ir::IrRequest {
+            user,
+            parallel_tool_calls,
             system: system_blocks,
             messages,
             tools,
@@ -1961,8 +1978,30 @@ impl ProtocolWriter for AnthropicWriter {
         }
         // Emit `tool_choice` in Anthropic's native object shape when present so a forced /
         // targeted directive translated from another protocol does not silently degrade to `auto`.
+        // The parallelism carry (OpenAI `parallel_tool_calls`) rides the same object as Anthropic's
+        // inverted `disable_parallel_tool_use` — valid on auto/any/tool, not on `none`.
         if let Some(tc) = &req.tool_choice {
-            out.insert("tool_choice".to_string(), write_anthropic_tool_choice(tc));
+            let mut tc_val = write_anthropic_tool_choice(tc);
+            if let (Some(parallel), Some(map)) = (req.parallel_tool_calls, tc_val.as_object_mut()) {
+                if map.get("type").and_then(|t| t.as_str()) != Some("none") {
+                    map.insert(
+                        "disable_parallel_tool_use".to_string(),
+                        serde_json::json!(!parallel),
+                    );
+                }
+            }
+            out.insert("tool_choice".to_string(), tc_val);
+        } else if let Some(parallel) = req.parallel_tool_calls {
+            // No directive but the caller did set parallelism: Anthropic can only express it inside
+            // a tool_choice object, so synthesize the neutral `auto` carrier — only when tools are
+            // actually present (the flag is meaningless without them, and Anthropic rejects a
+            // tool_choice on a tool-less request).
+            if !req.tools.is_empty() {
+                out.insert(
+                    "tool_choice".to_string(),
+                    serde_json::json!({"type": "auto", "disable_parallel_tool_use": !parallel}),
+                );
+            }
         }
         if let Some(max_tokens) = req.max_tokens {
             out.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
@@ -2020,6 +2059,12 @@ impl ProtocolWriter for AnthropicWriter {
                  response_format field and tool-forcing is not implemented in this pass; the \
                  structured-output directive from a cross-protocol request is NOT forwarded"
             );
+        }
+        // Carry the end-user identifier into Anthropic's spelling (`metadata.user_id`). Emitted
+        // before the `extra` overlay: if the request natively carried an Anthropic `metadata`
+        // object it rides `extra` and overwrites this, so the verbatim original always wins.
+        if let Some(user) = &req.user {
+            out.insert("metadata".to_string(), serde_json::json!({"user_id": user}));
         }
         for (key, value) in &req.extra {
             out.insert(key.clone(), value.clone());
@@ -4749,6 +4794,8 @@ mod anthropic_hardening_tests {
     #[test]
     fn write_request_never_emits_system_role_message() {
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: Vec::new(),
             messages: vec![
                 crate::ir::IrMessage {
@@ -5507,6 +5554,8 @@ mod anthropic_hardening_tests {
     fn test_write_request_file_id_image_dropped_not_corrupted() {
         let writer = AnthropicWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -5573,6 +5622,8 @@ mod anthropic_hardening_tests {
     fn test_write_request_image_s3_dropped_not_corrupted() {
         let writer = AnthropicWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -6033,6 +6084,143 @@ mod anthropic_hardening_tests {
         assert_eq!(
             out.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
             Some(10)
+        );
+    }
+}
+
+#[cfg(test)]
+mod user_and_parallelism_carry_tests {
+    //! The two OpenAI<->Anthropic analog carries: `user` <-> `metadata.user_id` and
+    //! `parallel_tool_calls` <-> `!tool_choice.disable_parallel_tool_use`. Same switch, different
+    //! spelling/location — these must CROSS the seam instead of dying in `extra`.
+    use super::{AnthropicReader, AnthropicWriter};
+    use crate::proto::openai_chat::{OpenAiReader, OpenAiWriter};
+    use crate::proto::{ProtocolReader, ProtocolWriter};
+
+    fn tools_json() -> serde_json::Value {
+        serde_json::json!([{
+            "type": "function",
+            "function": {"name": "f", "description": "d", "parameters": {"type": "object"}}
+        }])
+    }
+
+    /// OpenAI -> Anthropic: `user` lands as `metadata.user_id`; `parallel_tool_calls: false`
+    /// lands inverted inside the caller's tool_choice object.
+    #[test]
+    fn openai_user_and_parallel_carry_to_anthropic() {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools_json(),
+            "tool_choice": "auto",
+            "user": "end-user-7",
+            "parallel_tool_calls": false
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        assert_eq!(ir.user.as_deref(), Some("end-user-7"));
+        assert_eq!(ir.parallel_tool_calls, Some(false));
+        // Promoted fields must NOT also ride extra (double-emit guard).
+        assert!(!ir.extra.contains_key("user"));
+        assert!(!ir.extra.contains_key("parallel_tool_calls"));
+
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(out["metadata"]["user_id"], "end-user-7");
+        assert_eq!(out["tool_choice"]["type"], "auto");
+        assert_eq!(out["tool_choice"]["disable_parallel_tool_use"], true);
+    }
+
+    /// Anthropic -> OpenAI: `metadata.user_id` lands as `user`; `disable_parallel_tool_use: true`
+    /// lands inverted as `parallel_tool_calls: false`.
+    #[test]
+    fn anthropic_user_and_parallel_carry_to_openai() {
+        let body = serde_json::json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": "end-user-7"},
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
+        });
+        let ir = AnthropicReader.read_request(&body).expect("parses");
+        assert_eq!(ir.user.as_deref(), Some("end-user-7"));
+        assert_eq!(ir.parallel_tool_calls, Some(false));
+
+        let out = OpenAiWriter.write_request(&ir);
+        assert_eq!(out["user"], "end-user-7");
+        assert_eq!(out["parallel_tool_calls"], false);
+    }
+
+    /// Absence round-trips as absence: a request that never carried either field must not GAIN
+    /// `metadata`, `user`, `parallel_tool_calls`, or a synthesized `tool_choice` on translation.
+    #[test]
+    fn absence_gains_nothing() {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        assert_eq!(ir.user, None);
+        assert_eq!(ir.parallel_tool_calls, None);
+        let out = AnthropicWriter.write_request(&ir);
+        assert!(out.get("metadata").is_none());
+        assert!(out.get("tool_choice").is_none());
+
+        let ir2 = AnthropicReader
+            .read_request(&serde_json::json!({
+                "model": "m", "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .expect("parses");
+        let out2 = OpenAiWriter.write_request(&ir2);
+        assert!(out2.get("user").is_none());
+        assert!(out2.get("parallel_tool_calls").is_none());
+    }
+
+    /// `parallel_tool_calls` with NO tool_choice synthesizes the neutral `auto` carrier — but only
+    /// when tools exist; a tool-less request must not gain a tool_choice Anthropic would reject.
+    #[test]
+    fn parallel_without_directive_synthesizes_auto_only_with_tools() {
+        let with_tools = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools_json(),
+            "parallel_tool_calls": false
+        });
+        let ir = OpenAiReader.read_request(&with_tools).expect("parses");
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(out["tool_choice"]["type"], "auto");
+        assert_eq!(out["tool_choice"]["disable_parallel_tool_use"], true);
+
+        let toolless = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "parallel_tool_calls": false
+        });
+        let ir2 = OpenAiReader.read_request(&toolless).expect("parses");
+        let out2 = AnthropicWriter.write_request(&ir2);
+        assert!(
+            out2.get("tool_choice").is_none(),
+            "no tools -> no synthesized tool_choice: {out2}"
+        );
+    }
+
+    /// A NATIVE Anthropic `metadata` object (riding `extra`) beats the promoted carry on the
+    /// writer's overlay — the verbatim original always wins.
+    #[test]
+    fn native_metadata_wins_over_promoted_user() {
+        let body = serde_json::json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": "original"}
+        });
+        let ir = AnthropicReader.read_request(&body).expect("parses");
+        // Same-protocol translated path: extra still carries metadata verbatim.
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(out["metadata"]["user_id"], "original");
+        assert_eq!(
+            out["metadata"].as_object().unwrap().len(),
+            1,
+            "metadata must be the verbatim original, not a merged object"
         );
     }
 }

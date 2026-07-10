@@ -1385,6 +1385,8 @@ impl ProtocolReader for BedrockReader {
         }
 
         Ok(crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: system_blocks,
             messages,
             tools,
@@ -3496,6 +3498,8 @@ mod tests {
     #[test]
     fn test_write_request() {
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![crate::ir::IrBlock::Text {
                 text: "You are a helpful assistant.".to_string(),
                 cache_control: None,
@@ -4593,6 +4597,8 @@ mod tests {
     fn test_write_request_skips_system_role_message() {
         let writer = BedrockWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![
                 crate::ir::IrMessage {
@@ -4663,6 +4669,8 @@ mod tests {
     fn test_write_request_tool_result_preserves_non_text_content() {
         let writer = BedrockWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -4926,6 +4934,8 @@ mod tests {
 
         // Cross-protocol shape: typed tools, empty extra (seam cleared it).
         let ir_tools = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![],
             tools: vec![crate::ir::IrTool {
@@ -4964,6 +4974,8 @@ mod tests {
 
         // No tools, no raw toolConfig → no toolConfig key at all.
         let ir_empty = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![],
             tools: vec![],
@@ -5489,6 +5501,8 @@ mod tests {
 
         // Cross-protocol shape: top_k set in the IR, extra cleared (as the translate seam leaves it).
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -5638,6 +5652,8 @@ mod tests {
             serde_json::json!({"maxTokens": 1, "topP": 0.5}),
         );
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -5678,6 +5694,8 @@ mod tests {
 
         // Cross-protocol egress: no inferenceConfig in extra → config built purely from typed IR.
         let ir2 = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -5826,6 +5844,8 @@ mod tests {
         // Top-level URL-sentinel image → dropped (no image block, no garbage bytes).
         let url = "https://example.com/cat.png";
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -5914,6 +5934,8 @@ mod tests {
     fn test_write_request_all_nonrepresentable_turn_kept_with_placeholder() {
         let writer = BedrockWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![
                 crate::ir::IrMessage {
@@ -6234,6 +6256,8 @@ mod tests {
         let writer = BedrockWriter;
         let url = "https://example.com/in-tool.png";
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Tool,
@@ -7774,6 +7798,8 @@ mod tests {
             }],
         };
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![
                 text_msg(crate::ir::IrRole::User, "q"),
@@ -7853,6 +7879,8 @@ mod tests {
 
     fn tool_choice_req(tc: Option<crate::ir::IrToolChoice>) -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![],
             tools: vec![crate::ir::IrTool {
@@ -8026,6 +8054,8 @@ mod tests {
     #[test]
     fn test_bedrock_writer_clamps_temperature_above_one() {
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -8070,6 +8100,8 @@ mod tests {
         tools: Vec<crate::ir::IrTool>,
     ) -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system,
             messages,
             tools,
@@ -8401,6 +8433,8 @@ mod tests {
     fn test_write_request_response_format_dropped() {
         let writer = BedrockWriter;
         let req = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,

@@ -712,6 +712,8 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     fn probe_body(&self, model: &str) -> Vec<u8> {
         use crate::ir::{IrBlock, IrMessage, IrRequest, IrRole};
         let ir = IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![IrMessage {
                 role: IrRole::User,

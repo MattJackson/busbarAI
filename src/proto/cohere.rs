@@ -911,6 +911,8 @@ impl ProtocolReader for CohereReader {
         }
 
         Ok(crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: system_blocks,
             messages,
             tools,
@@ -2191,6 +2193,8 @@ mod tests {
     #[test]
     fn test_write_request() {
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![crate::ir::IrBlock::Text {
                 text: "You are helpful.".to_string(),
                 cache_control: None,
@@ -2288,6 +2292,8 @@ mod tests {
     #[test]
     fn test_read_request_roundtrip() {
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![
                 crate::ir::IrMessage {
@@ -2584,6 +2590,8 @@ mod tests {
     #[test]
     fn test_write_request_sole_tooluse_omits_empty_content() {
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Assistant,
@@ -2629,6 +2637,8 @@ mod tests {
     #[test]
     fn test_write_request_text_block_shapes() {
         let single = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -3957,6 +3967,8 @@ mod tests {
     #[test]
     fn test_write_request_stream_field_conditional() {
         let base = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,
@@ -4129,6 +4141,8 @@ mod tests {
     #[test]
     fn test_tool_role_text_alongside_result_not_dropped() {
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Tool,
@@ -4187,6 +4201,8 @@ mod tests {
     #[test]
     fn test_tool_result_multi_block_content_joins_without_space() {
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Tool,
@@ -4239,6 +4255,8 @@ mod tests {
     #[test]
     fn test_tool_role_text_without_result_not_dropped() {
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Tool,
@@ -4285,6 +4303,8 @@ mod tests {
     #[test]
     fn test_tool_role_multi_text_without_result_is_string() {
         let ir = crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::Tool,
@@ -5824,6 +5844,8 @@ mod tests {
     /// round-trip tests below.
     fn ir_with_tool_choice(tc: Option<crate::ir::IrToolChoice>) -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            user: None,
+            parallel_tool_calls: None,
             system: vec![],
             messages: vec![crate::ir::IrMessage {
                 role: crate::ir::IrRole::User,

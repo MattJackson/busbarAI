@@ -81,6 +81,17 @@ pub(crate) struct IrRequest {
     /// caller omitted it (no `tool_choice` emitted, so a request that never carried one does not gain
     /// a spurious `auto` on translation).
     pub(crate) tool_choice: Option<IrToolChoice>,
+    /// End-user identifier for provider-side abuse tracking. Two protocols model it, in different
+    /// places: OpenAI top-level `user`, Anthropic `metadata.user_id`. First-class so it CARRIES
+    /// between those two instead of dying in `extra` at the cross-protocol seam; writers for
+    /// protocols with no analog (Gemini/Bedrock/Cohere) simply never emit it. `None` == absent.
+    pub(crate) user: Option<String>,
+    /// Tool-call parallelism switch, normalized as "parallel allowed?". OpenAI models it as
+    /// top-level `parallel_tool_calls` (default true); Anthropic as
+    /// `tool_choice.disable_parallel_tool_use` (default false) — the SAME switch, inverted, in a
+    /// different location, so it carries between the two. `None` == caller never said, nothing
+    /// emitted (both defaults are "parallel allowed", so absence round-trips as absence).
+    pub(crate) parallel_tool_calls: Option<bool>,
     pub(crate) stream: bool,
     pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
