@@ -46,6 +46,7 @@ mod config_validate;
 mod eventstream;
 mod forward;
 mod governance;
+mod handler;
 mod handlers;
 mod health;
 mod ir;
