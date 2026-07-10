@@ -1007,6 +1007,13 @@ fn build_router_with_limits(
         )
         .route("/admin/keys/{id}/usage", get(admin::key_usage))
         .route("/v1/chat/completions", post(route::openai_ingress))
+        // 1.2 operations (OpenAI-family ingress): embeddings/moderations/images/audio, dispatched
+        // through the four-trait operation pipeline (router → cell → forward_operation).
+        .route("/v1/embeddings", post(route::openai_embeddings))
+        .route("/v1/moderations", post(route::openai_moderations))
+        .route("/v1/images/generations", post(route::openai_images))
+        .route("/v1/audio/transcriptions", post(route::openai_transcriptions))
+        .route("/v1/audio/speech", post(route::openai_speech))
         // OpenAI list-models: SDKs call `models.list()` first; UIs build pickers from it.
         // Governance-scoped like /stats (restricted keys see only their reachable names).
         .route("/v1/models", get(handlers::list_models))

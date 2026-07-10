@@ -815,6 +815,123 @@ pub(crate) async fn openai_ingress(
     ingress_body_model(&app, &gov, &caller, &headers, body, "openai").await
 }
 
+/// Minimal `model` form-field extractor for multipart transcription. A boundary-aware
+/// `parse_multipart_model` is a P5 refinement; this scan handles the standard `name="model"` part.
+fn multipart_model(body: &[u8]) -> Option<String> {
+    let s = String::from_utf8_lossy(body);
+    let idx = s.find("name=\"model\"")?;
+    let start = s[idx..].find("\r\n\r\n")? + idx + 4;
+    let val = &s[start..];
+    let end = val.find("\r\n").unwrap_or(val.len());
+    let m = val[..end].trim().to_string();
+    (!m.is_empty()).then_some(m)
+}
+
+/// Ingress for the NEW operations (embeddings/moderations/images/audio, 1.2). Resolves the
+/// (protocol, operation) cell — absent ⇒ no-cell 404 in the CALLER's dialect (design §3) — then
+/// forwards SAME-protocol through `forward_operation`. Model comes from the JSON body `model` (JSON
+/// ops) or the multipart form (transcription). Cross-protocol IR bridge lands after first green.
+async fn operation_ingress(
+    app: &Arc<App>,
+    gov: &crate::governance::GovCtx,
+    caller: &crate::auth::CallerToken,
+    headers: &HeaderMap,
+    body: Bytes,
+    proto: &'static str,
+    operation: crate::operation::Operation,
+) -> Response {
+    let caller_token = caller.0.as_deref();
+    let started = Instant::now();
+    let charged_at = crate::store::now();
+
+    let Some(rh) = crate::cells::request_handler(proto) else {
+        return finish_rejected(
+            app, gov, proto, crate::forward::POOL_LABEL_UNRESOLVED, started, charged_at,
+            ingress_error(proto, StatusCode::NOT_FOUND, crate::forward::KIND_NOT_FOUND,
+                "This protocol does not support that operation."),
+        );
+    };
+    let Some(cell) = rh.operation_handler(operation) else {
+        return finish_rejected(
+            app, gov, proto, crate::forward::POOL_LABEL_UNRESOLVED, started, charged_at,
+            ingress_error(proto, StatusCode::NOT_FOUND, crate::forward::KIND_NOT_FOUND,
+                "This endpoint does not support that operation."),
+        );
+    };
+
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let model = if ct.starts_with("multipart/") {
+        multipart_model(&body)
+    } else {
+        crate::json::parse(&body)
+            .ok()
+            .and_then(|v: serde_json::Value| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+    };
+    let model = match model {
+        Some(m) if !m.is_empty() => m,
+        _ => {
+            return finish_rejected(
+                app, gov, proto, crate::forward::POOL_LABEL_UNRESOLVED, started, charged_at,
+                ingress_error(proto, StatusCode::BAD_REQUEST, crate::forward::KIND_INVALID_REQUEST,
+                    "Missing required parameter: 'model'."),
+            );
+        }
+    };
+
+    if let Some(resp) = governance_guard(app, gov, proto, &model, started, charged_at).await {
+        return resp;
+    }
+
+    let (cands, pool_name): (Vec<WeightedLane>, &str) = if let Some(c) = app.pools.get(&model) {
+        (c.clone(), model.as_str())
+    } else if let Some(&i) = app.by_model.get(&model) {
+        (vec![WeightedLane { idx: i, weight: 1 }], "")
+    } else {
+        return finish(
+            app, gov, proto, pool_label(app, &model), started, charged_at,
+            ingress_error(proto, StatusCode::NOT_FOUND, crate::forward::KIND_NOT_FOUND,
+                &not_found_message(&model, None)),
+        );
+    };
+
+    let req_ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .cloned()
+        .unwrap_or_else(|| axum::http::HeaderValue::from_static("application/json"));
+    let accept = match operation {
+        crate::operation::Operation::Speech => "*/*",
+        _ => "application/json",
+    };
+    let resp = crate::forward::forward_operation(
+        app.clone(), cands, body, req_ct, caller_token, pool_name, proto, cell, accept,
+    )
+    .await;
+    finish(app, gov, proto, &model, started, charged_at, resp)
+}
+
+macro_rules! op_ingress_handler {
+    ($name:ident, $proto:literal, $op:expr) => {
+        pub(crate) async fn $name(
+            State(app): State<Arc<App>>,
+            axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
+            axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> Response {
+            operation_ingress(&app, &gov, &caller, &headers, body, $proto, $op).await
+        }
+    };
+}
+
+op_ingress_handler!(openai_moderations, "openai", crate::operation::Operation::Moderation);
+op_ingress_handler!(openai_embeddings, "openai", crate::operation::Operation::Embeddings);
+op_ingress_handler!(openai_images, "openai", crate::operation::Operation::Image);
+op_ingress_handler!(openai_transcriptions, "openai", crate::operation::Operation::Transcription);
+op_ingress_handler!(openai_speech, "openai", crate::operation::Operation::Speech);
+
 // POST /v2/chat — Cohere v2 ingress: model + stream live in the body, exactly like OpenAI.
 #[tracing::instrument(name = "cohere_ingress", skip_all)]
 pub(crate) async fn cohere_ingress(

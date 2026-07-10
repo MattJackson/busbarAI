@@ -2143,6 +2143,92 @@ mod coerce_on_error_tests {
     }
 }
 
+/// Forward a NEW operation (embeddings/moderations/images/audio) through a candidate pool — v1
+/// SAME-PROTOCOL passthrough: the ingress body is relayed to the egress lane UNCHANGED (ingress dialect
+/// == egress dialect, so no translation), reusing the send/auth/permit primitives. Deliberately simpler
+/// than [`forward_with_pool`]: no streaming, no cross-protocol IR bridge yet, and v1 records a breaker
+/// SUCCESS on 2xx but does not yet classify upstream errors into the breaker (enriched in a follow-up).
+/// The cross-protocol IR bridge (ingress cell `read_request`→IrReq→egress cell `write_request`; response
+/// reverse) is layered on after first green. Multipart/binary bodies pass through verbatim same-proto.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_operation(
+    app: Arc<App>,
+    cands: Vec<WeightedLane>,
+    body: Bytes,
+    req_content_type: axum::http::HeaderValue,
+    caller_token: Option<&str>,
+    pool_name: &str,
+    ingress_protocol: &str,
+    cell: &dyn crate::handler::OperationHandler,
+    accept: &'static str,
+) -> Response {
+    for wl in &cands {
+        let i = wl.idx;
+        // Concurrency permit; a busy/cooling lane yields None → try the next candidate.
+        let Some(_permit) = app.store.try_acquire(i) else {
+            continue;
+        };
+        let base = &app.lanes[i].base_url;
+        let url_path = cell.upstream_path(&app.lanes[i], false);
+        let (wire_path, canonical_uri) = sign_and_wire_path_parts(&url_path);
+        let key = match app.auth_mode() {
+            crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(""),
+            crate::auth::AuthMode::Token | crate::auth::AuthMode::None => {
+                app.lanes[i].api_key.as_str()
+            }
+        };
+        let signing_ctx = crate::proto::SigningContext {
+            host: host_from_base(base),
+            canonical_uri,
+            body: body.as_ref(),
+            timestamp_epoch: now(),
+            auth_mode: app.auth_mode(),
+        };
+        let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
+        let writer = app.lanes[i].protocol.writer();
+        let req = app
+            .client
+            .post(format!("{base}{wire_path}"))
+            .headers(convert_headers(auth))
+            .header(CONTENT_TYPE, req_content_type.clone())
+            .header(USER_AGENT, writer.egress_user_agent())
+            .header(ACCEPT, accept)
+            .body(body.clone())
+            .timeout(std::time::Duration::from_secs(30));
+        match req.send().await {
+            Ok(resp) => {
+                let status = StatusCode::from_u16(resp.status().as_u16())
+                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                let up_ctype = resp
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .cloned()
+                    .unwrap_or_else(|| axum::http::HeaderValue::from_static(APPLICATION_JSON));
+                match resp.bytes().await {
+                    Ok(bytes) => {
+                        if status.is_success() {
+                            app.store.record_success_in(pool_name, i);
+                        }
+                        return Response::builder()
+                            .status(status)
+                            .header(CONTENT_TYPE, up_ctype)
+                            .body(Body::from(bytes))
+                            .unwrap_or_else(|_| status.into_response());
+                    }
+                    Err(_) => continue, // body read failed → failover
+                }
+            }
+            Err(_) => continue, // transport error → failover
+        }
+    }
+    ingress_error(
+        ingress_protocol,
+        StatusCode::SERVICE_UNAVAILABLE,
+        KIND_API_ERROR,
+        "All upstreams for this operation are unavailable.",
+    )
+}
+
 /// Forward with pool name context for on_exhausted config lookup.
 /// Thin wrapper: parse the body ONCE for callers that only hold bytes (tests, ad-hoc routes), then
 /// delegate. The ingress hot path (`route::forward_resolved`) instead calls
