@@ -24,6 +24,7 @@ const PAGES = {
   'circuit-breaker': 'Fault-attributed circuit breaking: scope, failure classification, the state machine, trip conditions, cooldown, and config.',
   'failover': 'In-flight failover: the first-byte boundary, failover budget, context-length failover, session affinity, and pool exhaustion.',
   'observability': 'Health, metrics, and observability endpoints: /healthz, /stats, /metrics, and the signals worth alerting on.',
+  'hooks': 'Your logic on the request path: the routing policy hook and the request-log hook, what each receives, what you control, and the fail-safe guarantees.',
   'operations': 'Running Busbar in production: process configuration, TLS and mTLS, health and readiness, metrics to watch, the admin API, and troubleshooting.',
   'architecture': 'A request traced end to end: the superset IR, the reader/writer seams behind protocols-not-providers, and failure disposition.',
 };

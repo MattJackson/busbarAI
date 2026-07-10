@@ -98,6 +98,7 @@ export default defineConfig({
           items: [
             { label: 'Pools', slug: 'docs/pools' },
             { label: 'Routing', slug: 'docs/routing' },
+            { label: 'Hooks', slug: 'docs/hooks' },
             { label: 'Protocols & Translation', slug: 'docs/protocols' },
           ],
         },
