@@ -1,0 +1,28 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1280" height="640" fill="#0F172A"/>
+  <!-- subtle lime connector lines echoing the site diagram -->
+  <line x1="0" y1="150" x2="360" y2="150" stroke="#A3E635" stroke-width="2" opacity="0.5"/>
+  <line x1="920" y1="150" x2="1280" y2="150" stroke="#A3E635" stroke-width="2" opacity="0.5"/>
+  <line x1="0" y1="490" x2="360" y2="490" stroke="#334155" stroke-width="2" opacity="0.6"/>
+  <line x1="920" y1="490" x2="1280" y2="490" stroke="#334155" stroke-width="2" opacity="0.6"/>
+  <!-- glyph (lime), scaled up, left of the wordmark -->
+  <g transform="translate(300 250) scale(2.1)" style="color:#A3E635">
+    <g transform="translate(-64 -64)"><g transform="translate(64 64) scale(1.46) translate(-62 -64)"><g transform="translate(3 0)">
+    <rect x="46" y="39" width="9" height="50" rx="4.5" fill="currentColor"/>
+    <g stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="36" y1="64" x2="41" y2="64" stroke-width="5"/>
+      <path d="M60 45 L79 45 Q87 45 87 55" stroke-width="5"/>
+      <line x1="60" y1="64" x2="72" y2="64" stroke-width="5"/>
+      <path d="M60 83 L79 83 Q87 83 87 73" stroke-width="5"/>
+    </g>
+    <g fill="currentColor">
+      <circle cx="31" cy="64" r="4.6"/><circle cx="87" cy="55" r="4.6"/>
+      <circle cx="76" cy="64" r="4.6"/><circle cx="87" cy="73" r="4.6"/>
+    </g>
+  </g></g></g>
+  </g>
+  <text x="470" y="330" font-family="Inter, ui-sans-serif, system-ui, -apple-system, Helvetica, Arial, sans-serif" font-size="120" font-weight="800" fill="#FFFFFF" letter-spacing="-2">Busbar</text>
+  <!-- slogan -->
+  <text x="640" y="470" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, -apple-system, Helvetica, Arial, sans-serif" font-size="46" font-weight="600" fill="#A3E635" letter-spacing="0.5">Your AI Control Plane</text>
+  <text x="640" y="540" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="26" fill="#94A3B8">One endpoint. Every provider. Losslessly.</text>
+</svg>
