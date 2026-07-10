@@ -9,26 +9,16 @@
 [![CI](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/MattJackson/busbarAI?include_prereleases)](https://github.com/MattJackson/busbarAI/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-![Status](https://img.shields.io/badge/status-1.1.0-brightgreen)
+![Status](https://img.shields.io/badge/status-1.2.0-brightgreen)
 
 📖 **Docs:** [getbusbar.com](https://getbusbar.com)  
 ⚡ **Install:** `curl -fsSL https://getbusbar.com/install.sh | sh`  
 🐳 **Docker:** [`getbusbar/busbar`](https://hub.docker.com/r/getbusbar/busbar) — `FROM scratch`, ~5 MB, multi-arch, cosign-signed  
 🤖 **Agent-readable:** [getbusbar.com/llms.txt](https://getbusbar.com/llms.txt)
 
-Busbar sits between your application and your LLM providers. Point any SDK at one URL (OpenAI, Anthropic, Gemini, Bedrock, Cohere, or the Responses API) and Busbar routes it to the backends you chose, translating between protocols where they differ. When a provider fails, it keeps serving. That's why this isn't another proxy with a long model list.
+Busbar sits between your application and every AI provider. Point any SDK at one URL (OpenAI, Anthropic, Gemini, Bedrock, Cohere, or the Responses API) and Busbar routes each request to the backends you chose, translating losslessly between protocols where they differ: chat, embeddings, images, audio, and moderations. When a provider fails, it keeps serving.
 
-> You define a model name and the backends behind it. Any client, speaking any of the six protocols, can reach that name. Which provider actually serves it is your config, not their code.
-
-- **Lossless translation, both ways.** Nothing is flattened to OpenAI shape, so Anthropic thinking blocks, structured-output schemas, and Bedrock tool use survive the hop. Keep the SDK your code already speaks and swap providers with a config edit.
-- **Failover inside the request.** If a lane fails before the first byte reaches your client (even on a streaming request), Busbar reroutes to the next backend in the pool. Your user never sees the 500.
-- Every provider connection gets a circuit breaker that knows whose fault a failure was. A provider outage, a bad client request, a context overflow, and a revoked key are four different problems, and each gets different treatment instead of a blind retry.
-- The request path is programmable. Routing is the first hook: pick a built-in policy (`weighted`, `cheapest`, `fastest`, `least_busy`, `usage`) or bring your own as a webhook in any language, or as a sandboxed Rhai script. A slow or broken hook falls back; it never blocks a request.
-- TLS termination is native and mTLS is one config key. A client without a certificate signed by your CA is rejected at the handshake, before any token check even runs. Zero trust without a service mesh.
-
-The whole thing is one static Rust binary (Linux and macOS on Intel and ARM, Windows on Intel). No Python sidecar, no interpreter, no GC in the request path. Your keys stay in your infrastructure.
-
-> **Status: 1.1.0, stable.** The HTTP API, the configuration schema, and the six wire-protocol contracts are frozen under Semantic Versioning. Every release ships a CycloneDX SBOM and a build-provenance attestation, and the code has been through multiple rounds of security and correctness review. Apache-2.0.
+> **Status: 1.2.0, stable.** API, config schema, and the six wire-protocol contracts are frozen under Semantic Versioning. Every release ships an SBOM and a build-provenance attestation. Apache-2.0.
 
 ---
 
