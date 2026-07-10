@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 pub(crate) struct BedrockRequestHandler;
 static EMB: BedrockEmbeddings = BedrockEmbeddings;
+static IMG: BedrockImage = BedrockImage;
 
 impl RequestHandler for BedrockRequestHandler {
     fn protocol_name(&self) -> &'static str {
@@ -22,8 +23,49 @@ impl RequestHandler for BedrockRequestHandler {
     fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler> {
         match op {
             Operation::Embeddings => Some(&EMB),
-            _ => None, // images/others land as built; anthropic-style gaps stay None → no-cell 404
+            Operation::Image => Some(&IMG),
+            _ => None, // others land as built; genuine gaps stay None → no-cell 404
         }
+    }
+}
+
+/// Amazon Titan Image Generator via `/model/{id}/invoke`. prompt in → `images[]` (b64) out.
+struct BedrockImage;
+
+impl OperationHandler for BedrockImage {
+    fn upstream_path(&self, lane: &Lane, _wants_stream: bool) -> String {
+        lane.path
+            .clone()
+            .unwrap_or_else(|| format!("/model/{}/invoke", lane.wire_model()))
+    }
+    fn read_request(&self, _wire: &Value) -> Result<IrReq, IngressReject> {
+        Err(IngressReject::BadRequest("bedrock image is egress-only".into()))
+    }
+    fn write_request(&self, ir: &IrReq) -> Bytes {
+        let IrReq::Image(r) = ir else { return Bytes::new() };
+        let body = json!({
+            "taskType": "TEXT_IMAGE",
+            "textToImageParams": { "text": r.prompt.clone().unwrap_or_default() },
+            "imageGenerationConfig": { "numberOfImages": r.n.unwrap_or(1) },
+        });
+        Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
+    }
+    fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
+        let v: Value = serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
+        let images = v
+            .get("images")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|b| b.as_str())
+                    .map(|b| crate::media::ImageOutput { b64: Some(b.to_string()), ..Default::default() })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(IrResp::Image(crate::ir::image::ImageResp { images, ..Default::default() }))
+    }
+    fn write_response(&self, _ir: &IrResp) -> Bytes {
+        Bytes::new()
     }
 }
 

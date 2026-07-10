@@ -71,7 +71,6 @@ macro_rules! passthrough_cell {
     };
 }
 
-passthrough_cell!(OpenAiImage, "/v1/images/generations", "image");
 passthrough_cell!(OpenAiTranscription, "/v1/audio/transcriptions", "transcription");
 passthrough_cell!(OpenAiSpeech, "/v1/audio/speech", "speech");
 
@@ -190,6 +189,98 @@ impl OperationHandler for OpenAiEmbeddings {
             body["usage"] = json!({ "prompt_tokens": u.input, "total_tokens": u.input + u.output });
         }
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
+    }
+}
+
+// ---------------------------------------------------------------- image cell (real, cross-protocol)
+
+use crate::ir::image::{ImageOp, ImageReq, ImageResp, ImageSize};
+use crate::media::ImageOutput;
+
+struct OpenAiImage;
+
+impl OperationHandler for OpenAiImage {
+    fn upstream_path(&self, lane: &Lane, _wants_stream: bool) -> String {
+        lane.path.clone().unwrap_or_else(|| "/v1/images/generations".to_string())
+    }
+    fn read_request(&self, wire: &Value) -> Result<IrReq, IngressReject> {
+        let size = wire.get("size").and_then(Value::as_str).and_then(|s| {
+            if s == "auto" {
+                Some(ImageSize::Auto)
+            } else {
+                s.split_once('x')
+                    .and_then(|(w, h)| Some(ImageSize::Wh { width: w.parse().ok()?, height: h.parse().ok()? }))
+            }
+        });
+        Ok(IrReq::Image(ImageReq {
+            op: ImageOp::Generate,
+            model: wire.get("model").and_then(Value::as_str).unwrap_or_default().to_string(),
+            prompt: wire.get("prompt").and_then(Value::as_str).map(str::to_string),
+            n: wire.get("n").and_then(Value::as_u64).map(|n| n as u32),
+            size,
+            quality: wire.get("quality").and_then(Value::as_str).map(str::to_string),
+            style: wire.get("style").and_then(Value::as_str).map(str::to_string),
+            response_format: wire.get("response_format").and_then(Value::as_str).map(str::to_string),
+            user: wire.get("user").and_then(Value::as_str).map(str::to_string),
+            ..Default::default()
+        }))
+    }
+    fn write_request(&self, ir: &IrReq) -> Bytes {
+        let IrReq::Image(r) = ir else { return Bytes::new() };
+        let mut body = json!({ "model": r.model });
+        if let Some(p) = &r.prompt {
+            body["prompt"] = json!(p);
+        }
+        if let Some(n) = r.n {
+            body["n"] = json!(n);
+        }
+        if let Some(ImageSize::Wh { width, height }) = r.size {
+            body["size"] = json!(format!("{width}x{height}"));
+        }
+        Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
+    }
+    fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
+        let v: Value = serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
+        let images = v
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|d| ImageOutput {
+                        b64: d.get("b64_json").and_then(Value::as_str).map(str::to_string),
+                        url: d.get("url").and_then(Value::as_str).map(str::to_string),
+                        revised_prompt: d.get("revised_prompt").and_then(Value::as_str).map(str::to_string),
+                        ..Default::default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(IrResp::Image(ImageResp {
+            created: v.get("created").and_then(Value::as_u64),
+            images,
+            ..Default::default()
+        }))
+    }
+    fn write_response(&self, ir: &IrResp) -> Bytes {
+        let IrResp::Image(r) = ir else { return Bytes::new() };
+        let data: Vec<Value> = r
+            .images
+            .iter()
+            .map(|img| {
+                let mut o = serde_json::Map::new();
+                if let Some(b) = &img.b64 {
+                    o.insert("b64_json".into(), json!(b));
+                }
+                if let Some(u) = &img.url {
+                    o.insert("url".into(), json!(u));
+                }
+                if let Some(rp) = &img.revised_prompt {
+                    o.insert("revised_prompt".into(), json!(rp));
+                }
+                Value::Object(o)
+            })
+            .collect();
+        Bytes::from(serde_json::to_vec(&json!({ "created": r.created.unwrap_or(0), "data": data })).unwrap_or_default())
     }
 }
 
