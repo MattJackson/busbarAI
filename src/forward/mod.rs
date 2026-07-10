@@ -1964,6 +1964,31 @@ fn emit_breaker_trip(app: &Arc<App>, pool_name: &str, i: usize) {
     tracing::warn!(pool = %pool_name, lane = %app.lanes[i].model, "lane breaker tripped (Closed→Open)");
 }
 
+/// The effective per-attempt time-to-response-headers cap for pool member `i`: the pool-member
+/// override wins over the model-level default (`None` = uncapped). This is the layering the
+/// feature promises — the SAME model can be `attempt_timeout_ms: 10000` in a batch pool and
+/// `50` in a latency-critical pool, with the model-level value as the fallback for pools (and
+/// the default `""` cell) that don't override it.
+fn effective_attempt_timeout_ms(
+    cands: &[crate::state::WeightedLane],
+    i: usize,
+    lane_default: Option<u64>,
+) -> Option<u64> {
+    cands
+        .iter()
+        .find(|w| w.idx == i)
+        .and_then(|w| w.attempt_timeout_ms)
+        .or(lane_default)
+}
+
+/// Floor an `attempt_timeout_ms` cap by the request's remaining wall-clock budget (whole seconds),
+/// so a per-attempt cap can never grant MORE time than the request has left — mirroring how the
+/// reqwest transport timeout is budget-clamped. `.max(1)` keeps the cap non-zero on a nearly
+/// exhausted budget (a zero-duration timeout would fail the attempt before it is even tried).
+fn attempt_cap(ms: u64, remaining_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(ms.min(remaining_secs.saturating_mul(1000).max(1)))
+}
+
 /// The coerced result of running a routing policy at the seam — what the ordered walk should do.
 enum PolicyOutcome {
     /// Use this ranked order (the policy returned `Prefer`, or `on_error == first` produced the
@@ -2674,7 +2699,60 @@ pub(crate) async fn forward_with_pool_parsed(
         // Wall-clock start of the upstream call, for the `metrics.latencyMs` a native bedrock
         // ConverseStream `metadata` frame carries on the buffered-synthesis path below.
         let upstream_started = std::time::Instant::now();
-        let res = req.send().await;
+        // PER-ATTEMPT time-to-response-headers cap (`attempt_timeout_ms` — the hang detector). The
+        // pool-member override wins over the model-level value; either is floored by the remaining
+        // request budget. `send()` resolves when RESPONSE HEADERS arrive, so wrapping it bounds the
+        // hang (connect + headers) without bounding a healthy long stream's BODY — the stream
+        // rationale above is untouched. Expiry maps to the same transport-error arm as any reqwest
+        // timeout: transient → breaker failure → fail over to the next member WITHIN this request.
+        let attempt_ms = effective_attempt_timeout_ms(&cands, i, app.lanes[i].attempt_timeout_ms);
+        let res = match attempt_ms {
+            Some(ms) => {
+                let cap = attempt_cap(ms, request_ctx.remaining(now()));
+                match tokio::time::timeout(cap, req.send()).await {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        // Mirror the reqwest transport-timeout arm below EXACTLY (breaker record,
+                        // trip emit, failure + failover metrics, permit drop) — the only deltas are
+                        // the distinct `attempt_timeout` disposition/reason labels so operators can
+                        // see hang-hops as their own series, and the warn naming the cap.
+                        record_upstream_rtt(upstream_started.elapsed());
+                        let tripped = app.store.record_transient_in(
+                            pool_name,
+                            i,
+                            ERR_NET_TIMEOUT,
+                            &breaker_cfg,
+                            None,
+                        );
+                        if tripped {
+                            emit_breaker_trip(&app, pool_name, i);
+                        }
+                        metrics::counter!(
+                            crate::metrics::UPSTREAM_FAILURES_TOTAL,
+                            "pool" => metric_pool.to_owned(),
+                            "lane" => app.lanes[i].model.clone(),
+                            "disposition" => "attempt_timeout"
+                        )
+                        .increment(1);
+                        metrics::counter!(
+                            crate::metrics::FAILOVERS_TOTAL,
+                            "pool" => metric_pool.to_owned(),
+                            "reason" => "attempt_timeout"
+                        )
+                        .increment(1);
+                        tracing::warn!(
+                            pool = %pool_name,
+                            lane = %app.lanes[i].model,
+                            attempt_timeout_ms = ms,
+                            "no response headers within the attempt cap; failing over"
+                        );
+                        drop(permit);
+                        continue;
+                    }
+                }
+            }
+            None => req.send().await,
+        };
         record_upstream_rtt(upstream_started.elapsed());
 
         match res {
@@ -3852,7 +3930,48 @@ async fn forward_once(
     // Wall-clock start of the upstream call, for the `metrics.latencyMs` a native bedrock
     // ConverseStream `metadata` frame carries on the buffered-synthesis path below.
     let upstream_started = std::time::Instant::now();
-    let res = req.send().await;
+    // Per-attempt time-to-headers cap on the DEGRADED path too (lane-level only: this path selects
+    // by pool cell, not a member row, so the member override does not apply here). Expiry = the same
+    // transport-timeout handling as the reqwest error below.
+    let res = match app.lanes[i].attempt_timeout_ms {
+        Some(ms) => {
+            let cap = attempt_cap(ms, timeout_secs);
+            match tokio::time::timeout(cap, req.send()).await {
+                Ok(r) => r,
+                Err(_elapsed) => {
+                    record_upstream_rtt(upstream_started.elapsed());
+                    tracing::warn!(
+                        pool = %pool,
+                        lane = %app.lanes[i].model,
+                        attempt_timeout_ms = ms,
+                        "no response headers within the attempt cap (degraded path)"
+                    );
+                    // Mirror the transport-error handling: record transient on the POOL cell and
+                    // signal the caller to try the next degraded candidate.
+                    let tripped = app.store.record_transient_in(
+                        pool,
+                        i,
+                        ERR_NET_TIMEOUT,
+                        forward_once_cfg.as_ref(),
+                        None,
+                    );
+                    if tripped {
+                        emit_breaker_trip(app, pool, i);
+                    }
+                    app.store.release_probe_in(pool, i);
+                    metrics::counter!(
+                        crate::metrics::UPSTREAM_FAILURES_TOTAL,
+                        "pool" => pool.to_string(),
+                        "lane" => app.lanes[i].model.clone(),
+                        "disposition" => "attempt_timeout"
+                    )
+                    .increment(1);
+                    return Err(());
+                }
+            }
+        }
+        None => req.send().await,
+    };
     record_upstream_rtt(upstream_started.elapsed());
 
     match res {
@@ -5049,6 +5168,7 @@ mod auth_style_tests {
             }),
             health: None,
             upstream_model: None,
+            attempt_timeout_ms: None,
         }
     }
 
@@ -5220,6 +5340,69 @@ mod auth_style_tests {
 }
 
 #[cfg(test)]
+mod attempt_timeout_precedence_tests {
+    use super::{attempt_cap, effective_attempt_timeout_ms};
+    use crate::state::WeightedLane;
+
+    fn member(idx: usize, attempt_timeout_ms: Option<u64>) -> WeightedLane {
+        WeightedLane {
+            idx,
+            weight: 1,
+            attempt_timeout_ms,
+        }
+    }
+
+    /// The layering the feature promises: the pool-member override wins over the model-level
+    /// default, so the SAME model can carry a 10000ms cap in one pool and 50ms in another.
+    #[test]
+    fn test_member_override_wins_over_model_default() {
+        let cands = vec![member(0, Some(50)), member(1, None)];
+        assert_eq!(
+            effective_attempt_timeout_ms(&cands, 0, Some(10_000)),
+            Some(50),
+            "the pool-member override must beat the model-level default"
+        );
+    }
+
+    /// A member WITHOUT an override inherits the model-level default.
+    #[test]
+    fn test_model_default_applies_when_member_has_no_override() {
+        let cands = vec![member(0, Some(50)), member(1, None)];
+        assert_eq!(
+            effective_attempt_timeout_ms(&cands, 1, Some(10_000)),
+            Some(10_000),
+            "a member with no override must fall back to the model-level cap"
+        );
+    }
+
+    /// Neither level set → uncapped (None): the attempt runs under the ordinary transport timeout.
+    #[test]
+    fn test_no_cap_anywhere_is_none() {
+        let cands = vec![member(0, None)];
+        assert_eq!(effective_attempt_timeout_ms(&cands, 0, None), None);
+    }
+
+    /// The default `""` cell (single-model route) has no member rows at all — the model-level
+    /// value is the only source.
+    #[test]
+    fn test_empty_cands_uses_model_default() {
+        assert_eq!(effective_attempt_timeout_ms(&[], 3, Some(750)), Some(750));
+        assert_eq!(effective_attempt_timeout_ms(&[], 3, None), None);
+    }
+
+    /// The cap is floored by the request's remaining budget, and never zero.
+    #[test]
+    fn test_attempt_cap_budget_floor() {
+        // Plenty of budget: the cap is the configured value.
+        assert_eq!(attempt_cap(200, 30).as_millis(), 200);
+        // Cap larger than the remaining budget: clamped to the budget.
+        assert_eq!(attempt_cap(10_000, 2).as_millis(), 2_000);
+        // Exhausted budget: clamped to 1ms, never a zero-duration (instant-fail) timer.
+        assert_eq!(attempt_cap(10_000, 0).as_millis(), 1);
+    }
+}
+
+#[cfg(test)]
 mod max_tokens_precedence_tests {
     use crate::ir::variant::{EgressPrep, IrReq};
     use crate::ir::IrRequest;
@@ -5244,6 +5427,7 @@ mod max_tokens_precedence_tests {
             auth: None,
             health: None,
             upstream_model: None,
+            attempt_timeout_ms: None,
         }
     }
 
@@ -6559,7 +6743,11 @@ mod ingress_indistinguishability_tests {
         .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body.into(),
             None,
             "pa",
@@ -6677,7 +6865,11 @@ mod ingress_indistinguishability_tests {
         .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body.into(),
             None,
             "pa",
@@ -6885,7 +7077,11 @@ mod ingress_indistinguishability_tests {
         // Caller presents NO credential.
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body.into(),
             None,
             "pa",
@@ -6963,7 +7159,11 @@ mod ingress_indistinguishability_tests {
                 .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body.into(),
             None,
             "pg",
@@ -7046,7 +7246,11 @@ mod ingress_indistinguishability_tests {
         .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body.into(),
             None,
             "pa",
@@ -7118,7 +7322,11 @@ mod ingress_indistinguishability_tests {
         .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body.into(),
             None,
             "pa",
@@ -7192,7 +7400,11 @@ data: {"type":"message_stop"}"#
         .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body.into(),
             None,
             "ps",
@@ -7255,7 +7467,11 @@ data: {"type":"message_stop"}"#
         .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body.into(),
             None,
             "pc",
@@ -7389,7 +7605,11 @@ data: {"type":"message_stop"}"#
         .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             "leastbad",
@@ -7483,7 +7703,11 @@ data: {"type":"message_stop"}"#
         .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             "leastbad",
@@ -7564,7 +7788,11 @@ data: {"type":"message_stop"}"#
 
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             serde_json::to_vec(
                 &json!({"messages": [{"role": "user", "content": [{"text": "hi"}]}]}),
             )
@@ -7641,7 +7869,7 @@ data: {"type":"message_stop"}"#
 
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane { idx: 0, weight: 1, attempt_timeout_ms: None }],
             serde_json::to_vec(
                 &json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50}),
             )
@@ -7720,7 +7948,7 @@ data: {"type":"message_stop"}"#
 
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane { idx: 0, weight: 1, attempt_timeout_ms: None }],
             serde_json::to_vec(
                 &json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50}),
             )
@@ -7844,7 +8072,11 @@ data: {"type":"message_stop"}"#
         .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body.into(),
             None,
             "pb",
@@ -7929,7 +8161,11 @@ data: {"type":"message_stop"}"#
         .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body.into(),
             None,
             "pg",
@@ -8016,7 +8252,11 @@ data: {"type":"message_stop"}"#
         .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body.into(),
             None,
             "leastbad-g",
@@ -8102,7 +8342,11 @@ data: {"type":"message_stop"}"#
         .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body.into(),
             None,
             "pc",
@@ -8183,7 +8427,11 @@ data: {"type":"message_stop"}"#
         let bad = br#"{ "model": "p", BUSBAR_SENTINEL_LEAK }"#.to_vec();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             bad.into(),
             None,
             "p",
@@ -8825,7 +9073,11 @@ mod forward_once_pool_cell_tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             "primary",
@@ -8893,7 +9145,11 @@ mod forward_once_pool_cell_tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             "primary",
@@ -8976,7 +9232,11 @@ mod forward_once_pool_cell_tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             "primary",
@@ -9087,7 +9347,11 @@ mod forward_once_pool_cell_tests {
         let response = forward_with_pool(
             app.clone(),
             // Originating candidate set for pool A = its dead member (lane 0) → A exhausts.
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             "A",
@@ -9186,9 +9450,21 @@ mod ordered_walk_tests {
 
     fn cands() -> Vec<WeightedLane> {
         vec![
-            WeightedLane { idx: 0, weight: 1 },
-            WeightedLane { idx: 1, weight: 1 },
-            WeightedLane { idx: 2, weight: 1 },
+            WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            },
+            WeightedLane {
+                idx: 1,
+                weight: 1,
+                attempt_timeout_ms: None,
+            },
+            WeightedLane {
+                idx: 2,
+                weight: 1,
+                attempt_timeout_ms: None,
+            },
         ]
     }
 
@@ -9205,7 +9481,11 @@ mod ordered_walk_tests {
         // candidate), so the sticky path is exercised ON the drained lane. With the drain gate it is
         // skipped, and SWRR (which also excludes weight 0) finds nothing → None. WITHOUT the gate this
         // returned `Some((0, _))` — the bug. (Deterministic: 1 candidate ⇒ pos is always 0.)
-        let drained_only = vec![WeightedLane { idx: 0, weight: 0 }];
+        let drained_only = vec![WeightedLane {
+            idx: 0,
+            weight: 0,
+            attempt_timeout_ms: None,
+        }];
         let mut rc = RequestCtx::new(60);
         let picked = pick_among(&app, &drained_only, &mut rc, Some("session-abc"), "p", None).await;
         assert!(
@@ -9218,8 +9498,16 @@ mod ordered_walk_tests {
         // — whatever the hash position, the drained lane 0 is never returned (skipped on the sticky
         // path, excluded by SWRR), and selection falls through to the healthy lane.
         let drained_and_healthy = vec![
-            WeightedLane { idx: 0, weight: 0 },
-            WeightedLane { idx: 1, weight: 1 },
+            WeightedLane {
+                idx: 0,
+                weight: 0,
+                attempt_timeout_ms: None,
+            },
+            WeightedLane {
+                idx: 1,
+                weight: 1,
+                attempt_timeout_ms: None,
+            },
         ];
         for key in ["s1", "s2", "session-xyz", "abc", "00000", "user-42"] {
             let mut rc = RequestCtx::new(60);
@@ -9318,9 +9606,21 @@ mod ordered_walk_tests {
         let app = three_lane_app();
         // Lane 2 drained (weight 0); 0 and 1 still serve.
         let cands = vec![
-            WeightedLane { idx: 0, weight: 1 },
-            WeightedLane { idx: 1, weight: 1 },
-            WeightedLane { idx: 2, weight: 0 },
+            WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            },
+            WeightedLane {
+                idx: 1,
+                weight: 1,
+                attempt_timeout_ms: None,
+            },
+            WeightedLane {
+                idx: 2,
+                weight: 0,
+                attempt_timeout_ms: None,
+            },
         ];
         let mut rc = RequestCtx::new(60);
         // Policy ranks the drained lane #1.
@@ -9345,9 +9645,21 @@ mod ordered_walk_tests {
     async fn ordered_walk_all_weight_zero_selects_none() {
         let app = three_lane_app();
         let cands = vec![
-            WeightedLane { idx: 0, weight: 0 },
-            WeightedLane { idx: 1, weight: 0 },
-            WeightedLane { idx: 2, weight: 0 },
+            WeightedLane {
+                idx: 0,
+                weight: 0,
+                attempt_timeout_ms: None,
+            },
+            WeightedLane {
+                idx: 1,
+                weight: 0,
+                attempt_timeout_ms: None,
+            },
+            WeightedLane {
+                idx: 2,
+                weight: 0,
+                attempt_timeout_ms: None,
+            },
         ];
         let mut rc = RequestCtx::new(60);
         let order = [0usize, 1, 2];
@@ -9389,6 +9701,7 @@ mod probe_guard_tests {
             err: 0,
             client_fault: 0,
             upstream_model: None,
+            attempt_timeout_ms: None,
         }
     }
 

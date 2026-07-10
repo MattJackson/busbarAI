@@ -1476,6 +1476,8 @@ pub(crate) struct LaneData {
     /// Optional upstream model name override. When set, this value is sent to the provider as the
     /// model identifier in the request body and URL path, instead of `self.model` (the config key).
     pub(crate) upstream_model: Option<String>,
+    /// Model-level per-attempt time-to-headers cap (ms); flows ModelCfg → LaneData → Lane.
+    pub(crate) attempt_timeout_ms: Option<u64>,
 }
 
 /// Helper for weighted selection tests - creates a lane with specific weight.
@@ -1496,6 +1498,7 @@ fn make_lane_data_with_weight(id: usize, max_permits: usize) -> (LaneData, u32) 
         err: 0,
         client_fault: 0,
         upstream_model: None,
+        attempt_timeout_ms: None,
     };
     (lane, (id as u32) + 1) // weight = id + 1 (so lane 0 has weight 1, lane 1 has weight 2, etc.)
 }
@@ -2434,6 +2437,7 @@ mod tests {
             err: 0,
             client_fault: 0,
             upstream_model: None,
+            attempt_timeout_ms: None,
         }
     }
 

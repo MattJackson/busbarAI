@@ -287,6 +287,7 @@ A model is a **lane**: one model at one provider, with its own concurrency semap
 | `max_requests` | integer | no | `-1` | Lifetime request budget. `-1` = unlimited. When the counter reaches `0` the lane is unusable. Must not be `0` (zero budget = permanently unusable = startup error). |
 | `default_max_tokens` | integer | no | `4096` | Injected **only** on a cross-protocol hop to a backend that requires `max_tokens` (Anthropic protocol) when the caller omitted it. Has no effect on same-protocol passthrough. Must be > 0 when set. |
 | `upstream_model` | string | no | the config key | The model id sent to the provider on the wire (request body for body-model protocols; URL path for path-model protocols like Bedrock/Gemini; and health probes). Defaults to the config key. Set it when the key can't be the wire id: most commonly to run the **same model behind two providers** (the keys must differ, but each needs its own provider-specific model string). Must be non-empty when set. Metrics, breaker cells, and logs still key off the config key, not this. |
+| `attempt_timeout_ms` | integer | no | unset (no cap) | Per-attempt cap, in milliseconds, on time to **response headers** (the hang detector). If the provider has not started answering within the cap, the attempt is treated exactly like a transport timeout: the breaker records a transient failure and the request fails over to the next pool member within the same request. Because the cap covers only connect + headers, a healthy long **stream body** is never cut off by it. A pool member's own `attempt_timeout_ms` overrides this per pool. Must be ≥ 1 when set (0 is a startup error); always floored by the request's remaining `failover.timeout_secs` budget. |
 
 ```yaml
 models:
@@ -368,6 +369,7 @@ pools:
 | `target` | string | **yes** | n/a | Name of a model in `models`. Must be a configured model; a missing model is a startup error. |
 | `weight` | integer | no | `1` | Relative selection share under smooth weighted round-robin (SWRR), computed over the currently healthy/usable members. Must be ≥ 1. `0` is a startup error. |
 | `context_max` | integer | no | none | This member's maximum context window (tokens). Used for [context-length failover](#context-length-failover). |
+| `attempt_timeout_ms` | integer | no | the model's value | Per-attempt time-to-response-headers cap for this member **in this pool**, overriding the model-level `attempt_timeout_ms`. Lets the same model carry different hang tolerances per pool (e.g. `10000` in a batch pool, `50` in a latency-critical one). Must be ≥ 1 when set (0 is a startup error). See [Per-attempt timeouts](#per-attempt-timeouts-attempt_timeout_ms). |
 | `tier` | string | no | none | Operator-declared routing tier label (e.g. `"primary"`, `"overflow"`, `"large"`, `"small"`). Inert for `route: weighted` pools. Exposed to webhook and script policies as the `tier` field on each candidate. See [`route` and `policy`](#route-and-policy). |
 | `cost_per_mtok` | float | no | none | Operator-declared cost in currency units per million tokens. Drives the `cheapest` native policy (sort ascending) and is exposed to webhook/script policies. Inert when unset or when `route: weighted`. |
 | `tags` | list<string> | no | `[]` | Free-form string labels (e.g. `["opus", "large-context"]`). Inert for `route: weighted` pools. Exposed to webhook/script policies for tag-based candidate selection. |
@@ -377,6 +379,40 @@ Selection uses Nginx-style smooth weighted round-robin (SWRR) across the healthy
 **Empty `members` list is a startup error.**
 
 A pool spanning members that use different underlying protocols produces a startup **warning** (not an error). Cross-protocol requests are translated via the IR (intermediate representation), which is lossless for all standard fields. Source-only fields (e.g. OpenAI `logprobs`, `n`) are dropped before reaching a foreign backend.
+
+---
+
+#### Per-attempt timeouts (`attempt_timeout_ms`)
+
+Some providers fail by **hanging**: the connection opens, then nothing comes back for minutes. The ordinary transport timeout is sized for a full response and is far too long to catch this. `attempt_timeout_ms` caps how long a single attempt may wait for **response headers**; when it expires, the attempt is recorded as a transient failure on that member's breaker cell and the request fails over to the next member, all within the same request.
+
+Two layers, member wins over model:
+
+```yaml
+models:
+  gemini-pro:
+    provider: gemini
+    max_concurrent: 20
+    attempt_timeout_ms: 10000     # model-level default: give it 10s anywhere
+
+pools:
+  batch:
+    members:
+      - target: gemini-pro        # inherits the model's 10000ms
+      - target: gpt-4o
+  realtime:
+    members:
+      - target: gemini-pro
+        attempt_timeout_ms: 50    # THIS pool can't wait: hop after 50ms
+      - target: gpt-4o
+```
+
+Details:
+
+- The cap covers **connect + time to response headers only**. A healthy stream that has started answering is never cut off mid-body by it.
+- Expiry is classified like a network timeout: it counts toward the breaker's transient streak (repeated hangs trip the lane) and shows up in metrics as `disposition="attempt_timeout"` on `busbar_upstream_failures_total` and `reason="attempt_timeout"` on `busbar_failovers_total`.
+- The cap is always floored by the request's remaining [`failover.timeout_secs`](#failover) budget; it can never extend a request past that.
+- Unset means no per-attempt cap (the transport timeout still applies). `0` is a startup error; disable by omitting the field.
 
 ---
 
@@ -684,7 +720,7 @@ governance:
 **Enforcement semantics (important for operators):**
 - **RPM is precise.** The per-minute counter is incremented synchronously on admission.
 - **TPM is best-effort.** Token counts are fed post-response; concurrent in-flight requests are not pre-charged. The first request of each rate window is always admitted.
-- **Budget is best-effort/soft under concurrency.** The budget check and deduction are not atomic; concurrent requests can overshoot. Overshoot is bounded by the degree of parallelism, not unbounded. On store errors, behavior is controlled by `budget_on_store_error` (default `allow` = fail open; set `deny` for fail-closed hard guarantee).
+- **Budget admission is a hard, atomic cap.** The budget check and the flat per-request charge are one atomic conditional UPSERT (`charge_within_budget`): a request whose fee would push the window's spend past `max_budget_cents` is rejected before it is forwarded, and a concurrent burst cannot race past the limit. The **token-priced component** (`price_per_1k_tokens_cents`) is accrued post-response, so spend from requests already in flight when the cap is neared can land after admission; that overshoot is bounded by in-flight parallelism. A request admitted and then failing upstream (non-2xx) has its flat fee refunded. On store errors, behavior is controlled by `budget_on_store_error` (default `allow` = fail open; set `deny` for fail-closed).
 
 **Incompatible combination:** `enabled: true` + `auth.mode: passthrough` is a startup error. Governance supersedes passthrough; the combination is unsupported.
 

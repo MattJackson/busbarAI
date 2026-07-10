@@ -604,6 +604,7 @@ impl LaneSpec {
             health: self.health.clone(),
             default_max_tokens: self.default_max_tokens,
             upstream_model: self.upstream_model.clone(),
+            attempt_timeout_ms: None,
         }
     }
     fn to_lane_data(&self) -> crate::store::LaneData {
@@ -625,6 +626,7 @@ impl LaneSpec {
             err: self.err,
             client_fault: self.client_fault,
             upstream_model: self.upstream_model.clone(),
+            attempt_timeout_ms: None,
         }
     }
 }
@@ -738,7 +740,11 @@ impl TestApp {
 fn weighted(members: &[(usize, u32)]) -> Vec<crate::state::WeightedLane> {
     members
         .iter()
-        .map(|&(idx, weight)| crate::state::WeightedLane { idx, weight })
+        .map(|&(idx, weight)| crate::state::WeightedLane {
+            idx,
+            weight,
+            attempt_timeout_ms: None,
+        })
         .collect()
 }
 
@@ -889,7 +895,11 @@ mod tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             None,
@@ -949,7 +959,11 @@ mod tests {
         .unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body.into(),
             None,
             "pa",
@@ -1215,7 +1229,11 @@ mod tests {
             .pool("pc", &[(0, 1)])
             .build();
 
-        let cands = vec![crate::state::WeightedLane { idx: 0, weight: 1 }];
+        let cands = vec![crate::state::WeightedLane {
+            idx: 0,
+            weight: 1,
+            attempt_timeout_ms: None,
+        }];
         let body = serde_json::to_vec(
             &json!({"model": "pc", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}),
         )
@@ -1332,8 +1350,16 @@ mod tests {
             .build();
 
         let cands = vec![
-            crate::state::WeightedLane { idx: 0, weight: 1 },
-            crate::state::WeightedLane { idx: 1, weight: 1 },
+            crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            },
+            crate::state::WeightedLane {
+                idx: 1,
+                weight: 1,
+                attempt_timeout_ms: None,
+            },
         ];
         let body = serde_json::to_vec(
             &json!({"model": "pe", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}),
@@ -2242,7 +2268,11 @@ mod tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             None,
@@ -2293,7 +2323,11 @@ mod tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             None,
@@ -2342,7 +2376,11 @@ mod tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             None,
@@ -2393,7 +2431,11 @@ mod tests {
         assert_eq!(sem.available_permits(), 1);
         let response = forward(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             None,
@@ -2459,8 +2501,16 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -2527,8 +2577,16 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -2610,7 +2668,11 @@ mod tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward(
             app_passthrough.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             None,
@@ -2661,7 +2723,11 @@ mod tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward(
             app_token.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             None,
@@ -2770,7 +2836,11 @@ mod tests {
         // Forward with caller's token (simulating what auth middleware would extract)
         let response = forward(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             Some(caller_bearer_token),
             None,
@@ -2828,8 +2898,16 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -2904,9 +2982,21 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
-                crate::state::WeightedLane { idx: 2, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 2,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -2978,8 +3068,16 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -3071,7 +3169,11 @@ mod tests {
         // Forward request (tap integrated in FirstByteBody)
         let response = forward(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             None,
@@ -3243,7 +3345,11 @@ mod tests {
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let response = forward(
                 app.clone(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                vec![crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                }],
                 req_body.into(),
                 None,
                 None,
@@ -3298,7 +3404,11 @@ mod tests {
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let _response = forward(
                 app.clone(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                vec![crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                }],
                 req_body.into(),
                 None,
                 None,
@@ -3356,7 +3466,11 @@ mod tests {
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let _response = forward(
                 app.clone(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                vec![crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                }],
                 req_body.into(),
                 None,
                 None,
@@ -3409,7 +3523,11 @@ mod tests {
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let _response = forward(
                 app.clone(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                vec![crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                }],
                 req_body.into(),
                 None,
                 None,
@@ -3462,7 +3580,11 @@ mod tests {
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let _response = forward(
                 app.clone(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                vec![crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                }],
                 req_body.into(),
                 None,
                 None,
@@ -3515,7 +3637,11 @@ mod tests {
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let response = forward(
                 app.clone(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                vec![crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                }],
                 req_body.into(),
                 None,
                 None,
@@ -3636,7 +3762,11 @@ mod tests {
             // Lane 1 with error_map: code 1113 → billing → HardDown
             let _response_1 = forward(
                 app_1.clone(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                vec![crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                }],
                 req_body.clone().into(),
                 None,
                 None,
@@ -3651,7 +3781,11 @@ mod tests {
             // Lane 2 without mapping: HTTP 400 → ClientFault → no trip
             let _response_2 = forward(
                 app_2.clone(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                vec![crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                }],
                 req_body.into(),
                 None,
                 None,
@@ -3679,11 +3813,13 @@ mod tests {
                 max_concurrent: 10,
                 default_max_tokens: None,
                 upstream_model: None,
+                attempt_timeout_ms: None,
             };
             let pool = crate::config::PoolCfg {
                 members: vec![crate::config::PoolMember {
                     target: "m".into(),
                     weight: 1,
+                    attempt_timeout_ms: None,
                     context_max: None,
                     tier: None,
                     cost_per_mtok: None,
@@ -3808,7 +3944,11 @@ mod tests {
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let response = forward(
                 app.clone(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                vec![crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                }],
                 req_body.into(),
                 None,
                 None,
@@ -3884,8 +4024,16 @@ mod tests {
             let response = forward(
                 app.clone(),
                 vec![
-                    crate::state::WeightedLane { idx: 0, weight: 1 },
-                    crate::state::WeightedLane { idx: 1, weight: 1 },
+                    crate::state::WeightedLane {
+                        idx: 0,
+                        weight: 1,
+                        attempt_timeout_ms: None,
+                    },
+                    crate::state::WeightedLane {
+                        idx: 1,
+                        weight: 1,
+                        attempt_timeout_ms: None,
+                    },
                 ],
                 req_body.into(),
                 None,
@@ -3946,8 +4094,16 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -4030,8 +4186,16 @@ mod tests {
         let response = forward_with_pool(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -4106,7 +4270,11 @@ mod tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
         let response = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             "leastbad",
@@ -4167,7 +4335,11 @@ mod tests {
         .unwrap();
         let response = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             "p",
@@ -4241,7 +4413,11 @@ mod tests {
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
             let response = forward_with_pool(
                 app.clone(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                vec![crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                }],
                 req_body.into(),
                 None,
                 "leastbad",
@@ -4330,8 +4506,16 @@ mod tests {
         let response = forward_with_pool(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -4406,8 +4590,16 @@ mod tests {
         let response = forward_with_pool(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -4482,9 +4674,21 @@ mod tests {
         let response1 = forward_with_pool(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
-                crate::state::WeightedLane { idx: 2, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 2,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.clone().into(),
             None,
@@ -4505,9 +4709,21 @@ mod tests {
         let response2 = forward_with_pool(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
-                crate::state::WeightedLane { idx: 2, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 2,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.clone().into(),
             None,
@@ -4534,9 +4750,21 @@ mod tests {
         let response3 = forward_with_pool(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
-                crate::state::WeightedLane { idx: 2, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 2,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -4644,8 +4872,16 @@ mod tests {
         let response = forward_with_pool(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -4819,8 +5055,16 @@ mod tests {
         let response1 = forward_with_pool(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.clone().into(),
             None,
@@ -4841,8 +5085,16 @@ mod tests {
         let response2 = forward_with_pool(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -5173,7 +5425,11 @@ mod tests {
         // Forward with ingress_protocol="openai" to trigger translation into anthropic lane
         let response = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             openai_body.to_string().into(),
             None,
             "m",
@@ -5421,7 +5677,11 @@ mod tests {
         // Forward with ingress_protocol="anthropic" - same protocol, no translation should occur
         let response = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             anthropic_body.to_string().into(),
             None,
             "m",
@@ -5466,7 +5726,11 @@ mod tests {
             json!({"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true});
         let response = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             anthropic_body.to_string().into(),
             None,
             "m",
@@ -5536,7 +5800,11 @@ mod tests {
         let anthropic_body = json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
         let response = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             anthropic_body.to_string().into(),
             None,
             "m",
@@ -5618,8 +5886,16 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             body.to_string().into(),
             None,
@@ -5700,8 +5976,16 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -5760,8 +6044,16 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![
-                crate::state::WeightedLane { idx: 0, weight: 1 },
-                crate::state::WeightedLane { idx: 1, weight: 1 },
+                crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
+                crate::state::WeightedLane {
+                    idx: 1,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                },
             ],
             req_body.into(),
             None,
@@ -5823,7 +6115,11 @@ mod tests {
             let req_body = serde_json::to_vec(&json!({"model": "test-model", "stream": true, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50})).unwrap();
             let resp = forward(
                 app.clone(),
-                vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+                vec![crate::state::WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                }],
                 req_body.into(),
                 None,
                 None,
@@ -5881,7 +6177,11 @@ mod tests {
         let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50})).unwrap();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             "default",
@@ -5940,7 +6240,11 @@ mod tests {
         let started = std::time::Instant::now();
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1 }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             req_body.into(),
             None,
             "default",

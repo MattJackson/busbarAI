@@ -1,6 +1,6 @@
 # Getting Started with Busbar
 
-Busbar is a self-hosted LLM gateway: a single static Rust binary that sits between your application and your LLM providers. Point any SDK at it (OpenAI, Anthropic, Gemini, Cohere, Bedrock, or the OpenAI Responses API) and Busbar routes each request to the provider (or pool of providers) you configured, translating between wire protocols when the ingress and egress differ.
+Busbar is your AI control plane: a single self-hosted, static Rust binary that sits between your application and your AI providers. Point any SDK at it (OpenAI, Anthropic, Gemini, Cohere, Bedrock, or the OpenAI Responses API) and Busbar routes each request to the provider (or pool of providers) you configured, translating between wire protocols when the ingress and egress differ.
 
 It does the same job as LiteLLM or OpenRouter (one API in front of every model and provider) and goes further: it speaks six provider protocols natively (so any vendor's SDK can point at it, not just OpenAI-shaped ones), ships as one binary with no Python runtime and no third party in your data path, and gives you per-(pool, lane) circuit breaking with in-flight failover. You run it in your own infra and it holds your keys.
 

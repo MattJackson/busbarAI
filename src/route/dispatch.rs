@@ -186,7 +186,14 @@ pub(crate) async fn operation_resolved(
     let (cands, pool_name): (Vec<WeightedLane>, &str) = if let Some(c) = app.pools.get(model) {
         (c.clone(), model)
     } else if let Some(&i) = app.by_model.get(model) {
-        (vec![WeightedLane { idx: i, weight: 1 }], "")
+        (
+            vec![WeightedLane {
+                idx: i,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
+            "",
+        )
     } else {
         return finish(
             app,

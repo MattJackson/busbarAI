@@ -33,6 +33,9 @@ pub(crate) struct Lane {
     /// Optional active health-probe settings (from the provider's `health:` block). `None` or
     /// `mode: none` means no background probing for this lane.
     pub(crate) health: Option<crate::config::HealthCfg>,
+    /// Model-level per-ATTEMPT time-to-response-headers cap (ms) — the hang detector. A pool
+    /// member's `attempt_timeout_ms` overrides it per workload; see `ModelCfg::attempt_timeout_ms`.
+    pub(crate) attempt_timeout_ms: Option<u64>,
     /// Optional default max output tokens, injected at the cross-protocol translation seam when the
     /// source request omitted `max_tokens` (legal for OpenAI) but this lane's protocol REQUIRES it
     /// (Anthropic Messages — see `ProtocolWriter::requires_max_tokens`). Falls back to
@@ -57,6 +60,9 @@ impl Lane {
 pub(crate) struct WeightedLane {
     pub(crate) idx: usize,  // index into lanes array
     pub(crate) weight: u32, // member weight from config
+    /// Pool-member override of the lane's `attempt_timeout_ms` (one model, different budgets per
+    /// workload/pool). `None` = inherit the model-level value.
+    pub(crate) attempt_timeout_ms: Option<u64>,
 }
 
 /// Operator-declared per-member routing metadata (config), projected into the routing `Candidate`

@@ -309,6 +309,12 @@ pub(crate) struct ModelCfg {
     /// the provider expects a different model string (e.g. Bedrock model IDs).
     #[serde(default)]
     pub(crate) upstream_model: Option<String>,
+    /// Per-ATTEMPT time-to-response-headers cap (ms). If this lane has not returned response headers
+    /// within the budget, the attempt is abandoned (transient → breaker) and the request FAILS OVER
+    /// to the next member — the hang detector. Model-level default; a pool member's
+    /// `attempt_timeout_ms` overrides it per workload. Absent = bounded only by the request budget.
+    #[serde(default)]
+    pub(crate) attempt_timeout_ms: Option<u64>,
 }
 
 fn neg1() -> i64 {
@@ -531,6 +537,11 @@ pub(crate) struct PoolMember {
     /// into the routing `Candidate` (via `MemberMeta`) and read by webhook/script policies.
     #[serde(default)]
     pub(crate) tier: Option<String>,
+    /// Per-ATTEMPT time-to-response-headers cap (ms) for THIS member in THIS pool — overrides the
+    /// model-level `attempt_timeout_ms`, so one model can be patient in an image pool (10000) and
+    /// ruthless in a realtime pool (50). See `ModelCfg::attempt_timeout_ms` for semantics.
+    #[serde(default)]
+    pub(crate) attempt_timeout_ms: Option<u64>,
     /// Operator-declared cost in currency-units per million tokens. Drives the native `cheapest`
     /// policy and is exposed to webhook/script policies. Inert when unset.
     #[serde(default)]

@@ -77,6 +77,17 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 model_name
             ));
         }
+        // `attempt_timeout_ms: 0` would race a zero-duration `tokio::time::timeout` against
+        // `req.send()` — the timer wins before the connection is even attempted, so EVERY attempt
+        // on the lane "times out" instantly and the lane is permanently un-usable (breaker-tripped
+        // on first touch) with no boot diagnostic. The same fail-loud rule as max_concurrent:0.
+        // Disabling the cap is expressed by omitting the field, not by 0.
+        if model_cfg.attempt_timeout_ms == Some(0) {
+            errors.push(format!(
+                "model '{}' has attempt_timeout_ms: 0; a zero cap fails every attempt instantly — use a positive millisecond value, or omit it to disable the per-attempt cap",
+                model_name
+            ));
+        }
         // `upstream_model`, when set, is sent to the provider as the wire model id — an empty or
         // whitespace-only override would put a blank model on the wire (a guaranteed upstream 400/404)
         // with no boot diagnostic. Reject it loudly; omit the field to fall back to the config key.
@@ -356,6 +367,15 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                         pool_name, member.target, cost
                     ));
                 }
+            }
+            // Member-level `attempt_timeout_ms: 0` — same instant-fail foot-gun as the model-level
+            // check above, but the member override is consulted FIRST by the engine, so a zero here
+            // poisons the member even when the model's own value is sane. Same fail-loud rule.
+            if member.attempt_timeout_ms == Some(0) {
+                errors.push(format!(
+                    "pool '{}' member '{}' has attempt_timeout_ms: 0; a zero cap fails every attempt instantly — use a positive millisecond value, or omit it to inherit the model's setting",
+                    pool_name, member.target
+                ));
             }
             // Resolve the member target. `model_protocols` only holds models whose provider
             // resolved (the model loop above skips a model whose provider is unknown), so a bare
@@ -1479,6 +1499,7 @@ mod tests {
             max_concurrent,
             default_max_tokens: None,
             upstream_model: None,
+            attempt_timeout_ms: None,
         }
     }
 
@@ -1498,6 +1519,7 @@ mod tests {
         config::PoolMember {
             target: target.into(),
             weight: 1,
+            attempt_timeout_ms: None,
             context_max: None,
             tier: None,
             cost_per_mtok: None,
@@ -2083,6 +2105,58 @@ mod tests {
         assert!(
             !errs.iter().any(|e| e.contains("okmodel")),
             "a positive max_concurrent must not error; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_attempt_timeout_ms() {
+        // attempt_timeout_ms: 0 races a zero-duration timer against req.send() — every attempt
+        // "times out" before the connection is tried, permanently poisoning the lane. Must fail
+        // loud at boot at BOTH levels (model default and pool-member override); omitted (None)
+        // and positive values must not error.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "myprovider".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        let mut zero = make_model("myprovider", 10);
+        zero.attempt_timeout_ms = Some(0);
+        models.insert("zerocap".to_string(), zero);
+        let mut positive = make_model("myprovider", 10);
+        positive.attempt_timeout_ms = Some(5000);
+        models.insert("okcap".to_string(), positive);
+        models.insert("nocap".to_string(), make_model("myprovider", 10)); // None
+
+        // Pool with one zero-override member and one positive-override member.
+        let mut zero_member = make_member("okcap");
+        zero_member.attempt_timeout_ms = Some(0);
+        let mut ok_member = make_member("nocap");
+        ok_member.attempt_timeout_ms = Some(200);
+        let mut pools = HashMap::new();
+        pools.insert(
+            "mypool".to_string(),
+            make_pool(vec![zero_member, ok_member]),
+        );
+
+        let cfg = make_root_cfg(providers, models, pools);
+        let errs = validate(&cfg).expect_err("attempt_timeout_ms: 0 must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("zerocap") && e.contains("attempt_timeout_ms: 0")),
+            "expected a model-level attempt_timeout_ms:0 error for 'zerocap'; got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("mypool")
+                && e.contains("okcap")
+                && e.contains("attempt_timeout_ms: 0")),
+            "expected a member-level attempt_timeout_ms:0 error for pool 'mypool' member 'okcap'; got: {errs:?}"
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.contains("attempt_timeout_ms") && e.contains("nocap")),
+            "None / positive attempt_timeout_ms must not error; got: {errs:?}"
         );
     }
 

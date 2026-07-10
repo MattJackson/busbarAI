@@ -410,6 +410,7 @@ async fn main() {
             err: 0,
             client_fault: 0,
             upstream_model: mc.upstream_model.clone(),
+            attempt_timeout_ms: mc.attempt_timeout_ms,
         });
 
         eprintln!(
@@ -470,6 +471,7 @@ async fn main() {
             auth: provider_cfg.auth,
             health: provider_cfg.health.clone(),
             upstream_model: ld.upstream_model.clone(),
+            attempt_timeout_ms: ld.attempt_timeout_ms,
             default_max_tokens: model_default_max_tokens.get(&ld.model).copied().flatten(),
         });
     }
@@ -491,6 +493,8 @@ async fn main() {
                 WeightedLane {
                     idx: lane_idx,
                     weight: m.weight, // from config PoolMember.weight (default 1)
+                    // Per-member attempt cap: one model, different hang budgets per pool/workload.
+                    attempt_timeout_ms: m.attempt_timeout_ms,
                 }
             })
             .collect();
@@ -1151,6 +1155,7 @@ mod tests {
         PoolMember {
             target: target.to_string(),
             weight: 1,
+            attempt_timeout_ms: None,
             context_max,
             tier: None,
             cost_per_mtok: None,

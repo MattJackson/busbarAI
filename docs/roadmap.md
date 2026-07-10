@@ -95,4 +95,13 @@ same pattern Bedrock established with SigV4 and Azure OpenAI (shipped in 0.14):
   verified catalog. Supportable today via a config entry + `path` override; will be
   documented as a recipe.
 
+### Pre-release stream buffer
+
+Streaming failover today is bounded by the first byte reaching the client (see
+[failover](failover.md)). A configurable pre-release buffer would hold the first
+*K* tokens / *T* ms of an upstream stream before releasing any byte, so a provider
+that dies inside that window can still be rerouted invisibly. Costs up to *T* ms of
+added TTFT, so it will be opt-in per pool and default to off (today's behavior).
+Not yet built; no config surface exists for it.
+
 APIs and config are stable at 1.0.0 under Semantic Versioning, no breaking change without a major-version bump.

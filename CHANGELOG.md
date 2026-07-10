@@ -9,15 +9,16 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Deprecated**, **Removed**, **Fixed**, **Security**. Migration steps for a breaking change
 appear as a bold **Migration** item under **Changed**.
 
-## [Unreleased]
+## [1.2.0], 2026-07-10
 
-Busbar now speaks more than chat. Four new operations land on top of chat —
+Busbar now speaks more than chat. Four new operations land on top of chat:
 **Embeddings**, **Moderations**, **Image generation**, and **Audio** (transcription and
-speech) — and every one is **cross-protocol**, the same lossless translation that already
-carried chat. An OpenAI-dialect client can call embeddings, images, or audio against an
-Amazon Bedrock, Google Gemini, or Cohere backend and get the response back in its own
-dialect; the round trip is lossless in both directions, errors included. Chat was
-operation #1; it is byte-for-byte unchanged, the acceptance harness passes 58/58 offline.
+speech). Every one is **cross-protocol**, carried by the same lossless translation that
+already carried chat. A Gemini client can call embeddings on an Amazon Bedrock backend,
+an OpenAI client can route images and audio to Google Gemini, and every answer comes back
+in the caller's own dialect. The round trip is lossless in both directions, errors
+included. Chat itself is byte-for-byte unchanged: it is simply the first operation now,
+not a special case.
 
 ### Added
 
@@ -25,6 +26,17 @@ operation #1; it is byte-for-byte unchanged, the acceptance harness passes 58/58
   An OpenAI-dialect embeddings request routes to **OpenAI**, **Amazon Bedrock** (Titan),
   **Cohere** (v2 `/embed`), or **Google Gemini** (`embedContent`) and returns in the
   caller's own dialect. Vectors, token/usage accounting, and errors all survive the hop.
+- **Per-attempt hang detection (`attempt_timeout_ms`).** Some providers fail by hanging:
+  the connection opens and response headers never come back, silently eating the whole
+  failover budget on one member. `attempt_timeout_ms` caps a single attempt's time to
+  response headers; on expiry the attempt is recorded as a transient breaker failure and
+  the request fails over to the next pool member within the same request. Set it on a
+  model as that model's default, and override it per pool member, so the same model can
+  carry a 10s cap in a batch pool and a 50ms cap in a latency-critical one. The cap covers
+  connect and headers only (a stream that has started answering is never cut off) and is
+  always floored by the request's remaining `failover.timeout_secs`. `0` is a startup
+  error. Observable as `disposition="attempt_timeout"` on `busbar_upstream_failures_total`
+  and `reason="attempt_timeout"` on `busbar_failovers_total`.
 - **Moderations (`/v1/moderations`), cross-protocol.** Content-classification requests
   translate through the IR and return in the caller's dialect, so a moderation call is not
   pinned to one vendor's endpoint.
@@ -37,7 +49,7 @@ operation #1; it is byte-for-byte unchanged, the acceptance harness passes 58/58
   operation.
 - **Clean, dialect-native 404 for an operation a backend lacks.** Calling an operation a
   backend does not implement (e.g. image generation on an Anthropic backend) returns a
-  well-formed 404 **in the caller's own protocol dialect** — never a crash, never a
+  well-formed 404 **in the caller's own protocol dialect**: never a crash, never a
   malformed body, and never taking the lane down for other traffic.
 
 ### Changed

@@ -151,6 +151,20 @@ pools:
       exclusions:
         - glm-4.6        # kept in the pool for capacity, but never used as a failover destination
 
+  # 5b) Per-attempt hang cap (attempt_timeout_ms): some providers fail by HANGING — the connection
+  #     opens and headers never come back, silently eating the whole failover budget on one member.
+  #     attempt_timeout_ms caps a single attempt's time to RESPONSE HEADERS; on expiry the attempt
+  #     counts as a transient breaker failure and the request hops to the next member immediately.
+  #     It never cuts a stream that has started answering (covers connect + headers only).
+  #     Two layers: set it on a model (models.<name>.attempt_timeout_ms) as that model's default
+  #     everywhere, and/or on a pool member to override per pool — so the SAME model can get 10s in
+  #     a batch pool and 50ms in a latency-critical one. 0 is a startup error; omit to disable.
+  realtime:
+    members:
+      - target: gemini-1.5-pro
+        attempt_timeout_ms: 250   # this pool is time-critical: hop if no headers in 250ms
+      - target: claude-haiku      # fallback lane picks the request up in-flight
+
   # 6) Exhaustion policy + fallback pool: when every member is tripped/at-capacity, choose what to do.
   #    action: reject | status_503 | least_bad | fallback_pool:<name>
   #      least_bad      — serve the member whose cooldown expires soonest rather than 503.

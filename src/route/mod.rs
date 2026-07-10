@@ -959,6 +959,7 @@ pub(crate) async fn bedrock_converse_stream(
 /// but a model id whose first (axum) decode legitimately yielded a literal `%XX` sequence would be
 /// corrupted by a second pass. We therefore use axum's decoded value verbatim. (`percent_decode`
 /// remains as a tested helper for any caller that holds a still-encoded segment.)
+#[allow(clippy::too_many_arguments)]
 async fn bedrock_ingress(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
@@ -1067,7 +1068,11 @@ pub(crate) async fn named(
         // op_handler shared by all direct/ad-hoc routes, surfaced by /stats and /healthz), no affinity.
         let resp = crate::forward::forward_with_pool(
             app.clone(),
-            vec![WeightedLane { idx: i, weight: 1 }],
+            vec![WeightedLane {
+                idx: i,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
             body,
             caller_token,
             "",
@@ -1142,7 +1147,11 @@ pub(crate) async fn adhoc(
             // breaker OperationHandler (empty pool name), no affinity.
             let resp = crate::forward::forward_with_pool(
                 app.clone(),
-                vec![WeightedLane { idx: i, weight: 1 }],
+                vec![WeightedLane {
+                    idx: i,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                }],
                 body,
                 caller_token,
                 "",
@@ -3304,7 +3313,11 @@ mod tests {
             let inner = Arc::get_mut(&mut app).expect("sole owner");
             inner.pools.insert(
                 "mypool".to_string(),
-                vec![WeightedLane { idx: 0, weight: 1 }],
+                vec![WeightedLane {
+                    idx: 0,
+                    weight: 1,
+                    attempt_timeout_ms: None,
+                }],
             );
             inner.by_model.insert("mymodel".to_string(), 0);
         }
