@@ -418,7 +418,14 @@ mod dispatch_tests {
     /// forbidden.)
     #[test]
     fn engine_never_branches_on_operation_identity() {
-        let engine = include_str!("../forward.rs");
+        // Scan EVERY file of the forward engine (the module split must not open a blind spot).
+        let engine_files = [
+            ("src/forward/mod.rs", include_str!("../forward/mod.rs")),
+            (
+                "src/forward/operation.rs",
+                include_str!("../forward/operation.rs"),
+            ),
+        ];
         let forbidden = [
             "op.name() ==",
             "op.name()==",
@@ -426,12 +433,14 @@ mod dispatch_tests {
             "==op.name()",
             "match op.name()",
         ];
-        for pat in forbidden {
-            assert!(
-                !engine.contains(pat),
-                "src/forward.rs contains a forbidden operation-identity branch (`{pat}`). The \
-                 engine must read capabilities off the cell, never branch on op.name()."
-            );
+        for (file, engine) in engine_files {
+            for pat in forbidden {
+                assert!(
+                    !engine.contains(pat),
+                    "{file} contains a forbidden operation-identity branch (`{pat}`). The \
+                     engine must read capabilities off the cell, never branch on op.name()."
+                );
+            }
         }
     }
 }
