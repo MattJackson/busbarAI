@@ -36,8 +36,7 @@ impl RequestHandler for OpenAiRequestHandler {
             Operation::Image => Some(&IMAGE),
             Operation::Transcription => Some(&TRANSCRIPTION),
             Operation::Speech => Some(&SPEECH),
-            // chat re-homes onto a cell in Phase B (OpSpec removal).
-            Operation::Chat => None,
+            Operation::Chat => Some(&crate::cells::chat::CHAT_HANDLER),
         }
     }
     fn upstream_path(&self, ctx: &EgressCtx) -> String {
@@ -596,15 +595,17 @@ mod tests {
     #[test]
     fn no_cell_lookup() {
         let h = OpenAiRequestHandler;
+        // OpenAI serves every operation (chat now via its cell too). The no-cell 404 is exercised on a
+        // protocol that lacks an op — e.g. anthropic embeddings — in the cells registry tests.
         assert!(h.operation_handler(Operation::Moderation).is_some());
-        assert!(h.operation_handler(Operation::Chat).is_none());
+        assert!(h.operation_handler(Operation::Chat).is_some());
     }
 
     #[test]
     fn moderation_request_round_trips_openai_shape() {
         let cell = OpenAiModeration;
         let wire = json!({ "model": "omni-moderation-latest", "input": "hello" });
-        let ir = cell.read_request(&wire).unwrap();
+        let ir = cell.read_request(&serde_json::to_vec(&wire).unwrap(), "application/json").unwrap();
         let back: Value = serde_json::from_slice(&cell.write_request(&ir)).unwrap();
         assert_eq!(back["model"], "omni-moderation-latest");
         assert_eq!(back["input"], "hello"); // single text → bare string, round-tripped
@@ -617,7 +618,7 @@ mod tests {
             "categories":{"violence":true},"category_scores":{"violence":0.9},
             "category_applied_input_types":{"violence":["text"]}}]}"#;
         let ir = cell.read_response(wire).unwrap();
-        let back: Value = serde_json::from_slice(&cell.write_response(&ir)).unwrap();
+        let back: Value = serde_json::from_slice(&cell.write_response(&ir).bytes).unwrap();
         assert_eq!(back["results"][0]["flagged"], true);
         assert_eq!(back["results"][0]["categories"]["violence"], true);
         assert_eq!(back["results"][0]["category_scores"]["violence"], 0.9);

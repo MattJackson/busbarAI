@@ -133,7 +133,10 @@ mod tests {
     /// fall through to OpenAI).
     #[test]
     fn resolver_table() {
-        let cases: &[(&str, &[(&'static str, &'static str)], Option<(&str, Operation)>)] = &[
+        // (path, headers, expected (protocol, operation)) — aliased to keep the type readable.
+        type ResolverCase =
+            (&'static str, &'static [(&'static str, &'static str)], Option<(&'static str, Operation)>);
+        let cases: &[ResolverCase] = &[
             ("/v1/chat/completions", &[], Some(("openai", Operation::Chat))),
             ("/v1/embeddings", &[], Some(("openai", Operation::Embeddings))),
             ("/v1/moderations", &[], Some(("openai", Operation::Moderation))),

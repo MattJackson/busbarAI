@@ -1,113 +1,88 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! Operations — the second first-class axis of busbar, peer to protocols.
+//! The forward engine's operation-dispatch handle.
 //!
-//! A **protocol** is a wire *language* (openai, anthropic, gemini, bedrock, cohere, responses),
-//! implemented once behind the [`crate::proto::ProtocolReader`]/[`ProtocolWriter`] vtables. An
-//! **operation** is a *kind of work* a request asks for — chat completion, embeddings, moderation,
-//! image generation, audio — orthogonal to which language carries it.
+//! There is ONE operation mechanism in busbar: `Router → RequestHandler → OperationHandler → IR`
+//! (see [`crate::handler`]). The streaming forward engine (`forward.rs`) needs a small value it can
+//! carry through failover/streaming and query for operation behavior; [`OpDispatch`] is that value —
+//! a `(operation, cell)` pair. It holds NO behavior of its own: every method delegates to the
+//! [`OperationHandler`] cell (capabilities) or to the [`crate::handler::RequestHandler`] (path). The
+//! obsolete `OpSpec` trait and `ChatOp` are gone; chat is operation #1, reached through the same
+//! registry as every other operation via [`crate::cells::request_handler`].
 //!
-//! Historically "chat" was implicit throughout the forward engine: the upstream path, the stream
-//! intent, the usage-extraction shape, and the affinity key were all hardcoded to chat's world.
-//! `OpSpec` lifts those assumptions out of the engine and behind a spec, so the engine
-//! (`forward.rs`) is written ONCE against the spec and every operation — including ones a provider
-//! ships next year — is a new spec plus a route registration, never an engine edit.
-//!
-//! ## The seam discipline
-//!
-//! Every default method on [`OpSpec`] encodes the MOST RESTRICTIVE behavior (no streaming,
-//! same-protocol-only, no usage). Chat is the spec that *overrides* nearly everything; its
-//! overrides are the code that used to live in the engine, relocated verbatim. The engine branches
-//! on the *capabilities a spec declares*, never on an op's identity — there is no
-//! `if op.name() == "chat"` anywhere in `forward.rs`. That invariant is what makes chat removable
-//! and audio addable without touching the engine, and it is enforced by a source-scanning test.
-//!
-//! Representation: `Op = &'static dyn OpSpec`. Specs are zero-state unit structs in `static`s, so
-//! threading one through the engine is a pointer copy and a call through it is the same cost class
-//! as the `Box<dyn ProtocolWriter>` calls already on those lines — negligible against busbar's
-//! ~40 µs overhead, and monomorphizing a 9k-line engine per-op would cost far more than it saves.
+//! The engine still branches on the *capabilities a cell declares*, never on an operation's
+//! *identity* — there is no `if op.name() == "chat"` anywhere in `forward.rs` (enforced by the
+//! source-scanning test below). That invariant is what keeps chat removable and audio addable
+//! without touching the engine.
 
 use serde_json::Value;
 
+use crate::handler::{EgressCtx, OperationHandler};
 use crate::ir::IrUsage;
+use crate::operation::Operation;
 use crate::proto::ProtocolWriter;
 use crate::state::Lane;
 
-pub(crate) mod chat;
+/// A `(operation, cell)` dispatch handle, threaded through the forward engine by value (`Copy`). The
+/// engine reads operation behavior off it without ever naming an operation.
+#[derive(Clone, Copy)]
+pub(crate) struct OpDispatch {
+    pub(crate) operation: Operation,
+    pub(crate) cell: &'static dyn OperationHandler,
+}
 
-/// A `&'static` handle to an operation spec, threaded through the forward engine.
-pub(crate) type Op = &'static dyn OpSpec;
+/// The engine's operation handle. (Kept as `Op` so the engine's signatures read unchanged.)
+pub(crate) type Op = OpDispatch;
 
-/// A first-class operation. The forward engine consumes only this trait and never names an
-/// operation; each concrete op lives in its own file under `src/ops/`.
-///
-/// The trait surface is exactly what the engine wires today (chat-only). The additional axes an
-/// operation needs to be non-chat — cross-protocol translation capability, the `(protocol × op)`
-/// support matrix and candidate-lane filtering, opaque (non-JSON) request/response bodies — land
-/// alongside the operations that first exercise them, so the engine never carries a capability no
-/// registered operation uses.
-pub(crate) trait OpSpec: Send + Sync {
-    /// Stable identifier — a bounded metric label, the `paths:` config key, and the docs name.
-    /// e.g. `"chat"`, `"embeddings"`.
-    fn name(&self) -> &'static str;
-
-    /// Can this operation produce a client-facing incremental stream? Gates the ingress `stream`
-    /// read, the JSON-array shim probe, SSE detection, and every `StreamTranslate` path. A
-    /// non-streaming op's request body is still forwarded byte-verbatim; only response streaming
-    /// is disabled. Default: `false`.
-    fn streaming(&self) -> bool {
-        false
+impl OpDispatch {
+    /// Stable identifier — a bounded metric label / tracing span field. VALUE use only; the engine
+    /// must never compare or `match` on it (that would be an operation-identity branch).
+    pub(crate) fn name(&self) -> &'static str {
+        self.operation.name()
     }
-
-    /// The caller's stream intent, read from the parsed ingress body. Default: `false` — a
-    /// non-streaming op never asks the upstream to stream regardless of body contents. Chat
-    /// overrides with the OpenAI-family `"stream"` boolean read.
-    fn wants_stream(&self, _body: &Value) -> bool {
-        false
+    pub(crate) fn streaming(&self) -> bool {
+        self.cell.streaming()
     }
-
-    /// A session-affinity key derived from the request body when no affinity header is present.
-    /// Default: `None`. Chat overrides with the top-level `system` string (Anthropic-shaped).
-    fn body_affinity_key<'a>(&self, _body: &'a Value) -> Option<&'a str> {
-        None
+    pub(crate) fn wants_stream(&self, body: &Value) -> bool {
+        self.cell.wants_stream(body)
     }
-
-    /// THE (protocol × operation) SUPPORT-MATRIX CELL, fused with path resolution: the upstream
-    /// path this `lane`'s protocol serves this operation on, or `None` if the protocol does not
-    /// speak this operation (which drives candidate-lane filtering in the router). The `lane`
-    /// carries its own per-operation path override, so provider-specific overrides stay
-    /// spec-contained. `None` for chat is impossible — every protocol speaks chat.
-    fn upstream_path(&self, lane: &Lane, wants_stream: bool) -> Option<String>;
-
-    /// Should the non-stream response body be buffered so [`OpSpec::extract_usage`] can read it?
-    /// Default: `false` — an op that never bills tokens (moderations) and an op whose response is
-    /// large binary (audio speech) skip the reassembly buffer entirely. Chat and the token-billed
-    /// ops override to `true`.
-    fn taps_nonstream_usage(&self) -> bool {
-        false
+    pub(crate) fn body_affinity_key<'a>(&self, body: &'a Value) -> Option<&'a str> {
+        self.cell.body_affinity_key(body)
     }
-
-    /// Extract billable usage from a complete same-protocol non-stream 2xx body, called once at
-    /// stream end. Default: `None` — flat-fee-only billing (the per-request fee is charged at
-    /// admission regardless; token billing only fires when this returns `Some`). Chat runs the
-    /// egress protocol's reader over the body and reports its IR usage.
-    fn extract_usage(&self, _ingress_protocol: &str, _body: &[u8]) -> Option<IrUsage> {
-        None
+    pub(crate) fn taps_nonstream_usage(&self) -> bool {
+        self.cell.taps_usage()
     }
-
-    /// The egress `Accept` header for the upstream request. Default: the protocol writer's own
-    /// stream-aware choice (JSON / SSE / eventstream) — correct for chat and every JSON-response
-    /// op. An op whose response is binary (audio speech) overrides this to `*/*`.
-    fn egress_accept(&self, writer: &dyn ProtocolWriter, wants_stream: bool) -> &'static str {
-        writer.egress_accept(wants_stream)
+    pub(crate) fn extract_usage(&self, ingress_protocol: &str, body: &[u8]) -> Option<IrUsage> {
+        self.cell.extract_usage(ingress_protocol, body)
+    }
+    pub(crate) fn egress_accept(&self, writer: &dyn ProtocolWriter, wants_stream: bool) -> &'static str {
+        self.cell.egress_accept(writer, wants_stream)
+    }
+    /// The (protocol × operation) upstream path: lane override, else the lane's protocol
+    /// `RequestHandler` renders it from resolved primitives (never the `Lane`). `None` only if the
+    /// protocol has no registered handler — impossible for chat (all six are registered).
+    pub(crate) fn upstream_path(&self, lane: &Lane, wants_stream: bool) -> Option<String> {
+        if let Some(p) = &lane.path {
+            return Some(p.clone());
+        }
+        crate::cells::request_handler(lane.protocol.name()).map(|rh| {
+            rh.upstream_path(&EgressCtx {
+                operation: self.operation,
+                model: lane.wire_model(),
+                stream: wants_stream,
+            })
+        })
     }
 }
 
-/// The chat operation — spec #1, and the only operation the engine registers today. Threaded
-/// through the forward path as the concrete [`Op`]. Embeddings/moderations/images/audio join as
-/// their own spec files, and a registry over them lands with the router that enumerates ops.
-pub(crate) static CHAT: Op = &chat::ChatOp;
+/// Chat — operation #1. The dispatch handle the chat ingress and the engine's tests thread; it wraps
+/// the shared chat cell that `request_handler(proto).operation_handler(Chat)` returns for every
+/// protocol, so this const IS the four-trait dispatch, not a bypass of it.
+pub(crate) const CHAT: Op = OpDispatch {
+    operation: Operation::Chat,
+    cell: &crate::cells::chat::CHAT_HANDLER,
+};
 
 #[cfg(test)]
 mod tests {
@@ -118,10 +93,7 @@ mod tests {
         let chat = CHAT;
         assert_eq!(chat.name(), "chat");
         assert!(chat.streaming(), "chat streams");
-        assert!(
-            chat.taps_nonstream_usage(),
-            "chat bills tokens from the body"
-        );
+        assert!(chat.taps_nonstream_usage(), "chat bills tokens from the body");
         assert!(
             chat.wants_stream(&serde_json::json!({"stream": true})),
             "chat reads the stream boolean"
@@ -131,19 +103,15 @@ mod tests {
             chat.body_affinity_key(&serde_json::json!({"system": "you are helpful"})),
             Some("you are helpful")
         );
-        assert_eq!(
-            chat.body_affinity_key(&serde_json::json!({"system": ""})),
-            None
-        );
+        assert_eq!(chat.body_affinity_key(&serde_json::json!({"system": ""})), None);
     }
 
     /// The load-bearing invariant of the operations axis: the forward engine branches on the
-    /// *capabilities* a spec declares, never on an operation's *identity*. If this ever breaks —
-    /// someone adds `if op.name() == "embeddings"` or `match op.name() { ... }` to the engine —
-    /// then chat stops being just spec #1 and the "add an operation without touching the engine"
-    /// property is lost. Scan the engine source and fail loudly if an identity branch appears.
-    /// (`op.name()` used as a value — e.g. the tracing span field — is fine; only comparisons and
-    /// matches on it are forbidden.)
+    /// *capabilities* a cell declares, never on an operation's *identity*. If someone adds
+    /// `if op.name() == "embeddings"` or `match op.name() { ... }` to the engine, chat stops being
+    /// just operation #1 and the "add an operation without touching the engine" property is lost.
+    /// (`op.name()` used as a value — a tracing span field — is fine; only comparisons/matches are
+    /// forbidden.)
     #[test]
     fn engine_never_branches_on_operation_identity() {
         let engine = include_str!("../forward.rs");
@@ -158,8 +126,7 @@ mod tests {
             assert!(
                 !engine.contains(pat),
                 "src/forward.rs contains a forbidden operation-identity branch (`{pat}`). The \
-                 engine must read capabilities off the OpSpec, never branch on op.name(). Move \
-                 the differing behavior into a trait method on OpSpec instead."
+                 engine must read capabilities off the cell, never branch on op.name()."
             );
         }
     }

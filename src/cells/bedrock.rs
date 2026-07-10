@@ -23,7 +23,8 @@ impl RequestHandler for BedrockRequestHandler {
         match op {
             Operation::Embeddings => Some(&EMB),
             Operation::Image => Some(&IMG),
-            _ => None, // others land as built; genuine gaps stay None → no-cell 404
+            Operation::Chat => Some(&crate::cells::chat::CHAT_HANDLER),
+            _ => None, // genuine gaps stay None → no-cell 404
         }
     }
     fn upstream_path(&self, ctx: &EgressCtx) -> String {

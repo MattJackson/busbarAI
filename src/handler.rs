@@ -18,8 +18,11 @@
 #![allow(dead_code)]
 
 use crate::ir::variant::{IrReq, IrResp};
+use crate::ir::IrUsage;
 use crate::operation::Operation;
+use crate::proto::ProtocolWriter;
 use bytes::Bytes;
+use serde_json::Value;
 
 /// A serialized wire body plus the content-type the cell chose for it. The engine relays both without
 /// interpreting either — `application/json` for JSON ops, `audio/mpeg` etc. for a binary op like speech.
@@ -75,13 +78,38 @@ pub(crate) struct EgressCtx<'a> {
 /// That is the entire contract — the load-bearing discipline that makes the matrix scale. It knows
 /// NOTHING about routing: no `Lane`, no path, no model. The path is the `RequestHandler`'s concern.
 pub(crate) trait OperationHandler: Send + Sync {
-    /// CELL capabilities (M1): whether THIS (protocol, operation) cell can stream a response, and
-    /// whether its non-stream response must be buffered for usage. Defaults: no.
+    // CELL capabilities: the operation-behavior surface the forward engine reads (never branching on
+    // operation identity). Every default is the MOST RESTRICTIVE behavior — no streaming, no stream
+    // intent, no affinity, no usage tap. Chat overrides them; the JSON ops keep the defaults. This is
+    // exactly the old `OpSpec` surface, now living on the cell so there is ONE operation mechanism.
+
+    /// Can this operation produce a client-facing incremental stream?
     fn streaming(&self) -> bool {
         false
     }
+    /// Should the non-stream 2xx body be buffered so [`Self::extract_usage`] can read it?
     fn taps_usage(&self) -> bool {
         false
+    }
+    /// The caller's stream intent, from the parsed ingress body. Chat reads the OpenAI-family
+    /// `"stream"` boolean; a non-streaming op never asks upstream to stream.
+    fn wants_stream(&self, _body: &Value) -> bool {
+        false
+    }
+    /// A body-derived session-affinity key (used only when no affinity header is present). Chat uses
+    /// the top-level Anthropic-shaped `system` string.
+    fn body_affinity_key<'a>(&self, _body: &'a Value) -> Option<&'a str> {
+        None
+    }
+    /// Extract billable usage from a complete same-protocol non-stream 2xx body (called once at stream
+    /// end). `None` = flat/no token meter. Chat runs the egress protocol's reader over the body.
+    fn extract_usage(&self, _ingress_protocol: &str, _body: &[u8]) -> Option<IrUsage> {
+        None
+    }
+    /// The egress `Accept` header for the upstream request. Default: the writer's stream-aware choice
+    /// (JSON / SSE / eventstream). A binary-response op (audio speech) overrides to `*/*`.
+    fn egress_accept(&self, writer: &dyn ProtocolWriter, wants_stream: bool) -> &'static str {
+        writer.egress_accept(wants_stream)
     }
 
     /// Wire → IR (request). The cell owns the ENTIRE wire format: it receives RAW bytes + the request

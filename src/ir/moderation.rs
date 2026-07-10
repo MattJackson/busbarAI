@@ -52,11 +52,14 @@ mod tests {
 
     #[test]
     fn results_are_positional_and_carry_flags_and_scores() {
-        let mut r = ModerationResult::default();
-        r.flagged = true;
-        r.categories.insert("violence".into(), true);
-        r.category_scores.insert("violence".into(), 0.97);
-        r.applied_input_types.insert("violence".into(), vec!["text".into()]);
+        let r = ModerationResult {
+            flagged: true,
+            categories: [("violence".to_string(), true)].into_iter().collect(),
+            category_scores: [("violence".to_string(), 0.97)].into_iter().collect(),
+            applied_input_types: [("violence".to_string(), vec!["text".to_string()])]
+                .into_iter()
+                .collect(),
+        };
         let resp = ModerationResp { results: vec![r], ..Default::default() };
         assert!(resp.results[0].flagged);
         assert_eq!(resp.results[0].category_scores["violence"], 0.97);

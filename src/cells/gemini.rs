@@ -29,6 +29,7 @@ impl RequestHandler for GeminiRequestHandler {
             Operation::Image => Some(&IMG),
             Operation::Transcription => Some(&TRANSCRIPTION),
             Operation::Speech => Some(&SPEECH),
+            Operation::Chat => Some(&crate::cells::chat::CHAT_HANDLER),
             _ => None,
         }
     }
