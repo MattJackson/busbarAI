@@ -15,7 +15,7 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
 const SOFTWARE = { '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Busbar', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows', offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }, url: 'https://getbusbar.com', description: 'Your AI Control Plane: a single self-hosted Rust binary between your applications and every AI provider, with lossless cross-protocol translation, fault-attributed circuit breaking, and in-flight streaming-safe failover, running in your own infrastructure.' };
 
 const protocols = ['OpenAI', 'Anthropic', 'Gemini', 'Bedrock', 'Cohere', 'Responses'];
-const capabilities = ['Chat', 'Embeddings', 'Images', 'Audio', 'Moderations'];
+const capabilities = ['Chat', 'Embeddings', 'Images', 'Audio', 'Moderations', 'Rerank'];
 
 const features = [
   {
@@ -234,7 +234,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         <p class="lede">
           Busbar is a single binary you run in your own infrastructure, sitting between your
           applications and every AI provider. One endpoint to route and fail over chat,
-          embeddings, images, and audio across providers, enforce hard budget caps, provision or revoke access, and see every
+          embeddings, images, audio, and rerank across providers, enforce hard budget caps, provision or revoke access, and see every
           request’s cost, latency, and traffic.
         </p>
       </div>
@@ -248,7 +248,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
 
         <div class="diagram hero-diagram">
           <div class="col col-clients">
-            <div class="col-label">Any client · 6 protocols · 5 capabilities</div>
+            <div class="col-label">Any client · 6 protocols · 6 capabilities</div>
             <div class="node">OpenAI · Anthropic</div>
             <div class="node">Gemini · Bedrock</div>
             <div class="node">Cohere · Responses</div>

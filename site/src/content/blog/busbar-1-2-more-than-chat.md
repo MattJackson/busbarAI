@@ -8,7 +8,7 @@ authorTitle: "Founder, Busbar"
 
 For its whole life so far, Busbar has done one thing extremely well: it takes a chat request in any of six wire protocols, routes it to a pool of backends, and translates it losslessly to whatever the backend speaks, and back. Chat was the whole job. That is the core of Busbar as an AI control plane, and until now it only carried one kind of traffic.
 
-With **1.2, Busbar speaks more than chat.** Four new operations land on top of it, and every one is cross-protocol: embeddings, moderations, image generation, and audio (transcription, speech-to-English translation, and text-to-speech).
+With **1.2, Busbar speaks more than chat.** Five new operations land on top of it, and every one is cross-protocol: embeddings, moderations, image generation, audio (transcription, speech-to-English translation, and text-to-speech), and rerank.
 
 ## Cross-protocol is the whole point
 
@@ -40,11 +40,14 @@ Concretely, the matrix that works today:
       <tr><th>Images</th><td class="yes">✓</td><td class="no">·</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">·</td></tr>
       <tr><th>Audio</th><td class="yes">✓</td><td class="no">·</td><td class="yes">✓</td><td class="no">·</td><td class="no">·</td></tr>
       <tr><th>Moderations</th><td class="yes">✓</td><td class="no">·</td><td class="no">·</td><td class="no">·</td><td class="no">·</td></tr>
+      <tr><th>Rerank</th><td class="no">·</td><td class="no">·</td><td class="no">·</td><td class="yes">✓</td><td class="yes">✓</td></tr>
     </tbody>
   </table>
 </div>
 
 Point a Gemini SDK at Busbar, ask for embeddings, and land on a Bedrock backend without changing a line. The vectors come back in the shape your SDK expects. Any pairing the matrix allows works the same way, in any direction, for images and audio too. Your code never learns where it went.
+
+Rerank is the newest row: Cohere's v2 rerank and Bedrock's rerank models, cross-protocol between the two, and the clean dialect-native 404 everywhere else.
 
 And it's lossless *both ways*: responses and errors. If the backend rejects the request, you get the error in your own protocol's envelope, not a leaked upstream shape you have to special-case. Token and usage accounting survives the round trip too, on every operation, not just chat.
 
