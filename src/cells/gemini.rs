@@ -46,6 +46,46 @@ impl RequestHandler for GeminiRequestHandler {
             Operation::Moderation => format!("/v1beta/models/{m}:generateContent"),
         }
     }
+    fn resolve_operation(&self, path: &str, body: &[u8]) -> Option<Operation> {
+        // Gemini multiplexes: the ACTION names embeddings/image; `generateContent` serves chat AND
+        // audio, split by BODY — `responseModalities:["AUDIO"]` ⇒ speech, an `inline_data` part with
+        // an audio mime ⇒ transcription, an inline IMAGE part is multimodal CHAT. The byte-scan is a
+        // cheap pre-filter so plain chat never pays the JSON parse.
+        if path.contains(":embedContent") || path.contains(":batchEmbedContents") {
+            return Some(Operation::Embeddings);
+        }
+        if path.contains(":predict") {
+            return Some(Operation::Image);
+        }
+        if !(path.contains(":generateContent") || path.contains(":streamGenerateContent")) {
+            return None;
+        }
+        let has = |n: &[u8]| body.windows(n.len()).any(|w| w == n);
+        if has(b"responseModalities") || has(b"inline_data") || has(b"inlineData") {
+            if let Ok(v) = serde_json::from_slice::<Value>(body) {
+                let audio_out = v
+                    .pointer("/generationConfig/responseModalities")
+                    .and_then(Value::as_array)
+                    .is_some_and(|m| m.iter().any(|x| x.as_str() == Some("AUDIO")));
+                if audio_out {
+                    return Some(Operation::Speech);
+                }
+                let audio_in = v.pointer("/contents/0/parts").and_then(Value::as_array).is_some_and(|parts| {
+                    parts.iter().any(|p| {
+                        p.get("inline_data")
+                            .or_else(|| p.get("inlineData"))
+                            .and_then(|d| d.get("mime_type").or_else(|| d.get("mimeType")))
+                            .and_then(Value::as_str)
+                            .is_some_and(|m| m.starts_with("audio/"))
+                    })
+                });
+                if audio_in {
+                    return Some(Operation::Transcription);
+                }
+            }
+        }
+        Some(Operation::Chat)
+    }
 }
 
 /// Gemini transcription — audio understood via `models/{id}:generateContent` with inline audio data.
@@ -53,8 +93,42 @@ impl RequestHandler for GeminiRequestHandler {
 struct GeminiTranscription;
 
 impl OperationHandler for GeminiTranscription {
-    fn read_request(&self, _body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
-        Err(IngressReject::BadRequest("gemini transcription is egress-only".into()))
+    /// gemini `generateContent`-with-audio wire → IR (gemini as INGRESS): `inline_data` part is the
+    /// audio, a text part (if any) is the instruction/prompt. Model rides the PATH.
+    fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
+        let wire: Value =
+            serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
+        let mut audio = None;
+        let mut prompt = None;
+        if let Some(parts) = wire.pointer("/contents/0/parts").and_then(Value::as_array) {
+            for p in parts {
+                let inline = p.get("inline_data").or_else(|| p.get("inlineData"));
+                if let Some(d) = inline {
+                    audio = Some(MediaBlob {
+                        payload: MediaPayload::B64(
+                            d.get("data").and_then(Value::as_str).unwrap_or_default().to_string(),
+                        ),
+                        mime_type: d
+                            .get("mime_type")
+                            .or_else(|| d.get("mimeType"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("application/octet-stream")
+                            .to_string(),
+                        pcm: None,
+                    });
+                } else if let Some(t) = p.get("text").and_then(Value::as_str) {
+                    prompt = Some(t.to_string());
+                }
+            }
+        }
+        let Some(audio) = audio else {
+            return Err(IngressReject::BadRequest("transcription requires an inline_data audio part".into()));
+        };
+        Ok(IrReq::Transcription(crate::ir::audio::TranscriptionReq {
+            audio: Some(audio),
+            prompt,
+            ..Default::default()
+        }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
         let IrReq::Transcription(r) = ir else { return Bytes::new() };
@@ -105,18 +179,51 @@ impl OperationHandler for GeminiTranscription {
         });
         Ok(IrResp::Transcription(TranscriptionResp { text, usage, ..Default::default() }))
     }
-    fn write_response(&self, _ir: &IrResp) -> WireBody {
-        WireBody::json(Bytes::new())
+    /// IR → gemini candidates response (gemini as INGRESS): transcript text as the model turn.
+    fn write_response(&self, ir: &IrResp) -> WireBody {
+        let IrResp::Transcription(r) = ir else { return WireBody::json(Bytes::new()) };
+        let mut body = json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": r.text }], "role": "model" },
+                "finishReason": "STOP",
+            }],
+        });
+        if let Some(crate::billing::Billing::Tokens(t)) = &r.usage {
+            body["usageMetadata"] = json!({
+                "promptTokenCount": t.input,
+                "candidatesTokenCount": t.output,
+                "totalTokenCount": t.input + t.output,
+            });
+        }
+        WireBody::json(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
     }
 }
 
-/// Gemini speech (TTS) — `models/{id}:generateContent` with `responseModalities: [AUDIO]`. Egress-only.
+/// Gemini speech (TTS) — `models/{id}:generateContent` with `responseModalities: [AUDIO]`.
 /// Gemini returns inline base64 PCM; a raw-binary body (mock/other) is wrapped verbatim.
 struct GeminiSpeech;
 
 impl OperationHandler for GeminiSpeech {
-    fn read_request(&self, _body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
-        Err(IngressReject::BadRequest("gemini speech is egress-only".into()))
+    /// gemini TTS wire → IR (gemini as INGRESS): text part is the input; voice from speechConfig.
+    fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
+        let wire: Value =
+            serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
+        let input = wire
+            .pointer("/contents/0/parts")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("")
+            })
+            .unwrap_or_default();
+        if input.is_empty() {
+            return Err(IngressReject::BadRequest("speech requires a text part".into()));
+        }
+        let voice = wire
+            .pointer("/generationConfig/speechConfig/voiceConfig/prebuiltVoiceConfig/voiceName")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Ok(IrReq::Speech(crate::ir::audio::SpeechReq { input, voice, ..Default::default() }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
         let IrReq::Speech(r) = ir else { return Bytes::new() };
@@ -164,8 +271,28 @@ impl OperationHandler for GeminiSpeech {
             ..Default::default()
         }))
     }
-    fn write_response(&self, _ir: &IrResp) -> WireBody {
-        WireBody::json(Bytes::new())
+    /// IR → gemini TTS response (gemini as INGRESS): inline base64 audio as the model turn. Real
+    /// Gemini answers TTS in JSON (`inlineData`), never raw binary — the caller's dialect rules.
+    fn write_response(&self, ir: &IrResp) -> WireBody {
+        let IrResp::Speech(r) = ir else { return WireBody::json(Bytes::new()) };
+        let (data, mime) = match &r.audio {
+            Some(blob) => {
+                let d = match &blob.payload {
+                    MediaPayload::B64(s) => s.clone(),
+                    MediaPayload::Bytes(b) => base64_encode(b),
+                    MediaPayload::Uri(_) => String::new(),
+                };
+                (d, blob.mime_type.clone())
+            }
+            None => (String::new(), "audio/mpeg".into()),
+        };
+        let body = json!({
+            "candidates": [{
+                "content": { "parts": [{ "inlineData": { "mimeType": mime, "data": data } }], "role": "model" },
+                "finishReason": "STOP",
+            }],
+        });
+        WireBody::json(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
     }
 }
 
@@ -173,8 +300,21 @@ impl OperationHandler for GeminiSpeech {
 struct GeminiImage;
 
 impl OperationHandler for GeminiImage {
-    fn read_request(&self, _body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
-        Err(IngressReject::BadRequest("gemini image is egress-only".into()))
+    /// Imagen `:predict` wire → IR (gemini as INGRESS): `instances[].prompt` + `parameters`.
+    fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
+        let wire: Value =
+            serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
+        let params = wire.get("parameters").cloned().unwrap_or_default();
+        Ok(IrReq::Image(crate::ir::image::ImageReq {
+            prompt: wire
+                .pointer("/instances/0/prompt")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            n: params.get("sampleCount").and_then(Value::as_u64).map(|n| n as u32),
+            aspect_ratio: params.get("aspectRatio").and_then(Value::as_str).map(str::to_string),
+            person_generation: params.get("personGeneration").and_then(Value::as_str).map(str::to_string),
+            ..Default::default()
+        }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
         let IrReq::Image(r) = ir else { return Bytes::new() };
@@ -201,8 +341,24 @@ impl OperationHandler for GeminiImage {
             .unwrap_or_default();
         Ok(IrResp::Image(crate::ir::image::ImageResp { images, ..Default::default() }))
     }
-    fn write_response(&self, _ir: &IrResp) -> WireBody {
-        WireBody::json(Bytes::new())
+    /// IR → Imagen `:predict` response (gemini as INGRESS): `predictions[].bytesBase64Encoded`.
+    fn write_response(&self, ir: &IrResp) -> WireBody {
+        let IrResp::Image(r) = ir else { return WireBody::json(Bytes::new()) };
+        let predictions: Vec<Value> = r
+            .images
+            .iter()
+            .map(|img| {
+                let mut p = json!({});
+                if let Some(b64) = &img.b64 {
+                    p["bytesBase64Encoded"] = json!(b64);
+                }
+                p["mimeType"] = json!(img.mime_type.clone().unwrap_or_else(|| "image/png".into()));
+                p
+            })
+            .collect();
+        WireBody::json(Bytes::from(
+            serde_json::to_vec(&json!({ "predictions": predictions })).unwrap_or_default(),
+        ))
     }
 }
 
@@ -210,8 +366,29 @@ impl OperationHandler for GeminiImage {
 struct GeminiEmbeddings;
 
 impl OperationHandler for GeminiEmbeddings {
-    fn read_request(&self, _body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
-        Err(IngressReject::BadRequest("gemini embeddings is egress-only".into()))
+    fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
+        // gemini `:embedContent` wire → IR (gemini as INGRESS). Model rides the PATH (routing fills
+        // it via `IrReq::set_model`); the body carries `content.parts[].text`.
+        let wire: Value =
+            serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
+        let text = wire
+            .pointer("/content/parts")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("")
+            })
+            .unwrap_or_default();
+        if text.is_empty() {
+            return Err(IngressReject::BadRequest("embedContent requires `content.parts[].text`".into()));
+        }
+        Ok(IrReq::Embeddings(crate::ir::embeddings::EmbeddingsReq {
+            input: EmbInput::Text(vec![text]),
+            task_type: wire.get("taskType").and_then(Value::as_str).map(str::to_string),
+            title: wire.get("title").and_then(Value::as_str).map(str::to_string),
+            dimensions: wire.get("outputDimensionality").and_then(Value::as_u64).map(|d| d as u32),
+            encoding_formats: vec![EncFmt::Float],
+            ..Default::default()
+        }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
         let IrReq::Embeddings(r) = ir else { return Bytes::new() };
@@ -238,7 +415,19 @@ impl OperationHandler for GeminiEmbeddings {
             .map(|n| crate::billing::TokenUsage { input: n, ..Default::default() });
         Ok(IrResp::Embeddings(EmbeddingsResp { embeddings: vec![item], usage, ..Default::default() }))
     }
-    fn write_response(&self, _ir: &IrResp) -> WireBody {
-        WireBody::json(Bytes::new())
+    /// IR → gemini `:embedContent` response (gemini as INGRESS): `{"embedding":{"values":[..]}}`.
+    fn write_response(&self, ir: &IrResp) -> WireBody {
+        let IrResp::Embeddings(r) = ir else { return WireBody::json(Bytes::new()) };
+        let values: Vec<f32> = r
+            .embeddings
+            .first()
+            .and_then(|item| match item.vectors.get(&EncFmt::Float) {
+                Some(VectorData::Float(v)) => Some(v.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        WireBody::json(Bytes::from(
+            serde_json::to_vec(&json!({ "embedding": { "values": values } })).unwrap_or_default(),
+        ))
     }
 }

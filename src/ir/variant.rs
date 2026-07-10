@@ -53,6 +53,22 @@ impl IrReq {
             IrReq::Embeddings(_) | IrReq::Moderation(_) | IrReq::Image(_) => false,
         }
     }
+
+    /// Set the model — the ROUTING layer's injection point, operation-blind. Two callers:
+    /// path-model ingress dialects (gemini/bedrock carry the model in the URL, so the cell parses an
+    /// empty body model and routing fills it), and the cross-protocol egress hop (the egress wire must
+    /// carry the LANE's wire model, not the caller's busbar model name). Chat is a no-op: `IrRequest`
+    /// carries no model field (chat's model lives at the routing/rewrite layer, as today).
+    pub(crate) fn set_model(&mut self, model: &str) {
+        match self {
+            IrReq::Chat(_) => {}
+            IrReq::Embeddings(r) => r.model = model.to_string(),
+            IrReq::Moderation(r) => r.model = model.to_string(),
+            IrReq::Image(r) => r.model = model.to_string(),
+            IrReq::Transcription(r) => r.model = model.to_string(),
+            IrReq::Speech(r) => r.model = model.to_string(),
+        }
+    }
 }
 
 /// Response-side IR — one variant per operation. `Chat` reuses the existing `IrResponse` verbatim.

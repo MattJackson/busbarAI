@@ -135,6 +135,13 @@ pub(crate) trait RequestHandler: Send + Sync {
     /// ⇒ the no-cell 404 (§3). The cell, when present, is a pure codec.
     fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler>;
 
+    /// WHICH operation this request asks for — the RequestHandler knows its protocol and reads the
+    /// path (and, where the protocol multiplexes one endpoint, the body: Gemini `generateContent`
+    /// serves chat AND audio; Bedrock `InvokeModel` serves embeddings AND images) and says "this is
+    /// audio, this is chat". The Router only picks the protocol; THIS decides the operation.
+    /// `None` ⇒ the path is not an operation this protocol serves.
+    fn resolve_operation(&self, path: &str, body: &[u8]) -> Option<Operation>;
+
     /// The `(protocol, operation) → path template` map: this protocol's upstream URL for the operation
     /// in `ctx`, built from RESOLVED PRIMITIVES ([`EgressCtx`]) — never the `Lane`. One `match op` per
     /// protocol. Routing applies any `lane.path` override BEFORE calling this (so this is the default).
@@ -180,6 +187,9 @@ mod tests {
                 Operation::Moderation => "/v1/moderations".into(),
                 _ => String::new(),
             }
+        }
+        fn resolve_operation(&self, path: &str, _body: &[u8]) -> Option<Operation> {
+            path.ends_with("/v1/moderations").then_some(Operation::Moderation)
         }
     }
 

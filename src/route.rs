@@ -827,10 +827,16 @@ fn multipart_model(body: &[u8]) -> Option<String> {
     (!m.is_empty()).then_some(m)
 }
 
-/// Ingress for the NEW operations (embeddings/moderations/images/audio, 1.2). Resolves the
-/// (protocol, operation) cell — absent ⇒ no-cell 404 in the CALLER's dialect (design §3) — then
-/// forwards SAME-protocol through `forward_operation`. Model comes from the JSON body `model` (JSON
-/// ops) or the multipart form (transcription). Cross-protocol IR bridge lands after first green.
+/// Ingress for the NEW operations (embeddings/moderations/images/audio, 1.2), for EVERY dialect that
+/// speaks the op. Resolves the (protocol, operation) cell — absent ⇒ no-cell 404 in the CALLER's
+/// dialect (design §3) — then forwards through `forward_operation` (same-proto passthrough or the
+/// cross-protocol IR bridge). Model resolution: `model_hint` for path-model dialects (gemini/bedrock —
+/// their route handler parsed it from the URL), else the JSON body `model` (openai/cohere) or the
+/// multipart form (openai transcription).
+// 8 args: the (proto, operation, model_hint) triple collapses into the unified catch-all dispatch
+// (Router → RequestHandler decides operation+model) in the step-2 refactor; grouping them into a
+// one-shot struct now would be churn the collapse immediately deletes.
+#[allow(clippy::too_many_arguments)]
 async fn operation_ingress(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
@@ -839,6 +845,7 @@ async fn operation_ingress(
     body: Bytes,
     proto: &'static str,
     operation: crate::operation::Operation,
+    model_hint: Option<String>,
 ) -> Response {
     let caller_token = caller.0.as_deref();
     let started = Instant::now();
@@ -863,7 +870,9 @@ async fn operation_ingress(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let model = if ct.starts_with("multipart/") {
+    let model = if let Some(m) = model_hint {
+        Some(m)
+    } else if ct.starts_with("multipart/") {
         multipart_model(&body)
     } else {
         crate::json::parse(&body)
@@ -921,7 +930,7 @@ macro_rules! op_ingress_handler {
             headers: HeaderMap,
             body: Bytes,
         ) -> Response {
-            operation_ingress(&app, &gov, &caller, &headers, body, $proto, $op).await
+            operation_ingress(&app, &gov, &caller, &headers, body, $proto, $op, None).await
         }
     };
 }
@@ -931,6 +940,33 @@ op_ingress_handler!(openai_embeddings, "openai", crate::operation::Operation::Em
 op_ingress_handler!(openai_images, "openai", crate::operation::Operation::Image);
 op_ingress_handler!(openai_transcriptions, "openai", crate::operation::Operation::Transcription);
 op_ingress_handler!(openai_speech, "openai", crate::operation::Operation::Speech);
+// POST /v2/embed — Cohere v2 embeddings ingress: model lives in the body, like /v2/chat.
+op_ingress_handler!(cohere_embeddings, "cohere", crate::operation::Operation::Embeddings);
+
+/// POST /model/{model_id}/invoke — Bedrock `InvokeModel` ingress. The path names the model; the
+/// bedrock RequestHandler reads the BODY and decides the operation (`textToImageParams` ⇒ image,
+/// `inputText` ⇒ embeddings). An unrecognized body is a clean 400 in the Bedrock dialect.
+pub(crate) async fn bedrock_invoke(
+    State(app): State<Arc<App>>,
+    Path(model_id): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
+    axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(operation) = crate::cells::request_handler("bedrock")
+        .and_then(|rh| rh.resolve_operation(uri.path(), &body))
+    else {
+        return ingress_error(
+            "bedrock",
+            StatusCode::BAD_REQUEST,
+            crate::forward::KIND_INVALID_REQUEST,
+            "InvokeModel body is not a supported operation (expected inputText or textToImageParams).",
+        );
+    };
+    operation_ingress(&app, &gov, &caller, &headers, body, "bedrock", operation, Some(model_id)).await
+}
 
 // POST /v2/chat — Cohere v2 ingress: model + stream live in the body, exactly like OpenAI.
 #[tracing::instrument(name = "cohere_ingress", skip_all)]
@@ -1058,6 +1094,18 @@ pub(crate) async fn gemini_ingress(
             );
         }
     };
+
+    // 1.2 OPERATION dispatch — the gemini RequestHandler knows its protocol and reads the path+body
+    // to say "this is embeddings / image / audio / chat" (design: Router picks the protocol; the
+    // RequestHandler decides the operation and hands off to its OperationHandler). Chat falls
+    // through to the existing streaming chat path below.
+    if let Some(op) = crate::cells::request_handler("gemini")
+        .and_then(|rh| rh.resolve_operation(uri.path(), &body))
+        .filter(|op| *op != crate::operation::Operation::Chat)
+    {
+        return operation_ingress(&app, &gov, &caller, &headers, body, "gemini", op, Some(model.to_string()))
+            .await;
+    }
 
     // Only the two generate actions are proxied (see the route doc above). Any other action is an
     // intentional limitation and returns a NOT_FOUND envelope. No `_ =>` catch-all: the two

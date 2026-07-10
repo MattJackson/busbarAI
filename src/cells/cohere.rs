@@ -31,14 +31,52 @@ impl RequestHandler for CohereRequestHandler {
             _ => "/v2/embed".into(),
         }
     }
+    fn resolve_operation(&self, path: &str, _body: &[u8]) -> Option<Operation> {
+        if path.ends_with("/v2/chat") {
+            Some(Operation::Chat)
+        } else if path.ends_with("/v2/embed") {
+            Some(Operation::Embeddings)
+        } else {
+            None
+        }
+    }
 }
 
 /// Cohere v2 embeddings (`/v2/embed`). `input_type` is required by Cohere; default to a document role.
 struct CohereEmbeddings;
 
 impl OperationHandler for CohereEmbeddings {
-    fn read_request(&self, _body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
-        Err(IngressReject::BadRequest("cohere embeddings is egress-only".into()))
+    /// cohere `/v2/embed` wire → IR (cohere as INGRESS): `texts[]` + required `input_type`.
+    fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
+        let wire: Value =
+            serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
+        let texts = wire
+            .get("texts")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if texts.is_empty() {
+            return Err(IngressReject::BadRequest("embed request requires `texts`".into()));
+        }
+        let encoding_formats = wire
+            .get("embedding_types")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(|s| if s == "base64" { EncFmt::Base64 } else { EncFmt::Float })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![EncFmt::Float]);
+        Ok(IrReq::Embeddings(crate::ir::embeddings::EmbeddingsReq {
+            model: wire.get("model").and_then(Value::as_str).unwrap_or_default().to_string(),
+            input: EmbInput::Text(texts),
+            input_type: wire.get("input_type").and_then(Value::as_str).map(str::to_string),
+            dimensions: wire.get("output_dimension").and_then(Value::as_u64).map(|d| d as u32),
+            truncate: wire.get("truncate").and_then(Value::as_str).map(str::to_string),
+            encoding_formats,
+            ..Default::default()
+        }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
         let IrReq::Embeddings(r) = ir else { return Bytes::new() };
@@ -90,7 +128,30 @@ impl OperationHandler for CohereEmbeddings {
             ..Default::default()
         }))
     }
-    fn write_response(&self, _ir: &IrResp) -> WireBody {
-        WireBody::json(Bytes::new())
+    /// IR → cohere v2 embed response (cohere as INGRESS): `embeddings.float[[..]]` + billed_units.
+    fn write_response(&self, ir: &IrResp) -> WireBody {
+        let IrResp::Embeddings(r) = ir else { return WireBody::json(Bytes::new()) };
+        let floats: Vec<Vec<f32>> = r
+            .embeddings
+            .iter()
+            .filter_map(|item| match item.vectors.get(&EncFmt::Float) {
+                Some(VectorData::Float(v)) => Some(v.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut body = json!({
+            "response_type": "embeddings_by_type",
+            "embeddings": { "float": floats },
+        });
+        if let Some(id) = &r.id {
+            body["id"] = json!(id);
+        }
+        if let Some(texts) = &r.input_echo {
+            body["texts"] = json!(texts);
+        }
+        if let Some(u) = &r.usage {
+            body["meta"] = json!({ "billed_units": { "input_tokens": u.input } });
+        }
+        WireBody::json(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
     }
 }

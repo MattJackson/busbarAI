@@ -25,4 +25,7 @@ impl RequestHandler for AnthropicRequestHandler {
         // The Messages API (chat only); streaming is negotiated via the `stream` flag + SSE Accept.
         "/v1/messages".into()
     }
+    fn resolve_operation(&self, path: &str, _body: &[u8]) -> Option<Operation> {
+        path.ends_with("/v1/messages").then_some(Operation::Chat)
+    }
 }

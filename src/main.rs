@@ -1020,6 +1020,7 @@ fn build_router_with_limits(
         .route("/v1beta/models", get(handlers::list_models_v1beta))
         // Cohere v2 + OpenAI Responses ingress: model+stream in the body (body-model protocols).
         .route("/v2/chat", post(route::cohere_ingress))
+        .route("/v2/embed", post(route::cohere_embeddings))
         .route("/v1/responses", post(route::responses_ingress))
         // Gemini ingress: model+action packed into the last path segment with a colon. axum can't
         // split on a `:` inside a segment, so capture the tail with a wildcard and split in-handler.
@@ -1034,6 +1035,9 @@ fn build_router_with_limits(
             "/model/{model_id}/converse-stream",
             post(route::bedrock_converse_stream),
         )
+        // Bedrock InvokeModel ingress (1.2 ops): the bedrock RequestHandler reads the body to decide
+        // the operation (Titan embeddings vs Titan image).
+        .route("/model/{model_id}/invoke", post(route::bedrock_invoke))
         .route("/{name}/v1/messages", post(route::named))
         .route("/{provider}/{model}/v1/messages", post(route::adhoc))
         // Global fallback for unmatched paths (404) and wrong-method hits on a valid path (405).

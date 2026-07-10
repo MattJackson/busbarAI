@@ -37,14 +37,44 @@ impl RequestHandler for BedrockRequestHandler {
             _ => format!("/model/{}/invoke", ctx.model),
         }
     }
+    fn resolve_operation(&self, path: &str, body: &[u8]) -> Option<Operation> {
+        // Converse is chat; InvokeModel multiplexes — the BODY names the op (Titan image vs Titan
+        // embeddings). Unknown invoke bodies resolve to None (a clean 400 at the route layer).
+        if path.ends_with("/converse") || path.ends_with("/converse-stream") {
+            return Some(Operation::Chat);
+        }
+        if path.ends_with("/invoke") {
+            let has = |n: &[u8]| body.windows(n.len()).any(|w| w == n);
+            if has(b"textToImageParams") {
+                return Some(Operation::Image);
+            }
+            if has(b"inputText") {
+                return Some(Operation::Embeddings);
+            }
+        }
+        None
+    }
 }
 
 /// Amazon Titan Image Generator via `/model/{id}/invoke`. prompt in → `images[]` (b64) out.
 struct BedrockImage;
 
 impl OperationHandler for BedrockImage {
-    fn read_request(&self, _body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
-        Err(IngressReject::BadRequest("bedrock image is egress-only".into()))
+    /// Titan image `InvokeModel` wire → IR (bedrock as INGRESS). Model rides the PATH, not the body —
+    /// the route layer resolves it; the IR's `model` is filled by routing (`IrReq::set_model`).
+    fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
+        let wire: Value =
+            serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
+        let params = wire.get("textToImageParams").cloned().unwrap_or_default();
+        let cfg = wire.get("imageGenerationConfig").cloned().unwrap_or_default();
+        Ok(IrReq::Image(crate::ir::image::ImageReq {
+            prompt: params.get("text").and_then(Value::as_str).map(str::to_string),
+            negative_prompt: params.get("negativeText").and_then(Value::as_str).map(str::to_string),
+            n: cfg.get("numberOfImages").and_then(Value::as_u64).map(|n| n as u32),
+            seed: cfg.get("seed").and_then(Value::as_u64),
+            guidance_scale: cfg.get("cfgScale").and_then(Value::as_f64).map(|f| f as f32),
+            ..Default::default()
+        }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
         let IrReq::Image(r) = ir else { return Bytes::new() };
@@ -69,17 +99,35 @@ impl OperationHandler for BedrockImage {
             .unwrap_or_default();
         Ok(IrResp::Image(crate::ir::image::ImageResp { images, ..Default::default() }))
     }
-    fn write_response(&self, _ir: &IrResp) -> WireBody {
-        WireBody::json(Bytes::new())
+    /// IR → Titan image response (bedrock as INGRESS): `{"images": ["<b64>", …]}`.
+    fn write_response(&self, ir: &IrResp) -> WireBody {
+        let IrResp::Image(r) = ir else { return WireBody::json(Bytes::new()) };
+        let images: Vec<&str> = r.images.iter().filter_map(|i| i.b64.as_deref()).collect();
+        WireBody::json(Bytes::from(
+            serde_json::to_vec(&json!({ "images": images })).unwrap_or_default(),
+        ))
     }
 }
 
-/// Amazon Titan Embeddings via `/model/{id}/invoke`. Egress-only in the harness (openai→bedrock).
+/// Amazon Titan Embeddings via `/model/{id}/invoke`.
 struct BedrockEmbeddings;
 
 impl OperationHandler for BedrockEmbeddings {
-    fn read_request(&self, _body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
-        Err(IngressReject::BadRequest("bedrock embeddings is egress-only".into()))
+    /// Titan `InvokeModel` wire → IR (bedrock as INGRESS): `inputText` (+ v2 dims/normalize). Model
+    /// rides the PATH; routing fills it via `IrReq::set_model`.
+    fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
+        let wire: Value =
+            serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
+        let Some(text) = wire.get("inputText").and_then(Value::as_str) else {
+            return Err(IngressReject::BadRequest("invoke embeddings requires `inputText`".into()));
+        };
+        Ok(IrReq::Embeddings(crate::ir::embeddings::EmbeddingsReq {
+            input: EmbInput::Text(vec![text.to_string()]),
+            dimensions: wire.get("dimensions").and_then(Value::as_u64).map(|d| d as u32),
+            normalize: wire.get("normalize").and_then(Value::as_bool),
+            encoding_formats: vec![EncFmt::Float],
+            ..Default::default()
+        }))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
         let IrReq::Embeddings(r) = ir else { return Bytes::new() };
@@ -108,7 +156,21 @@ impl OperationHandler for BedrockEmbeddings {
             .map(|n| crate::billing::TokenUsage { input: n, ..Default::default() });
         Ok(IrResp::Embeddings(EmbeddingsResp { embeddings: vec![item], usage, ..Default::default() }))
     }
-    fn write_response(&self, _ir: &IrResp) -> WireBody {
-        WireBody::json(Bytes::new())
+    /// IR → Titan embeddings response (bedrock as INGRESS): `embedding` + `inputTextTokenCount`.
+    fn write_response(&self, ir: &IrResp) -> WireBody {
+        let IrResp::Embeddings(r) = ir else { return WireBody::json(Bytes::new()) };
+        let floats: Vec<f32> = r
+            .embeddings
+            .first()
+            .and_then(|item| match item.vectors.get(&EncFmt::Float) {
+                Some(VectorData::Float(v)) => Some(v.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut body = json!({ "embedding": floats });
+        if let Some(u) = &r.usage {
+            body["inputTextTokenCount"] = json!(u.input);
+        }
+        WireBody::json(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
     }
 }

@@ -2230,13 +2230,16 @@ pub(crate) async fn forward_operation(
                     };
                     // The cell owns the wire format: hand it raw bytes + the request content-type and let
                     // it parse (JSON, multipart, …). The engine never inspects the body.
-                    let ir_req = match cell.read_request(body.as_ref(), req_content_type.to_str().unwrap_or("")) {
+                    let mut ir_req = match cell.read_request(body.as_ref(), req_content_type.to_str().unwrap_or("")) {
                         Ok(ir) => ir,
                         Err(_) => {
                             return ingress_error(ingress_protocol, StatusCode::BAD_REQUEST,
                                 KIND_INVALID_REQUEST, "We could not process the content of your request.")
                         }
                     };
+                    // The egress wire must carry the LANE's wire model, never the caller's busbar
+                    // model name (routing owns model resolution; the codec stays blind to lanes).
+                    ir_req.set_model(app.lanes[i].wire_model());
                     let egress_bytes = egress_cell.write_request(&ir_req);
                     let base = &app.lanes[i].base_url;
                     // Routing owns the path: apply the lane override, else ask the EGRESS protocol's

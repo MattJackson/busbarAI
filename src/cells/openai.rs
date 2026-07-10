@@ -49,6 +49,24 @@ impl RequestHandler for OpenAiRequestHandler {
             Operation::Speech => "/v1/audio/speech".into(),
         }
     }
+    fn resolve_operation(&self, path: &str, _body: &[u8]) -> Option<Operation> {
+        // OpenAI names the operation in the path — the body is never needed.
+        if path.ends_with("/v1/chat/completions") {
+            Some(Operation::Chat)
+        } else if path.ends_with("/v1/embeddings") {
+            Some(Operation::Embeddings)
+        } else if path.ends_with("/v1/moderations") {
+            Some(Operation::Moderation)
+        } else if path.contains("/v1/images/") {
+            Some(Operation::Image)
+        } else if path.ends_with("/v1/audio/transcriptions") || path.ends_with("/v1/audio/translations") {
+            Some(Operation::Transcription)
+        } else if path.ends_with("/v1/audio/speech") {
+            Some(Operation::Speech)
+        } else {
+            None
+        }
+    }
 }
 
 // -------------------------------------------------- audio cells (real codecs, cross-protocol)

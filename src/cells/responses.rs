@@ -23,4 +23,7 @@ impl RequestHandler for ResponsesRequestHandler {
     fn upstream_path(&self, _ctx: &EgressCtx) -> String {
         "/v1/responses".into()
     }
+    fn resolve_operation(&self, path: &str, _body: &[u8]) -> Option<Operation> {
+        path.ends_with("/v1/responses").then_some(Operation::Chat)
+    }
 }
