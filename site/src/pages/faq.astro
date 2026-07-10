@@ -4,7 +4,7 @@ import PageLayout from '../layouts/PageLayout.astro';
 
 <PageLayout
   title="FAQ · Busbar"
-  description="Straight answers to the questions we get most: comparisons, mid-stream failure, dependencies, provider coverage, and what the AGPL means for you."
+  description="Straight answers to the questions we get most: comparisons, mid-stream failure, dependencies, provider coverage, and what the Apache-2.0 license means for you."
 >
   <p class="kicker">FAQ</p>
   <h1>Frequently asked questions</h1>
@@ -143,20 +143,18 @@ import PageLayout from '../layouts/PageLayout.astro';
     copying one ~9 MB binary and a YAML file.
   </p>
 
-  <h2>What does the AGPL actually require from me?</h2>
+  <h2>What does the Apache-2.0 license require from me?</h2>
   <p>
-    Running unmodified Busbar inside your company, as a network service, triggers no obligation
-    to publish anything. Your configs, your prompts, and the applications that call Busbar are
-    yours; using a program over a network doesn't make your code a derivative of it.
+    Almost nothing, and that's the point. Busbar is licensed under the Apache License 2.0: a
+    permissive license with no copyleft. Use it commercially, run it as an internal or
+    customer-facing service, modify it privately, embed it in your own products. You are never
+    required to publish your changes, your configs, or the applications that call it.
   </p>
   <p>
-    The AGPL's network clause applies when you modify Busbar itself and let others use the
-    modified version over a network: then you must offer them the modified source. If your legal
-    team wants it in writing, that's
-    <a href="https://github.com/MattJackson/busbarAI/blob/main/LICENSE">§13 of the license</a>,
-    and this paragraph isn't legal advice.
-  </p>
-  <p>
-    Commercial licensing is available; <a href="mailto:hello@getbusbar.com">contact us</a>.
+    What it does ask: keep the license and copyright notices with the code if you redistribute
+    it, and note significant changes if you distribute a modified version. In return you also
+    get an express patent grant from every contributor. If your legal team wants it in writing,
+    that's <a href="https://github.com/MattJackson/busbarAI/blob/main/LICENSE">the license
+    itself</a>, and this paragraph isn't legal advice.
   </p>
 </PageLayout>
