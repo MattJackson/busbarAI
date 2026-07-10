@@ -70,9 +70,9 @@ pools:
 
 Already-tried lanes are accumulated in an `excluded` set across hops for the lifetime of the request. A lane that succeeded (2xx headers) but whose body then failed before the first byte is refunded its `max_requests` budget spend and is also excluded from further hops on that request.
 
-## Catching hangs: `attempt_timeout_ms`
+## Catching hangs
 
-Some providers fail by hanging: they accept the connection and never return response headers. The per-request failover budget (`failover.timeout_secs`) does not catch this well, because the hang quietly eats the whole budget on one member before any hop can happen. `attempt_timeout_ms` closes that gap. It caps how long a single attempt may wait for response headers; on expiry the attempt is recorded as a transient breaker failure and the request hops to the next member immediately. Set it on a model as that model's default, and override it per pool member: the same model can carry a 10s cap in a batch pool and a 50ms cap in a latency-critical one. The cap never cuts a stream that has started answering (it covers connect + headers only), and it is always floored by the request's remaining `failover.timeout_secs`. Full semantics and examples in the [configuration reference](https://getbusbar.com/docs/configuration/#per-attempt-timeouts-attempt_timeout_ms).
+Some providers fail by hanging: they accept the connection and never return response headers. The per-request failover budget does not catch this well, because the hang quietly eats the whole budget on one member before any hop can happen. Busbar closes that gap with a per-attempt cap on time to response headers, configured as `attempt_timeout_ms`. When the cap expires, the attempt is recorded as a transient breaker failure and the request hops to the next member immediately. Set it on a model as that model's default, and override it per pool member: the same model can carry a 10s cap in a batch pool and a 50ms cap in a latency-critical one. The cap never cuts a stream that has started answering (it covers connect + headers only), and it is always floored by the request's remaining `failover.timeout_secs`. Full semantics and examples in the [configuration reference](https://getbusbar.com/docs/configuration/#per-attempt-timeouts-attempt_timeout_ms).
 
 ## Context-length failover
 
