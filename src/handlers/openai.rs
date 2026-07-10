@@ -105,6 +105,26 @@ fn header_attr(headers: &str, attr: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Sanitize a client-supplied MIME type before it enters the IR: a MIME type is `type/subtype`
+/// plus optional `; param=value`, all printable ASCII. A CR/LF or other control char here is a
+/// header-injection vector — on a cross-protocol transcription hop the value is written verbatim
+/// into busbar's OUTGOING multipart `Content-Type` header, so `audio/mp3\r\nX-Injected: ...`
+/// would inject headers (or a premature blank line) into the upstream request. Cut at the first
+/// control character; if nothing survives, fall back to a safe default.
+fn sanitize_mime_type(raw: &str) -> String {
+    let clean: String = raw
+        .chars()
+        .take_while(|c| !c.is_control())
+        .filter(|c| c.is_ascii() && !c.is_control())
+        .collect();
+    let trimmed = clean.trim();
+    if trimmed.is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Minimal byte-level `multipart/form-data` parser: enough for the OpenAI audio form (a `model` text
 /// part + a binary `file` part). Boundary comes from the content-type; file bytes are preserved raw
 /// (never lossily UTF-8'd) so audio survives the ingress→IR hop.
@@ -184,7 +204,8 @@ impl OperationHandler for OpenAiTranscription {
                         payload: MediaPayload::Bytes(Bytes::copy_from_slice(f.value)),
                         mime_type: f
                             .content_type
-                            .clone()
+                            .as_deref()
+                            .map(sanitize_mime_type)
                             .unwrap_or_else(|| "application/octet-stream".into()),
                         pcm: None,
                     })
@@ -257,7 +278,7 @@ impl OperationHandler for OpenAiTranscription {
             }
             Some(Billing::Tokens(t)) => {
                 body["usage"] = json!({ "type": "tokens", "input_tokens": t.input,
-                    "output_tokens": t.output, "total_tokens": t.input + t.output });
+                    "output_tokens": t.output, "total_tokens": t.input.saturating_add(t.output) });
             }
             _ => {}
         }
@@ -381,7 +402,7 @@ impl OperationHandler for OpenAiEmbeddings {
         let dimensions = wire
             .get("dimensions")
             .and_then(Value::as_u64)
-            .map(|d| d as u32);
+            .and_then(|d| u32::try_from(d).ok());
         let encoding_formats = match wire.get("encoding_format").and_then(Value::as_str) {
             Some("base64") => vec![EncFmt::Base64],
             _ => vec![EncFmt::Float],
@@ -409,6 +430,12 @@ impl OperationHandler for OpenAiEmbeddings {
         let mut body = json!({ "model": r.model, "input": input });
         if let Some(d) = r.dimensions {
             body["dimensions"] = json!(d);
+        }
+        // Honor a base64 encoding request (OpenAI supports float (default) and base64). Dropping
+        // it made a cross-protocol base64 embeddings request silently come back as float; the
+        // response reader decodes both, so emitting the field completes the round trip.
+        if r.encoding_formats.contains(&EncFmt::Base64) {
+            body["encoding_format"] = json!("base64");
         }
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
     }
@@ -486,7 +513,7 @@ impl OperationHandler for OpenAiEmbeddings {
             body["model"] = json!(m);
         }
         if let Some(u) = &r.usage {
-            body["usage"] = json!({ "prompt_tokens": u.input, "total_tokens": u.input + u.output });
+            body["usage"] = json!({ "prompt_tokens": u.input, "total_tokens": u.input.saturating_add(u.output) });
         }
         WireBody::json(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
     }
@@ -526,7 +553,10 @@ impl OperationHandler for OpenAiImage {
                 .get("prompt")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            n: wire.get("n").and_then(Value::as_u64).map(|n| n as u32),
+            n: wire
+                .get("n")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok()),
             size,
             quality: wire
                 .get("quality")
@@ -852,5 +882,71 @@ mod tests {
         assert_eq!(back["usage"]["input_tokens"], 11);
         assert_eq!(back["usage"]["output_tokens"], 3);
         assert_eq!(back["usage"]["total_tokens"], 14);
+    }
+
+    #[test]
+    fn embeddings_base64_encoding_format_survives_to_openai_egress() {
+        // A base64 embeddings request must emit `encoding_format: "base64"` on OpenAI egress, or
+        // the backend defaults to float and the caller silently gets the wrong encoding.
+        let ir = crate::ir::variant::IrReq::Embeddings(crate::ir::embeddings::EmbeddingsReq {
+            model: "text-embedding-3-small".into(),
+            input: crate::ir::embeddings::EmbInput::Text(vec!["hi".into()]),
+            encoding_formats: vec![crate::ir::embeddings::EncFmt::Base64],
+            ..Default::default()
+        });
+        let out = OpenAiEmbeddings.write_request(&ir);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["encoding_format"], "base64");
+        // A plain (float) request must NOT gain a spurious encoding_format key.
+        let ir2 = crate::ir::variant::IrReq::Embeddings(crate::ir::embeddings::EmbeddingsReq {
+            model: "m".into(),
+            input: crate::ir::embeddings::EmbInput::Text(vec!["hi".into()]),
+            encoding_formats: vec![crate::ir::embeddings::EncFmt::Float],
+            ..Default::default()
+        });
+        let out2 = OpenAiEmbeddings.write_request(&ir2);
+        let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+        assert!(v2.get("encoding_format").is_none());
+    }
+
+    #[test]
+    fn mime_type_sanitizer_strips_header_injection() {
+        // A CR/LF in the client's multipart Content-Type must never survive into the IR, or it
+        // would inject headers into busbar's egress multipart request on a cross-protocol hop.
+        assert_eq!(
+            super::sanitize_mime_type("audio/mp3\r\nX-Injected: evil"),
+            "audio/mp3"
+        );
+        assert_eq!(super::sanitize_mime_type("audio/wav"), "audio/wav");
+        assert_eq!(
+            super::sanitize_mime_type("audio/mpeg; codecs=mp3"),
+            "audio/mpeg; codecs=mp3"
+        );
+        // A value that is only control chars degrades to the safe default, never empty.
+        assert_eq!(
+            super::sanitize_mime_type("\r\n\r\n"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn total_tokens_saturate_on_upstream_overflow() {
+        // The three egress token sums must saturate (operands are upstream-controlled), matching
+        // the billing.rs invariant — bare `+` would panic in debug / wrap to 0 in release.
+        use crate::billing::{Billing, TokenUsage};
+        let huge = TokenUsage {
+            input: u64::MAX,
+            output: 5,
+            ..Default::default()
+        };
+        // openai transcription write path
+        let ir = crate::ir::variant::IrResp::Transcription(crate::ir::audio::TranscriptionResp {
+            text: "x".into(),
+            usage: Some(Billing::Tokens(huge.clone())),
+            ..Default::default()
+        });
+        let out = OpenAiTranscription.write_response(&ir);
+        let v: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(v["usage"]["total_tokens"], u64::MAX); // saturated, not panicked/wrapped
     }
 }

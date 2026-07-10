@@ -104,7 +104,7 @@ impl OperationHandler for BedrockImage {
             n: cfg
                 .get("numberOfImages")
                 .and_then(Value::as_u64)
-                .map(|n| n as u32),
+                .and_then(|n| u32::try_from(n).ok()),
             seed: cfg.get("seed").and_then(Value::as_u64),
             guidance_scale: cfg
                 .get("cfgScale")
@@ -176,7 +176,7 @@ impl OperationHandler for BedrockEmbeddings {
             dimensions: wire
                 .get("dimensions")
                 .and_then(Value::as_u64)
-                .map(|d| d as u32),
+                .and_then(|d| u32::try_from(d).ok()),
             normalize: wire.get("normalize").and_then(Value::as_bool),
             encoding_formats: vec![EncFmt::Float],
             ..Default::default()
@@ -271,7 +271,10 @@ impl OperationHandler for BedrockRerank {
             model: String::new(),
             query,
             documents,
-            top_n: wire.get("top_n").and_then(Value::as_u64).map(|n| n as u32),
+            top_n: wire
+                .get("top_n")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok()),
             ..Default::default()
         }))
     }

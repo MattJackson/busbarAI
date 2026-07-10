@@ -1941,7 +1941,7 @@ impl ProtocolWriter for OpenAiWriter {
                 .unwrap_or(crate::ir::REASONING_BUDGET_DEFAULTS);
             out.insert(
                 "reasoning_effort".to_string(),
-                serde_json::json!(ask.to_effort(table).as_str()),
+                serde_json::json!(ask.to_effort(table).as_openai_reasoning_effort()),
             );
         }
         // The logprobs ask in OpenAI's native spelling (a Gemini `responseLogprobs`/`logprobs`

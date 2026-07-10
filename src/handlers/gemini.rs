@@ -232,7 +232,7 @@ impl OperationHandler for GeminiTranscription {
             body["usageMetadata"] = json!({
                 "promptTokenCount": t.input,
                 "candidatesTokenCount": t.output,
-                "totalTokenCount": t.input + t.output,
+                "totalTokenCount": t.input.saturating_add(t.output),
             });
         }
         WireBody::json(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
@@ -371,7 +371,7 @@ impl OperationHandler for GeminiImage {
             n: params
                 .get("sampleCount")
                 .and_then(Value::as_u64)
-                .map(|n| n as u32),
+                .and_then(|n| u32::try_from(n).ok()),
             aspect_ratio: params
                 .get("aspectRatio")
                 .and_then(Value::as_str)
@@ -481,7 +481,7 @@ impl OperationHandler for GeminiEmbeddings {
             dimensions: wire
                 .get("outputDimensionality")
                 .and_then(Value::as_u64)
-                .map(|d| d as u32),
+                .and_then(|d| u32::try_from(d).ok()),
             encoding_formats: vec![EncFmt::Float],
             ..Default::default()
         }))

@@ -1078,7 +1078,12 @@ impl ProtocolReader for GeminiReader {
             // block below. Without this arm a streamed Gemini citation was silently dropped.
             let citations = read_gemini_citations(candidate);
             if !citations.is_empty() {
-                let ti = state.text_index.unwrap_or(state.open_tools.len());
+                // Offset by the thinking slot (index 0) when a reasoning block is open, exactly
+                // like the text-part arm — otherwise a citation/logprobs delta arriving before the
+                // first answer-text part opens a text block at index 0, colliding with the
+                // thinking block and corrupting cross-protocol block-index mapping.
+                let offset = usize::from(state.reasoning_seen);
+                let ti = state.text_index.unwrap_or(offset + state.open_tools.len());
                 if !state.text_block_open {
                     state.text_block_open = true;
                     state.text_index = Some(ti);
@@ -1100,7 +1105,12 @@ impl ProtocolReader for GeminiReader {
             // stream can re-emit them as `choices[].logprobs.content[]`.
             let stream_logprobs = read_gemini_logprobs(candidate.get("logprobsResult"));
             if !stream_logprobs.is_empty() {
-                let ti = state.text_index.unwrap_or(state.open_tools.len());
+                // Offset by the thinking slot (index 0) when a reasoning block is open, exactly
+                // like the text-part arm — otherwise a citation/logprobs delta arriving before the
+                // first answer-text part opens a text block at index 0, colliding with the
+                // thinking block and corrupting cross-protocol block-index mapping.
+                let offset = usize::from(state.reasoning_seen);
+                let ti = state.text_index.unwrap_or(offset + state.open_tools.len());
                 if !state.text_block_open {
                     state.text_block_open = true;
                     state.text_index = Some(ti);
@@ -2499,10 +2509,19 @@ impl ProtocolWriter for GeminiWriter {
                 crate::ir::IrReasoningAsk::Dynamic => -1,
                 other => i64::from(other.to_budget(table)),
             };
-            gen_config.insert(
-                "thinkingConfig".to_string(),
-                serde_json::json!({"thinkingBudget": budget}),
-            );
+            // Only SYNTHESIZE a thinkingConfig when the request did not already carry a native
+            // Gemini one (i.e. this is a CROSS-protocol ask — `extra` is cleared at the seam, so
+            // `gen_config` has no thinkingConfig). A Gemini-native request keeps its original
+            // thinkingConfig verbatim (seeded from `extra`), so same-protocol stays byte-exact.
+            // On the synthesized (cross-protocol) path, `includeThoughts: true` is REQUIRED or
+            // Gemini spends the budget thinking but returns NO thought parts — the carry would come
+            // back empty. We always want the thoughts back to translate them to the caller.
+            if !gen_config.contains_key("thinkingConfig") {
+                gen_config.insert(
+                    "thinkingConfig".to_string(),
+                    serde_json::json!({"thinkingBudget": budget, "includeThoughts": true}),
+                );
+            }
         }
         if let Some(presence_penalty) = req.presence_penalty {
             gen_config.insert(
@@ -8968,6 +8987,54 @@ mod logprobs_carry_tests {
             .expect("openai writer must emit a logprobs chunk");
         assert_eq!(frame["choices"][0]["logprobs"]["content"][0]["token"], "Hi");
         assert_eq!(frame["choices"][0]["delta"], serde_json::json!({}));
+    }
+
+    /// A Gemini stream carrying BOTH a `thought:true` part AND a `logprobsResult` in the same
+    /// chunk must not collide the logprobs' text block on index 0 with the thinking block. The
+    /// thinking block owns 0; the text block (opened by the logprobs arm) must land at index 1.
+    #[test]
+    fn stream_thinking_plus_logprobs_do_not_collide_on_index_zero() {
+        let chunk = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "reasoning", "thought": true}]},
+                "logprobsResult": {
+                    "chosenCandidates": [{"token": "Hi", "logProbability": -0.03}]
+                }
+            }]
+        });
+        let mut state = crate::ir::StreamDecodeState::default();
+        let events = Protocol::gemini()
+            .reader()
+            .read_response_events("", &chunk, &mut state);
+        use crate::ir::{IrBlockMeta, IrDelta, IrStreamEvent};
+        // Thinking block opened at 0.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            IrStreamEvent::BlockStart {
+                index: 0,
+                block: IrBlockMeta::Thinking
+            }
+        )));
+        // The logprobs text block must open at 1, never 0.
+        let lp_start = events.iter().find_map(|e| match e {
+            IrStreamEvent::BlockStart {
+                index,
+                block: IrBlockMeta::Text,
+            } => Some(*index),
+            _ => None,
+        });
+        assert_eq!(
+            lp_start,
+            Some(1),
+            "logprobs text block must not collide with thinking at 0"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            IrStreamEvent::BlockDelta {
+                index: 1,
+                delta: IrDelta::LogprobsDelta(_)
+            }
+        )));
     }
 
     /// STREAMING, OpenAI backend -> Gemini caller: a chunk's `choices[0].logprobs` becomes a

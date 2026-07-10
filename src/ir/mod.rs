@@ -358,6 +358,20 @@ impl IrReasoningAsk {
 }
 
 impl IrReasoningEffort {
+    /// The OpenAI-family `reasoning_effort` value. Identical to [`Self::as_str`] EXCEPT `Minimal`
+    /// maps to `"low"`: `"minimal"` is only accepted by newer OpenAI reasoning models (gpt-5),
+    /// while the o-series accepts only low/medium/high. `Minimal` reaches an OpenAI egress writer
+    /// only via a small cross-protocol budget (Anthropic/Gemini source), and the lane's reasoning
+    /// model is operator-declared, not known here — emitting the universally-valid `"low"` upholds
+    /// the never-cause-a-400 translation invariant. (Same-protocol OpenAI is byte-exact and never
+    /// reaches this projection.)
+    pub(crate) fn as_openai_reasoning_effort(self) -> &'static str {
+        match self {
+            IrReasoningEffort::Minimal => "low",
+            other => other.as_str(),
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             IrReasoningEffort::Minimal => "minimal",

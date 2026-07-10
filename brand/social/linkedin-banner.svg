@@ -1,4 +1,4 @@
-<svg width="2256" height="382" viewBox="0 0 1128 191" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Busbar — One endpoint. Every LLM protocol. Losslessly.">
+<svg width="2256" height="382" viewBox="0 0 1128 191" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Busbar — Your AI Control Plane">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0F172A"/>
@@ -28,7 +28,7 @@
        bottom-left, so all content starts right of it. -->
 
   <!-- hero tagline -->
-  <text x="300" y="86" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="32" font-weight="700" fill="#FFFFFF">One endpoint. Every LLM protocol. <tspan fill="#A3E635">Losslessly.</tspan></text>
+  <text x="300" y="86" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="32" font-weight="700" fill="#FFFFFF">Your <tspan fill="#A3E635">AI Control Plane</tspan></text>
 
   <!-- supporting line -->
   <text x="302" y="120" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="16.5" font-weight="500" fill="#94A3B8">Lossless translation · fault-aware circuit breaking · in-flight failover · one Rust binary</text>

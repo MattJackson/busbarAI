@@ -2107,7 +2107,16 @@ impl ProtocolWriter for AnthropicWriter {
         // vec is Anthropic's native `stop_sequences` array. Emitted before the `extra` overlay (these
         // keys were pulled OUT of extra by the reader, so there is no double-emit on passthrough).
         if let Some(top_p) = req.top_p {
-            out.insert("top_p".to_string(), serde_json::json!(top_p));
+            if thinking_emitted {
+                // Anthropic rejects top_p modifications alongside thinking (same rule as
+                // temperature/top_k); omit it, observably, rather than ship a certain 400.
+                tracing::warn!(
+                    top_p,
+                    "omitting top_p on Anthropic egress: not compatible with thinking"
+                );
+            } else {
+                out.insert("top_p".to_string(), serde_json::json!(top_p));
+            }
         }
         if let Some(top_k) = req.top_k {
             if thinking_emitted {
@@ -6448,6 +6457,7 @@ mod reasoning_carry_tests {
     fn thinking_omits_incompatible_sampling_knobs() {
         let mut body = openai_effort_body("low");
         body["temperature"] = serde_json::json!(0.5);
+        body["top_p"] = serde_json::json!(0.9);
         let ir = crate::proto::openai_chat::OpenAiReader
             .read_request(&body)
             .expect("parses");
@@ -6456,6 +6466,10 @@ mod reasoning_carry_tests {
         assert!(
             out.get("temperature").is_none(),
             "temperature != 1 must be omitted with thinking: {out}"
+        );
+        assert!(
+            out.get("top_p").is_none(),
+            "top_p must be omitted with thinking (Anthropic 400s on it): {out}"
         );
 
         // Without a reasoning ask the same temperature is emitted normally.
@@ -6510,6 +6524,24 @@ mod reasoning_carry_tests {
         assert_eq!(out["thinking"]["budget_tokens"], 4096);
     }
 
+    /// CROSS-protocol Gemini egress MUST request `includeThoughts: true` alongside the budget, or
+    /// a real Gemini backend spends the budget but returns no thought parts (empty carry).
+    #[test]
+    fn gemini_cross_protocol_egress_requests_include_thoughts() {
+        // openai reader -> IR carries a reasoning ask and NO native gemini generationConfig,
+        // so the gemini writer takes the synthesized (cross-protocol) path.
+        let ir = crate::proto::openai_chat::OpenAiReader
+            .read_request(&openai_effort_body("high"))
+            .expect("parses");
+        let out = Protocol::gemini().writer().write_request(&ir);
+        let tc = &out["generationConfig"]["thinkingConfig"];
+        assert_eq!(
+            tc["includeThoughts"], true,
+            "must ask Gemini to return thoughts: {out}"
+        );
+        assert!(tc.get("thinkingBudget").is_some());
+    }
+
     /// Responses `reasoning: {effort}` reads into the ask and re-emits from the typed field.
     #[test]
     fn responses_effort_round_trips() {
@@ -6535,6 +6567,23 @@ mod reasoning_carry_tests {
         with_max.max_tokens = Some(32000);
         let aout = AnthropicWriter.write_request(&with_max);
         assert_eq!(aout["thinking"]["budget_tokens"], 8192);
+    }
+
+    /// A tiny cross-protocol budget (below the `low` table entry) must NOT emit the o-series-
+    /// invalid `reasoning_effort: "minimal"` on OpenAI egress — it maps to `"low"` to avoid a 400.
+    #[test]
+    fn small_budget_maps_to_low_not_minimal_on_openai() {
+        let body = serde_json::json!({
+            "model": "m", "max_tokens": 16000,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 1500}  // below low (4096)
+        });
+        let ir = AnthropicReader.read_request(&body).expect("parses");
+        let out = crate::proto::openai_chat::OpenAiWriter.write_request(&ir);
+        assert_eq!(
+            out["reasoning_effort"], "low",
+            "must not emit o-series-invalid 'minimal'"
+        );
     }
 
     /// A disabled-form `thinking` param is NOT promoted (stays in extra for same-proto fidelity)

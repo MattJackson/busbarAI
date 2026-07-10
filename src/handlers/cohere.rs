@@ -104,7 +104,7 @@ impl OperationHandler for CohereEmbeddings {
             dimensions: wire
                 .get("output_dimension")
                 .and_then(Value::as_u64)
-                .map(|d| d as u32),
+                .and_then(|d| u32::try_from(d).ok()),
             truncate: wire
                 .get("truncate")
                 .and_then(Value::as_str)
@@ -255,11 +255,14 @@ impl OperationHandler for CohereRerank {
                 .to_string(),
             query,
             documents,
-            top_n: wire.get("top_n").and_then(Value::as_u64).map(|n| n as u32),
+            top_n: wire
+                .get("top_n")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok()),
             max_tokens_per_doc: wire
                 .get("max_tokens_per_doc")
                 .and_then(Value::as_u64)
-                .map(|n| n as u32),
+                .and_then(|n| u32::try_from(n).ok()),
             ..Default::default()
         }))
     }
@@ -423,6 +426,29 @@ mod rerank_tests {
         assert_eq!(v["results"][0]["index"], 2);
         assert_eq!(v["results"][0]["relevance_score"], 0.98);
         assert_eq!(v["results"][1]["index"], 0);
+    }
+
+    /// A client top_n larger than u32::MAX must DROP to None (omitted), never silently wrap to a
+    /// bogus small value — the checked-narrowing contract for all client-supplied counts.
+    #[test]
+    fn oversized_top_n_drops_to_none_not_wrapped() {
+        let body = serde_json::to_vec(&json!({
+            "model": "rerank-v3.5", "query": "q", "documents": ["a", "b"],
+            "top_n": u64::from(u32::MAX) + 1
+        }))
+        .unwrap();
+        let ir = CohereRequestHandler
+            .operation_handler(Operation::Rerank)
+            .unwrap()
+            .read_request(&body, "application/json")
+            .expect("parses");
+        let IrReq::Rerank(r) = ir else {
+            panic!("expected rerank")
+        };
+        assert_eq!(
+            r.top_n, None,
+            "an out-of-range top_n must be omitted, not wrapped"
+        );
     }
 
     /// Protocols without a rerank surface have NO handler: the universal no-handler 404 covers
