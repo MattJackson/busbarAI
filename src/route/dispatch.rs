@@ -82,16 +82,41 @@ pub(crate) async fn operation_ingress(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    // Parse ONCE, before model extraction, so a malformed JSON body gets the parse 400 (below),
+    // never a misleading missing-model 400.
+    let parsed_v: Option<serde_json::Value> = if ct.starts_with("application/json") || ct.is_empty()
+    {
+        match crate::json::parse(&body) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                tracing::debug!(detail = %crate::json::parse_err_log(body.len()), "request body JSON parse failed");
+                return finish_rejected(
+                    app,
+                    gov,
+                    proto,
+                    crate::forward::POOL_LABEL_UNRESOLVED,
+                    started,
+                    charged_at,
+                    ingress_error(
+                        proto,
+                        StatusCode::BAD_REQUEST,
+                        crate::forward::KIND_INVALID_REQUEST,
+                        "We could not parse the JSON body of your request.",
+                    ),
+                );
+            }
+        }
+    } else {
+        None
+    };
     let model = if let Some(m) = model_hint {
         Some(m)
     } else if ct.starts_with("multipart/") {
         multipart_model(&body)
     } else {
-        crate::json::parse(&body)
-            .ok()
-            .and_then(|v: serde_json::Value| {
-                v.get("model").and_then(|m| m.as_str()).map(str::to_string)
-            })
+        parsed_v
+            .as_ref()
+            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
     };
     let model = match model {
         Some(m) if !m.is_empty() => m,
@@ -113,39 +138,82 @@ pub(crate) async fn operation_ingress(
         }
     };
 
-    if let Some(resp) = governance_guard(app, gov, proto, &model, started, charged_at).await {
+    operation_resolved(
+        app,
+        gov,
+        proto,
+        operation,
+        op_handler,
+        &model,
+        headers,
+        body,
+        parsed_v,
+        caller_token,
+        started,
+        charged_at,
+        None,
+    )
+    .await
+}
+
+/// THE UNIVERSAL RESOLVED CORE — every operation, chat included, from the moment the model is known:
+/// governance → candidates → affinity → the one engine. `gemini_api_version` shapes the gemini
+/// dialect's model-not-found echo; everything else is operation- and protocol-blind.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn operation_resolved(
+    app: &Arc<App>,
+    gov: &crate::governance::GovCtx,
+    proto: &'static str,
+    operation: crate::operation::Operation,
+    op_handler: &'static dyn crate::handlers::OperationHandler,
+    model: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    parsed_v: Option<serde_json::Value>,
+    caller_token: Option<&str>,
+    started: Instant,
+    charged_at: u64,
+    gemini_api_version: Option<&str>,
+) -> Response {
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Some(resp) = governance_guard(app, gov, proto, model, started, charged_at).await {
         return resp;
     }
 
-    let (cands, pool_name): (Vec<WeightedLane>, &str) = if let Some(c) = app.pools.get(&model) {
-        (c.clone(), model.as_str())
-    } else if let Some(&i) = app.by_model.get(&model) {
+    let (cands, pool_name): (Vec<WeightedLane>, &str) = if let Some(c) = app.pools.get(model) {
+        (c.clone(), model)
+    } else if let Some(&i) = app.by_model.get(model) {
         (vec![WeightedLane { idx: i, weight: 1 }], "")
     } else {
         return finish(
             app,
             gov,
             proto,
-            pool_label(app, &model),
+            pool_label(app, model),
             started,
             charged_at,
             ingress_error(
                 proto,
                 StatusCode::NOT_FOUND,
                 crate::forward::KIND_NOT_FOUND,
-                &not_found_message(&model, None),
+                &not_found_message(model, gemini_api_version),
             ),
         );
     };
 
     // THE ONE ENGINE: every operation — chat included — forwards through the same failover/breaker/
-    // policy pipeline. JSON bodies ride parsed (`Some(v)`); opaque bodies (multipart/binary) ride
-    // `None` and relay/translate at the byte level through the operation codecs.
-    let v: Option<serde_json::Value> = if ct.starts_with("application/json") || ct.is_empty() {
-        crate::json::parse(&body).ok()
-    } else {
-        None
-    };
+    // policy pipeline. JSON bodies ride parsed (`Some(v)`, parsed once by the caller); opaque bodies
+    // (multipart/binary) ride `None` and relay/translate at the byte level via the operation codecs.
+    let v = parsed_v;
+    // Session affinity: the pool's configured affinity header, read generically for EVERY operation
+    // (sticky routing is an engine capability, not a chat feature).
+    let affinity_key: Option<String> = headers
+        .get(affinity_header_for(app, model))
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string);
     let req_ct_owned = ct.to_string();
     let resp = crate::forward::forward_with_pool_parsed(
         app.clone(),
@@ -159,7 +227,7 @@ pub(crate) async fn operation_ingress(
         },
         caller_token,
         pool_name,
-        None,
+        affinity_key.as_deref(),
         proto,
         crate::handlers::OpDispatch {
             operation,
@@ -168,7 +236,7 @@ pub(crate) async fn operation_ingress(
         usage_sink(app, gov, charged_at),
     )
     .await;
-    finish(app, gov, proto, &model, started, charged_at, resp)
+    finish(app, gov, proto, model, started, charged_at, resp)
 }
 
 // (The per-operation axum wrappers are gone: the protocol catch-all `protocol_dispatch` resolves the

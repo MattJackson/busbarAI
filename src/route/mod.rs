@@ -12,7 +12,7 @@ use axum::{
 };
 use serde_json::Value;
 
-use crate::forward::{forward_with_pool, forward_with_pool_parsed};
+use crate::forward::forward_with_pool;
 use crate::state::{App, WeightedLane};
 
 /// enforce a virtual key's allowed-pools list against the resolved target pool. No-op
@@ -717,92 +717,45 @@ async fn forward_resolved(
     charged_at: u64,
     gemini_api_version: Option<&str>,
 ) -> Response {
-    // Governance guards (pool-allowed / budget / rate). A rejection is wrapped in `finish_rejected`
-    // inside `governance_guard` so it is still counted in metrics and the request-log webhook.
-    if let Some(resp) = governance_guard(app, gov, proto, model, started, charged_at).await {
-        return resp;
-    }
-
-    if let Some(cands) = app.pools.get(model) {
-        let affinity_key = headers
-            .get(affinity_header_for(app, model))
-            .and_then(|v| v.to_str().ok());
-        let resp = forward_with_pool_parsed(
-            app.clone(),
-            cands.clone(),
-            body,
-            Some(v),
-            crate::forward::APPLICATION_JSON,
-            caller_token,
-            model,
-            affinity_key,
+    // CHAT IS A STANDARD OPERATION: this is now a thin adapter over the universal
+    // `operation_resolved` core — the same code path every operation takes. It exists only to keep
+    // the chat routing arms' (body-model / path-model) call shape stable; the chat OperationHandler
+    // resolves through the registry like any other.
+    let Some(op_handler) = crate::handlers::request_handler(proto)
+        .and_then(|rh| rh.operation_handler(crate::operation::Operation::Chat))
+    else {
+        return finish_rejected(
+            app,
+            gov,
             proto,
-            crate::handlers::chat(proto),
-            usage_sink(app, gov, charged_at),
-        )
-        .await;
-        return finish(app, gov, proto, model, started, charged_at, resp);
-    }
-
-    if let Some(&i) = app.by_model.get(model) {
-        // Route through forward_with_pool with this ingress protocol so a request to a
-        // different-protocol backend is translated both ways. (The `forward` wrapper assumes
-        // Anthropic ingress, which is correct only for the /v1/messages routes — not here.)
-        //
-        // pool_name is "" — the lane-default breaker CELL shared by every direct/single-model
-        // route (forward.rs: `forward` passes "" for the same reason; LOW #4). This is a
-        // by_model hit, NOT a named pool, so it must share breaker state with the same model
-        // reached via the `named`/`adhoc` single-model paths. Passing the MODEL name here would
-        // track the same lane under a model-keyed op_handler on universal ingress but under the ""
-        // op_handler on the /v1/messages routes, splitting breaker state (and /stats, /healthz) for
-        // one lane across two cells purely by route shape. The bounded `pool` metric LABEL still
-        // resolves to the model name for the "" OperationHandler (forward.rs `metric_pool_label`), so the
-        // request/upstream metric correlation is unaffected — only the OperationHandler key is unified.
-        let resp = forward_with_pool_parsed(
-            app.clone(),
-            vec![WeightedLane { idx: i, weight: 1 }],
-            body,
-            Some(v),
-            crate::forward::APPLICATION_JSON,
-            caller_token,
-            "",
-            None,
-            proto,
-            crate::handlers::chat(proto),
-            usage_sink(app, gov, charged_at),
-        )
-        .await;
-        return finish(app, gov, proto, model, started, charged_at, resp);
-    }
-
-    // `not_found_error` is the canonical token every writer maps (OpenAI, Responses, Anthropic →
-    // their native not-found type; Gemini → NOT_FOUND). The older generic `not_found` leaked
-    // verbatim through the OpenAI writer as a non-canonical `error.type`.
-    //
-    // Model/pool miss: wrap the 404 in `finish` so it is still counted in REQUESTS_TOTAL /
-    // REQUEST_DURATION_SECONDS and fires the request-log webhook — the same observability invariant
-    // the governance rejections and the `named`/`adhoc` 404s already enforce. A raw early-return
-    // made every unknown-model miss on the universal-ingress routes (openai/cohere/responses/
-    // gemini/bedrock) invisible to Prometheus and the webhook.
-    // Both maps missed, so `model` is an unresolved, client-supplied string — stamp the bounded
-    // sentinel as the `pool` label (metrics.rs), never the raw model (unbounded-cardinality
-    // DoS). `pool_label` returns `"unresolved"` here by construction.
-    finish(
+            crate::forward::POOL_LABEL_UNRESOLVED,
+            started,
+            charged_at,
+            ingress_error(
+                proto,
+                StatusCode::NOT_FOUND,
+                crate::forward::KIND_NOT_FOUND,
+                "This endpoint does not support that operation.",
+            ),
+        );
+    };
+    operation_resolved(
         app,
         gov,
         proto,
-        pool_label(app, model),
+        crate::operation::Operation::Chat,
+        op_handler,
+        model,
+        headers,
+        body,
+        Some(v),
+        caller_token,
         started,
         charged_at,
-        ingress_error(
-            proto,
-            StatusCode::NOT_FOUND,
-            crate::forward::KIND_NOT_FOUND,
-            &not_found_message(model, gemini_api_version),
-        ),
+        gemini_api_version,
     )
+    .await
 }
-
 // POST /v1/chat/completions — OpenAI-style ingress: model comes from the body. Routes through
 // `forward_with_pool` with ingress protocol "openai", so a request whose model resolves to a
 // non-OpenAI lane is translated both ways (request and response) via the IR — cross-protocol works.
@@ -818,7 +771,7 @@ pub(crate) async fn openai_ingress(
 }
 
 mod dispatch;
-pub(crate) use dispatch::{operation_ingress, protocol_dispatch};
+pub(crate) use dispatch::{operation_ingress, operation_resolved, protocol_dispatch};
 
 // POST /v2/chat — Cohere v2 ingress: model + stream live in the body, exactly like OpenAI.
 #[tracing::instrument(name = "cohere_ingress", skip_all)]
