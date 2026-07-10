@@ -11,6 +11,7 @@ use serde_json::Value;
 // new operations live in submodules and are assembled into `enum IrReq`/`enum IrResp` (§12.4) once
 // all six exist.
 pub(crate) mod embeddings;
+pub(crate) mod image;
 pub(crate) mod moderation;
 
 #[derive(Debug, Clone, PartialEq, Default)]
