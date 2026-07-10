@@ -629,7 +629,10 @@ async fn ingress_path_model(
 }
 
 mod dispatch;
-pub(crate) use dispatch::{operation_ingress, operation_resolved, protocol_dispatch};
+pub(crate) use dispatch::{operation_resolved, protocol_dispatch};
+// The universal ingress entry — live callers sit inside `dispatch` itself; tests drive it directly.
+#[cfg(test)]
+pub(crate) use dispatch::operation_ingress;
 
 // POST /v1beta/models/*rest — Gemini ingress. The native path packs MODEL and ACTION into the last
 // segment with a colon: `/v1beta/models/{model}:{action}`. axum cannot split on a `:` inside a
