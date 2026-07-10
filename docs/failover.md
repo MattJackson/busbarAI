@@ -66,7 +66,7 @@ pools:
         - last-resort-model    # never selected as primary or failover
 ```
 
-`exclusions` is a per-pool member blocklist. A model listed in `exclusions` is never selected: not as the initial pick and not as a failover destination. Use it to keep a member in the pool (so it appears in `/stats` and can be targeted directly) without it ever being auto-selected. Each `exclusions` entry must name a member of this pool. A member not in the pool at all is a simpler case; `exclusions` is for members you want visible but never auto-dispatched.
+`exclusions` is a per-pool member blocklist. A model listed in `exclusions` is never selected through the pool: not as the initial pick and not as a failover destination. A request to the pool can never land on it. The model itself stays fully routable by its own name, because direct routing bypasses pools entirely: `"model": "last-resort-model"` on `/v1/chat/completions`, or `POST /last-resort-model/v1/messages`. That is the point of excluding rather than removing: the member keeps its `/stats` row and stays callable on purpose (an expensive last resort a human or a specific job can invoke deliberately), while the pool's automatic selection never spends on it. Each `exclusions` entry must name a member of this pool.
 
 Already-tried lanes are accumulated in an `excluded` set across hops for the lifetime of the request. A lane that succeeded (2xx headers) but whose body then failed before the first byte is refunded its `max_requests` budget spend and is also excluded from further hops on that request.
 
