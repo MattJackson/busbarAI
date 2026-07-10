@@ -187,6 +187,26 @@ pub(crate) trait OperationHandler: Send + Sync {
         writer.egress_accept(wants_stream)
     }
 
+    /// Value-level codec bridges — for engine seams that already hold a PARSED JSON body (the
+    /// streaming chat engine parses once for shim/intent reads). Defaults round-trip through the
+    /// byte codecs (correct for every JSON operation); chat overrides them to call its proto
+    /// reader/writer directly (no re-serialize on the hot path). Non-JSON operations never meet
+    /// these seams.
+    fn read_request_value(&self, v: &Value) -> Result<IrReq, IngressReject> {
+        let bytes = serde_json::to_vec(v).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
+        self.read_request(&bytes, "application/json")
+    }
+    fn write_request_value(&self, ir: &IrReq) -> Option<Value> {
+        serde_json::from_slice(&self.write_request(ir)).ok()
+    }
+    fn read_response_value(&self, v: &Value) -> Result<IrResp, CodecError> {
+        let bytes = serde_json::to_vec(v).map_err(|e| CodecError::Malformed(e.to_string()))?;
+        self.read_response(&bytes)
+    }
+    fn write_response_value(&self, ir: &IrResp) -> Option<Value> {
+        serde_json::from_slice(&self.write_response(ir).bytes).ok()
+    }
+
     /// Wire → IR (request). The OperationHandler owns the ENTIRE wire format: it receives RAW bytes + the request
     /// content-type and decides how to parse — JSON (`serde_json::from_slice`) for JSON ops, multipart
     /// for transcription, etc. The engine never parses; "JSON vs opaque" is the OperationHandler's private business.

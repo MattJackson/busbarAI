@@ -54,6 +54,32 @@ impl IrReq {
         }
     }
 
+    /// Neutral CROSS-PROTOCOL egress preparation — each operation applies ITS OWN semantics before
+    /// its IR is written into a foreign egress dialect; the engine calls this without knowing which
+    /// operation it holds. Chat: default `max_tokens` when the egress requires one, decode the
+    /// client-echoed tool ids back to the backend's originals, and clear source-only `extra` keys
+    /// (the §8.2 foreign-format leak guard). The other operations' extras are source-scoped by
+    /// construction, so they need no clearing.
+    pub(crate) fn prepare_for_egress(&mut self, prep: &EgressPrep) {
+        match self {
+            IrReq::Chat(ir) => {
+                if ir.max_tokens.is_none() && prep.egress_requires_max_tokens {
+                    ir.max_tokens = Some(
+                        prep.lane_default_max_tokens
+                            .unwrap_or(prep.global_default_max_tokens),
+                    );
+                }
+                crate::proto::decode_request_tool_ids(prep.ingress_protocol, &mut ir.messages);
+                ir.extra.clear();
+            }
+            IrReq::Embeddings(_)
+            | IrReq::Moderation(_)
+            | IrReq::Image(_)
+            | IrReq::Transcription(_)
+            | IrReq::Speech(_) => {}
+        }
+    }
+
     /// Set the model — the ROUTING layer's injection point, operation-blind. Two callers:
     /// path-model ingress dialects (gemini/bedrock carry the model in the URL, so the OperationHandler parses an
     /// empty body model and routing fills it), and the cross-protocol egress hop (the egress wire must
@@ -82,7 +108,59 @@ pub(crate) enum IrResp {
     Speech(SpeechResp),
 }
 
+/// Resolved primitives for [`IrReq::prepare_for_egress`] — never a `Lane` or config handle.
+pub(crate) struct EgressPrep<'a> {
+    pub(crate) ingress_protocol: &'a str,
+    pub(crate) egress_requires_max_tokens: bool,
+    pub(crate) lane_default_max_tokens: Option<u32>,
+    pub(crate) global_default_max_tokens: u32,
+}
+
 impl IrResp {
+    /// Neutral CROSS-PROTOCOL ingress preparation — each operation reshapes ITS OWN response IR for
+    /// delivery in the caller's dialect; the engine calls this blind. Chat: strip the backend's
+    /// native-format identity (`id`/`system_fingerprint`/`stop_sequence`) so the ingress writer
+    /// mints CLIENT-format values, stamp a synthesized `created` when the egress reader left it
+    /// empty (the protocol-agnostic boundary signal identity-gating writers key on), and remap tool
+    /// ids to the caller's native shape. The other operations' responses carry no cross-protocol
+    /// identity to reshape.
+    pub(crate) fn prepare_for_ingress(&mut self, ingress_protocol: &str, now_epoch: u64) {
+        match self {
+            IrResp::Chat(ir) => {
+                ir.id = None;
+                ir.system_fingerprint = None;
+                ir.stop_sequence = None;
+                if ir.created.is_none() {
+                    ir.created = Some(now_epoch);
+                }
+                crate::proto::ToolIdRemap::default().remap_response(ingress_protocol, ir);
+            }
+            IrResp::Embeddings(_)
+            | IrResp::Moderation(_)
+            | IrResp::Image(_)
+            | IrResp::Transcription(_)
+            | IrResp::Speech(_) => {}
+        }
+    }
+
+    /// Buffered-2xx-to-native-stream synthesis (bedrock ConverseStream answered by a non-SSE
+    /// upstream): operations that can stream delegate to the ingress writer's frame synthesizer;
+    /// the rest have no stream wire. Engine stays operation-blind.
+    pub(crate) fn wrap_buffered_as_stream(
+        &self,
+        writer: &dyn crate::proto::ProtocolWriter,
+        elapsed_ms: Option<u64>,
+    ) -> Option<Vec<u8>> {
+        match self {
+            IrResp::Chat(ir) => writer.wrap_buffered_as_stream(ir, elapsed_ms),
+            IrResp::Embeddings(_)
+            | IrResp::Moderation(_)
+            | IrResp::Image(_)
+            | IrResp::Transcription(_)
+            | IrResp::Speech(_) => None,
+        }
+    }
+
     pub(crate) fn operation(&self) -> Operation {
         match self {
             IrResp::Chat(_) => Operation::Chat,

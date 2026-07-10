@@ -20,7 +20,7 @@ use serde_json::Value;
 use crate::breaker::{classify as classify_disposition, normalize_raw_error, Disposition};
 use crate::config::OnExhausted;
 use crate::proto::{convert_headers, StatusClass};
-use crate::state::{App, Lane, WeightedLane};
+use crate::state::{App, WeightedLane};
 use crate::store::{now, Permit};
 
 /// At a cross-protocol translation boundary, ensure the IR carries `max_tokens` when the egress
@@ -28,14 +28,8 @@ use crate::store::{now, Permit};
 /// Without this the upstream 400s with `max_tokens: Field required`. Uses the lane's configured
 /// `default_max_tokens`, falling back to `crate::proto::DEFAULT_MAX_TOKENS`. No-op when the IR
 /// already carries a value or the egress protocol treats `max_tokens` as optional.
-fn apply_required_max_tokens(ir: &mut crate::ir::IrRequest, lane: &Lane, default_max_tokens: u32) {
-    if ir.max_tokens.is_none() && lane.protocol.writer().requires_max_tokens() {
-        // Per-lane `default_max_tokens` wins; otherwise the operator-configured GLOBAL fallback
-        // (`limits.default_max_tokens`, threaded via `App`), which defaults to
-        // `proto::DEFAULT_MAX_TOKENS` (4096).
-        ir.max_tokens = Some(lane.default_max_tokens.unwrap_or(default_max_tokens));
-    }
-}
+// (max-tokens defaulting moved into `IrReq::prepare_for_egress` — the IR owns its cross-protocol
+// semantics; the engine is operation-blind. The unit tests below exercise it through the IR method.)
 
 /// The two `x-busbar-*` TRANSPARENCY response headers stamped when a non-default routing policy
 /// chose the target lane: the policy name and the chosen lane's model. Hoisted to consts so the
@@ -387,6 +381,7 @@ fn translate_request_cross_protocol(
     app: &Arc<App>,
     i: usize,
     ingress_protocol: &str,
+    op: crate::handlers::Op,
     mut body: Value,
     // The PRISTINE source bytes `body` was parsed from THIS hop (the retained original). On a
     // same-protocol passthrough where no same-proto-reachable mutation fired (the request short-
@@ -411,7 +406,7 @@ fn translate_request_cross_protocol(
         )
         .increment(1);
         // Cross-protocol: translate the request body through the superset IR.
-        let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) else {
+        let Some(_ingress_proto) = crate::proto::protocol_for(ingress_protocol) else {
             return Err(Box::new(ingress_error(
                 ingress_protocol,
                 StatusCode::BAD_REQUEST,
@@ -419,35 +414,47 @@ fn translate_request_cross_protocol(
                 "We received an unexpected internal error. Please try again.",
             )));
         };
-        match ingress_proto.reader().read_request(&body) {
-            Ok(mut ir) => {
-                apply_required_max_tokens(&mut ir, &app.lanes[i], app.default_max_tokens);
-                // CROSS-PROTOCOL tool-id reverse remap (the request half of the §Finding-2 class fix).
-                // On the prior cross-protocol RESPONSE we reshaped each egress `tool_use` id to the
-                // ingress client's native shape (e.g. OpenAI `call_…` → Anthropic `toolu_bb1<hex>`). The
-                // client now echoes that native id back inside a `tool_result`; decode it to the ORIGINAL
-                // egress id here so the backend sees the id it actually issued and the tool-call
-                // correlation survives the round trip. Client-authored ids (no busbar marker) pass
-                // through untouched. Same-protocol passthrough never enters this branch.
-                crate::proto::decode_request_tool_ids(ingress_protocol, &mut ir.messages);
-                // CROSS-PROTOCOL extra-key leak guard (the structural class fix). Every reader sweeps
-                // unmodeled top-level request keys into `ir.extra`; on a SAME-protocol round-trip the
-                // egress writer re-emits them verbatim (lossless passthrough, the intended behavior).
-                // But on a CROSS-protocol hop those keys are source-protocol-only passthrough fields,
-                // and the foreign egress writer would merge them onto the backend body — leaking e.g.
-                // OpenAI `logprobs`/`top_logprobs`/`n` onto an Anthropic or Gemini backend (a §8.2
-                // foreign-format leak and a deterministic proxy tell). Clear `extra` ONCE here, at the
-                // single shared translate seam, BEFORE handing the IR to the egress `write_request`, so
-                // no individual writer can leak them and the fix cannot be missed on any one path.
-                // Same-protocol passthrough never enters this branch, so its `extra` stays intact.
-                //
-                // `response_format` is now a FIRST-CLASS IR field (not an `extra` key), so it survives
-                // this `extra.clear()` and is mapped per-protocol by each egress writer: OpenAI/Cohere
-                // emit it natively, Gemini → `responseSchema`/`responseMimeType`, Responses → `text.format`,
-                // and Anthropic/Bedrock (which lack a native analog) emit a non-silent `warn!` and drop
-                // it in their own writer. So no seam-level handling is needed here anymore.
-                ir.extra.clear();
-                body = app.lanes[i].protocol.writer().write_request(&ir);
+        // OPERATION-BLIND translate: the INGRESS operation handler parses its dialect into the
+        // neutral IR; the IR applies its own cross-protocol semantics (`prepare_for_egress` — chat's
+        // max-tokens default, tool-id decode, and the §8.2 extra-key leak guard live INSIDE the IR,
+        // not here); the EGRESS handler writes its dialect. The engine names no operation.
+        // Codec roles resolve from PROTOCOL IDENTITY, not from the threaded handle: the ingress
+        // dialect is (ingress_protocol, operation)'s handler; the egress dialect is the lane's.
+        // (`op` supplies the operation tag + capabilities; its instance is registry-identical to
+        // this lookup on every production path.)
+        let ingress_handler = crate::handlers::request_handler(ingress_protocol)
+            .and_then(|rh| rh.operation_handler(op.operation));
+        let egress_handler = crate::handlers::request_handler(egress_name)
+            .and_then(|rh| rh.operation_handler(op.operation));
+        let Some(ingress_handler) = ingress_handler else {
+            return Err(Box::new(ingress_error(
+                ingress_protocol,
+                StatusCode::NOT_FOUND,
+                KIND_NOT_FOUND,
+                "This endpoint does not support that operation.",
+            )));
+        };
+        match ingress_handler.read_request_value(&body) {
+            Ok(mut ir_req) => {
+                ir_req.prepare_for_egress(&crate::ir::variant::EgressPrep {
+                    ingress_protocol,
+                    egress_requires_max_tokens: app.lanes[i]
+                        .protocol
+                        .writer()
+                        .requires_max_tokens(),
+                    lane_default_max_tokens: app.lanes[i].default_max_tokens,
+                    global_default_max_tokens: app.default_max_tokens,
+                });
+                let Some(written) = egress_handler.and_then(|h| h.write_request_value(&ir_req))
+                else {
+                    return Err(Box::new(ingress_error(
+                        ingress_protocol,
+                        StatusCode::NOT_FOUND,
+                        KIND_NOT_FOUND,
+                        "This model does not support that operation.",
+                    )));
+                };
+                body = written;
                 // The body was fully rebuilt from the IR (read_request → write_request), so it bears
                 // no fixed relationship to `hop_bytes` — a cross-protocol hop is NEVER pristine and
                 // must serialize the rewritten `Value`, never short-circuit to the original bytes.
@@ -1849,6 +1856,22 @@ pub(crate) fn egress_accept(egress_protocol: &str, wants_stream: bool) -> &'stat
 /// cache_creation + output` (see [`crate::ir::IrUsage::billable_tokens`]). Readers normalize
 /// `input_tokens` to UNCACHED and keep the cache fields ADDITIVE, so this sum is correct
 /// provider-agnostically. This matches the streaming billing arm.
+/// OPERATION-BLIND usage recording: project the response IR's neutral `Billing` and record token
+/// meters through the existing sink (identical numbers for chat — the Billing round-trip preserves
+/// the additive-cache convention). Non-token meters (duration/characters/images/flat) are carried in
+/// the client-visible body today and priced by the 1.3 engine; nothing to record here yet.
+fn record_resp_usage(ir: &crate::ir::variant::IrResp, usage_sink: &Option<UsageSink>) {
+    if let Some(crate::billing::Billing::Tokens(t)) = ir.usage() {
+        let usage = crate::ir::IrUsage {
+            input_tokens: t.input,
+            output_tokens: t.output,
+            cache_creation_input_tokens: t.cache_creation,
+            cache_read_input_tokens: t.cache_read,
+        };
+        record_ir_usage(&usage, usage_sink);
+    }
+}
+
 fn record_ir_usage(usage: &crate::ir::IrUsage, usage_sink: &Option<UsageSink>) {
     if let Some(sink) = usage_sink {
         // `billable_tokens` saturates internally — operands are UPSTREAM-CONTROLLED token counts, so
@@ -2473,7 +2496,7 @@ pub(crate) async fn forward_with_pool_parsed(
         // paths route through `translate_request_cross_protocol` so neither can carry a translation
         // step the other lacks (the recurring drift class this round's unification ends).
         let payload =
-            match translate_request_cross_protocol(&app, i, ingress_protocol, hop_v, &body) {
+            match translate_request_cross_protocol(&app, i, ingress_protocol, op, hop_v, &body) {
                 Ok(p) => p,
                 Err(resp) => {
                     // Probe class guard: a translation failure also bails before dispatch, so release
@@ -3133,7 +3156,10 @@ pub(crate) async fn forward_with_pool_parsed(
                     // and TransportError branches above deliberately avoid. So tap usage ONLY once we
                     // are inside the block that actually mints and returns a translated response.
                     if let Ok(rv) = crate::json::parse::<Value>(&bytes) {
-                        if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&rv) {
+                        let egress_op =
+                            crate::handlers::request_handler(app.lanes[i].protocol.name())
+                                .and_then(|rh| rh.operation_handler(op.operation));
+                        if let Some(Ok(mut ir)) = egress_op.map(|h| h.read_response_value(&rv)) {
                             if let Some(ingress_proto) =
                                 crate::proto::protocol_for(ingress_protocol)
                             {
@@ -3141,68 +3167,13 @@ pub(crate) async fn forward_with_pool_parsed(
                                 // delivering this body (every exit from this block is a delivered
                                 // response). No FirstByteBody on this buffered path, so bill here —
                                 // straight from the IR usage the egress reader just decoded (Change A).
-                                record_ir_usage(&ir.usage, &usage_sink);
-                                // Cross-protocol reframe: strip the backend's NATIVE-FORMAT identity
-                                // so the ingress writer mints values in the CLIENT's format. Without
-                                // this an OpenAI backend's `chatcmpl-...` id (or its opaque
-                                // `system_fingerprint` / a matched `stop_sequence`) would leak
-                                // verbatim to e.g. an Anthropic client — a foreign-format id is an
-                                // immediate proxy tell (§8.2). This seam only runs when ingress !=
-                                // egress; same-protocol passthrough never reaches here, so native ids
-                                // are preserved there.
-                                //
-                                // `created` is deliberately LEFT INTACT: it is a plain unix-epoch int
-                                // (no protocol-specific format to leak), and the ingress writers use
-                                // "is `created` populated?" as the signal that this response crossed a
-                                // protocol boundary and therefore SHOULD synthesize a native id
-                                // (anthropic `write_response` mints `msg_…` only when `created` is
-                                // `Some`). Clearing it here would suppress that synthesis and emit an
-                                // id-less body — the opposite of the goal. The anthropic writer omits
-                                // `created` from its wire shape entirely; the openai writer re-emits
-                                // it as an int, which is format-neutral.
-                                ir.id = None;
-                                ir.system_fingerprint = None;
-                                ir.stop_sequence = None;
-                                // CROSS-PROTOCOL BOUNDARY SIGNAL (class fix). Some egress readers
-                                // return an identity-EMPTY IR — notably Bedrock, whose Converse body
-                                // carries no body-level `id`/`created`/`model` (its `read_response`
-                                // returns all three `None`). After the strip above such an IR is
-                                // indistinguishable, AT THE WRITER, from a MINIMAL SAME-protocol body
-                                // that legitimately omitted identity. Writers that gate identity
-                                // emission on the boundary signal `created.is_some() ||
-                                // model.is_some()` (the Gemini writer) therefore emitted NEITHER a
-                                // synthesized `responseId` NOR `usageMetadata.totalTokenCount` for a
-                                // Bedrock→Gemini hop, so a google-genai client read
-                                // `response_id`/`total_token_count` as absent — a token-accounting gap
-                                // and a distinguishability tell.
-                                //
-                                // Fix the CLASS at the seam, not per-writer: this code runs ONLY when
-                                // ingress != egress (same-protocol passthrough relays the raw upstream
-                                // body and never reaches a writer), so a populated `created` here is an
-                                // unambiguous, protocol-AGNOSTIC marker that a translation occurred.
-                                // Stamp a synthesized unix-epoch `created` whenever the egress reader
-                                // left it empty, so EVERY identity-empty egress (Bedrock today; any
-                                // future one) trips the same boundary signal and every ingress writer
-                                // emits full native identity. `created` is format-neutral on the wire
-                                // (anthropic omits it; openai/responses re-emit it as an int they would
-                                // otherwise synthesize anyway; gemini/cohere never serialize it), so
-                                // stamping it changes no wire shape beyond turning identity emission
-                                // back ON. The same-protocol minimal roundtrip is unaffected because it
-                                // never enters this seam.
-                                if ir.created.is_none() {
-                                    ir.created = Some(now());
-                                }
-                                // CROSS-PROTOCOL tool-id native remap (the response half of the
-                                // §Finding-2 class fix). The egress backend's tool-call ids are in its
-                                // OWN protocol's shape (OpenAI `call_…`, Bedrock `tooluse_…`, …); emitted
-                                // verbatim they leak a foreign id to a different-protocol client (a proxy
-                                // tell, and an id the client's SDK may reject as malformed). Reshape each
-                                // to the INGRESS client's native form here, at the seam — same-protocol
-                                // passthrough never reaches this block, so native ids stay verbatim there.
-                                // The transform is a deterministic reversible bijection, so the matching
-                                // `tool_result` the client sends back next round decodes to this id.
-                                crate::proto::ToolIdRemap::default()
-                                    .remap_response(ingress_protocol, &mut ir);
+                                record_resp_usage(&ir, &usage_sink);
+                                // OPERATION-BLIND ingress preparation: the IR reshapes ITSELF for
+                                // delivery in the caller's dialect (chat: native-identity strip, the
+                                // protocol-agnostic `created` boundary signal, tool-id remap — see
+                                // `IrResp::prepare_for_ingress` for the full rationale, relocated
+                                // verbatim from this seam).
+                                ir.prepare_for_ingress(ingress_protocol, now());
                                 // Bedrock ingress that requested ConverseStream (`wants_stream`) but
                                 // got a BUFFERED (non-SSE) 2xx upstream: a native AWS SDK
                                 // ConverseStream decoder expects binary `eventstream` frames, NOT an
@@ -3217,9 +3188,8 @@ pub(crate) async fn forward_with_pool_parsed(
                                 if wants_stream {
                                     let elapsed_ms =
                                         u64::try_from(upstream_started.elapsed().as_millis()).ok();
-                                    if let Some(frames) = ingress_proto
-                                        .writer()
-                                        .wrap_buffered_as_stream(&ir, elapsed_ms)
+                                    if let Some(frames) = ir
+                                        .wrap_buffered_as_stream(ingress_proto.writer(), elapsed_ms)
                                     {
                                         let rb = Response::builder().status(status).header(
                                             CONTENT_TYPE,
@@ -3240,7 +3210,13 @@ pub(crate) async fn forward_with_pool_parsed(
                                             .unwrap_or_else(|_| status.into_response());
                                     }
                                 }
-                                let mut translated = ingress_proto.writer().write_response(&ir);
+                                // The INGRESS operation handler writes its dialect (chat's
+                                // delegates to the same writer vtable — byte-identical).
+                                let mut translated =
+                                    crate::handlers::request_handler(ingress_protocol)
+                                        .and_then(|rh| rh.operation_handler(op.operation))
+                                        .and_then(|h| h.write_response_value(&ir))
+                                        .unwrap_or(Value::Null);
                                 // A native AWS Bedrock Converse (non-stream) response ALWAYS populates
                                 // `metrics.latencyMs` (the SDK surfaces it via
                                 // `ConverseOutput::metrics().latencyMs()`); the bedrock writer's
@@ -3638,7 +3614,7 @@ async fn forward_once(
     // previously lacked the `ir.extra.clear()` the hot path had, leaking source-only keys like OpenAI
     // `logprobs`/`top_logprobs`/`n` to a foreign backend): the clear now lives in the one shared fn,
     // so neither path can be missing it.
-    let payload = match translate_request_cross_protocol(app, i, ingress_protocol, v, body) {
+    let payload = match translate_request_cross_protocol(app, i, ingress_protocol, op, v, body) {
         Ok(p) => p,
         Err(resp) => {
             // Probe-leak guard (HIGH #1): release the POOL-cell single-flight probe this
@@ -3941,36 +3917,19 @@ async fn forward_once(
                 // 500 below with NO completion delivered, so charging before translation is proven
                 // would bill the key for a body the client never receives.
                 if let Ok(rv) = crate::json::parse::<Value>(&bytes) {
-                    if let Ok(mut ir) = app.lanes[i].protocol.reader().read_response(&rv) {
+                    let egress_op = crate::handlers::request_handler(app.lanes[i].protocol.name())
+                        .and_then(|rh| rh.operation_handler(op.operation));
+                    if let Some(Ok(mut ir)) = egress_op.map(|h| h.read_response_value(&rv)) {
                         if let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) {
                             // Token accounting: committed to translating and delivering this body
                             // (every exit below is a delivered response). No FirstByteBody on this
                             // buffered path, so bill from the IR usage just decoded (Change A,
                             // mirrors the main path).
-                            record_ir_usage(&ir.usage, &usage_sink);
-                            // Strip the backend's native-format identity so the ingress writer mints
-                            // values in the CLIENT's format (see the main path for the rationale).
-                            ir.id = None;
-                            ir.system_fingerprint = None;
-                            ir.stop_sequence = None;
-                            // Cross-protocol boundary signal for an identity-empty egress (Bedrock):
-                            // stamp a synthesized `created` so the ingress writers trip their
-                            // `created`-based identity gate, exactly as on the main forward path above.
-                            if ir.created.is_none() {
-                                ir.created = Some(now());
-                            }
-                            // CROSS-PROTOCOL tool-id native remap — the SAME seam transform the main
-                            // forward path applies at 2666-2667. This degraded (LeastBad/FallbackPool)
-                            // route reaches the cross-protocol buffered-translate block too, so without
-                            // it a tool-call response emits the egress backend's RAW native id (e.g. an
-                            // OpenAI `call_…`) verbatim to a different-protocol client: a foreign-format
-                            // proxy tell AND a broken round-trip (the `tool_result` the client echoes
-                            // next round would not decode back to the egress id at the request seam).
-                            // Reshape each tool id to the ingress client's native form here.
-                            // (`cross_protocol` gates this whole block, so same-protocol passthrough is
-                            // never remapped; the transform is a deterministic reversible bijection.)
-                            crate::proto::ToolIdRemap::default()
-                                .remap_response(ingress_protocol, &mut ir);
+                            record_resp_usage(&ir, &usage_sink);
+                            // OPERATION-BLIND ingress preparation (identity strip, `created`
+                            // boundary signal, tool-id remap) — the SAME seam transform the main
+                            // path applies; relocated verbatim into `IrResp::prepare_for_ingress`.
+                            ir.prepare_for_ingress(ingress_protocol, now());
                             // Bedrock ConverseStream request answered by a buffered (non-SSE) 2xx:
                             // emit the native binary eventstream frame sequence, not an
                             // `application/json` Converse body the SDK's stream decoder cannot parse
@@ -3978,9 +3937,8 @@ async fn forward_once(
                             if wants_stream {
                                 let elapsed_ms =
                                     u64::try_from(upstream_started.elapsed().as_millis()).ok();
-                                if let Some(frames) = ingress_proto
-                                    .writer()
-                                    .wrap_buffered_as_stream(&ir, elapsed_ms)
+                                if let Some(frames) =
+                                    ir.wrap_buffered_as_stream(ingress_proto.writer(), elapsed_ms)
                                 {
                                     let rb = Response::builder().status(status).header(
                                         CONTENT_TYPE,
@@ -3996,7 +3954,10 @@ async fn forward_once(
                                         .unwrap_or_else(|_| status.into_response()));
                                 }
                             }
-                            let mut translated = ingress_proto.writer().write_response(&ir);
+                            let mut translated = crate::handlers::request_handler(ingress_protocol)
+                                .and_then(|rh| rh.operation_handler(op.operation))
+                                .and_then(|h| h.write_response_value(&ir))
+                                .unwrap_or(Value::Null);
                             // Inject `metrics.latencyMs` for a bedrock-ingress non-stream Converse — a
                             // native AWS Converse always populates it, so its absence is a proxy tell
                             // (mirrors the streaming path and the buffered cross-protocol path above).
@@ -5071,7 +5032,7 @@ mod auth_style_tests {
 
 #[cfg(test)]
 mod max_tokens_precedence_tests {
-    use super::apply_required_max_tokens;
+    use crate::ir::variant::{EgressPrep, IrReq};
     use crate::ir::IrRequest;
     use crate::proto::Protocol;
     use crate::state::Lane;
@@ -5104,42 +5065,58 @@ mod max_tokens_precedence_tests {
     #[test]
     fn per_model_then_global_then_4096() {
         let global = 8192; // a non-4096 global to prove it is consulted distinctly.
+                           // The defaulting now lives on the IR (`IrReq::prepare_for_egress`) — the engine passes the
+                           // lane's resolved primitives. Drive it exactly as the translate seam does.
+        let prep = |lane: &Lane, global: u32| EgressPrep {
+            ingress_protocol: "openai",
+            egress_requires_max_tokens: lane.protocol.writer().requires_max_tokens(),
+            lane_default_max_tokens: lane.default_max_tokens,
+            global_default_max_tokens: global,
+        };
+        let apply = |ir: IrRequest, lane: &Lane, global: u32| -> Option<u32> {
+            let mut req = IrReq::Chat(ir);
+            req.prepare_for_egress(&prep(lane, global));
+            match req {
+                IrReq::Chat(c) => c.max_tokens,
+                _ => unreachable!(),
+            }
+        };
 
         // 1. Per-model set → per-model wins over the global.
-        let mut ir = IrRequest::default();
-        apply_required_max_tokens(&mut ir, &anthropic_lane(Some(1234)), global);
-        assert_eq!(ir.max_tokens, Some(1234), "per-model default must win");
+        assert_eq!(
+            apply(IrRequest::default(), &anthropic_lane(Some(1234)), global),
+            Some(1234),
+            "per-model default must win"
+        );
 
         // 2. Per-model unset → fall back to the global.
-        let mut ir = IrRequest::default();
-        apply_required_max_tokens(&mut ir, &anthropic_lane(None), global);
         assert_eq!(
-            ir.max_tokens,
+            apply(IrRequest::default(), &anthropic_lane(None), global),
             Some(global),
             "with no per-model default, the global limit must be used"
         );
 
         // 3. Per-model unset AND global left at its historical default → 4096.
-        let mut ir = IrRequest::default();
-        apply_required_max_tokens(
-            &mut ir,
-            &anthropic_lane(None),
-            crate::proto::DEFAULT_MAX_TOKENS,
-        );
         assert_eq!(
-            ir.max_tokens,
+            apply(
+                IrRequest::default(),
+                &anthropic_lane(None),
+                crate::proto::DEFAULT_MAX_TOKENS
+            ),
             Some(4096),
             "with neither per-model nor a custom global, the 4096 fallback must be used"
         );
 
         // 4. A caller-supplied value is NEVER overridden by any default.
-        let mut ir = IrRequest {
-            max_tokens: Some(7),
-            ..IrRequest::default()
-        };
-        apply_required_max_tokens(&mut ir, &anthropic_lane(Some(1234)), global);
         assert_eq!(
-            ir.max_tokens,
+            apply(
+                IrRequest {
+                    max_tokens: Some(7),
+                    ..IrRequest::default()
+                },
+                &anthropic_lane(Some(1234)),
+                global
+            ),
             Some(7),
             "an explicit caller max_tokens must be preserved over every default"
         );
@@ -5209,8 +5186,15 @@ mod request_short_circuit_tests {
         let app = app_with_lane(proto, lane_model);
         // hop_bytes = the exact serialized source bytes the caller retained for this hop.
         let hop_bytes = crate::json::to_vec(&body).unwrap();
-        translate_request_cross_protocol(&app, 0, proto_name, body, &hop_bytes)
-            .expect("same-proto shaping is infallible for a valid body")
+        translate_request_cross_protocol(
+            &app,
+            0,
+            proto_name,
+            crate::handlers::chat(proto_name),
+            body,
+            &hop_bytes,
+        )
+        .expect("same-proto shaping is infallible for a valid body")
     }
 
     // ---- FIDELITY PROOF: pristine same-proto request → bytes == retained original, all 6 protocols.
@@ -5268,8 +5252,15 @@ mod request_short_circuit_tests {
             .build();
         let body = json!({"model":"client-alias","messages":[]});
         let hop_bytes = crate::json::to_vec(&body).unwrap();
-        let out = translate_request_cross_protocol(&app, 0, "openai", body, &hop_bytes)
-            .expect("same-proto shaping is infallible for a valid body");
+        let out = translate_request_cross_protocol(
+            &app,
+            0,
+            "openai",
+            crate::handlers::chat("openai"),
+            body,
+            &hop_bytes,
+        )
+        .expect("same-proto shaping is infallible for a valid body");
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("model").and_then(|m| m.as_str()),

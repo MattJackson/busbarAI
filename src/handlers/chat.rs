@@ -69,6 +69,35 @@ impl OperationHandler for ChatOperation {
         writer.egress_accept(wants_stream)
     }
 
+    // ---- Value-level bridges: direct vtable calls (the engine seams hold parsed JSON) ----
+
+    fn read_request_value(&self, v: &Value) -> Result<IrReq, IngressReject> {
+        let p = self
+            .proto()
+            .ok_or_else(|| IngressReject::BadRequest(format!("unknown protocol {}", self.0)))?;
+        p.reader()
+            .read_request(v)
+            .map(IrReq::Chat)
+            .map_err(|e| IngressReject::BadRequest(format!("{e:?}")))
+    }
+    fn write_request_value(&self, ir: &IrReq) -> Option<Value> {
+        let IrReq::Chat(r) = ir else { return None };
+        Some(self.proto()?.writer().write_request(r))
+    }
+    fn read_response_value(&self, v: &Value) -> Result<IrResp, CodecError> {
+        let p = self
+            .proto()
+            .ok_or_else(|| CodecError::Malformed(format!("unknown protocol {}", self.0)))?;
+        p.reader()
+            .read_response(v)
+            .map(IrResp::Chat)
+            .map_err(|e| CodecError::Malformed(format!("{e:?}")))
+    }
+    fn write_response_value(&self, ir: &IrResp) -> Option<Value> {
+        let IrResp::Chat(r) = ir else { return None };
+        Some(self.proto()?.writer().write_response(r))
+    }
+
     // ---- codecs: REAL — this protocol's chat wire ↔ the chat IR ----
 
     fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
