@@ -375,16 +375,50 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
 
     <!-- ONE PROVIDER TODAY -->
     <section class="core wrap">
-      <div class="core-inner">
-        <h2>Already committed to one AI provider?</h2>
-        <p>
-          Busbar pays for itself before the second provider exists. Run it as a straight
-          passthrough and your posture improves the same day: the provider key moves out of every
-          app deployment, a runaway loop hits your cap instead of your bill, and every request
-          shows up in your metrics. When the constraint moves, a new backend is a config lane, not
-          a rewrite. <a href="/faq/#one-provider">Why add a control plane now</a> · <a
-          href="/blog/valuable-before-the-second-provider/">the day it paid off</a>
-        </p>
+      <div class="core-grid">
+        <div class="core-inner">
+          <h2>Already committed to one AI provider?</h2>
+          <p>
+            Busbar pays for itself before the second provider exists. Run it as a straight
+            passthrough and your posture improves the same day: the provider key moves out of every
+            app deployment, a runaway loop hits your cap instead of your bill, and every request
+            shows up in your metrics. When the constraint moves, a new backend is a config lane, not
+            a rewrite. <a href="/faq/#one-provider">Why add a control plane now</a> · <a
+            href="/blog/valuable-before-the-second-provider/">the day it paid off</a>
+          </p>
+        </div>
+        <!-- Supporting illustration: the hero diagram's language, reduced to the
+             single-provider story — apps with one token, Busbar applying the three
+             day-one pillars, one provider holding one key. -->
+        <div
+          class="diagram diagram-mini"
+          role="img"
+          aria-label="Your applications call Busbar with one Busbar token. Busbar applies Governance, Security, and Observability, then forwards to your single provider: one key, kept in one place."
+        >
+          <div class="col">
+            <div class="col-label">Your apps</div>
+            <div class="node">One Busbar token</div>
+          </div>
+          <div class="link-zone" aria-hidden="true">
+            <svg viewBox="0 0 120 60" preserveAspectRatio="none"><path d="M0 30 H 120" /></svg>
+          </div>
+          <div class="col">
+            <div class="busbar-box">
+              <div class="bb-title"><img src={glyphWhite.src} alt="" width="20" height="20" /> Busbar</div>
+              <div class="bb-tags">
+                <span>Governance</span><span>Security</span><span>Observability</span>
+              </div>
+              <div class="bb-sub">one endpoint · :8080</div>
+            </div>
+          </div>
+          <div class="link-zone" aria-hidden="true">
+            <svg viewBox="0 0 120 60" preserveAspectRatio="none"><path d="M0 30 H 120" /></svg>
+          </div>
+          <div class="col">
+            <div class="col-label">Your provider</div>
+            <div class="node">One key, one place</div>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -729,6 +763,20 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       .hook-line line { stroke: #cbd5e1; stroke-width: 2; stroke-dasharray: 5 5; }
       .hook-out { position: absolute; top: 100%; left: 0; right: 0; margin-top: 54px; text-align: center; font-size: 11px; font-weight: 600; color: var(--muted); }
 
+      /* SINGLE-PROVIDER MINI DIAGRAM (the "Already committed?" section): the hero
+         diagram's visual language scaled down to a supporting illustration. Shares
+         .diagram/.col/.node/.busbar-box classes; this modifier only compresses. */
+      .core-grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 44px; align-items: center; }
+      .diagram-mini { grid-template-columns: 1fr 0.5fr 1.4fr 0.5fr 1fr; padding: 34px 18px 22px; }
+      .diagram-mini .link-zone svg { height: 40px; }
+      .diagram-mini .busbar-box { padding: 16px 14px; box-shadow: 0 12px 28px -14px rgba(15,23,42,0.45); }
+      .diagram-mini .bb-title { font-size: 15px; }
+      .diagram-mini .bb-tags { margin: 10px 0 8px; }
+      .diagram-mini .bb-tags span { font-size: 10.5px; padding: 3px 7px; }
+      .diagram-mini .bb-sub { font-size: 11px; }
+      .diagram-mini .node { font-size: 12.5px; padding: 9px 11px; text-align: center; }
+      .diagram-mini .col-label { font-size: 10.5px; text-align: center; }
+
       /* FEATURES */
       .features { padding: 18px 28px 96px; }
       .feature-grid { display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(2, auto 1fr auto); gap: 22px; }
@@ -793,6 +841,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         /* Two-column sections collapse to one column. These are SEPARATE elements,
            so the selector must be a list (`.a, .b`), not a compound (`.a.b`). */
         .qs-grid, .adopt-grid { grid-template-columns: 1fr; gap: 32px; }
+        .core-grid { grid-template-columns: 1fr; gap: 28px; }
         .feature-grid { grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(3, auto 1fr auto); }
         /* Diagram: collapse to a vertical stack, hide the SVG connectors. */
         .diagram { grid-template-columns: 1fr; gap: 0; padding: 32px 20px; }
