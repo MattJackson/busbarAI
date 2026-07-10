@@ -41,6 +41,7 @@ mod admin;
 mod auth;
 mod billing;
 mod breaker;
+mod cells;
 mod config;
 mod config_validate;
 mod eventstream;
