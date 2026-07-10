@@ -15,6 +15,54 @@
 
 use bytes::Bytes;
 
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 (RFC 4648 §4, with `=` padding). Audio cells cross the JSON/binary boundary
+/// (Gemini inline_data is base64; OpenAI speech is raw bytes), so encode/decode live with the blob
+/// types rather than pulling in a `base64` crate.
+pub(crate) fn base64_encode(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(B64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 { B64_ALPHABET[((n >> 6) & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { B64_ALPHABET[(n & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Decode standard base64 (padding optional; whitespace ignored). Returns `None` on any invalid byte
+/// so a malformed provider payload fails loud rather than silently truncating audio.
+pub(crate) fn base64_decode(input: &str) -> Option<Bytes> {
+    let mut val = [255u8; 256];
+    for (i, &c) in B64_ALPHABET.iter().enumerate() {
+        val[c as usize] = i as u8;
+    }
+    let mut bits: u32 = 0;
+    let mut nbits = 0u32;
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    for &b in input.as_bytes() {
+        if b == b'=' || b.is_ascii_whitespace() {
+            continue;
+        }
+        let v = val[b as usize];
+        if v == 255 {
+            return None;
+        }
+        bits = (bits << 6) | v as u32;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((bits >> nbits) as u8);
+        }
+    }
+    Some(Bytes::from(out))
+}
+
 /// Audio payload — exactly ONE representation, enforced. `B64` is the lossless common denominator
 /// across providers; `Bytes` is the raw OpenAI binary response; `Uri` covers reference forms.
 #[derive(Debug, Clone, PartialEq)]

@@ -4,11 +4,10 @@
 //! Bedrock `RequestHandler` + cells (design §6/§7). Embeddings first (Titan, via InvokeModel).
 #![allow(dead_code)]
 
-use crate::handler::{CodecError, IngressReject, OperationHandler, RequestHandler};
+use crate::handler::{CodecError, EgressCtx, IngressReject, OperationHandler, RequestHandler, WireBody};
 use crate::ir::embeddings::{EmbInput, EmbeddingItem, EmbeddingsResp, EncFmt, VectorData};
 use crate::ir::variant::{IrReq, IrResp};
 use crate::operation::Operation;
-use crate::state::Lane;
 use bytes::Bytes;
 use serde_json::{json, Value};
 
@@ -27,18 +26,23 @@ impl RequestHandler for BedrockRequestHandler {
             _ => None, // others land as built; genuine gaps stay None → no-cell 404
         }
     }
+    fn upstream_path(&self, ctx: &EgressCtx) -> String {
+        match ctx.operation {
+            // Chat uses the Converse API (stream-aware); embeddings/images use InvokeModel.
+            Operation::Chat => {
+                let verb = if ctx.stream { "converse-stream" } else { "converse" };
+                format!("/model/{}/{verb}", ctx.model)
+            }
+            _ => format!("/model/{}/invoke", ctx.model),
+        }
+    }
 }
 
 /// Amazon Titan Image Generator via `/model/{id}/invoke`. prompt in → `images[]` (b64) out.
 struct BedrockImage;
 
 impl OperationHandler for BedrockImage {
-    fn upstream_path(&self, lane: &Lane, _wants_stream: bool) -> String {
-        lane.path
-            .clone()
-            .unwrap_or_else(|| format!("/model/{}/invoke", lane.wire_model()))
-    }
-    fn read_request(&self, _wire: &Value) -> Result<IrReq, IngressReject> {
+    fn read_request(&self, _body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
         Err(IngressReject::BadRequest("bedrock image is egress-only".into()))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
@@ -64,8 +68,8 @@ impl OperationHandler for BedrockImage {
             .unwrap_or_default();
         Ok(IrResp::Image(crate::ir::image::ImageResp { images, ..Default::default() }))
     }
-    fn write_response(&self, _ir: &IrResp) -> Bytes {
-        Bytes::new()
+    fn write_response(&self, _ir: &IrResp) -> WireBody {
+        WireBody::json(Bytes::new())
     }
 }
 
@@ -73,12 +77,7 @@ impl OperationHandler for BedrockImage {
 struct BedrockEmbeddings;
 
 impl OperationHandler for BedrockEmbeddings {
-    fn upstream_path(&self, lane: &Lane, _wants_stream: bool) -> String {
-        lane.path
-            .clone()
-            .unwrap_or_else(|| format!("/model/{}/invoke", lane.wire_model()))
-    }
-    fn read_request(&self, _wire: &Value) -> Result<IrReq, IngressReject> {
+    fn read_request(&self, _body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
         Err(IngressReject::BadRequest("bedrock embeddings is egress-only".into()))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
@@ -108,7 +107,7 @@ impl OperationHandler for BedrockEmbeddings {
             .map(|n| crate::billing::TokenUsage { input: n, ..Default::default() });
         Ok(IrResp::Embeddings(EmbeddingsResp { embeddings: vec![item], usage, ..Default::default() }))
     }
-    fn write_response(&self, _ir: &IrResp) -> Bytes {
-        Bytes::new()
+    fn write_response(&self, _ir: &IrResp) -> WireBody {
+        WireBody::json(Bytes::new())
     }
 }

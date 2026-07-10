@@ -4,11 +4,10 @@
 //! Cohere `RequestHandler` + cells (design §6/§7). Embeddings via `/v2/embed`.
 #![allow(dead_code)]
 
-use crate::handler::{CodecError, IngressReject, OperationHandler, RequestHandler};
+use crate::handler::{CodecError, EgressCtx, IngressReject, OperationHandler, RequestHandler, WireBody};
 use crate::ir::embeddings::{EmbInput, EmbeddingItem, EmbeddingsResp, EncFmt, VectorData};
 use crate::ir::variant::{IrReq, IrResp};
 use crate::operation::Operation;
-use crate::state::Lane;
 use bytes::Bytes;
 use serde_json::{json, Value};
 
@@ -25,16 +24,19 @@ impl RequestHandler for CohereRequestHandler {
             _ => None,
         }
     }
+    fn upstream_path(&self, ctx: &EgressCtx) -> String {
+        match ctx.operation {
+            Operation::Chat => "/v2/chat".into(),
+            _ => "/v2/embed".into(),
+        }
+    }
 }
 
 /// Cohere v2 embeddings (`/v2/embed`). `input_type` is required by Cohere; default to a document role.
 struct CohereEmbeddings;
 
 impl OperationHandler for CohereEmbeddings {
-    fn upstream_path(&self, lane: &Lane, _wants_stream: bool) -> String {
-        lane.path.clone().unwrap_or_else(|| "/v2/embed".to_string())
-    }
-    fn read_request(&self, _wire: &Value) -> Result<IrReq, IngressReject> {
+    fn read_request(&self, _body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
         Err(IngressReject::BadRequest("cohere embeddings is egress-only".into()))
     }
     fn write_request(&self, ir: &IrReq) -> Bytes {
@@ -87,7 +89,7 @@ impl OperationHandler for CohereEmbeddings {
             ..Default::default()
         }))
     }
-    fn write_response(&self, _ir: &IrResp) -> Bytes {
-        Bytes::new()
+    fn write_response(&self, _ir: &IrResp) -> WireBody {
+        WireBody::json(Bytes::new())
     }
 }

@@ -2171,7 +2171,8 @@ pub(crate) async fn forward_operation(
         // mistranslation. Same-protocol (egress == ingress) skips straight to verbatim passthrough below.
         let egress_proto = app.lanes[i].protocol.name();
         if egress_proto != ingress_protocol {
-            match crate::cells::request_handler(egress_proto).and_then(|h| h.operation_handler(operation)) {
+            let egress_rh = crate::cells::request_handler(egress_proto);
+            match egress_rh.and_then(|h| h.operation_handler(operation)) {
                 None => {
                     return ingress_error(
                         ingress_protocol,
@@ -2181,19 +2182,16 @@ pub(crate) async fn forward_operation(
                     );
                 }
                 Some(egress_cell) => {
+                    // Safe: the same registry lookup that yielded `egress_cell` yielded this handler.
+                    let egress_rh = egress_rh.expect("egress request_handler present");
                     // CROSS-PROTOCOL IR BRIDGE (the core value): ingress wire → IR → egress wire; on
                     // the way back, egress wire → IR → caller-dialect wire.
                     let Some(_permit) = app.store.try_acquire(i) else {
                         continue;
                     };
-                    let v = match crate::json::parse(&body) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            return ingress_error(ingress_protocol, StatusCode::BAD_REQUEST,
-                                KIND_INVALID_REQUEST, "We could not parse the JSON body of your request.")
-                        }
-                    };
-                    let ir_req = match cell.read_request(&v) {
+                    // The cell owns the wire format: hand it raw bytes + the request content-type and let
+                    // it parse (JSON, multipart, …). The engine never inspects the body.
+                    let ir_req = match cell.read_request(body.as_ref(), req_content_type.to_str().unwrap_or("")) {
                         Ok(ir) => ir,
                         Err(_) => {
                             return ingress_error(ingress_protocol, StatusCode::BAD_REQUEST,
@@ -2202,7 +2200,15 @@ pub(crate) async fn forward_operation(
                     };
                     let egress_bytes = egress_cell.write_request(&ir_req);
                     let base = &app.lanes[i].base_url;
-                    let e_path = egress_cell.upstream_path(&app.lanes[i], false);
+                    // Routing owns the path: apply the lane override, else ask the EGRESS protocol's
+                    // RequestHandler to render it from resolved primitives (never the Lane).
+                    let e_path = app.lanes[i].path.clone().unwrap_or_else(|| {
+                        egress_rh.upstream_path(&crate::handler::EgressCtx {
+                            operation,
+                            model: app.lanes[i].wire_model(),
+                            stream: false,
+                        })
+                    });
                     let (wire_path, canonical_uri) = sign_and_wire_path_parts(&e_path);
                     let key = match app.auth_mode() {
                         crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(""),
@@ -2248,11 +2254,13 @@ pub(crate) async fn forward_operation(
                                                 "We could not read the upstream response.")
                                         }
                                     };
-                                    let client_bytes = cell.write_response(&ir_resp);
+                                    // The cell chose the caller-dialect wire AND its content-type
+                                    // (JSON, or audio/* for speech); relay both verbatim.
+                                    let wire = cell.write_response(&ir_resp);
                                     return Response::builder()
                                         .status(StatusCode::OK)
-                                        .header(CONTENT_TYPE, APPLICATION_JSON)
-                                        .body(Body::from(client_bytes))
+                                        .header(CONTENT_TYPE, wire.content_type)
+                                        .body(Body::from(wire.bytes))
                                         .unwrap_or_else(|_| StatusCode::OK.into_response());
                                 }
                                 Err(_) => continue, // body read failed → failover
@@ -2268,7 +2276,18 @@ pub(crate) async fn forward_operation(
             continue;
         };
         let base = &app.lanes[i].base_url;
-        let url_path = cell.upstream_path(&app.lanes[i], false);
+        // Same-protocol passthrough: lane override, else this protocol's RequestHandler renders the path.
+        let url_path = app.lanes[i].path.clone().unwrap_or_else(|| {
+            crate::cells::request_handler(ingress_protocol)
+                .map(|rh| {
+                    rh.upstream_path(&crate::handler::EgressCtx {
+                        operation,
+                        model: app.lanes[i].wire_model(),
+                        stream: false,
+                    })
+                })
+                .unwrap_or_default()
+        });
         let (wire_path, canonical_uri) = sign_and_wire_path_parts(&url_path);
         let key = match app.auth_mode() {
             crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(""),

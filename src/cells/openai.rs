@@ -9,11 +9,10 @@
 //! added here as they're built.
 #![allow(dead_code)]
 
-use crate::handler::{CodecError, IngressReject, OperationHandler, RequestHandler};
+use crate::handler::{CodecError, EgressCtx, IngressReject, OperationHandler, RequestHandler, WireBody};
 use crate::ir::moderation::{ModerationInput, ModerationReq, ModerationResp, ModerationResult};
 use crate::ir::variant::{IrReq, IrResp};
 use crate::operation::Operation;
-use crate::state::Lane;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -37,42 +36,204 @@ impl RequestHandler for OpenAiRequestHandler {
             Operation::Image => Some(&IMAGE),
             Operation::Transcription => Some(&TRANSCRIPTION),
             Operation::Speech => Some(&SPEECH),
-            // chat re-homes onto a cell in the final P4 step (OpSpec removal).
+            // chat re-homes onto a cell in Phase B (OpSpec removal).
             Operation::Chat => None,
+        }
+    }
+    fn upstream_path(&self, ctx: &EgressCtx) -> String {
+        match ctx.operation {
+            Operation::Chat => "/v1/chat/completions".into(),
+            Operation::Embeddings => "/v1/embeddings".into(),
+            Operation::Moderation => "/v1/moderations".into(),
+            Operation::Image => "/v1/images/generations".into(),
+            Operation::Transcription => "/v1/audio/transcriptions".into(),
+            Operation::Speech => "/v1/audio/speech".into(),
         }
     }
 }
 
-// The embeddings/image/audio cells below are registered so their SAME-protocol (openai→openai) rows go
-// green now (v1 `forward_operation` relays the body verbatim same-proto and uses only `upstream_path`).
-// Their wire↔IR codecs are exercised on the CROSS-protocol path; until that bridge lands they fail LOUD
-// (a clear error, never a silent mistranslation). Same-proto correctness is proven by the harness now.
+// -------------------------------------------------- audio cells (real codecs, cross-protocol)
 
-macro_rules! passthrough_cell {
-    ($ty:ident, $path:literal, $op:literal) => {
-        struct $ty;
-        impl OperationHandler for $ty {
-            fn upstream_path(&self, lane: &Lane, _wants_stream: bool) -> String {
-                lane.path.clone().unwrap_or_else(|| $path.to_string())
-            }
-            fn read_request(&self, _wire: &Value) -> Result<IrReq, IngressReject> {
-                Err(IngressReject::BadRequest(concat!($op, " cross-protocol codec not yet implemented").into()))
-            }
-            fn write_request(&self, _ir: &IrReq) -> Bytes {
-                Bytes::new()
-            }
-            fn read_response(&self, _wire: &[u8]) -> Result<IrResp, CodecError> {
-                Err(CodecError::Malformed(concat!($op, " cross-protocol codec not yet implemented").into()))
-            }
-            fn write_response(&self, _ir: &IrResp) -> Bytes {
-                Bytes::new()
-            }
-        }
-    };
+use crate::ir::audio::{SpeechReq, SpeechResp, TranscriptionReq, TranscriptionResp};
+use crate::media::{base64_decode, MediaBlob, MediaPayload};
+
+/// One decoded part of a `multipart/form-data` body (its value borrowed from the request bytes).
+struct MultipartField<'a> {
+    name: String,
+    content_type: Option<String>,
+    value: &'a [u8],
 }
 
-passthrough_cell!(OpenAiTranscription, "/v1/audio/transcriptions", "transcription");
-passthrough_cell!(OpenAiSpeech, "/v1/audio/speech", "speech");
+fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn header_attr(headers: &str, attr: &str) -> Option<String> {
+    let key = format!("{attr}=\"");
+    let i = headers.find(&key)? + key.len();
+    let rest = &headers[i..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Minimal byte-level `multipart/form-data` parser: enough for the OpenAI audio form (a `model` text
+/// part + a binary `file` part). Boundary comes from the content-type; file bytes are preserved raw
+/// (never lossily UTF-8'd) so audio survives the ingress→IR hop.
+fn parse_multipart<'a>(body: &'a [u8], content_type: &str) -> Vec<MultipartField<'a>> {
+    let Some(boundary) = content_type.split("boundary=").nth(1) else {
+        return Vec::new();
+    };
+    let boundary = boundary.trim().trim_matches('"');
+    let delim = format!("--{boundary}");
+    let delim_b = delim.as_bytes();
+    // Collect every delimiter offset, then walk the segments between consecutive delimiters.
+    let mut positions = Vec::new();
+    let (n, dl) = (body.len(), delim_b.len());
+    let mut i = 0;
+    while i + dl <= n {
+        if &body[i..i + dl] == delim_b {
+            positions.push(i);
+            i += dl;
+        } else {
+            i += 1;
+        }
+    }
+    let mut fields = Vec::new();
+    for w in positions.windows(2) {
+        let seg = &body[w[0] + dl..w[1]];
+        let seg = seg.strip_prefix(b"\r\n").unwrap_or(seg);
+        let Some(hpos) = find_sub(seg, b"\r\n\r\n") else { continue };
+        let headers = String::from_utf8_lossy(&seg[..hpos]);
+        let mut value = &seg[hpos + 4..];
+        if value.ends_with(b"\r\n") {
+            value = &value[..value.len() - 2];
+        }
+        let Some(name) = header_attr(&headers, "name") else { continue };
+        let content_type = headers.lines().find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("Content-Type:")
+                .or_else(|| l.strip_prefix("content-type:"))
+                .map(|v| v.trim().to_string())
+        });
+        fields.push(MultipartField { name, content_type, value });
+    }
+    fields
+}
+
+/// Transcription (STT): multipart audio IN → `{text}` OUT.
+struct OpenAiTranscription;
+
+impl OperationHandler for OpenAiTranscription {
+    fn read_request(&self, body: &[u8], content_type: &str) -> Result<IrReq, IngressReject> {
+        let fields = parse_multipart(body, content_type);
+        let mut req = TranscriptionReq::default();
+        for f in &fields {
+            match f.name.as_str() {
+                "model" => req.model = String::from_utf8_lossy(f.value).trim().to_string(),
+                "language" => req.source_language = Some(String::from_utf8_lossy(f.value).trim().to_string()),
+                "prompt" => req.prompt = Some(String::from_utf8_lossy(f.value).into_owned()),
+                "response_format" => {
+                    req.response_format = Some(String::from_utf8_lossy(f.value).trim().to_string())
+                }
+                "file" => {
+                    req.audio = Some(MediaBlob {
+                        payload: MediaPayload::Bytes(Bytes::copy_from_slice(f.value)),
+                        mime_type: f.content_type.clone().unwrap_or_else(|| "application/octet-stream".into()),
+                        pcm: None,
+                    })
+                }
+                _ => {}
+            }
+        }
+        if req.audio.is_none() {
+            return Err(IngressReject::BadRequest("transcription requires a file part".into()));
+        }
+        Ok(IrReq::Transcription(req))
+    }
+    fn write_request(&self, ir: &IrReq) -> Bytes {
+        // OpenAI-as-egress rebuilds the multipart form (fixed boundary — no randomness needed). Not on
+        // the harness path (openai is always ingress there); kept for cross-protocol symmetry.
+        let IrReq::Transcription(r) = ir else { return Bytes::new() };
+        let boundary = "----busbaraudioMIME";
+        let mut out: Vec<u8> = Vec::new();
+        let mut push_field = |name: &str, val: &str| {
+            out.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{val}\r\n").as_bytes());
+        };
+        push_field("model", &r.model);
+        if let Some(blob) = &r.audio {
+            let bytes = match &blob.payload {
+                MediaPayload::Bytes(b) => b.clone(),
+                MediaPayload::B64(s) => base64_decode(s).unwrap_or_default(),
+                MediaPayload::Uri(_) => Bytes::new(),
+            };
+            out.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio\"\r\nContent-Type: {}\r\n\r\n", blob.mime_type).as_bytes());
+            out.extend_from_slice(&bytes);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        Bytes::from(out)
+    }
+    fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
+        // OpenAI transcription is `{"text": "..."}` (json) or bare text (response_format=text).
+        let text = match serde_json::from_slice::<Value>(wire) {
+            Ok(v) => v.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
+            Err(_) => String::from_utf8_lossy(wire).into_owned(),
+        };
+        Ok(IrResp::Transcription(TranscriptionResp { text, ..Default::default() }))
+    }
+    fn write_response(&self, ir: &IrResp) -> WireBody {
+        let IrResp::Transcription(r) = ir else { return WireBody::json(Bytes::new()) };
+        WireBody::json(Bytes::from(serde_json::to_vec(&json!({ "text": r.text })).unwrap_or_default()))
+    }
+}
+
+/// Speech (TTS): `{input}` IN → binary audio OUT.
+struct OpenAiSpeech;
+
+impl OperationHandler for OpenAiSpeech {
+    fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
+        let wire: Value =
+            serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
+        let get = |k: &str| wire.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+        Ok(IrReq::Speech(SpeechReq {
+            input: get("input"),
+            model: get("model"),
+            voice: get("voice"),
+            response_format: wire.get("response_format").and_then(Value::as_str).map(str::to_string),
+            instructions: wire.get("instructions").and_then(Value::as_str).map(str::to_string),
+            ..Default::default()
+        }))
+    }
+    fn write_request(&self, ir: &IrReq) -> Bytes {
+        let IrReq::Speech(r) = ir else { return Bytes::new() };
+        let mut body = json!({ "model": r.model, "input": r.input, "voice": r.voice });
+        if let Some(f) = &r.response_format {
+            body["response_format"] = json!(f);
+        }
+        Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
+    }
+    fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
+        // OpenAI speech is raw binary audio (mp3 by default) — wrap the bytes verbatim.
+        Ok(IrResp::Speech(SpeechResp {
+            audio: Some(MediaBlob {
+                payload: MediaPayload::Bytes(Bytes::copy_from_slice(wire)),
+                mime_type: "audio/mpeg".into(),
+                pcm: None,
+            }),
+            ..Default::default()
+        }))
+    }
+    fn write_response(&self, ir: &IrResp) -> WireBody {
+        let IrResp::Speech(r) = ir else { return WireBody::json(Bytes::new()) };
+        let Some(blob) = &r.audio else { return WireBody::json(Bytes::new()) };
+        let bytes = match &blob.payload {
+            MediaPayload::Bytes(b) => b.clone(),
+            MediaPayload::B64(s) => base64_decode(s).unwrap_or_default(),
+            MediaPayload::Uri(_) => Bytes::new(),
+        };
+        WireBody::typed(bytes, &blob.mime_type)
+    }
+}
 
 // -------------------------------------------------- embeddings cell (real codec, cross-protocol)
 
@@ -81,12 +242,11 @@ use crate::ir::embeddings::{EmbInput, EmbeddingItem, EmbeddingsReq, EmbeddingsRe
 struct OpenAiEmbeddings;
 
 impl OperationHandler for OpenAiEmbeddings {
-    fn upstream_path(&self, lane: &Lane, _wants_stream: bool) -> String {
-        lane.path.clone().unwrap_or_else(|| "/v1/embeddings".to_string())
-    }
 
     /// openai embeddings wire → IR (used when openai is the INGRESS of a cross-protocol call).
-    fn read_request(&self, wire: &Value) -> Result<IrReq, IngressReject> {
+    fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
+        let wire: Value =
+            serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
         let model = wire.get("model").and_then(Value::as_str).unwrap_or_default().to_string();
         let input = match wire.get("input") {
             Some(Value::String(s)) => EmbInput::Text(vec![s.clone()]),
@@ -164,8 +324,8 @@ impl OperationHandler for OpenAiEmbeddings {
     }
 
     /// IR → openai embeddings response wire (used when openai is the INGRESS — the caller's dialect).
-    fn write_response(&self, ir: &IrResp) -> Bytes {
-        let IrResp::Embeddings(r) = ir else { return Bytes::new() };
+    fn write_response(&self, ir: &IrResp) -> WireBody {
+        let IrResp::Embeddings(r) = ir else { return WireBody::json(Bytes::new()) };
         let data: Vec<Value> = r
             .embeddings
             .iter()
@@ -188,7 +348,7 @@ impl OperationHandler for OpenAiEmbeddings {
         if let Some(u) = &r.usage {
             body["usage"] = json!({ "prompt_tokens": u.input, "total_tokens": u.input + u.output });
         }
-        Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
+        WireBody::json(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
     }
 }
 
@@ -200,10 +360,9 @@ use crate::media::ImageOutput;
 struct OpenAiImage;
 
 impl OperationHandler for OpenAiImage {
-    fn upstream_path(&self, lane: &Lane, _wants_stream: bool) -> String {
-        lane.path.clone().unwrap_or_else(|| "/v1/images/generations".to_string())
-    }
-    fn read_request(&self, wire: &Value) -> Result<IrReq, IngressReject> {
+    fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
+        let wire: Value =
+            serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
         let size = wire.get("size").and_then(Value::as_str).and_then(|s| {
             if s == "auto" {
                 Some(ImageSize::Auto)
@@ -261,8 +420,8 @@ impl OperationHandler for OpenAiImage {
             ..Default::default()
         }))
     }
-    fn write_response(&self, ir: &IrResp) -> Bytes {
-        let IrResp::Image(r) = ir else { return Bytes::new() };
+    fn write_response(&self, ir: &IrResp) -> WireBody {
+        let IrResp::Image(r) = ir else { return WireBody::json(Bytes::new()) };
         let data: Vec<Value> = r
             .images
             .iter()
@@ -280,7 +439,9 @@ impl OperationHandler for OpenAiImage {
                 Value::Object(o)
             })
             .collect();
-        Bytes::from(serde_json::to_vec(&json!({ "created": r.created.unwrap_or(0), "data": data })).unwrap_or_default())
+        WireBody::json(Bytes::from(
+            serde_json::to_vec(&json!({ "created": r.created.unwrap_or(0), "data": data })).unwrap_or_default(),
+        ))
     }
 }
 
@@ -289,11 +450,10 @@ impl OperationHandler for OpenAiImage {
 struct OpenAiModeration;
 
 impl OperationHandler for OpenAiModeration {
-    fn upstream_path(&self, lane: &Lane, _wants_stream: bool) -> String {
-        lane.path.clone().unwrap_or_else(|| "/v1/moderations".to_string())
-    }
 
-    fn read_request(&self, wire: &Value) -> Result<IrReq, IngressReject> {
+    fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
+        let wire: Value =
+            serde_json::from_slice(body).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
         let model = wire
             .get("model")
             .and_then(Value::as_str)
@@ -329,9 +489,9 @@ impl OperationHandler for OpenAiModeration {
         }))
     }
 
-    fn write_response(&self, ir: &IrResp) -> Bytes {
+    fn write_response(&self, ir: &IrResp) -> WireBody {
         let IrResp::Moderation(r) = ir else {
-            return Bytes::new();
+            return WireBody::json(Bytes::new());
         };
         let results: Vec<Value> = r
             .results
@@ -352,7 +512,7 @@ impl OperationHandler for OpenAiModeration {
         if let Some(m) = &r.model {
             body["model"] = json!(m);
         }
-        Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
+        WireBody::json(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
     }
 }
 
