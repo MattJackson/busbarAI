@@ -10,6 +10,10 @@ use crate::handlers::{EgressCtx, OperationHandler, RequestHandler};
 use crate::operation::Operation;
 
 pub(crate) struct AnthropicRequestHandler;
+/// This protocol's OWN chat instance — delete this line (and the registry arm) and this
+/// protocol's chat 404s via the standard no-handler path; everything else keeps working.
+static CHAT: crate::handlers::chat::ChatOperation =
+    crate::handlers::chat::ChatOperation("anthropic");
 
 impl RequestHandler for AnthropicRequestHandler {
     fn protocol_name(&self) -> &'static str {
@@ -17,7 +21,7 @@ impl RequestHandler for AnthropicRequestHandler {
     }
     fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler> {
         match op {
-            Operation::Chat => Some(&crate::handlers::chat::CHAT_HANDLER),
+            Operation::Chat => Some(&CHAT),
             _ => None, // no embeddings/images/audio → no-handler 404 in the caller's dialect
         }
     }

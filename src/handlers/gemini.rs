@@ -16,6 +16,9 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 
 pub(crate) struct GeminiRequestHandler;
+/// This protocol's OWN chat instance — delete this line (and the registry arm) and this
+/// protocol's chat 404s via the standard no-handler path; everything else keeps working.
+static CHAT: crate::handlers::chat::ChatOperation = crate::handlers::chat::ChatOperation("gemini");
 static EMB: GeminiEmbeddings = GeminiEmbeddings;
 static IMG: GeminiImage = GeminiImage;
 static TRANSCRIPTION: GeminiTranscription = GeminiTranscription;
@@ -31,7 +34,7 @@ impl RequestHandler for GeminiRequestHandler {
             Operation::Image => Some(&IMG),
             Operation::Transcription => Some(&TRANSCRIPTION),
             Operation::Speech => Some(&SPEECH),
-            Operation::Chat => Some(&crate::handlers::chat::CHAT_HANDLER),
+            Operation::Chat => Some(&CHAT),
             _ => None,
         }
     }

@@ -1199,6 +1199,20 @@ pub(crate) async fn named(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Deletion switch (chat is a standard operation): the named/adhoc conveniences are the
+    // anthropic-dialect chat surface, so they consult the anthropic chat OperationHandler exactly
+    // like the catch-all does. Absent handler → the standard no-handler 404 in the caller's dialect.
+    if crate::handlers::request_handler("anthropic")
+        .and_then(|rh| rh.operation_handler(crate::operation::Operation::Chat))
+        .is_none()
+    {
+        return crate::forward::ingress_error(
+            "anthropic",
+            StatusCode::NOT_FOUND,
+            crate::forward::KIND_NOT_FOUND,
+            "This endpoint does not support that operation.",
+        );
+    }
     // Caller's bearer token (for passthrough-mode forwarding); None falls back to the lane's key.
     let caller_token = caller.0.as_deref();
     // `started` is taken BEFORE the governance guards so a governance-rejected request still
@@ -1282,6 +1296,18 @@ pub(crate) async fn adhoc(
     axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
     body: Bytes,
 ) -> Response {
+    // Deletion switch — same consult as `named` (this is the other anthropic-dialect chat surface).
+    if crate::handlers::request_handler("anthropic")
+        .and_then(|rh| rh.operation_handler(crate::operation::Operation::Chat))
+        .is_none()
+    {
+        return crate::forward::ingress_error(
+            "anthropic",
+            StatusCode::NOT_FOUND,
+            crate::forward::KIND_NOT_FOUND,
+            "This endpoint does not support that operation.",
+        );
+    }
     let caller_token = caller.0.as_deref();
     let started = Instant::now();
     // Header-arrival epoch pinned once; reused for both the per-request and token fees (#29).

@@ -14,6 +14,9 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 
 pub(crate) struct CohereRequestHandler;
+/// This protocol's OWN chat instance — delete this line (and the registry arm) and this
+/// protocol's chat 404s via the standard no-handler path; everything else keeps working.
+static CHAT: crate::handlers::chat::ChatOperation = crate::handlers::chat::ChatOperation("cohere");
 static EMB: CohereEmbeddings = CohereEmbeddings;
 
 impl RequestHandler for CohereRequestHandler {
@@ -23,7 +26,7 @@ impl RequestHandler for CohereRequestHandler {
     fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler> {
         match op {
             Operation::Embeddings => Some(&EMB),
-            Operation::Chat => Some(&crate::handlers::chat::CHAT_HANDLER),
+            Operation::Chat => Some(&CHAT),
             _ => None,
         }
     }

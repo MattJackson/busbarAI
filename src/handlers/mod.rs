@@ -365,7 +365,7 @@ impl OpDispatch {
 /// fallback. Prefer [`chat`] on the request path so the RequestHandler actually decides the OperationHandler.
 pub(crate) const CHAT: Op = OpDispatch {
     operation: Operation::Chat,
-    op_handler: &crate::handlers::chat::CHAT_HANDLER,
+    op_handler: &crate::handlers::chat::ChatOperation("openai"),
 };
 
 /// Resolve the chat dispatch THROUGH the registry — the same path every other operation takes:

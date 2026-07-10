@@ -14,6 +14,9 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 
 pub(crate) struct BedrockRequestHandler;
+/// This protocol's OWN chat instance — delete this line (and the registry arm) and this
+/// protocol's chat 404s via the standard no-handler path; everything else keeps working.
+static CHAT: crate::handlers::chat::ChatOperation = crate::handlers::chat::ChatOperation("bedrock");
 static EMB: BedrockEmbeddings = BedrockEmbeddings;
 static IMG: BedrockImage = BedrockImage;
 
@@ -25,7 +28,7 @@ impl RequestHandler for BedrockRequestHandler {
         match op {
             Operation::Embeddings => Some(&EMB),
             Operation::Image => Some(&IMG),
-            Operation::Chat => Some(&crate::handlers::chat::CHAT_HANDLER),
+            Operation::Chat => Some(&CHAT),
             _ => None, // genuine gaps stay None → no-handler 404
         }
     }

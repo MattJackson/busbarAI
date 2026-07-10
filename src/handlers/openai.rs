@@ -20,6 +20,9 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 pub(crate) struct OpenAiRequestHandler;
+/// This protocol's OWN chat instance — delete this line (and the registry arm) and this
+/// protocol's chat 404s via the standard no-handler path; everything else keeps working.
+static CHAT: crate::handlers::chat::ChatOperation = crate::handlers::chat::ChatOperation("openai");
 
 static MODERATION: OpenAiModeration = OpenAiModeration;
 static EMBEDDINGS: OpenAiEmbeddings = OpenAiEmbeddings;
@@ -38,7 +41,7 @@ impl RequestHandler for OpenAiRequestHandler {
             Operation::Image => Some(&IMAGE),
             Operation::Transcription => Some(&TRANSCRIPTION),
             Operation::Speech => Some(&SPEECH),
-            Operation::Chat => Some(&crate::handlers::chat::CHAT_HANDLER),
+            Operation::Chat => Some(&CHAT),
         }
     }
     fn upstream_path(&self, ctx: &EgressCtx) -> String {

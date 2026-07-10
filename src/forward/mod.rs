@@ -2190,6 +2190,28 @@ pub(crate) async fn forward_with_pool_parsed(
     op: crate::handlers::Op,
     usage_sink: Option<UsageSink>,
 ) -> Response {
+    // EGRESS deletion switch (design §3, same contract as `forward_operation`): every candidate
+    // lane's protocol must HOLD this operation's handler. A protocol whose handler was deleted is
+    // not a valid egress for the operation — a clean no-handler 404 in the CALLER's dialect, never a
+    // silent dispatch. Dormant while all six protocols serve chat; load-bearing the moment one is
+    // removed (the deletion test).
+    let cands: Vec<WeightedLane> = {
+        let (kept, dropped): (Vec<WeightedLane>, Vec<WeightedLane>) =
+            cands.into_iter().partition(|wl| {
+                crate::handlers::request_handler(app.lanes[wl.idx].protocol.name())
+                    .and_then(|rh| rh.operation_handler(op.operation))
+                    .is_some()
+            });
+        if kept.is_empty() && !dropped.is_empty() {
+            return ingress_error(
+                ingress_protocol,
+                StatusCode::NOT_FOUND,
+                KIND_NOT_FOUND,
+                "This model does not support that operation.",
+            );
+        }
+        kept
+    };
     // `v` is the PRISTINE parsed request body (parsed once by the caller). Never mutated after this
     // point: each failover hop derives a fresh per-hop `hop_v` (the first hop consumes `v`; hops 2+
     // re-parse the retained `body` bytes) before translating/rewriting, so a cross-protocol hop never
