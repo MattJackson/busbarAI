@@ -26,11 +26,17 @@ pub(crate) fn protocol_id(path: &str, h: &HeaderMap) -> Option<&'static str> {
     {
         return Some("bedrock");
     }
-    if h.contains_key("anthropic-version") {
+    if h.contains_key("anthropic-version") || h.contains_key("anthropic-beta") {
         return Some("anthropic");
     }
     if h.contains_key("x-goog-api-key") {
         return Some("gemini");
+    }
+    // `x-api-key` is Anthropic's credential header and, among the six registered protocols, unique to
+    // it (Gemini uses x-goog-api-key; Azure-style is `api-key`). Catches curl users who omit the
+    // anthropic-version header.
+    if h.contains_key("x-api-key") {
+        return Some("anthropic");
     }
     // 2. Gemini path verb (key in ?key=, no header)
     if path.contains(":generateContent")
@@ -150,6 +156,18 @@ mod tests {
             (
                 "/claude-3/v1/messages",
                 &[("anthropic-version", "2023-06-01")],
+                Some(("anthropic", Operation::Chat)),
+            ),
+            // anthropic via x-api-key alone (curl user, no version header)
+            (
+                "/v1/messages",
+                &[("x-api-key", "sk-ant-xxx")],
+                Some(("anthropic", Operation::Chat)),
+            ),
+            // anthropic via anthropic-beta alone
+            (
+                "/v1/messages",
+                &[("anthropic-beta", "prompt-caching-2024-07-31")],
                 Some(("anthropic", Operation::Chat)),
             ),
             // gemini via header
