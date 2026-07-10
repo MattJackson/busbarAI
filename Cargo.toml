@@ -8,7 +8,7 @@ edition = "2021"
 # "method not found", and so MSRV-aware tooling resolves compatible deps.
 rust-version = "1.87"
 description = "Native-protocol LLM gateway: lossless cross-protocol translation, weighted pools, per-(pool,lane) circuit breaking, and governance — in one static Rust binary."
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 [[bin]]
 name = "busbar"

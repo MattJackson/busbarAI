@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 use std::pin::Pin;
@@ -372,6 +372,7 @@ fn strip_same_protocol_model_shim(v: &mut Value, ingress_protocol: &str) -> bool
 /// Returns `Err(Response)` — an ingress-native error envelope with the right status — on the only two
 /// shaping failures (unknown ingress protocol, request translation error) and on the effectively
 /// infallible re-serialization, so neither caller can panic on the request path.
+#[allow(clippy::too_many_arguments)]
 fn translate_request_cross_protocol(
     app: &Arc<App>,
     i: usize,
@@ -379,6 +380,10 @@ fn translate_request_cross_protocol(
     op: crate::handlers::Op,
     body: Option<Value>,
     req_content_type: &str,
+    // The EFFECTIVE per-lane reasoning capability for this attempt (pool-member override wins over
+    // the model flag) — computed by the caller because only it holds the candidate rows. Gates the
+    // reasoning ask at `prepare_for_egress`; see `ModelCfg::reasoning`.
+    reasoning_allowed: bool,
     // The PRISTINE source bytes `body` was parsed from THIS hop (the retained original). On a
     // same-protocol passthrough where no same-proto-reachable mutation fired (the request short-
     // circuit, Change B step 1), these exact bytes are re-emitted verbatim instead of re-serializing
@@ -419,6 +424,8 @@ fn translate_request_cross_protocol(
                 egress_requires_max_tokens: app.lanes[i].protocol.writer().requires_max_tokens(),
                 lane_default_max_tokens: app.lanes[i].default_max_tokens,
                 global_default_max_tokens: app.default_max_tokens,
+                reasoning_allowed,
+                reasoning_budgets: app.reasoning_effort_budgets,
             });
             ir_req.set_model(app.lanes[i].wire_model());
             return Ok(eh.write_request(&ir_req).to_vec());
@@ -479,6 +486,8 @@ fn translate_request_cross_protocol(
                         .requires_max_tokens(),
                     lane_default_max_tokens: app.lanes[i].default_max_tokens,
                     global_default_max_tokens: app.default_max_tokens,
+                    reasoning_allowed,
+                    reasoning_budgets: app.reasoning_effort_budgets,
                 });
                 let Some(eh) = egress_handler else {
                     return Err(Box::new(ingress_error(
@@ -1981,6 +1990,17 @@ fn effective_attempt_timeout_ms(
         .or(lane_default)
 }
 
+/// The effective per-lane reasoning capability for pool member `i`: the pool-member override wins
+/// over the model-level flag (same layering as `effective_attempt_timeout_ms`), default false —
+/// a lane never receives thinking params unless some level of config claimed the capability.
+fn effective_reasoning(cands: &[crate::state::WeightedLane], i: usize, lane_default: bool) -> bool {
+    cands
+        .iter()
+        .find(|w| w.idx == i)
+        .and_then(|w| w.reasoning)
+        .unwrap_or(lane_default)
+}
+
 /// Floor an `attempt_timeout_ms` cap by the request's remaining wall-clock budget (whole seconds),
 /// so a per-attempt cap can never grant MORE time than the request has left — mirroring how the
 /// reqwest transport timeout is budget-clamped. `.max(1)` keeps the cap non-zero on a nearly
@@ -2586,6 +2606,7 @@ pub(crate) async fn forward_with_pool_parsed(
             op,
             hop_v,
             req_content_type,
+            effective_reasoning(&cands, i, app.lanes[i].reasoning),
             &body,
         ) {
             Ok(p) => p,
@@ -3851,6 +3872,8 @@ async fn forward_once(
         op,
         v,
         req_content_type,
+        // Degraded path selects by pool cell, not member row: lane-level flag only.
+        app.lanes[i].reasoning,
         body,
     ) {
         Ok(p) => p,
@@ -5177,6 +5200,7 @@ mod auth_style_tests {
 
     fn lane_with_auth(auth: Option<&str>) -> Lane {
         Lane {
+            reasoning: false,
             default_max_tokens: None,
             model: "gpt-4o".to_string(),
             provider: "azure".to_string(),
@@ -5374,6 +5398,7 @@ mod attempt_timeout_precedence_tests {
 
     fn member(idx: usize, attempt_timeout_ms: Option<u64>) -> WeightedLane {
         WeightedLane {
+            reasoning: None,
             idx,
             weight: 1,
             attempt_timeout_ms,
@@ -5442,6 +5467,7 @@ mod max_tokens_precedence_tests {
     // An Anthropic lane (its writer `requires_max_tokens()` is true) with a given per-model default.
     fn anthropic_lane(default_max_tokens: Option<u32>) -> Lane {
         Lane {
+            reasoning: false,
             default_max_tokens,
             model: "claude".to_string(),
             provider: "anthropic".to_string(),
@@ -5473,6 +5499,8 @@ mod max_tokens_precedence_tests {
             egress_requires_max_tokens: lane.protocol.writer().requires_max_tokens(),
             lane_default_max_tokens: lane.default_max_tokens,
             global_default_max_tokens: global,
+            reasoning_allowed: true,
+            reasoning_budgets: crate::ir::REASONING_BUDGET_DEFAULTS,
         };
         let apply = |ir: IrRequest, lane: &Lane, global: u32| -> Option<u32> {
             let mut req = IrReq::Chat(ir);
@@ -5594,6 +5622,7 @@ mod request_short_circuit_tests {
             crate::handlers::chat(proto_name),
             Some(body),
             crate::forward::APPLICATION_JSON,
+            true,
             &hop_bytes,
         )
         .expect("same-proto shaping is infallible for a valid body")
@@ -5661,6 +5690,7 @@ mod request_short_circuit_tests {
             crate::handlers::chat("openai"),
             Some(body),
             crate::forward::APPLICATION_JSON,
+            true,
             &hop_bytes,
         )
         .expect("same-proto shaping is infallible for a valid body");
@@ -6772,6 +6802,7 @@ mod ingress_indistinguishability_tests {
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -6894,6 +6925,7 @@ mod ingress_indistinguishability_tests {
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -7106,6 +7138,7 @@ mod ingress_indistinguishability_tests {
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -7188,6 +7221,7 @@ mod ingress_indistinguishability_tests {
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -7275,6 +7309,7 @@ mod ingress_indistinguishability_tests {
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -7351,6 +7386,7 @@ mod ingress_indistinguishability_tests {
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -7429,6 +7465,7 @@ data: {"type":"message_stop"}"#
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -7496,6 +7533,7 @@ data: {"type":"message_stop"}"#
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -7634,6 +7672,7 @@ data: {"type":"message_stop"}"#
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -7732,6 +7771,7 @@ data: {"type":"message_stop"}"#
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -7817,6 +7857,7 @@ data: {"type":"message_stop"}"#
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -7897,7 +7938,12 @@ data: {"type":"message_stop"}"#
 
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1, attempt_timeout_ms: None }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+                reasoning: None,
+            }],
             serde_json::to_vec(
                 &json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50}),
             )
@@ -7976,7 +8022,12 @@ data: {"type":"message_stop"}"#
 
         let resp = forward_with_pool(
             app.clone(),
-            vec![crate::state::WeightedLane { idx: 0, weight: 1, attempt_timeout_ms: None }],
+            vec![crate::state::WeightedLane {
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+                reasoning: None,
+            }],
             serde_json::to_vec(
                 &json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50}),
             )
@@ -8101,6 +8152,7 @@ data: {"type":"message_stop"}"#
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -8190,6 +8242,7 @@ data: {"type":"message_stop"}"#
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -8281,6 +8334,7 @@ data: {"type":"message_stop"}"#
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -8371,6 +8425,7 @@ data: {"type":"message_stop"}"#
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -8456,6 +8511,7 @@ data: {"type":"message_stop"}"#
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -9102,6 +9158,7 @@ mod forward_once_pool_cell_tests {
         let response = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -9174,6 +9231,7 @@ mod forward_once_pool_cell_tests {
         let response = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -9261,6 +9319,7 @@ mod forward_once_pool_cell_tests {
         let response = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -9376,6 +9435,7 @@ mod forward_once_pool_cell_tests {
             app.clone(),
             // Originating candidate set for pool A = its dead member (lane 0) → A exhausts.
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -9479,16 +9539,19 @@ mod ordered_walk_tests {
     fn cands() -> Vec<WeightedLane> {
         vec![
             WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
             },
             WeightedLane {
+                reasoning: None,
                 idx: 1,
                 weight: 1,
                 attempt_timeout_ms: None,
             },
             WeightedLane {
+                reasoning: None,
                 idx: 2,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -9510,6 +9573,7 @@ mod ordered_walk_tests {
         // skipped, and SWRR (which also excludes weight 0) finds nothing → None. WITHOUT the gate this
         // returned `Some((0, _))` — the bug. (Deterministic: 1 candidate ⇒ pos is always 0.)
         let drained_only = vec![WeightedLane {
+            reasoning: None,
             idx: 0,
             weight: 0,
             attempt_timeout_ms: None,
@@ -9527,11 +9591,13 @@ mod ordered_walk_tests {
         // path, excluded by SWRR), and selection falls through to the healthy lane.
         let drained_and_healthy = vec![
             WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 0,
                 attempt_timeout_ms: None,
             },
             WeightedLane {
+                reasoning: None,
                 idx: 1,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -9635,16 +9701,19 @@ mod ordered_walk_tests {
         // Lane 2 drained (weight 0); 0 and 1 still serve.
         let cands = vec![
             WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
             },
             WeightedLane {
+                reasoning: None,
                 idx: 1,
                 weight: 1,
                 attempt_timeout_ms: None,
             },
             WeightedLane {
+                reasoning: None,
                 idx: 2,
                 weight: 0,
                 attempt_timeout_ms: None,
@@ -9674,16 +9743,19 @@ mod ordered_walk_tests {
         let app = three_lane_app();
         let cands = vec![
             WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 0,
                 attempt_timeout_ms: None,
             },
             WeightedLane {
+                reasoning: None,
                 idx: 1,
                 weight: 0,
                 attempt_timeout_ms: None,
             },
             WeightedLane {
+                reasoning: None,
                 idx: 2,
                 weight: 0,
                 attempt_timeout_ms: None,
@@ -9715,6 +9787,7 @@ mod probe_guard_tests {
 
     fn lane(max: usize) -> LaneData {
         LaneData {
+            reasoning: false,
             model: "m0".into(),
             provider: "p0".into(),
             max,

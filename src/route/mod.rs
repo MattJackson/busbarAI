@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 use std::sync::Arc;
@@ -1069,6 +1069,7 @@ pub(crate) async fn named(
         let resp = crate::forward::forward_with_pool(
             app.clone(),
             vec![WeightedLane {
+                reasoning: None,
                 idx: i,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -1148,6 +1149,7 @@ pub(crate) async fn adhoc(
             let resp = crate::forward::forward_with_pool(
                 app.clone(),
                 vec![WeightedLane {
+                    reasoning: None,
                     idx: i,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -1252,6 +1254,7 @@ mod tests {
             on_exhausted_cfgs: std::collections::HashMap::new(),
             governance: None,
             default_max_tokens: crate::config::DEFAULT_DEFAULT_MAX_TOKENS,
+            reasoning_effort_budgets: [1024, 4096, 8192, 16384],
         })
     }
 
@@ -3314,6 +3317,7 @@ mod tests {
             inner.pools.insert(
                 "mypool".to_string(),
                 vec![WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,

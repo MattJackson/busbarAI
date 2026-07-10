@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 //! OpenAI Responses API protocol reader/writer implementation.
@@ -824,7 +824,20 @@ impl ProtocolReader for ResponsesReader {
             extra.insert("model".to_string(), model_val.clone());
         }
 
+        // The reasoning ASK: Responses spells it `reasoning: {effort}`. Promote the effort word so
+        // it carries to Anthropic/Gemini thinking budgets; the raw `reasoning` object (which can
+        // also carry `summary`) STAYS in extra for same-protocol fidelity — the writer emits from
+        // the typed field only when extra does not already carry the verbatim original.
+        let reasoning = obj
+            .get("reasoning")
+            .and_then(|r| r.get("effort"))
+            .and_then(|v| v.as_str())
+            .and_then(crate::ir::IrReasoningEffort::parse)
+            .map(crate::ir::IrReasoningAsk::Effort);
+
         Ok(crate::ir::IrRequest {
+            reasoning,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -2874,6 +2887,22 @@ impl ProtocolWriter for ResponsesWriter {
         // stalling the SSE translation loop. Mirrors the OpenAI writer.
         out.insert("stream".to_string(), serde_json::json!(req.stream));
 
+        // The reasoning carry in the Responses spelling: `reasoning: {effort}`. A numeric budget
+        // (Anthropic/Gemini source) is bucketized through the effort table. Emitted from the typed
+        // field only when `extra` does not carry a verbatim native `reasoning` object (the extra
+        // overlay below would forward the original, and must win: it can carry `summary` too).
+        if let Some(ask) = req.reasoning {
+            if !req.extra.contains_key("reasoning") {
+                let table = req
+                    .reasoning_budgets
+                    .unwrap_or(crate::ir::REASONING_BUDGET_DEFAULTS);
+                out.insert(
+                    "reasoning".to_string(),
+                    serde_json::json!({"effort": ask.to_effort(table).as_str()}),
+                );
+            }
+        }
+
         for (key, value) in &req.extra {
             // `text` from extra carries only the non-`format` remainder (verbosity, etc.). When the IR
             // carried a `response_format`, the merged `text` (remainder + format) was already inserted
@@ -3715,6 +3744,8 @@ mod tests {
     #[test]
     fn write_request_drops_top_k_with_warn() {
         let mk = |top_k: Option<u32>| crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -3762,6 +3793,8 @@ mod tests {
     #[test]
     fn test_write_request() {
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4012,6 +4045,8 @@ mod tests {
     #[test]
     fn test_roundtrip_identity() {
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5249,6 +5284,8 @@ mod tests {
     #[test]
     fn test_tool_only_assistant_turn_no_empty_message_wrapper() {
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5312,6 +5349,8 @@ mod tests {
     #[test]
     fn test_assistant_text_then_tool_call_order() {
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5636,6 +5675,8 @@ mod tests {
 
         // Tool-role path.
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5673,6 +5714,8 @@ mod tests {
 
         // Assistant-role inline tool_result path.
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5903,6 +5946,8 @@ mod tests {
         let payload = "QUJDMTIzKz0=";
         let media_type = "image/jpeg";
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5978,6 +6023,8 @@ mod tests {
 
         // Round-trip through the writer reconstructs the exact original image_url.
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -6018,6 +6065,8 @@ mod tests {
     #[test]
     fn test_write_request_emits_stream() {
         let make = |stream: bool| crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -9051,6 +9100,8 @@ mod tests {
     /// individual tests can set just the one knob under test.
     fn empty_ir_request() -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,

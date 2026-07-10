@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 //! Gemini protocol reader/writer implementation.
@@ -671,6 +671,21 @@ impl ProtocolReader for GeminiReader {
             .and_then(|gc| gc.get("logprobs"))
             .and_then(|v| v.as_u64())
             .and_then(|v| u32::try_from(v).ok());
+        // The thinking ASK: `generationConfig.thinkingConfig.thinkingBudget` (a token count; -1 =
+        // "model decides"), promoted so it carries to Anthropic's budget_tokens (straight number
+        // copy) or OpenAI's reasoning_effort (bucketized). The raw thinkingConfig ALSO survives
+        // same-protocol via the preserved generationConfig in extra; the writer overlays a fresh
+        // thinkingConfig from the typed field on cross-protocol egress.
+        let reasoning = obj
+            .get("generationConfig")
+            .and_then(|gc| gc.get("thinkingConfig"))
+            .and_then(|tc| tc.get("thinkingBudget"))
+            .and_then(|v| v.as_i64())
+            .and_then(|n| match n {
+                -1 => Some(crate::ir::IrReasoningAsk::Dynamic),
+                n if n > 0 => u32::try_from(n).ok().map(crate::ir::IrReasoningAsk::Budget),
+                _ => None, // 0 = thinking off; absent ask carries "off" faithfully
+            });
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
         // Promote Gemini's native `toolConfig.functionCallingConfig` into the IR `tool_choice` union
         // (PF-H1) so a forced / targeted directive survives the cross-protocol seam instead of
@@ -724,6 +739,8 @@ impl ProtocolReader for GeminiReader {
         }
 
         Ok(crate::ir::IrRequest {
+            reasoning,
+            reasoning_budgets: None,
             logprobs,
             top_logprobs,
             user: None,
@@ -2410,6 +2427,22 @@ impl ProtocolWriter for GeminiWriter {
         if let Some(top_logprobs) = req.top_logprobs {
             gen_config.insert("logprobs".to_string(), serde_json::json!(top_logprobs));
         }
+        // The reasoning carry in Gemini's native spelling: `thinkingConfig.thinkingBudget`.
+        // Dynamic round-trips as Gemini's own -1; effort words go through the table. (Only present
+        // when the seam's per-lane capability gate allowed the ask through.)
+        if let Some(ask) = req.reasoning {
+            let table = req
+                .reasoning_budgets
+                .unwrap_or(crate::ir::REASONING_BUDGET_DEFAULTS);
+            let budget: i64 = match ask {
+                crate::ir::IrReasoningAsk::Dynamic => -1,
+                other => i64::from(other.to_budget(table)),
+            };
+            gen_config.insert(
+                "thinkingConfig".to_string(),
+                serde_json::json!({"thinkingBudget": budget}),
+            );
+        }
         if let Some(presence_penalty) = req.presence_penalty {
             gen_config.insert(
                 "presencePenalty".to_string(),
@@ -3901,6 +3934,8 @@ mod tests {
     fn test_write_request_image_s3_dropped_not_corrupted() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4754,6 +4789,8 @@ mod tests {
     fn test_write_request_omits_stream_field() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4875,6 +4912,8 @@ mod tests {
     fn test_write_request_thinking_only_turn_survives_with_placeholder() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4969,6 +5008,8 @@ mod tests {
     fn test_write_request_null_tool_result_coerced_to_struct() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5030,6 +5071,8 @@ mod tests {
     fn test_write_request_scalar_tool_result_coerced_to_struct() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5164,6 +5207,8 @@ mod tests {
     fn test_write_request_tool_result_plaintext_wrapped_not_dropped() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5225,6 +5270,8 @@ mod tests {
     fn test_write_request_tool_result_json_passthrough() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5969,6 +6016,8 @@ mod tests {
             serde_json::json!({"maxOutputTokens": 100, "responseMimeType": "text/plain"}),
         );
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -6402,6 +6451,8 @@ mod tests {
     fn test_write_request_image_url_sentinel_emits_file_data() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -6450,6 +6501,8 @@ mod tests {
     fn test_write_request_base64_image_still_inline_data() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -6777,6 +6830,8 @@ mod tests {
     fn test_tool_role_maps_to_user_for_function_response() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -6838,6 +6893,8 @@ mod tests {
     fn test_assistant_tool_use_stays_model_role() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -7060,6 +7117,8 @@ mod tests {
         let writer = GeminiWriter;
         let synthetic_id = "call_00000000deadbeef".to_string();
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -7140,6 +7199,8 @@ mod tests {
     fn test_write_request_same_protocol_function_response_name_falls_back_to_id() {
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -7365,6 +7426,8 @@ mod tests {
         // write_request path
         let writer = GeminiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -7726,6 +7789,8 @@ mod tests {
     /// field(s) under test so the assertion targets exactly one gap.
     fn base_ir_request() -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,

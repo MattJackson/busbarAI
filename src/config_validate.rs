@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 use std::collections::{HashMap, HashSet};
@@ -33,6 +33,27 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         &cfg.allow_metadata_hosts,
         &mut errors,
     );
+
+    // The reasoning effort table drives word<->number projection at the egress seam (the
+    // cross-protocol thinking carry). A zero entry would project thinking budgets below every
+    // provider minimum (Anthropic floors at 1024) and a non-ascending table makes bucketization
+    // non-monotonic (a LARGER numeric budget mapping back to a SMALLER effort word). Reject both
+    // at boot rather than ship a table that silently corrupts the mapping.
+    {
+        let b = cfg.limits.reasoning_effort_budgets;
+        if b.minimal == 0 || b.low == 0 || b.medium == 0 || b.high == 0 {
+            errors.push(format!(
+                "limits.reasoning_effort_budgets entries must be > 0 (got {}/{}/{}/{})",
+                b.minimal, b.low, b.medium, b.high
+            ));
+        }
+        if !(b.minimal <= b.low && b.low <= b.medium && b.medium <= b.high) {
+            errors.push(format!(
+                "limits.reasoning_effort_budgets must be ascending (minimal <= low <= medium <= high); got {}/{}/{}/{}",
+                b.minimal, b.low, b.medium, b.high
+            ));
+        }
+    }
 
     // Collect provider names for pool-name conflict check and member resolution
     let provider_names: HashSet<&str> = cfg.providers.keys().map(|s| s.as_str()).collect();
@@ -1494,6 +1515,7 @@ mod tests {
 
     fn make_model(provider: &str, max_concurrent: usize) -> config::ModelCfg {
         config::ModelCfg {
+            reasoning: None,
             max_requests: -1,
             provider: provider.into(),
             max_concurrent,
@@ -1517,6 +1539,7 @@ mod tests {
 
     fn make_member(target: &str) -> config::PoolMember {
         config::PoolMember {
+            reasoning: None,
             target: target.into(),
             weight: 1,
             attempt_timeout_ms: None,

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -1478,6 +1478,8 @@ pub(crate) struct LaneData {
     pub(crate) upstream_model: Option<String>,
     /// Model-level per-attempt time-to-headers cap (ms); flows ModelCfg → LaneData → Lane.
     pub(crate) attempt_timeout_ms: Option<u64>,
+    /// Operator-declared reasoning-capability flag (see `ModelCfg::reasoning`).
+    pub(crate) reasoning: bool,
 }
 
 /// Helper for weighted selection tests - creates a lane with specific weight.
@@ -1499,6 +1501,7 @@ fn make_lane_data_with_weight(id: usize, max_permits: usize) -> (LaneData, u32) 
         client_fault: 0,
         upstream_model: None,
         attempt_timeout_ms: None,
+        reasoning: false,
     };
     (lane, (id as u32) + 1) // weight = id + 1 (so lane 0 has weight 1, lane 1 has weight 2, etc.)
 }
@@ -2438,6 +2441,7 @@ mod tests {
             client_fault: 0,
             upstream_model: None,
             attempt_timeout_ms: None,
+            reasoning: false,
         }
     }
 

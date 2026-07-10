@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 //! Bedrock Converse protocol reader/writer implementation.
@@ -1385,6 +1385,8 @@ impl ProtocolReader for BedrockReader {
         }
 
         Ok(crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -2223,6 +2225,13 @@ impl ProtocolWriter for BedrockWriter {
     // does NOT override `requires_max_tokens` — injecting a default here would silently cap output.
 
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
+        // The reasoning carry has no Bedrock Converse shape in this pass; dropped observably (matching
+        // the penalties/top_k convention) rather than silently.
+        if req.reasoning.is_some() {
+            tracing::warn!(
+                "dropping cross-protocol reasoning/thinking ask: no Bedrock Converse mapping in this release"
+            );
+        }
         let mut out = serde_json::Map::new();
 
         // The captured native `cachePoint` markers (see `CACHE_POINTS_SENTINEL`). On a same-protocol
@@ -3503,6 +3512,8 @@ mod tests {
     #[test]
     fn test_write_request() {
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4604,6 +4615,8 @@ mod tests {
     fn test_write_request_skips_system_role_message() {
         let writer = BedrockWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4678,6 +4691,8 @@ mod tests {
     fn test_write_request_tool_result_preserves_non_text_content() {
         let writer = BedrockWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4945,6 +4960,8 @@ mod tests {
 
         // Cross-protocol shape: typed tools, empty extra (seam cleared it).
         let ir_tools = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4987,6 +5004,8 @@ mod tests {
 
         // No tools, no raw toolConfig → no toolConfig key at all.
         let ir_empty = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5519,6 +5538,8 @@ mod tests {
 
         // Cross-protocol shape: top_k set in the IR, extra cleared (as the translate seam leaves it).
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5672,6 +5693,8 @@ mod tests {
             serde_json::json!({"maxTokens": 1, "topP": 0.5}),
         );
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5716,6 +5739,8 @@ mod tests {
 
         // Cross-protocol egress: no inferenceConfig in extra → config built purely from typed IR.
         let ir2 = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5868,6 +5893,8 @@ mod tests {
         // Top-level URL-sentinel image → dropped (no image block, no garbage bytes).
         let url = "https://example.com/cat.png";
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5960,6 +5987,8 @@ mod tests {
     fn test_write_request_all_nonrepresentable_turn_kept_with_placeholder() {
         let writer = BedrockWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -6284,6 +6313,8 @@ mod tests {
         let writer = BedrockWriter;
         let url = "https://example.com/in-tool.png";
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -7829,6 +7860,8 @@ mod tests {
             }],
         };
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -7912,6 +7945,8 @@ mod tests {
 
     fn tool_choice_req(tc: Option<crate::ir::IrToolChoice>) -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -8089,6 +8124,8 @@ mod tests {
     #[test]
     fn test_bedrock_writer_clamps_temperature_above_one() {
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -8137,6 +8174,8 @@ mod tests {
         tools: Vec<crate::ir::IrTool>,
     ) -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -8472,6 +8511,8 @@ mod tests {
     fn test_write_request_response_format_dropped() {
         let writer = BedrockWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 use std::collections::HashMap;
@@ -315,6 +315,16 @@ pub(crate) struct ModelCfg {
     /// `attempt_timeout_ms` overrides it per workload. Absent = bounded only by the request budget.
     #[serde(default)]
     pub(crate) attempt_timeout_ms: Option<u64>,
+    /// Operator declaration that THIS model accepts reasoning/thinking request parameters
+    /// (Anthropic `thinking`, Gemini `thinkingConfig`, OpenAI `reasoning_effort`). Capability is
+    /// per-MODEL, not per-provider (Sonnet takes `thinking`, Haiku 400s on it), and busbar keeps no
+    /// model database — this flag is the operator asserting what they deployed, in the same family
+    /// as `context_max`/`cost_per_mtok`. When absent/false, a cross-protocol reasoning ask is
+    /// DROPPED at the seam with a warn (never sent, so a non-reasoning model can never 400 from
+    /// translation). A pool member's `reasoning` overrides this per pool. Same-protocol passthrough
+    /// is byte-exact and ignores the flag.
+    #[serde(default)]
+    pub(crate) reasoning: Option<bool>,
 }
 
 fn neg1() -> i64 {
@@ -542,6 +552,11 @@ pub(crate) struct PoolMember {
     /// ruthless in a realtime pool (50). See `ModelCfg::attempt_timeout_ms` for semantics.
     #[serde(default)]
     pub(crate) attempt_timeout_ms: Option<u64>,
+    /// Per-pool override of the model-level `reasoning` capability flag (member wins), so the same
+    /// lane can allow thinking in a research pool and refuse it in a latency-critical one. See
+    /// `ModelCfg::reasoning` for semantics.
+    #[serde(default)]
+    pub(crate) reasoning: Option<bool>,
     /// Operator-declared cost in currency-units per million tokens. Drives the native `cheapest`
     /// policy and is exposed to webhook/script policies. Inert when unset.
     #[serde(default)]
@@ -1211,6 +1226,50 @@ pub(crate) struct LimitsCfg {
     pub(crate) max_honored_retry_after_secs: u64,
     #[serde(default = "default_default_max_tokens")]
     pub(crate) default_max_tokens: u32,
+    /// Effort-word → thinking-token-budget table for the cross-protocol reasoning carry: what
+    /// OpenAI's `reasoning_effort` words mean in tokens when projected onto Anthropic
+    /// `thinking.budget_tokens` / Gemini `thinkingBudget` (and, inverted, the bucket thresholds
+    /// when a numeric budget is projected onto an effort word). "Medium" is a cost decision, so
+    /// operators can override it; defaults 1024/4096/8192/16384.
+    #[serde(default)]
+    pub(crate) reasoning_effort_budgets: ReasoningEffortBudgets,
+}
+
+/// The `minimal/low/medium/high` → token-budget table (see `LimitsCfg::reasoning_effort_budgets`).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub(crate) struct ReasoningEffortBudgets {
+    #[serde(default = "default_reasoning_minimal")]
+    pub(crate) minimal: u32,
+    #[serde(default = "default_reasoning_low")]
+    pub(crate) low: u32,
+    #[serde(default = "default_reasoning_medium")]
+    pub(crate) medium: u32,
+    #[serde(default = "default_reasoning_high")]
+    pub(crate) high: u32,
+}
+
+impl Default for ReasoningEffortBudgets {
+    fn default() -> Self {
+        Self {
+            minimal: default_reasoning_minimal(),
+            low: default_reasoning_low(),
+            medium: default_reasoning_medium(),
+            high: default_reasoning_high(),
+        }
+    }
+}
+
+fn default_reasoning_minimal() -> u32 {
+    1024
+}
+fn default_reasoning_low() -> u32 {
+    4096
+}
+fn default_reasoning_medium() -> u32 {
+    8192
+}
+fn default_reasoning_high() -> u32 {
+    16384
 }
 
 impl Default for LimitsCfg {
@@ -1227,6 +1286,7 @@ impl Default for LimitsCfg {
             tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
             max_honored_retry_after_secs: default_max_honored_retry_after_secs(),
             default_max_tokens: default_default_max_tokens(),
+            reasoning_effort_budgets: ReasoningEffortBudgets::default(),
         }
     }
 }
@@ -1295,6 +1355,7 @@ pub(crate) struct LimitsResolved {
     pub(crate) tls_handshake_timeout_secs: u64,
     pub(crate) max_honored_retry_after_secs: u64,
     pub(crate) default_max_tokens: u32,
+    pub(crate) reasoning_effort_budgets: ReasoningEffortBudgets,
     pub(crate) max_inflight_webhook_deliveries: usize,
     pub(crate) webhook_delivery_timeout_secs: u64,
     pub(crate) key_gauge_limit: usize,
@@ -1337,6 +1398,7 @@ impl LimitsResolved {
             tls_handshake_timeout_secs: limits.tls_handshake_timeout_secs,
             max_honored_retry_after_secs: limits.max_honored_retry_after_secs,
             default_max_tokens: limits.default_max_tokens,
+            reasoning_effort_budgets: limits.reasoning_effort_budgets,
             max_inflight_webhook_deliveries: obs.max_inflight_webhook_deliveries,
             webhook_delivery_timeout_secs: obs.webhook_delivery_timeout_secs,
             key_gauge_limit: metrics.key_gauge_limit,

@@ -69,8 +69,28 @@ not a special case.
   well-formed 404 **in the caller's own protocol dialect**: never a crash, never a
   malformed body, and never taking the lane down for other traffic.
 
+- **Cross-protocol reasoning/thinking carry (opt-in per lane).** The reasoning ask now
+  translates between the three protocols that model it: OpenAI `reasoning_effort` /
+  Responses `reasoning.effort` (words), Anthropic `thinking.budget_tokens` and Gemini
+  `thinkingConfig.thinkingBudget` (token budgets). Number to number is a straight copy
+  (a Claude/Gemini thinking pool loses nothing); words and numbers convert through a
+  configurable effort table (`limits.reasoning_effort_budgets`, defaults
+  1024/4096/8192/16384). Because thinking support is per-MODEL, not per-protocol, the
+  carry is **gated by an operator flag**: `reasoning: true` on a model (overridable per
+  pool member) declares "this backend accepts thinking params". Without the flag the ask
+  is dropped at the seam with a warn and the request proceeds normally, so a
+  non-reasoning model can never 400 from translation. Budgets are clamped to fit
+  `max_tokens` (Anthropic requires it), and Anthropic-incompatible sampling knobs
+  (temperature, top_k) are omitted with a warn when thinking is emitted. The
+  response-side thinking CONTENT was already lossless and is unaffected. Gemini's
+  dynamic `-1` round-trips to Gemini and projects elsewhere as `medium`.
+
 ### Changed
 
+- **License: Apache 2.0.** Busbar 1.2.0 and onward is licensed under the
+  **Apache License, Version 2.0**: permissive, commercial-friendly, with an explicit
+  patent grant. Use it, modify it, and redistribute it, privately or commercially,
+  with no copyleft obligations.
 - **Every operation is lossless across protocols, errors included.** Responses *and*
   error envelopes always come back in the caller's own protocol dialect, and token/usage
   accounting survives the cross-protocol round trip on every operation, not just chat.
@@ -855,5 +875,5 @@ This changelog begins at 0.14.0; earlier history is not recorded here.
 
 ### Changed
 
-- Licensed the project under **AGPL-3.0-or-later** (previously MIT), the AGPL's
-  network-use clause is the appropriate copyleft for a gateway run as a service.
+- Relicensed the project from MIT to a copyleft license. (Superseded: as of 1.2.0 the
+  project is licensed under the **Apache License 2.0**.)

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 //! The protocol catch-all dispatch (design: web server listens for anything → Router IDs the
@@ -188,6 +188,7 @@ pub(crate) async fn operation_resolved(
     } else if let Some(&i) = app.by_model.get(model) {
         (
             vec![WeightedLane {
+                reasoning: None,
                 idx: i,
                 weight: 1,
                 attempt_timeout_ms: None,

@@ -288,6 +288,7 @@ A model is a **lane**: one model at one provider, with its own concurrency semap
 | `default_max_tokens` | integer | no | `4096` | Injected **only** on a cross-protocol hop to a backend that requires `max_tokens` (Anthropic protocol) when the caller omitted it. Has no effect on same-protocol passthrough. Must be > 0 when set. |
 | `upstream_model` | string | no | the config key | The model id sent to the provider on the wire (request body for body-model protocols; URL path for path-model protocols like Bedrock/Gemini; and health probes). Defaults to the config key. Set it when the key can't be the wire id: most commonly to run the **same model behind two providers** (the keys must differ, but each needs its own provider-specific model string). Must be non-empty when set. Metrics, breaker cells, and logs still key off the config key, not this. |
 | `attempt_timeout_ms` | integer | no | unset (no cap) | Per-attempt cap, in milliseconds, on time to **response headers** (the hang detector). If the provider has not started answering within the cap, the attempt is treated exactly like a transport timeout: the breaker records a transient failure and the request fails over to the next pool member within the same request. Because the cap covers only connect + headers, a healthy long **stream body** is never cut off by it. A pool member's own `attempt_timeout_ms` overrides this per pool. Must be ≥ 1 when set (0 is a startup error); always floored by the request's remaining `failover.timeout_secs` budget. |
+| `reasoning` | bool | no | `false` | Operator declaration that this model accepts reasoning/thinking request parameters (Anthropic `thinking`, Gemini `thinkingConfig`, OpenAI `reasoning_effort`). Gates the [cross-protocol reasoning carry](#cross-protocol-reasoning-reasoning): without the flag, a translated reasoning ask is dropped at the seam (warned) and never sent, so a non-reasoning model can never 400 from translation. Capability is per-model, not per-provider (Sonnet takes `thinking`; Haiku rejects it) — you declare what you deployed, like `context_max`. A pool member's `reasoning` overrides this per pool. Same-protocol passthrough ignores it. |
 
 ```yaml
 models:
@@ -370,6 +371,7 @@ pools:
 | `weight` | integer | no | `1` | Relative selection share under smooth weighted round-robin (SWRR), computed over the currently healthy/usable members. Must be ≥ 1. `0` is a startup error. |
 | `context_max` | integer | no | none | This member's maximum context window (tokens). Used for [context-length failover](#context-length-failover). |
 | `attempt_timeout_ms` | integer | no | the model's value | Per-attempt time-to-response-headers cap for this member **in this pool**, overriding the model-level `attempt_timeout_ms`. Lets the same model carry different hang tolerances per pool (e.g. `10000` in a batch pool, `50` in a latency-critical one). Must be ≥ 1 when set (0 is a startup error). See [Per-attempt timeouts](#per-attempt-timeouts-attempt_timeout_ms). |
+| `reasoning` | bool | no | the model's value | Per-pool override of the model-level `reasoning` capability flag (member wins), so the same lane can allow thinking in a research pool and refuse it in a latency-critical one. See [Cross-protocol reasoning](#cross-protocol-reasoning-reasoning). |
 | `tier` | string | no | none | Operator-declared routing tier label (e.g. `"primary"`, `"overflow"`, `"large"`, `"small"`). Inert for `route: weighted` pools. Exposed to webhook and script policies as the `tier` field on each candidate. See [`route` and `policy`](#route-and-policy). |
 | `cost_per_mtok` | float | no | none | Operator-declared cost in currency units per million tokens. Drives the `cheapest` native policy (sort ascending) and is exposed to webhook/script policies. Inert when unset or when `route: weighted`. |
 | `tags` | list<string> | no | `[]` | Free-form string labels (e.g. `["opus", "large-context"]`). Inert for `route: weighted` pools. Exposed to webhook/script policies for tag-based candidate selection. |
@@ -413,6 +415,40 @@ Details:
 - Expiry is classified like a network timeout: it counts toward the breaker's transient streak (repeated hangs trip the lane) and shows up in metrics as `disposition="attempt_timeout"` on `busbar_upstream_failures_total` and `reason="attempt_timeout"` on `busbar_failovers_total`.
 - The cap is always floored by the request's remaining [`failover.timeout_secs`](#failover) budget; it can never extend a request past that.
 - Unset means no per-attempt cap (the transport timeout still applies). `0` is a startup error; disable by omitting the field.
+
+---
+
+#### Cross-protocol reasoning (`reasoning`)
+
+The reasoning/thinking ask translates between the three protocols that model it: OpenAI `reasoning_effort` and Responses `reasoning.effort` (words), Anthropic `thinking.budget_tokens` and Gemini `thinkingConfig.thinkingBudget` (token budgets). Number to number is a straight copy; words and numbers convert through the effort table below. The response-side thinking content (thinking blocks, thought parts) already translates losslessly and needs no configuration.
+
+The ask is **gated per lane** because thinking support is per-model, not per-protocol, and Busbar keeps no model database. `reasoning: true` on a model (or a pool member, which wins) declares "this backend accepts thinking params":
+
+```yaml
+models:
+  claude-sonnet:
+    provider: anthropic
+    max_concurrent: 20
+    reasoning: true       # this model accepts thinking params
+  claude-haiku:
+    provider: anthropic
+    max_concurrent: 40    # no flag: a translated reasoning ask is dropped (warned), never sent
+```
+
+With the flag set, an OpenAI client's `reasoning_effort: "high"` reaches this Claude lane as `thinking: {type: enabled, budget_tokens: 16384}`; a Gemini client's `thinkingBudget: 6000` reaches it as `budget_tokens: 6000`. Without the flag the request still succeeds, thinking at the backend's default level.
+
+The effort table (word ↔ number conversion, both directions) is operator-tunable:
+
+```yaml
+limits:
+  reasoning_effort_budgets:   # defaults shown; must be ascending, all > 0
+    minimal: 1024
+    low: 4096
+    medium: 8192
+    high: 16384
+```
+
+Guard rails, applied automatically: the budget is clamped to leave at least 1024 answer tokens under `max_tokens` (Anthropic requires `budget_tokens < max_tokens`), and when `max_tokens` is too small to fit any thinking the ask is dropped with a warn. Anthropic rejects `temperature`/`top_k` alongside thinking, so those knobs are omitted (warned) when a thinking ask is emitted to an Anthropic backend. Gemini's dynamic `-1` round-trips to Gemini verbatim and projects elsewhere as `medium`.
 
 ---
 

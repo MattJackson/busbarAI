@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 //! The protocol seam: a protocol-agnostic core, with each wire dialect's specifics confined to a
@@ -712,6 +712,8 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     fn probe_body(&self, model: &str) -> Vec<u8> {
         use crate::ir::{IrBlock, IrMessage, IrRequest, IrRole};
         let ir = IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,

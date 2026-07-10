@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 //! Gemini `RequestHandler` + cells (design §6/§7). Embeddings via `models/{id}:embedContent`.

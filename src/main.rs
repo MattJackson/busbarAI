@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 //
 // busbar — a native-protocol LLM gateway. It fronts many LLM providers and routes each request to
@@ -411,6 +411,7 @@ async fn main() {
             client_fault: 0,
             upstream_model: mc.upstream_model.clone(),
             attempt_timeout_ms: mc.attempt_timeout_ms,
+            reasoning: mc.reasoning.unwrap_or(false),
         });
 
         eprintln!(
@@ -472,6 +473,7 @@ async fn main() {
             health: provider_cfg.health.clone(),
             upstream_model: ld.upstream_model.clone(),
             attempt_timeout_ms: ld.attempt_timeout_ms,
+            reasoning: ld.reasoning,
             default_max_tokens: model_default_max_tokens.get(&ld.model).copied().flatten(),
         });
     }
@@ -495,6 +497,7 @@ async fn main() {
                     weight: m.weight, // from config PoolMember.weight (default 1)
                     // Per-member attempt cap: one model, different hang budgets per pool/workload.
                     attempt_timeout_ms: m.attempt_timeout_ms,
+                    reasoning: m.reasoning,
                 }
             })
             .collect();
@@ -670,6 +673,10 @@ async fn main() {
         on_exhausted_cfgs,
         governance,
         default_max_tokens: cfg.limits.default_max_tokens,
+        reasoning_effort_budgets: {
+            let b = cfg.limits.reasoning_effort_budgets;
+            [b.minimal, b.low, b.medium, b.high]
+        },
     });
 
     // configure the request-log webhook (reusing the pooled client). No-op if unset.
@@ -1153,6 +1160,7 @@ mod tests {
 
     fn member(target: &str, context_max: Option<usize>) -> PoolMember {
         PoolMember {
+            reasoning: None,
             target: target.to_string(),
             weight: 1,
             attempt_timeout_ms: None,

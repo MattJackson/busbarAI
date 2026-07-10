@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 //! Cohere v2 protocol reader/writer implementation.
@@ -911,6 +911,8 @@ impl ProtocolReader for CohereReader {
         }
 
         Ok(crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -1478,6 +1480,13 @@ impl ProtocolWriter for CohereWriter {
     }
 
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
+        // The reasoning carry has no Cohere shape in this pass; dropped observably (matching
+        // the penalties/top_k convention) rather than silently.
+        if req.reasoning.is_some() {
+            tracing::warn!(
+                "dropping cross-protocol reasoning/thinking ask: no Cohere mapping in this release"
+            );
+        }
         let mut out = serde_json::Map::new();
         let mut messages_arr: Vec<serde_json::Value> = Vec::new();
 
@@ -2198,6 +2207,8 @@ mod tests {
     #[test]
     fn test_write_request() {
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -2299,6 +2310,8 @@ mod tests {
     #[test]
     fn test_read_request_roundtrip() {
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -2600,6 +2613,8 @@ mod tests {
     #[test]
     fn test_write_request_sole_tooluse_omits_empty_content() {
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -2649,6 +2664,8 @@ mod tests {
     #[test]
     fn test_write_request_text_block_shapes() {
         let single = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -3985,6 +4002,8 @@ mod tests {
     #[test]
     fn test_write_request_stream_field_conditional() {
         let base = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4161,6 +4180,8 @@ mod tests {
     #[test]
     fn test_tool_role_text_alongside_result_not_dropped() {
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4223,6 +4244,8 @@ mod tests {
     #[test]
     fn test_tool_result_multi_block_content_joins_without_space() {
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4279,6 +4302,8 @@ mod tests {
     #[test]
     fn test_tool_role_text_without_result_not_dropped() {
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4329,6 +4354,8 @@ mod tests {
     #[test]
     fn test_tool_role_multi_text_without_result_is_string() {
         let ir = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5874,6 +5901,8 @@ mod tests {
     /// round-trip tests below.
     fn ir_with_tool_choice(tc: Option<crate::ir::IrToolChoice>) -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,

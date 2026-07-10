@@ -189,7 +189,7 @@ These are conventions visible in the code; treat the [CONTRIBUTING.md](../CONTRI
 checklist as authoritative.
 
 - **SPDX header.** Every `src/*.rs` and `src/proto/*.rs` file starts with
-  `// SPDX-License-Identifier: AGPL-3.0-or-later` + `// Copyright (C) 2026 Matthew Jackson`.
+  `// SPDX-License-Identifier: Apache-2.0` + `// Copyright (C) 2026 Matthew Jackson`.
 - **No `_ =>` catch-all in the disposition/breaker matches.** The exhaustive match
   on `StatusClass`/`Disposition` is how the compiler enforces that every failure
   mode is handled; the arms even use `unreachable!()` for classes that cannot

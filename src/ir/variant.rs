@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 //! The per-operation IR enums (design §12.4): `IrReq` / `IrResp`, one variant per operation. The
@@ -70,6 +70,22 @@ impl IrReq {
                     );
                 }
                 crate::proto::decode_request_tool_ids(prep.ingress_protocol, &mut ir.messages);
+                // The reasoning gate. A lane that did not claim the capability never receives a
+                // thinking param (a non-reasoning model would 400 on it); the request still
+                // proceeds, thinking at the backend's default level.
+                if ir.reasoning.is_some() {
+                    if prep.reasoning_allowed {
+                        ir.reasoning_budgets = Some(prep.reasoning_budgets);
+                    } else {
+                        tracing::warn!(
+                            ingress = %prep.ingress_protocol,
+                            "dropping cross-protocol reasoning/thinking ask: the target lane does \
+                             not declare the capability; set `reasoning: true` on the model (or \
+                             pool member) if this backend accepts thinking params"
+                        );
+                        ir.reasoning = None;
+                    }
+                }
                 ir.extra.clear();
             }
             IrReq::Embeddings(_)
@@ -114,6 +130,14 @@ pub(crate) struct EgressPrep<'a> {
     pub(crate) egress_requires_max_tokens: bool,
     pub(crate) lane_default_max_tokens: Option<u32>,
     pub(crate) global_default_max_tokens: u32,
+    /// The per-lane reasoning capability gate: the effective `reasoning` flag for THIS attempt's
+    /// lane (pool-member override wins over the model-level flag). When false and the request
+    /// carries a reasoning ask, the ask is CLEARED here with a warn — the one place the gate
+    /// lives, so no writer can ever send a thinking param to a lane that did not claim it.
+    pub(crate) reasoning_allowed: bool,
+    /// The resolved effort-word → budget table (limits.reasoning_effort_budgets), stamped onto the
+    /// IR for writers to project words ↔ numbers with the operator's numbers.
+    pub(crate) reasoning_budgets: [u32; 4],
 }
 
 impl IrResp {

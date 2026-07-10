@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Matthew Jackson
 #
 # busbar deployment configuration (config.yaml).
@@ -72,6 +72,10 @@ models:
     max_concurrent: 20
     max_requests: -1
     # default_max_tokens: 4096   # backfill when an OpenAI client omits max_tokens (else 4096)
+    # reasoning: true   # declare that THIS model accepts thinking params: with it, a translated
+    #                   # reasoning ask (OpenAI reasoning_effort / Gemini thinkingBudget) reaches
+    #                   # this lane as Anthropic thinking{budget_tokens}; without it the ask is
+    #                   # dropped (warned) and never sent, so a non-thinking model never 400s.
   claude-haiku:
     provider: anthropic
     max_concurrent: 40

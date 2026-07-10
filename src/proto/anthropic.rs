@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 //! Anthropic protocol reader/writer implementation.
@@ -504,6 +504,18 @@ impl ProtocolReader for AnthropicReader {
             .and_then(|m| m.get("user_id"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        // The request-level `thinking` param (the ASK, not the response content blocks):
+        // {type:"enabled", budget_tokens:N} promotes into the IR reasoning ask so it can carry to
+        // Gemini's thinkingBudget or OpenAI's reasoning_effort. Any other form ({type:"disabled"},
+        // malformed) stays in `extra` untouched: same-protocol fidelity, and foreign targets treat
+        // an absent ask as off anyway.
+        let reasoning = obj
+            .get("thinking")
+            .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("enabled"))
+            .and_then(|t| t.get("budget_tokens"))
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok())
+            .map(crate::ir::IrReasoningAsk::Budget);
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Collect unmodeled top-level keys into `extra`. The set of modeled keys is a static,
@@ -535,6 +547,11 @@ impl ProtocolReader for AnthropicReader {
                 extra.insert(key.clone(), value.clone());
             }
         }
+        // A PROMOTED thinking ask must not also ride extra (the writer re-emits it from the typed
+        // field; a duplicate from extra would double-emit on a translated same-protocol hop).
+        if reasoning.is_some() {
+            extra.remove("thinking");
+        }
 
         // (No ingress sentinel scrub needed anymore: a client cannot forge a redacted-reasoning block.
         // `redacted` is a TYPED flag only the Anthropic/Bedrock readers set on a genuine
@@ -542,6 +559,8 @@ impl ProtocolReader for AnthropicReader {
         // mark a block redacted, so the old `__busbar` sentinel forgery vector is structurally closed.)
 
         Ok(crate::ir::IrRequest {
+            reasoning,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user,
@@ -2009,7 +2028,58 @@ impl ProtocolWriter for AnthropicWriter {
         if let Some(max_tokens) = req.max_tokens {
             out.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
         }
-        if let Some(temperature) = req.temperature {
+        // The reasoning carry: project the IR ask into Anthropic's `thinking` param. The budget is
+        // clamped to leave >=1024 tokens of answer under max_tokens (Anthropic requires
+        // budget_tokens < max_tokens and spends thinking FROM it) and floored at the API's 1024
+        // minimum; when max_tokens is too small to fit any thinking, the ask is dropped with a
+        // warn rather than shipped to a certain 400. Anthropic also rejects temperature/top_k
+        // modifications alongside thinking, so when the ask IS emitted those knobs are omitted
+        // (warned) below instead of shipped to a 400.
+        let mut thinking_emitted = false;
+        if let Some(ask) = req.reasoning {
+            let table = req
+                .reasoning_budgets
+                .unwrap_or(crate::ir::REASONING_BUDGET_DEFAULTS);
+            if matches!(ask, crate::ir::IrReasoningAsk::Dynamic) {
+                tracing::warn!(
+                    "gemini dynamic thinking (-1) has no Anthropic analog; projecting as the \
+                     'medium' effort budget"
+                );
+            }
+            let want = ask.to_budget(table);
+            let cap = req.max_tokens.map(|mt| mt.saturating_sub(1024));
+            let budget = cap.map_or(want, |c| want.min(c));
+            if budget >= 1024 {
+                if budget != want {
+                    tracing::warn!(
+                        requested_budget = want,
+                        clamped_budget = budget,
+                        max_tokens = ?req.max_tokens,
+                        "thinking budget clamped to fit under max_tokens"
+                    );
+                }
+                out.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({"type": "enabled", "budget_tokens": budget}),
+                );
+                thinking_emitted = true;
+            } else {
+                tracing::warn!(
+                    max_tokens = ?req.max_tokens,
+                    "dropping reasoning ask on Anthropic egress: max_tokens leaves no room for \
+                     the 1024-token thinking minimum"
+                );
+            }
+        }
+        if thinking_emitted && req.temperature.is_some_and(|t| t != 1.0) {
+            // Anthropic 400s on temperature != 1 with thinking enabled; the think-ask wins and the
+            // sampling knob is omitted, observably.
+            tracing::warn!(
+                temperature = ?req.temperature,
+                "omitting temperature on Anthropic egress: not compatible with thinking"
+            );
+        }
+        if let Some(temperature) = req.temperature.filter(|_| !thinking_emitted) {
             // Clamp to Anthropic's valid [0.0, 1.0] — see `clamp_temperature_for_anthropic`.
             // NON-SILENT clamp: silently rewriting a caller's sampling temperature
             // is exactly the lossy mutation busbar exists to avoid; we keep the clamp (Anthropic 422s on
@@ -2040,7 +2110,15 @@ impl ProtocolWriter for AnthropicWriter {
             out.insert("top_p".to_string(), serde_json::json!(top_p));
         }
         if let Some(top_k) = req.top_k {
-            out.insert("top_k".to_string(), serde_json::json!(top_k));
+            if thinking_emitted {
+                // Anthropic rejects top_k modifications alongside thinking; omit, observably.
+                tracing::warn!(
+                    top_k,
+                    "omitting top_k on Anthropic egress: not compatible with thinking"
+                );
+            } else {
+                out.insert("top_k".to_string(), serde_json::json!(top_k));
+            }
         }
         if !req.stop.is_empty() {
             out.insert("stop_sequences".to_string(), serde_json::json!(req.stop));
@@ -4806,6 +4884,8 @@ mod anthropic_hardening_tests {
     #[test]
     fn write_request_never_emits_system_role_message() {
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5570,6 +5650,8 @@ mod anthropic_hardening_tests {
     fn test_write_request_file_id_image_dropped_not_corrupted() {
         let writer = AnthropicWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5640,6 +5722,8 @@ mod anthropic_hardening_tests {
     fn test_write_request_image_s3_dropped_not_corrupted() {
         let writer = AnthropicWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -6242,5 +6326,234 @@ mod user_and_parallelism_carry_tests {
             1,
             "metadata must be the verbatim original, not a merged object"
         );
+    }
+}
+
+#[cfg(test)]
+mod reasoning_carry_tests {
+    //! The gated cross-protocol reasoning/thinking carry. The GATE lives at
+    //! `IrReq::prepare_for_egress` (per-lane `reasoning` flag); these tests cover the codec halves
+    //! (read the ask, project it) plus the gate itself, the clamp, and the sampling-knob omission.
+    use super::{AnthropicReader, AnthropicWriter};
+    use crate::ir::variant::{EgressPrep, IrReq};
+    use crate::ir::{IrReasoningAsk, IrReasoningEffort};
+    use crate::proto::{Protocol, ProtocolReader, ProtocolWriter};
+
+    fn openai_effort_body(effort: &str) -> serde_json::Value {
+        serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32000,
+            "reasoning_effort": effort
+        })
+    }
+
+    /// OpenAI `reasoning_effort` word -> Anthropic `thinking` budget via the table.
+    #[test]
+    fn openai_effort_projects_to_anthropic_budget() {
+        let ir = crate::proto::openai_chat::OpenAiReader
+            .read_request(&openai_effort_body("high"))
+            .expect("parses");
+        assert_eq!(
+            ir.reasoning,
+            Some(IrReasoningAsk::Effort(IrReasoningEffort::High))
+        );
+        assert!(!ir.extra.contains_key("reasoning_effort"));
+
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(out["thinking"]["type"], "enabled");
+        assert_eq!(out["thinking"]["budget_tokens"], 16384);
+    }
+
+    /// Anthropic budget -> Gemini `thinkingBudget` is a straight number copy; and Gemini's
+    /// dynamic -1 round-trips to Gemini verbatim while projecting to Anthropic as medium.
+    #[test]
+    fn budgets_copy_between_anthropic_and_gemini() {
+        let body = serde_json::json!({
+            "model": "m", "max_tokens": 16000,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 6000}
+        });
+        let ir = AnthropicReader.read_request(&body).expect("parses");
+        assert_eq!(ir.reasoning, Some(IrReasoningAsk::Budget(6000)));
+        assert!(
+            !ir.extra.contains_key("thinking"),
+            "promoted thinking must not also ride extra"
+        );
+        let gout = Protocol::gemini().writer().write_request(&ir);
+        assert_eq!(
+            gout["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            6000
+        );
+
+        let gbody = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"thinkingConfig": {"thinkingBudget": -1}}
+        });
+        let gir = Protocol::gemini()
+            .reader()
+            .read_request(&gbody)
+            .expect("parses");
+        assert_eq!(gir.reasoning, Some(IrReasoningAsk::Dynamic));
+        let back = Protocol::gemini().writer().write_request(&gir);
+        assert_eq!(
+            back["generationConfig"]["thinkingConfig"]["thinkingBudget"], -1,
+            "dynamic must round-trip to Gemini as its native -1"
+        );
+    }
+
+    /// A numeric budget projected onto a WORD protocol bucketizes through the same table.
+    #[test]
+    fn budget_bucketizes_to_effort_words() {
+        let body = serde_json::json!({
+            "model": "m", "max_tokens": 16000,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 6000}
+        });
+        let ir = AnthropicReader.read_request(&body).expect("parses");
+        let out = crate::proto::openai_chat::OpenAiWriter.write_request(&ir);
+        // 6000 sits between low (4096) and medium (8192) -> "low" (largest entry reached).
+        assert_eq!(out["reasoning_effort"], "low");
+    }
+
+    /// The Anthropic clamp: budget must leave >=1024 answer tokens under max_tokens; too-small
+    /// max_tokens drops the ask entirely (no thinking key, and sampling knobs survive).
+    #[test]
+    fn anthropic_clamps_and_drops_by_max_tokens() {
+        // Clamped: high (16384) under max_tokens 4096 -> 3072.
+        let mut body = openai_effort_body("high");
+        body["max_tokens"] = serde_json::json!(4096);
+        let ir = crate::proto::openai_chat::OpenAiReader
+            .read_request(&body)
+            .expect("parses");
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(out["thinking"]["budget_tokens"], 3072);
+
+        // Dropped: max_tokens 1500 leaves <1024 of thinking -> no thinking key at all.
+        let mut small = openai_effort_body("high");
+        small["max_tokens"] = serde_json::json!(1500);
+        let ir2 = crate::proto::openai_chat::OpenAiReader
+            .read_request(&small)
+            .expect("parses");
+        let out2 = AnthropicWriter.write_request(&ir2);
+        assert!(
+            out2.get("thinking").is_none(),
+            "no room -> no thinking: {out2}"
+        );
+    }
+
+    /// Anthropic rejects temperature/top_k alongside thinking: both are omitted (observably via
+    /// warn) when the ask is emitted, and present when it is not.
+    #[test]
+    fn thinking_omits_incompatible_sampling_knobs() {
+        let mut body = openai_effort_body("low");
+        body["temperature"] = serde_json::json!(0.5);
+        let ir = crate::proto::openai_chat::OpenAiReader
+            .read_request(&body)
+            .expect("parses");
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(out["thinking"]["budget_tokens"], 4096);
+        assert!(
+            out.get("temperature").is_none(),
+            "temperature != 1 must be omitted with thinking: {out}"
+        );
+
+        // Without a reasoning ask the same temperature is emitted normally.
+        let mut plain = openai_effort_body("low");
+        plain.as_object_mut().unwrap().remove("reasoning_effort");
+        plain["temperature"] = serde_json::json!(0.5);
+        let ir2 = crate::proto::openai_chat::OpenAiReader
+            .read_request(&plain)
+            .expect("parses");
+        let out2 = AnthropicWriter.write_request(&ir2);
+        assert_eq!(out2["temperature"], 0.5);
+    }
+
+    /// THE GATE: prepare_for_egress clears the ask when the lane did not claim the capability and
+    /// stamps the budget table when it did. Absence of an ask is untouched either way.
+    #[test]
+    fn seam_gate_clears_or_stamps() {
+        let prep = |allowed: bool| EgressPrep {
+            ingress_protocol: "openai",
+            egress_requires_max_tokens: true,
+            lane_default_max_tokens: None,
+            global_default_max_tokens: 32000,
+            reasoning_allowed: allowed,
+            reasoning_budgets: [1024, 2048, 3072, 4096],
+        };
+        let ir = crate::proto::openai_chat::OpenAiReader
+            .read_request(&openai_effort_body("high"))
+            .expect("parses");
+
+        let mut gated = IrReq::Chat(ir.clone());
+        gated.prepare_for_egress(&prep(false));
+        let IrReq::Chat(gated) = gated else {
+            unreachable!()
+        };
+        assert_eq!(
+            gated.reasoning, None,
+            "unflagged lane must never see the ask"
+        );
+
+        let mut allowed = IrReq::Chat(ir);
+        allowed.prepare_for_egress(&prep(true));
+        let IrReq::Chat(allowed) = allowed else {
+            unreachable!()
+        };
+        assert_eq!(
+            allowed.reasoning,
+            Some(IrReasoningAsk::Effort(IrReasoningEffort::High))
+        );
+        assert_eq!(allowed.reasoning_budgets, Some([1024, 2048, 3072, 4096]));
+        // The operator's table (not the defaults) drives the projection.
+        let out = AnthropicWriter.write_request(&allowed);
+        assert_eq!(out["thinking"]["budget_tokens"], 4096);
+    }
+
+    /// Responses `reasoning: {effort}` reads into the ask and re-emits from the typed field.
+    #[test]
+    fn responses_effort_round_trips() {
+        let body = serde_json::json!({
+            "model": "m", "input": "hi",
+            "reasoning": {"effort": "medium"}
+        });
+        let ir = Protocol::responses()
+            .reader()
+            .read_request(&body)
+            .expect("parses");
+        assert_eq!(
+            ir.reasoning,
+            Some(IrReasoningAsk::Effort(IrReasoningEffort::Medium))
+        );
+        // Cross-protocol: extra cleared -> the typed field emits the native shape.
+        let mut cleared = ir.clone();
+        cleared.extra.clear();
+        let out = Protocol::responses().writer().write_request(&cleared);
+        assert_eq!(out["reasoning"]["effort"], "medium");
+        // Anthropic egress: medium -> 8192.
+        let mut with_max = cleared;
+        with_max.max_tokens = Some(32000);
+        let aout = AnthropicWriter.write_request(&with_max);
+        assert_eq!(aout["thinking"]["budget_tokens"], 8192);
+    }
+
+    /// A disabled-form `thinking` param is NOT promoted (stays in extra for same-proto fidelity)
+    /// and no foreign target gains an ask from it.
+    #[test]
+    fn disabled_thinking_stays_in_extra() {
+        let body = serde_json::json!({
+            "model": "m", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "disabled"}
+        });
+        let ir = AnthropicReader.read_request(&body).expect("parses");
+        assert_eq!(ir.reasoning, None);
+        assert!(ir.extra.contains_key("thinking"));
+        let gout = Protocol::gemini().writer().write_request(&{
+            let mut c = ir.clone();
+            c.extra.clear();
+            c
+        });
+        assert!(gout["generationConfig"].get("thinkingConfig").is_none());
     }
 }

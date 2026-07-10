@@ -91,6 +91,6 @@ One auth note for Bedrock: Busbar signs outbound Bedrock requests with AWS SigV4
 
 ## Current status
 
-Busbar is at **1.1.0**, licensed AGPL-3.0-or-later. The wire protocol translation, circuit breaker model, governance layer, and admin API are stable under Semantic Versioning. The test suite covers over 1,600 test cases across the protocol translators, breaker FSM, auth middleware, governance enforcement, and config validation.
+Busbar is licensed **Apache-2.0**. The wire protocol translation, circuit breaker model, governance layer, and admin API are stable under Semantic Versioning. The test suite covers over 1,600 test cases across the protocol translators, breaker FSM, auth middleware, governance enforcement, and config validation.
 
-The AGPL license means that if you modify Busbar and run it as a networked service, you must make the modified source available. Read the LICENSE file before deploying in a commercial context.
+Apache-2.0 is permissive: use it commercially, modify it privately, redistribute it, with an explicit patent grant and no copyleft obligations.

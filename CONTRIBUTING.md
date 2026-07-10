@@ -7,7 +7,7 @@ test, and submit changes.
 
 - Be respectful and constructive in all project spaces.
 - By contributing, you agree your contributions are licensed under the project's
-  [AGPL-3.0-or-later](LICENSE) license.
+  [Apache-2.0](LICENSE) license.
 - Security issues go through [SECURITY.md](SECURITY.md), **not** public issues.
 
 ## Development setup

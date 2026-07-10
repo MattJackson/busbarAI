@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 //! The ingress Router (design-operations-oop.md §6, the 1.2 lynchpin): DUMB protocol identification.

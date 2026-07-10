@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 //! In-crate mock-upstream test harness (/).
@@ -587,6 +587,7 @@ impl LaneSpec {
 
     fn to_lane(&self) -> crate::state::Lane {
         crate::state::Lane {
+            reasoning: false,
             model: self.model.clone(),
             provider: self.provider.clone(),
             base_url: self.base_url.clone(),
@@ -609,6 +610,7 @@ impl LaneSpec {
     }
     fn to_lane_data(&self) -> crate::store::LaneData {
         crate::store::LaneData {
+            reasoning: false,
             model: self.model.clone(),
             provider: self.provider.clone(),
             max: self.max,
@@ -733,6 +735,7 @@ impl TestApp {
             on_exhausted_cfgs: self.on_exhausted_cfgs,
             governance: self.governance,
             default_max_tokens: crate::config::DEFAULT_DEFAULT_MAX_TOKENS,
+            reasoning_effort_budgets: [1024, 4096, 8192, 16384],
         })
     }
 }
@@ -741,6 +744,7 @@ fn weighted(members: &[(usize, u32)]) -> Vec<crate::state::WeightedLane> {
     members
         .iter()
         .map(|&(idx, weight)| crate::state::WeightedLane {
+            reasoning: None,
             idx,
             weight,
             attempt_timeout_ms: None,
@@ -896,6 +900,7 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -960,6 +965,7 @@ mod tests {
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -1230,6 +1236,7 @@ mod tests {
             .build();
 
         let cands = vec![crate::state::WeightedLane {
+            reasoning: None,
             idx: 0,
             weight: 1,
             attempt_timeout_ms: None,
@@ -1351,11 +1358,13 @@ mod tests {
 
         let cands = vec![
             crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
             },
             crate::state::WeightedLane {
+                reasoning: None,
                 idx: 1,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -2269,6 +2278,7 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -2324,6 +2334,7 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -2377,6 +2388,7 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -2432,6 +2444,7 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -2502,11 +2515,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -2578,11 +2593,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -2669,6 +2686,7 @@ mod tests {
         let response = forward(
             app_passthrough.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -2724,6 +2742,7 @@ mod tests {
         let response = forward(
             app_token.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -2837,6 +2856,7 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -2899,11 +2919,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -2983,16 +3005,19 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 2,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -3069,11 +3094,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -3170,6 +3197,7 @@ mod tests {
         let response = forward(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -3346,6 +3374,7 @@ mod tests {
             let response = forward(
                 app.clone(),
                 vec![crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -3405,6 +3434,7 @@ mod tests {
             let _response = forward(
                 app.clone(),
                 vec![crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -3467,6 +3497,7 @@ mod tests {
             let _response = forward(
                 app.clone(),
                 vec![crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -3524,6 +3555,7 @@ mod tests {
             let _response = forward(
                 app.clone(),
                 vec![crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -3581,6 +3613,7 @@ mod tests {
             let _response = forward(
                 app.clone(),
                 vec![crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -3638,6 +3671,7 @@ mod tests {
             let response = forward(
                 app.clone(),
                 vec![crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -3763,6 +3797,7 @@ mod tests {
             let _response_1 = forward(
                 app_1.clone(),
                 vec![crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -3782,6 +3817,7 @@ mod tests {
             let _response_2 = forward(
                 app_2.clone(),
                 vec![crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -3808,6 +3844,7 @@ mod tests {
             use crate::config::RootCfg;
 
             let model = crate::config::ModelCfg {
+                reasoning: None,
                 max_requests: -1,
                 provider: "p".into(),
                 max_concurrent: 10,
@@ -3817,6 +3854,7 @@ mod tests {
             };
             let pool = crate::config::PoolCfg {
                 members: vec![crate::config::PoolMember {
+                    reasoning: None,
                     target: "m".into(),
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -3945,6 +3983,7 @@ mod tests {
             let response = forward(
                 app.clone(),
                 vec![crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -4025,11 +4064,13 @@ mod tests {
                 app.clone(),
                 vec![
                     crate::state::WeightedLane {
+                        reasoning: None,
                         idx: 0,
                         weight: 1,
                         attempt_timeout_ms: None,
                     },
                     crate::state::WeightedLane {
+                        reasoning: None,
                         idx: 1,
                         weight: 1,
                         attempt_timeout_ms: None,
@@ -4095,11 +4136,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -4187,11 +4230,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -4271,6 +4316,7 @@ mod tests {
         let response = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -4336,6 +4382,7 @@ mod tests {
         let response = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -4414,6 +4461,7 @@ mod tests {
             let response = forward_with_pool(
                 app.clone(),
                 vec![crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -4507,11 +4555,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -4591,11 +4641,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -4675,16 +4727,19 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 2,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -4710,16 +4765,19 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 2,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -4751,16 +4809,19 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 2,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -4873,11 +4934,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -5056,11 +5119,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -5086,11 +5151,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -5426,6 +5493,7 @@ mod tests {
         let response = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -5678,6 +5746,7 @@ mod tests {
         let response = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -5727,6 +5796,7 @@ mod tests {
         let response = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -5801,6 +5871,7 @@ mod tests {
         let response = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -5887,11 +5958,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -5977,11 +6050,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -6045,11 +6120,13 @@ mod tests {
             app.clone(),
             vec![
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
                 },
                 crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 1,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -6116,6 +6193,7 @@ mod tests {
             let resp = forward(
                 app.clone(),
                 vec![crate::state::WeightedLane {
+                    reasoning: None,
                     idx: 0,
                     weight: 1,
                     attempt_timeout_ms: None,
@@ -6178,6 +6256,7 @@ mod tests {
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,
@@ -6241,6 +6320,7 @@ mod tests {
         let resp = forward_with_pool(
             app.clone(),
             vec![crate::state::WeightedLane {
+                reasoning: None,
                 idx: 0,
                 weight: 1,
                 attempt_timeout_ms: None,

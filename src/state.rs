@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 use std::collections::HashMap;
@@ -36,6 +36,9 @@ pub(crate) struct Lane {
     /// Model-level per-ATTEMPT time-to-response-headers cap (ms) — the hang detector. A pool
     /// member's `attempt_timeout_ms` overrides it per workload; see `ModelCfg::attempt_timeout_ms`.
     pub(crate) attempt_timeout_ms: Option<u64>,
+    /// Operator-declared: this model accepts reasoning/thinking request params (the cross-protocol
+    /// reasoning-carry gate). A pool member's `reasoning` overrides it. See `ModelCfg::reasoning`.
+    pub(crate) reasoning: bool,
     /// Optional default max output tokens, injected at the cross-protocol translation seam when the
     /// source request omitted `max_tokens` (legal for OpenAI) but this lane's protocol REQUIRES it
     /// (Anthropic Messages — see `ProtocolWriter::requires_max_tokens`). Falls back to
@@ -60,6 +63,9 @@ impl Lane {
 pub(crate) struct WeightedLane {
     pub(crate) idx: usize,  // index into lanes array
     pub(crate) weight: u32, // member weight from config
+    /// Pool-member override of the lane's `reasoning` capability flag (member wins). `None` =
+    /// inherit the model-level flag. See `ModelCfg::reasoning`.
+    pub(crate) reasoning: Option<bool>,
     /// Pool-member override of the lane's `attempt_timeout_ms` (one model, different budgets per
     /// workload/pool). `None` = inherit the model-level value.
     pub(crate) attempt_timeout_ms: Option<u64>,
@@ -123,6 +129,11 @@ pub(crate) struct App {
     /// at the cross-protocol seam when a lane has no per-lane `default_max_tokens`. Defaults to
     /// `proto::DEFAULT_MAX_TOKENS` (4096). Read by `forward::apply_required_max_tokens`.
     pub(crate) default_max_tokens: u32,
+    /// Resolved effort-word → thinking-budget table for the cross-protocol reasoning carry
+    /// (`limits.reasoning_effort_budgets`, defaults 1024/4096/8192/16384), ordered
+    /// [minimal, low, medium, high]. Stamped onto the IR at the egress seam so writers project
+    /// effort words and numeric budgets with the operator's numbers.
+    pub(crate) reasoning_effort_budgets: [u32; 4],
 }
 
 impl App {

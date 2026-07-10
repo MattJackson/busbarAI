@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/MattJackson/busbarAI?include_prereleases)](https://github.com/MattJackson/busbarAI/releases)
-[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Status](https://img.shields.io/badge/status-1.1.0-brightgreen)
 
 📖 **Docs:** [getbusbar.com](https://getbusbar.com)  
@@ -28,7 +28,7 @@ Busbar sits between your application and your LLM providers. Point any SDK at on
 
 The whole thing is one static Rust binary (Linux and macOS on Intel and ARM, Windows on Intel). No Python sidecar, no interpreter, no GC in the request path. Your keys stay in your infrastructure.
 
-> **Status: 1.1.0, stable.** The HTTP API, the configuration schema, and the six wire-protocol contracts are frozen under Semantic Versioning. Every release ships a CycloneDX SBOM and a build-provenance attestation, and the code has been through multiple rounds of security and correctness review. AGPL-3.0.
+> **Status: 1.1.0, stable.** The HTTP API, the configuration schema, and the six wire-protocol contracts are frozen under Semantic Versioning. Every release ships a CycloneDX SBOM and a build-provenance attestation, and the code has been through multiple rounds of security and correctness review. Apache-2.0.
 
 ---
 
@@ -97,4 +97,4 @@ Full walkthrough → **[Getting Started](https://getbusbar.com/docs/getting-star
 
 Full documentation is at **[getbusbar.com](https://getbusbar.com)** (agent-readable at [llms.txt](https://getbusbar.com/llms.txt)). Contributor docs (architecture, internals, ADRs) live in [`docs/`](docs/).
 
-Single Rust binary, MSRV 1.87. Contributions welcome ([CONTRIBUTING.md](CONTRIBUTING.md)). Licensed **AGPL-3.0-or-later** ([LICENSE](LICENSE)); Busbar runs as a network service, so the AGPL's network-use clause (§13) applies.
+Single Rust binary, MSRV 1.87. Contributions welcome ([CONTRIBUTING.md](CONTRIBUTING.md)). Licensed **Apache-2.0** ([LICENSE](LICENSE)): permissive, commercial-friendly, with an explicit patent grant.

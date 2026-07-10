@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 //! The superset intermediate representation (IR) — request and response/stream sides — that every
@@ -59,6 +59,22 @@ pub(crate) struct IrRequest {
     /// Cohere reader/writer correctly omit `n` (like Anthropic/Bedrock/Responses). `u32`: a
     /// non-negative count. `None` == absent — never emitted.
     pub(crate) n: Option<u32>,
+    /// The reasoning/thinking ASK, normalized: what the caller requested, in whichever spelling
+    /// their protocol uses (OpenAI `reasoning_effort` word, Anthropic `thinking.budget_tokens`
+    /// number, Gemini `thinkingConfig.thinkingBudget` number or -1 dynamic). Writers project it
+    /// into their own spelling: number → number is a straight copy (Anthropic ↔ Gemini), word ↔
+    /// number goes through the effort-budget table ([`IrRequest::reasoning_budgets`]). GATED at the
+    /// egress seam by the per-lane `reasoning` capability flag — when the lane does not claim the
+    /// capability, `prepare_for_egress` clears this with a warn, so a non-reasoning model never
+    /// receives (and never 400s on) a thinking param. The response-side thinking CONTENT is carried
+    /// by the Thinking blocks and is not gated. `None` == caller never asked.
+    pub(crate) reasoning: Option<IrReasoningAsk>,
+    /// The resolved effort-word → token-budget table [minimal, low, medium, high], stamped by the
+    /// egress seam from `limits.reasoning_effort_budgets` (operator-overridable; defaults
+    /// 1024/4096/8192/16384). Writers use it to project effort words to numeric budgets and to
+    /// bucketize numeric budgets back to words; when `None` (e.g. unit tests calling a writer
+    /// directly) writers fall back to the same defaults.
+    pub(crate) reasoning_budgets: Option<[u32; 4]>,
     /// Per-token log-probability request (OpenAI `logprobs: bool`; Gemini
     /// `generationConfig.responseLogprobs`). First-class so the ask carries between the two
     /// protocols that model it; writers with no analog (Anthropic/Bedrock) never emit it. The
@@ -277,6 +293,88 @@ pub(crate) struct IrResponse {
     /// zipped). Empty == the backend sent none (nothing emitted). Carried protocol-neutrally so a
     /// Gemini backend's logprobs reach an OpenAI-dialect caller in its own shape, and vice versa.
     pub(crate) logprobs: Vec<IrTokenLogprob>,
+}
+
+/// The normalized reasoning/thinking ask (see [`IrRequest::reasoning`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IrReasoningAsk {
+    /// A word-form ask (OpenAI `reasoning_effort` / Responses `reasoning.effort`).
+    Effort(IrReasoningEffort),
+    /// A numeric thinking-token budget (Anthropic `budget_tokens`, Gemini `thinkingBudget`).
+    Budget(u32),
+    /// Gemini's `thinkingBudget: -1` — "the model decides". Projected back to Gemini as -1
+    /// verbatim; projected to protocols with no dynamic concept as the `medium` table entry
+    /// (with a warn), since "model decides" has no closer analog than the middle of the road.
+    Dynamic,
+}
+
+/// The four effort words, ordered by ascending budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IrReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+/// The compiled-in effort table (mirrors the config defaults) — the writer fallback when the seam
+/// did not stamp [`IrRequest::reasoning_budgets`].
+pub(crate) const REASONING_BUDGET_DEFAULTS: [u32; 4] = [1024, 4096, 8192, 16384];
+
+impl IrReasoningAsk {
+    /// Project the ask to a NUMERIC budget using the effort table ([minimal, low, medium, high]).
+    pub(crate) fn to_budget(self, table: [u32; 4]) -> u32 {
+        match self {
+            IrReasoningAsk::Budget(n) => n,
+            IrReasoningAsk::Effort(IrReasoningEffort::Minimal) => table[0],
+            IrReasoningAsk::Effort(IrReasoningEffort::Low) => table[1],
+            IrReasoningAsk::Effort(IrReasoningEffort::Medium) => table[2],
+            IrReasoningAsk::Effort(IrReasoningEffort::High) => table[3],
+            IrReasoningAsk::Dynamic => table[2],
+        }
+    }
+
+    /// Project the ask to a WORD using the same table as bucket thresholds (a numeric budget maps
+    /// to the largest effort whose table entry it reaches), so word→number→word round-trips
+    /// degrade predictably.
+    pub(crate) fn to_effort(self, table: [u32; 4]) -> IrReasoningEffort {
+        match self {
+            IrReasoningAsk::Effort(e) => e,
+            IrReasoningAsk::Dynamic => IrReasoningEffort::Medium,
+            IrReasoningAsk::Budget(n) => {
+                if n >= table[3] {
+                    IrReasoningEffort::High
+                } else if n >= table[2] {
+                    IrReasoningEffort::Medium
+                } else if n >= table[1] {
+                    IrReasoningEffort::Low
+                } else {
+                    IrReasoningEffort::Minimal
+                }
+            }
+        }
+    }
+}
+
+impl IrReasoningEffort {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            IrReasoningEffort::Minimal => "minimal",
+            IrReasoningEffort::Low => "low",
+            IrReasoningEffort::Medium => "medium",
+            IrReasoningEffort::High => "high",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "minimal" => Some(IrReasoningEffort::Minimal),
+            "low" => Some(IrReasoningEffort::Low),
+            "medium" => Some(IrReasoningEffort::Medium),
+            "high" => Some(IrReasoningEffort::High),
+            _ => None,
+        }
+    }
 }
 
 /// One generated token's log probability, plus the top alternatives at that position. The neutral

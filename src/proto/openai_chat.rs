@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Matthew Jackson
 
 //! OpenAI protocol reader/writer implementation.
@@ -389,6 +389,8 @@ fn modeled_request_keys() -> &'static std::collections::HashSet<&'static str> {
             // Carried cross-protocol to Gemini's `generationConfig.responseLogprobs`/`logprobs`.
             "logprobs",
             "top_logprobs",
+            // Carried cross-protocol to Anthropic/Gemini thinking budgets (gated per lane).
+            "reasoning_effort",
         ]
         .into_iter()
         .collect()
@@ -765,6 +767,14 @@ impl ProtocolReader for OpenAiReader {
             .map(|s| s.to_string());
         let parallel_tool_calls = obj.get("parallel_tool_calls").and_then(|v| v.as_bool());
 
+        // The reasoning ASK in chat-completions spelling: a top-level `reasoning_effort` word.
+        // Promoted so it carries to Anthropic/Gemini thinking budgets via the effort table.
+        let reasoning = obj
+            .get("reasoning_effort")
+            .and_then(|v| v.as_str())
+            .and_then(crate::ir::IrReasoningEffort::parse)
+            .map(crate::ir::IrReasoningAsk::Effort);
+
         // Logprobs ask, carried first-class so it reaches a Gemini backend as
         // `generationConfig.responseLogprobs`/`logprobs` (and back).
         let logprobs = obj.get("logprobs").and_then(|v| v.as_bool());
@@ -774,6 +784,8 @@ impl ProtocolReader for OpenAiReader {
             .and_then(|v| u32::try_from(v).ok());
 
         Ok(crate::ir::IrRequest {
+            reasoning,
+            reasoning_budgets: None,
             logprobs,
             top_logprobs,
             user,
@@ -1921,6 +1933,17 @@ impl ProtocolWriter for OpenAiWriter {
                 serde_json::json!(parallel),
             );
         }
+        // The reasoning carry in chat-completions spelling: `reasoning_effort`. A numeric budget
+        // (Anthropic/Gemini source) is bucketized through the effort table.
+        if let Some(ask) = req.reasoning {
+            let table = req
+                .reasoning_budgets
+                .unwrap_or(crate::ir::REASONING_BUDGET_DEFAULTS);
+            out.insert(
+                "reasoning_effort".to_string(),
+                serde_json::json!(ask.to_effort(table).as_str()),
+            );
+        }
         // The logprobs ask in OpenAI's native spelling (a Gemini `responseLogprobs`/`logprobs`
         // arrives here via the IR).
         if let Some(logprobs) = req.logprobs {
@@ -2807,6 +2830,8 @@ mod tests {
     #[test]
     fn write_request_tool_result_multi_text_concatenates_without_separator() {
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -2851,6 +2876,8 @@ mod tests {
     #[test]
     fn write_request_emits_max_tokens_from_modeled_cap() {
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -2982,6 +3009,8 @@ mod tests {
     #[test]
     fn write_request_omits_token_cap_when_absent() {
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -3017,6 +3046,8 @@ mod tests {
     #[test]
     fn write_request_keeps_tool_use_on_user_message() {
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -3067,6 +3098,8 @@ mod tests {
     #[test]
     fn write_request_pure_tool_result_message_emits_only_flat_entries() {
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -3115,6 +3148,8 @@ mod tests {
     #[test]
     fn write_request_tool_role_mixed_content_not_dropped() {
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -3195,6 +3230,8 @@ mod tests {
     #[test]
     fn write_request_tool_result_on_user_message_emits_tool_message() {
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -3703,6 +3740,8 @@ mod tests {
     #[test]
     fn write_request_tool_call_only_assistant_has_null_content() {
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -3948,6 +3987,8 @@ mod tests {
     #[test]
     fn write_request_non_text_system_block_does_not_vanish_silently() {
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4143,6 +4184,8 @@ mod tests {
         // Gemini/Anthropic tool result rides on a non-Tool message), so this asserts both: the content
         // array carries only the text block, and a separate tool message carries the result.
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -4200,6 +4243,8 @@ mod tests {
     #[test]
     fn write_request_thinking_block_dropped_from_message_content() {
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5245,6 +5290,8 @@ mod tests {
         description: Option<&str>,
     ) -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5633,6 +5680,8 @@ mod tests {
     fn write_request_string_tool_arguments_emitted_verbatim() {
         let raw = "not-json {oops".to_string();
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -5937,6 +5986,8 @@ mod tests {
     /// Minimal valid `IrRequest` for writer-side tool_choice/temperature tests.
     fn test_ir_request() -> crate::ir::IrRequest {
         crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -6166,6 +6217,8 @@ mod tests {
     fn test_write_request_file_id_image_dropped_not_corrupted() {
         let writer = OpenAiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -6236,6 +6289,8 @@ mod tests {
     fn test_write_request_image_s3_dropped_not_corrupted() {
         let writer = OpenAiWriter;
         let req = crate::ir::IrRequest {
+            reasoning: None,
+            reasoning_budgets: None,
             logprobs: None,
             top_logprobs: None,
             user: None,
@@ -6327,6 +6382,7 @@ mod tests {
             "parallel_tool_calls",
             "logprobs",
             "top_logprobs",
+            "reasoning_effort",
         ] {
             assert!(a.contains(k), "modeled key set must contain {k}");
         }
