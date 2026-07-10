@@ -457,61 +457,6 @@ fn ingress_error(proto: &str, status: StatusCode, kind: &str, message: &str) -> 
     crate::forward::ingress_error(proto, status, kind, message)
 }
 
-/// CHAT IS A STANDARD OPERATION: thin adapter over the universal `operation_resolved` core — the
-/// same path every operation takes from the moment the model is known. Kept only so the path-model
-/// routing arms (gemini/bedrock, which resolve model+stream from the URL and inject shims into the
-/// body bytes) keep a stable call shape; the chat OperationHandler resolves through the registry
-/// like any other.
-#[allow(clippy::too_many_arguments)]
-async fn forward_resolved(
-    app: &Arc<App>,
-    gov: &crate::governance::GovCtx,
-    proto: &'static str,
-    model: &str,
-    headers: &HeaderMap,
-    body: Bytes,
-    v: Value,
-    caller_token: Option<&str>,
-    started: Instant,
-    charged_at: u64,
-    gemini_api_version: Option<&str>,
-) -> Response {
-    let Some(op_handler) = crate::handlers::request_handler(proto)
-        .and_then(|rh| rh.operation_handler(crate::operation::Operation::Chat))
-    else {
-        return finish_rejected(
-            app,
-            gov,
-            proto,
-            crate::forward::POOL_LABEL_UNRESOLVED,
-            started,
-            charged_at,
-            ingress_error(
-                proto,
-                StatusCode::NOT_FOUND,
-                crate::forward::KIND_NOT_FOUND,
-                "This endpoint does not support that operation.",
-            ),
-        );
-    };
-    operation_resolved(
-        app,
-        gov,
-        proto,
-        crate::operation::Operation::Chat,
-        op_handler,
-        model,
-        headers,
-        body,
-        Some(v),
-        caller_token,
-        started,
-        charged_at,
-        gemini_api_version,
-    )
-    .await
-}
-
 /// Shared ingress core for the PATH-MODEL protocols (`gemini`, `bedrock`): the model lives in the
 /// URL path and stream intent in the path/route suffix, NOT the body. A native client body carries
 /// neither, so this parses the body to a `Value`, INJECTS `"model"` (from the path) and `"stream"`
@@ -531,6 +476,7 @@ async fn ingress_path_model(
     headers: &HeaderMap,
     body: Bytes,
     model: &str,
+    operation: crate::operation::Operation,
     stream: bool,
     gemini_json_array: bool,
     proto: &'static str,
@@ -643,14 +589,37 @@ async fn ingress_path_model(
         }
     };
 
-    forward_resolved(
+    // UNIVERSAL: the caller (that protocol's routing arm) already resolved WHICH operation this is
+    // (`RequestHandler::resolve_operation`); look its handler up through the registry — identical
+    // for every protocol and operation. This arm's only per-protocol work was the URL parsing above.
+    let Some(op_handler) =
+        crate::handlers::request_handler(proto).and_then(|rh| rh.operation_handler(operation))
+    else {
+        return finish_rejected(
+            app,
+            gov,
+            proto,
+            crate::forward::POOL_LABEL_UNRESOLVED,
+            started,
+            charged_at,
+            ingress_error(
+                proto,
+                StatusCode::NOT_FOUND,
+                crate::forward::KIND_NOT_FOUND,
+                "This endpoint does not support that operation.",
+            ),
+        );
+    };
+    operation_resolved(
         app,
         gov,
         proto,
+        operation,
+        op_handler,
         model,
         headers,
         injected,
-        v,
+        Some(v),
         caller_token,
         started,
         charged_at,
@@ -863,6 +832,7 @@ pub(crate) async fn gemini_ingress(
         &headers,
         body,
         model,
+        crate::operation::Operation::Chat,
         stream,
         gemini_json_array,
         "gemini",
@@ -976,7 +946,17 @@ async fn bedrock_ingress(
     // Bedrock never uses the gemini JSON-array framing, and a model-not-found 404 uses the canonical
     // (non-gemini) message, so no api_version is threaded.
     ingress_path_model(
-        app, gov, caller, headers, body, model_id, stream, false, "bedrock", None,
+        app,
+        gov,
+        caller,
+        headers,
+        body,
+        model_id,
+        crate::operation::Operation::Chat,
+        stream,
+        false,
+        "bedrock",
+        None,
     )
     .await
 }
