@@ -321,6 +321,39 @@ response = bedrock.converse(
 
 ---
 
+## Operations: more than chat
+
+Since 1.2, chat is one of five operations. Embeddings, moderations, image generation, and audio (transcription, speech-to-English translation, and text-to-speech) all run through the same lossless translation layer, in both directions, errors and usage accounting included. A client speaking one protocol can call any operation on a backend speaking another, wherever both sides support it.
+
+There is nothing to configure. A lane or pool serves whichever operations its protocol supports; you call the operation's surface instead of the chat surface, with the same model or pool name.
+
+### Support matrix
+
+| Operation | openai | anthropic | gemini | bedrock | cohere | responses |
+|---|---|---|---|---|---|---|
+| Chat | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Embeddings | ✓ | — | ✓ | ✓ | ✓ | — |
+| Moderations | ✓ | — | — | — | — | — |
+| Image generation | ✓ | — | ✓ | ✓ | — | — |
+| Audio (transcription and speech) | ✓ | — | ✓ | — | — | — |
+
+The matrix reads both ways: a checked cell means that protocol speaks the operation as a client dialect (ingress) and as a backend (egress). Any checked ingress can route to any checked egress on the same row; Busbar translates between them.
+
+### Native surfaces per protocol
+
+Each protocol keeps its own real wire surface for each operation, exactly as its SDK sends it:
+
+| Protocol | Operation surfaces |
+|---|---|
+| openai | `/v1/embeddings`, `/v1/moderations`, `/v1/images/generations`, `/v1/audio/transcriptions` (and `/v1/audio/translations`), `/v1/audio/speech` |
+| gemini | `:embedContent` (and `:batchEmbedContents`) for embeddings, `:predict` for images; audio rides `:generateContent`, split by body (`responseModalities: ["AUDIO"]` is text-to-speech, an inline audio part is transcription) |
+| bedrock | Converse is chat; `/model/{id}/invoke` multiplexes by body (`textToImageParams` is image generation, `inputText` is embeddings) |
+| cohere | `/v2/embed` |
+
+### Calling an operation a backend lacks
+
+The dots in the matrix are real gaps: some backends do not implement some operations. Calling one anyway (image generation against an Anthropic lane, for example) returns a clean, well-formed 404 in the caller's own protocol dialect. It never crashes, never leaks an upstream error shape, and never affects the lane's health for other traffic. In a pool, a backend without the operation is simply not a candidate for that request.
+
 ## Body-model vs path-model ingress
 
 The six protocols split into two groups based on where the target model (or pool name) lives in the request:
@@ -413,7 +446,7 @@ Busbar's translation is **lossless** in a specific, testable sense: **neither en
 
 The reference is native-to-native: a translated exchange should behave exactly as if the client had spoken the backend's protocol directly. A difference counts as *loss* only if it trips one of those two tests, a client that can't parse what it got back, or a backend that rejects what it was sent. Field-level differences that trip neither test (e.g. an upstream `id` replaced with an ingress-native one) are not loss.
 
-Where a construct genuinely has **no representation** in the target protocol: a rare, inherent limit, see [Lost on a cross-protocol hop](#lost-on-a-cross-protocol-hop), Busbar degrades it to the closest valid native form **and emits a `warn!`**, never something either end would reject. The degradation is observable in logs; it is never silent and never yields an unparseable or malformed wire body.
+Where a construct genuinely has **no representation** in the target protocol: a rare, inherent limit, see [Fields the target protocol cannot express](#fields-the-target-protocol-cannot-express), Busbar degrades it to the closest valid native form **and emits a `warn!`**, never something either end would reject. The degradation is observable in logs; it is never silent and never yields an unparseable or malformed wire body.
 
 ### Always preserved
 
@@ -444,9 +477,9 @@ These fields survive a cross-protocol hop because they are first-class in the IR
 
 **Usage-token cross-protocol nuance (Anthropic/Bedrock → OpenAI/Gemini/Responses):** Anthropic and Bedrock responses carry a separate `cache_creation` token bucket that has no equivalent field in the OpenAI, Gemini, or Responses wire shapes. When such a response is translated to one of those protocols, the reported `prompt_tokens` / `input_tokens` total *includes* cache-creation tokens (so billing is complete), but the `cached_tokens` sub-field reflects only cache-read tokens, because the target wire shape has no cache-creation bucket to place them in. Billing is unaffected (all consumed tokens are counted); only the sub-field breakdown differs.
 
-### Lost on a cross-protocol hop
+### Fields the target protocol cannot express
 
-Fields that are not modeled in the IR do not survive a translated hop, they live only in the `extra` passthrough map, which is cleared at the cross-protocol seam. Examples:
+This is not loss in the sense defined above: lossless means neither end can tell the hop happened, and these are fields the *target protocol has no place for at all*. Anthropic has no `logprobs`; nothing Busbar could send would carry it. Forwarding such a field anyway would make the backend reject the request, which is the one thing translation must never do. So fields with no analog in the target protocol are dropped at the seam, deliberately and observably (they live in the `extra` passthrough map, which is cleared on a cross-protocol hop). Examples:
 
 - **OpenAI-only (no IR analog):** `logprobs`, `logit_bias`. These flow through `extra` verbatim on same-protocol OpenAI passthrough and are stripped on a cross-protocol hop. (`n` is *not* in this list, it is a first-class IR field, see "Always preserved" above.)
 - **Other source-protocol-specific fields** that no IR field models are likewise stored in `extra` and dropped at the seam.
