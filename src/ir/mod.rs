@@ -14,6 +14,7 @@ pub(crate) mod audio;
 pub(crate) mod embeddings;
 pub(crate) mod image;
 pub(crate) mod moderation;
+pub(crate) mod variant; // IrReq / IrResp enums + the operation-blind surface (§12.4)
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct IrRequest {
