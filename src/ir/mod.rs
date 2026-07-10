@@ -7,6 +7,11 @@
 
 use serde_json::Value;
 
+// Per-operation IR variants (design §5b). Chat is the existing `IrRequest`/`IrResponse` below; the
+// new operations live in submodules and are assembled into `enum IrReq`/`enum IrResp` (§12.4) once
+// all six exist.
+pub(crate) mod moderation;
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct IrRequest {
     pub(crate) system: Vec<IrBlock>,
