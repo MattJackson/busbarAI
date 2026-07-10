@@ -1729,17 +1729,25 @@ pub(crate) fn sign_and_wire_path(url_path: &str) -> String {
 /// so it is reused for both fields and only the wire path is (cheaply) cloned; with a query the wire
 /// path is `canonical?query`. Output is byte-identical to the previous split-and-`to_string` form.
 fn sign_and_wire_path_parts(url_path: &str) -> (String, String) {
-    match url_path.split_once('?') {
-        Some((path, query)) => {
-            let canonical = crate::sigv4::uri_encode_path(path);
-            let wire = format!("{canonical}?{query}");
-            (wire, canonical)
-        }
-        None => {
-            let canonical = crate::sigv4::uri_encode_path(url_path);
-            (canonical.clone(), canonical)
-        }
-    }
+    // The wire path is single-URI-encoded (what actually goes on the request line). The SigV4
+    // CANONICAL path is DOUBLE-URI-encoded for every service except S3 (Bedrock included): AWS
+    // re-encodes the already-encoded path it receives before recomputing the signature, so the
+    // signature must be taken over the double-encoded form. Using the single-encoded path for BOTH
+    // (as before) makes any path with an encodable char — every Bedrock model id has a `:` — fail
+    // with SignatureDoesNotMatch (403). The signature-blind mock cannot catch this; only a real
+    // upstream does, so it was invisible to the harness. For paths with no encodable chars
+    // (openai/anthropic `/v1/...`) `uri_encode_path` is a no-op and canonical == wire, unchanged.
+    let (path, query) = match url_path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (url_path, None),
+    };
+    let wire_path = crate::sigv4::uri_encode_path(path);
+    let canonical = crate::sigv4::uri_encode_path(&wire_path); // double-encode (non-S3 SigV4 rule)
+    let wire = match query {
+        Some(q) => format!("{wire_path}?{q}"),
+        None => wire_path,
+    };
+    (wire, canonical)
 }
 
 /// Build outbound auth headers for a lane. Defaults to the protocol's native auth via
@@ -2103,6 +2111,37 @@ fn coerce_on_error(
             order: candidates.iter().map(|c| c.idx).collect(),
             name: policy_name,
         },
+    }
+}
+
+#[cfg(test)]
+mod sigv4_path_tests {
+    use super::sign_and_wire_path_parts;
+
+    /// Bedrock model ids contain `:` (e.g. `amazon.titan-embed-text-v2:0`). AWS double-URI-encodes
+    /// the canonical path for non-S3 services, so the SIGNED canonical must be double-encoded
+    /// (`%253A`) while the wire path is single-encoded (`%3A`). Using the single-encoded path for
+    /// BOTH (the historical bug) yields SignatureDoesNotMatch → 403 against real AWS on EVERY Bedrock
+    /// request — invisible to the signature-blind mock, confirmed only by a real InvokeModel/Converse
+    /// call. Pin both encodings so this cannot silently regress.
+    #[test]
+    fn sigv4_canonical_double_encodes_bedrock_colon_path() {
+        let (wire, canonical) =
+            sign_and_wire_path_parts("/model/amazon.titan-embed-text-v2:0/invoke");
+        assert_eq!(wire, "/model/amazon.titan-embed-text-v2%3A0/invoke", "wire = single-encoded");
+        assert_eq!(
+            canonical, "/model/amazon.titan-embed-text-v2%253A0/invoke",
+            "SigV4 canonical = double-encoded (non-S3 rule)"
+        );
+    }
+
+    /// Colon-free paths (openai/anthropic `/v1/...`) are unaffected: `uri_encode_path` is a no-op, so
+    /// canonical == wire and nothing changed for the bearer-auth protocols.
+    #[test]
+    fn sigv4_plain_path_canonical_equals_wire() {
+        let (wire, canonical) = sign_and_wire_path_parts("/v1/chat/completions");
+        assert_eq!(wire, "/v1/chat/completions");
+        assert_eq!(canonical, wire);
     }
 }
 

@@ -53,6 +53,7 @@ impl RequestHandler for OpenAiRequestHandler {
 
 // -------------------------------------------------- audio cells (real codecs, cross-protocol)
 
+use crate::billing::Billing;
 use crate::ir::audio::{SpeechReq, SpeechResp, TranscriptionReq, TranscriptionResp};
 use crate::media::{base64_decode, MediaBlob, MediaPayload};
 
@@ -173,16 +174,49 @@ impl OperationHandler for OpenAiTranscription {
         Bytes::from(out)
     }
     fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
-        // OpenAI transcription is `{"text": "..."}` (json) or bare text (response_format=text).
-        let text = match serde_json::from_slice::<Value>(wire) {
-            Ok(v) => v.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
-            Err(_) => String::from_utf8_lossy(wire).into_owned(),
+        // OpenAI transcription is `{"text": "..."}` (json) or bare text (response_format=text). The
+        // real API also carries `usage` — whisper-1 DURATION (`{type:"duration",seconds}`), the
+        // gpt-4o-transcribe models TOKENS — captured from the live API (2026-07-10). Both → Billing.
+        let (text, usage) = match serde_json::from_slice::<Value>(wire) {
+            Ok(v) => {
+                let text = v.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+                (text, v.get("usage").and_then(parse_transcription_usage))
+            }
+            Err(_) => (String::from_utf8_lossy(wire).into_owned(), None),
         };
-        Ok(IrResp::Transcription(TranscriptionResp { text, ..Default::default() }))
+        Ok(IrResp::Transcription(TranscriptionResp { text, usage, ..Default::default() }))
     }
     fn write_response(&self, ir: &IrResp) -> WireBody {
         let IrResp::Transcription(r) = ir else { return WireBody::json(Bytes::new()) };
-        WireBody::json(Bytes::from(serde_json::to_vec(&json!({ "text": r.text })).unwrap_or_default()))
+        let mut body = json!({ "text": r.text });
+        // Surface the billable usage in OpenAI's own transcription shape — duration or tokens.
+        match &r.usage {
+            Some(Billing::Duration { seconds }) => {
+                body["usage"] = json!({ "type": "duration", "seconds": seconds });
+            }
+            Some(Billing::Tokens(t)) => {
+                body["usage"] = json!({ "type": "tokens", "input_tokens": t.input,
+                    "output_tokens": t.output, "total_tokens": t.input + t.output });
+            }
+            _ => {}
+        }
+        WireBody::json(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
+    }
+}
+
+/// OpenAI transcription `usage` → `Billing`: `{type:"duration",seconds}` (whisper) or a token shape.
+fn parse_transcription_usage(u: &Value) -> Option<Billing> {
+    match u.get("type").and_then(Value::as_str) {
+        Some("duration") => {
+            u.get("seconds").and_then(Value::as_f64).map(|seconds| Billing::Duration { seconds })
+        }
+        _ => u.get("input_tokens").and_then(Value::as_u64).map(|input| {
+            Billing::Tokens(crate::billing::TokenUsage {
+                input,
+                output: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+                ..Default::default()
+            })
+        }),
     }
 }
 
@@ -623,5 +657,41 @@ mod tests {
         assert_eq!(back["results"][0]["categories"]["violence"], true);
         assert_eq!(back["results"][0]["category_scores"]["violence"], 0.9);
         assert_eq!(back["id"], "modr-1");
+    }
+
+    /// Real OpenAI transcription usage (captured from the live API 2026-07-10): whisper-1 reports
+    /// DURATION (`{type:"duration",seconds}` → `Billing::Duration`); gpt-4o-transcribe reports TOKENS.
+    /// The cell must parse both from the wire and re-emit them in OpenAI's own transcription shape.
+    #[test]
+    fn transcription_usage_duration_round_trips() {
+        let cell = OpenAiTranscription;
+        let wire = br#"{"text":"Hello there?","usage":{"type":"duration","seconds":1}}"#;
+        let ir = cell.read_response(wire).unwrap();
+        let IrResp::Transcription(ref r) = ir else { panic!("expected transcription IR") };
+        assert!(matches!(r.usage, Some(Billing::Duration { seconds }) if (seconds - 1.0).abs() < 1e-9));
+        let back: Value = serde_json::from_slice(&cell.write_response(&ir).bytes).unwrap();
+        assert_eq!(back["text"], "Hello there?");
+        assert_eq!(back["usage"]["type"], "duration");
+        assert_eq!(back["usage"]["seconds"], 1.0);
+    }
+
+    #[test]
+    fn transcription_usage_tokens_round_trips() {
+        // A cross-protocol transcript whose usage arrived as tokens (e.g. Gemini) → OpenAI token shape.
+        let cell = OpenAiTranscription;
+        let ir = IrResp::Transcription(crate::ir::audio::TranscriptionResp {
+            text: "hi".into(),
+            usage: Some(Billing::Tokens(crate::billing::TokenUsage {
+                input: 11,
+                output: 3,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let back: Value = serde_json::from_slice(&cell.write_response(&ir).bytes).unwrap();
+        assert_eq!(back["usage"]["type"], "tokens");
+        assert_eq!(back["usage"]["input_tokens"], 11);
+        assert_eq!(back["usage"]["output_tokens"], 3);
+        assert_eq!(back["usage"]["total_tokens"], 14);
     }
 }
