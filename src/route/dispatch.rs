@@ -204,22 +204,22 @@ pub(crate) async fn protocol_dispatch(
             "method not allowed for this resource",
         );
     }
-    // THE DELETION SWITCH — chat is a standard operation. Before any chat arm runs, the protocol's
-    // RequestHandler must actually HOLD a chat OperationHandler; an absent handler is the same
-    // no-handler 404 (in the caller's dialect) every other operation gets. Delete a protocol's
-    // `static CHAT` + registry arm and its chat dies here while everything else keeps working.
+    // THE UNIVERSAL RULE — we only process operations for which the protocol HOLDS an
+    // OperationHandler; otherwise 404 in the caller's dialect. No operation is special: chat,
+    // embeddings, audio — same consult, same terminal. Delete any protocol's handler for any
+    // operation (its registry arm) and that operation dies HERE while everything else keeps working.
+    // (`resolve_operation` = the RequestHandler naming the operation; `None` falls through to the
+    // protocol arms, which own their native unknown-action envelopes.)
     if let Some(rh) = crate::handlers::request_handler(proto) {
-        if rh.resolve_operation(&path, &body) == Some(crate::operation::Operation::Chat)
-            && rh
-                .operation_handler(crate::operation::Operation::Chat)
-                .is_none()
-        {
-            return crate::forward::ingress_error(
-                proto,
-                StatusCode::NOT_FOUND,
-                crate::forward::KIND_NOT_FOUND,
-                "This endpoint does not support that operation.",
-            );
+        if let Some(op) = rh.resolve_operation(&path, &body) {
+            if rh.operation_handler(op).is_none() {
+                return crate::forward::ingress_error(
+                    proto,
+                    StatusCode::NOT_FOUND,
+                    crate::forward::KIND_NOT_FOUND,
+                    "This endpoint does not support that operation.",
+                );
+            }
         }
     }
     match proto {
