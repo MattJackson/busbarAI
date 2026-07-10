@@ -4,7 +4,7 @@
 
 <h1 align="center">Busbar</h1>
 
-<p align="center"><strong>The reliability layer for LLM traffic.</strong> A self-hosted control plane in a single Rust binary: one endpoint speaks every major SDK; fault-aware circuit breaking and in-flight failover keep your app serving when your providers aren't.</p>
+<p align="center"><strong>Your AI Control Plane.</strong> Self-hosted, in a single Rust binary: one endpoint speaks every major SDK; fault-aware circuit breaking and in-flight failover keep your app serving when your providers aren't.</p>
 
 [![CI](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/MattJackson/busbarAI?include_prereleases)](https://github.com/MattJackson/busbarAI/releases)
