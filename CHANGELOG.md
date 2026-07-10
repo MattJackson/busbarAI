@@ -9,6 +9,52 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Deprecated**, **Removed**, **Fixed**, **Security**. Migration steps for a breaking change
 appear as a bold **Migration** item under **Changed**.
 
+## [Unreleased]
+
+Busbar now speaks more than chat. Four new operations land on top of chat —
+**Embeddings**, **Moderations**, **Image generation**, and **Audio** (transcription and
+speech) — and every one is **cross-protocol**, the same lossless translation that already
+carried chat. An OpenAI-dialect client can call embeddings, images, or audio against an
+Amazon Bedrock, Google Gemini, or Cohere backend and get the response back in its own
+dialect; the round trip is lossless in both directions, errors included. Chat was
+operation #1; it is byte-for-byte unchanged, the acceptance harness passes 58/58 offline.
+
+### Added
+
+- **Embeddings (`/v1/embeddings` and each protocol's native surface), cross-protocol.**
+  An OpenAI-dialect embeddings request routes to **OpenAI**, **Amazon Bedrock** (Titan),
+  **Cohere** (v2 `/embed`), or **Google Gemini** (`embedContent`) and returns in the
+  caller's own dialect. Vectors, token/usage accounting, and errors all survive the hop.
+- **Moderations (`/v1/moderations`), cross-protocol.** Content-classification requests
+  translate through the IR and return in the caller's dialect, so a moderation call is not
+  pinned to one vendor's endpoint.
+- **Image generation, cross-protocol.** An OpenAI-dialect image request routes to
+  **OpenAI**, **Google Gemini** (Imagen), or **Amazon Bedrock** (Titan) and comes back in
+  the caller's dialect.
+- **Audio, cross-protocol.** **Transcription** (speech-to-text, including
+  speech-to-English translation) and **Speech** (text-to-speech) against **OpenAI** and
+  **Google Gemini** backends, translated to and from the caller's dialect like every other
+  operation.
+- **Clean, dialect-native 404 for an operation a backend lacks.** Calling an operation a
+  backend does not implement (e.g. image generation on an Anthropic backend) returns a
+  well-formed 404 **in the caller's own protocol dialect** — never a crash, never a
+  malformed body, and never taking the lane down for other traffic.
+
+### Changed
+
+- **Every operation is lossless across protocols, errors included.** Responses *and*
+  error envelopes always come back in the caller's own protocol dialect, and token/usage
+  accounting survives the cross-protocol round trip on every operation, not just chat.
+- **Four-layer operation architecture (internal).** The request path is now
+  Router → RequestHandler → OperationHandler → IR, where each operation is a small codec
+  over the shared reliability engine and chat is operation #1 rather than a special case.
+  Adding an operation is a codec, not a change to routing, failover, or the breaker. No
+  user-visible behavior change to chat.
+- **Billing is now a polymorphic data model (internal).** Usage is metered as tokens,
+  duration, characters, images, or a flat unit depending on the operation, so non-chat
+  operations meter on their natural axis. A pricing engine that turns these units into cost
+  is planned for 1.3.
+
 ## [1.1.1], 2026-07-09
 
 ### Added

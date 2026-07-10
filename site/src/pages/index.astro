@@ -3,7 +3,6 @@
 // coexisting with the Starlight docs served at /getting-started/, /reliability/, etc.
 // src/pages/ takes routing precedence over the Starlight content collection, so this
 // owns "/" while every docs route is untouched.
-import glyphLime from '../assets/busbar-glyph-lime.svg';
 import glyphWhite from '../assets/busbar-glyph-white.svg';
 import glyphPrimary from '../assets/busbar-primary.svg';
 import Nav from '../components/Nav.astro';
@@ -14,7 +13,7 @@ const DOCS = '/docs/why-busbar/';
 
 const ORG = { '@context': 'https://schema.org', '@type': 'Organization', name: 'Busbar', url: 'https://getbusbar.com', logo: 'https://getbusbar.com/favicon.svg', sameAs: ['https://github.com/MattJackson/busbarAI'] };
 const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'Busbar', url: 'https://getbusbar.com' };
-const SOFTWARE = { '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Busbar', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows', offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }, url: 'https://getbusbar.com', description: 'The self-hosted control plane for LLM traffic: lossless cross-protocol translation, fault-aware circuit breaking, and in-flight failover in one static Rust binary.' };
+const SOFTWARE = { '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Busbar', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows', offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }, url: 'https://getbusbar.com', description: 'Your AI control plane: a single self-hosted Rust binary between your applications and every AI provider — lossless cross-protocol translation, fault-attributed circuit breaking, and in-flight streaming-safe failover, running in your own infrastructure.' };
 
 const protocols = ['OpenAI', 'Anthropic', 'Gemini', 'Bedrock', 'Cohere', 'Responses'];
 
@@ -95,18 +94,18 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Busbar: One endpoint. Every LLM protocol. Losslessly.</title>
+    <title>Busbar: Your AI control plane. Self-hosted, single Rust binary.</title>
     <meta
       name="description"
-      content="Self-hosted LLM gateway and control plane in a single Rust binary. One endpoint speaks OpenAI, Anthropic, Gemini, Bedrock, Cohere, and Responses, routing to weighted pools, translating losslessly, and failing over through provider outages before your user sees a byte."
+      content="Your AI control plane. Busbar is a single self-hosted Rust binary between your applications and every AI provider — routing, lossless cross-protocol translation, and in-flight failover, all in your own infrastructure. Nothing phones home."
     />
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <meta property="og:title" content="Busbar: One endpoint. Every LLM protocol. Losslessly." />
+    <meta property="og:title" content="Busbar: Your AI control plane." />
     <meta
       property="og:description"
-      content="The self-hosted control plane for LLM traffic, in a single Rust binary. Speaks six wire protocols, routes to weighted pools, and fails over through outages."
+      content="Your AI control plane, self-hosted in a single Rust binary. Sits between your applications and every AI provider — routing, lossless translation, and in-flight failover, all in your own infrastructure."
     />
     <meta property="og:image" content="https://getbusbar.com/og-card.png" />
     <meta property="og:url" content="https://getbusbar.com/" />
@@ -122,29 +121,94 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
   <body>
     <Nav />
 
-    <!-- HERO -->
+    <!-- HERO (business-clarity beat 1, diagram + code as proof beats after) -->
     <section class="hero">
-      <div class="wrap hero-grid">
-        <div class="hero-copy">
-          <div class="eyebrow"><span class="eyebrow-full">The self-hosted LLM control plane · single Rust binary</span><span class="eyebrow-short">Self-hosted · single Rust binary</span></div>
-          <h1>One endpoint.<br /><span class="accent">Every LLM protocol.</span><br />Losslessly.</h1>
-          <p class="lede">
-            Busbar is the control plane between your application and every provider it calls.
-            Point any SDK at one URL: it routes to the backends you choose, translates across six
-            wire protocols without dropping a feature, and keeps serving through provider failures
-            before your user sees a byte.
-          </p>
-          <div class="cta-row">
-            <a href="/docs/getting-started/" class="btn">Get started</a>
-            <a href="/download/" class="btn btn-ghost">Download</a>
-            <a href={DOCS} class="btn btn-text">Read the docs →</a>
+      <div class="wrap hero-lead">
+        <!-- BEAT 1: the business claim, in words -->
+        <div class="eyebrow">AI control plane · self-hosted · single Rust binary</div>
+        <h1>Your <span class="accent">AI&nbsp;control&nbsp;plane</span></h1>
+        <p class="lede">
+          Busbar is a single binary you run in your own infrastructure, sitting between your
+          applications and every AI provider. One endpoint to route and fail over across
+          providers, enforce hard budget caps, provision or revoke access, and see every
+          request’s cost, latency, and traffic — all on your own compute.
+        </p>
+      </div>
+
+      <!-- BEAT 2: the "how it works" diagram — any client · 6 protocols → busbar →
+           any provider backend. Above the fold. -->
+      <div class="wrap">
+        <div class="diagram hero-diagram">
+          <div class="col col-clients">
+            <div class="col-label">Any client · 6 protocols</div>
+            <div class="node">OpenAI · Anthropic</div>
+            <div class="node">Gemini · Bedrock</div>
+            <div class="node">Cohere · Responses</div>
           </div>
-          <div class="proto-row" aria-label="Supported protocols">
-            {protocols.map((p) => <span class="proto">{p}</span>)}
+
+          <div class="link-zone">
+            <span class="hop-tls">TLS · mTLS</span>
+            <svg viewBox="0 0 120 220" preserveAspectRatio="none" aria-hidden="true">
+              <path d="M0 30 C 70 30, 50 110, 120 110" />
+              <path d="M0 110 H 120" />
+              <path d="M0 190 C 70 190, 50 110, 120 110" />
+            </svg>
+          </div>
+
+          <div class="col col-busbar">
+            <div class="busbar-box">
+              <div class="bb-title"><img src={glyphWhite.src} alt="" width="22" height="22" /> Busbar</div>
+              <div class="bb-tags">
+                <span>translate</span><span>route</span><span>failover</span><span>govern</span>
+              </div>
+              <div class="bb-sub">one endpoint · :8080</div>
+            </div>
+            <svg class="hook-line" viewBox="0 0 2 34" preserveAspectRatio="none" aria-hidden="true"><line x1="1" y1="0" x2="1" y2="34" /></svg>
+            <div class="hook-out">Hooks · your policy on the path</div>
+          </div>
+
+          <div class="link-zone" aria-hidden="true">
+            <svg viewBox="0 0 120 220" preserveAspectRatio="none">
+              <path d="M0 110 C 70 110, 50 30, 120 30" />
+              <path d="M0 110 H 120" />
+              <path d="M0 110 C 70 110, 50 190, 120 190" />
+            </svg>
+          </div>
+
+          <div class="col col-providers">
+            <div class="col-label">Backends · any provider</div>
+            <div class="node">Anthropic · OpenAI</div>
+            <div class="node">Gemini · Bedrock</div>
+            <div class="node node-more">+ more</div>
           </div>
         </div>
 
-        <div class="hero-demo" aria-hidden="false">
+        <!-- CTA row: below the diagram -->
+        <div class="cta-row">
+          <a href="/docs/getting-started/" class="btn">Get started</a>
+          <a href="/download/" class="btn btn-ghost">Download</a>
+          <a href={DOCS} class="btn btn-text">Read the docs →</a>
+        </div>
+
+        <div class="proto-row" aria-label="Supported protocols">
+          {protocols.map((p) => <span class="proto">{p}</span>)}
+        </div>
+      </div>
+    </section>
+
+    <!-- BEAT 3: adoption is a two-line swap (the code diff, demoted from the lead) -->
+    <section class="adopt wrap">
+      <div class="adopt-grid">
+        <div class="adopt-copy">
+          <h2>Adopting it is a two-line swap.</h2>
+          <p>
+            Already speak OpenAI? Point the SDK at busbar and pick a pool by name. The request
+            below, left as OpenAI, may have been served by Anthropic and came back as OpenAI —
+            translated both ways.
+          </p>
+          <p class="adopt-kicker"><strong>The model name is a config value, not a code dependency.</strong></p>
+        </div>
+        <div class="hero-demo">
           <div class="code-card">
             <div class="code-head">
               <span class="dot"></span><span class="dot"></span><span class="dot"></span>
@@ -152,78 +216,32 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
             </div>
             <pre><code set:html={heroCode}></code></pre>
           </div>
-          <p class="demo-note">
-            Left as OpenAI, may have been served by Anthropic, came back as OpenAI, translated both
-            ways. If a lane returned 429 mid-flight, Busbar rerouted before your client saw a byte.
-            <strong>The model name is a config value, not a code dependency.</strong>
-          </p>
         </div>
+      </div>
+    </section>
+
+    <!-- BEAT 4: sovereignty callout — the P3/P4 hammer, one confident band -->
+    <section class="sovereignty">
+      <div class="wrap">
+        <p>
+          A control plane you rent is still someone else’s. Busbar is one static binary in your
+          infrastructure — <strong>inspect it, pin it, run it air-gapped.</strong> Nothing has to
+          leave your network.
+        </p>
       </div>
     </section>
 
     <!-- CORE IDEA -->
     <section class="core wrap">
       <div class="core-inner">
-        <h2>Any protocol in. Any backend out.</h2>
+        <h2>No model list to be on.</h2>
         <p>
-          You define a model name and the backends behind it. Busbar accepts <em>any</em> input
-          protocol (OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses) and routes and
-          translates accordingly. One model name, reachable by every client; you choose what runs
-          behind it. This is not another proxy with a long model list. There is
-          no privileged protocol and no model list to be on: providers speak about six languages
-          between them, Busbar speaks all six, so a new model works the day it ships. <strong>The
-          model name is a config value, not a release note.</strong> See for yourself:
-          <a href="/build/">pick your models, get the config</a>.
+          Busbar isn’t another proxy with a curated model catalog. You define a model name and the
+          backends behind it — there’s no privileged protocol and no allowlist to wait for.
+          Providers speak about six languages between them; Busbar speaks all six, so
+          <strong>a new model works the day it ships, not the day we add it.</strong> See for
+          yourself: <a href="/build/">pick your models, get the config</a>.
         </p>
-      </div>
-    </section>
-
-    <!-- HOW IT WORKS DIAGRAM -->
-    <section class="flow wrap">
-      <h2 class="section-title">How it works</h2>
-      <div class="diagram">
-        <div class="col col-clients">
-          <div class="col-label">Any client · 6 protocols</div>
-          <div class="node">OpenAI · Anthropic</div>
-          <div class="node">Gemini · Bedrock</div>
-          <div class="node">Cohere · Responses</div>
-        </div>
-
-        <div class="link-zone">
-          <span class="hop-tls">TLS · mTLS</span>
-          <svg viewBox="0 0 120 220" preserveAspectRatio="none" aria-hidden="true">
-            <path d="M0 30 C 70 30, 50 110, 120 110" />
-            <path d="M0 110 H 120" />
-            <path d="M0 190 C 70 190, 50 110, 120 110" />
-          </svg>
-        </div>
-
-        <div class="col col-busbar">
-          <div class="busbar-box">
-            <div class="bb-title"><img src={glyphWhite.src} alt="" width="22" height="22" /> Busbar</div>
-            <div class="bb-tags">
-              <span>translate</span><span>route</span><span>failover</span><span>govern</span>
-            </div>
-            <div class="bb-sub">one endpoint · :8080</div>
-          </div>
-          <svg class="hook-line" viewBox="0 0 2 34" preserveAspectRatio="none" aria-hidden="true"><line x1="1" y1="0" x2="1" y2="34" /></svg>
-          <div class="hook-out">Hooks · your policy on the path</div>
-        </div>
-
-        <div class="link-zone" aria-hidden="true">
-          <svg viewBox="0 0 120 220" preserveAspectRatio="none">
-            <path d="M0 110 C 70 110, 50 30, 120 30" />
-            <path d="M0 110 H 120" />
-            <path d="M0 110 C 70 110, 50 190, 120 190" />
-          </svg>
-        </div>
-
-        <div class="col col-providers">
-          <div class="col-label">Backends · any provider</div>
-          <div class="node">Anthropic · OpenAI</div>
-          <div class="node">Gemini · Bedrock</div>
-          <div class="node node-more">+ more</div>
-        </div>
       </div>
     </section>
 
@@ -244,7 +262,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
     <!-- ONE PROVIDER TODAY -->
     <section class="core wrap">
       <div class="core-inner">
-        <h2>Already committed to one provider?</h2>
+        <h2>Already committed to one AI provider?</h2>
         <p>
           Busbar pays for itself before the second provider exists. Run it as a straight
           passthrough and your posture improves the same day: the provider key moves out of every
@@ -428,27 +446,66 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           linear-gradient(180deg, #fff 0%, var(--bg-soft) 100%);
         border-bottom: 1px solid var(--line);
       }
-      .hero-grid {
-        display: grid; grid-template-columns: 1.05fr 1fr; gap: 56px;
-        align-items: center; padding: 86px 28px 78px;
-      }
+      /* Beat 1 is a centered column: the slogan reads as a category definition, centered.
+         Kept compact so the diagram (beat 2) lands above the fold. */
+      .hero-lead { max-width: 48rem; margin: 0 auto; padding-top: 56px; padding-bottom: 4px; text-align: center; }
       .eyebrow {
         display: inline-block; font-size: 12.5px; font-weight: 600; letter-spacing: 0.04em;
         text-transform: uppercase; color: var(--muted);
         background: #fff; border: 1px solid var(--line); border-radius: 999px;
         padding: 5px 13px; margin-bottom: 22px;
+        /* The eyebrow carries the sovereignty proof and the "AI control plane" keyword; it must
+           render in full at every width. Let the pill wrap rather than ever truncate or clip it. */
+        max-width: 100%; white-space: normal; overflow-wrap: break-word;
       }
-      .eyebrow-short { display: none; }
-      .hero h1 { font-size: clamp(38px, 5.4vw, 60px); font-weight: 800; letter-spacing: -0.035em; }
+      /* The canonical slogan is the H1 — "control plane" must never trim. `text-wrap: balance`
+         plus per-word non-breaking joins ("AI control plane") keep the phrase whole; it wraps as
+         a unit rather than clipping. Sized to fit the two-word category on one line on desktop and
+         wrap cleanly on phones without overflow. */
+      .hero h1 {
+        font-size: clamp(38px, 6vw, 64px); font-weight: 800; letter-spacing: -0.035em;
+        text-wrap: balance; max-width: 100%; overflow-wrap: break-word;
+      }
       .hero h1 .accent { color: #4d7c0f; }
-      .lede { font-size: 18.5px; color: #334155; max-width: 36em; margin: 22px 0 30px; }
-      .cta-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-      .proto-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 34px; }
+      .lede { font-size: 18.5px; color: #334155; max-width: 38em; margin: 22px auto 4px; }
+
+      /* CTA row sits below the diagram, centered. */
+      .cta-row { display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; margin-top: 24px; }
+      .proto-row { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 22px; padding-bottom: 78px; }
       .proto {
         font-size: 12.5px; font-weight: 600; color: var(--charcoal);
         background: #fff; border: 1px solid var(--line); border-radius: 7px; padding: 5px 11px;
       }
       .proto::before { content: '●'; color: var(--lime); font-size: 9px; margin-right: 7px; vertical-align: 1.5px; }
+
+      /* HERO DIAGRAM (beat 2): the "how it works" grid, above the fold.
+         `.diagram` supplies its own frame; here we just cap width, center, and
+         soften the padding for the hero context. */
+      .hero-diagram {
+        margin: 14px auto 8px; max-width: 940px;
+        padding: 34px 26px 68px;
+        box-shadow: 0 18px 44px -26px rgba(15,23,42,0.18);
+      }
+
+      /* ADOPT (beat 3 — demoted code diff) */
+      .adopt { padding: 40px 28px 8px; }
+      .adopt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 44px; align-items: center; }
+      .adopt-copy h2 { font-size: clamp(26px, 3.2vw, 36px); font-weight: 800; }
+      .adopt-copy p { font-size: 17px; color: #334155; margin-top: 18px; max-width: 34em; }
+      .adopt-copy strong { color: var(--slate); font-weight: 600; }
+      /* The payoff line stands on its own, a touch larger, with a lime rule to set it apart. */
+      .adopt-kicker { font-size: 18px; margin-top: 20px; padding-left: 14px; border-left: 3px solid var(--lime); }
+      .adopt-kicker strong { color: var(--slate); font-weight: 700; }
+
+      /* SOVEREIGNTY band (beat 4 — the P3/P4 hammer) */
+      .sovereignty { padding: 56px 0; }
+      .sovereignty .wrap { display: flex; justify-content: center; }
+      .sovereignty p {
+        max-width: 52rem; text-align: center; margin: 0;
+        font-size: clamp(19px, 2.4vw, 24px); font-weight: 600; line-height: 1.45;
+        color: var(--slate); letter-spacing: -0.01em;
+      }
+      .sovereignty strong { color: #4d7c0f; font-weight: 700; }
 
       /* CODE CARD */
       .hero-demo { min-width: 0; }
@@ -590,7 +647,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       @media (max-width: 900px) {
         /* Two-column sections collapse to one column. These are SEPARATE elements,
            so the selector must be a list (`.a, .b`), not a compound (`.a.b`). */
-        .hero-grid, .qs-grid { grid-template-columns: 1fr; gap: 40px; }
+        .qs-grid, .adopt-grid { grid-template-columns: 1fr; gap: 32px; }
         .feature-grid { grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(3, auto 1fr auto); }
         /* Diagram: collapse to a vertical stack, hide the SVG connectors. */
         .diagram { grid-template-columns: 1fr; gap: 0; padding: 32px 20px; }
@@ -606,16 +663,19 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         .footer-cols { grid-template-columns: repeat(2, 1fr); }
       }
       @media (max-width: 640px) {
-        /* Shorter eyebrow so it stays on one clean line, and smaller code so the
-           samples fit without truncating at the card edge on common phones. */
-        .eyebrow-full { display: none; }
-        .eyebrow-short { display: inline; }
+        /* On phones the eyebrow becomes a full-width rounded block so the whole
+           slogan (incl. "control plane") wraps and reads cleanly. Smaller code so
+           the samples fit without truncating at the card edge on common phones. */
+        .eyebrow { display: block; border-radius: 14px; text-align: center; }
+        /* Diagram collapses to a vertical stack via its own 900px rule; soften padding here. */
+        .hero-diagram { padding: 8px 20px 8px; }
         .code-card pre { padding: 18px 16px; }
         .code-card code { font-size: 11px; }
         .qs-block code { font-size: 12px; }
         .feature-grid { grid-template-columns: 1fr; grid-template-rows: repeat(6, auto 1fr auto); }
         .trust-grid { grid-template-columns: repeat(2, 1fr); }
-        .hero-grid { padding: 48px 20px 44px; }
+        .hero-lead { padding-top: 44px; }
+        .proto-row { padding-bottom: 44px; }
         .quickstart { padding: 56px 0; }
         .core { padding: 64px 20px; }
         .core p { font-size: 17px; }
@@ -632,7 +692,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       @media (max-width: 420px) {
         .eyebrow { font-size: 11px; letter-spacing: 0.03em; }
         .wrap { padding: 0 16px; }
-        .hero-grid { padding: 40px 16px 36px; }
+        .hero-lead { padding-top: 38px; }
         .diagram { padding: 24px 16px; }
         .footer-cols { grid-template-columns: 1fr; }
         .trust-grid { grid-template-columns: 1fr; }

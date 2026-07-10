@@ -45,26 +45,29 @@
   letter-spacing: 0.01em;
 }
 
-/* Docs on wide screens: Starlight splits the leftover width evenly around the
-   content column, which opens a dead gap between the sidebar and the text.
-   Keep the content against the sidebar; the "On this page" rail follows it,
-   and the spare width all lands on the right. */
+/* Docs on wide screens: Starlight's default 45rem content column leaves the
+   whole right third of a wide viewport empty (content + TOC hug the sidebar,
+   dead space on the right). Rather than fight Starlight's centering math, we
+   widen the content column responsively so the text + "On this page" rail
+   spread across the available width and the page reads as balanced. Starlight
+   keeps the content centered in the gap between the sidebars, so the left nav
+   and right TOC are untouched. */
 @media (min-width: 72em) {
-  .main-pane.main-pane {
-    --sl-content-margin-inline: 0 auto;
-    width: min(100%, calc(var(--sl-content-width) + 2 * var(--sl-content-pad-x)));
-  }
-  .right-sidebar-container.right-sidebar-container {
-    flex: 1;
-    width: auto;
+  :root {
+    --sl-content-width: 56rem;
   }
 }
 
-/* Ultra-wide screens: with the content pinned against the sidebar, the leftover
-   width all lands on the right. Let the content column grow into it so long
-   tables and code blocks get the room, keeping a sane right margin. */
+@media (min-width: 90em) {
+  :root {
+    --sl-content-width: 64rem;
+  }
+}
+
+/* Ultra-wide screens: keep growing the column so long tables and code blocks
+   get the room, while a sane right margin remains. */
 @media (min-width: 110em) {
   :root {
-    --sl-content-width: 85rem;
+    --sl-content-width: 78rem;
   }
 }

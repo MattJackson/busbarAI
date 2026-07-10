@@ -25,7 +25,17 @@ try {
       <img src={glyphPrimary.src} alt="" width="30" height="30" />
       <span>Busbar</span>
     </a>
-    <nav class="nav-links">
+    <button
+      class="nav-toggle"
+      type="button"
+      aria-label="Menu"
+      aria-expanded="false"
+      aria-controls="nav-links"
+    >
+      <svg class="ico-menu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      <svg class="ico-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
+    </button>
+    <nav class="nav-links" id="nav-links">
       <a href={DOCS}>Docs</a>
       <a href="/faq/">FAQ</a>
       <a href="/blog/">Blog</a>
@@ -59,21 +69,54 @@ try {
   .nav-links a.star-link .star-count { font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .nav-links a.star-link .gh-logo { width: 1.3em; height: 1.3em; color: var(--charcoal, #1e293b); }
   .nav-links a.star-link:hover .gh-logo { color: var(--slate, #0f172a); }
-  @media (max-width: 640px) {
-    .nav-links { gap: 14px; }
+
+  /* Hamburger toggle: hidden on desktop, shown on phones. */
+  .nav-toggle {
+    display: none; align-items: center; justify-content: center;
+    width: 44px; height: 44px; margin: 0 -8px 0 0; padding: 0;
+    background: none; border: 0; color: var(--charcoal, #1e293b); cursor: pointer;
   }
-  /* Download is also in the hero and footer; drop it from the nav on phones so the
-     header can never overflow the viewport. */
-  @media (max-width: 520px) {
-    .nav-links a[href='/download/'] { display: none; }
-  }
-  @media (max-width: 420px) {
-    .nav-links { gap: 10px; font-size: 13.5px; }
-  }
-  @media (max-width: 360px) {
-    .nav-links a[href='/blog/'] { display: none; }
+  .nav-toggle svg { width: 24px; height: 24px; }
+  .nav-toggle .ico-close { display: none; }
+  .nav-toggle[aria-expanded='true'] .ico-menu { display: none; }
+  .nav-toggle[aria-expanded='true'] .ico-close { display: block; }
+
+  @media (max-width: 700px) {
+    .nav-toggle { display: inline-flex; }
+    /* Off-canvas dropdown holding the full nav; every link stays reachable. */
+    .nav-links {
+      position: absolute; top: 100%; left: 0; right: 0;
+      flex-direction: column; align-items: stretch; gap: 0;
+      background: #fff; border-bottom: 1px solid var(--line, #e2e8f0);
+      box-shadow: 0 12px 24px rgba(15, 23, 42, 0.08);
+      padding: 8px 20px 16px; font-size: 16px;
+      display: none;
+    }
+    .nav-links.open { display: flex; }
+    .nav-links a {
+      display: flex; align-items: center; gap: 0.5em;
+      padding: 12px 4px; min-height: 44px;
+      border-bottom: 1px solid var(--line, #e2e8f0);
+    }
+    .nav-links a:last-child { border-bottom: 0; }
   }
 </style>
+
+<script is:inline>
+  // Mobile hamburger: toggle the nav dropdown; close it on link tap or Escape.
+  (() => {
+    const btn = document.querySelector('.nav-toggle');
+    const links = document.getElementById('nav-links');
+    if (!btn || !links) return;
+    const setOpen = (open) => {
+      links.classList.toggle('open', open);
+      btn.setAttribute('aria-expanded', String(open));
+    };
+    btn.addEventListener('click', () => setOpen(btn.getAttribute('aria-expanded') !== 'true'));
+    links.addEventListener('click', (e) => { if (e.target.closest('a')) setOpen(false); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setOpen(false); });
+  })();
+</script>
 
 <script is:inline>
   // Same-origin /api/stars first (a Cloudflare Worker; content blockers like Brave

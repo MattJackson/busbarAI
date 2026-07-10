@@ -23,13 +23,8 @@ use crate::proto::{convert_headers, StatusClass};
 use crate::state::{App, WeightedLane};
 use crate::store::{now, Permit};
 
-/// At a cross-protocol translation boundary, ensure the IR carries `max_tokens` when the egress
-/// protocol REQUIRES one (Anthropic Messages) but the source request omitted it (legal for OpenAI).
-/// Without this the upstream 400s with `max_tokens: Field required`. Uses the lane's configured
-/// `default_max_tokens`, falling back to `crate::proto::DEFAULT_MAX_TOKENS`. No-op when the IR
-/// already carries a value or the egress protocol treats `max_tokens` as optional.
-// (max-tokens defaulting moved into `IrReq::prepare_for_egress` — the IR owns its cross-protocol
-// semantics; the engine is operation-blind. The unit tests below exercise it through the IR method.)
+// NOTE: cross-protocol max-tokens defaulting lives in `IrReq::prepare_for_egress` — the IR owns its
+// cross-protocol semantics; the engine is operation-blind. Precedence unit tests drive the IR method.
 
 /// The two `x-busbar-*` TRANSPARENCY response headers stamped when a non-default routing policy
 /// chose the target lane: the policy name and the chosen lane's model. Hoisted to consts so the
