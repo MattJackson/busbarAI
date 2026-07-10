@@ -76,13 +76,23 @@ impl OpDispatch {
     }
 }
 
-/// Chat — operation #1. The dispatch handle the chat ingress and the engine's tests thread; it wraps
-/// the shared chat cell that `request_handler(proto).operation_handler(Chat)` returns for every
-/// protocol, so this const IS the four-trait dispatch, not a bypass of it.
+/// Chat — operation #1. A const handle to the shared chat cell, for tests and as the resolver's
+/// fallback. Prefer [`chat`] on the request path so the RequestHandler actually decides the cell.
 pub(crate) const CHAT: Op = OpDispatch {
     operation: Operation::Chat,
     cell: &crate::cells::chat::CHAT_HANDLER,
 };
+
+/// Resolve the chat dispatch THROUGH the registry — the same path every other operation takes:
+/// `request_handler(protocol).operation_handler(Chat)`. This is how "the RequestHandler decides which
+/// OperationHandler handles the request" is honored for chat too, not just the JSON ops. Every protocol
+/// is registered and serves chat, so the fallback is unreachable (kept for total-safety, not behavior).
+pub(crate) fn chat(protocol: &str) -> Op {
+    crate::cells::request_handler(protocol)
+        .and_then(|rh| rh.operation_handler(Operation::Chat))
+        .map(|cell| OpDispatch { operation: Operation::Chat, cell })
+        .unwrap_or(CHAT)
+}
 
 #[cfg(test)]
 mod tests {

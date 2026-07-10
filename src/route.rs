@@ -736,7 +736,7 @@ async fn forward_resolved(
             model,
             affinity_key,
             proto,
-            crate::ops::CHAT,
+            crate::ops::chat(proto),
             usage_sink(app, gov, charged_at),
         )
         .await;
@@ -766,7 +766,7 @@ async fn forward_resolved(
             "",
             None,
             proto,
-            crate::ops::CHAT,
+            crate::ops::chat(proto),
             usage_sink(app, gov, charged_at),
         )
         .await;
@@ -1319,7 +1319,7 @@ pub(crate) async fn named(
             &name,
             affinity_key,
             "anthropic",
-            crate::ops::CHAT,
+            crate::ops::chat("anthropic"),
             usage_sink(&app, &gov, charged_at),
         )
         .await;
@@ -1336,7 +1336,7 @@ pub(crate) async fn named(
             "",
             None,
             "anthropic",
-            crate::ops::CHAT,
+            crate::ops::chat("anthropic"),
             usage_sink(&app, &gov, charged_at),
         )
         .await;
@@ -1399,7 +1399,7 @@ pub(crate) async fn adhoc(
                 "",
                 None,
                 "anthropic",
-                crate::ops::CHAT,
+                crate::ops::chat("anthropic"),
                 usage_sink(&app, &gov, charged_at),
             )
             .await;
