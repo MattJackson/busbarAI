@@ -1015,13 +1015,15 @@ impl ProtocolReader for CohereReader {
                                 });
                             }
                         } else if let Some(block_obj) = content_obj.as_object() {
-                            // Native Cohere v2 content-delta shape: `content` is a single
-                            // `{ "type": "text", "text": "<chunk>" }` object (the exact shape this
-                            // file's writer emits at delta.message.content). Without this branch the
-                            // object falls through both the string and array arms and the streamed
-                            // text is silently dropped — a writer→reader roundtrip break and data
-                            // loss on a real Cohere v2 backend stream.
-                            if block_obj.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            // Cohere v2 content-delta object shape. REAL Cohere streams
+                            // `{ "text": "<chunk>" }` with NO `type` field (only content-start
+                            // carries `type`); this file's writer emits `{ "type": "text",
+                            // "text": … }`. Accept BOTH: requiring `type == "text"` (the old
+                            // check) silently dropped every streamed chunk from a real Cohere
+                            // backend — a lossy reader that only round-tripped its own writer.
+                            // Reject only an object that declares a DIFFERENT type.
+                            let ty = block_obj.get("type").and_then(|t| t.as_str());
+                            if ty.is_none() || ty == Some("text") {
                                 if let Some(text) = block_obj.get("text").and_then(|t| t.as_str()) {
                                     if !text.is_empty() {
                                         out.push(IrStreamEvent::BlockDelta {
@@ -3553,6 +3555,32 @@ mod tests {
             decoded_text.as_deref(),
             Some("hi"),
             "object-shaped content-delta must round-trip to the original text, got events: {evs:?}"
+        );
+    }
+
+    /// REAL Cohere v2 content-delta carries `delta.message.content = {"text": …}` with NO `type`
+    /// field (only content-start has one) — captured shape, pinned by the acceptance harness's
+    /// native-stream mock. The reader must decode it; requiring `type == "text"` silently dropped
+    /// every streamed chunk from a real Cohere backend.
+    #[test]
+    fn test_content_delta_real_cohere_shape_no_type_field() {
+        let frame: serde_json::Value = serde_json::from_str(
+            r#"{"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"hi"}}}}"#,
+        )
+        .unwrap();
+        let mut state = crate::ir::StreamDecodeState::default();
+        let evs = CohereReader.read_response_events("", &frame, &mut state);
+        let decoded: Option<String> = evs.iter().find_map(|e| match e {
+            IrStreamEvent::BlockDelta {
+                delta: crate::ir::IrDelta::TextDelta(t),
+                ..
+            } => Some(t.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            decoded.as_deref(),
+            Some("hi"),
+            "the real (type-less) content-delta shape must decode, got events: {evs:?}"
         );
     }
 

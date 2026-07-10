@@ -783,7 +783,7 @@ mod tests {
         let ir = cell
             .read_request(&serde_json::to_vec(&wire).unwrap(), "application/json")
             .unwrap();
-        let back: Value = serde_json::from_slice(&OperationHandler.write_request(&ir)).unwrap();
+        let back: Value = serde_json::from_slice(&cell.write_request(&ir)).unwrap();
         assert_eq!(back["model"], "omni-moderation-latest");
         assert_eq!(back["input"], "hello"); // single text → bare string, round-tripped
     }
@@ -794,9 +794,8 @@ mod tests {
         let wire = br#"{"id":"modr-1","model":"m","results":[{"flagged":true,
             "categories":{"violence":true},"category_scores":{"violence":0.9},
             "category_applied_input_types":{"violence":["text"]}}]}"#;
-        let ir = OperationHandler.read_response(wire).unwrap();
-        let back: Value =
-            serde_json::from_slice(&OperationHandler.write_response(&ir).bytes).unwrap();
+        let ir = cell.read_response(wire).unwrap();
+        let back: Value = serde_json::from_slice(&cell.write_response(&ir).bytes).unwrap();
         assert_eq!(back["results"][0]["flagged"], true);
         assert_eq!(back["results"][0]["categories"]["violence"], true);
         assert_eq!(back["results"][0]["category_scores"]["violence"], 0.9);
@@ -810,15 +809,14 @@ mod tests {
     fn transcription_usage_duration_round_trips() {
         let cell = OpenAiTranscription;
         let wire = br#"{"text":"Hello there?","usage":{"type":"duration","seconds":1}}"#;
-        let ir = OperationHandler.read_response(wire).unwrap();
+        let ir = cell.read_response(wire).unwrap();
         let IrResp::Transcription(ref r) = ir else {
             panic!("expected transcription IR")
         };
         assert!(
             matches!(r.usage, Some(Billing::Duration { seconds }) if (seconds - 1.0).abs() < 1e-9)
         );
-        let back: Value =
-            serde_json::from_slice(&OperationHandler.write_response(&ir).bytes).unwrap();
+        let back: Value = serde_json::from_slice(&cell.write_response(&ir).bytes).unwrap();
         assert_eq!(back["text"], "Hello there?");
         assert_eq!(back["usage"]["type"], "duration");
         assert_eq!(back["usage"]["seconds"], 1.0);
@@ -837,8 +835,7 @@ mod tests {
             })),
             ..Default::default()
         });
-        let back: Value =
-            serde_json::from_slice(&OperationHandler.write_response(&ir).bytes).unwrap();
+        let back: Value = serde_json::from_slice(&cell.write_response(&ir).bytes).unwrap();
         assert_eq!(back["usage"]["type"], "tokens");
         assert_eq!(back["usage"]["input_tokens"], 11);
         assert_eq!(back["usage"]["output_tokens"], 3);
