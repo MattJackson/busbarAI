@@ -55,7 +55,7 @@ impl IrReq {
     }
 
     /// Set the model — the ROUTING layer's injection point, operation-blind. Two callers:
-    /// path-model ingress dialects (gemini/bedrock carry the model in the URL, so the cell parses an
+    /// path-model ingress dialects (gemini/bedrock carry the model in the URL, so the OperationHandler parses an
     /// empty body model and routing fills it), and the cross-protocol egress hop (the egress wire must
     /// carry the LANE's wire model, not the caller's busbar model name). Chat is a no-op: `IrRequest`
     /// carries no model field (chat's model lives at the routing/rewrite layer, as today).

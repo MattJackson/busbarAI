@@ -8,15 +8,15 @@
 //! - [`RequestHandler`] — ONE per protocol (`openai.rs`, `anthropic.rs`, …). Dumb and
 //!   protocol-specific: reads path+body to decide WHICH operation a request asks for
 //!   (`resolve_operation`), owns the `(protocol, operation) → path template` (`upstream_path`), and
-//!   holds its row of the support matrix (`operation_handler`; `None` = the no-cell 404).
-//! - [`OperationHandler`] — ONE per (protocol × operation) cell. A pure codec: wire ↔ IR, both
+//!   holds its row of the support matrix (`operation_handler`; `None` = the no-handler 404).
+//! - [`OperationHandler`] — ONE per (protocol × operation). A pure codec: wire ↔ IR, both
 //!   directions, plus the operation-capability surface the engine reads. It never routes, fails
 //!   over, checks auth, bills, or knows another protocol exists.
-//! - [`OpDispatch`] — the thin `(operation, cell)` handle the streaming engine threads; no behavior
+//! - [`OpDispatch`] — the thin `(operation, OperationHandler)` handle the streaming engine threads; no behavior
 //!   of its own. [`request_handler`] is the registry the catch-all dispatch resolves through.
 //!
-//! Adding a protocol: a Router ID line, a `RequestHandler` impl here, its cells. Adding an
-//! operation: a cell + a line in each `RequestHandler` that speaks it. Nothing else moves.
+//! Adding a protocol: a Router ID line, a `RequestHandler` impl here, its OperationHandlers. Adding an
+//! operation: an OperationHandler + a line in each `RequestHandler` that speaks it. Nothing else moves.
 #![allow(dead_code)]
 
 pub(crate) mod anthropic;
@@ -36,7 +36,7 @@ static RESPONSES: responses::ResponsesRequestHandler = responses::ResponsesReque
 
 /// The protocol's `RequestHandler`, by name (matches `router` / `proto::Protocol::name()`). All six
 /// protocols are registered (every one speaks chat); a registered handler may still return `None`
-/// from `operation_handler` for an op it lacks — that IS the no-cell 404.
+/// from `operation_handler` for an op it lacks — that IS the no-handler 404.
 pub(crate) fn request_handler(protocol: &str) -> Option<&'static dyn RequestHandler> {
     match protocol {
         "openai" => Some(&OPENAI),
@@ -55,7 +55,7 @@ mod registry_tests {
     use crate::operation::Operation;
 
     #[test]
-    fn registry_resolves_openai_and_its_moderation_cell() {
+    fn registry_resolves_openai_and_its_moderation_handler() {
         let h = request_handler("openai").expect("openai handler registered");
         assert_eq!(h.protocol_name(), "openai");
         assert!(h.operation_handler(Operation::Moderation).is_some());
@@ -68,7 +68,7 @@ mod registry_tests {
     #[test]
     fn every_protocol_serves_chat_via_its_request_handler() {
         // Chat is operation #1, reached through the SAME registry as every other op. All six
-        // protocols resolve a handler and a chat cell — the unified dispatch, no special path.
+        // protocols resolve a handler and a chat OperationHandler — the unified dispatch, no special path.
         for proto in [
             "openai",
             "anthropic",
@@ -93,7 +93,7 @@ use crate::proto::ProtocolWriter;
 use bytes::Bytes;
 use serde_json::Value;
 
-/// A serialized wire body plus the content-type the cell chose for it. The engine relays both without
+/// A serialized wire body plus the content-type the OperationHandler chose for it. The engine relays both without
 /// interpreting either — `application/json` for JSON ops, `audio/mpeg` etc. for a binary op like speech.
 pub(crate) struct WireBody {
     pub(crate) bytes: Bytes,
@@ -122,14 +122,14 @@ impl WireBody {
 
 /// A request that could not be parsed into this operation's IR — rendered as a caller-dialect 4xx
 /// (via the existing `forward::ingress_error`). `UnsupportedSubOp` is the m3 second 404 site
-/// (`ImageIr.op` unsupported for the model) — distinct from cell-absence (§3), same terminal.
+/// (`ImageIr.op` unsupported for the model) — distinct from handler-absence (§3), same terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IngressReject {
     BadRequest(String),
     UnsupportedSubOp { op: Operation, model: String },
 }
 
-/// An upstream response body this cell could not decode into its operation's IR.
+/// An upstream response body this OperationHandler could not decode into its operation's IR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodecError {
     Malformed(String),
@@ -153,10 +153,10 @@ pub(crate) struct EgressCtx<'a> {
 /// That is the entire contract — the load-bearing discipline that makes the matrix scale. It knows
 /// NOTHING about routing: no `Lane`, no path, no model. The path is the `RequestHandler`'s concern.
 pub(crate) trait OperationHandler: Send + Sync {
-    // CELL capabilities: the operation-behavior surface the forward engine reads (never branching on
+    // OperationHandler capabilities: the operation-behavior surface the forward engine reads (never branching on
     // operation identity). Every default is the MOST RESTRICTIVE behavior — no streaming, no stream
     // intent, no affinity, no usage tap. Chat overrides them; the JSON ops keep the defaults. This is
-    // exactly the old `OpSpec` surface, now living on the cell so there is ONE operation mechanism.
+    // exactly the old `OpSpec` surface, now living on the OperationHandler so there is ONE operation mechanism.
 
     /// Can this operation produce a client-facing incremental stream?
     fn streaming(&self) -> bool {
@@ -187,9 +187,9 @@ pub(crate) trait OperationHandler: Send + Sync {
         writer.egress_accept(wants_stream)
     }
 
-    /// Wire → IR (request). The cell owns the ENTIRE wire format: it receives RAW bytes + the request
+    /// Wire → IR (request). The OperationHandler owns the ENTIRE wire format: it receives RAW bytes + the request
     /// content-type and decides how to parse — JSON (`serde_json::from_slice`) for JSON ops, multipart
-    /// for transcription, etc. The engine never parses; "JSON vs opaque" is the cell's private business.
+    /// for transcription, etc. The engine never parses; "JSON vs opaque" is the OperationHandler's private business.
     fn read_request(&self, body: &[u8], content_type: &str) -> Result<IrReq, IngressReject>;
     /// IR → egress wire (request bytes sent upstream).
     fn write_request(&self, ir: &IrReq) -> Bytes;
@@ -201,13 +201,13 @@ pub(crate) trait OperationHandler: Send + Sync {
     fn write_response(&self, ir: &IrResp) -> WireBody;
 }
 
-/// A protocol's dialect + its operation cells (one impl per protocol).
+/// A protocol's dialect + its OperationHandlers (one impl per protocol).
 pub(crate) trait RequestHandler: Send + Sync {
     /// Stable protocol identity (matches `proto::Protocol::name()`).
     fn protocol_name(&self) -> &'static str;
 
     /// This protocol's row of the support matrix. `None` ⇒ the protocol does not serve the operation
-    /// ⇒ the no-cell 404 (§3). The cell, when present, is a pure codec.
+    /// ⇒ the no-handler 404 (§3). The OperationHandler, when present, is a pure codec.
     fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler>;
 
     /// WHICH operation this request asks for — the RequestHandler knows its protocol and reads the
@@ -235,7 +235,7 @@ pub(crate) trait RequestHandler: Send + Sync {
 mod contract_tests {
     use super::*;
 
-    // A trivial cell + handler prove the trait objects are object-safe and the no-cell lookup works.
+    // A trivial OperationHandler + RequestHandler prove the trait objects are object-safe and the no-OperationHandler lookup works.
     struct NoopModeration;
     impl OperationHandler for NoopModeration {
         fn read_request(&self, _body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
@@ -258,7 +258,7 @@ mod contract_tests {
             "openai"
         }
         fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler> {
-            // openai serves moderation; not, say, chat-on-a-moderation-only stub → None = no-cell 404.
+            // openai serves moderation; not, say, chat-on-a-moderation-only stub → None = no-handler 404.
             match op {
                 Operation::Moderation => Some(&NoopModeration),
                 _ => None,
@@ -277,12 +277,12 @@ mod contract_tests {
     }
 
     #[test]
-    fn no_cell_lookup_returns_none_for_unsupported_op() {
+    fn no_handler_lookup_returns_none_for_unsupported_op() {
         let h = OpenAiLike;
         assert!(h.operation_handler(Operation::Moderation).is_some());
         assert!(
             h.operation_handler(Operation::Chat).is_none(),
-            "an absent cell IS the no-cell 404"
+            "an absent OperationHandler IS the no-handler 404"
         );
         assert_eq!(h.protocol_name(), "openai");
     }
@@ -305,12 +305,12 @@ mod contract_tests {
 
 use crate::state::Lane;
 
-/// A `(operation, cell)` dispatch handle, threaded through the forward engine by value (`Copy`). The
+/// A `(operation, OperationHandler)` dispatch handle, threaded through the forward engine by value (`Copy`). The
 /// engine reads operation behavior off it without ever naming an operation.
 #[derive(Clone, Copy)]
 pub(crate) struct OpDispatch {
     pub(crate) operation: Operation,
-    pub(crate) cell: &'static dyn OperationHandler,
+    pub(crate) op_handler: &'static dyn OperationHandler,
 }
 
 /// The engine's operation handle. (Kept as `Op` so the engine's signatures read unchanged.)
@@ -323,26 +323,26 @@ impl OpDispatch {
         self.operation.name()
     }
     pub(crate) fn streaming(&self) -> bool {
-        self.cell.streaming()
+        self.op_handler.streaming()
     }
     pub(crate) fn wants_stream(&self, body: &Value) -> bool {
-        self.cell.wants_stream(body)
+        self.op_handler.wants_stream(body)
     }
     pub(crate) fn body_affinity_key<'a>(&self, body: &'a Value) -> Option<&'a str> {
-        self.cell.body_affinity_key(body)
+        self.op_handler.body_affinity_key(body)
     }
     pub(crate) fn taps_nonstream_usage(&self) -> bool {
-        self.cell.taps_usage()
+        self.op_handler.taps_usage()
     }
     pub(crate) fn extract_usage(&self, ingress_protocol: &str, body: &[u8]) -> Option<IrUsage> {
-        self.cell.extract_usage(ingress_protocol, body)
+        self.op_handler.extract_usage(ingress_protocol, body)
     }
     pub(crate) fn egress_accept(
         &self,
         writer: &dyn ProtocolWriter,
         wants_stream: bool,
     ) -> &'static str {
-        self.cell.egress_accept(writer, wants_stream)
+        self.op_handler.egress_accept(writer, wants_stream)
     }
     /// The (protocol × operation) upstream path: lane override, else the lane's protocol
     /// `RequestHandler` renders it from resolved primitives (never the `Lane`). `None` only if the
@@ -361,11 +361,11 @@ impl OpDispatch {
     }
 }
 
-/// Chat — operation #1. A const handle to the shared chat cell, for tests and as the resolver's
-/// fallback. Prefer [`chat`] on the request path so the RequestHandler actually decides the cell.
+/// Chat — operation #1. A const handle to the shared chat OperationHandler, for tests and as the resolver's
+/// fallback. Prefer [`chat`] on the request path so the RequestHandler actually decides the OperationHandler.
 pub(crate) const CHAT: Op = OpDispatch {
     operation: Operation::Chat,
-    cell: &crate::handlers::chat::CHAT_HANDLER,
+    op_handler: &crate::handlers::chat::CHAT_HANDLER,
 };
 
 /// Resolve the chat dispatch THROUGH the registry — the same path every other operation takes:
@@ -375,9 +375,9 @@ pub(crate) const CHAT: Op = OpDispatch {
 pub(crate) fn chat(protocol: &str) -> Op {
     crate::handlers::request_handler(protocol)
         .and_then(|rh| rh.operation_handler(Operation::Chat))
-        .map(|cell| OpDispatch {
+        .map(|op_handler| OpDispatch {
             operation: Operation::Chat,
-            cell,
+            op_handler,
         })
         .unwrap_or(CHAT)
 }
@@ -411,7 +411,7 @@ mod dispatch_tests {
     }
 
     /// The load-bearing invariant of the operations axis: the forward engine branches on the
-    /// *capabilities* a cell declares, never on an operation's *identity*. If someone adds
+    /// *capabilities* an OperationHandler declares, never on an operation's *identity*. If someone adds
     /// `if op.name() == "embeddings"` or `match op.name() { ... }` to the engine, chat stops being
     /// just operation #1 and the "add an operation without touching the engine" property is lost.
     /// (`op.name()` used as a value — a tracing span field — is fine; only comparisons/matches are
@@ -438,7 +438,7 @@ mod dispatch_tests {
                 assert!(
                     !engine.contains(pat),
                     "{file} contains a forbidden operation-identity branch (`{pat}`). The \
-                     engine must read capabilities off the cell, never branch on op.name()."
+                     engine must read capabilities off the OperationHandler, never branch on op.name()."
                 );
             }
         }

@@ -100,7 +100,7 @@ pub(crate) struct MediaBlob {
 
 impl MediaBlob {
     /// Well-formedness: PCM parameters are present iff the MIME type denotes headerless raw PCM.
-    /// Guards against a cell that forgets the params on `audio/L16`/`pcm` (silently lossy) or attaches
+    /// Guards against an OperationHandler that forgets the params on `audio/L16`/`pcm` (silently lossy) or attaches
     /// them to a self-describing container (meaningless).
     pub(crate) fn is_well_formed(&self) -> bool {
         let raw_pcm = self.mime_type.contains("L16")

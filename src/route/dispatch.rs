@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Matthew Jackson
 
 //! The protocol catch-all dispatch (design: web server listens for anything → Router IDs the
-//! protocol → that protocol's `RequestHandler` decides the operation → its cell). Holds
+//! protocol → that protocol's `RequestHandler` decides the operation → its OperationHandler). Holds
 //! `protocol_dispatch` (the axum fallback), the generic `operation_ingress` for the 1.2 operations,
 //! and the bedrock InvokeModel arm. A child of `route` so it shares the ingress core's private
 //! helpers (`finish*`, `governance_guard`, chat cores) without widening their visibility.
@@ -22,7 +22,7 @@ fn multipart_model(body: &[u8]) -> Option<String> {
 }
 
 /// Ingress for the NEW operations (embeddings/moderations/images/audio, 1.2), for EVERY dialect that
-/// speaks the op. Resolves the (protocol, operation) cell — absent ⇒ no-cell 404 in the CALLER's
+/// speaks the op. Resolves the (protocol, operation) OperationHandler — absent ⇒ no-handler 404 in the CALLER's
 /// dialect (design §3) — then forwards through `forward_operation` (same-proto passthrough or the
 /// cross-protocol IR bridge). Model resolution: `model_hint` for path-model dialects (gemini/bedrock —
 /// their route handler parsed it from the URL), else the JSON body `model` (openai/cohere) or the
@@ -61,7 +61,7 @@ pub(crate) async fn operation_ingress(
             ),
         );
     };
-    let Some(cell) = rh.operation_handler(operation) else {
+    let Some(op_handler) = rh.operation_handler(operation) else {
         return finish_rejected(
             app,
             gov,
@@ -155,7 +155,7 @@ pub(crate) async fn operation_ingress(
         pool_name,
         proto,
         operation,
-        cell,
+        op_handler,
         accept,
     )
     .await;
@@ -168,9 +168,9 @@ pub(crate) async fn operation_ingress(
 /// THE PROTOCOL CATCH-ALL (design: web server listens for anything). One axum fallback replaces the
 /// per-path protocol routes: the Router does DUMB protocol identification from (path, headers); the
 /// identified protocol's RequestHandler reads path+body and decides the operation; the operation's
-/// cell does the rest. `main.rs` keeps explicit routes ONLY for busbar's own API (health/metrics/
+/// OperationHandler does the rest. `main.rs` keeps explicit routes ONLY for busbar's own API (health/metrics/
 /// admin/discovery + the named/adhoc conveniences) — a new protocol touches the Router ID ladder, a
-/// RequestHandler, and its cells, never this dispatch and never `main.rs`.
+/// RequestHandler, and its OperationHandlers, never this dispatch and never `main.rs`.
 ///
 /// Gemini and Bedrock delegate to their protocol arms wholesale (path-model parsing, streaming
 /// variants, native unsupported-action envelopes live there); the body-model protocols split here:

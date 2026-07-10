@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 /// Request/response extras NAMESPACED BY SOURCE PROTOCOL. Outer key = source protocol name (e.g.
-/// `"openai"`), inner map = that protocol's unmodeled fields. An egress cell may CHOOSE to honor a
+/// `"openai"`), inner map = that protocol's unmodeled fields. An egress OperationHandler may CHOOSE to honor a
 /// foreign knob it recognizes; anything it does not consume is surfaced by `unmappable_for` and
 /// warn-and-dropped — never silently lost. Same-protocol round-trips re-emit the whole map verbatim.
 pub(crate) type SourceScopedExtra = BTreeMap<String, Map<String, Value>>;
@@ -24,7 +24,7 @@ pub(crate) type SourceScopedExtra = BTreeMap<String, Map<String, Value>>;
 pub(crate) enum DropReason {
     /// A first-class IR field with no analog on the egress protocol (e.g. OpenAI `logprobs` → Anthropic).
     NoTargetAnalog,
-    /// A source-protocol-only `extra` knob the egress cell did not recognize.
+    /// A source-protocol-only `extra` knob the egress OperationHandler did not recognize.
     SourceOnlyExtra,
 }
 

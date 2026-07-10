@@ -83,7 +83,7 @@ mod coerce_on_error_tests {
 /// == egress dialect, so no translation), reusing the send/auth/permit primitives. Deliberately simpler
 /// than [`forward_with_pool`]: no streaming, no cross-protocol IR bridge yet, and v1 records a breaker
 /// SUCCESS on 2xx but does not yet classify upstream errors into the breaker (enriched in a follow-up).
-/// The cross-protocol IR bridge (ingress cell `read_request`→IrReq→egress cell `write_request`; response
+/// The cross-protocol IR bridge (ingress OperationHandler `read_request`→IrReq→egress OperationHandler `write_request`; response
 /// reverse) is layered on after first green. Multipart/binary bodies pass through verbatim same-proto.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn forward_operation(
@@ -95,14 +95,14 @@ pub(crate) async fn forward_operation(
     pool_name: &str,
     ingress_protocol: &str,
     operation: crate::operation::Operation,
-    cell: &dyn crate::handlers::OperationHandler,
+    op_handler: &dyn crate::handlers::OperationHandler,
     accept: &'static str,
 ) -> Response {
     for wl in &cands {
         let i = wl.idx;
         // Egress dimension (design §3): if the egress lane speaks a DIFFERENT protocol, it must have a
-        // cell for this operation. No cell → no-cell 404 in the CALLER's dialect (e.g. images→anthropic).
-        // A cell present but no cross-protocol IR bridge yet → fail LOUD (501), never a silent
+        // OperationHandler for this operation. No op_handler → no-handler 404 in the CALLER's dialect (e.g. images→anthropic).
+        // An OperationHandler present but no cross-protocol IR bridge yet → fail LOUD (501), never a silent
         // mistranslation. Same-protocol (egress == ingress) skips straight to verbatim passthrough below.
         let egress_proto = app.lanes[i].protocol.name();
         if egress_proto != ingress_protocol {
@@ -116,17 +116,17 @@ pub(crate) async fn forward_operation(
                         "This model does not support that operation.",
                     );
                 }
-                Some(egress_cell) => {
-                    // Safe: the same registry lookup that yielded `egress_cell` yielded this handler.
+                Some(egress_op_handler) => {
+                    // Safe: the same registry lookup that yielded `egress_op_handler` yielded this handler.
                     let egress_rh = egress_rh.expect("egress request_handler present");
                     // CROSS-PROTOCOL IR BRIDGE (the core value): ingress wire → IR → egress wire; on
                     // the way back, egress wire → IR → caller-dialect wire.
                     let Some(_permit) = app.store.try_acquire(i) else {
                         continue;
                     };
-                    // The cell owns the wire format: hand it raw bytes + the request content-type and let
+                    // The OperationHandler owns the wire format: hand it raw bytes + the request content-type and let
                     // it parse (JSON, multipart, …). The engine never inspects the body.
-                    let mut ir_req = match cell
+                    let mut ir_req = match op_handler
                         .read_request(body.as_ref(), req_content_type.to_str().unwrap_or(""))
                     {
                         Ok(ir) => ir,
@@ -142,7 +142,7 @@ pub(crate) async fn forward_operation(
                     // The egress wire must carry the LANE's wire model, never the caller's busbar
                     // model name (routing owns model resolution; the codec stays blind to lanes).
                     ir_req.set_model(app.lanes[i].wire_model());
-                    let egress_bytes = egress_cell.write_request(&ir_req);
+                    let egress_bytes = egress_op_handler.write_request(&ir_req);
                     let base = &app.lanes[i].base_url;
                     // Routing owns the path: apply the lane override, else ask the EGRESS protocol's
                     // RequestHandler to render it from resolved primitives (never the Lane).
@@ -194,7 +194,7 @@ pub(crate) async fn forward_operation(
                                         );
                                     }
                                     app.store.record_success_in(pool_name, i);
-                                    let ir_resp = match egress_cell.read_response(&bytes) {
+                                    let ir_resp = match egress_op_handler.read_response(&bytes) {
                                         Ok(ir) => ir,
                                         Err(_) => {
                                             return ingress_error(
@@ -205,9 +205,9 @@ pub(crate) async fn forward_operation(
                                             )
                                         }
                                     };
-                                    // The cell chose the caller-dialect wire AND its content-type
+                                    // The OperationHandler chose the caller-dialect wire AND its content-type
                                     // (JSON, or audio/* for speech); relay both verbatim.
-                                    let wire = cell.write_response(&ir_resp);
+                                    let wire = op_handler.write_response(&ir_resp);
                                     return Response::builder()
                                         .status(StatusCode::OK)
                                         .header(CONTENT_TYPE, wire.content_type)

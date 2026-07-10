@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! OpenAI `RequestHandler` and its operation cells (design §6/§7). Per the design these live under
+//! OpenAI `RequestHandler` and its OperationHandlers (design §6/§7). Per the design these live under
 //! `handlers/request/openai/operations/`; the flat `cells/openai.rs` layout is a deferred cosmetic
-//! move. Cells are pure codecs — wire ↔ IR, both directions, nothing else.
+//! move. OperationHandlers are pure codecs — wire ↔ IR, both directions, nothing else.
 //!
 //! First cell: moderation (openai-only, K=1). More openai cells (embeddings/images/audio/chat) are
 //! added here as they're built.
@@ -335,7 +335,7 @@ impl OperationHandler for OpenAiSpeech {
     }
 }
 
-// -------------------------------------------------- embeddings cell (real codec, cross-protocol)
+// -------------------------------------------------- embeddings OperationHandler (real codec, cross-protocol)
 
 use crate::ir::embeddings::{
     EmbInput, EmbeddingItem, EmbeddingsReq, EmbeddingsResp, EncFmt, VectorData,
@@ -480,7 +480,7 @@ impl OperationHandler for OpenAiEmbeddings {
     }
 }
 
-// ---------------------------------------------------------------- image cell (real, cross-protocol)
+// ---------------------------------------------------------------- image OperationHandler (real, cross-protocol)
 
 use crate::ir::image::{ImageOp, ImageReq, ImageResp, ImageSize};
 use crate::media::ImageOutput;
@@ -628,7 +628,7 @@ impl OperationHandler for OpenAiModeration {
 
     fn write_request(&self, ir: &IrReq) -> Bytes {
         let IrReq::Moderation(r) = ir else {
-            // A cell only ever receives its own variant; anything else is a programming error, not a
+            // An OperationHandler only ever receives its own variant; anything else is a programming error, not a
             // runtime path. Emit an empty body rather than panic.
             return Bytes::new();
         };
@@ -770,8 +770,8 @@ mod tests {
     #[test]
     fn no_cell_lookup() {
         let h = OpenAiRequestHandler;
-        // OpenAI serves every operation (chat now via its cell too). The no-cell 404 is exercised on a
-        // protocol that lacks an op — e.g. anthropic embeddings — in the cells registry tests.
+        // OpenAI serves every operation (chat now via its OperationHandler too). The no-handler 404 is exercised on a
+        // protocol that lacks an op — e.g. anthropic embeddings — in the OperationHandlers registry tests.
         assert!(h.operation_handler(Operation::Moderation).is_some());
         assert!(h.operation_handler(Operation::Chat).is_some());
     }
@@ -783,7 +783,7 @@ mod tests {
         let ir = cell
             .read_request(&serde_json::to_vec(&wire).unwrap(), "application/json")
             .unwrap();
-        let back: Value = serde_json::from_slice(&cell.write_request(&ir)).unwrap();
+        let back: Value = serde_json::from_slice(&OperationHandler.write_request(&ir)).unwrap();
         assert_eq!(back["model"], "omni-moderation-latest");
         assert_eq!(back["input"], "hello"); // single text → bare string, round-tripped
     }
@@ -794,8 +794,9 @@ mod tests {
         let wire = br#"{"id":"modr-1","model":"m","results":[{"flagged":true,
             "categories":{"violence":true},"category_scores":{"violence":0.9},
             "category_applied_input_types":{"violence":["text"]}}]}"#;
-        let ir = cell.read_response(wire).unwrap();
-        let back: Value = serde_json::from_slice(&cell.write_response(&ir).bytes).unwrap();
+        let ir = OperationHandler.read_response(wire).unwrap();
+        let back: Value =
+            serde_json::from_slice(&OperationHandler.write_response(&ir).bytes).unwrap();
         assert_eq!(back["results"][0]["flagged"], true);
         assert_eq!(back["results"][0]["categories"]["violence"], true);
         assert_eq!(back["results"][0]["category_scores"]["violence"], 0.9);
@@ -804,19 +805,20 @@ mod tests {
 
     /// Real OpenAI transcription usage (captured from the live API 2026-07-10): whisper-1 reports
     /// DURATION (`{type:"duration",seconds}` → `Billing::Duration`); gpt-4o-transcribe reports TOKENS.
-    /// The cell must parse both from the wire and re-emit them in OpenAI's own transcription shape.
+    /// The OperationHandler must parse both from the wire and re-emit them in OpenAI's own transcription shape.
     #[test]
     fn transcription_usage_duration_round_trips() {
         let cell = OpenAiTranscription;
         let wire = br#"{"text":"Hello there?","usage":{"type":"duration","seconds":1}}"#;
-        let ir = cell.read_response(wire).unwrap();
+        let ir = OperationHandler.read_response(wire).unwrap();
         let IrResp::Transcription(ref r) = ir else {
             panic!("expected transcription IR")
         };
         assert!(
             matches!(r.usage, Some(Billing::Duration { seconds }) if (seconds - 1.0).abs() < 1e-9)
         );
-        let back: Value = serde_json::from_slice(&cell.write_response(&ir).bytes).unwrap();
+        let back: Value =
+            serde_json::from_slice(&OperationHandler.write_response(&ir).bytes).unwrap();
         assert_eq!(back["text"], "Hello there?");
         assert_eq!(back["usage"]["type"], "duration");
         assert_eq!(back["usage"]["seconds"], 1.0);
@@ -835,7 +837,8 @@ mod tests {
             })),
             ..Default::default()
         });
-        let back: Value = serde_json::from_slice(&cell.write_response(&ir).bytes).unwrap();
+        let back: Value =
+            serde_json::from_slice(&OperationHandler.write_response(&ir).bytes).unwrap();
         assert_eq!(back["usage"]["type"], "tokens");
         assert_eq!(back["usage"]["input_tokens"], 11);
         assert_eq!(back["usage"]["output_tokens"], 3);

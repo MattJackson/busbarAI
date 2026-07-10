@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Matthew Jackson
 
-//! The chat cell — chat is operation #1, not the engine's foundation. Reached like every other
+//! The chat OperationHandler — chat is operation #1, not the engine's foundation. Reached like every other
 //! operation via `RequestHandler::operation_handler(Operation::Chat)`, with its path from
 //! `RequestHandler::upstream_path`. This carries chat's capability overrides (the code that used to
 //! live on the deleted `OpSpec`/`ChatOp`), verbatim, so the forward engine is byte-identical to
@@ -9,7 +9,7 @@
 //!
 //! ONE `ChatHandler` serves every protocol: chat's capabilities are protocol-agnostic — they read the
 //! OpenAI-family `stream` boolean, the Anthropic-shaped `system` key, and otherwise delegate to the
-//! protocol's `reader()`/`writer()` (passed in as arguments), never to the cell's own identity.
+//! protocol's `reader()`/`writer()` (passed in as arguments), never to the OperationHandler's own identity.
 //!
 //! Chat's wire↔IR translation is the streaming engine (`forward.rs` via `proto::ProtocolReader`/
 //! `ProtocolWriter`), which is stream-safe; the ops bridge (`forward_operation`) is non-stream and is
@@ -24,10 +24,10 @@ use crate::proto::ProtocolWriter;
 use bytes::Bytes;
 use serde_json::Value;
 
-/// The chat operation cell — a protocol-agnostic singleton (see module docs).
+/// The chat OperationHandler — a protocol-agnostic singleton (see module docs).
 pub(crate) struct ChatHandler;
 
-/// The shared handle every protocol's `RequestHandler` returns for `Operation::Chat`, and the cell
+/// The shared handle every protocol's `RequestHandler` returns for `Operation::Chat`, and the OperationHandler
 /// behind `crate::handlers::CHAT`.
 pub(crate) static CHAT_HANDLER: ChatHandler = ChatHandler;
 

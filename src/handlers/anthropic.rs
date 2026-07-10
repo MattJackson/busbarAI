@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Matthew Jackson
 
 //! Anthropic `RequestHandler`. Chat-only today (Anthropic ships no embeddings/images/audio API here);
-//! its non-chat operations stay `None` = no-cell 404. Chat dispatches through the same registry as
+//! its non-chat operations stay `None` = no-handler 404. Chat dispatches through the same registry as
 //! every other operation.
 #![allow(dead_code)]
 
@@ -18,7 +18,7 @@ impl RequestHandler for AnthropicRequestHandler {
     fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler> {
         match op {
             Operation::Chat => Some(&crate::handlers::chat::CHAT_HANDLER),
-            _ => None, // no embeddings/images/audio → no-cell 404 in the caller's dialect
+            _ => None, // no embeddings/images/audio → no-handler 404 in the caller's dialect
         }
     }
     fn upstream_path(&self, _ctx: &EgressCtx) -> String {

@@ -1,7 +1,7 @@
 //! The `Operation` axis — busbar's semantic operation vocabulary (design-operations-oop.md §1b/§6).
 //!
 //! A coarse TAG only: a metrics label and the `paths:` config key. It carries NO capability booleans
-//! — whether a given (protocol, operation, model) streams or reports usage is a CELL fact and lives on
+//! — whether a given (protocol, operation, model) streams or reports usage is an OperationHandler fact and lives on
 //! the `OperationHandler`, not here (design §6, M1). Variant names are 1:1 with the forthcoming
 //! `enum Ir` (design C2), so the egress-`write` dispatch is a trivial same-name match.
 //!
