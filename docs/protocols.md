@@ -479,11 +479,41 @@ These fields survive a cross-protocol hop because they are first-class in the IR
 
 ### Fields the target protocol cannot express
 
-This is not loss in the sense defined above: lossless means neither end can tell the hop happened, and these are fields the *target protocol has no place for at all*. Anthropic has no `logprobs`; nothing Busbar could send would carry it. Forwarding such a field anyway would make the backend reject the request, which is the one thing translation must never do. So fields with no analog in the target protocol are dropped at the seam, deliberately and observably (they live in the `extra` passthrough map, which is cleared on a cross-protocol hop). Examples:
+This is not loss in the sense defined above: lossless means neither end can tell the hop happened, and these are fields that have *no place to go* on the other side of the hop. Forwarding them anyway would make the backend reject the request, which is the one thing translation must never do. So they are dropped at the seam, deliberately. On a **same-protocol** route none of this applies: every one of these fields survives byte-for-byte (see [Same-protocol note](#same-protocol-note)).
 
-- **OpenAI-only (no IR analog):** `logprobs`, `logit_bias`. These flow through `extra` verbatim on same-protocol OpenAI passthrough and are stripped on a cross-protocol hop. (`n` is *not* in this list, it is a first-class IR field, see "Always preserved" above.)
-- **Other source-protocol-specific fields** that no IR field models are likewise stored in `extra` and dropped at the seam.
-- **Protocol-specific identifiers:** The upstream's `id` field is stripped and replaced with an ingress-native minted ID on cross-protocol responses (so Anthropic `msg_...` IDs don't appear in OpenAI responses).
+The tables below are **measured, not asserted**: each field was sent through Busbar to a same-protocol and a cross-protocol backend against a capture mock, and the egress wire bodies were diffed (verified against 1.2.0).
+
+Two things can happen to a field on a cross-protocol hop:
+
+1. **Dropped at the seam.** The field is provider-specific with no IR representation. It rides the `extra` passthrough map (which is why it survives same-protocol) and `extra` is cleared before a cross-protocol write.
+2. **Dropped by the target writer.** The field IS first-class in the IR, but the target protocol has no such knob (Anthropic has no `seed`; OpenAI has no `top_k`). Dropped with a `warn!` log.
+
+**Impact key**: **High** means the response can be materially different or a safety/grounding behavior silently changes. **Medium** means a feature is unavailable but the request semantics are intact. **Low** means bookkeeping only.
+
+| Sent by | Field | Cross-protocol fate | Impact | What changes |
+|---|---|---|---|---|
+| OpenAI | `logprobs`, `top_logprobs` | dropped at seam | Medium | no per-token probabilities |
+| OpenAI | `logit_bias` | dropped at seam | Medium | token steering unavailable |
+| OpenAI | `store`, `metadata`, `user`, `service_tier` | dropped at seam | Low | bookkeeping and tier hints only |
+| OpenAI | `parallel_tool_calls` | dropped at seam | Medium | tool-call parallelism hint lost |
+| OpenAI | `stream_options` | dropped at seam | Low | usage-in-stream hint lost |
+| OpenAI | `seed`, `frequency_penalty`, `presence_penalty` | IR-carried; dropped by targets without the knob (e.g. Anthropic) | Medium | sampling reproducibility/penalties unavailable on that backend |
+| Anthropic | `top_k` | IR-carried; dropped by targets without the knob (e.g. OpenAI) | Medium | top-k sampling unavailable on that backend |
+| Anthropic | `metadata`, `service_tier` | dropped at seam | Low | bookkeeping and tier hints only |
+| Gemini | `safetySettings` | dropped at seam | **High** | the target backend applies **its own** safety defaults, not your configured thresholds |
+| Gemini | `cachedContent` | dropped at seam | **High** | the cache reference is meaningless elsewhere; full prompt is reprocessed (cost/latency) |
+| Gemini | `generationConfig.thinkingConfig` and other unmodeled sub-fields | dropped at seam | Medium | provider-specific generation tweaks lost (`responseSchema`/`responseMimeType` are NOT in this list; structured output is IR-mapped) |
+| Gemini | `labels` | dropped at seam | Low | billing labels lost |
+| Cohere | `documents` | dropped at seam (with `warn!`) | **High** | RAG grounding gone; the backend answers from model knowledge alone |
+| Cohere | `citation_options`, `safety_mode` | dropped at seam | Medium | citations and safety mode fall back to backend defaults |
+| Bedrock | `guardrailConfig` | dropped at seam | **High** | your guardrail is not applied by the foreign backend |
+| Bedrock | `additionalModelRequestFields`, `performanceConfig`, `promptVariables` | dropped at seam | Medium | model-specific escape hatches lost |
+| Responses | `previous_response_id` | dropped at seam | **High** | conversation state does not follow to a foreign backend; the model answers without that context |
+| Responses | `store`, `reasoning`, `truncation`, `include`, `metadata` | dropped at seam | Medium/Low | reasoning-effort hint and bookkeeping lost |
+
+The rule of thumb that falls out of the table: **statefulness, grounding, and safety configuration do not cross protocols**, because they are references to machinery that only exists at one vendor. If your request depends on `safetySettings`, `guardrailConfig`, `documents`, or `previous_response_id`, route it to a same-protocol backend (pin the pool, or use `exclusions`/direct routing), where all of it survives byte-for-byte. Sampling periphery (`logit_bias`, `top_k`, `seed`) degrades gracefully: the request still works, that one knob just does not exist over there.
+
+Also note: **protocol-specific identifiers** are replaced, not leaked. The upstream's `id` is swapped for an ingress-native minted ID on cross-protocol responses, so Anthropic `msg_...` IDs never appear in OpenAI-shaped responses. That is translation working, not loss.
 
 ### The `extra` map
 
