@@ -21,6 +21,10 @@ use std::collections::BTreeMap;
 pub(crate) struct OpenAiRequestHandler;
 
 static MODERATION: OpenAiModeration = OpenAiModeration;
+static EMBEDDINGS: OpenAiEmbeddings = OpenAiEmbeddings;
+static IMAGE: OpenAiImage = OpenAiImage;
+static TRANSCRIPTION: OpenAiTranscription = OpenAiTranscription;
+static SPEECH: OpenAiSpeech = OpenAiSpeech;
 
 impl RequestHandler for OpenAiRequestHandler {
     fn protocol_name(&self) -> &'static str {
@@ -29,11 +33,48 @@ impl RequestHandler for OpenAiRequestHandler {
     fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler> {
         match op {
             Operation::Moderation => Some(&MODERATION),
-            // embeddings/images/audio/chat cells land here as built.
-            _ => None,
+            Operation::Embeddings => Some(&EMBEDDINGS),
+            Operation::Image => Some(&IMAGE),
+            Operation::Transcription => Some(&TRANSCRIPTION),
+            Operation::Speech => Some(&SPEECH),
+            // chat re-homes onto a cell in the final P4 step (OpSpec removal).
+            Operation::Chat => None,
         }
     }
 }
+
+// The embeddings/image/audio cells below are registered so their SAME-protocol (openai→openai) rows go
+// green now (v1 `forward_operation` relays the body verbatim same-proto and uses only `upstream_path`).
+// Their wire↔IR codecs are exercised on the CROSS-protocol path; until that bridge lands they fail LOUD
+// (a clear error, never a silent mistranslation). Same-proto correctness is proven by the harness now.
+
+macro_rules! passthrough_cell {
+    ($ty:ident, $path:literal, $op:literal) => {
+        struct $ty;
+        impl OperationHandler for $ty {
+            fn upstream_path(&self, lane: &Lane, _wants_stream: bool) -> String {
+                lane.path.clone().unwrap_or_else(|| $path.to_string())
+            }
+            fn read_request(&self, _wire: &Value) -> Result<IrReq, IngressReject> {
+                Err(IngressReject::BadRequest(concat!($op, " cross-protocol codec not yet implemented").into()))
+            }
+            fn write_request(&self, _ir: &IrReq) -> Bytes {
+                Bytes::new()
+            }
+            fn read_response(&self, _wire: &[u8]) -> Result<IrResp, CodecError> {
+                Err(CodecError::Malformed(concat!($op, " cross-protocol codec not yet implemented").into()))
+            }
+            fn write_response(&self, _ir: &IrResp) -> Bytes {
+                Bytes::new()
+            }
+        }
+    };
+}
+
+passthrough_cell!(OpenAiEmbeddings, "/v1/embeddings", "embeddings");
+passthrough_cell!(OpenAiImage, "/v1/images/generations", "image");
+passthrough_cell!(OpenAiTranscription, "/v1/audio/transcriptions", "transcription");
+passthrough_cell!(OpenAiSpeech, "/v1/audio/speech", "speech");
 
 // ---------------------------------------------------------------- moderation cell
 
