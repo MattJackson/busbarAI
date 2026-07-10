@@ -131,7 +131,7 @@ pools:
       action: least_bad    # degraded but not a hard error
 ```
 
-| `action` | Behavior |
+| Action | Behavior |
 |---|---|
 | `reject` / `status_503` / `503` | Return `503` with `Retry-After` set to the soonest member's cooldown expiry. (Default when `on_exhausted` is omitted.) |
 | `least_bad` | Select the member whose cooldown expires soonest and send the request anyway, even though its breaker is Open. Logs a loud degraded-service warning. |

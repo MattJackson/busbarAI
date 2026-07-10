@@ -53,7 +53,7 @@ By default a pool uses **smooth weighted round-robin (SWRR)** over the healthy m
 
 Set `route:` to something other than `weighted` and a **routing policy** decides the order instead. The policy runs once per request, before the failover loop:
 
-| `route:` | Picks the member with... |
+| Route | Picks the member with... |
 |---|---|
 | `weighted` (default) | the next weighted turn (SWRR). Zero overhead. |
 | `cheapest` | the lowest `cost_per_mtok`. |

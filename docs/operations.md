@@ -197,7 +197,7 @@ Passive health alone only learns a lane is sick when real traffic hits it, and o
 recovers it on the next organic request. Active probing (per-provider `health:`
 config) adds a background prober:
 
-| `mode` | Behavior |
+| Mode | Behavior |
 |---|---|
 | `none` (default) | No probing; pure passive health. |
 | `dead` | Periodically re-probe **only tripped** lanes, so a recovered upstream is picked back up promptly. |

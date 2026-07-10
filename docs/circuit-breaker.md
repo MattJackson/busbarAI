@@ -79,17 +79,17 @@ One important guard: a `context_length` mapping in `error_map` is **suppressed o
   <text x="360" y="287" text-anchor="middle" fill="#b45309" font-size="11">one probe admitted</text>
   <!-- Closed -> Open -->
   <line x1="228" y1="80" x2="486" y2="80" stroke="#64748b" stroke-width="2" marker-end="url(#brk-arw)"/>
-  <text x="357" y="70" text-anchor="middle" fill="#334155" font-size="12" font-weight="600">trip condition met</text>
+  <text paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" x="357" y="70" text-anchor="middle" fill="#334155" font-size="12" font-weight="600">trip condition met</text>
   <!-- Open -> HalfOpen -->
   <path d="M540,112 Q470,160 452,236" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#brk-arw)"/>
-  <text x="470" y="176" text-anchor="middle" fill="#334155" font-size="12" font-weight="600">cooldown expires</text>
+  <text paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" x="470" y="176" text-anchor="middle" fill="#334155" font-size="12" font-weight="600">cooldown expires</text>
   <!-- HalfOpen -> Closed -->
   <path d="M270,258 Q168,202 150,116" fill="none" stroke="#16a34a" stroke-width="2" marker-end="url(#brk-ok)"/>
-  <text x="176" y="182" text-anchor="middle" fill="#166534" font-size="12" font-weight="600">probe succeeds</text>
+  <text paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" x="176" y="182" text-anchor="middle" fill="#166534" font-size="12" font-weight="600">probe succeeds</text>
   <!-- HalfOpen -> Open (fail) -->
   <path d="M452,272 Q642,236 582,116" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#brk-fail)"/>
-  <text x="632" y="204" text-anchor="middle" fill="#991b1b" font-size="12" font-weight="600">probe fails</text>
-  <text x="632" y="220" text-anchor="middle" fill="#b91c1c" font-size="11">(escalated cooldown)</text>
+  <text paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" x="632" y="204" text-anchor="middle" fill="#991b1b" font-size="12" font-weight="600">probe fails</text>
+  <text paint-order="stroke" stroke="#ffffff" stroke-width="5" stroke-linejoin="round" x="632" y="220" text-anchor="middle" fill="#b91c1c" font-size="11">(escalated cooldown)</text>
 </svg>
 
 **Closed**: the lane is healthy and receives traffic. Failures are recorded against the window/streak. A single failure that does not meet the trip condition arms a brief cooldown on the cell (the lane is temporarily deprioritized) but the breaker stays Closed.
@@ -195,7 +195,7 @@ providers:
       timeout_secs: 5      # default
 ```
 
-| `mode` | What it does |
+| Mode | What it does |
 |---|---|
 | `none` | No probing. Pure passive health. (Default.) |
 | `dead` | Periodically re-probe only tripped or hard-down lanes. Use this to recover a lane promptly after a backend restores, without probing healthy lanes. |
