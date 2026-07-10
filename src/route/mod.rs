@@ -734,26 +734,10 @@ pub(crate) async fn gemini_ingress(
         }
     };
 
-    // 1.2 OPERATION dispatch — the gemini RequestHandler knows its protocol and reads the path+body
-    // to say "this is embeddings / image / audio / chat" (design: Router picks the protocol; the
-    // RequestHandler decides the operation and hands off to its OperationHandler). Chat falls
-    // through to the existing streaming chat path below.
-    if let Some(op) = crate::handlers::request_handler("gemini")
-        .and_then(|rh| rh.resolve_operation(uri.path(), &body))
-        .filter(|op| *op != crate::operation::Operation::Chat)
-    {
-        return operation_ingress(
-            &app,
-            &gov,
-            &caller,
-            &headers,
-            body,
-            "gemini",
-            op,
-            Some(model.to_string()),
-        )
-        .await;
-    }
+    // The gemini RequestHandler resolves WHICH operation this request is (path action + body for the
+    // generateContent multiplex) — ONE resolution, and every operation takes the SAME flow below.
+    let operation = crate::handlers::request_handler("gemini")
+        .and_then(|rh| rh.resolve_operation(uri.path(), &body));
 
     // Only the two generate actions are proxied (see the route doc above). Any other action is an
     // intentional limitation and returns a NOT_FOUND envelope. No `_ =>` catch-all: the two
@@ -770,10 +754,10 @@ pub(crate) async fn gemini_ingress(
     // unsupported method); a colon-bearing OpenAI id whose tail is not a Gemini action gets the
     // canonical OpenAI `not_found_error` envelope, so the same path never yields two different error
     // shapes depending on how the client (Gemini SDK vs OpenAI SDK) reached it.
-    let stream = match action {
-        "streamGenerateContent" => true,
-        "generateContent" => false,
-        other => {
+    let stream = match (operation.is_some(), action) {
+        (true, "streamGenerateContent") => true,
+        (true, _) => false, // generateContent / embedContent / predict — non-stream in 1.2
+        (false, other) => {
             // Pre-routing failure (unsupported native action → model never resolved): route through
             // `finish_rejected` with the bounded `proto_for_path` literal as both envelope + metric protocol
             // and the bounded `"unresolved"` pool label, keeping it observable in metrics + webhook.
@@ -825,6 +809,24 @@ pub(crate) async fn gemini_ingress(
     let alt_sse = uri.query().map(query_has_alt_sse).unwrap_or(false);
     let gemini_json_array = stream && !alt_sse;
 
+    // `operation` is Some here (a None already returned the unsupported-action envelope above);
+    // bail with the standard no-handler 404 rather than assume any operation.
+    let Some(operation) = operation else {
+        return finish_rejected(
+            &app,
+            &gov,
+            "gemini",
+            crate::forward::POOL_LABEL_UNRESOLVED,
+            started,
+            charged_at,
+            ingress_error(
+                "gemini",
+                StatusCode::NOT_FOUND,
+                crate::forward::KIND_NOT_FOUND,
+                "This endpoint does not support that operation.",
+            ),
+        );
+    };
     ingress_path_model(
         &app,
         &gov,
@@ -832,7 +834,7 @@ pub(crate) async fn gemini_ingress(
         &headers,
         body,
         model,
-        crate::operation::Operation::Chat,
+        operation,
         stream,
         gemini_json_array,
         "gemini",
@@ -903,7 +905,17 @@ pub(crate) async fn bedrock_converse(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    bedrock_ingress(&app, &gov, &caller, &headers, body, &model_id, false).await
+    let Some(op) = crate::handlers::request_handler("bedrock")
+        .and_then(|rh| rh.resolve_operation(&format!("/model/{model_id}/converse"), &body))
+    else {
+        return ingress_error(
+            "bedrock",
+            StatusCode::NOT_FOUND,
+            crate::forward::KIND_NOT_FOUND,
+            "This endpoint does not support that operation.",
+        );
+    };
+    bedrock_ingress(&app, &gov, &caller, &headers, body, &model_id, op, false).await
 }
 
 // POST /model/:modelId/converse-stream — Bedrock Converse ingress (streaming, stream=true). The
@@ -920,7 +932,17 @@ pub(crate) async fn bedrock_converse_stream(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    bedrock_ingress(&app, &gov, &caller, &headers, body, &model_id, true).await
+    let Some(op) = crate::handlers::request_handler("bedrock")
+        .and_then(|rh| rh.resolve_operation(&format!("/model/{model_id}/converse-stream"), &body))
+    else {
+        return ingress_error(
+            "bedrock",
+            StatusCode::NOT_FOUND,
+            crate::forward::KIND_NOT_FOUND,
+            "This endpoint does not support that operation.",
+        );
+    };
+    bedrock_ingress(&app, &gov, &caller, &headers, body, &model_id, op, true).await
 }
 
 /// Shared body for both Bedrock ingress routes: delegate to the path-model core with the
@@ -941,22 +963,13 @@ async fn bedrock_ingress(
     headers: &HeaderMap,
     body: Bytes,
     model_id: &str,
+    operation: crate::operation::Operation,
     stream: bool,
 ) -> Response {
     // Bedrock never uses the gemini JSON-array framing, and a model-not-found 404 uses the canonical
     // (non-gemini) message, so no api_version is threaded.
     ingress_path_model(
-        app,
-        gov,
-        caller,
-        headers,
-        body,
-        model_id,
-        crate::operation::Operation::Chat,
-        stream,
-        false,
-        "bedrock",
-        None,
+        app, gov, caller, headers, body, model_id, operation, stream, false, "bedrock", None,
     )
     .await
 }
