@@ -39,6 +39,7 @@
 
 mod admin;
 mod auth;
+mod billing;
 mod breaker;
 mod config;
 mod config_validate;
@@ -50,6 +51,7 @@ mod health;
 mod ir;
 mod json;
 mod limits;
+mod media;
 mod metrics;
 mod net_guard;
 mod observability;
