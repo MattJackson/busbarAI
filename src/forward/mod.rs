@@ -377,7 +377,8 @@ fn translate_request_cross_protocol(
     i: usize,
     ingress_protocol: &str,
     op: crate::handlers::Op,
-    mut body: Value,
+    body: Option<Value>,
+    req_content_type: &str,
     // The PRISTINE source bytes `body` was parsed from THIS hop (the retained original). On a
     // same-protocol passthrough where no same-proto-reachable mutation fired (the request short-
     // circuit, Change B step 1), these exact bytes are re-emitted verbatim instead of re-serializing
@@ -385,6 +386,45 @@ fn translate_request_cross_protocol(
     hop_bytes: &[u8],
 ) -> Result<Vec<u8>, Box<Response>> {
     let egress_name = app.lanes[i].protocol.name();
+    // OPAQUE ingress body (multipart/binary — `None`): translate at the BYTE level through the
+    // operation codecs (cross-protocol) or relay the pristine bytes verbatim (same-protocol) —
+    // exactly the contract the JSON branch below implements at the Value level.
+    let Some(mut body) = body else {
+        if ingress_protocol != egress_name {
+            let ingress_handler = crate::handlers::request_handler(ingress_protocol)
+                .and_then(|rh| rh.operation_handler(op.operation));
+            let egress_handler = crate::handlers::request_handler(egress_name)
+                .and_then(|rh| rh.operation_handler(op.operation));
+            let (Some(ih), Some(eh)) = (ingress_handler, egress_handler) else {
+                return Err(Box::new(ingress_error(
+                    ingress_protocol,
+                    StatusCode::NOT_FOUND,
+                    KIND_NOT_FOUND,
+                    "This model does not support that operation.",
+                )));
+            };
+            let mut ir_req = match ih.read_request(hop_bytes, req_content_type) {
+                Ok(ir) => ir,
+                Err(_) => {
+                    return Err(Box::new(ingress_error(
+                        ingress_protocol,
+                        StatusCode::BAD_REQUEST,
+                        KIND_INVALID_REQUEST,
+                        "We could not process the content of your request.",
+                    )))
+                }
+            };
+            ir_req.prepare_for_egress(&crate::ir::variant::EgressPrep {
+                ingress_protocol,
+                egress_requires_max_tokens: app.lanes[i].protocol.writer().requires_max_tokens(),
+                lane_default_max_tokens: app.lanes[i].default_max_tokens,
+                global_default_max_tokens: app.default_max_tokens,
+            });
+            ir_req.set_model(app.lanes[i].wire_model());
+            return Ok(eh.write_request(&ir_req).to_vec());
+        }
+        return Ok(hop_bytes.to_vec());
+    };
     // Request short-circuit pristine-tracking (Change B). Starts true; flips false the moment ANY
     // same-protocol-reachable mutation actually changes the body. The cross-protocol branch below
     // always rebuilds the body from the IR (read_request → write_request), so it is never pristine.
@@ -440,8 +480,7 @@ fn translate_request_cross_protocol(
                     lane_default_max_tokens: app.lanes[i].default_max_tokens,
                     global_default_max_tokens: app.default_max_tokens,
                 });
-                let Some(written) = egress_handler.and_then(|h| h.write_request_value(&ir_req))
-                else {
+                let Some(eh) = egress_handler else {
                     return Err(Box::new(ingress_error(
                         ingress_protocol,
                         StatusCode::NOT_FOUND,
@@ -449,7 +488,16 @@ fn translate_request_cross_protocol(
                         "This model does not support that operation.",
                     )));
                 };
-                body = written;
+                match eh.write_request_value(&ir_req) {
+                    Some(written) => body = written,
+                    None => {
+                        // The EGRESS wire is not JSON (multipart transcription): the IR carries the
+                        // resolved model in-band, and the JSON-only post-shaping below (shim strips,
+                        // model rewrite) does not apply — emit the handler's bytes directly.
+                        ir_req.set_model(app.lanes[i].wire_model());
+                        return Ok(eh.write_request(&ir_req).to_vec());
+                    }
+                }
                 // The body was fully rebuilt from the IR (read_request → write_request), so it bears
                 // no fixed relationship to `hop_bytes` — a cross-protocol hop is NEVER pristine and
                 // must serialize the rewritten `Value`, never short-circuit to the original bytes.
@@ -2132,9 +2180,6 @@ fn coerce_on_error(
     }
 }
 
-mod operation;
-pub(crate) use operation::forward_operation;
-
 /// Forward with pool name context for on_exhausted config lookup.
 /// Thin wrapper: parse the body ONCE for callers that only hold bytes (tests, ad-hoc routes), then
 /// delegate. The ingress hot path (`route::forward_resolved`) instead calls
@@ -2168,7 +2213,8 @@ pub(crate) async fn forward_with_pool(
         app,
         cands,
         body,
-        v,
+        Some(v),
+        APPLICATION_JSON,
         caller_token,
         pool_name,
         affinity_key,
@@ -2196,7 +2242,12 @@ pub(crate) async fn forward_with_pool_parsed(
     app: Arc<App>,
     cands: Vec<WeightedLane>,
     body: Bytes,
-    v: Value,
+    // The request body parsed ONCE by the caller for JSON-body operations; `None` for an OPAQUE
+    // ingress body (multipart transcription, binary) — those relay/translate at the BYTE level via
+    // the operation codecs and skip every JSON-only read below.
+    v: Option<Value>,
+    // The ingress request Content-Type — the byte-level codec's parse hint (multipart boundary).
+    req_content_type: &str,
     caller_token: Option<&str>,
     pool_name: &str,
     affinity_key: Option<&str>,
@@ -2241,7 +2292,7 @@ pub(crate) async fn forward_with_pool_parsed(
     // translation rewrites `v` (Gemini routes streaming requests to a different upstream endpoint).
     // Delegated to the operation: chat reads the OpenAI-family `stream` boolean (byte-identical to
     // the previous inline read); a non-streaming op always returns false.
-    let wants_stream = op.wants_stream(&v);
+    let wants_stream = v.as_ref().map(|v| op.wants_stream(v)).unwrap_or(false);
 
     // Gemini ingress streaming WITHOUT `?alt=sse`: the native client expects a JSON-array streamed
     // body, not SSE. The route layer signals this via a router shim key (read here; stripped from the
@@ -2255,7 +2306,12 @@ pub(crate) async fn forward_with_pool_parsed(
     // stream (chat streams, so this is a no-op for chat — `true && x == x`).
     let gemini_json_array = op.streaming()
         && crate::proto::protocol_for(ingress_protocol)
-            .map(|p| p.writer().uses_array_stream_shim() && p.writer().wants_array_stream(&v))
+            .map(|p| {
+                p.writer().uses_array_stream_shim()
+                    && v.as_ref()
+                        .map(|v| p.writer().wants_array_stream(v))
+                        .unwrap_or(false)
+            })
             .unwrap_or(false);
 
     // Derive affinity key early (before any mutations to v). When no affinity header was supplied,
@@ -2264,7 +2320,9 @@ pub(crate) async fn forward_with_pool_parsed(
     let affinity_key_str: Option<String> = if let Some(k) = affinity_key {
         Some(k.to_string())
     } else {
-        op.body_affinity_key(&v).map(String::from)
+        v.as_ref()
+            .and_then(|v| op.body_affinity_key(v))
+            .map(String::from)
     };
 
     // Before-first-byte failover boundary:
@@ -2343,7 +2401,7 @@ pub(crate) async fn forward_with_pool_parsed(
                 resolved,
                 &cands,
                 &request_ctx,
-                &v,
+                v.as_ref().unwrap_or(&Value::Null),
                 pool_name,
                 ingress_protocol,
                 wants_stream,
@@ -2383,7 +2441,8 @@ pub(crate) async fn forward_with_pool_parsed(
     // the common no-failover path parses the body ONCE, not twice. Failover hops (2+) re-parse from
     // the retained `body` bytes — never from a previous hop's egress-shaped Value — preserving the
     // mixed-protocol-pool correctness the per-hop re-parse was introduced for.
-    let mut first_hop_v = Some(v);
+    let body_is_json = v.is_some();
+    let mut first_hop_v = v;
     for _attempt in 0..=max_cap {
         // Check deadline first (propagated across hops)
         if request_ctx.expired(now()) {
@@ -2429,6 +2488,7 @@ pub(crate) async fn forward_with_pool_parsed(
                     &mut request_ctx,
                     ingress_protocol,
                     op,
+                    req_content_type,
                     usage_sink.clone(),
                 )
                 .await;
@@ -2463,45 +2523,56 @@ pub(crate) async fn forward_with_pool_parsed(
         // parsed `Value` tree per hop: a single JSON parse is far cheaper in time and peak heap than
         // an O(n) `Value::clone` of a large request (long histories / base64 images / big tool
         // schemas), which under sustained failover compounded to O(n × max_cap) allocations.
-        let hop_v: Value = match first_hop_v.take() {
-            // First hop: reuse the pristine parse from above (no second parse on the common path).
-            Some(v) => v,
-            // Failover hops: re-parse from the retained pristine bytes (sonic-rs: SIMD parse).
-            None => match crate::json::parse(&body) {
-                Ok(v) => v,
-                // `body` already parsed once successfully above; this re-parse is infallible.
-                Err(_) => {
-                    // Probe class guard: this lane may have CAS-won the single-flight recovery probe in
-                    // `pick_among`. We bail BEFORE dispatching any request, so no outcome will be
-                    // recorded to clear `probe_in_flight` — release it here or the recovering lane stays
-                    // wedged HalfOpen until the slow out-of-band prober resets it.
-                    app.store.release_probe_in(pool_name, i);
-                    drop(permit);
-                    return ingress_error(
-                        ingress_protocol,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        KIND_API_ERROR,
-                        "We received an unexpected internal error. Please try again.",
-                    );
-                }
-            },
+        let hop_v: Option<Value> = if !body_is_json {
+            None // opaque ingress body: byte-level relay/translate; nothing to re-parse.
+        } else {
+            Some(match first_hop_v.take() {
+                // First hop: reuse the pristine parse from above (no second parse on the common path).
+                Some(v) => v,
+                // Failover hops: re-parse from the retained pristine bytes (sonic-rs: SIMD parse).
+                None => match crate::json::parse(&body) {
+                    Ok(v) => v,
+                    // `body` already parsed once successfully above; this re-parse is infallible.
+                    Err(_) => {
+                        // Probe class guard: this lane may have CAS-won the single-flight recovery probe in
+                        // `pick_among`. We bail BEFORE dispatching any request, so no outcome will be
+                        // recorded to clear `probe_in_flight` — release it here or the recovering lane stays
+                        // wedged HalfOpen until the slow out-of-band prober resets it.
+                        app.store.release_probe_in(pool_name, i);
+                        drop(permit);
+                        return ingress_error(
+                            ingress_protocol,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            KIND_API_ERROR,
+                            "We received an unexpected internal error. Please try again.",
+                        );
+                    }
+                },
+            })
         };
         // SINGLE shared cross-protocol request-shaping seam (shared verbatim with `forward_once`'s
         // degraded path): read→clear-extra→write, shim-key strip, model rewrite, serialize. Both
         // paths route through `translate_request_cross_protocol` so neither can carry a translation
         // step the other lacks (the recurring drift class this round's unification ends).
-        let payload =
-            match translate_request_cross_protocol(&app, i, ingress_protocol, op, hop_v, &body) {
-                Ok(p) => p,
-                Err(resp) => {
-                    // Probe class guard: a translation failure also bails before dispatch, so release
-                    // the (possibly won) single-flight probe before returning — same wedged-HalfOpen
-                    // leak as the re-parse path above.
-                    app.store.release_probe_in(pool_name, i);
-                    drop(permit);
-                    return *resp;
-                }
-            };
+        let payload = match translate_request_cross_protocol(
+            &app,
+            i,
+            ingress_protocol,
+            op,
+            hop_v,
+            req_content_type,
+            &body,
+        ) {
+            Ok(p) => p,
+            Err(resp) => {
+                // Probe class guard: a translation failure also bails before dispatch, so release
+                // the (possibly won) single-flight probe before returning — same wedged-HalfOpen
+                // leak as the re-parse path above.
+                app.store.release_probe_in(pool_name, i);
+                drop(permit);
+                return *resp;
+            }
+        };
         let base = &app.lanes[i].base_url;
 
         // Mode-aware key selection: passthrough uses caller token, others use lane's api_key
@@ -2555,11 +2626,25 @@ pub(crate) async fn forward_with_pool_parsed(
         };
         let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 
+        // Egress request Content-Type: JSON bodies stay JSON (chat byte-identical). An OPAQUE body
+        // relays the caller's own CT same-protocol (multipart boundary preserved verbatim) and uses
+        // the EGRESS operation handler's declared wire CT cross-protocol (its write_request built
+        // that wire — e.g. openai transcription's fixed-boundary multipart).
+        let egress_ct: &str = if body_is_json {
+            APPLICATION_JSON
+        } else if ingress_protocol == egress_name {
+            req_content_type
+        } else {
+            crate::handlers::request_handler(egress_name)
+                .and_then(|rh| rh.operation_handler(op.operation))
+                .map(|h| h.egress_request_content_type())
+                .unwrap_or(APPLICATION_JSON)
+        };
         let mut req = app
             .client
             .post(format!("{base}{wire_path}"))
             .headers(convert_headers(auth))
-            .header(CONTENT_TYPE, APPLICATION_JSON)
+            .header(CONTENT_TYPE, egress_ct)
             // Native-SDK User-Agent for the egress protocol. The shared client sets none, so without
             // this the backend sees a UA-less request — a proxy fingerprint. Dispatched through the
             // writer vtable (`ProtocolWriter::egress_user_agent`) — `writer` is already resolved above.
@@ -3150,10 +3235,36 @@ pub(crate) async fn forward_with_pool_parsed(
                     // completion the client never receives, exactly the inconsistency the Truncated
                     // and TransportError branches above deliberately avoid. So tap usage ONLY once we
                     // are inside the block that actually mints and returns a translated response.
+                    let egress_op = crate::handlers::request_handler(app.lanes[i].protocol.name())
+                        .and_then(|rh| rh.operation_handler(op.operation));
+                    // OPAQUE (non-JSON) egress body — e.g. binary speech audio: bridge at the BYTE
+                    // level through the operation codecs and relay the ingress handler's WireBody
+                    // (bytes + ITS content-type) verbatim. JSON bodies take the Value path below.
+                    if crate::json::parse::<Value>(&bytes).is_err() {
+                        if let Some(Ok(mut ir)) = egress_op.map(|h| h.read_response(&bytes)) {
+                            record_resp_usage(&ir, &usage_sink);
+                            ir.prepare_for_ingress(ingress_protocol, now());
+                            if let Some(wire) = crate::handlers::request_handler(ingress_protocol)
+                                .and_then(|rh| rh.operation_handler(op.operation))
+                                .map(|h| h.write_response(&ir))
+                            {
+                                let rb = Response::builder()
+                                    .status(status)
+                                    .header(CONTENT_TYPE, wire.content_type);
+                                let rb =
+                                    maybe_attach_response_request_id(rb, ingress_protocol, None);
+                                let rb = maybe_attach_route_policy(
+                                    rb,
+                                    chosen_policy_name,
+                                    &app.lanes[i].model,
+                                );
+                                return rb
+                                    .body(Body::from(wire.bytes))
+                                    .unwrap_or_else(|_| status.into_response());
+                            }
+                        }
+                    }
                     if let Ok(rv) = crate::json::parse::<Value>(&bytes) {
-                        let egress_op =
-                            crate::handlers::request_handler(app.lanes[i].protocol.name())
-                                .and_then(|rh| rh.operation_handler(op.operation));
                         if let Some(Ok(mut ir)) = egress_op.map(|h| h.read_response_value(&rv)) {
                             if let Some(ingress_proto) =
                                 crate::proto::protocol_for(ingress_protocol)
@@ -3207,11 +3318,40 @@ pub(crate) async fn forward_with_pool_parsed(
                                 }
                                 // The INGRESS operation handler writes its dialect (chat's
                                 // delegates to the same writer vtable — byte-identical).
-                                let mut translated =
-                                    crate::handlers::request_handler(ingress_protocol)
-                                        .and_then(|rh| rh.operation_handler(op.operation))
-                                        .and_then(|h| h.write_response_value(&ir))
-                                        .unwrap_or(Value::Null);
+                                let ingress_op = crate::handlers::request_handler(ingress_protocol)
+                                    .and_then(|rh| rh.operation_handler(op.operation));
+                                let Some(ingress_op) = ingress_op else {
+                                    return ingress_error(
+                                        ingress_protocol,
+                                        StatusCode::NOT_FOUND,
+                                        KIND_NOT_FOUND,
+                                        "This endpoint does not support that operation.",
+                                    );
+                                };
+                                let mut translated = match ingress_op.write_response_value(&ir) {
+                                    Some(t) => t,
+                                    None => {
+                                        // The ingress dialect's response is NOT JSON (binary
+                                        // speech): relay the WireBody — bytes + its content-type.
+                                        let wire = ingress_op.write_response(&ir);
+                                        let rb = Response::builder()
+                                            .status(status)
+                                            .header(CONTENT_TYPE, wire.content_type);
+                                        let rb = maybe_attach_response_request_id(
+                                            rb,
+                                            ingress_protocol,
+                                            None,
+                                        );
+                                        let rb = maybe_attach_route_policy(
+                                            rb,
+                                            chosen_policy_name,
+                                            &app.lanes[i].model,
+                                        );
+                                        return rb
+                                            .body(Body::from(wire.bytes))
+                                            .unwrap_or_else(|_| status.into_response());
+                                    }
+                                };
                                 // A native AWS Bedrock Converse (non-stream) response ALWAYS populates
                                 // `metrics.latencyMs` (the SDK surfaces it via
                                 // `ConverseOutput::metrics().latencyMs()`); the bedrock writer's
@@ -3405,6 +3545,7 @@ pub(crate) async fn forward_with_pool_parsed(
         &mut request_ctx,
         ingress_protocol,
         op,
+        req_content_type,
         usage_sink,
     )
     .await
@@ -3443,6 +3584,7 @@ async fn handle_exhaustion_for_pool(
     request_ctx: &mut RequestCtx,
     ingress_protocol: &str,
     op: crate::handlers::Op,
+    req_content_type: &str,
     usage_sink: Option<UsageSink>,
 ) -> Response {
     // Cycle-guard fix (LOW #22): mark the ORIGINATING pool visited here, BEFORE the mode lookup —
@@ -3473,6 +3615,7 @@ async fn handle_exhaustion_for_pool(
                 request_ctx,
                 ingress_protocol,
                 op,
+                req_content_type,
                 usage_sink,
             )
             .await
@@ -3488,6 +3631,7 @@ async fn handle_exhaustion_for_pool(
                 pool_name,
                 ingress_protocol,
                 op,
+                req_content_type,
                 usage_sink,
             )
             .await
@@ -3554,11 +3698,15 @@ async fn forward_once(
     // `probe_in_flight` forever. An empty `pool` means the lane-default cell (direct/ad-hoc routes).
     pool: &str,
     op: crate::handlers::Op,
+    req_content_type: &str,
     usage_sink: Option<UsageSink>,
 ) -> Result<Response, ()> {
-    // Re-parse body for per-lane model rewriting.
-    let v: Value = match crate::json::parse(body) {
-        Ok(v) => v,
+    // Re-parse body for per-lane model rewriting. An OPAQUE (non-JSON) body — multipart/binary
+    // operations — parses to `None` and relays/translates at the byte level, exactly like the main
+    // path; only a JSON-Content-Type body that FAILS to parse is the caller's 400.
+    let v: Option<Value> = match crate::json::parse(body) {
+        Ok(v) => Some(v),
+        Err(_) if !req_content_type.starts_with("application/json") => None,
         Err(_) => {
             // See the main forward path: log a sanitized note for operators; never the parser's raw
             // error (with sonic-rs it embeds a fragment of the input body — secrets/PII) nor leak it
@@ -3581,12 +3729,21 @@ async fn forward_once(
     };
 
     // stream intent for the stream-aware upstream path (Gemini).
-    let wants_stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    let wants_stream = v
+        .as_ref()
+        .and_then(|v| v.get("stream"))
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
     // Gemini ingress streaming WITHOUT `?alt=sse` → JSON-array streamed body (see main path). GATED
     // on `uses_array_stream_shim()` (true only for GeminiWriter) so a body-model client cannot
     // smuggle the shim key to force JSON-array reframing of its SSE stream.
     let gemini_json_array = crate::proto::protocol_for(ingress_protocol)
-        .map(|p| p.writer().uses_array_stream_shim() && p.writer().wants_array_stream(&v))
+        .map(|p| {
+            p.writer().uses_array_stream_shim()
+                && v.as_ref()
+                    .map(|v| p.writer().wants_array_stream(v))
+                    .unwrap_or(false)
+        })
         .unwrap_or(false);
     let egress_name = app.lanes[i].protocol.name();
 
@@ -3609,7 +3766,15 @@ async fn forward_once(
     // previously lacked the `ir.extra.clear()` the hot path had, leaking source-only keys like OpenAI
     // `logprobs`/`top_logprobs`/`n` to a foreign backend): the clear now lives in the one shared fn,
     // so neither path can be missing it.
-    let payload = match translate_request_cross_protocol(app, i, ingress_protocol, op, v, body) {
+    let payload = match translate_request_cross_protocol(
+        app,
+        i,
+        ingress_protocol,
+        op,
+        v,
+        req_content_type,
+        body,
+    ) {
         Ok(p) => p,
         Err(resp) => {
             // Probe-leak guard (HIGH #1): release the POOL-cell single-flight probe this
@@ -3949,10 +4114,34 @@ async fn forward_once(
                                         .unwrap_or_else(|_| status.into_response()));
                                 }
                             }
-                            let mut translated = crate::handlers::request_handler(ingress_protocol)
-                                .and_then(|rh| rh.operation_handler(op.operation))
-                                .and_then(|h| h.write_response_value(&ir))
-                                .unwrap_or(Value::Null);
+                            let ingress_op = crate::handlers::request_handler(ingress_protocol)
+                                .and_then(|rh| rh.operation_handler(op.operation));
+                            let Some(ingress_op) = ingress_op else {
+                                return Ok(ingress_error(
+                                    ingress_protocol,
+                                    StatusCode::NOT_FOUND,
+                                    KIND_NOT_FOUND,
+                                    "This endpoint does not support that operation.",
+                                ));
+                            };
+                            let mut translated = match ingress_op.write_response_value(&ir) {
+                                Some(t) => t,
+                                None => {
+                                    // Binary ingress dialect: relay the WireBody verbatim.
+                                    let wire = ingress_op.write_response(&ir);
+                                    let rb = Response::builder()
+                                        .status(status)
+                                        .header(CONTENT_TYPE, wire.content_type);
+                                    let rb = maybe_attach_response_request_id(
+                                        rb,
+                                        ingress_protocol,
+                                        None,
+                                    );
+                                    return Ok(rb
+                                        .body(Body::from(wire.bytes))
+                                        .unwrap_or_else(|_| status.into_response()));
+                                }
+                            };
                             // Inject `metrics.latencyMs` for a bedrock-ingress non-stream Converse — a
                             // native AWS Converse always populates it, so its absence is a proxy tell
                             // (mirrors the streaming path and the buffered cross-protocol path above).
@@ -4120,6 +4309,7 @@ async fn handle_fallback_pool(
     request_ctx: &mut RequestCtx,
     ingress_protocol: &str,
     op: crate::handlers::Op,
+    req_content_type: &str,
     usage_sink: Option<UsageSink>,
 ) -> Response {
     // Deadline propagated across hops.
@@ -4175,6 +4365,7 @@ async fn handle_fallback_pool(
                 request_ctx,
                 ingress_protocol,
                 op,
+                req_content_type,
                 usage_sink,
             ))
             .await;
@@ -4195,6 +4386,7 @@ async fn handle_fallback_pool(
             // against THAT cell, not the default `""` cell.
             pool_name,
             op,
+            req_content_type,
             // Clone per attempt: a transient transport failure retries the next member, so the sink
             // must survive into the next loop iteration; only a successful stream consumes it.
             usage_sink.clone(),
@@ -4223,6 +4415,7 @@ async fn handle_least_bad(
     pool: &str,
     ingress_protocol: &str,
     op: crate::handlers::Op,
+    req_content_type: &str,
     usage_sink: Option<UsageSink>,
 ) -> Response {
     let Some(soonest_idx) = find_soonest_cooldown(&app.store, cands, now, pool) else {
@@ -4254,6 +4447,7 @@ async fn handle_least_bad(
         // `cooldown_remaining_in(pool, …)`), so record its breaker outcome against the POOL cell.
         pool,
         op,
+        req_content_type,
         usage_sink,
     )
     .await
@@ -5186,7 +5380,8 @@ mod request_short_circuit_tests {
             0,
             proto_name,
             crate::handlers::chat(proto_name),
-            body,
+            Some(body),
+            crate::forward::APPLICATION_JSON,
             &hop_bytes,
         )
         .expect("same-proto shaping is infallible for a valid body")
@@ -5252,7 +5447,8 @@ mod request_short_circuit_tests {
             0,
             "openai",
             crate::handlers::chat("openai"),
-            body,
+            Some(body),
+            crate::forward::APPLICATION_JSON,
             &hop_bytes,
         )
         .expect("same-proto shaping is infallible for a valid body");

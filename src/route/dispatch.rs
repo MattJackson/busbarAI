@@ -138,25 +138,34 @@ pub(crate) async fn operation_ingress(
         );
     };
 
-    let req_ct = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .cloned()
-        .unwrap_or_else(|| axum::http::HeaderValue::from_static("application/json"));
-    let accept = match operation {
-        crate::operation::Operation::Speech => "*/*",
-        _ => "application/json",
+    // THE ONE ENGINE: every operation — chat included — forwards through the same failover/breaker/
+    // policy pipeline. JSON bodies ride parsed (`Some(v)`); opaque bodies (multipart/binary) ride
+    // `None` and relay/translate at the byte level through the operation codecs.
+    let v: Option<serde_json::Value> = if ct.starts_with("application/json") || ct.is_empty() {
+        crate::json::parse(&body).ok()
+    } else {
+        None
     };
-    let resp = crate::forward::forward_operation(
+    let req_ct_owned = ct.to_string();
+    let resp = crate::forward::forward_with_pool_parsed(
         app.clone(),
         cands,
         body,
-        req_ct,
+        v,
+        if req_ct_owned.is_empty() {
+            crate::forward::APPLICATION_JSON
+        } else {
+            &req_ct_owned
+        },
         caller_token,
         pool_name,
+        None,
         proto,
-        operation,
-        op_handler,
-        accept,
+        crate::handlers::OpDispatch {
+            operation,
+            op_handler,
+        },
+        usage_sink(app, gov, charged_at),
     )
     .await;
     finish(app, gov, proto, &model, started, charged_at, resp)

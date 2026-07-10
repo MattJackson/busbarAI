@@ -181,6 +181,12 @@ pub(crate) trait OperationHandler: Send + Sync {
     fn extract_usage(&self, _ingress_protocol: &str, _body: &[u8]) -> Option<IrUsage> {
         None
     }
+    /// The Content-Type of THIS operation's egress request wire (what `write_request` emits).
+    /// JSON for every JSON-bodied operation; a multipart operation overrides with its boundary.
+    fn egress_request_content_type(&self) -> &'static str {
+        "application/json"
+    }
+
     /// The egress `Accept` header for the upstream request. Default: the writer's stream-aware choice
     /// (JSON / SSE / eventstream). A binary-response op (audio speech) overrides to `*/*`.
     fn egress_accept(&self, writer: &dyn ProtocolWriter, wants_stream: bool) -> &'static str {
@@ -439,13 +445,7 @@ mod dispatch_tests {
     #[test]
     fn engine_never_branches_on_operation_identity() {
         // Scan EVERY file of the forward engine (the module split must not open a blind spot).
-        let engine_files = [
-            ("src/forward/mod.rs", include_str!("../forward/mod.rs")),
-            (
-                "src/forward/operation.rs",
-                include_str!("../forward/operation.rs"),
-            ),
-        ];
+        let engine_files = [("src/forward/mod.rs", include_str!("../forward/mod.rs"))];
         let forbidden = [
             "op.name() ==",
             "op.name()==",

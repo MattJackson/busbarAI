@@ -157,6 +157,11 @@ fn parse_multipart<'a>(body: &'a [u8], content_type: &str) -> Vec<MultipartField
 struct OpenAiTranscription;
 
 impl OperationHandler for OpenAiTranscription {
+    fn egress_request_content_type(&self) -> &'static str {
+        // write_request rebuilds the multipart form with this FIXED boundary.
+        "multipart/form-data; boundary=----busbaraudioMIME"
+    }
+
     fn read_request(&self, body: &[u8], content_type: &str) -> Result<IrReq, IngressReject> {
         let fields = parse_multipart(body, content_type);
         let mut req = TranscriptionReq::default();
