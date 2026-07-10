@@ -2180,17 +2180,90 @@ pub(crate) async fn forward_operation(
                         "This model does not support that operation.",
                     );
                 }
-                Some(_egress_cell) => {
-                    return ingress_error(
-                        ingress_protocol,
-                        StatusCode::NOT_IMPLEMENTED,
-                        KIND_API_ERROR,
-                        "Cross-protocol translation for this operation is not yet available.",
-                    );
+                Some(egress_cell) => {
+                    // CROSS-PROTOCOL IR BRIDGE (the core value): ingress wire → IR → egress wire; on
+                    // the way back, egress wire → IR → caller-dialect wire.
+                    let Some(_permit) = app.store.try_acquire(i) else {
+                        continue;
+                    };
+                    let v = match crate::json::parse(&body) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return ingress_error(ingress_protocol, StatusCode::BAD_REQUEST,
+                                KIND_INVALID_REQUEST, "We could not parse the JSON body of your request.")
+                        }
+                    };
+                    let ir_req = match cell.read_request(&v) {
+                        Ok(ir) => ir,
+                        Err(_) => {
+                            return ingress_error(ingress_protocol, StatusCode::BAD_REQUEST,
+                                KIND_INVALID_REQUEST, "We could not process the content of your request.")
+                        }
+                    };
+                    let egress_bytes = egress_cell.write_request(&ir_req);
+                    let base = &app.lanes[i].base_url;
+                    let e_path = egress_cell.upstream_path(&app.lanes[i], false);
+                    let (wire_path, canonical_uri) = sign_and_wire_path_parts(&e_path);
+                    let key = match app.auth_mode() {
+                        crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(""),
+                        crate::auth::AuthMode::Token | crate::auth::AuthMode::None => {
+                            app.lanes[i].api_key.as_str()
+                        }
+                    };
+                    let signing_ctx = crate::proto::SigningContext {
+                        host: host_from_base(base),
+                        canonical_uri,
+                        body: egress_bytes.as_ref(),
+                        timestamp_epoch: now(),
+                        auth_mode: app.auth_mode(),
+                    };
+                    let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
+                    let writer = app.lanes[i].protocol.writer();
+                    let req = app
+                        .client
+                        .post(format!("{base}{wire_path}"))
+                        .headers(convert_headers(auth))
+                        .header(CONTENT_TYPE, APPLICATION_JSON)
+                        .header(USER_AGENT, writer.egress_user_agent())
+                        .header(ACCEPT, accept)
+                        .body(egress_bytes.clone())
+                        .timeout(std::time::Duration::from_secs(30));
+                    match req.send().await {
+                        Ok(resp) => {
+                            let status = StatusCode::from_u16(resp.status().as_u16())
+                                .unwrap_or(StatusCode::BAD_GATEWAY);
+                            match resp.bytes().await {
+                                Ok(bytes) => {
+                                    if !status.is_success() {
+                                        // Never translate an error body; surface an ingress-native error.
+                                        return ingress_error(ingress_protocol, status, KIND_API_ERROR,
+                                            "The upstream provider returned an error.");
+                                    }
+                                    app.store.record_success_in(pool_name, i);
+                                    let ir_resp = match egress_cell.read_response(&bytes) {
+                                        Ok(ir) => ir,
+                                        Err(_) => {
+                                            return ingress_error(ingress_protocol,
+                                                StatusCode::BAD_GATEWAY, KIND_API_ERROR,
+                                                "We could not read the upstream response.")
+                                        }
+                                    };
+                                    let client_bytes = cell.write_response(&ir_resp);
+                                    return Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header(CONTENT_TYPE, APPLICATION_JSON)
+                                        .body(Body::from(client_bytes))
+                                        .unwrap_or_else(|_| StatusCode::OK.into_response());
+                                }
+                                Err(_) => continue, // body read failed → failover
+                            }
+                        }
+                        Err(_) => continue, // transport error → failover
+                    }
                 }
             }
         }
-        // Concurrency permit; a busy/cooling lane yields None → try the next candidate.
+        // SAME-protocol passthrough. Concurrency permit; busy/cooling lane → next candidate.
         let Some(_permit) = app.store.try_acquire(i) else {
             continue;
         };

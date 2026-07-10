@@ -71,10 +71,127 @@ macro_rules! passthrough_cell {
     };
 }
 
-passthrough_cell!(OpenAiEmbeddings, "/v1/embeddings", "embeddings");
 passthrough_cell!(OpenAiImage, "/v1/images/generations", "image");
 passthrough_cell!(OpenAiTranscription, "/v1/audio/transcriptions", "transcription");
 passthrough_cell!(OpenAiSpeech, "/v1/audio/speech", "speech");
+
+// -------------------------------------------------- embeddings cell (real codec, cross-protocol)
+
+use crate::ir::embeddings::{EmbInput, EmbeddingItem, EmbeddingsReq, EmbeddingsResp, EncFmt, VectorData};
+
+struct OpenAiEmbeddings;
+
+impl OperationHandler for OpenAiEmbeddings {
+    fn upstream_path(&self, lane: &Lane, _wants_stream: bool) -> String {
+        lane.path.clone().unwrap_or_else(|| "/v1/embeddings".to_string())
+    }
+
+    /// openai embeddings wire → IR (used when openai is the INGRESS of a cross-protocol call).
+    fn read_request(&self, wire: &Value) -> Result<IrReq, IngressReject> {
+        let model = wire.get("model").and_then(Value::as_str).unwrap_or_default().to_string();
+        let input = match wire.get("input") {
+            Some(Value::String(s)) => EmbInput::Text(vec![s.clone()]),
+            Some(Value::Array(a)) => {
+                EmbInput::Text(a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            }
+            _ => return Err(IngressReject::BadRequest("embeddings request missing `input`".into())),
+        };
+        let dimensions = wire.get("dimensions").and_then(Value::as_u64).map(|d| d as u32);
+        let encoding_formats = match wire.get("encoding_format").and_then(Value::as_str) {
+            Some("base64") => vec![EncFmt::Base64],
+            _ => vec![EncFmt::Float],
+        };
+        Ok(IrReq::Embeddings(EmbeddingsReq {
+            model,
+            input,
+            dimensions,
+            encoding_formats,
+            user: wire.get("user").and_then(Value::as_str).map(str::to_string),
+            ..Default::default()
+        }))
+    }
+
+    /// IR → openai embeddings wire (used when openai is the EGRESS).
+    fn write_request(&self, ir: &IrReq) -> Bytes {
+        let IrReq::Embeddings(r) = ir else { return Bytes::new() };
+        let input = match &r.input {
+            EmbInput::Text(v) if v.len() == 1 => json!(v[0]),
+            EmbInput::Text(v) => json!(v),
+            _ => json!([]),
+        };
+        let mut body = json!({ "model": r.model, "input": input });
+        if let Some(d) = r.dimensions {
+            body["dimensions"] = json!(d);
+        }
+        Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
+    }
+
+    /// openai embeddings response wire → IR (used when openai is the EGRESS).
+    fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
+        let v: Value = serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
+        let embeddings = v
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .enumerate()
+                    .map(|(idx, d)| {
+                        let index = d.get("index").and_then(Value::as_u64).unwrap_or(idx as u64) as usize;
+                        let mut item = EmbeddingItem { index, ..Default::default() };
+                        if let Some(f) = d.get("embedding").and_then(Value::as_array) {
+                            item.vectors.insert(
+                                EncFmt::Float,
+                                VectorData::Float(f.iter().filter_map(|x| x.as_f64().map(|n| n as f32)).collect()),
+                            );
+                        } else if let Some(b) = d.get("embedding").and_then(Value::as_str) {
+                            item.vectors.insert(EncFmt::Base64, VectorData::Base64(b.to_string()));
+                        }
+                        item
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let usage = v.get("usage").map(|u| crate::billing::TokenUsage {
+            input: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+            ..Default::default()
+        });
+        Ok(IrResp::Embeddings(EmbeddingsResp {
+            model: v.get("model").and_then(Value::as_str).map(str::to_string),
+            object_kind: Some("list".into()),
+            embeddings,
+            usage,
+            ..Default::default()
+        }))
+    }
+
+    /// IR → openai embeddings response wire (used when openai is the INGRESS — the caller's dialect).
+    fn write_response(&self, ir: &IrResp) -> Bytes {
+        let IrResp::Embeddings(r) = ir else { return Bytes::new() };
+        let data: Vec<Value> = r
+            .embeddings
+            .iter()
+            .map(|item| {
+                let emb = match item.vectors.get(&EncFmt::Float) {
+                    Some(VectorData::Float(f)) => json!(f),
+                    _ => match item.vectors.values().next() {
+                        Some(VectorData::Base64(b)) => json!(b),
+                        Some(VectorData::Int(v)) => json!(v),
+                        _ => json!([]),
+                    },
+                };
+                json!({ "object": "embedding", "index": item.index, "embedding": emb })
+            })
+            .collect();
+        let mut body = json!({ "object": "list", "data": data });
+        if let Some(m) = &r.model {
+            body["model"] = json!(m);
+        }
+        if let Some(u) = &r.usage {
+            body["usage"] = json!({ "prompt_tokens": u.input, "total_tokens": u.input + u.output });
+        }
+        Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
+    }
+}
 
 // ---------------------------------------------------------------- moderation cell
 

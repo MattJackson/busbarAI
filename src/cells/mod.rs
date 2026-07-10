@@ -9,18 +9,28 @@
 //! Foundation; `dead_code` allowed until the seam dispatch consumes the registry (P4).
 #![allow(dead_code)]
 
+pub(crate) mod bedrock;
+pub(crate) mod cohere;
+pub(crate) mod gemini;
 pub(crate) mod openai;
 
 use crate::handler::RequestHandler;
 
 static OPENAI: openai::OpenAiRequestHandler = openai::OpenAiRequestHandler;
+static BEDROCK: bedrock::BedrockRequestHandler = bedrock::BedrockRequestHandler;
+static COHERE: cohere::CohereRequestHandler = cohere::CohereRequestHandler;
+static GEMINI: gemini::GeminiRequestHandler = gemini::GeminiRequestHandler;
 
-/// The ingress protocol's `RequestHandler`, by name (matches `router` / `proto::Protocol::name()`).
-/// `None` for a protocol with no operation cells yet (its ops 404 until built).
+/// The protocol's `RequestHandler`, by name (matches `router` / `proto::Protocol::name()`). `None`
+/// for a protocol with no operation cells yet (its ops 404 until built). Note: a registered handler
+/// may still return `None` from `operation_handler` for an op it lacks — that IS the no-cell 404.
 pub(crate) fn request_handler(protocol: &str) -> Option<&'static dyn RequestHandler> {
     match protocol {
         "openai" => Some(&OPENAI),
-        // anthropic/gemini/bedrock/cohere/responses handlers registered as their cells are built.
+        "bedrock" => Some(&BEDROCK),
+        "cohere" => Some(&COHERE),
+        "gemini" => Some(&GEMINI),
+        // anthropic/responses handlers registered as their cells are built.
         _ => None,
     }
 }
