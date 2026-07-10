@@ -946,9 +946,8 @@ impl ProtocolReader for GeminiReader {
                                                 text.to_string(),
                                             ),
                                         });
-                                        if let Some(sig) = part
-                                            .get("thoughtSignature")
-                                            .and_then(|v| v.as_str())
+                                        if let Some(sig) =
+                                            part.get("thoughtSignature").and_then(|v| v.as_str())
                                         {
                                             out.push(IrStreamEvent::BlockDelta {
                                                 index: 0,
@@ -971,9 +970,8 @@ impl ProtocolReader for GeminiReader {
                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                 if !text.is_empty() {
                                     let offset = usize::from(state.reasoning_seen);
-                                    let ti = state
-                                        .text_index
-                                        .unwrap_or(offset + state.open_tools.len());
+                                    let ti =
+                                        state.text_index.unwrap_or(offset + state.open_tools.len());
                                     if state.thinking_block_open {
                                         state.thinking_block_open = false;
                                         out.push(IrStreamEvent::BlockStop { index: 0 });
