@@ -27,9 +27,9 @@ Whichever way you run it, the logic is small and the same. Classify the request 
 
 **Classify** on shape: tools declared means agent or code work. A big `max_tokens` or a long prompt means long-form work. One message with streaming turned off is almost always a script or a cron job, not a person, so it gets treated as batch work. Everything else is a person waiting on an answer. Routing does not need to read your prompt to do any of this, so by default it does not get it.
 
-**Score** turns the bucket into dials. A code request weights capability and latency; a batch request weights cost. Each candidate scores on its live cost, latency, and free concurrency, plus a boost for the operator-declared quality `tier`, then scaled down as a lane nears its rate-limit cap.
+**Score** is the reality check. Each kind of request has a favorite lane, but the favorite gets a head start, not the win: every lane is scored on how it is doing right now, its price, its latency, its free capacity, weighed by what this kind of request cares about. The favorite gets a bonus on top; a lane near its rate limit gets trimmed.
 
-**Sort** descending, return the order. That is the whole policy. It is not a static "if X use Y" table and it is not blind cost math: one classification step picks the weights, then a scoring pass applies them to the live signals of every candidate, so the same pool serves a code request and a batch request ranked differently.
+**Sort** by score, best first, and return that order. That is the whole policy. It is not a static "if X use Y" table and it is not blind cost math: the classification names a favorite, the scoring routes to reality, and the same pool serves a code request and a batch request ranked differently.
 
 ## Answer one: a Rust binary on a socket, about 8 microseconds
 
