@@ -14,7 +14,7 @@ Measured end to end through busbar's transport against this exact example binary
 
 ```yaml
 pools:
-  smart:
+  my-smart-model:
     route: socket
     policy:
       socket: /run/busbar/router.sock
@@ -52,7 +52,7 @@ co-located; plus the network if it is not.
 
 ```yaml
 pools:
-  smart:
+  my-smart-model:
     route: webhook
     policy:
       url: "http://127.0.0.1:8787/"
