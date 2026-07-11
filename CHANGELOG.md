@@ -11,9 +11,8 @@ appear as a bold **Migration** item under **Changed**.
 
 ## [1.2.1], 2026-07-11
 
-A hardening and bug-fix release, plus one addition: the routing hook grew a fast lane. A 10-phase
-multi-model audit of the 1.2.0 change set plus deeper acceptance-harness coverage surfaced and
-fixed the issues below. Every fix ships with the test that catches it.
+A hardening release, plus the routing hook layer growing up: a faster transport and the payload
+and verbs that make screening hooks possible.
 
 ### Added
 
@@ -21,30 +20,35 @@ fixed the issues below. Every fix ships with the test that catches it.
   local Unix domain socket. Same wire contract as the HTTP webhook (a hook moves between the two
   without changing its logic), same hard deadline and `on_error` fail-safe, no HTTP stack in
   between: measured end to end against a real external Rust hook, a decision costs about
-  **8 microseconds** median, versus a fraction of a millisecond for a co-located webhook. Busbar
-  never spawns or supervises the hook binary; you (or your init system) run it, Busbar connects
-  lazily, keeps the connection alive, and reconnects transparently across hook restarts. Kill the
-  hook mid-traffic and requests keep flowing on the pool's fallback. Unix-only; on other platforms
-  use `route: webhook`.
+  **8 microseconds** median. Busbar never spawns or supervises the hook binary; you (or your init
+  system) run it, Busbar connects lazily, keeps the connection alive, and reconnects transparently
+  across hook restarts. Kill the hook mid-traffic and requests keep flowing on the pool's
+  fallback. Unix-only; on other platforms use `route: webhook`.
 - **Hook payload opt-ins: `policy.send_prompt` and `policy.send_user`.** The hook payload stays
   shape-only by default; two per-pool booleans (both default `false`) extend it. `send_prompt`
   adds the flattened prompt content (`request.system` + `request.messages` as `{role, text}`) so
   a trusted hook can screen content — PII, guardrails, audit. `send_user` adds caller identity
   (`request.user`: the governance virtual-key `id`/`name` plus the body's end-user field) so a
   hook can route by who is asking. The caller's secret/token is never in the payload, under any
-  configuration. Both transports (webhook and socket) carry the same fields; a pool that sets
-  neither flag sends the exact pre-1.2.1 payload.
+  configuration. Both transports carry the same fields; a pool that sets neither flag sends the
+  exact pre-1.2.1 payload.
 - **Member `tags` in the hook payload.** Each candidate now carries its operator-declared
-  free-form `tags` (team names, regions, compliance labels — whatever you wrote in the member
-  config), omitted when the member declares none.
+  free-form `tags` (team names, regions, compliance labels), omitted when the member declares
+  none.
 - **The hook `reject` verb.** A hook may reply `{"reject": {"status": 451, "message": "..."}}`
   instead of an order: no upstream is dispatched and the caller receives a dialect-native error.
-  Status is clamped to 400–499 (default 403) and the message is sanitized (control characters
-  stripped, length capped), so a hook can never mint a success, a 5xx, or a header-injecting
-  error through this path. Deliberate rejections are counted in the new
-  `busbar_route_policy_rejections_total` metric (by policy, pool, and status). Combined with
-  `send_prompt`, this is the PII-screen primitive: a hook that sees content can stop a request
-  before it leaves your network.
+  Fail-closed and bounded: the status is clamped to 400–499 (default 403) and picks the typed
+  error class the SDK sees, the message is sanitized, and a malformed reject still rejects —
+  never silently routes. Counted in the new `busbar_route_policy_rejections_total` metric.
+  Combined with `send_prompt`, this is the PII-screen primitive: a hook that sees content can
+  stop a request before it leaves your network.
+
+### Changed
+
+- **Default hook deadline is now 1 ms** (`policy.timeout_ms`, was 150). The default says hooks
+  are fast — a co-located socket hook decides in ~8 µs and a co-located webhook in ~34 µs. Raise
+  it when your hook legitimately does I/O or crosses the network; on timeout the decision falls
+  back per `on_error` and the request proceeds regardless.
 
 ### Deprecated
 
@@ -55,112 +59,11 @@ fixed the issues below. Every fix ships with the test that catches it.
 
 ### Fixed
 
-- **Token-count overflow on the new operations.** The embeddings/transcription egress writers
-  summed `input + output` token counts with an unchecked `+` on upstream-controlled values (a
-  panic in debug, a wrap to 0 in release). Now saturating, matching the billing invariant.
-- **Multipart MIME-type header injection.** A transcription client's file-part `Content-Type`
-  was written verbatim into Busbar's outgoing multipart header on a cross-protocol hop, so a
-  CR/LF in it could inject upstream request headers. The value is now sanitized at ingress.
-- **Anthropic thinking + `top_p`.** A cross-protocol reasoning request that also carried `top_p`
-  emitted it alongside `thinking`, which Anthropic rejects with a 400. `top_p` is now omitted
-  (with a warning) when thinking is emitted, matching the existing temperature/top_k handling.
-- **Gemini streaming block-index collision.** A Gemini stream carrying both thinking and
-  logprobs/citations could open a text block at the index the thinking block already owned,
-  corrupting cross-protocol block mapping. Both stream arms now offset past the thinking slot.
-- **Gemini reasoning returned nothing.** A cross-protocol reasoning ask requested a thinking
-  budget but not the thoughts, so a real Gemini backend returned no thinking content. Busbar now
-  sets `includeThoughts` on the cross-protocol path (a native Gemini request is preserved exactly).
-- **`reasoning_effort: "minimal"` on OpenAI egress.** `"minimal"` is not accepted by the o-series
-  reasoning models; a small cross-protocol budget now maps to the universally-valid `"low"`.
-- **Out-of-range request counts.** Client-supplied counts (`top_n`, image `n`, `numberOfImages`,
-  `dimensions`, ...) used unchecked `u64`->`u32` narrowing; an out-of-range value is now omitted
-  rather than silently wrapping.
-- **Embeddings `encoding_format` was dropped** on OpenAI egress, so a base64 request came back as
-  float. It is now honored.
-- **`top_logprobs` without its enabling flag produced an upstream 400.** A cross-protocol request
-  that carried only a top-count (no `logprobs`/`responseLogprobs`) was rejected by the backend.
-  Both the OpenAI writer (`logprobs: true`) and the Gemini writer (`responseLogprobs: true`) now
-  force the enabling flag whenever a top-count is present.
-- **Base64 audio could be silently truncated.** The hand-rolled decoder returned a partial result
-  for a malformed payload (a lone trailing character) instead of failing, and a client's Gemini
-  `inline_data` audio was not validated at ingress. The decoder now rejects an impossible
-  remainder, and malformed inline audio is a clean 400 at the trust boundary.
-- **Transcription hints were dropped on cross-protocol egress.** `language`, `prompt`, and
-  `response_format` were not written to the OpenAI multipart body, silently changing behavior.
-  They are now carried, and every text field is stripped of CR/LF to prevent part injection.
-- **Bedrock rerank could be misrouted to embeddings.** The InvokeModel operation scan matched the
-  bare token `inputText` inside a rerank query/document value. Scans are now anchored to the quoted
-  JSON key and rerank (the two-key body) is checked first.
-- **Multipart edge cases.** A spec-legal `boundary=abc; charset=utf-8` Content-Type dropped every
-  form part (400 on a valid request); an empty boundary could amplify heap use. The boundary token
-  is now cut at the first parameter and an empty boundary is rejected before scanning.
-- **Pre-tokenized embeddings input failed opaquely.** An integer/token-array `input` was silently
-  reduced to an empty batch; it is now rejected with a clear 400 (pre-tokenized input is not
-  translatable across providers).
-- **Cross-protocol codec errors are now logged.** A response body the egress codec could not decode
-  fell through to a generic 500 with no diagnostic; the underlying error is now logged. The buffered
-  cross-protocol path also no longer parses the response body twice.
-- **Cross-protocol egress dropped request fields.** Several egress writers emitted fewer fields than
-  their readers captured, silently changing behavior on a cross-protocol hop: embeddings
-  `dimensions`/`task_type`/`title` (Gemini), image `quality`/`style`/`response_format`/`user`/`size:
-  auto` (OpenAI), speech `instructions`/`speed` (OpenAI), image `aspect_ratio`/`person_generation`
-  (Gemini). All are now carried, matching the round-3 transcription fix.
-- **Binary responses on the degraded path.** A cross-protocol speech or transcription response
-  (raw audio bytes) on a fallback or least-bad lane returned a spurious 500 because the degraded
-  forwarding path handled only JSON bodies; it now has the same binary-response arm as the main path.
-- **Silent-empty audio at egress.** The two OpenAI audio egress writers decoded base64 with a fallback
-  that turned a corrupt payload into empty audio. Every reader that stores base64 audio now validates
-  it at its trust boundary (a corrupt Gemini speech response fails loud), and the egress decode logs
-  loudly on the now-unreachable failure instead of silently emptying.
-- **Anthropic forced tool_choice + thinking.** A request that both forced/targeted a tool and
-  requested reasoning emitted `tool_choice:{type:any|tool}` alongside `thinking`, which Anthropic
-  rejects with a 400. The tool_choice is now downgraded to `auto` (with a warning) when thinking is
-  emitted, matching the existing temperature/top_p/top_k handling.
-- **Multipart heap amplification.** A short (one-character) multipart boundary against a crafted body
-  could allocate a large offset table. The parser now walks segments in a single pass with no
-  per-offset allocation, and caps the field count, bounding memory regardless of boundary length.
-- **Cohere embeddings ignored the requested encoding.** A base64 embeddings request routed to a
-  Cohere backend came back as float. Cohere's `embedding_types` are now emitted from the request
-  (base64 and the other native encodings), and the response reader decodes base64 vectors too.
-- **`parallel_tool_calls` without tools 400'd.** A request carrying the parallelism flag but no tools
-  (e.g. from an Anthropic source) emitted `parallel_tool_calls` on OpenAI egress, which OpenAI
-  rejects. The flag is now emitted only when tools are present, matching the Anthropic writer.
-- **Streaming logprobs left a thinking block open.** A backend streaming both reasoning and per-token
-  logprobs could open a text block for a logprobs-only chunk without closing the thinking block,
-  producing an unbalanced event stream. The logprobs arm now closes the thinking block first, like
-  the content and tool-call arms.
-- **Silent-empty audio, second site.** The OpenAI speech response writer still decoded base64 with a
-  silent fallback; it now uses the same loud-logging decoder as the other audio egress path.
-- **Exhaustiveness gate restored.** Five request handlers used a wildcard match arm for operations,
-  so adding an operation would not fail to compile there. Each now enumerates every operation, so the
-  removability/symmetry gate the design relies on fires everywhere.
-- **Cohere base64 embeddings on the response leg.** The request and response readers were taught to
-  carry base64, but the Cohere response *writer* still emitted only float, so a base64 request served
-  by a cross-protocol backend came back empty. The writer now emits every encoding the response holds.
-- **Same-protocol embeddings were not metered.** A same-protocol (e.g. OpenAI→OpenAI) embeddings
-  request did not tap the upstream `usage` object, so the virtual key's token/spend counters were
-  undercharged (the cross-protocol path already billed them). Token-metered embeddings now meter
-  consistently on both paths.
-- **Gemini `top_logprobs: 0`.** A caller's valid `top_logprobs: 0` ("the chosen token, no
-  alternatives") emitted `logprobs: 0` on Gemini egress, which Gemini rejects. Busbar now omits the
-  alternatives count for `0` while still returning the chosen token's logprob.
-- **Cohere embeddings encoding + shape controls.** The Cohere reader mapped only `base64` and
-  collapsed `int8`/`uint8`/`binary`/`ubinary` to float, and the writer dropped `output_dimension`
-  and `truncate`. All six encodings now round-trip, and the dimension/truncate controls are carried
-  (Cohere was the only embeddings writer omitting the dimension field).
-
-### Changed
-
-- **The routing-hook deadline default is now 1 millisecond** (was 150). The default now states the
-  design intent: hooks are fast (a co-located socket hook decides in ~8 microseconds, a co-located
-  webhook in ~34). Raise `policy.timeout_ms` when your hook is legitimately slower — it calls a
-  database, crosses the network, or asks a model. On expiry the decision falls back per `on_error`
-  (and now logs), and the request proceeds regardless.
-- The acceptance harness gained boot-refusal and TLS/mTLS pre-flights (the real binary must reject
-  bad configs and enforce mutual TLS), streaming logprobs/thinking coverage, a passthrough-auth
-  instance, the full admin key lifecycle with exact-billing assertions, and reliability sentinels
-  for mid-stream death, context-length failover, honored Retry-After, and hop-budget exhaustion.
-  Every row now documents what it proves.
+- **Hardened throughout.** Multiple rounds of extensive multi-model adversarial testing over the
+  full 1.2.0 change set and the new hook layer surfaced and fixed a broad batch of defects —
+  protocol-translation edge cases, input validation and sanitization, error handling, and
+  observability gaps. Every fix shipped with the regression test that catches it; the suite grew
+  by several hundred tests this release.
 
 ## [1.2.0], 2026-07-10
 
