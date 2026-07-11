@@ -15,6 +15,12 @@ The API release. Everything you could only do by editing YAML and restarting, yo
 over an authenticated, audited API. And the routing hook grew into a hook system: gates,
 taps, and routes, on every request.
 
+This release reshapes how hooks and policies are configured. Hooks are now defined once by
+name and referenced everywhere; the old inline `policy:` block and transport-named `route:`
+values are replaced. **Existing configs need a one-time update** — see the 1.2.x → 1.3
+migration guide. The change is a clean cut with no silent fallbacks: an old-form key reports a
+clear startup error telling you exactly what to write instead.
+
 ### Added
 
 - **The Admin API is now a full config plane.** Anything the config file can express, the API
@@ -54,17 +60,17 @@ taps, and routes, on every request.
 - Completion telemetry now carries usage for every operation type — chat tokens, embeddings,
   images, audio, rerank — plus a request id that correlates a request across hook stages.
 
-### Deprecated
-
-- The `route: socket` / `route: webhook` + `policy:` form, in favor of named hooks. It keeps
-  working and warns at startup.
-
 ### Removed
 
-- **The embedded Rhai script routing policy (`route: script`).** Deprecated in 1.2.1 and only
-  ever available behind an opt-in build flag, it is gone. A compiled hook over a socket or an
+- **The inline `policy:` block and transport-named `route:` values.** A pool's `route:` now
+  takes a hook name (defined once under `hooks:`) or a native policy name
+  (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`) — the old `route: socket` /
+  `route: webhook` + `policy:` form is replaced. Each removed key reports a startup error with
+  the exact replacement. See the migration guide.
+- **The embedded Rhai script routing policy (`route: script`).** Available only behind an
+  opt-in build flag and deprecated in 1.2.1, it is gone. A compiled hook over a socket or an
   HTTP webhook does the same job with real process isolation; if you want scripting, run a hook
-  that embeds it. `route: script` now reports a clear startup error pointing at the hook forms.
+  that embeds it.
 
 ## [1.2.1], 2026-07-11
 
