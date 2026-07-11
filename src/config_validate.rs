@@ -675,6 +675,36 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
+    // Rule (routing/socket): a `route: socket` pool MUST carry a non-empty, ABSOLUTE `policy.socket`
+    // path (a relative path silently depends on busbar's CWD — a classic deploy footgun). The socket
+    // FILE may not exist yet (the hook binary can start after busbar; connection is lazy), so only
+    // the path's shape is validated. Rejected at startup rather than silently degrading to SWRR, so
+    // an operator who asked for a socket hook learns immediately that it is misconfigured. On
+    // non-unix platforms the transport is unavailable — also a startup error, pointing at webhook.
+    for (pool_name, pool_cfg) in &cfg.pools {
+        if pool_cfg.route != crate::config::RouteKind::Socket {
+            continue;
+        }
+        if !cfg!(unix) {
+            errors.push(format!(
+                "pool '{pool_name}' route: socket is not available on this platform (Unix domain \
+                 sockets); use route: webhook for an out-of-process routing hook here"
+            ));
+            continue;
+        }
+        match pool_cfg.policy.as_ref().and_then(|p| p.socket.as_deref()) {
+            None | Some("") => errors.push(format!(
+                "pool '{pool_name}' route: socket requires policy.socket (the hook binary's Unix \
+                 domain socket path)"
+            )),
+            Some(path) if !path.starts_with('/') => errors.push(format!(
+                "pool '{pool_name}' policy.socket must be an absolute path (got '{path}'); a \
+                 relative path depends on busbar's working directory"
+            )),
+            Some(_) => {}
+        }
+    }
+
     // Rule 5: Validate auth-block semantics. `auth.mode` is now a parsed `AuthMode` enum (an invalid
     // spelling fails at deserialize, so there is no longer an unknown-mode arm here). The legacy
     // single-token `token:` field was removed in 1.0.0; `AuthCfg` is now `deny_unknown_fields`, so a
@@ -3938,6 +3968,7 @@ models:
         pool.route = config::RouteKind::Webhook;
         pool.policy = Some(config::PolicyCfg {
             url: url.map(str::to_string),
+            socket: None,
             timeout_ms: 150,
             on_error: config::PolicyOnError::default(),
             script: None,

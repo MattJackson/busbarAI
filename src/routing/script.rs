@@ -494,7 +494,7 @@ mod tests {
                     0.5
                 };
                 let mut s = w_cost * cost_s + w_lat * lat_s + w_conc * conc_s;
-                if c.tier.is_some_and(|t| tiers.iter().any(|&x| x == t)) {
+                if c.tier.is_some_and(|t| tiers.contains(&t)) {
                     s += 0.5;
                 }
                 if let Some(h) = c.rate_headroom {

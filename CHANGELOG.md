@@ -11,9 +11,28 @@ appear as a bold **Migration** item under **Changed**.
 
 ## [Unreleased]
 
-A hardening and bug-fix release. No new features; a 10-phase multi-model audit of the 1.2.0
-change set plus deeper acceptance-harness coverage surfaced and fixed the issues below. Every fix
-ships with the test that catches it.
+A hardening and bug-fix release, plus one addition: the routing hook grew a fast lane. A 10-phase
+multi-model audit of the 1.2.0 change set plus deeper acceptance-harness coverage surfaced and
+fixed the issues below. Every fix ships with the test that catches it.
+
+### Added
+
+- **The socket routing hook (`route: socket`).** Your routing policy as a compiled binary on a
+  local Unix domain socket. Same wire contract as the HTTP webhook (a hook moves between the two
+  without changing its logic), same hard deadline and `on_error` fail-safe, no HTTP stack in
+  between: measured end to end against a real external Rust hook, a decision costs about
+  **8 microseconds** median, versus a fraction of a millisecond for a co-located webhook. Busbar
+  never spawns or supervises the hook binary; you (or your init system) run it, Busbar connects
+  lazily, keeps the connection alive, and reconnects transparently across hook restarts. Kill the
+  hook mid-traffic and requests keep flowing on the pool's fallback. Unix-only; on other platforms
+  use `route: webhook`.
+
+### Deprecated
+
+- **`route: script` (Rhai).** The embedded interpreter costs ~100x more per decision than a
+  compiled socket hook for the same logic, and its sandbox is a weaker isolation story than a
+  separate process. It still works behind the `script-policy` feature but warns at startup;
+  migrate to `route: socket` (compiled hook) or `route: webhook` (any language).
 
 ### Fixed
 

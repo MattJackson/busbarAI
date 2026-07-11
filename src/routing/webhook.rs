@@ -29,11 +29,7 @@
 //! validated sidecar URL + the shared client at config load, and `forward::decide_policy_order`
 //! invokes it per request through the same failover loop the natives feed.
 
-use super::{
-    Candidate, PolicyResult, RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest,
-};
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use super::{Candidate, PolicyResult, RoutingContext, RoutingPolicy, RoutingRequest};
 use std::time::Duration;
 
 /// A `WebhookPolicy` POSTs the request projection to an operator sidecar and returns the ranked
@@ -55,59 +51,6 @@ impl WebhookPolicy {
     }
 }
 
-/// The stable request schema POSTed to the sidecar. Versioned by shape, not a field, in v1. A flat,
-/// serde-derived projection so the wire format is reviewable and append-only.
-#[derive(Debug, Serialize)]
-struct WebhookRequest<'a> {
-    request: WebhookReqProjection<'a>,
-    candidates: Vec<WebhookCandidate<'a>>,
-    context: WebhookContext<'a>,
-}
-
-/// The request projection (a cheap, read-only slice of the ingress request).
-#[derive(Debug, Serialize)]
-struct WebhookReqProjection<'a> {
-    pool: &'a str,
-    ingress_protocol: &'a str,
-    message_count: usize,
-    has_tools: bool,
-    total_chars: usize,
-    max_tokens: Option<u32>,
-    stream: bool,
-}
-
-/// One candidate as seen by the sidecar. `idx` is the stable handle the sidecar echoes back in
-/// `order`; the rest are the signals a policy ranks on.
-#[derive(Debug, Serialize)]
-struct WebhookCandidate<'a> {
-    idx: usize,
-    model: &'a str,
-    tier: Option<&'a str>,
-    cost_per_mtok: Option<f64>,
-    latency_ms: Option<f64>,
-    available_concurrency: usize,
-    budget_remaining: Option<i64>,
-    rate_headroom: Option<f64>,
-}
-
-/// The routing context projection.
-#[derive(Debug, Serialize)]
-struct WebhookContext<'a> {
-    pool: &'a str,
-    budget_remaining: Option<i64>,
-}
-
-/// The sidecar's response. `order` is the ranked preference (candidate `idx` values, most-preferred
-/// first); an explicit `abstain: true` (or an absent/empty `order`) means "no opinion". Both fields
-/// are optional so an empty `{}` deserializes to Abstain. Unknown JSON fields are ignored.
-#[derive(Debug, Deserialize, Default)]
-struct WebhookResponse {
-    #[serde(default)]
-    order: Option<Vec<usize>>,
-    #[serde(default)]
-    abstain: bool,
-}
-
 #[async_trait::async_trait]
 impl RoutingPolicy for WebhookPolicy {
     async fn decide(
@@ -117,35 +60,9 @@ impl RoutingPolicy for WebhookPolicy {
         ctx: &RoutingContext<'_>,
         budget: Duration,
     ) -> PolicyResult {
-        // Build the stable wire projection borrowing from the live request/candidates/ctx.
-        let body = WebhookRequest {
-            request: WebhookReqProjection {
-                pool: req.pool,
-                ingress_protocol: req.ingress_protocol,
-                message_count: req.message_count,
-                has_tools: req.has_tools,
-                total_chars: req.total_chars,
-                max_tokens: req.max_tokens,
-                stream: req.stream,
-            },
-            candidates: candidates
-                .iter()
-                .map(|c| WebhookCandidate {
-                    idx: c.idx,
-                    model: c.model,
-                    tier: c.tier,
-                    cost_per_mtok: c.cost_per_mtok,
-                    latency_ms: c.latency_ms,
-                    available_concurrency: c.available_concurrency,
-                    budget_remaining: c.budget_remaining,
-                    rate_headroom: c.rate_headroom,
-                })
-                .collect(),
-            context: WebhookContext {
-                pool: ctx.pool,
-                budget_remaining: ctx.budget_remaining,
-            },
-        };
+        // Build the ONE shared hook wire projection (`routing::wire`) — identical for every
+        // out-of-process transport, so a hook moves between webhook and socket without changes.
+        let body = super::wire::build(req, candidates, ctx);
 
         // Serialize the projection with `serde_json` and POST it as a raw body. We do NOT use
         // reqwest's `.json()` helper because the request-path build does not enable reqwest's `json`
@@ -192,19 +109,10 @@ impl RoutingPolicy for WebhookPolicy {
         // Parse through the `crate::json` depth-guard seam (MAX_JSON_DEPTH=128) so a hostile/buggy
         // sidecar returning a pathologically nested body is rejected as `Err` (→ `on_error`) BEFORE a
         // recursive deserialize can blow the stack — same guard the forwarding path uses. The 64 KiB
-        // cap above bounds size; this bounds nesting depth.
-        let parsed: WebhookResponse = crate::json::parse(&buf)?;
-        if parsed.abstain {
-            return Ok(RoutingDecision::Abstain);
-        }
-        let Some(order) = parsed.order else {
-            return Ok(RoutingDecision::Abstain);
-        };
-
-        // Defensively drop unknown idxs, dedup, and coerce an empty result to Abstain — the shared
-        // liberal-in-what-you-accept normalizer every transport uses.
-        let valid: HashSet<usize> = candidates.iter().map(|c| c.idx).collect();
-        Ok(RoutingDecision::from_ranked(order, &valid))
+        // cap above bounds size; this bounds nesting depth. Normalization (abstain / drop unknown
+        // idxs / dedup / empty → Abstain) is the shared `wire::normalize`, same as every transport.
+        let parsed: super::wire::HookResponse = crate::json::parse(&buf)?;
+        Ok(super::wire::normalize(parsed, candidates))
     }
 
     fn name(&self) -> &'static str {
@@ -215,6 +123,7 @@ impl RoutingPolicy for WebhookPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing::RoutingDecision;
     use axum::{routing::post, Router};
     use std::time::Duration as StdDuration;
 

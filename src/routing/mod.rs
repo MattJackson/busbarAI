@@ -37,7 +37,9 @@ fn policy_timeout(timeout_ms: u64) -> std::time::Duration {
 pub(crate) mod native;
 #[cfg(feature = "script-policy")]
 pub(crate) mod script;
+pub(crate) mod socket;
 pub(crate) mod webhook;
+pub(crate) mod wire;
 
 /// A read-only, cheaply-constructed projection of the request for routing decisions. Built ONCE per
 /// request from the pristine ingress `serde_json::Value` BEFORE the failover loop, and ONLY for
@@ -244,15 +246,55 @@ pub(crate) fn resolve_policy(
         // Rhai. The script is compiled ONCE here at config load; a compile error degrades to the
         // default SWRR (`None`) with a loud warning — never strands a request. When the feature is
         // absent, `route: script` likewise degrades to default with a clear "feature not enabled"
-        // warning, so a misconfigured pool is loud, not silent.
+        // warning, so a misconfigured pool is loud, not silent. DEPRECATED in favor of the socket
+        // hook (`resolve_script` warns).
         RouteKind::Script => resolve_script(cfg),
+        // The Unix-socket BINARY hook: an operator-run compiled hook on a local Unix domain socket,
+        // same wire contract as the webhook, microseconds instead of a network hop. Unix-only; the
+        // non-unix arm degrades loudly to the default (use `route: webhook` there). A missing socket
+        // path falls back to `None` — startup validation surfaces the misconfiguration.
+        RouteKind::Socket => resolve_socket(cfg),
     }
+}
+
+/// Resolve a `route: socket` pool: wrap the configured socket path as a [`socket::SocketPolicy`].
+/// The connection is LAZY (the hook binary may start after busbar), so only the path's presence is
+/// checked here; `config_validate` enforces it loudly at startup.
+#[cfg(unix)]
+fn resolve_socket(cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
+    let policy_cfg = cfg.policy.as_ref()?;
+    let path = policy_cfg.socket.as_deref()?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(ResolvedPolicy::Policy {
+        policy: Arc::new(socket::SocketPolicy::new(path.to_string())),
+        on_error: policy_cfg.on_error.clone(),
+        timeout: policy_timeout(policy_cfg.timeout_ms),
+    })
+}
+
+/// Non-unix fallback: `tokio::net::UnixStream` is unix-only, so `route: socket` degrades to the
+/// default SWRR with a loud pointer at the webhook transport. The request is never stranded.
+#[cfg(not(unix))]
+fn resolve_socket(_cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
+    tracing::warn!(
+        "route: socket (the Unix-socket hook) is not available on this platform; falling back to \
+         weighted. Use `route: webhook` for an out-of-process routing hook here."
+    );
+    None
 }
 
 /// Resolve a `route: script` pool. Feature-gated body: with `script-policy` it compiles the operator
 /// script once and wraps it as a `Policy`; without the feature it warns and falls to the default.
 #[cfg(feature = "script-policy")]
 fn resolve_script(cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
+    tracing::warn!(
+        "route: script (Rhai) is DEPRECATED and will be removed in a future release: the \
+         interpreter adds ~100us per decision where the socket hook (`route: socket`, a compiled \
+         binary on a Unix socket, same wire contract) answers in single-digit microseconds. \
+         Migrate to `route: socket` or `route: webhook`."
+    );
     let policy_cfg = cfg.policy.as_ref();
     let source = match policy_cfg.map_or(Ok(None), script_source) {
         Ok(Some(src)) => src,
@@ -431,6 +473,60 @@ mod tests {
             &client
         )
         .is_none());
+    }
+
+    /// `route: socket` + a `policy.socket` path resolves to a constructed socket policy (unix);
+    /// a missing/empty path falls back to `None` (startup validation surfaces the misconfig).
+    #[cfg(unix)]
+    #[test]
+    fn socket_arm_resolves_constructed_policy() {
+        use crate::config::{PolicyCfg, RouteKind};
+        let client = reqwest::Client::new();
+        let cfg = pool_cfg(
+            RouteKind::Socket,
+            Some(PolicyCfg {
+                socket: Some("/run/busbar/hook.sock".to_string()),
+                ..Default::default()
+            }),
+        );
+        match resolve_policy(&cfg, &client) {
+            Some(ResolvedPolicy::Policy { policy, .. }) => assert_eq!(policy.name(), "socket"),
+            other => panic!(
+                "route: socket must resolve to a Policy, got none={}",
+                other.is_none()
+            ),
+        }
+        // Missing / empty socket path → None (default SWRR; validation is the loud gate).
+        assert!(resolve_policy(&pool_cfg(RouteKind::Socket, None), &client).is_none());
+        assert!(resolve_policy(
+            &pool_cfg(
+                RouteKind::Socket,
+                Some(PolicyCfg {
+                    socket: Some(String::new()),
+                    ..Default::default()
+                }),
+            ),
+            &client
+        )
+        .is_none());
+    }
+
+    /// The `route: socket` YAML shorthand desugars to `RouteKind::Socket` and resolves with the
+    /// documented default deadline (not 0ms) — same guarantee as the native shorthands.
+    #[cfg(unix)]
+    #[test]
+    fn socket_route_parses_and_gets_default_timeout() {
+        let client = reqwest::Client::new();
+        let yaml = "route: socket\nmembers: []\npolicy:\n  socket: /run/busbar/hook.sock\n";
+        let cfg: crate::config::PoolCfg = serde_yaml::from_str(yaml).expect("socket route parses");
+        assert_eq!(cfg.route, crate::config::RouteKind::Socket);
+        match resolve_policy(&cfg, &client) {
+            Some(ResolvedPolicy::Policy { timeout, .. }) => assert_eq!(
+                timeout,
+                std::time::Duration::from_millis(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
+            ),
+            other => panic!("must resolve, got none={}", other.is_none()),
+        }
     }
 
     /// The plain default (`route: weighted`) stays the zero-cost `None` path.

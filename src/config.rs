@@ -398,6 +398,7 @@ impl<'de> Deserialize<'de> for PoolCfg {
                 (RouteKind::Weighted, None)
             }
             Some("webhook") => (RouteKind::Webhook, None),
+            Some("socket") => (RouteKind::Socket, None),
             Some("script") => (RouteKind::Script, None),
             Some("native") => (RouteKind::Native, None),
             // Native shorthands: a bare policy name in `route:` ⇒ Native + that name in policy.name.
@@ -419,8 +420,8 @@ impl<'de> Deserialize<'de> for PoolCfg {
             ),
             Some(other) => {
                 return Err(serde::de::Error::custom(format!(
-                    "unknown route '{other}': expected one of weighted, webhook, script, native, \
-                     or a native shorthand (cheapest, fastest, least_busy, usage)"
+                    "unknown route '{other}': expected one of weighted, webhook, socket, script, \
+                     native, or a native shorthand (cheapest, fastest, least_busy, usage)"
                 )));
             }
         };
@@ -466,7 +467,11 @@ pub(crate) enum RouteKind {
     Weighted,
     /// An operator-run HTTP sidecar that returns a ranked member preference.
     Webhook,
+    /// An operator-run BINARY hook on a local Unix domain socket (`policy.socket`) — the same wire
+    /// contract as the webhook without the HTTP stack, for microsecond decisions. Unix-only.
+    Socket,
     /// An embedded Rhai script (behind the `script-policy` cargo feature) returning a ranked order.
+    /// DEPRECATED: prefer `socket` (compiled hook, ~100x faster) or `webhook`.
     Script,
     /// A Busbar-native policy selected by `policy.name` (e.g. `cheapest`/`fastest`/`least_busy`/
     /// `usage`/`weighted`).
@@ -499,6 +504,12 @@ pub(crate) struct PolicyCfg {
     /// RFC1918/CGNAT/metadata blocked — the OTLP precedent). Required when `route: webhook`.
     #[serde(default)]
     pub(crate) url: Option<String>,
+    // ── socket transport ─────────────────────────────────────────────────────────────────────────
+    /// Filesystem path of the hook binary's Unix domain socket. Required when `route: socket`.
+    /// The binary is operator-run (busbar never spawns it); the connection is lazy, so the hook may
+    /// start after busbar. Unix-only — on other platforms `route: socket` degrades to weighted.
+    #[serde(default)]
+    pub(crate) socket: Option<String>,
     // ── shared ───────────────────────────────────────────────────────────────────────────────────
     /// Hard wall-clock deadline for the policy decision, in milliseconds (default 150). On timeout
     /// the decision is coerced to `on_error`.
