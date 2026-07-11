@@ -127,18 +127,7 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
       a { color: inherit; text-decoration: none; }
       h1, h2, h3, h4 { letter-spacing: -0.02em; line-height: 1.1; margin: 0; }
 
-      /* NAV */
-      .nav {
-        position: sticky; top: 0; z-index: 50;
-        background: rgba(255, 255, 255, 0.82);
-        backdrop-filter: saturate(180%) blur(12px);
-        border-bottom: 1px solid var(--line);
-      }
-      .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; }
-      .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; letter-spacing: -0.01em; }
-      .nav-links { display: flex; align-items: center; gap: 26px; font-size: 14.5px; font-weight: 500; }
-      .nav-links a { color: var(--charcoal); transition: color 0.15s; }
-      .nav-links a:hover { color: var(--slate); }
+      /* Nav styling lives in the shared Nav.astro component (single source of truth). */
 
       /* PAGE CONTENT */
       .page-wrap {
@@ -304,15 +293,69 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
       }
       @media (max-width: 640px) {
         html { overflow-x: clip; }
-        .nav-links { gap: 14px; }
         .footer-cols { grid-template-columns: 1fr 1fr; }
         .page-wrap { padding: 40px 16px 64px; }
         .page-doc h1 { font-size: clamp(24px, 7vw, 36px); }
         .page-doc h2 { font-size: 19px; }
+
+        /* Comparison tables reflow to stacked per-row cards: the 3-column grid
+           clips the key "Busbar" column inside the overflow-x wrapper on phones,
+           so below 640px each row becomes a self-contained card with the two
+           values labelled. Desktop keeps the table untouched. */
+        .page-doc .cmp {
+          overflow-x: visible;
+          border: 0;
+          border-radius: 0;
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+        }
+        .page-doc .cmp table,
+        .page-doc .cmp tbody,
+        .page-doc .cmp tr,
+        .page-doc .cmp td {
+          display: block;
+          width: auto;
+        }
+        .page-doc .cmp thead { display: none; }
+        .page-doc .cmp tr {
+          border: 1px solid var(--line);
+          border-radius: 12px;
+          overflow: hidden;
+          background: #fff;
+        }
+        /* Row label becomes the card title. */
+        .page-doc .cmp td:first-child {
+          background: var(--bg-soft);
+          font-size: 13px;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+          color: var(--slate);
+          white-space: normal;
+          padding: 10px 16px;
+          border-bottom: 1px solid var(--line);
+        }
+        /* Value cells get a column label (Busbar / competitor). */
+        .page-doc .cmp td:not(:first-child) {
+          border-bottom: 1px solid var(--line);
+          padding: 12px 16px;
+        }
+        .page-doc .cmp tr td:last-child { border-bottom: 0; }
+        .page-doc .cmp td:nth-child(2)::before,
+        .page-doc .cmp td:nth-child(3)::before {
+          display: block;
+          font-size: 11.5px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          color: var(--muted);
+          margin-bottom: 4px;
+        }
+        .page-doc .cmp td:nth-child(2)::before { content: 'Busbar'; color: #4d7c0f; }
+        .page-doc .cmp td:nth-child(3)::before { content: var(--cmp-name, 'Alternative'); }
       }
       @media (max-width: 420px) {
         .wrap { padding: 0 16px; }
-        .nav-links { gap: 10px; font-size: 13.5px; }
       }
     </style>
   </body>

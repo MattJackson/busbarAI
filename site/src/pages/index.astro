@@ -551,20 +551,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       h1, h2, h3, h4 { letter-spacing: -0.02em; line-height: 1.1; margin: 0; }
       code, pre { font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace; }
 
-      /* NAV */
-      .nav {
-        position: sticky; top: 0; z-index: 50;
-        background: rgba(255, 255, 255, 0.82);
-        backdrop-filter: saturate(180%) blur(12px);
-        border-bottom: 1px solid var(--line);
-      }
-      .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; }
-      .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; letter-spacing: -0.01em; }
-      .nav-links { display: flex; align-items: center; gap: 26px; font-size: 14.5px; font-weight: 500; }
-      .nav-links a { color: var(--charcoal); transition: color 0.15s; }
-      .nav-links a:hover { color: var(--slate); }
-      .nav-links a.ghost { color: var(--muted); }
-
+      /* Nav styling lives in the shared Nav.astro component (single source of truth). */
       .btn {
         display: inline-flex; align-items: center; justify-content: center;
         background: var(--slate); color: #fff; font-weight: 600; font-size: 15px;
@@ -577,14 +564,6 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       .btn-ghost:hover { border-color: #cbd5e1; box-shadow: 0 6px 16px rgba(15,23,42,0.07); }
       .btn-text { background: transparent; border-color: transparent; color: var(--charcoal); padding-left: 6px; padding-right: 6px; }
       .btn-text:hover { transform: none; box-shadow: none; color: var(--slate); }
-      .nav-links a.star-link { display: inline-flex; align-items: center; gap: 0.4em; color: #ca8a04; font-weight: 700; }
-      .nav-links a.star-link:hover { color: #a16207; }
-      .nav-links a.star-link .star-count { font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
-      .nav-links a.star-link .gh-logo { width: 1.3em; height: 1.3em; color: var(--charcoal); }
-      .nav-links a.star-link:hover .gh-logo { color: var(--slate); }
-      .nav-links a.nav-discord { display: inline-flex; align-items: center; color: var(--muted); }
-      .nav-links a.nav-discord:hover { color: #5865f2; }
-      .nav-discord-logo { width: 1.25em; height: 1.25em; }
 
       /* HERO */
       .hero {

@@ -214,19 +214,7 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
       a { color: inherit; text-decoration: none; }
       h1, h2, h3, h4 { letter-spacing: -0.02em; line-height: 1.1; margin: 0; }
 
-      /* NAV */
-      .nav {
-        position: sticky; top: 0; z-index: 50;
-        background: rgba(255, 255, 255, 0.82);
-        backdrop-filter: saturate(180%) blur(12px);
-        border-bottom: 1px solid var(--line);
-      }
-      .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; }
-      .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; letter-spacing: -0.01em; }
-      .nav-links { display: flex; align-items: center; gap: 26px; font-size: 14.5px; font-weight: 500; }
-      .nav-links a { color: var(--charcoal); transition: color 0.15s; }
-      .nav-links a:hover { color: var(--slate); }
-      .nav-links a.ghost { color: var(--muted); }
+      /* Nav styling lives in the shared Nav.astro component (single source of truth). */
 
       /* LEGAL CONTENT */
       .legal-wrap {
@@ -322,7 +310,6 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
       }
       @media (max-width: 640px) {
         html { overflow-x: clip; }
-        .nav-links { gap: 14px; }
         .footer-cols { grid-template-columns: 1fr 1fr; }
         .legal-wrap { padding: 40px 16px 64px; }
         .legal-doc h1 { font-size: clamp(24px, 7vw, 36px); }
@@ -330,7 +317,6 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
       }
       @media (max-width: 420px) {
         .wrap { padding: 0 16px; }
-        .nav-links { gap: 10px; font-size: 13.5px; }
       }
     </style>
   </body>
