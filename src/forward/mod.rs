@@ -10350,6 +10350,7 @@ mod hook_seam_tests {
     struct CapturedReq {
         prompt: Option<SeenPrompt>,
         identity: Option<SeenIdentity>,
+        max_tokens: Option<u32>,
     }
 
     /// A test policy that records the projection it was handed and returns a fixed decision.
@@ -10381,6 +10382,7 @@ mod hook_seam_tests {
                     .identity
                     .as_ref()
                     .map(|i| (i.key_id.clone(), i.key_name.clone(), i.user.clone())),
+                max_tokens: req.max_tokens,
             });
             Ok(match &self.reject {
                 Some((status, message)) => RoutingDecision::Reject {
@@ -10518,6 +10520,20 @@ mod hook_seam_tests {
             PolicyOutcome::Reject => "Reject",
             PolicyOutcome::RejectRequest { .. } => "RejectRequest",
         }
+    }
+
+    /// An absurd caller `max_tokens` (> u32::MAX) SATURATES in the projection instead of wrapping
+    /// to a small number — the SIZE signal must still read "huge ask" to the policy.
+    #[tokio::test]
+    async fn max_tokens_saturates_not_wraps() {
+        let v = serde_json::json!({
+            "model": "m0",
+            "max_tokens": 5_000_000_000u64,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (_, captured) = run(false, false, None, v).await;
+        let captured = captured.expect("policy must have been called");
+        assert_eq!(captured.max_tokens, Some(u32::MAX));
     }
 
     /// `send_user` with GOVERNANCE configured: the caller's secret resolves to its key record and
