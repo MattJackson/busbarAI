@@ -525,6 +525,9 @@ pub(crate) struct PolicyCfg {
     /// `{role, text}`) in the hook payload. DEFAULT OFF — the default payload is shape-only, so no
     /// prompt text ever leaves the process unless the operator flips this per pool. Turning it on
     /// says "this hook is trusted with request content" (PII screening, guardrails, audit).
+    /// Cost note: the hook payload then scales with the request body (bounded by the ingress body
+    /// cap; the serialized line is transiently held per decision) — budget hook memory accordingly.
+    /// Webhook/socket only; the deprecated script transport ignores it (with a startup warning).
     #[serde(default)]
     pub(crate) send_prompt: bool,
     /// Opt-in: include caller identity in the hook payload — the governance virtual-key `id`/`name`

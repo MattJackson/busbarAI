@@ -102,23 +102,16 @@ pub(crate) struct HookResponse {
     /// REJECT the request outright: no upstream is dispatched, the caller gets a dialect-native
     /// error. Takes precedence over `order`/`abstain` — a hook that says both meant reject. The
     /// verb that makes a content-seeing hook (`policy.send_prompt`) a guardrail, not just a router.
+    ///
+    /// Deliberately an untyped `Value`, parsed best-effort by `normalize`: the verb is FAIL-CLOSED.
+    /// Once a hook says "reject", a malformed detail (a status of 70000, a numeric message) must
+    /// degrade to "reject with the defaults", never to "silently route the request" — a typed
+    /// struct here would abort the WHOLE reply parse on a bad field and coerce the decision to
+    /// `on_error`, routing a request the hook tried to stop. `{"reject": false}` (and JSON `null`,
+    /// which maps to absent) is the one explicit "not rejecting" shape; anything else present
+    /// rejects.
     #[serde(default)]
-    pub(crate) reject: Option<HookReject>,
-}
-
-/// The reject reply body. Both fields optional: a bare `{"reject":{}}` is a valid full-strength
-/// rejection with the defaults (403, a generic message).
-#[derive(Debug, Deserialize)]
-pub(crate) struct HookReject {
-    /// Client-error status for the caller. Clamped by `normalize` to 400..=499 (default 403): a
-    /// hook cannot mint a success, a redirect, or a 5xx through this path.
-    #[serde(default)]
-    pub(crate) status: Option<u16>,
-    /// Human-readable reason, surfaced in the dialect-native error body. Sanitized by `normalize`
-    /// (control characters stripped, length capped) so a hook reply can never smuggle CRLF or a
-    /// megabyte of text into the client error.
-    #[serde(default)]
-    pub(crate) message: Option<String>,
+    pub(crate) reject: Option<serde_json::Value>,
 }
 
 /// Reject-status clamp range + fallback: any status outside 400..=499 becomes 403.
@@ -152,8 +145,8 @@ pub(crate) fn build<'a>(
                 p.messages
                     .iter()
                     .map(|(role, text)| HookMessage {
-                        role: role.as_str(),
-                        text: text.as_str(),
+                        role: role.as_ref(),
+                        text: text.as_ref(),
                     })
                     .collect()
             }),
@@ -188,28 +181,34 @@ pub(crate) fn build<'a>(
 /// everything; then explicit abstain / absent order → `Abstain`; otherwise the shared liberal
 /// normalizer (drop unknown idxs, dedup, empty → Abstain). One normalization for every transport.
 pub(crate) fn normalize(parsed: HookResponse, candidates: &[Candidate<'_>]) -> RoutingDecision {
+    // FAIL-CLOSED: any `reject` value except an explicit `false` is a rejection (see the field
+    // doc). Details are extracted best-effort; anything missing or out-of-shape falls back to the
+    // safe defaults rather than downgrading the verb.
     if let Some(reject) = parsed.reject {
-        // Clamp: a hook may only speak client errors. Anything else (0, 200, 302, 500) → 403.
-        let status = match reject.status {
-            Some(s) if (400..=499).contains(&s) => s,
-            _ => REJECT_STATUS_DEFAULT,
-        };
-        // Sanitize: strip control chars (no CRLF/log injection), cap the length, fall back to the
-        // default when nothing printable survives.
-        let message: String = reject
-            .message
-            .as_deref()
-            .unwrap_or("")
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(REJECT_MESSAGE_MAX_CHARS)
-            .collect();
-        let message = if message.trim().is_empty() {
-            REJECT_MESSAGE_DEFAULT.to_string()
-        } else {
-            message
-        };
-        return RoutingDecision::Reject { status, message };
+        if reject != serde_json::Value::Bool(false) {
+            // Clamp: a hook may only speak client errors. Anything else (absent, non-integer, 0,
+            // 200, 302, 500, 70000, -1) → 403.
+            let status = match reject.get("status").and_then(|s| s.as_i64()) {
+                Some(s) if (400..=499).contains(&s) => s as u16,
+                _ => REJECT_STATUS_DEFAULT,
+            };
+            // Sanitize: strip control chars (no CRLF/log injection), cap the length, fall back to
+            // the default when nothing printable survives.
+            let message: String = reject
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(REJECT_MESSAGE_MAX_CHARS)
+                .collect();
+            let message = if message.trim().is_empty() {
+                REJECT_MESSAGE_DEFAULT.to_string()
+            } else {
+                message
+            };
+            return RoutingDecision::Reject { status, message };
+        }
     }
     if parsed.abstain {
         return RoutingDecision::Abstain;
@@ -350,7 +349,9 @@ mod tests {
         }
     }
 
-    /// A hook may only speak client errors: in-range statuses pass, everything else clamps to 403.
+    /// A hook may only speak client errors: in-range statuses pass, everything else clamps to 403 —
+    /// including values that would not even FIT a u16 (70000, -1): the reject verb must stay a
+    /// rejection, never abort the reply parse and silently route the request.
     #[test]
     fn reject_status_clamps_to_4xx() {
         for (sent, want) in [
@@ -362,6 +363,8 @@ mod tests {
             (500, 403),
             (0, 403),
             (999, 403),
+            (70000, 403),
+            (-1, 403),
         ] {
             match norm(&format!(r#"{{"reject":{{"status":{sent}}}}}"#)) {
                 RoutingDecision::Reject { status, .. } => {
@@ -409,6 +412,43 @@ mod tests {
                 other => panic!("expected Reject for {json}, got {other:?}"),
             }
         }
+    }
+
+    /// The reject verb is FAIL-CLOSED: any malformed / non-object `reject` value still rejects with
+    /// the defaults (403 + canned message) — a hook that tried to say "reject" must never have its
+    /// request silently routed because a detail was mis-typed. The one explicit opt-out is
+    /// `reject: false` (and `null`, which parses as absent): those defer to `order`/`abstain`.
+    #[test]
+    fn reject_is_fail_closed_on_malformed_values() {
+        for json in [
+            r#"{"reject":true}"#,
+            r#"{"reject":"nope"}"#,
+            r#"{"reject":123}"#,
+            r#"{"reject":[]}"#,
+            r#"{"reject":{"status":"451"}}"#,
+            r#"{"reject":{"status":451.5}}"#,
+            r#"{"reject":{"message":123}}"#,
+        ] {
+            match norm(json) {
+                RoutingDecision::Reject { status, message } => {
+                    assert_eq!(
+                        status, 403,
+                        "malformed reject must use the default status: {json}"
+                    );
+                    assert_eq!(message, REJECT_MESSAGE_DEFAULT, "for {json}");
+                }
+                other => panic!("expected fail-closed Reject for {json}, got {other:?}"),
+            }
+        }
+        // The explicit opt-outs: false / null defer to the rest of the reply.
+        assert!(matches!(
+            norm(r#"{"order":[1,0],"reject":false}"#),
+            RoutingDecision::Prefer(o) if o == vec![1, 0]
+        ));
+        assert!(matches!(
+            norm(r#"{"order":[1,0],"reject":null}"#),
+            RoutingDecision::Prefer(o) if o == vec![1, 0]
+        ));
     }
 
     /// The pre-reject behaviors are untouched: order normalizes, abstain abstains, `{}` abstains.

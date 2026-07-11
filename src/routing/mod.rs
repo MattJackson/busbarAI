@@ -71,9 +71,10 @@ pub(crate) struct RoutingRequest<'a> {
     pub(crate) stream: bool,
     /// The request's prompt content — `Some` ONLY when the pool opted in via `policy.send_prompt`
     /// (default off). The default projection is shape-only; this is the operator-gated exception
-    /// that lets a trusted hook screen content (PII, guardrails, audit). Owned: flattening the
-    /// ingress body allocates, and that cost is paid only behind the opt-in.
-    pub(crate) prompt: Option<PromptProjection>,
+    /// that lets a trusted hook screen content (PII, guardrails, audit). Borrows from the parsed
+    /// body where it can (bare-string content); only block-array flattening allocates, and that
+    /// cost is paid only behind the opt-in.
+    pub(crate) prompt: Option<PromptProjection<'a>>,
     /// Caller identity — `Some` ONLY when the pool opted in via `policy.send_user` (default off).
     /// Carries the governance virtual-key `id`/`name` and the body's end-user field. NEVER the
     /// caller's secret/token, regardless of configuration.
@@ -82,19 +83,32 @@ pub(crate) struct RoutingRequest<'a> {
 
 /// The opt-in prompt content projection (`policy.send_prompt: true`). Text only: string content and
 /// `{type:"text"}` blocks are flattened; non-text blocks (images, tool results) are skipped, so the
-/// payload carries words, not binary blobs.
-#[derive(Debug, Clone)]
-pub(crate) struct PromptProjection {
+/// payload carries text, not binary blobs. `Cow`: bare-string content borrows straight from the
+/// parsed body (the common case, zero copies); only block arrays allocate a joined string.
+#[derive(Clone)]
+pub(crate) struct PromptProjection<'a> {
     /// The system prompt's text, flattened (bare string, or text blocks concatenated).
-    pub(crate) system: Option<String>,
+    pub(crate) system: Option<std::borrow::Cow<'a, str>>,
     /// Every message as `(role, flattened text)`, in request order.
-    pub(crate) messages: Vec<(String, String)>,
+    pub(crate) messages: Vec<(std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)>,
+}
+
+/// Debug REDACTS the content: this struct exists precisely because the operator opted prompt text
+/// into the hook payload, and a stray `{:?}` on the routing path (a debug log while chasing a hook
+/// issue) must not fan that text out into log aggregators. Shapes only.
+impl std::fmt::Debug for PromptProjection<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PromptProjection")
+            .field("system_chars", &self.system.as_deref().map(str::len))
+            .field("message_count", &self.messages.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The opt-in caller identity projection (`policy.send_user: true`). By construction this can never
 /// carry a secret: the governance lookup resolves the token to its key record and only the record's
 /// `id`/`name` are projected.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct CallerIdentity {
     /// Governance virtual-key id (stable handle), if the caller authenticated with a virtual key.
     pub(crate) key_id: Option<String>,
@@ -103,6 +117,18 @@ pub(crate) struct CallerIdentity {
     /// The request body's end-user identifier (`user` in OpenAI dialect, `metadata.user_id` in
     /// Anthropic dialect), if the caller supplied one.
     pub(crate) user: Option<String>,
+}
+
+/// Debug shows the operator-facing key labels but REDACTS the end-user identifier — it is caller
+/// PII that the operator opted into the hook payload, not into every debug log on the routing path.
+impl std::fmt::Debug for CallerIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallerIdentity")
+            .field("key_id", &self.key_id)
+            .field("key_name", &self.key_name)
+            .field("user", &self.user.as_deref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// One routable member, with the metadata + live signals a policy ranks on. Projected from
@@ -346,6 +372,15 @@ fn resolve_script(cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
          Migrate to `route: socket` or `route: webhook`."
     );
     let policy_cfg = cfg.policy.as_ref();
+    // The payload opt-ins are webhook/socket-only: the frozen Rhai env has no bindings for them,
+    // so `resolve` forces them off (building the projections would be pure waste). Warn so the
+    // operator learns the flags are inert here rather than wondering why the script sees nothing.
+    if policy_cfg.is_some_and(|p| p.send_prompt || p.send_user) {
+        tracing::warn!(
+            "route: script does not support policy.send_prompt / policy.send_user; the flags are \
+             ignored. Migrate to `route: socket` or `route: webhook` for the payload opt-ins."
+        );
+    }
     let source = match policy_cfg.map_or(Ok(None), script_source) {
         Ok(Some(src)) => src,
         Ok(None) => {
@@ -368,11 +403,12 @@ fn resolve_script(cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
                     .map(|p| p.timeout_ms)
                     .unwrap_or(crate::limits::default_policy_timeout_ms()),
             ),
-            // The deprecated script transport never receives the opt-in projections (its Rhai env
-            // predates them and is frozen); the flags are still honored at the seam if set, the
-            // script just has no bindings to read them.
-            send_prompt: policy_cfg.map(|p| p.send_prompt).unwrap_or(false),
-            send_user: policy_cfg.map(|p| p.send_user).unwrap_or(false),
+            // The deprecated script transport never receives the opt-in projections (its frozen
+            // Rhai env has no bindings for them), so the flags are FORCED OFF here: honoring them
+            // would burn the per-request flattening/lookup cost to build data the script cannot
+            // read. Setting them on a script pool warns (below) instead of silently wasting work.
+            send_prompt: false,
+            send_user: false,
         }),
         Err(e) => {
             tracing::warn!("route: script failed to compile: {e}; falling back to weighted");
@@ -649,5 +685,93 @@ mod tests {
             RoutingDecision::from_ranked(std::iter::empty(), &valid),
             RoutingDecision::Abstain,
         );
+    }
+
+    /// The deprecated script transport FORCES the payload opt-ins off at resolve time: its frozen
+    /// Rhai env has no bindings for them, so honoring the flags would burn per-request flattening
+    /// cost building data the script can never read.
+    #[cfg(feature = "script-policy")]
+    #[test]
+    fn script_resolve_forces_opt_in_flags_off() {
+        use crate::config::{PolicyCfg, RouteKind};
+        let client = reqwest::Client::new();
+        let cfg = pool_cfg(
+            RouteKind::Script,
+            Some(PolicyCfg {
+                script: Some("candidates.map(|c| c.idx)".to_string()),
+                timeout_ms: 5,
+                send_prompt: true,
+                send_user: true,
+                ..Default::default()
+            }),
+        );
+        match resolve_policy(&cfg, &client) {
+            Some(ResolvedPolicy::Policy {
+                send_prompt,
+                send_user,
+                ..
+            }) => {
+                assert!(!send_prompt, "script must force send_prompt off");
+                assert!(!send_user, "script must force send_user off");
+            }
+            None => panic!("script pool must resolve to a policy"),
+        }
+    }
+
+    /// LOCKS the invariant behind `forward`'s `unreachable!("from_ranked never rejects")` arm:
+    /// `from_ranked` is a pure order-normalizer and must only ever produce Prefer/Abstain. If a
+    /// future change makes it emit Reject, that unreachable arm panics on a live request — this
+    /// test is the tripwire that fails FIRST.
+    #[test]
+    fn from_ranked_never_produces_reject() {
+        let valid: HashSet<usize> = [0usize, 1, 2].into_iter().collect();
+        for ranked in [
+            vec![0usize, 1, 2],
+            vec![2, 2, 2],
+            vec![9, 8, 7],
+            vec![],
+            vec![1],
+            vec![0, 9, 1, 0, 2, 2],
+        ] {
+            let d = RoutingDecision::from_ranked(ranked.clone(), &valid);
+            assert!(
+                !matches!(d, RoutingDecision::Reject { .. }),
+                "from_ranked({ranked:?}) must never yield Reject"
+            );
+        }
+    }
+
+    /// The opt-in projections REDACT their content in Debug: a stray `{{:?}}` debug log on the
+    /// routing path must never fan operator-opted-in prompt text or end-user PII into the log
+    /// stream (the VirtualKey key-hash precedent).
+    #[test]
+    fn opt_in_projections_redact_debug() {
+        let p = PromptProjection {
+            system: Some("SECRET-SYSTEM-PROMPT".into()),
+            messages: vec![("user".into(), "SECRET-MESSAGE-TEXT".into())],
+        };
+        let dbg = format!("{p:?}");
+        assert!(
+            !dbg.contains("SECRET-SYSTEM-PROMPT"),
+            "leaked system: {dbg}"
+        );
+        assert!(
+            !dbg.contains("SECRET-MESSAGE-TEXT"),
+            "leaked message: {dbg}"
+        );
+
+        let i = CallerIdentity {
+            key_id: Some("k-1".into()),
+            key_name: Some("sales-team".into()),
+            user: Some("alice@example.com".into()),
+        };
+        let dbg = format!("{i:?}");
+        assert!(
+            !dbg.contains("alice@example.com"),
+            "leaked end-user id: {dbg}"
+        );
+        // The operator-facing key labels stay visible — they are the operator's own config values,
+        // and losing them would make the struct undiagnosable.
+        assert!(dbg.contains("sales-team"));
     }
 }

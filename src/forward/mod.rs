@@ -2059,8 +2059,25 @@ fn total_text_chars(v: &Value, system_chars: usize) -> usize {
     total
 }
 
+/// Map a hook-chosen reject status to the closest dialect error KIND, so an SDK caller catches the
+/// right typed exception: a hook 429 must surface as a rate-limit error, not a permission error.
+/// Statuses without a natural kind (400, 422, 451, ...) read as invalid-request; 403 (the reject
+/// default) stays a permission error.
+fn reject_kind_for_status(status: u16) -> &'static str {
+    match status {
+        401 => KIND_AUTHENTICATION,
+        403 => KIND_PERMISSION,
+        404 => KIND_NOT_FOUND,
+        408 => KIND_TIMEOUT,
+        429 => KIND_RATE_LIMIT,
+        _ => KIND_INVALID_REQUEST,
+    }
+}
+
 /// The request body's end-user identifier, dialect-aware: `user` (OpenAI) first, then
-/// `metadata.user_id` (Anthropic). Part of the `policy.send_user` opt-in identity projection.
+/// `metadata.user_id` (Anthropic). An empty string coalesces to `None` — "no user id" and
+/// `user: ""` mean the same thing to a routing hook. Part of the `policy.send_user` opt-in
+/// identity projection.
 fn body_end_user(v: &Value) -> Option<String> {
     v.get("user")
         .and_then(|u| u.as_str())
@@ -2069,19 +2086,24 @@ fn body_end_user(v: &Value) -> Option<String> {
                 .and_then(|m| m.get("user_id"))
                 .and_then(|u| u.as_str())
         })
+        .filter(|s| !s.is_empty())
         .map(str::to_string)
 }
 
 /// Flatten the ingress body's prompt content into the opt-in hook projection
 /// (`policy.send_prompt`). The same content walk as `total_text_chars` — bare-string content and
-/// `{type:"text", text}` blocks — but collecting the words instead of counting the chars. Non-text
+/// `{type:"text", text}` blocks — but collecting the text instead of counting the chars. Non-text
 /// blocks (images, documents, tool results) are skipped: the projection carries text, never binary
-/// blobs. Runs ONLY behind the per-pool opt-in, so the allocations never touch a default pool.
-fn build_prompt_projection(v: &Value) -> crate::routing::PromptProjection {
-    // A content value is a bare string or an array of blocks; text blocks are joined by newline.
-    fn flatten_content(c: Option<&Value>) -> String {
+/// blobs. Bare-string content BORROWS from the parsed body (`Cow::Borrowed`, the common case);
+/// only block arrays allocate a joined string. Runs ONLY behind the per-pool opt-in, so even that
+/// cost never touches a default pool.
+fn build_prompt_projection(v: &Value) -> crate::routing::PromptProjection<'_> {
+    use std::borrow::Cow;
+    // A content value is a bare string (borrowed as-is) or an array of blocks (text blocks joined
+    // by newline into an owned string).
+    fn flatten_content(c: Option<&Value>) -> Cow<'_, str> {
         match c {
-            Some(Value::String(s)) => s.clone(),
+            Some(Value::String(s)) => Cow::Borrowed(s.as_str()),
             Some(Value::Array(blocks)) => {
                 let mut out = String::new();
                 for b in blocks {
@@ -2092,9 +2114,9 @@ fn build_prompt_projection(v: &Value) -> crate::routing::PromptProjection {
                         out.push_str(t);
                     }
                 }
-                out
+                Cow::Owned(out)
             }
-            _ => String::new(),
+            _ => Cow::Borrowed(""),
         }
     }
     let system = v
@@ -2107,11 +2129,8 @@ fn build_prompt_projection(v: &Value) -> crate::routing::PromptProjection {
         .map(|msgs| {
             msgs.iter()
                 .map(|m| {
-                    let role = m
-                        .get("role")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                    let role: Cow<'_, str> =
+                        Cow::Borrowed(m.get("role").and_then(|r| r.as_str()).unwrap_or(""));
                     (role, flatten_content(m.get("content")))
                 })
                 .collect()
@@ -2626,16 +2645,19 @@ pub(crate) async fn forward_with_pool_parsed(
                         "status" => status.to_string(),
                     )
                     .increment(1);
+                    // The message is safe to log: `wire::normalize` already stripped control chars
+                    // and capped the length, and it is the exact string the CLIENT receives anyway.
                     tracing::info!(
                         policy = name,
                         pool = pool_name,
                         status,
+                        message = %message,
                         "routing policy rejected the request"
                     );
                     return ingress_error(
                         ingress_protocol,
                         StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
-                        KIND_PERMISSION,
+                        reject_kind_for_status(status),
                         &message,
                     );
                 }
@@ -10187,10 +10209,14 @@ mod hook_opt_in_projection_tests {
         assert_eq!(
             p.messages,
             vec![
-                ("user".to_string(), "hello".to_string()),
-                ("assistant".to_string(), "part one\npart two".to_string()),
-            ]
+                ("user".into(), "hello".into()),
+                ("assistant".into(), "part one\npart two".into()),
+            ] as Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)>
         );
+        // The bare-string message BORROWS from the body (the zero-copy path); the block-array
+        // message is owned (flattening had to join).
+        assert!(matches!(p.messages[0].1, std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(p.messages[1].1, std::borrow::Cow::Owned(_)));
     }
 
     /// A system prompt given as a BLOCK ARRAY (Anthropic allows both) flattens too; an absent /
@@ -10227,5 +10253,262 @@ mod hook_opt_in_projection_tests {
         let v: Value = serde_json::json!({"user": 42});
         assert_eq!(body_end_user(&v), None);
         assert_eq!(body_end_user(&Value::Null), None);
+    }
+}
+
+#[cfg(test)]
+mod hook_seam_tests {
+    //! Tests for `decide_policy_order`'s NEW seams: the `send_prompt`/`send_user` opt-in gating
+    //! (the flags decide whether the projections are built AND what the policy actually sees), and
+    //! the `RoutingDecision::Reject` → `PolicyOutcome::RejectRequest` mapping — plus the reject
+    //! status → error-kind mapping and its dialect-native envelope.
+    use super::*;
+    use crate::routing::{
+        Candidate, PolicyResult, ResolvedPolicy, RoutingContext, RoutingDecision, RoutingPolicy,
+        RoutingRequest,
+    };
+    use crate::state::WeightedLane;
+    use crate::test_support::{LaneSpec, TestApp};
+    use std::sync::Mutex as StdMutex;
+
+    /// The prompt as the policy saw it: (flattened system, [(role, text)]).
+    type SeenPrompt = (Option<String>, Vec<(String, String)>);
+    /// The identity as the policy saw it: (key_id, key_name, end-user).
+    type SeenIdentity = (Option<String>, Option<String>, Option<String>);
+
+    /// What the policy saw through the seam, captured for assertion.
+    #[derive(Clone, Default)]
+    struct CapturedReq {
+        prompt: Option<SeenPrompt>,
+        identity: Option<SeenIdentity>,
+    }
+
+    /// A test policy that records the projection it was handed and returns a fixed decision.
+    struct CapturingPolicy {
+        seen: Arc<StdMutex<Option<CapturedReq>>>,
+        reject: Option<(u16, String)>,
+    }
+
+    #[async_trait::async_trait]
+    impl RoutingPolicy for CapturingPolicy {
+        async fn decide(
+            &self,
+            req: &RoutingRequest<'_>,
+            _candidates: &[Candidate<'_>],
+            _ctx: &RoutingContext<'_>,
+            _budget: std::time::Duration,
+        ) -> PolicyResult {
+            *self.seen.lock().unwrap() = Some(CapturedReq {
+                prompt: req.prompt.as_ref().map(|p| {
+                    (
+                        p.system.as_deref().map(str::to_string),
+                        p.messages
+                            .iter()
+                            .map(|(r, t)| (r.to_string(), t.to_string()))
+                            .collect(),
+                    )
+                }),
+                identity: req
+                    .identity
+                    .as_ref()
+                    .map(|i| (i.key_id.clone(), i.key_name.clone(), i.user.clone())),
+            });
+            Ok(match &self.reject {
+                Some((status, message)) => RoutingDecision::Reject {
+                    status: *status,
+                    message: message.clone(),
+                },
+                None => RoutingDecision::Abstain,
+            })
+        }
+        fn name(&self) -> &'static str {
+            "capture"
+        }
+    }
+
+    /// Run `decide_policy_order` against a one-lane test app with the given flags/body/decision.
+    async fn run(
+        send_prompt: bool,
+        send_user: bool,
+        reject: Option<(u16, String)>,
+        v: Value,
+    ) -> (PolicyOutcome, Option<CapturedReq>) {
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        let seen = Arc::new(StdMutex::new(None));
+        let resolved = ResolvedPolicy::Policy {
+            policy: Arc::new(CapturingPolicy {
+                seen: seen.clone(),
+                reject,
+            }),
+            on_error: crate::config::PolicyOnError::default(),
+            timeout: std::time::Duration::from_millis(500),
+            send_prompt,
+            send_user,
+        };
+        let cands = vec![WeightedLane {
+            reasoning: None,
+            idx: 0,
+            weight: 1,
+            attempt_timeout_ms: None,
+        }];
+        let rc = RequestCtx::new(60);
+        let out = decide_policy_order(
+            &app,
+            &resolved,
+            &cands,
+            &rc,
+            &v,
+            "p",
+            "anthropic",
+            false,
+            None,
+        )
+        .await;
+        let captured = seen.lock().unwrap().clone();
+        (out, captured)
+    }
+
+    fn body() -> Value {
+        serde_json::json!({
+            "model": "m0",
+            "system": "sys prompt",
+            "user": "alice",
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+    }
+
+    /// Both flags OFF (the default): the policy must see NO prompt and NO identity — the shape-only
+    /// contract holds at the seam itself, not just at the wire.
+    #[tokio::test]
+    async fn default_flags_project_nothing() {
+        let (out, captured) = run(false, false, None, body()).await;
+        let captured = captured.expect("policy must have been called");
+        assert!(captured.prompt.is_none(), "send_prompt off ⇒ no prompt");
+        assert!(captured.identity.is_none(), "send_user off ⇒ no identity");
+        assert!(matches!(out, PolicyOutcome::Weighted), "abstain ⇒ weighted");
+    }
+
+    /// `send_prompt: true` alone: the policy sees the flattened content; identity stays absent.
+    #[tokio::test]
+    async fn send_prompt_projects_content_only() {
+        let (_, captured) = run(true, false, None, body()).await;
+        let captured = captured.expect("policy must have been called");
+        let (system, messages) = captured.prompt.expect("send_prompt on ⇒ prompt present");
+        assert_eq!(system.as_deref(), Some("sys prompt"));
+        assert_eq!(messages, vec![("user".to_string(), "hello".to_string())]);
+        assert!(captured.identity.is_none(), "send_user off ⇒ no identity");
+    }
+
+    /// `send_user: true` alone: the policy sees the body's end-user id (no governance configured,
+    /// so the key fields are None); the prompt stays absent.
+    #[tokio::test]
+    async fn send_user_projects_identity_only() {
+        let (_, captured) = run(false, true, None, body()).await;
+        let captured = captured.expect("policy must have been called");
+        assert!(captured.prompt.is_none(), "send_prompt off ⇒ no prompt");
+        let (key_id, key_name, user) = captured.identity.expect("send_user on ⇒ identity present");
+        assert_eq!(key_id, None, "no governance ⇒ no key id");
+        assert_eq!(key_name, None, "no governance ⇒ no key name");
+        assert_eq!(user.as_deref(), Some("alice"));
+    }
+
+    /// A policy Reject flows through the seam as `PolicyOutcome::RejectRequest` with the policy's
+    /// exact status/message and its name — NOT through `on_error` (a rejection is a decision, not
+    /// a failure).
+    #[tokio::test]
+    async fn reject_decision_maps_to_reject_request_outcome() {
+        let (out, _) = run(true, false, Some((451, "PII detected".to_string())), body()).await;
+        match out {
+            PolicyOutcome::RejectRequest {
+                status,
+                message,
+                name,
+            } => {
+                assert_eq!(status, 451);
+                assert_eq!(message, "PII detected");
+                assert_eq!(name, "capture");
+            }
+            other => panic!(
+                "expected RejectRequest, got a different outcome: {}",
+                outcome_kind(&other)
+            ),
+        }
+    }
+
+    fn outcome_kind(o: &PolicyOutcome) -> &'static str {
+        match o {
+            PolicyOutcome::Order { .. } => "Order",
+            PolicyOutcome::Weighted => "Weighted",
+            PolicyOutcome::Reject => "Reject",
+            PolicyOutcome::RejectRequest { .. } => "RejectRequest",
+        }
+    }
+
+    /// The reject status → dialect error KIND mapping: an SDK caller must catch the right typed
+    /// exception class for the status the hook chose.
+    #[test]
+    fn reject_kind_mapping_matches_status_semantics() {
+        assert_eq!(reject_kind_for_status(401), KIND_AUTHENTICATION);
+        assert_eq!(reject_kind_for_status(403), KIND_PERMISSION);
+        assert_eq!(reject_kind_for_status(404), KIND_NOT_FOUND);
+        assert_eq!(reject_kind_for_status(408), KIND_TIMEOUT);
+        assert_eq!(reject_kind_for_status(429), KIND_RATE_LIMIT);
+        for other in [400, 422, 451, 499] {
+            assert_eq!(reject_kind_for_status(other), KIND_INVALID_REQUEST);
+        }
+    }
+
+    /// A hook reject rides `ingress_error` into a DIALECT-NATIVE envelope: the sanitized message
+    /// must appear verbatim in the error body, with the mapped kind and the hook's exact status —
+    /// here through the Anthropic writer (the ingress the reject tests route with).
+    #[tokio::test]
+    async fn reject_message_reaches_anthropic_error_body() {
+        use http_body_util::BodyExt as _;
+        let status = 451u16;
+        let resp = ingress_error(
+            "anthropic",
+            StatusCode::from_u16(status).unwrap(),
+            reject_kind_for_status(status),
+            "PII detected in message 3",
+        );
+        assert_eq!(resp.status().as_u16(), 451);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(
+            v["error"]["message"], "PII detected in message 3",
+            "the hook's sanitized reject message must reach the client verbatim"
+        );
+    }
+
+    /// The same reject through the BEDROCK ingress writer: a valid Bedrock error envelope with the
+    /// `x-amzn-errortype` header — the reject path takes whatever dialect the caller spoke.
+    #[tokio::test]
+    async fn reject_produces_bedrock_native_envelope() {
+        use http_body_util::BodyExt as _;
+        let resp = ingress_error(
+            "bedrock",
+            StatusCode::from_u16(429).unwrap(),
+            reject_kind_for_status(429),
+            "quota guardrail: try later",
+        );
+        assert_eq!(resp.status().as_u16(), 429);
+        assert!(
+            resp.headers().get("x-amzn-errortype").is_some(),
+            "Bedrock error envelope must carry x-amzn-errortype"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["message"], "quota guardrail: try later",
+            "Bedrock error body carries the message field"
+        );
     }
 }
