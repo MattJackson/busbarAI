@@ -33,11 +33,11 @@ Whichever way you run it, the logic is small and the same. Classify the request 
 
 ## Answer one: a Rust binary on a socket, about 8 microseconds
 
-`route: socket` points Busbar at a compiled binary you run, listening on a local Unix domain socket. Busbar writes the request-and-candidates projection as one line of JSON, your binary writes back the ranked order, the connection stays open. No HTTP stack, no network, no interpreter.
+The pool's name is the model your clients call: point any SDK at Busbar and send `"model": "smart"`, and this pool answers. `route: socket` points Busbar at a compiled binary you run, listening on a local Unix domain socket. Busbar writes the request-and-candidates projection as one line of JSON, your binary writes back the ranked order, the connection stays open. No HTTP stack, no network, no interpreter.
 
 ```yaml
 pools:
-  chat:
+  smart:
     route: socket
     policy:
       socket: /run/busbar/router.sock
@@ -111,7 +111,7 @@ The socket hook is Unix-only and compiled. When you want the policy in whatever 
 
 ```yaml
 pools:
-  chat:
+  smart:
     route: webhook
     policy:
       url: "http://127.0.0.1:8787/"
