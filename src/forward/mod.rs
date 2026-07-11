@@ -3339,8 +3339,24 @@ pub(crate) async fn forward_with_pool_parsed(
                     // OPAQUE (non-JSON) egress body — e.g. binary speech audio: bridge at the BYTE
                     // level through the operation codecs and relay the ingress handler's WireBody
                     // (bytes + ITS content-type) verbatim. JSON bodies take the Value path below.
-                    if crate::json::parse::<Value>(&bytes).is_err() {
-                        if let Some(Ok(mut ir)) = egress_op.map(|h| h.read_response(&bytes)) {
+                    // Parse the 2xx body ONCE, then branch on JSON vs opaque (binary). A prior version
+                    // probed with a throwaway parse here and re-parsed the same bytes for the JSON path
+                    // below, doubling the parse cost of every cross-protocol JSON completion.
+                    let body_json = crate::json::parse::<Value>(&bytes);
+                    if body_json.is_err() {
+                        let decoded = egress_op.map(|h| h.read_response(&bytes));
+                        if let Some(Err(ref e)) = decoded {
+                            // A binary/opaque upstream body the egress codec cannot decode: log the
+                            // CodecError so a repeated wall of 500s has a visible root cause instead of
+                            // only the generic 'not translatable' warn below.
+                            tracing::warn!(
+                                ingress = %ingress_protocol,
+                                egress = %app.lanes[i].protocol.name(),
+                                error = ?e,
+                                "cross-protocol binary response failed the egress codec (read_response); returning ingress-native 500",
+                            );
+                        }
+                        if let Some(Ok(mut ir)) = decoded {
                             record_resp_usage(&ir, &usage_sink);
                             ir.prepare_for_ingress(ingress_protocol, now());
                             if let Some(wire) = crate::handlers::request_handler(ingress_protocol)
@@ -3363,8 +3379,20 @@ pub(crate) async fn forward_with_pool_parsed(
                             }
                         }
                     }
-                    if let Ok(rv) = crate::json::parse::<Value>(&bytes) {
-                        if let Some(Ok(mut ir)) = egress_op.map(|h| h.read_response_value(&rv)) {
+                    if let Ok(rv) = &body_json {
+                        let decoded = egress_op.map(|h| h.read_response_value(rv));
+                        if let Some(Err(ref e)) = decoded {
+                            // A JSON 2xx whose shape the egress codec rejects (e.g. a missing
+                            // `embedding` array): log the CodecError before the generic 500 so the
+                            // operator can tell a broken upstream from a new/renamed response field.
+                            tracing::warn!(
+                                ingress = %ingress_protocol,
+                                egress = %app.lanes[i].protocol.name(),
+                                error = ?e,
+                                "cross-protocol JSON response failed the egress codec (read_response_value); returning ingress-native 500",
+                            );
+                        }
+                        if let Some(Ok(mut ir)) = decoded {
                             if let Some(ingress_proto) =
                                 crate::proto::protocol_for(ingress_protocol)
                             {
@@ -4244,7 +4272,19 @@ async fn forward_once(
                 if let Ok(rv) = crate::json::parse::<Value>(&bytes) {
                     let egress_op = crate::handlers::request_handler(app.lanes[i].protocol.name())
                         .and_then(|rh| rh.operation_handler(op.operation));
-                    if let Some(Ok(mut ir)) = egress_op.map(|h| h.read_response_value(&rv)) {
+                    let decoded = egress_op.map(|h| h.read_response_value(&rv));
+                    if let Some(Err(ref e)) = decoded {
+                        // Degraded/fallback path: same swallowed-CodecError gap as the main forward
+                        // path — log the codec error before the generic 500 so repeated failures on a
+                        // fallback lane have a visible root cause.
+                        tracing::warn!(
+                            ingress = %ingress_protocol,
+                            egress = %app.lanes[i].protocol.name(),
+                            error = ?e,
+                            "cross-protocol JSON response failed the egress codec (read_response_value, degraded path); returning ingress-native 500",
+                        );
+                    }
+                    if let Some(Ok(mut ir)) = decoded {
                         if let Some(ingress_proto) = crate::proto::protocol_for(ingress_protocol) {
                             // Token accounting: committed to translating and delivering this body
                             // (every exit below is a delivered response). No FirstByteBody on this

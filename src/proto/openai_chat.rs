@@ -1948,11 +1948,14 @@ impl ProtocolWriter for OpenAiWriter {
         }
         // The logprobs ask in OpenAI's native spelling (a Gemini `responseLogprobs`/`logprobs`
         // arrives here via the IR).
-        if let Some(logprobs) = req.logprobs {
-            out.insert("logprobs".to_string(), serde_json::json!(logprobs));
-        }
+        // OpenAI requires `logprobs: true` for `top_logprobs` to be valid. Force the enabling flag
+        // whenever the count is present, even if the source protocol only carried the count (a
+        // Gemini request with `logprobs: N` but no `responseLogprobs`) — otherwise OpenAI 400s.
         if let Some(top_logprobs) = req.top_logprobs {
+            out.insert("logprobs".to_string(), serde_json::json!(true));
             out.insert("top_logprobs".to_string(), serde_json::json!(top_logprobs));
+        } else if let Some(logprobs) = req.logprobs {
+            out.insert("logprobs".to_string(), serde_json::json!(logprobs));
         }
         if let Some(response_format) = &req.response_format {
             out.insert(
@@ -2873,6 +2876,24 @@ mod tests {
             "multi-text ToolResult content must concatenate with NO separator, got {}",
             tool_msg["content"]
         );
+    }
+
+    #[test]
+    fn write_request_forces_logprobs_flag_when_only_top_logprobs_present() {
+        // A source request carrying only the top-count (no enabling flag) — e.g. read from Gemini's
+        // independent `logprobs` field — must emit `logprobs: true` on OpenAI egress, or the API
+        // rejects it with "logprobs must be true when top_logprobs is set".
+        let mut ir = OpenAiReader
+            .read_request(&serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "top_logprobs": 5
+            }))
+            .expect("parses");
+        ir.logprobs = None; // only the top-count is set
+        let out = OpenAiWriter.write_request(&ir);
+        assert_eq!(out["logprobs"], true, "enabling flag must be forced");
+        assert_eq!(out["top_logprobs"], 5);
     }
 
     #[test]

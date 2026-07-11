@@ -124,13 +124,21 @@ impl OperationHandler for GeminiTranscription {
             for p in parts {
                 let inline = p.get("inline_data").or_else(|| p.get("inlineData"));
                 if let Some(d) = inline {
+                    // Validate the client-supplied base64 at this trust boundary: a malformed
+                    // payload must 400 here, not silently become an empty audio body downstream
+                    // (the egress writer decodes it and any `unwrap_or_default` would truncate).
+                    let data = d
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if crate::media::base64_decode(&data).is_none() {
+                        return Err(IngressReject::BadRequest(
+                            "inline_data.data is not valid base64".into(),
+                        ));
+                    }
                     audio = Some(MediaBlob {
-                        payload: MediaPayload::B64(
-                            d.get("data")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                        ),
+                        payload: MediaPayload::B64(data),
                         mime_type: d
                             .get("mime_type")
                             .or_else(|| d.get("mimeType"))
@@ -562,5 +570,179 @@ impl OperationHandler for GeminiEmbeddings {
         WireBody::json(Bytes::from(
             serde_json::to_vec(&json!({ "embedding": { "values": values } })).unwrap_or_default(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcription_read_request_captures_inline_audio() {
+        // A generateContent body with a valid-base64 inline_data audio part → IR Transcription
+        // carrying the audio blob (and any text part as the prompt).
+        let audio_b64 = base64_encode(b"pretend-audio-bytes");
+        let body = serde_json::to_vec(&json!({
+            "contents": [{ "role": "user", "parts": [
+                { "text": "please transcribe" },
+                { "inline_data": { "mime_type": "audio/wav", "data": audio_b64 } },
+            ]}],
+        }))
+        .unwrap();
+        let ir = TRANSCRIPTION
+            .read_request(&body, "application/json")
+            .expect("valid inline audio body");
+        let IrReq::Transcription(r) = ir else {
+            panic!("expected IrReq::Transcription");
+        };
+        let blob = r.audio.expect("audio captured");
+        assert_eq!(blob.mime_type, "audio/wav");
+        assert_eq!(r.prompt.as_deref(), Some("please transcribe"));
+        match blob.payload {
+            MediaPayload::B64(s) => assert_eq!(s, base64_encode(b"pretend-audio-bytes")),
+            _ => panic!("expected B64 payload"),
+        }
+    }
+
+    #[test]
+    fn transcription_read_request_invalid_base64_is_bad_request() {
+        // Malformed base64 in inline_data.data must 400 at this trust boundary rather than
+        // silently truncate to an empty audio body downstream.
+        let body = serde_json::to_vec(&json!({
+            "contents": [{ "role": "user", "parts": [
+                { "inline_data": { "mime_type": "audio/wav", "data": "!!!not base64!!!" } },
+            ]}],
+        }))
+        .unwrap();
+        let err = TRANSCRIPTION
+            .read_request(&body, "application/json")
+            .expect_err("invalid base64 must reject");
+        assert!(matches!(err, IngressReject::BadRequest(_)));
+    }
+
+    #[test]
+    fn transcription_read_request_without_inline_data_is_bad_request() {
+        // No inline_data audio part → the specific "requires an inline_data audio part" 400.
+        let body = serde_json::to_vec(&json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "just text" }]}],
+        }))
+        .unwrap();
+        let err = TRANSCRIPTION
+            .read_request(&body, "application/json")
+            .expect_err("no audio part must reject");
+        match err {
+            IngressReject::BadRequest(m) => {
+                assert!(m.contains("inline_data audio part"), "message was: {m}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_operation_audio_out_is_speech() {
+        // responseModalities:["AUDIO"] on generateContent ⇒ Speech (TTS).
+        let h = GeminiRequestHandler;
+        let body = serde_json::to_vec(&json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "say hi" }]}],
+            "generationConfig": { "responseModalities": ["AUDIO"] },
+        }))
+        .unwrap();
+        assert_eq!(
+            h.resolve_operation("/v1beta/models/gemini-x:generateContent", &body),
+            Some(Operation::Speech),
+        );
+    }
+
+    #[test]
+    fn resolve_operation_audio_in_is_transcription() {
+        // An inline_data part with an audio/* mime ⇒ Transcription.
+        let body = serde_json::to_vec(&json!({
+            "contents": [{ "role": "user", "parts": [
+                { "inline_data": { "mime_type": "audio/wav", "data": "AAAA" } },
+            ]}],
+        }))
+        .unwrap();
+        let h = GeminiRequestHandler;
+        assert_eq!(
+            h.resolve_operation("/v1beta/models/gemini-x:generateContent", &body),
+            Some(Operation::Transcription),
+        );
+    }
+
+    #[test]
+    fn resolve_operation_plain_text_is_chat() {
+        // A plain text chat body (no audio modalities, no inline_data) ⇒ Chat.
+        let body = serde_json::to_vec(&json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hello" }]}],
+        }))
+        .unwrap();
+        let h = GeminiRequestHandler;
+        assert_eq!(
+            h.resolve_operation("/v1beta/models/gemini-x:generateContent", &body),
+            Some(Operation::Chat),
+        );
+    }
+
+    #[test]
+    fn embeddings_read_request_captures_content_text() {
+        // embedContent body → IR Embeddings carrying content.parts[].text.
+        let body = serde_json::to_vec(&json!({
+            "content": { "parts": [{ "text": "embed me" }] },
+        }))
+        .unwrap();
+        let ir = EMB
+            .read_request(&body, "application/json")
+            .expect("valid embedContent body");
+        let IrReq::Embeddings(r) = ir else {
+            panic!("expected IrReq::Embeddings");
+        };
+        assert_eq!(r.input, EmbInput::Text(vec!["embed me".to_string()]));
+    }
+
+    #[test]
+    fn embeddings_read_request_without_text_is_bad_request() {
+        // No content.parts text ⇒ 400.
+        let body = serde_json::to_vec(&json!({ "content": { "parts": [] } })).unwrap();
+        let err = EMB
+            .read_request(&body, "application/json")
+            .expect_err("empty content must reject");
+        assert!(matches!(err, IngressReject::BadRequest(_)));
+    }
+
+    #[test]
+    fn image_read_request_captures_prompt_and_count() {
+        // Imagen :predict body → IR Image with instances[0].prompt and parameters.sampleCount.
+        let body = serde_json::to_vec(&json!({
+            "instances": [{ "prompt": "a fox" }],
+            "parameters": { "sampleCount": 3 },
+        }))
+        .unwrap();
+        let ir = IMG
+            .read_request(&body, "application/json")
+            .expect("valid predict body");
+        let IrReq::Image(r) = ir else {
+            panic!("expected IrReq::Image");
+        };
+        assert_eq!(r.prompt.as_deref(), Some("a fox"));
+        assert_eq!(r.n, Some(3));
+    }
+
+    #[test]
+    fn image_write_read_roundtrip_preserves_prompt() {
+        // write_request emits instances[].prompt + parameters.sampleCount; read_request recovers.
+        let req = IrReq::Image(crate::ir::image::ImageReq {
+            prompt: Some("roundtrip fox".to_string()),
+            n: Some(2),
+            ..Default::default()
+        });
+        let wire = IMG.write_request(&req);
+        let back = IMG
+            .read_request(&wire, "application/json")
+            .expect("emitted body reparses");
+        let IrReq::Image(r) = back else {
+            panic!("expected IrReq::Image");
+        };
+        assert_eq!(r.prompt.as_deref(), Some("roundtrip fox"));
+        assert_eq!(r.n, Some(2));
     }
 }

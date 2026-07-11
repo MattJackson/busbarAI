@@ -132,7 +132,17 @@ fn parse_multipart<'a>(body: &'a [u8], content_type: &str) -> Vec<MultipartField
     let Some(boundary) = content_type.split("boundary=").nth(1) else {
         return Vec::new();
     };
+    // The boundary token ends at the next Content-Type parameter: `boundary=abc; charset=utf-8` is
+    // spec-legal (RFC 2046) and must yield `abc`, not `abc; charset=utf-8` (which matches no real
+    // delimiter and silently drops every part). Cut at the first `;`, then trim and unquote.
+    let boundary = boundary.split(';').next().unwrap_or(boundary);
     let boundary = boundary.trim().trim_matches('"');
+    // An empty (or absent) boundary yields delim `--`, whose 2-byte scan can push ~body/2 offsets
+    // into `positions` (heap amplification from a crafted Content-Type). A real boundary is >=1 char;
+    // reject anything shorter than that rather than scan.
+    if boundary.is_empty() {
+        return Vec::new();
+    }
     let delim = format!("--{boundary}");
     let delim_b = delim.as_bytes();
     // Collect every delimiter offset, then walk the segments between consecutive delimiters.
@@ -229,9 +239,26 @@ impl OperationHandler for OpenAiTranscription {
         let boundary = "----busbaraudioMIME";
         let mut out: Vec<u8> = Vec::new();
         let mut push_field = |name: &str, val: &str| {
-            out.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{val}\r\n").as_bytes());
+            // Strip CR/LF from the value: any field (model, language, prompt, response_format) can
+            // carry attacker- or misconfig-supplied text, and an embedded `\r\n--boundary` would
+            // terminate this part and inject arbitrary new MIME parts. This is the one place these
+            // fields are serialized, so sanitizing here covers every text field uniformly.
+            let safe: String = val.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            out.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{safe}\r\n").as_bytes());
         };
         push_field("model", &r.model);
+        // Carry the caller's transcription hints on cross-protocol egress (e.g. Gemini ingress ->
+        // OpenAI Whisper): dropping these silently changed behavior (no language hint / prompt /
+        // format). Emit each only when present, matching the OpenAI multipart form field names.
+        if let Some(lang) = &r.source_language {
+            push_field("language", lang);
+        }
+        if let Some(prompt) = &r.prompt {
+            push_field("prompt", prompt);
+        }
+        if let Some(fmt) = &r.response_format {
+            push_field("response_format", fmt);
+        }
         if let Some(blob) = &r.audio {
             let bytes = match &blob.payload {
                 MediaPayload::Bytes(b) => b.clone(),
@@ -393,11 +420,24 @@ impl OperationHandler for OpenAiEmbeddings {
             .to_string();
         let input = match wire.get("input") {
             Some(Value::String(s)) => EmbInput::Text(vec![s.clone()]),
-            Some(Value::Array(a)) => EmbInput::Text(
-                a.iter()
-                    .filter_map(|x| x.as_str().map(str::to_string))
-                    .collect(),
-            ),
+            Some(Value::Array(a)) => {
+                // An array of strings is the multi-text batch. An array of integers (or token-ID
+                // sub-arrays) is OpenAI's pre-tokenized input form, which does not translate across
+                // providers — reject it loudly rather than silently `filter_map` it to an empty batch
+                // that reaches the backend as a confusing 400.
+                if a.is_empty() || !a.iter().all(Value::is_string) {
+                    return Err(IngressReject::BadRequest(
+                        "embeddings `input` must be a string or a non-empty array of strings \
+                         (pre-tokenized integer input is not supported)"
+                            .into(),
+                    ));
+                }
+                EmbInput::Text(
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect(),
+                )
+            }
             _ => {
                 return Err(IngressReject::BadRequest(
                     "embeddings request missing `input`".into(),
@@ -980,5 +1020,123 @@ mod tests {
         let out = OpenAiTranscription.write_response(&ir);
         let v: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
         assert_eq!(v["usage"]["total_tokens"], u64::MAX); // saturated, not panicked/wrapped
+    }
+
+    // Builds a well-formed multipart body with the given Content-Type boundary spelling.
+    fn multipart_body(delim_boundary: &str) -> Vec<u8> {
+        format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+             Content-Type: audio/wav\r\n\r\nRIFFDATA\r\n--{b}--\r\n",
+            b = delim_boundary
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn multipart_boundary_ignores_trailing_content_type_params() {
+        // RFC 2046 permits params after the boundary token: `boundary=abc; charset=utf-8`. The
+        // parser must key on `abc`, not `abc; charset=utf-8` (which matches no real delimiter and
+        // used to drop every part, 400-ing a well-formed request).
+        let body = multipart_body("abc");
+        let ir = OpenAiTranscription
+            .read_request(&body, "multipart/form-data; boundary=abc; charset=utf-8")
+            .expect("well-formed body must parse despite trailing CT params");
+        let IrReq::Transcription(r) = ir else {
+            panic!("expected transcription IR")
+        };
+        assert_eq!(r.model, "whisper-1");
+        assert!(r.audio.is_some());
+    }
+
+    #[test]
+    fn multipart_empty_boundary_is_rejected_not_amplified() {
+        // An empty boundary yields delim `--`, whose 2-byte scan could push ~body/2 offsets into a
+        // Vec (heap amplification). It must short-circuit to a clean BadRequest, never scan.
+        let body = vec![b'-'; 4096];
+        let err = OpenAiTranscription
+            .read_request(&body, "multipart/form-data; boundary=")
+            .unwrap_err();
+        assert!(matches!(err, IngressReject::BadRequest(_)));
+    }
+
+    #[test]
+    fn transcription_egress_carries_language_prompt_and_format() {
+        // A cross-protocol transcription (e.g. Gemini ingress -> OpenAI egress) must not silently
+        // drop the caller's language hint, prompt, or response_format on the multipart body.
+        let ir = IrReq::Transcription(crate::ir::audio::TranscriptionReq {
+            model: "whisper-1".into(),
+            source_language: Some("fr".into()),
+            prompt: Some("Glossary: API, SDK".into()),
+            response_format: Some("verbose_json".into()),
+            audio: Some(MediaBlob {
+                payload: MediaPayload::Bytes(Bytes::from_static(b"x")),
+                mime_type: "audio/wav".into(),
+                pcm: None,
+            }),
+            ..Default::default()
+        });
+        let out = OpenAiTranscription.write_request(&ir);
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("name=\"language\"\r\n\r\nfr\r\n"),
+            "language: {text}"
+        );
+        assert!(
+            text.contains("name=\"prompt\"\r\n\r\nGlossary: API, SDK\r\n"),
+            "prompt: {text}"
+        );
+        assert!(
+            text.contains("name=\"response_format\"\r\n\r\nverbose_json\r\n"),
+            "format: {text}"
+        );
+    }
+
+    #[test]
+    fn transcription_egress_field_strips_crlf_injection() {
+        // A CR/LF in any text field (here the operator-supplied model) must not terminate the part
+        // and inject new MIME parts into the egress request.
+        let ir = IrReq::Transcription(crate::ir::audio::TranscriptionReq {
+            model: "whisper-1\r\nContent-Disposition: form-data; name=\"evil\"\r\n\r\npwn".into(),
+            audio: Some(MediaBlob {
+                payload: MediaPayload::Bytes(Bytes::from_static(b"x")),
+                mime_type: "audio/wav".into(),
+                pcm: None,
+            }),
+            ..Default::default()
+        });
+        let out = OpenAiTranscription.write_request(&ir);
+        let text = String::from_utf8_lossy(&out);
+        // The CR/LF is stripped, so the injection text collapses INLINE into the model value line
+        // and can no longer start a MIME header line — the danger is a `\r\n`-prefixed injected part,
+        // which must not exist.
+        assert!(
+            !text.contains("\r\nContent-Disposition: form-data; name=\"evil\""),
+            "injected part must not begin a header line: {text}"
+        );
+        // No injected part boundary either: the only `--boundary` delimiters are the two the writer
+        // frames (model, file) plus the closing one — the flattened injection cannot add its own.
+        assert_eq!(text.matches("------busbaraudioMIME").count(), 3);
+    }
+
+    #[test]
+    fn embeddings_integer_input_is_rejected_not_silently_emptied() {
+        // Pre-tokenized integer input does not translate cross-protocol; it must 400 loudly rather
+        // than filter_map to an empty batch that confuses the backend.
+        let err = OpenAiEmbeddings
+            .read_request(
+                br#"{"model":"text-embedding-3-small","input":[1,2,3]}"#,
+                "application/json",
+            )
+            .unwrap_err();
+        assert!(matches!(err, IngressReject::BadRequest(_)));
+        // An empty array is likewise rejected.
+        assert!(OpenAiEmbeddings
+            .read_request(br#"{"model":"m","input":[]}"#, "application/json")
+            .is_err());
+        // A normal string-array batch still parses.
+        assert!(OpenAiEmbeddings
+            .read_request(br#"{"model":"m","input":["a","b"]}"#, "application/json")
+            .is_ok());
     }
 }

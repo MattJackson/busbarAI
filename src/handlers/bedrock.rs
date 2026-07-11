@@ -55,17 +55,21 @@ impl RequestHandler for BedrockRequestHandler {
             return Some(Operation::Chat);
         }
         if path.ends_with("/invoke") {
+            // Anchor every scan to the QUOTED JSON key (`"key"`), not the bare token: an unanchored
+            // `inputText` matched the substring inside a rerank query/document VALUE and misrouted the
+            // whole request to embeddings. Check rerank (the two-key body) FIRST so a document that
+            // merely mentions "inputText"/"textToImageParams" can't steal it.
             let has = |n: &[u8]| body.windows(n.len()).any(|w| w == n);
-            if has(b"textToImageParams") {
-                return Some(Operation::Image);
-            }
-            if has(b"inputText") {
-                return Some(Operation::Embeddings);
-            }
             // Rerank models (cohere.rerank-*, amazon.rerank-*) take {query, documents} — no
             // other InvokeModel body carries both keys.
             if has(b"\"query\"") && has(b"\"documents\"") {
                 return Some(Operation::Rerank);
+            }
+            if has(b"\"textToImageParams\"") {
+                return Some(Operation::Image);
+            }
+            if has(b"\"inputText\"") {
+                return Some(Operation::Embeddings);
             }
         }
         None
@@ -327,5 +331,98 @@ impl OperationHandler for BedrockRerank {
             body["id"] = json!(id);
         }
         WireBody::json(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invoke_rerank_not_misclassified_by_inputtext_substring() {
+        // A rerank body whose query/document text merely MENTIONS "inputText" must resolve to
+        // Rerank (checked first, key-anchored), not be stolen by the embeddings substring scan.
+        let h = BedrockRequestHandler;
+        let body = br#"{"query":"how does inputText work?","documents":["textToImageParams too"]}"#;
+        assert_eq!(
+            h.resolve_operation("/model/cohere.rerank-v3-5:0/invoke", body),
+            Some(Operation::Rerank),
+        );
+        // Real Titan embeddings (top-level inputText key) still resolves to Embeddings.
+        assert_eq!(
+            h.resolve_operation(
+                "/model/amazon.titan-embed-text-v2:0/invoke",
+                br#"{"inputText":"hello"}"#,
+            ),
+            Some(Operation::Embeddings),
+        );
+        // Real Titan image (top-level textToImageParams key) still resolves to Image.
+        assert_eq!(
+            h.resolve_operation(
+                "/model/amazon.titan-image-generator-v1/invoke",
+                br#"{"textToImageParams":{"text":"a cat"}}"#,
+            ),
+            Some(Operation::Image),
+        );
+        // Converse remains chat.
+        assert_eq!(
+            h.resolve_operation("/model/anthropic.claude/converse", b"{}"),
+            Some(Operation::Chat),
+        );
+    }
+
+    #[test]
+    fn image_read_request_captures_prompt_and_count() {
+        // Titan image InvokeModel body → IR Image with the prompt from textToImageParams.text and
+        // n from imageGenerationConfig.numberOfImages.
+        let body = br#"{"textToImageParams":{"text":"a cat"},"imageGenerationConfig":{"numberOfImages":2}}"#;
+        let ir = BedrockImage
+            .read_request(body, "application/json")
+            .expect("valid titan image body");
+        let IrReq::Image(r) = ir else {
+            panic!("expected IrReq::Image");
+        };
+        assert_eq!(r.prompt.as_deref(), Some("a cat"));
+        assert_eq!(r.n, Some(2));
+    }
+
+    #[test]
+    fn embeddings_read_request_captures_input_text() {
+        // Titan embeddings InvokeModel body → IR Embeddings carrying the inputText string.
+        let ir = BedrockEmbeddings
+            .read_request(br#"{"inputText":"hello"}"#, "application/json")
+            .expect("valid titan embeddings body");
+        let IrReq::Embeddings(r) = ir else {
+            panic!("expected IrReq::Embeddings");
+        };
+        assert_eq!(r.input, EmbInput::Text(vec!["hello".to_string()]));
+    }
+
+    #[test]
+    fn embeddings_read_request_without_input_text_is_bad_request() {
+        // A Titan embeddings body missing the required inputText key must 400 at the trust
+        // boundary, not resolve to an empty embed input.
+        let err = BedrockEmbeddings
+            .read_request(br#"{"dimensions":256}"#, "application/json")
+            .expect_err("missing inputText must reject");
+        assert!(matches!(err, IngressReject::BadRequest(_)));
+    }
+
+    #[test]
+    fn embeddings_write_read_roundtrip_preserves_input_text() {
+        // write_request emits `inputText`; read_request must recover the same input string.
+        let req = IrReq::Embeddings(crate::ir::embeddings::EmbeddingsReq {
+            input: EmbInput::Text(vec!["roundtrip".to_string()]),
+            encoding_formats: vec![EncFmt::Float],
+            ..Default::default()
+        });
+        let wire = BedrockEmbeddings.write_request(&req);
+        let back = BedrockEmbeddings
+            .read_request(&wire, "application/json")
+            .expect("emitted body reparses");
+        let IrReq::Embeddings(r) = back else {
+            panic!("expected IrReq::Embeddings");
+        };
+        assert_eq!(r.input, EmbInput::Text(vec!["roundtrip".to_string()]));
     }
 }

@@ -39,6 +39,29 @@ ships with the test that catches it.
   rather than silently wrapping.
 - **Embeddings `encoding_format` was dropped** on OpenAI egress, so a base64 request came back as
   float. It is now honored.
+- **`top_logprobs` without its enabling flag produced an upstream 400.** A cross-protocol request
+  that carried only a top-count (no `logprobs`/`responseLogprobs`) was rejected by the backend.
+  Both the OpenAI writer (`logprobs: true`) and the Gemini writer (`responseLogprobs: true`) now
+  force the enabling flag whenever a top-count is present.
+- **Base64 audio could be silently truncated.** The hand-rolled decoder returned a partial result
+  for a malformed payload (a lone trailing character) instead of failing, and a client's Gemini
+  `inline_data` audio was not validated at ingress. The decoder now rejects an impossible
+  remainder, and malformed inline audio is a clean 400 at the trust boundary.
+- **Transcription hints were dropped on cross-protocol egress.** `language`, `prompt`, and
+  `response_format` were not written to the OpenAI multipart body, silently changing behavior.
+  They are now carried, and every text field is stripped of CR/LF to prevent part injection.
+- **Bedrock rerank could be misrouted to embeddings.** The InvokeModel operation scan matched the
+  bare token `inputText` inside a rerank query/document value. Scans are now anchored to the quoted
+  JSON key and rerank (the two-key body) is checked first.
+- **Multipart edge cases.** A spec-legal `boundary=abc; charset=utf-8` Content-Type dropped every
+  form part (400 on a valid request); an empty boundary could amplify heap use. The boundary token
+  is now cut at the first parameter and an empty boundary is rejected before scanning.
+- **Pre-tokenized embeddings input failed opaquely.** An integer/token-array `input` was silently
+  reduced to an empty batch; it is now rejected with a clear 400 (pre-tokenized input is not
+  translatable across providers).
+- **Cross-protocol codec errors are now logged.** A response body the egress codec could not decode
+  fell through to a generic 500 with no diagnostic; the underlying error is now logged. The buffered
+  cross-protocol path also no longer parses the response body twice.
 
 ### Changed
 

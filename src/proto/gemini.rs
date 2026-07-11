@@ -2506,7 +2506,11 @@ impl ProtocolWriter for GeminiWriter {
         }
         // The logprobs ask in Gemini's native spellings (an OpenAI `logprobs`/`top_logprobs`
         // arrives here via the IR): boolean `responseLogprobs`, top-count `logprobs`.
-        if let Some(logprobs) = req.logprobs {
+        // Gemini requires `responseLogprobs: true` for the `logprobs` top-count to be valid. Force
+        // it whenever the count is present (even if the source only set the count), or Gemini 400s.
+        if req.top_logprobs.is_some() {
+            gen_config.insert("responseLogprobs".to_string(), serde_json::json!(true));
+        } else if let Some(logprobs) = req.logprobs {
             gen_config.insert("responseLogprobs".to_string(), serde_json::json!(logprobs));
         }
         if let Some(top_logprobs) = req.top_logprobs {
