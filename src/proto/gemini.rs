@@ -2510,7 +2510,19 @@ impl ProtocolWriter for GeminiWriter {
             gen_config.insert("responseLogprobs".to_string(), serde_json::json!(logprobs));
         }
         if let Some(top_logprobs) = req.top_logprobs {
-            gen_config.insert("logprobs".to_string(), serde_json::json!(top_logprobs));
+            // Gemini's `logprobs` top-count caps at 5 on most models (OpenAI allows up to 20).
+            // Clamp to the safe floor rather than 400 a cross-protocol request that asked for more;
+            // busbar can't know the target model's exact cap, and 5 is universally accepted.
+            const GEMINI_MAX_TOP_LOGPROBS: u32 = 5;
+            let clamped = top_logprobs.min(GEMINI_MAX_TOP_LOGPROBS);
+            if clamped != top_logprobs {
+                tracing::warn!(
+                    requested = top_logprobs,
+                    clamped,
+                    "clamping top_logprobs to Gemini's max (5)"
+                );
+            }
+            gen_config.insert("logprobs".to_string(), serde_json::json!(clamped));
         }
         // The reasoning carry in Gemini's native spelling: `thinkingConfig.thinkingBudget`.
         // Dynamic round-trips as Gemini's own -1; effort words go through the table. (Only present
@@ -8868,7 +8880,7 @@ mod tests {
 mod logprobs_carry_tests {
     //! Cross-protocol logprobs (OpenAI<->Gemini): the ask (request) and the data (response,
     //! buffered AND streaming) must cross the seam in both directions via the neutral IR.
-    use crate::proto::Protocol;
+    use crate::proto::{Protocol, ProtocolReader};
 
     fn gemini_body_with_logprobs() -> serde_json::Value {
         serde_json::json!({
@@ -8950,6 +8962,51 @@ mod logprobs_carry_tests {
 
     /// OpenAI backend -> Gemini caller (buffered): `choices[0].logprobs.content[]` becomes
     /// `candidates[0].logprobsResult` with parallel chosen/top arrays.
+    #[test]
+    fn tts_instructions_prefix_the_prompt_not_language_code() {
+        // OpenAI TTS `instructions` (free-text style) must steer via the prompt, not corrupt
+        // Gemini's speechConfig.languageCode (a BCP-47 field).
+        let ir = crate::ir::variant::IrReq::Speech(crate::ir::audio::SpeechReq {
+            model: "gemini-2.5-flash-preview-tts".into(),
+            input: "hello there".into(),
+            voice: "Kore".into(),
+            instructions: Some("speak cheerfully".into()),
+            ..Default::default()
+        });
+        let out = crate::handlers::request_handler("gemini")
+            .and_then(|rh| rh.operation_handler(crate::operation::Operation::Speech))
+            .unwrap()
+            .write_request(&ir);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["contents"][0]["parts"][0]["text"],
+            "speak cheerfully: hello there"
+        );
+        assert!(
+            v["generationConfig"]["speechConfig"]
+                .get("languageCode")
+                .is_none(),
+            "instructions must not land in languageCode: {v}"
+        );
+    }
+
+    #[test]
+    fn top_logprobs_clamped_to_gemini_max_on_egress() {
+        // A cross-protocol logprobs ask with OpenAI's max (20) must be clamped to Gemini's 5, not
+        // forwarded to a 400 on older models.
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true, "top_logprobs": 20
+        });
+        let ir = crate::proto::openai_chat::OpenAiReader
+            .read_request(&body)
+            .expect("parses");
+        let out = Protocol::gemini().writer().write_request(&ir);
+        assert_eq!(out["generationConfig"]["logprobs"], 5);
+        assert_eq!(out["generationConfig"]["responseLogprobs"], true);
+    }
+
     #[test]
     fn openai_logprobs_reach_gemini_caller() {
         let body = serde_json::json!({

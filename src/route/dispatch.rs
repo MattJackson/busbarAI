@@ -9,15 +9,22 @@
 
 use super::*;
 
-/// Minimal `model` form-field extractor for multipart transcription. A boundary-aware
-/// `parse_multipart_model` is a P5 refinement; this scan handles the standard `name="model"` part.
+/// Minimal `model` form-field extractor for multipart transcription. Scans only the HEAD of the
+/// body (byte-level, no allocation) rather than lossy-converting the ENTIRE body: the `model` text
+/// part sits before the (potentially multi-MiB binary) audio part in a well-formed request, so a
+/// bounded head window finds it without allocating a full-body String per transcription. If it is
+/// not in the head (a pathologically-ordered body), it resolves to `None` → a clean routing 404,
+/// same as a genuinely-absent model.
 fn multipart_model(body: &[u8]) -> Option<String> {
-    let s = String::from_utf8_lossy(body);
-    let idx = s.find("name=\"model\"")?;
-    let start = s[idx..].find("\r\n\r\n")? + idx + 4;
-    let val = &s[start..];
-    let end = val.find("\r\n").unwrap_or(val.len());
-    let m = val[..end].trim().to_string();
+    // 64 KiB is far larger than any plausible run of text form fields preceding the audio blob.
+    const HEAD: usize = 64 * 1024;
+    let head = &body[..body.len().min(HEAD)];
+    let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|w| w == needle);
+    let idx = find(head, b"name=\"model\"")?;
+    let sep = find(&head[idx..], b"\r\n\r\n")? + idx + 4;
+    let val = &head[sep..];
+    let end = find(val, b"\r\n").unwrap_or(val.len());
+    let m = String::from_utf8_lossy(&val[..end]).trim().to_string();
     (!m.is_empty()).then_some(m)
 }
 
@@ -428,4 +435,31 @@ pub(crate) async fn bedrock_invoke(
         Some(model_id),
     )
     .await
+}
+
+#[cfg(test)]
+mod multipart_model_tests {
+    use super::multipart_model;
+
+    #[test]
+    fn extracts_model_from_head_ignoring_large_binary_tail() {
+        // A well-formed transcription: the `model` text part precedes a large binary audio part.
+        // multipart_model must find the model in the head without touching the (here 1 MiB) tail.
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n",
+        );
+        body.extend_from_slice(
+            b"--BOUNDARY\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a\"\r\n\r\n",
+        );
+        body.extend(std::iter::repeat_n(0u8, 1 << 20)); // 1 MiB of binary, not valid UTF-8
+        body.extend_from_slice(b"\r\n--BOUNDARY--\r\n");
+        assert_eq!(multipart_model(&body).as_deref(), Some("whisper-1"));
+    }
+
+    #[test]
+    fn absent_model_is_none() {
+        let body = b"--B\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nx\r\n--B--\r\n";
+        assert_eq!(multipart_model(body), None);
+    }
 }

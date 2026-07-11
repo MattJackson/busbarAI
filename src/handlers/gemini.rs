@@ -279,14 +279,19 @@ impl OperationHandler for GeminiSpeech {
         let IrReq::Speech(r) = ir else {
             return Bytes::new();
         };
-        let mut speech_config = json!({
+        let speech_config = json!({
             "voiceConfig": { "prebuiltVoiceConfig": { "voiceName": r.voice } }
         });
-        if let Some(instr) = &r.instructions {
-            speech_config["languageCode"] = json!(instr);
-        }
+        // OpenAI's `instructions` is FREE-TEXT style guidance ("speak cheerfully"), not a locale.
+        // The old code put it into `speechConfig.languageCode` (a BCP-47 field), producing an
+        // invalid Gemini request. Gemini steers TTS style through the PROMPT itself, so prefix the
+        // text (its documented style-control mechanism) instead of corrupting languageCode.
+        let text = match &r.instructions {
+            Some(instr) if !instr.trim().is_empty() => format!("{}: {}", instr.trim(), r.input),
+            _ => r.input.clone(),
+        };
         let body = json!({
-            "contents": [{ "role": "user", "parts": [{ "text": r.input }]}],
+            "contents": [{ "role": "user", "parts": [{ "text": text }]}],
             "generationConfig": { "responseModalities": ["AUDIO"], "speechConfig": speech_config },
         });
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())

@@ -5428,6 +5428,47 @@ mod attempt_timeout_precedence_tests {
         }
     }
 
+    fn rmember(idx: usize, reasoning: Option<bool>) -> WeightedLane {
+        WeightedLane {
+            reasoning,
+            idx,
+            weight: 1,
+            attempt_timeout_ms: None,
+        }
+    }
+
+    /// effective_reasoning: the pool-member override wins over the model-level flag; absent member
+    /// override inherits the model flag; no candidate row falls back to the model flag.
+    #[test]
+    fn effective_reasoning_member_override_wins() {
+        use super::effective_reasoning;
+        let cands = vec![
+            rmember(0, Some(true)),
+            rmember(1, Some(false)),
+            rmember(2, None),
+        ];
+        assert!(
+            effective_reasoning(&cands, 0, false),
+            "member true beats model false"
+        );
+        assert!(
+            !effective_reasoning(&cands, 1, true),
+            "member false beats model true"
+        );
+        assert!(
+            effective_reasoning(&cands, 2, true),
+            "no member override inherits model true"
+        );
+        assert!(
+            !effective_reasoning(&cands, 2, false),
+            "no member override inherits model false"
+        );
+        assert!(
+            !effective_reasoning(&[], 5, false),
+            "no candidate row uses the model flag"
+        );
+    }
+
     /// The layering the feature promises: the pool-member override wins over the model-level
     /// default, so the SAME model can carry a 10000ms cap in one pool and 50ms in another.
     #[test]
