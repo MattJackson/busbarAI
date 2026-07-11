@@ -74,22 +74,27 @@ Measured end to end through Busbar's real transport, against the real example bi
 The hook itself is about a hundred lines of Rust, standard library plus serde, and the whole policy fits in your head. In pseudocode:
 
 ```text
-classify the request by its shape:
-  has tools?              -> agent/code   prefer "fable"
-  big ask or big prompt?  -> long-form    prefer "opus"
-  single-shot, no stream? -> batch        prefer "haiku"
-  otherwise               -> interactive  prefer "sonnet"
+step 1: classify the request by its shape.
+        each kind of request has a favorite lane.
 
-each bucket splits its attention differently:
-  agent/code   40% speed, 40% free capacity, 20% price
-  long-form    40% price, 40% free capacity, 20% speed
-  batch        60% price, 30% free capacity, 10% speed
-  interactive  50% speed, 30% price, 20% free capacity
+  has tools?              -> agent/code   favorite: "fable"
+  big ask or big prompt?  -> long-form    favorite: "opus"
+  single-shot, no stream? -> batch        favorite: "haiku"
+  otherwise               -> interactive  favorite: "sonnet"
 
-score every lane on price, speed, and free capacity,
-weighed by how much this request's bucket cares about each.
-  add a bonus if the lane's tier is the preferred one
-  trim the score as the lane nears its rate limit
+step 2: reality-check the favorite against the live pool.
+        the favorite gets a head start, not the win.
+
+  score every lane on how it is doing RIGHT NOW:
+  its price, its speed, its free capacity
+  (batch cares mostly about price, interactive about speed)
+
+  the favorite gets a bonus on top of its score
+  a lane close to its rate limit gets trimmed
+
+  a healthy favorite wins. a saturated, slow favorite
+  loses to a healthy lane. that is the point: the
+  request routes to reality, not to the plan.
 
 sort by score, best first. That order is the reply.
 ```
@@ -99,14 +104,14 @@ Each signal is normalized against the pool, so "how cheap" means cheapest-in-thi
 Here is the decision it actually makes. One pool, the four lanes above, with live signals at this moment: `claude-fable` ($25/Mtok, 400 ms, 16 free slots), `claude-opus` ($15, 320 ms, 12 free), `claude-sonnet` ($3, 150 ms, 10 free), `claude-haiku` ($0.80, 95 ms, 6 free). The expensive lanes sit idle; the cheap ones are busy. Two requests walk in:
 
 ```text
-request A: has_tools=true         -> agent/code bucket, prefer tier "fable"
+request A: has_tools=true         -> agent/code bucket, favorite "fable"
   claude-fable:   signals 0.40  + boost 0.50 = 0.90   <- first
   claude-sonnet:  signals 0.68               = 0.68
   claude-haiku:   signals 0.65               = 0.65
   claude-opus:    signals 0.46               = 0.46
   reply: {"order":[0,2,3,1]}  -> the frontier model gets the agent work
 
-request B: single-shot, no stream -> batch bucket, prefer tier "haiku"
+request B: single-shot, no stream -> batch bucket, favorite "haiku"
   claude-haiku:   signals 0.77  + boost 0.50 = 1.27   <- first
   claude-sonnet:  signals 0.78               = 0.78
   claude-opus:    signals 0.49               = 0.49
