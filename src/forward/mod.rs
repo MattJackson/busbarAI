@@ -2180,9 +2180,27 @@ async fn decide_policy_order(
     .await
     {
         Ok(Ok(d)) => d,
-        // Policy errored, or timed out: apply on_error. The policy/transport stays cancel-safe — a
-        // dropped future on timeout is fine.
-        Ok(Err(_)) | Err(_) => {
+        // Policy errored: apply on_error — but LOG the error first. A hook binary that is down,
+        // deadline-exceeded, or replying garbage would otherwise fail silently on every request
+        // (the pool degrades to on_error with no operator-visible signal that the hook is broken).
+        Ok(Err(e)) => {
+            tracing::warn!(
+                policy = policy.name(),
+                pool = pool_name,
+                error = %e,
+                "routing policy failed; applying on_error fallback"
+            );
+            return coerce_on_error(on_error, &candidates, policy.name());
+        }
+        // Timed out at the seam's own hard deadline: same fallback, same visibility. The policy/
+        // transport stays cancel-safe — a dropped future on timeout is fine.
+        Err(_) => {
+            tracing::warn!(
+                policy = policy.name(),
+                pool = pool_name,
+                timeout_ms = timeout.as_millis() as u64,
+                "routing policy deadline exceeded; applying on_error fallback"
+            );
             return coerce_on_error(on_error, &candidates, policy.name());
         }
     };

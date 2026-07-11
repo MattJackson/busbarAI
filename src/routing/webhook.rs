@@ -420,7 +420,7 @@ mod tests {
     /// of them assert what Busbar actually serializes onto the wire. This captures the POSTed JSON and
     /// asserts the contracted projection — in particular that `context.budget_remaining` is present and
     /// carries the `RoutingContext`'s value (500), plus the per-candidate `budget_remaining` and the
-    /// request projection. Pins the `WebhookContext`/`WebhookReqProjection`/`WebhookCandidate` wire shape.
+    /// request projection. Pins the shared `wire::HookContext`/`HookReqProjection`/`HookCandidate` wire shape.
     #[tokio::test]
     async fn posts_budget_remaining_in_payload() {
         let (url, captured) = capturing_sidecar().await;

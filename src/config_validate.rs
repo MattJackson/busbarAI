@@ -4035,6 +4035,79 @@ models:
         );
     }
 
+    /// Build a single-pool config whose pool uses `route: socket` with the given `policy.socket`
+    /// path. Exercises the routing-socket validation rule (unix platforms).
+    #[cfg(unix)]
+    fn socket_pool_cfg(socket: Option<&str>) -> RootCfg {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "prov".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        models.insert("m1".to_string(), make_model("prov", 4));
+        let mut pool = make_pool(vec![make_member("m1")]);
+        pool.route = config::RouteKind::Socket;
+        pool.policy = Some(config::PolicyCfg {
+            url: None,
+            socket: socket.map(str::to_string),
+            timeout_ms: 150,
+            on_error: config::PolicyOnError::default(),
+            script: None,
+            script_file: None,
+            name: None,
+        });
+        let mut pools = HashMap::new();
+        pools.insert("p1".to_string(), pool);
+        make_root_cfg(providers, models, pools)
+    }
+
+    /// `route: socket` with a valid absolute path passes the socket rule (the socket FILE need not
+    /// exist — the hook binary may start after busbar; only the path's shape is validated).
+    #[cfg(unix)]
+    #[test]
+    fn test_socket_route_accepts_absolute_path() {
+        let cfg = socket_pool_cfg(Some("/run/busbar/hook.sock"));
+        if let Err(errs) = validate(&cfg) {
+            assert!(
+                !errs
+                    .iter()
+                    .any(|e| e.contains("route: socket") || e.contains("policy.socket")),
+                "an absolute socket path must pass the socket rule; got: {errs:?}"
+            );
+        }
+    }
+
+    /// `route: socket` with a missing or empty `policy.socket` is a startup error.
+    #[cfg(unix)]
+    #[test]
+    fn test_socket_route_requires_socket_path() {
+        for missing in [None, Some("")] {
+            let cfg = socket_pool_cfg(missing);
+            let errs = validate(&cfg)
+                .unwrap_err_or_default("missing policy.socket must fail validation".to_string());
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("route: socket") && e.contains("requires policy.socket")),
+                "missing/empty socket path must be reported; got: {errs:?}"
+            );
+        }
+    }
+
+    /// A RELATIVE `policy.socket` path is a startup error (it would silently depend on busbar's CWD).
+    #[cfg(unix)]
+    #[test]
+    fn test_socket_route_rejects_relative_path() {
+        let cfg = socket_pool_cfg(Some("run/hook.sock"));
+        let errs = validate(&cfg)
+            .unwrap_err_or_default("relative policy.socket must fail validation".to_string());
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("policy.socket") && e.contains("absolute")),
+            "relative socket path must be reported; got: {errs:?}"
+        );
+    }
+
     // Small ergonomic helper: like `expect_err` but with a custom message and returning the Vec.
     trait UnwrapErrOrDefault {
         fn unwrap_err_or_default(self, msg: String) -> Vec<String>;

@@ -67,7 +67,9 @@ impl SocketPolicy {
     async fn round_trip(conn: &mut Conn, line: &[u8]) -> Result<Vec<u8>, std::io::Error> {
         conn.1.write_all(line).await?;
         conn.1.flush().await?;
-        let mut reply = Vec::new();
+        // A ranking reply is a short JSON line ({"order":[...]}); 128 bytes covers realistic pool
+        // sizes without intermediate reallocation, while the cap below still bounds a hostile peer.
+        let mut reply = Vec::with_capacity(128);
         // Cap the reply read: `take` bounds how many bytes `read_until` may pull. If the cap is hit
         // without a newline, treat it as a protocol error (peer is flooding or not speaking NDJSON).
         let mut limited = (&mut conn.0).take(MAX_REPLY_BYTES);
@@ -100,6 +102,7 @@ impl RoutingPolicy for SocketPolicy {
         // The ONE shared hook wire projection — byte-identical JSON to the webhook's POST body, so a
         // hook graduates between transports without changing its logic. One line, newline-terminated.
         let mut line = serde_json::to_vec(&super::wire::build(req, candidates, ctx))?;
+        line.reserve_exact(1); // to_vec returns an exact-fit Vec; avoid a guaranteed realloc
         line.push(b'\n');
 
         // Hard wall-clock deadline over the WHOLE exchange (connect + write + read): the caller also
@@ -117,7 +120,11 @@ impl RoutingPolicy for SocketPolicy {
                         *guard = Some(conn);
                         return Ok::<Vec<u8>, std::io::Error>(reply);
                     }
-                    Err(_) => { /* stale after a hook restart — fall through to a fresh connect */
+                    Err(e) => {
+                        // Stale after a hook restart — fall through to a fresh connect. Debug (not
+                        // warn): a single reconnect is normal across a hook restart, but a hook that
+                        // crash-loops shows up as a steady stream of these.
+                        tracing::debug!(error = %e, "socket hook: cached connection failed; reconnecting");
                     }
                 }
             }
@@ -387,6 +394,92 @@ mod tests {
             t.elapsed() < Duration::from_secs(1),
             "the deadline must cut the exchange off promptly"
         );
+    }
+
+    /// A hook flooding MORE than the 64 KiB reply cap without a newline must surface as `Err`
+    /// (bounded allocation, no hang) — the hostile-peer guard on the reply read.
+    #[tokio::test]
+    async fn oversized_reply_is_err_not_unbounded() {
+        let dir = tempdir();
+        let path = dir.path().join("flood.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut reader = BufReader::new(r);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.is_ok() {
+                        // 80 KiB of 'a' with no newline: past the cap, never a complete line.
+                        let flood = vec![b'a'; 80 * 1024];
+                        let _ = w.write_all(&flood).await;
+                    }
+                    // Keep the connection open so the reader hits the cap, not EOF.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        });
+        let policy = SocketPolicy::new(path.to_string_lossy().into_owned());
+        let r = policy
+            .decide(&req(), &[cand(0)], &ctx(), Duration::from_secs(2))
+            .await;
+        assert!(r.is_err(), "a flooding hook must surface as Err, got {r:?}");
+    }
+
+    /// After a DEADLINE-EXCEEDED decision (the connection is dropped mid-protocol), the NEXT
+    /// decision must reconnect cleanly and succeed — a poisoned connection is never reused.
+    #[tokio::test]
+    async fn poisoned_connection_after_timeout_reconnects_cleanly() {
+        let dir = tempdir();
+        let path = dir.path().join("slowfast.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        // First connection: read the request, never reply (forces the deadline). Every LATER
+        // connection: behave normally.
+        tokio::spawn(async move {
+            let mut first = true;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let hang = std::mem::take(&mut first);
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut reader = BufReader::new(r);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        if hang {
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            break;
+                        }
+                        if w.write_all(b"{\"order\":[0]}\n").await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let policy = SocketPolicy::new(path.to_string_lossy().into_owned());
+        let cands = [cand(0)];
+        // Decision 1: the hook hangs -> deadline exceeded -> Err; the half-exchanged connection
+        // must be discarded (it was moved into the timed-out future and dropped).
+        let r1 = policy
+            .decide(&req(), &cands, &ctx(), Duration::from_millis(100))
+            .await;
+        assert!(r1.is_err(), "hung hook must exceed the deadline");
+        // Decision 2: a fresh connection must be made and succeed.
+        let r2 = policy
+            .decide(&req(), &cands, &ctx(), Duration::from_secs(2))
+            .await
+            .expect("post-timeout decision must reconnect cleanly");
+        assert_eq!(r2, RoutingDecision::Prefer(vec![0]));
     }
 
     /// The hook binary RESTARTS between decisions: the cached connection is stale, and the

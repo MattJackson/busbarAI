@@ -7,7 +7,7 @@
 //! ordered **preference** of members — not a single pick. The ordered list feeds the failover loop
 //! Busbar already has (`forward::pick_among`): if the policy's #1 is tripped / excluded / at
 //! capacity, Busbar walks to #2 using the existing breaker machinery. One transport-agnostic trait
-//! (`RoutingPolicy`); webhook / script / native are implementations.
+//! (`RoutingPolicy`); webhook / socket / script / native are implementations.
 //!
 //! ZERO-COST DEFAULT: a `route: weighted` (default / absent) pool resolves to `ResolvedPolicy::None`
 //! at config load and NEVER constructs any of the projection types or enters this module's async
@@ -16,8 +16,8 @@
 //! This surface is PRODUCTION-WIRED: `forward::decide_policy_order` builds the `RoutingRequest` +
 //! `Candidate` projections from the live store signals and invokes the resolved policy on every
 //! non-default request; `forward::pick_among` walks the ranked order through the existing failover
-//! loop. `resolve_policy` (below) constructs the native / webhook / script transports once at config
-//! load.
+//! loop. `resolve_policy` (below) constructs the native / webhook / socket / script transports once
+//! at config load.
 
 use std::sync::Arc;
 
@@ -50,7 +50,8 @@ pub(crate) struct RoutingRequest<'a> {
     pub(crate) pool: &'a str,
     pub(crate) ingress_protocol: &'a str,
     /// The model the caller asked for (may be a pool name or a member model), if any. Projected to
-    /// webhook/script policies; the script projection is the only reader in the default build, so it
+    /// the SCRIPT policy only — the shared webhook/socket wire (`wire::HookReqProjection`)
+    /// deliberately omits it. The script projection is the only reader in the default build, so it
     /// is gated on `script-policy`.
     #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
     pub(crate) requested_model: Option<&'a str>,
@@ -151,7 +152,7 @@ pub(crate) enum RoutingDecision {
     Abstain,
 }
 
-/// THE transport-agnostic contract. webhook / script / native all implement this.
+/// THE transport-agnostic contract. webhook / socket / script / native all implement this.
 #[async_trait::async_trait]
 pub(crate) trait RoutingPolicy: Send + Sync + 'static {
     /// Rank candidates for this request. MUST be cancel-safe and SHOULD respect `budget` (a
