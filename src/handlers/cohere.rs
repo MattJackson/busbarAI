@@ -41,7 +41,14 @@ impl RequestHandler for CohereRequestHandler {
         match ctx.operation {
             Operation::Chat => "/v2/chat".into(),
             Operation::Rerank => "/v2/rerank".into(),
-            _ => "/v2/embed".into(),
+            Operation::Embeddings => "/v2/embed".into(),
+            // Enumerated (not `_`) so adding an operation is a compile error here — the same
+            // removability/symmetry gate operation_handler enforces. Unreachable: operation_handler
+            // returns None for these, so egress path resolution is never reached.
+            Operation::Moderation
+            | Operation::Image
+            | Operation::Transcription
+            | Operation::Speech => "/v2/embed".into(),
         }
     }
     fn resolve_operation(&self, path: &str, _body: &[u8]) -> Option<Operation> {
@@ -67,6 +74,20 @@ fn cohere_embedding_type(f: &EncFmt) -> &'static str {
         EncFmt::Uint8 => "uint8",
         EncFmt::Binary => "binary",
         EncFmt::Ubinary => "ubinary",
+    }
+}
+
+/// Inverse of [`cohere_embedding_type`]: a Cohere `embedding_types` wire string → IR encoding. The
+/// full 1:1 map (not just base64), so an `int8`/`uint8`/`binary`/`ubinary` ask is not silently
+/// collapsed to float on the read side. Unknown strings fall back to float.
+fn cohere_encoding_format(s: &str) -> EncFmt {
+    match s {
+        "base64" => EncFmt::Base64,
+        "int8" => EncFmt::Int8,
+        "uint8" => EncFmt::Uint8,
+        "binary" => EncFmt::Binary,
+        "ubinary" => EncFmt::Ubinary,
+        _ => EncFmt::Float,
     }
 }
 
@@ -104,13 +125,7 @@ impl OperationHandler for CohereEmbeddings {
             .map(|a| {
                 a.iter()
                     .filter_map(|x| x.as_str())
-                    .map(|s| {
-                        if s == "base64" {
-                            EncFmt::Base64
-                        } else {
-                            EncFmt::Float
-                        }
-                    })
+                    .map(cohere_encoding_format)
                     .collect()
             })
             .unwrap_or_else(|| vec![EncFmt::Float]);
@@ -160,12 +175,20 @@ impl OperationHandler for CohereEmbeddings {
                 .map(cohere_embedding_type)
                 .collect()
         };
-        let body = json!({
+        let mut body = json!({
             "model": r.model,
             "texts": texts,
             "input_type": input_type,
             "embedding_types": embedding_types,
         });
+        // Carry the shape/truncation controls the reader captures (Cohere is the lone embeddings
+        // writer that was dropping these): `output_dimension` (Matryoshka on embed-v4) and `truncate`.
+        if let Some(d) = r.dimensions {
+            body["output_dimension"] = json!(d);
+        }
+        if let Some(t) = &r.truncate {
+            body["truncate"] = json!(t);
+        }
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
     }
     fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
@@ -627,6 +650,53 @@ mod rerank_tests {
             .read_request(&body, "application/json")
             .expect_err("missing texts must reject");
         assert!(matches!(err, IngressReject::BadRequest(_)));
+    }
+
+    #[test]
+    fn embeddings_read_request_maps_all_encoding_types_not_just_base64() {
+        // Every Cohere embedding_type must map to its IR variant, not collapse to Float. int8/
+        // uint8/binary/ubinary were silently downgraded before (only base64 was handled).
+        for (wire, want) in [
+            ("float", EncFmt::Float),
+            ("base64", EncFmt::Base64),
+            ("int8", EncFmt::Int8),
+            ("uint8", EncFmt::Uint8),
+            ("binary", EncFmt::Binary),
+            ("ubinary", EncFmt::Ubinary),
+        ] {
+            let body = serde_json::to_vec(&json!({
+                "model": "m", "texts": ["x"], "input_type": "search_query",
+                "embedding_types": [wire]
+            }))
+            .unwrap();
+            let IrReq::Embeddings(r) = CohereEmbeddings
+                .read_request(&body, "application/json")
+                .expect("parses")
+            else {
+                panic!("expected embeddings")
+            };
+            assert_eq!(r.encoding_formats, vec![want], "encoding_type {wire}");
+        }
+    }
+
+    #[test]
+    fn embeddings_write_request_carries_output_dimension_and_truncate() {
+        // Cohere was the lone embeddings writer dropping these; they must reach the wire so a
+        // Matryoshka (output_dimension) or explicit truncate request is honored.
+        use crate::ir::embeddings::{EmbeddingsReq, EncFmt};
+        let ir = IrReq::Embeddings(EmbeddingsReq {
+            model: "embed-v4.0".into(),
+            input: EmbInput::Text(vec!["x".into()]),
+            dimensions: Some(256),
+            truncate: Some("NONE".into()),
+            encoding_formats: vec![EncFmt::Int8],
+            ..Default::default()
+        });
+        let out = CohereEmbeddings.write_request(&ir);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["output_dimension"], 256);
+        assert_eq!(v["truncate"], "NONE");
+        assert_eq!(v["embedding_types"], json!(["int8"]));
     }
 
     /// A client top_n larger than u32::MAX must DROP to None (omitted), never silently wrap to a

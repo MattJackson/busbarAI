@@ -106,6 +106,10 @@ ships with the test that catches it.
 - **Gemini `top_logprobs: 0`.** A caller's valid `top_logprobs: 0` ("the chosen token, no
   alternatives") emitted `logprobs: 0` on Gemini egress, which Gemini rejects. Busbar now omits the
   alternatives count for `0` while still returning the chosen token's logprob.
+- **Cohere embeddings encoding + shape controls.** The Cohere reader mapped only `base64` and
+  collapsed `int8`/`uint8`/`binary`/`ubinary` to float, and the writer dropped `output_dimension`
+  and `truncate`. All six encodings now round-trip, and the dimension/truncate controls are carried
+  (Cohere was the only embeddings writer omitting the dimension field).
 
 ### Changed
 

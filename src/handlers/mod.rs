@@ -183,7 +183,19 @@ pub(crate) trait OperationHandler: Send + Sync {
     /// body and project its token usage — so a token-metered non-chat op (embeddings) bills the same
     /// as the cross-protocol path. Chat overrides this to run the egress protocol's chat reader.
     fn extract_usage(&self, _ingress_protocol: &str, body: &[u8]) -> Option<IrUsage> {
-        self.read_response(body).ok().and_then(|r| r.token_usage())
+        match self.read_response(body) {
+            Ok(r) => r.token_usage(),
+            Err(e) => {
+                // A same-protocol 2xx body the op's own codec cannot decode: log it (like the
+                // cross-protocol seam) rather than silently bill 0 tokens with no operator signal.
+                tracing::warn!(
+                    error = ?e,
+                    "usage tap: read_response failed to decode a same-protocol 2xx body; \
+                     billing 0 tokens for this request"
+                );
+                None
+            }
+        }
     }
     /// The Content-Type of THIS operation's egress request wire (what `write_request` emits).
     /// JSON for every JSON-bodied operation; a multipart operation overrides with its boundary.
