@@ -439,7 +439,7 @@ breaker FSM, and governance contract are unchanged.
   the worker stack and abort the whole process: an uncatchable crash that killed every in-flight
   request for all tenants. The JSON seam now rejects bodies past a 128-level nesting depth before any
   value is constructed. (Introduced by this release's SIMD-JSON parser, which, unlike `serde_json`,
-  does not bound recursion depth; found and fixed pre-release by a multi-tier audit.)
+  does not bound recursion depth; found and fixed pre-release by a security audit.)
 
 ## [1.0.0-rc.5], 2026-06-17
 
