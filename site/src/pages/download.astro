@@ -100,7 +100,7 @@ const groups = [
         </div>
         <p class="dl-install-note">
           A <code>FROM scratch</code> image: the static binary plus the provider catalog, ~5 MB
-          compressed. Pin an exact version (<code>getbusbar/busbar:1.1.0</code>) or ride
+          compressed. Pin an exact version (<code>getbusbar/busbar:{version || 'latest'}</code>) or ride
           <code>latest</code>; images carry a verifiable build-provenance attestation
           (<a href="https://hub.docker.com/r/getbusbar/busbar">Docker Hub</a>, also on GHCR).
           Then follow <a href="/docs/getting-started/">Getting Started</a> to configure and run it.
