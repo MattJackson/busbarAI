@@ -28,7 +28,6 @@ pub(crate) const POLICY_NAME_CHEAPEST: &str = "cheapest";
 pub(crate) const POLICY_NAME_FASTEST: &str = "fastest";
 pub(crate) const POLICY_NAME_LEAST_BUSY: &str = "least_busy";
 pub(crate) const POLICY_NAME_USAGE: &str = "usage";
-pub(crate) const POLICY_NAME_SMART: &str = "smart";
 
 /// `weighted` — the explicit form of the default. Always `Abstain`, so selection falls through to
 /// the unchanged inline SWRR. Lets operators write `route: native, policy.name: weighted` and get
@@ -188,133 +187,6 @@ impl RoutingPolicy for UsagePolicy {
     }
 }
 
-/// `smart` — task-aware MULTI-signal ranking, the native counterpart to a routing hook. It classifies
-/// the request into a task bucket from SHAPE signals only (tools, size, interactivity — never prompt
-/// content), then scores every candidate over the live `cost` / `latency` / `available_concurrency`
-/// signals with per-bucket weights, adds a boost for the operator-declared quality `tier`, and scales
-/// a lane down as it nears its rate-limit cap (`rate_headroom`). No sidecar, no script: a compiled,
-/// sub-microsecond, in-process decision. Never Abstains — `available_concurrency` is always present,
-/// so there is always something to rank on (a pool with no cost/latency/tier data degrades to
-/// concurrency-weighted, which is a sane default rather than a coin flip).
-struct SmartPolicy;
-
-/// The task buckets `smart` classifies into, each with its own weighting of the live signals.
-#[derive(Clone, Copy)]
-enum Bucket {
-    QuickAnswer,
-    Code,
-    LongForm,
-    Bulk,
-}
-
-impl Bucket {
-    /// Shape-only classification (no prompt content is ever available to a policy by default).
-    fn classify(req: &RoutingRequest<'_>) -> Bucket {
-        if req.has_tools {
-            Bucket::Code // tool / agent traffic wants the capable tier
-        } else if req.max_tokens.unwrap_or(0) >= 4096 || req.total_chars > 24_000 {
-            Bucket::LongForm // ~4 chars/token: 24k chars is roughly 6k tokens
-        } else if !req.stream && req.message_count <= 1 {
-            Bucket::Bulk // single-shot, non-interactive: optimize cost
-        } else {
-            Bucket::QuickAnswer // interactive default: optimize latency
-        }
-    }
-
-    /// Per-bucket `(cost, latency, concurrency)` weights + the quality tiers to boost.
-    fn weights(self) -> (f64, f64, f64, &'static [&'static str]) {
-        match self {
-            Bucket::QuickAnswer => (0.30, 0.50, 0.20, &["small", "overflow"]),
-            Bucket::Code => (0.10, 0.20, 0.20, &["large", "primary"]),
-            Bucket::LongForm => (0.20, 0.10, 0.20, &["large", "primary"]),
-            Bucket::Bulk => (0.60, 0.10, 0.30, &["small", "overflow"]),
-        }
-    }
-}
-
-/// Boost added to a candidate whose operator-declared `tier` is in the bucket's preferred set — the
-/// operator's quality judgment, encoded as data, enforced here.
-const SMART_TIER_BOOST: f64 = 0.5;
-
-/// The `smart` ranking: classify, then score every candidate and rank descending (best first),
-/// tie-broken by `idx` for determinism. Missing per-candidate signals score neutral (0.5) so a cold
-/// lane is neither punished nor favored. Sub-microsecond; runs inline on the async worker.
-fn smart_rank(req: &RoutingRequest<'_>, candidates: &[Candidate<'_>]) -> RoutingDecision {
-    if candidates.is_empty() {
-        return RoutingDecision::Abstain;
-    }
-    let (w_cost, w_lat, w_conc, tiers) = Bucket::classify(req).weights();
-    // Normalization ceilings across the candidate set (0 → the signal does not differentiate).
-    let max_cost = candidates
-        .iter()
-        .filter_map(|c| c.cost_per_mtok)
-        .fold(0.0_f64, f64::max);
-    let max_lat = candidates
-        .iter()
-        .filter_map(|c| c.latency_ms)
-        .fold(0.0_f64, f64::max);
-    let max_conc = candidates
-        .iter()
-        .map(|c| c.available_concurrency)
-        .max()
-        .unwrap_or(0);
-    let score = |c: &Candidate<'_>| -> f64 {
-        // Lower cost / latency is better → 1 - normalized; higher free concurrency is better.
-        let cost_s = c.cost_per_mtok.map_or(0.5, |x| {
-            if max_cost > 0.0 {
-                1.0 - x / max_cost
-            } else {
-                0.5
-            }
-        });
-        let lat_s = c.latency_ms.map_or(0.5, |x| {
-            if max_lat > 0.0 {
-                1.0 - x / max_lat
-            } else {
-                0.5
-            }
-        });
-        let conc_s = if max_conc > 0 {
-            c.available_concurrency as f64 / max_conc as f64
-        } else {
-            0.5
-        };
-        let mut s = w_cost * cost_s + w_lat * lat_s + w_conc * conc_s;
-        if c.tier.is_some_and(|t| tiers.contains(&t)) {
-            s += SMART_TIER_BOOST;
-        }
-        // Back a lane off as its rate-limit headroom shrinks, so traffic steers away from a 429.
-        if let Some(h) = c.rate_headroom {
-            s *= 0.5 + 0.5 * h;
-        }
-        s
-    };
-    let mut scored: Vec<(usize, f64)> = candidates.iter().map(|c| (c.idx, score(c))).collect();
-    // Descending by score; ties (and NaN-safe fallback) by idx ascending for a deterministic order.
-    scored.sort_by(|(ia, sa), (ib, sb)| {
-        sb.partial_cmp(sa)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(ia.cmp(ib))
-    });
-    RoutingDecision::Prefer(scored.into_iter().map(|(idx, _)| idx).collect())
-}
-
-#[async_trait::async_trait]
-impl RoutingPolicy for SmartPolicy {
-    async fn decide(
-        &self,
-        req: &RoutingRequest<'_>,
-        candidates: &[Candidate<'_>],
-        _ctx: &RoutingContext<'_>,
-        _budget: Duration,
-    ) -> PolicyResult {
-        Ok(smart_rank(req, candidates))
-    }
-    fn name(&self) -> &'static str {
-        POLICY_NAME_SMART
-    }
-}
-
 /// Resolve a native policy name to a boxed policy. `None` for an unknown name (rejected at startup
 /// validation). `weighted` returns the Abstaining default native.
 pub(crate) fn native_policy(name: &str) -> Option<std::sync::Arc<dyn RoutingPolicy>> {
@@ -325,7 +197,6 @@ pub(crate) fn native_policy(name: &str) -> Option<std::sync::Arc<dyn RoutingPoli
         POLICY_NAME_FASTEST => Some(Arc::new(FastestPolicy)),
         POLICY_NAME_LEAST_BUSY => Some(Arc::new(LeastBusyPolicy)),
         POLICY_NAME_USAGE => Some(Arc::new(UsagePolicy)),
-        POLICY_NAME_SMART => Some(Arc::new(SmartPolicy)),
         _ => None,
     }
 }
@@ -498,116 +369,14 @@ mod tests {
         assert!(native_policy("fastest").is_some());
         assert!(native_policy("least_busy").is_some());
         assert!(native_policy("usage").is_some());
-        assert!(native_policy("smart").is_some());
         assert!(native_policy("nonexistent").is_none());
-    }
-
-    /// Build a candidate with an explicit `tier` (the quality signal `smart` boosts).
-    fn cand_tier(
-        idx: usize,
-        cost: Option<f64>,
-        lat: Option<f64>,
-        conc: usize,
-        tier: &'static str,
-    ) -> Candidate<'static> {
-        let mut c = cand(idx, cost, lat, conc, None);
-        c.tier = Some(tier);
-        c
-    }
-
-    fn req_shape(
-        has_tools: bool,
-        max_tokens: Option<u32>,
-        stream: bool,
-        msgs: usize,
-    ) -> RoutingRequest<'static> {
-        RoutingRequest {
-            has_tools,
-            max_tokens,
-            stream,
-            message_count: msgs,
-            ..req()
-        }
-    }
-
-    /// `smart` in the CODE bucket (has_tools) boosts the preferred tier: the capable `large`-tier lane
-    /// wins over a cheaper/faster `small`-tier one because the tier boost dominates the code weights.
-    #[tokio::test]
-    async fn smart_code_bucket_boosts_capable_tier() {
-        let cands = [
-            cand_tier(0, Some(3.0), Some(900.0), 8, "large"),
-            cand_tier(1, Some(0.15), Some(300.0), 10, "small"),
-        ];
-        let d = SmartPolicy
-            .decide(
-                &req_shape(true, Some(512), true, 3),
-                &cands,
-                &ctx(),
-                Duration::from_millis(10),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            d,
-            RoutingDecision::Prefer(vec![0, 1]),
-            "code bucket prefers the large tier"
-        );
-    }
-
-    /// `smart` in the BULK bucket (single-shot, non-stream) weights COST heavily: the cheap lane wins.
-    #[tokio::test]
-    async fn smart_bulk_bucket_prefers_cheap() {
-        let cands = [
-            cand_tier(0, Some(3.0), Some(300.0), 8, "large"),
-            cand_tier(1, Some(0.15), Some(900.0), 8, "small"),
-        ];
-        let d = SmartPolicy
-            .decide(
-                &req_shape(false, None, false, 1),
-                &cands,
-                &ctx(),
-                Duration::from_millis(10),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            d,
-            RoutingDecision::Prefer(vec![1, 0]),
-            "bulk bucket prefers the cheap lane"
-        );
-    }
-
-    /// `smart` never Abstains on a non-empty pool (concurrency is always present) but DOES Abstain on
-    /// an empty pool, and its decision is deterministic (ties broken by idx).
-    #[tokio::test]
-    async fn smart_abstains_only_on_empty_pool() {
-        let empty: [Candidate<'_>; 0] = [];
-        let d = SmartPolicy
-            .decide(&req(), &empty, &ctx(), Duration::from_millis(10))
-            .await
-            .unwrap();
-        assert_eq!(d, RoutingDecision::Abstain);
-        // Two identical candidates: a valid ranking, tie-broken by idx (never a panic on equal f64).
-        let cands = [cand(0, None, None, 5, None), cand(1, None, None, 5, None)];
-        let d = SmartPolicy
-            .decide(&req(), &cands, &ctx(), Duration::from_millis(10))
-            .await
-            .unwrap();
-        assert_eq!(d, RoutingDecision::Prefer(vec![0, 1]));
     }
 
     /// The registry round-trips each known name to a policy whose `name()` matches (not merely
     /// `is_some()`) — the resolved transport's name is what feeds the `x-busbar-route-policy` header.
     #[test]
     fn native_registry_names_round_trip() {
-        for name in [
-            "weighted",
-            "cheapest",
-            "fastest",
-            "least_busy",
-            "usage",
-            "smart",
-        ] {
+        for name in ["weighted", "cheapest", "fastest", "least_busy", "usage"] {
             let p = native_policy(name).expect("known name must resolve");
             assert_eq!(
                 p.name(),
@@ -623,14 +392,7 @@ mod tests {
     #[tokio::test]
     async fn all_natives_abstain_on_empty_pool() {
         let empty: [Candidate<'_>; 0] = [];
-        for name in [
-            "weighted",
-            "cheapest",
-            "fastest",
-            "least_busy",
-            "usage",
-            "smart",
-        ] {
+        for name in ["weighted", "cheapest", "fastest", "least_busy", "usage"] {
             let p = native_policy(name).unwrap();
             let d = p
                 .decide(&req(), &empty, &ctx(), Duration::from_millis(10))

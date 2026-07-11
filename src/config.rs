@@ -417,14 +417,10 @@ impl<'de> Deserialize<'de> for PoolCfg {
                 RouteKind::Native,
                 Some(crate::routing::native::POLICY_NAME_USAGE),
             ),
-            Some(crate::routing::native::POLICY_NAME_SMART) => (
-                RouteKind::Native,
-                Some(crate::routing::native::POLICY_NAME_SMART),
-            ),
             Some(other) => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown route '{other}': expected one of weighted, webhook, script, native, \
-                     or a native shorthand (cheapest, fastest, least_busy, usage, smart)"
+                     or a native shorthand (cheapest, fastest, least_busy, usage)"
                 )));
             }
         };
