@@ -60,41 +60,30 @@ pools:
 
 Measured end to end through Busbar's real transport, against the real example binary running as a separate process: about **7.9 microseconds** median per decision, p99 around 12. Your policy is a separate process, so a crash in it is contained; Busbar never spawns or supervises it, connects lazily, and reconnects across restarts of your binary.
 
-The hook itself is about a hundred lines of Rust, standard library plus serde. The heart of it is the classify step picking each bucket's dials:
+The hook itself is about a hundred lines of Rust, standard library plus serde, and the whole policy fits in your head. In pseudocode:
 
-```rust
-// Step 1: what KIND of request is this? Each bucket sets its own dials: how much
-// this request cares about cheap, fast, and unloaded, and which tier to lean toward.
-fn weights(r: &Req) -> Dials {
-    // Four kinds of request, four lanes, one natural home each. The tier names are
-    // whatever YOU declare on your members; here, the ladder every dev knows.
-    if r.has_tools {
-        // Agent / code traffic: the work is hard. Send it to the frontier model.
-        Dials { cost: 0.20, latency: 0.40, free_capacity: 0.40, prefer_tiers: &["fable"] }
-    } else if r.max_tokens.unwrap_or(0) >= 4096 || r.total_chars > 24_000 {
-        // Long-form work: deep and big, but it takes a while anyway. Opus territory.
-        Dials { cost: 0.40, latency: 0.20, free_capacity: 0.40, prefer_tiers: &["opus"] }
-    } else if !r.stream && r.message_count <= 1 {
-        // Single-shot batch work with nobody watching: the cheapest lane wins.
-        Dials { cost: 0.60, latency: 0.10, free_capacity: 0.30, prefer_tiers: &["haiku"] }
-    } else {
-        // A human waiting on an interactive answer: the everyday driver.
-        Dials { cost: 0.30, latency: 0.50, free_capacity: 0.20, prefer_tiers: &["sonnet"] }
-    }
-}
+```text
+classify the request by its shape:
+  has tools?              -> agent/code   prefer "fable"
+  big ask or big prompt?  -> long-form    prefer "opus"
+  single-shot, no stream? -> bulk         prefer "haiku"
+  otherwise               -> interactive  prefer "sonnet"
 
-// Step 2: score EVERY lane through those dials. Cheaper, faster, and more free
-// capacity score higher; the preferred tier gets a +0.5 tilt; a lane near its
-// rate cap gets scaled down. Sort descending: that is the order.
-let score = |c: &Cand| -> f64 {
-    let mut s = dials.cost          * (1.0 - c.cost / max_cost)
-              + dials.latency       * (1.0 - c.latency / max_latency)
-              + dials.free_capacity * (c.free_slots as f64 / max_free as f64);
-    if dials.prefer_tiers.contains(&c.tier) { s += 0.5 }     // your quality judgment
-    if let Some(h) = c.rate_headroom { s *= 0.5 + 0.5 * h }  // back off near 429s
-    s
-};
+each bucket also sets three dials: how much cheap, fast,
+and unloaded matter. bulk turns the cost dial up to 0.6;
+interactive turns the speed dial up to 0.5.
+
+score every lane through the dials:
+  score = cheap x cost-dial
+        + fast x speed-dial
+        + unloaded x free-dial
+  +0.5 if the lane's tier is the preferred one  (your judgment)
+  scaled down as the lane nears its rate cap    (dodge 429s)
+
+sort by score, best first. That order is the reply.
 ```
+
+Each signal is normalized against the pool, so "how cheap" means cheapest-in-this-pool, not cheap in the abstract. A lane missing a signal (no cost declared, no latency yet) scores neutral, never punished. The real code, commented line by line, is in the repo.
 
 Here is the decision it actually makes. One pool, the four lanes above, with live signals at this moment: `claude-fable` ($25/Mtok, 400 ms, 16 free slots), `claude-opus` ($15, 320 ms, 12 free), `claude-sonnet` ($3, 150 ms, 10 free), `claude-haiku` ($0.80, 95 ms, 6 free). The expensive lanes sit idle; the cheap ones are busy. Two requests walk in:
 
@@ -143,24 +132,7 @@ pools:
         cost_per_mtok: 0.8
 ```
 
-The example sidecar is about a hundred lines of Go, standard library only, and its `classify` is the same shape as the Rust one:
-
-```go
-func classify(r request) weights {
-    switch {
-    case r.HasTools: // tool / agent traffic wants the capable tier
-        return weights{0.10, 0.20, 0.20, []string{"large", "primary"}}
-    case (r.MaxTokens != nil && *r.MaxTokens >= 4096) || r.TotalChars > 24000: // long-form
-        return weights{0.20, 0.10, 0.20, []string{"large", "primary"}}
-    case !r.Stream && r.MessageCount <= 1: // single-shot: optimize cost
-        return weights{0.60, 0.10, 0.30, []string{"small", "overflow"}}
-    default: // interactive default: optimize latency
-        return weights{0.30, 0.50, 0.20, []string{"small", "overflow"}}
-    }
-}
-```
-
-Same classify, same weights, same sort, and critically the same wire contract: both transports carry byte-identical JSON, so a hook graduates from a webhook prototype to a compiled socket binary without changing its logic. Both examples are in the repo under [`examples/smart-router/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router). The webhook adds the HTTP round trip the socket does not: about 34 microseconds co-located, measured the same way, and it runs anywhere.
+The example sidecar is about a hundred lines of Go, standard library only, and it makes the exact same decision: classify on shape, score through the bucket's dials, sort. Same classify, same weights, same sort, and critically the same wire contract: both transports carry byte-identical JSON, so a hook graduates from a webhook prototype to a compiled socket binary without changing its logic. Both examples are in the repo under [`examples/smart-router/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router). The webhook adds the HTTP round trip the socket does not: about 34 microseconds co-located, measured the same way, and it runs anywhere.
 
 ## What the hook sees, and what it does not
 
