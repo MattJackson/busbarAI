@@ -25,11 +25,11 @@ Busbar's position is simple: you own the first job, the control plane owns the s
 
 Whichever way you run it, the logic is small and the same. Classify the request into a task bucket from shape alone, score every candidate through that bucket's weights over the live signals, sort.
 
-**Classify** on shape: tools declared means code, a big `max_tokens` or a long prompt means long-form, a single-shot non-streaming call means bulk, everything else is a quick interactive answer. Routing does not need to read your prompt to do this, so by default it does not get it.
+**Classify** on shape: tools declared means agent or code work. A big `max_tokens` or a long prompt means long-form work. One message with streaming turned off is almost always a script or a cron job, not a person, so it gets treated as batch work. Everything else is a person waiting on an answer. Routing does not need to read your prompt to do any of this, so by default it does not get it.
 
-**Score** turns the bucket into dials. A code request weights capability and latency; a bulk request weights cost. Each candidate scores on its live cost, latency, and free concurrency, plus a boost for the operator-declared quality `tier`, then scaled down as a lane nears its rate-limit cap.
+**Score** turns the bucket into dials. A code request weights capability and latency; a batch request weights cost. Each candidate scores on its live cost, latency, and free concurrency, plus a boost for the operator-declared quality `tier`, then scaled down as a lane nears its rate-limit cap.
 
-**Sort** descending, return the order. That is the whole policy. It is not a static "if X use Y" table and it is not blind cost math: one classification step picks the weights, then a scoring pass applies them to the live signals of every candidate, so the same pool serves a code request and a bulk request ranked differently.
+**Sort** descending, return the order. That is the whole policy. It is not a static "if X use Y" table and it is not blind cost math: one classification step picks the weights, then a scoring pass applies them to the live signals of every candidate, so the same pool serves a code request and a batch request ranked differently.
 
 ## Answer one: a Rust binary on a socket, about 8 microseconds
 
@@ -66,11 +66,11 @@ The hook itself is about a hundred lines of Rust, standard library plus serde, a
 classify the request by its shape:
   has tools?              -> agent/code   prefer "fable"
   big ask or big prompt?  -> long-form    prefer "opus"
-  single-shot, no stream? -> bulk         prefer "haiku"
+  single-shot, no stream? -> batch        prefer "haiku"
   otherwise               -> interactive  prefer "sonnet"
 
 each bucket also sets three dials: how much cheap, fast,
-and unloaded matter. bulk turns the cost dial up to 0.6;
+and unloaded matter. batch turns the cost dial up to 0.6;
 interactive turns the speed dial up to 0.5.
 
 score every lane through the dials:
@@ -95,7 +95,7 @@ request A: has_tools=true         -> agent/code bucket, prefer tier "fable"
   claude-opus:    signals 0.46               = 0.46
   reply: {"order":[0,2,3,1]}  -> the frontier model gets the agent work
 
-request B: single-shot, no stream -> bulk bucket, prefer tier "haiku"
+request B: single-shot, no stream -> batch bucket, prefer tier "haiku"
   claude-haiku:   signals 0.77  + boost 0.50 = 1.27   <- first
   claude-sonnet:  signals 0.78               = 0.78
   claude-opus:    signals 0.49               = 0.49
