@@ -39,6 +39,15 @@ taps, and routes, on every request.
 - **Concurrent hooks.** All of a request's hooks fire at once, so added latency is the
   slowest hook, not the sum. Any reject wins; restrictions intersect; the route ranks what
   survives.
+- **Pluggable auth.** Authentication is now an ordered chain of modules: each module
+  identifies the caller, rejects, or passes to the next. Today's token auth is the first
+  module and the default — and it is removable: list only your own module and tokens are
+  gone. External modules speak the same hook transports; validated identities are cached
+  (with instant admin flush), and auth always fails closed. Budgets, rate limits, pool
+  access, and audit all follow the authenticated principal, whoever issued it.
+- **Admin API lockdown.** The admin API authenticates through its own pluggable chain, with
+  scoped principals (read-only, hooks-register, full) replacing the single shared admin
+  token, and every mutation in the audit log attributed to the person who made it.
 
 ### Changed
 
