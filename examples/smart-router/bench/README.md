@@ -4,43 +4,42 @@ How much latency does the routing decision add? This measures the **decision cos
 the work the hook does before busbar's failover loop dispatches the request. It is
 not a full LLM round trip: end-to-end latency is your upstream plus this.
 
-All numbers below are on an Apple M5 Pro (18 cores), macOS 26.5.
+All numbers on an Apple M5 Pro (18 cores), macOS 26.5, release builds, 3 candidates.
 
-## Native `smart` policy: ~0.67 microseconds
+## Socket hook (`route: socket`): ~8 microseconds
 
-The native policy classifies, scores, and ranks in-process, compiled, with no
-network and no interpreter. Measured over 50,000 iterations for a 3-candidate pool:
+Measured through busbar's REAL transport (`SocketPolicy::decide()`: serialize the
+projection, Unix-socket round trip, parse, normalize) against the actual
+[`rust-hook`](../rust-hook/) example binary running as a separate process,
+50,000 samples:
 
 | metric | value |
 |---|---|
-| median | ~666 ns (0.67 us) |
-| p99 | ~1.0 us |
+| median | ~7.9 us |
+| p95 | ~9.7 us |
+| p99 | ~12 us |
 
-Reproduce (the probe ships with busbar under the `script-policy` feature, which
-pulls in the comparison interpreter):
+Reproduce with the probe that ships in busbar:
 
 ```
-cargo test --features script-policy --bin busbar native_rank_timing -- --nocapture --ignored
+cd rust-hook && cargo run --release -- /tmp/bb-probe.sock &
+BUSBAR_SOCKET_PROBE_PATH=/tmp/bb-probe.sock \
+  cargo test --release --bin busbar socket_decide_timing -- --nocapture --ignored
 ```
 
-This is a rounding error on a request: the whole busbar layer adds tens of
-microseconds, so a routing decision at two thirds of a microsecond is free in any
-way that matters.
+## Webhook (`route: webhook`): sub-millisecond co-located
 
-## Webhook: sub-millisecond, plus the network
+The HTTP transport adds framing and a TCP round trip the socket does not. A
+co-located sidecar answers in a fraction of a millisecond; a sidecar across the
+network costs whatever that hop costs. Either way it is far under the default
+`policy.timeout_ms` of 150 ms, after which busbar falls back to the pool's
+`on_error` and the request proceeds regardless.
 
-A `route: webhook` sidecar adds a round trip the native policy does not. Co-located
-over loopback, the sidecar decision returns in a fraction of a millisecond; a
-sidecar across the network costs whatever that hop costs. Either way it is far under
-the default `policy.timeout_ms` of 150 ms, after which busbar falls back to the
-pool's `on_error` and the request proceeds regardless. To measure your own sidecar,
-time a POST of the request+candidate projection to it over a kept-alive connection
-(busbar reuses a connection pool, so cold-connect numbers overstate steady state).
+## Why the socket hook replaced the script engine
 
-## Why native, not a script
-
-For reference: an earlier prototype ran the same logic through an embedded script
-interpreter and measured ~108 us per evaluation, over 100x slower than the compiled
-native policy. That is why the shipped in-process answer is native, and why the
-webhook (out-of-process, any language) is the escape hatch for custom logic rather
-than an in-process scripting engine.
+For the record: the deprecated `route: script` (an embedded Rhai interpreter) ran
+the same ranking logic in ~180 us per decision — the interpreter alone accounts
+for ~108 us, which no transport work can remove. A compiled hook over a local
+socket is ~20x faster AND runs in its own process, so a crash is contained. That
+is why the fast rung of the hook ladder is a compiled binary, not an embedded
+script.

@@ -1,0 +1,13 @@
+[package]
+name = "smart-router-hook"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The busbar socket-hook example: stdlib + serde only.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3

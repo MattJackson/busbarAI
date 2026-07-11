@@ -13,7 +13,7 @@ Busbar ships two hooks today.
 
 ## The routing policy hook
 
-Set `route: webhook` (an HTTP sidecar in any language) or `route: script` (an in-process, sandboxed [Rhai](https://rhai.rs) script) on a pool, and your logic runs once per request, before the failover loop.
+Set `route: webhook` (an HTTP sidecar in any language) or `route: socket` (a compiled binary on a local Unix domain socket — same wire contract, about 8 microseconds per decision) on a pool, and your logic runs once per request, before the failover loop. (`route: script`, the embedded Rhai engine, is deprecated: the socket hook runs the same logic ~20x faster in its own process.)
 
 ### What you receive
 
