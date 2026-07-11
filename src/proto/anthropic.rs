@@ -6355,11 +6355,15 @@ mod user_and_parallelism_carry_tests {
     /// lands inverted as `parallel_tool_calls: false`.
     #[test]
     fn anthropic_user_and_parallel_carry_to_openai() {
+        // Tools present: `parallel_tool_calls` is only valid on OpenAI egress WITH tools (the writer
+        // gates the emission on tools, matching OpenAI's own 400 on a tool-less request), and the
+        // flag is meaningless without them anyway.
         let body = serde_json::json!({
             "model": "m",
             "max_tokens": 16,
             "messages": [{"role": "user", "content": "hi"}],
             "metadata": {"user_id": "end-user-7"},
+            "tools": tools_json(),
             "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
         });
         let ir = AnthropicReader.read_request(&body).expect("parses");
@@ -6369,6 +6373,25 @@ mod user_and_parallelism_carry_tests {
         let out = OpenAiWriter.write_request(&ir);
         assert_eq!(out["user"], "end-user-7");
         assert_eq!(out["parallel_tool_calls"], false);
+    }
+
+    /// A tool-less request carrying `parallel_tool_calls` must NOT emit the flag on OpenAI egress —
+    /// OpenAI 400s on `parallel_tool_calls` without `tools`.
+    #[test]
+    fn parallel_tool_calls_omitted_on_openai_egress_without_tools() {
+        let body = serde_json::json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
+        });
+        let ir = AnthropicReader.read_request(&body).expect("parses");
+        assert_eq!(ir.parallel_tool_calls, Some(false));
+        let out = OpenAiWriter.write_request(&ir);
+        assert!(
+            out.get("parallel_tool_calls").is_none(),
+            "must not emit parallel_tool_calls without tools: {out}"
+        );
     }
 
     /// Absence round-trips as absence: a request that never carried either field must not GAIN

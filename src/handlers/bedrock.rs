@@ -31,7 +31,9 @@ impl RequestHandler for BedrockRequestHandler {
             Operation::Image => Some(&IMG),
             Operation::Rerank => Some(&RERANK),
             Operation::Chat => Some(&CHAT),
-            _ => None, // genuine gaps stay None → no-handler 404
+            // Enumerated (not `_`) so adding an operation is a compile error here — the documented
+            // removability/symmetry gate. These are genuine gaps → no-handler 404.
+            Operation::Moderation | Operation::Transcription | Operation::Speech => None,
         }
     }
     fn upstream_path(&self, ctx: &EgressCtx) -> String {

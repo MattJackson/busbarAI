@@ -80,7 +80,22 @@ ships with the test that catches it.
   emitted, matching the existing temperature/top_p/top_k handling.
 - **Multipart heap amplification.** A short (one-character) multipart boundary against a crafted body
   could allocate a large offset table. The parser now walks segments in a single pass with no
-  per-offset allocation, bounding memory by the parsed fields regardless of boundary length.
+  per-offset allocation, and caps the field count, bounding memory regardless of boundary length.
+- **Cohere embeddings ignored the requested encoding.** A base64 embeddings request routed to a
+  Cohere backend came back as float. Cohere's `embedding_types` are now emitted from the request
+  (base64 and the other native encodings), and the response reader decodes base64 vectors too.
+- **`parallel_tool_calls` without tools 400'd.** A request carrying the parallelism flag but no tools
+  (e.g. from an Anthropic source) emitted `parallel_tool_calls` on OpenAI egress, which OpenAI
+  rejects. The flag is now emitted only when tools are present, matching the Anthropic writer.
+- **Streaming logprobs left a thinking block open.** A backend streaming both reasoning and per-token
+  logprobs could open a text block for a logprobs-only chunk without closing the thinking block,
+  producing an unbalanced event stream. The logprobs arm now closes the thinking block first, like
+  the content and tool-call arms.
+- **Silent-empty audio, second site.** The OpenAI speech response writer still decoded base64 with a
+  silent fallback; it now uses the same loud-logging decoder as the other audio egress path.
+- **Exhaustiveness gate restored.** Five request handlers used a wildcard match arm for operations,
+  so adding an operation would not fail to compile there. Each now enumerates every operation, so the
+  removability/symmetry gate the design relies on fires everywhere.
 
 ### Changed
 

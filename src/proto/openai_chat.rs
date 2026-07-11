@@ -927,6 +927,14 @@ impl ProtocolReader for OpenAiReader {
         let lp_entries = read_openai_logprobs(choice0.and_then(|c| c.get("logprobs")));
         if !lp_entries.is_empty() {
             if !state.text_block_open {
+                // Close any still-open thinking block FIRST (a logprobs-only chunk can arrive while
+                // the thinking block is open — e.g. a reasoning backend that streams logprobs). Without
+                // this the text block opens at `text_index` while the thinking block at 0 stays open,
+                // leaving two blocks open and an unbalanced IR stream — the same guard steps 3 and 4 have.
+                if state.thinking_block_open {
+                    state.thinking_block_open = false;
+                    out.push(IrStreamEvent::BlockStop { index: 0 });
+                }
                 state.text_block_open = true;
                 state.text_index = Some(text_index);
                 out.push(IrStreamEvent::BlockStart {
@@ -1929,7 +1937,11 @@ impl ProtocolWriter for OpenAiWriter {
         if let Some(user) = &req.user {
             out.insert("user".to_string(), serde_json::json!(user));
         }
-        if let Some(parallel) = req.parallel_tool_calls {
+        // OpenAI rejects `parallel_tool_calls` when no tools are present ("only allowed when 'tools'
+        // are specified"). An Anthropic source can carry the flag (via `disable_parallel_tool_use`)
+        // on a tool-less request, so gate the emission on tools — matching the Anthropic writer,
+        // which only emits its equivalent when tools are present.
+        if let (Some(parallel), false) = (req.parallel_tool_calls, req.tools.is_empty()) {
             out.insert(
                 "parallel_tool_calls".to_string(),
                 serde_json::json!(parallel),
@@ -5875,6 +5887,59 @@ mod tests {
             "early reasoning must open a thinking block at index 0, got {evs:?}"
         );
         assert!(state.reasoning_seen);
+    }
+
+    #[test]
+    fn logprobs_only_chunk_closes_thinking_before_opening_text() {
+        // A reasoning backend can stream a logprobs-only chunk (no content delta) while a thinking
+        // block is still open. The reader must close the thinking block (BlockStop{index:0}) BEFORE
+        // opening the text block, so the two blocks are never open simultaneously.
+        let mut state = crate::ir::StreamDecodeState::default();
+        // (a) open a thinking block.
+        let c1 = serde_json::json!({
+            "id": "chatcmpl-x", "object": OBJ_CHUNK, "created": 1u64, "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"reasoning_content": "thinking..."}, "finish_reason": null}]
+        });
+        let _ = OpenAiReader.read_response_events("", &c1, &mut state);
+        assert!(state.thinking_block_open, "thinking block should be open");
+
+        // (b) a chunk with NO content delta but choice-level logprobs.content populated.
+        let c2 = serde_json::json!({
+            "id": "chatcmpl-x", "object": OBJ_CHUNK, "created": 1u64, "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "logprobs": {"content": [{"token": "Hi", "logprob": -0.1, "bytes": [72, 105]}]},
+                "finish_reason": null
+            }]
+        });
+        let evs = OpenAiReader.read_response_events("", &c2, &mut state);
+
+        // The thinking block's BlockStop{index:0} must appear, and it must come before the text
+        // BlockStart — i.e. no two blocks are ever open at once.
+        let stop_pos = evs
+            .iter()
+            .position(|e| matches!(e, IrStreamEvent::BlockStop { index: 0 }));
+        let start_pos = evs.iter().position(|e| {
+            matches!(
+                e,
+                IrStreamEvent::BlockStart {
+                    block: crate::ir::IrBlockMeta::Text,
+                    ..
+                }
+            )
+        });
+        let stop_pos = stop_pos.unwrap_or_else(|| {
+            panic!("thinking block must close with BlockStop{{index:0}}, got {evs:?}")
+        });
+        let start_pos = start_pos
+            .unwrap_or_else(|| panic!("logprobs-only chunk must open a text block, got {evs:?}"));
+        assert!(
+            stop_pos < start_pos,
+            "thinking BlockStop must precede text BlockStart (no two blocks open at once), got {evs:?}"
+        );
+        assert!(!state.thinking_block_open, "thinking block must be closed");
+        assert!(state.text_block_open, "text block must be open");
     }
 
     // Regression: `max_tokens` / `max_completion_tokens` must be narrowed with a

@@ -4,8 +4,8 @@
 //! The per-operation IR enums (design §12.4): `IrReq` / `IrResp`, one variant per operation. The
 //! design's single `enum Ir` reconciles to TWO enums because the engine already splits request from
 //! response (`IrRequest`/`IrResponse`). The inherent methods here ARE the surface the operation-blind
-//! middle sees; each exhaustive `match` is the removability / symmetry gate (§9) — adding operation #7
-//! is a compile error at every one.
+//! middle sees; each exhaustive `match` is the removability / symmetry gate (§9) — adding the next
+//! operation (an 8th, past the current seven Chat..Rerank) is a compile error at every one.
 //!
 //! `affinity_key` and `unmappable_for` (B1) land with the seam wiring (P4/P5), where they can be
 //! verified against the harness for chat-byte-identical behavior; they are intentionally not stubbed

@@ -21,7 +21,14 @@ impl RequestHandler for ResponsesRequestHandler {
     fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler> {
         match op {
             Operation::Chat => Some(&CHAT),
-            _ => None,
+            // Enumerated (not `_`) so adding an operation is a compile error here — the documented
+            // removability/symmetry gate. The Responses API serves only chat here.
+            Operation::Embeddings
+            | Operation::Moderation
+            | Operation::Image
+            | Operation::Transcription
+            | Operation::Speech
+            | Operation::Rerank => None,
         }
     }
     fn upstream_path(&self, _ctx: &EgressCtx) -> String {

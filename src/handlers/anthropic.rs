@@ -22,7 +22,14 @@ impl RequestHandler for AnthropicRequestHandler {
     fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler> {
         match op {
             Operation::Chat => Some(&CHAT),
-            _ => None, // no embeddings/images/audio → no-handler 404 in the caller's dialect
+            // Enumerated (not `_`) so adding an operation is a compile error here — the documented
+            // removability/symmetry gate. Anthropic serves only chat → no-handler 404 for the rest.
+            Operation::Embeddings
+            | Operation::Moderation
+            | Operation::Image
+            | Operation::Transcription
+            | Operation::Speech
+            | Operation::Rerank => None,
         }
     }
     fn upstream_path(&self, _ctx: &EgressCtx) -> String {

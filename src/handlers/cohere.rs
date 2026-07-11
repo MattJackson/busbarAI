@@ -29,7 +29,12 @@ impl RequestHandler for CohereRequestHandler {
             Operation::Embeddings => Some(&EMB),
             Operation::Rerank => Some(&RERANK),
             Operation::Chat => Some(&CHAT),
-            _ => None,
+            // Enumerated (not `_`) so adding an operation is a compile error here — the documented
+            // removability/symmetry gate. Cohere has no moderation/image/audio surface.
+            Operation::Moderation
+            | Operation::Image
+            | Operation::Transcription
+            | Operation::Speech => None,
         }
     }
     fn upstream_path(&self, ctx: &EgressCtx) -> String {
@@ -49,6 +54,19 @@ impl RequestHandler for CohereRequestHandler {
         } else {
             None
         }
+    }
+}
+
+/// Cohere `embedding_types` name for an IR encoding — a 1:1 mapping (Cohere v2 supports exactly
+/// these six), so a requested encoding is served natively instead of downgraded to float.
+fn cohere_embedding_type(f: &EncFmt) -> &'static str {
+    match f {
+        EncFmt::Float => "float",
+        EncFmt::Base64 => "base64",
+        EncFmt::Int8 => "int8",
+        EncFmt::Uint8 => "uint8",
+        EncFmt::Binary => "binary",
+        EncFmt::Ubinary => "ubinary",
     }
 }
 
@@ -125,44 +143,58 @@ impl OperationHandler for CohereEmbeddings {
             .input_type
             .clone()
             .unwrap_or_else(|| "search_document".to_string());
+        // Honor the caller's requested encoding(s): Cohere's `embedding_types` map 1:1 to the IR
+        // `EncFmt` variants, so a base64 ask is served natively rather than silently downgraded to
+        // float (the same drop that was fixed for the OpenAI egress writer). Default to float.
+        let embedding_types: Vec<&str> = if r.encoding_formats.is_empty() {
+            vec!["float"]
+        } else {
+            r.encoding_formats
+                .iter()
+                .map(cohere_embedding_type)
+                .collect()
+        };
         let body = json!({
             "model": r.model,
             "texts": texts,
             "input_type": input_type,
-            "embedding_types": ["float"],
+            "embedding_types": embedding_types,
         });
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
     }
     fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
         let v: Value =
             serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
-        let embeddings = v
-            .get("embeddings")
-            .and_then(|e| e.get("float"))
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .enumerate()
-                    .map(|(idx, row)| {
-                        let mut item = EmbeddingItem {
-                            index: idx,
-                            ..Default::default()
-                        };
-                        if let Some(f) = row.as_array() {
-                            item.vectors.insert(
-                                EncFmt::Float,
-                                VectorData::Float(
-                                    f.iter()
-                                        .filter_map(|x| x.as_f64().map(|n| n as f32))
-                                        .collect(),
-                                ),
-                            );
-                        }
-                        item
-                    })
-                    .collect()
+        // Cohere returns each requested encoding under its own key (`embeddings.float`,
+        // `embeddings.base64`, ...), positionally aligned. Read float AND base64 so a base64 request
+        // is not lost on the response leg (its floats key is absent when only base64 was requested).
+        let emb = v.get("embeddings");
+        let floats = emb.and_then(|e| e.get("float")).and_then(Value::as_array);
+        let b64s = emb.and_then(|e| e.get("base64")).and_then(Value::as_array);
+        let count = floats.map_or(0, Vec::len).max(b64s.map_or(0, Vec::len));
+        let embeddings: Vec<EmbeddingItem> = (0..count)
+            .map(|idx| {
+                let mut item = EmbeddingItem {
+                    index: idx,
+                    ..Default::default()
+                };
+                if let Some(f) = floats.and_then(|a| a.get(idx)).and_then(Value::as_array) {
+                    item.vectors.insert(
+                        EncFmt::Float,
+                        VectorData::Float(
+                            f.iter()
+                                .filter_map(|x| x.as_f64().map(|n| n as f32))
+                                .collect(),
+                        ),
+                    );
+                }
+                if let Some(s) = b64s.and_then(|a| a.get(idx)).and_then(Value::as_str) {
+                    item.vectors
+                        .insert(EncFmt::Base64, VectorData::Base64(s.to_string()));
+                }
+                item
             })
-            .unwrap_or_default();
+            .collect();
         let usage = v
             .get("meta")
             .and_then(|m| m.get("billed_units"))
@@ -426,6 +458,113 @@ mod rerank_tests {
         assert_eq!(v["results"][0]["index"], 2);
         assert_eq!(v["results"][0]["relevance_score"], 0.98);
         assert_eq!(v["results"][1]["index"], 0);
+    }
+
+    #[test]
+    fn embeddings_write_request_emits_base64_encoding_type() {
+        use crate::ir::embeddings::EmbeddingsReq;
+        let ir = IrReq::Embeddings(EmbeddingsReq {
+            model: "embed-v4".into(),
+            input: EmbInput::Text(vec!["a".into()]),
+            encoding_formats: vec![EncFmt::Base64],
+            ..Default::default()
+        });
+        let out = CohereEmbeddings.write_request(&ir);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["embedding_types"], json!(["base64"]));
+    }
+
+    #[test]
+    fn embeddings_write_request_defaults_to_float_when_empty() {
+        use crate::ir::embeddings::EmbeddingsReq;
+        let ir = IrReq::Embeddings(EmbeddingsReq {
+            model: "embed-v4".into(),
+            input: EmbInput::Text(vec!["a".into()]),
+            encoding_formats: vec![],
+            ..Default::default()
+        });
+        let out = CohereEmbeddings.write_request(&ir);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["embedding_types"], json!(["float"]));
+    }
+
+    #[test]
+    fn embeddings_write_request_preserves_multiple_encoding_types_in_order() {
+        use crate::ir::embeddings::EmbeddingsReq;
+        let ir = IrReq::Embeddings(EmbeddingsReq {
+            model: "embed-v4".into(),
+            input: EmbInput::Text(vec!["a".into()]),
+            encoding_formats: vec![EncFmt::Float, EncFmt::Base64],
+            ..Default::default()
+        });
+        let out = CohereEmbeddings.write_request(&ir);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["embedding_types"], json!(["float", "base64"]));
+    }
+
+    #[test]
+    fn embeddings_read_response_reads_base64_vectors() {
+        let body = serde_json::to_vec(&json!({
+            "id": "x",
+            "embeddings": {"base64": ["AAAA", "BBBB"]}
+        }))
+        .unwrap();
+        let ir = CohereEmbeddings.read_response(&body).expect("parses");
+        let IrResp::Embeddings(r) = ir else {
+            panic!("expected embeddings")
+        };
+        assert_eq!(r.embeddings.len(), 2);
+        assert_eq!(
+            r.embeddings[0].vectors[&EncFmt::Base64],
+            VectorData::Base64("AAAA".into())
+        );
+        assert_eq!(
+            r.embeddings[1].vectors[&EncFmt::Base64],
+            VectorData::Base64("BBBB".into())
+        );
+    }
+
+    #[test]
+    fn embeddings_read_response_reads_float_vectors() {
+        let body = serde_json::to_vec(&json!({
+            "embeddings": {"float": [[0.1, 0.2]]}
+        }))
+        .unwrap();
+        let ir = CohereEmbeddings.read_response(&body).expect("parses");
+        let IrResp::Embeddings(r) = ir else {
+            panic!("expected embeddings")
+        };
+        assert_eq!(r.embeddings.len(), 1);
+        assert!(matches!(
+            r.embeddings[0].vectors[&EncFmt::Float],
+            VectorData::Float(_)
+        ));
+    }
+
+    #[test]
+    fn embeddings_read_request_parses_texts() {
+        let body = serde_json::to_vec(&json!({
+            "model": "m",
+            "texts": ["a", "b"],
+            "input_type": "search_query"
+        }))
+        .unwrap();
+        let ir = CohereEmbeddings
+            .read_request(&body, "application/json")
+            .expect("parses");
+        let IrReq::Embeddings(r) = ir else {
+            panic!("expected embeddings")
+        };
+        assert_eq!(r.input, EmbInput::Text(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn embeddings_read_request_rejects_missing_texts() {
+        let body = serde_json::to_vec(&json!({"model": "m"})).unwrap();
+        let err = CohereEmbeddings
+            .read_request(&body, "application/json")
+            .expect_err("missing texts must reject");
+        assert!(matches!(err, IngressReject::BadRequest(_)));
     }
 
     /// A client top_n larger than u32::MAX must DROP to None (omitted), never silently wrap to a

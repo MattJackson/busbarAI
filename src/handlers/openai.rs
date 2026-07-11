@@ -163,6 +163,11 @@ fn parse_multipart<'a>(body: &'a [u8], content_type: &str) -> Vec<MultipartField
     // pure delimiter bytes used to push ~body/dl offsets into a `positions` Vec (heap amplification,
     // e.g. ~90 MB from a 32 MiB body with a 1-char boundary). Processing each segment as its closing
     // delimiter is found keeps memory bounded by the parsed fields, whatever the boundary length.
+    // The OpenAI audio form carries a handful of named parts (model, file, language, prompt,
+    // response_format). Cap the field count so a crafted body of hundreds of thousands of minimal
+    // parts (short boundary) can't amplify into a large Vec of heap-allocated fields; a real request
+    // never approaches this, and extra parts we don't model are ignored anyway.
+    const MAX_MULTIPART_PARTS: usize = 64;
     let mut fields = Vec::new();
     let (n, dl) = (body.len(), delim_b.len());
     let mut i = 0;
@@ -172,6 +177,9 @@ fn parse_multipart<'a>(body: &'a [u8], content_type: &str) -> Vec<MultipartField
             if let Some(p) = prev {
                 if let Some(field) = parse_multipart_segment(&body[p + dl..i]) {
                     fields.push(field);
+                    if fields.len() >= MAX_MULTIPART_PARTS {
+                        break;
+                    }
                 }
             }
             prev = Some(i);
@@ -422,7 +430,7 @@ impl OperationHandler for OpenAiSpeech {
         };
         let bytes = match &blob.payload {
             MediaPayload::Bytes(b) => b.clone(),
-            MediaPayload::B64(s) => base64_decode(s).unwrap_or_default(),
+            MediaPayload::B64(s) => decode_ir_b64(s),
             MediaPayload::Uri(_) => Bytes::new(),
         };
         WireBody::typed(bytes, &blob.mime_type)
@@ -1243,6 +1251,92 @@ mod tests {
         assert_eq!(v["response_format"], "b64_json");
         assert_eq!(v["user"], "user-42");
         assert_eq!(v["size"], "auto");
+    }
+
+    #[test]
+    fn speech_write_response_decodes_b64_payload_to_raw_bytes() {
+        // A Speech response whose audio rides as base64 must be decoded to the raw bytes on egress
+        // (routed through decode_ir_b64), not emitted as the base64 string.
+        let raw = b"\xff\xfb\x90\x00some-audio";
+        let b64 = crate::media::base64_encode(raw);
+        let ir = IrResp::Speech(crate::ir::audio::SpeechResp {
+            audio: Some(MediaBlob {
+                payload: MediaPayload::B64(b64),
+                mime_type: "audio/mpeg".into(),
+                pcm: None,
+            }),
+            ..Default::default()
+        });
+        let out = OpenAiSpeech.write_response(&ir);
+        assert_eq!(out.bytes.as_ref(), raw);
+    }
+
+    #[test]
+    fn parse_multipart_caps_at_64_parts() {
+        // A crafted body with far more than 64 minimal parts must yield at most 64 fields, bounding
+        // heap amplification.
+        let boundary = "b";
+        let mut body = Vec::new();
+        for i in 0..100 {
+            body.extend_from_slice(b"--b\r\n");
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"f{i}\"\r\n\r\nv\r\n").as_bytes(),
+            );
+        }
+        body.extend_from_slice(b"--b--\r\n");
+        let fields = parse_multipart(&body, &format!("multipart/form-data; boundary={boundary}"));
+        assert!(
+            fields.len() <= 64,
+            "expected at most 64 parts, got {}",
+            fields.len()
+        );
+    }
+
+    #[test]
+    fn image_read_request_parses_size_quality_and_response_format() {
+        let body = br#"{"model":"dall-e-3","prompt":"a cat","size":"1024x1024","quality":"hd","response_format":"b64_json"}"#;
+        let ir = OpenAiImage
+            .read_request(body, "application/json")
+            .expect("valid image body");
+        let IrReq::Image(r) = ir else {
+            panic!("expected image IR")
+        };
+        assert_eq!(
+            r.size,
+            Some(ImageSize::Wh {
+                width: 1024,
+                height: 1024
+            })
+        );
+        assert_eq!(r.quality.as_deref(), Some("hd"));
+        assert_eq!(r.response_format.as_deref(), Some("b64_json"));
+        assert_eq!(r.prompt.as_deref(), Some("a cat"));
+    }
+
+    #[test]
+    fn image_read_request_parses_auto_size() {
+        let body = br#"{"model":"gpt-image-1","prompt":"a cat","size":"auto"}"#;
+        let ir = OpenAiImage
+            .read_request(body, "application/json")
+            .expect("valid image body");
+        let IrReq::Image(r) = ir else {
+            panic!("expected image IR")
+        };
+        assert_eq!(r.size, Some(ImageSize::Auto));
+    }
+
+    #[test]
+    fn image_read_response_reads_b64_and_revised_prompt() {
+        let body = br#"{"data":[{"b64_json":"AAA","revised_prompt":"a big cat"}]}"#;
+        let ir = OpenAiImage
+            .read_response(body)
+            .expect("valid image response");
+        let IrResp::Image(r) = ir else {
+            panic!("expected image IR")
+        };
+        assert_eq!(r.images.len(), 1);
+        assert_eq!(r.images[0].b64.as_deref(), Some("AAA"));
+        assert_eq!(r.images[0].revised_prompt.as_deref(), Some("a big cat"));
     }
 
     #[test]
