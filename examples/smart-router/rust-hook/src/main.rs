@@ -111,7 +111,7 @@ fn rank(p: &Payload) -> Vec<usize> {
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
-/// What kind of request is this? Pure shape, no prompt text (busbar never sends content).
+/// What kind of request is this? Pure shape: routing hooks get no prompt text by default.
 /// Each bucket returns its own dial settings for `rank` to score through.
 fn weights(r: &Req) -> Dials {
     // Four kinds of request, four lanes, one natural home each. The tier names are whatever YOU
@@ -135,7 +135,7 @@ fn weights(r: &Req) -> Dials {
 
 // ── The wire types: exactly what busbar sends. Same JSON as the webhook transport. ──────────────
 
-/// The request's SHAPE. No prompt text, no message bodies — busbar keeps content in-process.
+/// The request's SHAPE. No prompt text or message bodies ride the routing payload by default.
 #[derive(Deserialize)]
 struct Req {
     #[serde(default)]

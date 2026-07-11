@@ -3,7 +3,7 @@
 // Busbar POSTs a projection of the request + the pool's candidates before each
 // request's failover loop; this sidecar classifies the request into a task
 // bucket and returns a ranked preference {"order":[idx,...]}. It uses ONLY the
-// fields busbar actually sends (see src/routing/webhook.rs): no prompt text ever
+// fields busbar actually sends (see src/routing/webhook.rs): no prompt text by default
 // leaves busbar, so classification is on shape (size, counts, tools, streaming,
 // max_tokens), not content.
 //

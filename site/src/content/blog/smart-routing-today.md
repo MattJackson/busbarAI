@@ -25,7 +25,7 @@ Busbar's position is simple: you own the first job, the control plane owns the s
 
 Whichever way you run it, the logic is small and the same. Classify the request into a task bucket from shape alone, score every candidate through that bucket's weights over the live signals, sort.
 
-**Classify** on shape, never content: tools declared means code, a big `max_tokens` or a long prompt means long-form, a single-shot non-streaming call means bulk, everything else is a quick interactive answer.
+**Classify** on shape: tools declared means code, a big `max_tokens` or a long prompt means long-form, a single-shot non-streaming call means bulk, everything else is a quick interactive answer. Routing does not need to read your prompt to do this, so by default it does not get it.
 
 **Score** turns the bucket into dials. A code request weights capability and latency; a bulk request weights cost. Each candidate scores on its live cost, latency, and free concurrency, plus a boost for the operator-declared quality `tier`, then scaled down as a lane nears its rate-limit cap.
 

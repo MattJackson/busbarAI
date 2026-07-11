@@ -256,7 +256,7 @@ Field notes:
 - `candidates[*].rate_headroom`; remaining RPM/TPM headroom as a fraction; `null` when governance is disabled or the lane has no rate limit.
 - `context.budget_remaining`; always `null` in 1.0: the per-key governance budget is intentionally not fed to the routing seam. Use per-member `budget_remaining` for lane-level capacity.
 
-> The payload contains only the request projection; no prompt text, no message bodies. Busbar never sends request content to any external sink.
+> The payload contains only the request projection; no prompt text, no message bodies. Routing hooks receive no request content by default: a routing decision is a shape decision. Content-carrying hooks (PII screening, audit, guardrails) are planned as an explicit per-hook opt-in, never a default.
 
 **Response payload (sidecar → Busbar):**
 
