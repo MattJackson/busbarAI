@@ -139,7 +139,17 @@ sort by score, best first. That order is the reply.
   <text x="461" y="236" text-anchor="middle" fill="#64748b" font-size="11">hook slow, wrong, or dead? Busbar falls back to its default after 1 ms and the request proceeds anyway</text>
 </svg>
 
-Here is the decision it actually makes. One pool, the four lanes above, with live signals at this moment: `claude-fable` ($25/Mtok, 400 ms, 16 free slots), `claude-opus` ($15, 320 ms, 12 free), `claude-sonnet` ($3, 150 ms, 10 free), `claude-haiku` ($0.80, 95 ms, 6 free). The expensive lanes sit idle; the cheap ones are busy. Two requests walk in:
+Here is the decision it actually makes. One pool, the four lanes above, with their live signals at this moment. Notice the shape of the pool: the expensive lanes sit idle, the cheap ones are busy.
+
+```text
+lane            price         latency   free slots
+claude-fable    $25.00/Mtok   400 ms    16
+claude-opus     $15.00/Mtok   320 ms    12
+claude-sonnet    $3.00/Mtok   150 ms    10
+claude-haiku     $0.80/Mtok    95 ms     6
+```
+
+Two requests walk in:
 
 ```text
 request A: has_tools=true         -> agent/code bucket, favorite "fable"
