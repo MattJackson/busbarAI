@@ -99,7 +99,6 @@ step 2: reality-check the favorite against the live pool.
 sort by score, best first. That order is the reply.
 ```
 
-Each signal is normalized against the pool, so "how cheap" means cheapest-in-this-pool, not cheap in the abstract. A lane missing a signal (no cost declared, no latency yet) scores neutral, never punished. The real code, commented line by line, is in the repo.
 
 <svg viewBox="0 0 940 250" role="img" aria-label="The decision flow: a request arrives, your hook classifies it by shape, names a favorite lane, and reality-checks every lane against its live signals; the ranked order goes back to Busbar, which dispatches with failover and the circuit breaker intact." style="width:100%;height:auto;max-width:940px;font-family:ui-sans-serif,system-ui,sans-serif;">
   <defs>
