@@ -59,6 +59,13 @@ taps, and routes, on every request.
 - The `route: socket` / `route: webhook` + `policy:` form, in favor of named hooks. It keeps
   working and warns at startup.
 
+### Removed
+
+- **The embedded Rhai script routing policy (`route: script`).** Deprecated in 1.2.1 and only
+  ever available behind an opt-in build flag, it is gone. A compiled hook over a socket or an
+  HTTP webhook does the same job with real process isolation; if you want scripting, run a hook
+  that embeds it. `route: script` now reports a clear startup error pointing at the hook forms.
+
 ## [1.2.1], 2026-07-11
 
 A hardening release, plus the routing hook layer growing up: a faster transport and the payload
