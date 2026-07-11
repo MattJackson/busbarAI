@@ -9,7 +9,7 @@ discussion: "https://github.com/MattJackson/busbarAI/discussions/14"
 
 A user told me this week: "The best model should be selected automatically based on the task, latency, quality, and cost."
 
-I agree. And I want to show why that sentence does not describe a new product. It describes a hook, and it should stay a hook: the policy is your judgment, and your judgment does not belong compiled into someone else's core. Busbar, Your AI Control Plane, runs that hook two ways, and in this post I show both, measured honestly: a compiled Rust binary on a local Unix socket that decides in about **8 microseconds**, and a webhook in any language for everywhere else. Both plug into the same failover, circuit-breaker, and fail-safe machinery, so neither can take your traffic down. Any client speaking any of Busbar's six protocols hits the pool as if it were a model, and Translate carries the request to whichever backend wins. (Everything here is built on the 1.2.1 release.)
+I agree. And I want to show why that sentence does not describe a new product. It describes a hook, and it should stay a hook: the policy is your judgment, and your judgment does not belong compiled into someone else's core. Busbar, Your AI Control Plane, runs that hook two ways, and in this post I show both, measured honestly: a compiled Rust binary on a local Unix socket that decides in about **8 microseconds (µs)**, and a webhook in any language for everywhere else. Both plug into the same failover, circuit-breaker, and fail-safe machinery, so neither can take your traffic down. Any client speaking any of Busbar's six protocols hits the pool as if it were a model, and Translate carries the request to whichever backend wins. (Everything here is built on the 1.2.1 release.)
 
 ## The shape of the problem
 
@@ -58,7 +58,7 @@ pools:
         cost_per_mtok: 0.8
 ```
 
-Measured end to end through Busbar's real transport, against the real example binary running as a separate process: about **7.9 microseconds** median per decision, p99 around 12. Your policy is a separate process, so a crash in it is contained; Busbar never spawns or supervises it, connects lazily, and reconnects across restarts of your binary.
+Measured end to end through Busbar's real transport, against the real example binary running as a separate process: median **7.9 µs** per decision, p99 12 µs. Your policy is a separate process, so a crash in it is contained; Busbar never spawns or supervises it, connects lazily, and reconnects across restarts of your binary.
 
 The hook itself is about a hundred lines of Rust, standard library plus serde, and the whole policy fits in your head. In pseudocode:
 
@@ -132,7 +132,7 @@ pools:
         cost_per_mtok: 0.8
 ```
 
-The example sidecar is about a hundred lines of Go, standard library only, and it makes the exact same decision: classify on shape, score through the bucket's dials, sort. Same classify, same weights, same sort, and critically the same wire contract: both transports carry byte-identical JSON, so a hook graduates from a webhook prototype to a compiled socket binary without changing its logic. Both examples are in the repo under [`examples/smart-router/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router). The webhook adds the HTTP round trip the socket does not: about 34 microseconds co-located, measured the same way, and it runs anywhere.
+The example sidecar is about a hundred lines of Go, standard library only, and it makes the exact same decision: classify on shape, score through the bucket's dials, sort. Same classify, same weights, same sort, and critically the same wire contract: both transports carry byte-identical JSON, so a hook graduates from a webhook prototype to a compiled socket binary without changing its logic. Both examples are in the repo under [`examples/smart-router/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router). The webhook adds the HTTP round trip the socket does not: about 34 µs co-located, measured the same way, and it runs anywhere.
 
 ## What the hook sees, and what it does not
 
@@ -144,7 +144,7 @@ Notice what is missing: the prompt. Routing is a shape decision, so by default B
 
 Here is the reason this belongs in a control plane and not in your app code. The hook is advisory. It can never become load-bearing.
 
-The decision has a hard deadline, `policy.timeout_ms`, which defaults to 1 millisecond. That default is a statement: hooks are fast, and a deadline should say so. A co-located socket hook decides in about 8 microseconds and a co-located webhook in about 34, so 1 ms is 20x headroom or more. If your hook is legitimately slower, it calls a database, crosses the network, or asks a model, you raise the deadline; the default does not pay for it. If the hook is slow, the decision is cut off and Busbar applies `on_error`, which defaults to plain weighted round-robin. Same for a crash, a non-2xx, or malformed JSON. A broken sidecar is indistinguishable from having no policy at all. Kill the router mid-traffic and requests keep flowing.
+The decision has a hard deadline, `policy.timeout_ms`, which defaults to 1 millisecond. That default is a statement: hooks are fast, and a deadline should say so. A co-located socket hook decides in about 8 µs and a co-located webhook in about 34 µs, so 1 ms is 20x headroom or more. If your hook is legitimately slower, it calls a database, crosses the network, or asks a model, you raise the deadline; the default does not pay for it. If the hook is slow, the decision is cut off and Busbar applies `on_error`, which defaults to plain weighted round-robin. Same for a crash, a non-2xx, or malformed JSON. A broken sidecar is indistinguishable from having no policy at all. Kill the router mid-traffic and requests keep flowing.
 
 And the ranking feeds the same Failover loop everything else uses. If the policy's first choice is tripped or at capacity, Busbar walks to the second with the normal circuit-breaker machinery. If the policy drops a candidate from its list, that lane is demoted, not excluded, so a buggy ranking can never strand a healthy model. The policy proposes. The control plane disposes.
 
@@ -154,10 +154,10 @@ Every response tells you what happened: `x-busbar-route-policy` and `x-busbar-ro
 
 You can reproduce both numbers yourself; the benchmark and the commands are in [`examples/smart-router/bench/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router/bench), all on an Apple M5 Pro, all through Busbar's real transport code against real separate processes.
 
-- **Socket hook: about 7.9 microseconds** median per decision (p99 about 12, 50,000 samples). A compiled Rust binary over a kept-alive local socket. The whole Busbar layer adds tens of microseconds to a request, so the decision is close to free.
-- **Webhook: about 34 microseconds** median per decision (p99 about 47, 20,000 samples) co-located over loopback, plus whatever the network hop costs if it is not. You trade roughly 4x the socket's latency for any-language, any-OS reach; both are noise next to an LLM call.
+- **Socket hook:** median 7.9 µs, p99 12 µs (50,000 samples). A compiled Rust binary over a kept-alive local socket. The whole Busbar layer adds tens of µs to a request, so the decision is close to free.
+- **Webhook:** median 34 µs, p99 47 µs (20,000 samples), co-located over loopback, plus whatever the network hop costs if it is not. You trade roughly 4x the socket's latency for any-language, any-OS reach; both are noise next to an LLM call.
 
-Either way it is far under even the 1 ms default deadline, after which Busbar coerces the decision to the pool's `on_error` fallback and the request proceeds anyway. (For the record: Busbar previously offered an embedded script engine for this, and the interpreter alone cost about 108 microseconds per decision, twenty times the entire compiled hook round trip. It is deprecated as of 1.2.1. When the same logic runs 20x faster in a separate process that cannot crash the control plane, an embedded interpreter is the wrong tool.)
+Either way it is far under even the 1 ms default deadline, after which Busbar coerces the decision to the pool's `on_error` fallback and the request proceeds anyway. (For the record: Busbar previously offered an embedded script engine for this, and the interpreter alone cost about 108 µs per decision, twenty times the entire compiled hook round trip. It is deprecated as of 1.2.1. When the same logic runs 20x faster in a separate process that cannot crash the control plane, an embedded interpreter is the wrong tool.)
 
 ## Honest words about "quality"
 
@@ -167,9 +167,9 @@ What quality means here: you run your evals, you form a judgment about which mod
 
 ## Why a hook, and not a feature
 
-Here is the thinking behind all of this. I build hooks so a team can encode its own policy without the core carrying fifty features that ninety-five percent of users will never turn on. Smart routing is the perfect example: it is not one behavior, it is your behavior, and it changes with your evals and your budget. I even prototyped building this router into the core, measured it at two thirds of a microsecond, and then took it back out. Fast was not the question. Whose judgment ships in the binary was the question, and the answer is yours, not mine.
+Here is the thinking behind all of this. I build hooks so a team can encode its own policy without the core carrying fifty features that ninety-five percent of users will never turn on. Smart routing is the perfect example: it is not one behavior, it is your behavior, and it changes with your evals and your budget. I even prototyped building this router into the core, measured it at 0.67 µs, and then took it back out. Fast was not the question. Whose judgment ships in the binary was the question, and the answer is yours, not mine.
 
-So the core carries the seam and the guarantees: the projection, the deadline, the fail-safe, the failover integration. The policy stays a hook, and the hook ladder is a speed-versus-reach choice you make per pool: the webhook for any language on any OS, the socket binary when you want the decision in single-digit microseconds. Same contract on both rungs.
+So the core carries the seam and the guarantees: the projection, the deadline, the fail-safe, the failover integration. The policy stays a hook, and the hook ladder is a speed-versus-reach choice you make per pool: the webhook for any language on any OS, the socket binary when you want the decision in single-digit µs. Same contract on both rungs.
 
 The next question is distribution. A routing policy someone already tuned for their workload is one you should be able to start from instead of writing from scratch, the same way you reach for a package. Call it a Hooks Repository: a place teams publish and share hooks. I would genuinely like your thoughts on this. Grow a shared hook ecosystem around the seam? Tell me what would actually change how you run this.
 

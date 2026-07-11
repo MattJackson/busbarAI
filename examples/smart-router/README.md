@@ -3,14 +3,14 @@
 Pick the best model automatically by task, latency, quality, and cost. It is not a
 new product, it is a routing hook: classify each request into a task bucket from
 its shape, score every candidate over the live cost / latency / concurrency
-signals, sort. Busbar gives the hook two transports — same wire contract, your
+signals, sort. Busbar gives the hook two transports: same wire contract, your
 choice of speed vs reach.
 
-## The socket hook (`rust-hook/`): a compiled binary, ~8 microseconds
+## The socket hook (`rust-hook/`): a compiled binary, ~8 µs
 
 `route: socket` talks to an operator-run binary over a local Unix domain socket.
 Measured end to end through busbar's transport against this exact example binary
-(separate process, 3 candidates, 50k samples): **~7.9 us median, p99 ~12 us**.
+(separate process, 3 candidates, 50k samples): **~7.9 µs median, p99 ~12 µs**.
 
 ```yaml
 pools:
@@ -35,7 +35,7 @@ pools:
         cost_per_mtok: 0.8
 ```
 
-Run the hook (you own its lifecycle — busbar never spawns it; connection is lazy,
+Run the hook (you own its lifecycle: busbar never spawns it; connection is lazy,
 so start order does not matter, and busbar reconnects across hook restarts):
 
 ```
@@ -46,7 +46,7 @@ Unix-only (macOS/Linux, any architecture). On Windows use the webhook below.
 
 ## The webhook (`policy_server.go`): any language, any OS
 
-`route: webhook` POSTs the same projection over HTTP to a sidecar you run —
+`route: webhook` POSTs the same projection over HTTP to a sidecar you run ,
 portable everywhere, written in whatever your team already ships. Sub-millisecond
 co-located; plus the network if it is not.
 
