@@ -50,7 +50,7 @@ pub(crate) struct IrRequest {
     /// `f64` for the same lossless-number reason as `temperature`. `None` == absent — never emitted.
     pub(crate) presence_penalty: Option<f64>,
     /// Deterministic-sampling seed (`seed`). A cross-protocol-preserved sampling control: written
-    /// only by protocols that natively model it (OpenAI/Responses, Gemini, Mistral). `i64` to carry
+    /// only by protocols that natively model it (OpenAI/Responses, Gemini). `i64` to carry
     /// the full JSON integer range losslessly. `None` == absent — never emitted.
     pub(crate) seed: Option<i64>,
     /// Number of candidate completions to generate (`n`). A cross-protocol-preserved output control:
@@ -713,9 +713,9 @@ pub(crate) struct StreamDecodeState {
     /// reader only; other readers leave it `None`.
     pub(crate) text_index: Option<usize>,
     pub(crate) open_tools: std::collections::BTreeSet<usize>,
-    /// Set once a reasoning (chain-of-thought) delta is seen on the OpenAI stream. When true, the
+    /// Set once a reasoning (chain-of-thought) delta is seen on the stream. When true, the
     /// thinking block occupies IR index 0 and the text/tool block indices shift up by one so the
-    /// thinking block precedes the answer (used by the OpenAI reader only).
+    /// thinking block precedes the answer (used by the OpenAI AND Gemini streaming readers).
     pub(crate) reasoning_seen: bool,
     /// Whether the reasoning Thinking block (index 0) is currently open.
     pub(crate) thinking_block_open: bool,

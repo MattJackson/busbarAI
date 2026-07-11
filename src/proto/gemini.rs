@@ -2526,7 +2526,13 @@ impl ProtocolWriter for GeminiWriter {
                     "clamping top_logprobs to Gemini's max (5)"
                 );
             }
-            gen_config.insert("logprobs".to_string(), serde_json::json!(clamped));
+            // Gemini's `logprobs` top-count is valid only in 1..=5. OpenAI's `top_logprobs: 0`
+            // ("chosen token, no alternatives") must NOT emit `logprobs: 0` — Gemini 400s on it.
+            // `responseLogprobs: true` (forced above) still returns the chosen token's logprob, so
+            // omit the alternatives count entirely for 0 rather than send an invalid value.
+            if clamped >= 1 {
+                gen_config.insert("logprobs".to_string(), serde_json::json!(clamped));
+            }
         }
         // The reasoning carry in Gemini's native spelling: `thinkingConfig.thinkingBudget`.
         // Dynamic round-trips as Gemini's own -1; effort words go through the table. (Only present
@@ -9009,6 +9015,39 @@ mod logprobs_carry_tests {
         let out = Protocol::gemini().writer().write_request(&ir);
         assert_eq!(out["generationConfig"]["logprobs"], 5);
         assert_eq!(out["generationConfig"]["responseLogprobs"], true);
+    }
+
+    #[test]
+    fn top_logprobs_zero_omits_gemini_logprobs_count_but_forces_response_logprobs() {
+        // OpenAI `top_logprobs: 0` ("chosen token, no alternatives") must NOT emit `logprobs: 0`
+        // (Gemini 400s on it) but must still force `responseLogprobs: true`.
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true, "top_logprobs": 0
+        });
+        let ir = crate::proto::openai_chat::OpenAiReader
+            .read_request(&body)
+            .expect("parses");
+        let out = Protocol::gemini().writer().write_request(&ir);
+        assert_eq!(out["generationConfig"]["responseLogprobs"], true);
+        assert!(
+            out["generationConfig"].get("logprobs").is_none(),
+            "logprobs:0 must be omitted, not sent (Gemini 400s): {out}"
+        );
+
+        // A non-zero count is emitted normally.
+        let body3 = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true, "top_logprobs": 3
+        });
+        let ir3 = crate::proto::openai_chat::OpenAiReader
+            .read_request(&body3)
+            .expect("parses");
+        let out3 = Protocol::gemini().writer().write_request(&ir3);
+        assert_eq!(out3["generationConfig"]["logprobs"], 3);
+        assert_eq!(out3["generationConfig"]["responseLogprobs"], true);
     }
 
     #[test]

@@ -167,6 +167,12 @@ impl OperationHandler for BedrockImage {
 struct BedrockEmbeddings;
 
 impl OperationHandler for BedrockEmbeddings {
+    // Token-metered: buffer the same-protocol non-stream 2xx body so the default
+    // `extract_usage` can read the `usage` object and bill the virtual key's TPM/spend
+    // (the cross-protocol path already bills; this closes the same-protocol gap).
+    fn taps_usage(&self) -> bool {
+        true
+    }
     /// Titan `InvokeModel` wire → IR (bedrock as INGRESS): `inputText` (+ v2 dims/normalize). Model
     /// rides the PATH; routing fills it via `IrReq::set_model`.
     fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {

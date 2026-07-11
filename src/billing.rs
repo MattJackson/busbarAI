@@ -8,8 +8,9 @@
 //! 1.3 governance overhaul prices the remaining units. Closed enum → pricing is an exhaustive match,
 //! so adding a unit is a compile error at every price site.
 //!
-//! Foundation types for the 1.2 operations rebuild; wired into the IR (`Ir::usage() -> Option<Billing>`)
-//! by the foundation commit. `dead_code` is allowed until that wiring lands.
+//! Foundation types for the 1.2 operations rebuild; wired into the IR as
+//! `IrResp::usage() -> Option<Billing>` (see `ir/variant.rs`). `dead_code` is allowed for units the
+//! 1.3 pricing engine has not yet wired.
 #![allow(dead_code)]
 
 /// Token usage — the SUPERSET of chat's cache-aware accounting AND the new ops' modality breakdown.

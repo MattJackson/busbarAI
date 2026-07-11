@@ -30,8 +30,8 @@ fn multipart_model(body: &[u8]) -> Option<String> {
 
 /// Ingress for the NEW operations (embeddings/moderations/images/audio, 1.2), for EVERY dialect that
 /// speaks the op. Resolves the (protocol, operation) OperationHandler — absent ⇒ no-handler 404 in the CALLER's
-/// dialect (design §3) — then forwards through `forward_operation` (same-proto passthrough or the
-/// cross-protocol IR bridge). Model resolution: `model_hint` for path-model dialects (gemini/bedrock —
+/// dialect (design §3) — then forwards through `forward::forward_with_pool_parsed` (same-proto
+/// passthrough or the cross-protocol IR bridge). Model resolution: `model_hint` for path-model dialects (gemini/bedrock —
 /// their route handler parsed it from the URL), else the JSON body `model` (openai/cohere) or the
 /// multipart form (openai transcription).
 // 8 args: the (proto, operation, model_hint) triple collapses into the unified catch-all dispatch

@@ -179,9 +179,11 @@ pub(crate) trait OperationHandler: Send + Sync {
         None
     }
     /// Extract billable usage from a complete same-protocol non-stream 2xx body (called once at stream
-    /// end). `None` = flat/no token meter. Chat runs the egress protocol's reader over the body.
-    fn extract_usage(&self, _ingress_protocol: &str, _body: &[u8]) -> Option<IrUsage> {
-        None
+    /// end, only when [`Self::taps_usage`] is true). Default: run THIS operation's own reader over the
+    /// body and project its token usage — so a token-metered non-chat op (embeddings) bills the same
+    /// as the cross-protocol path. Chat overrides this to run the egress protocol's chat reader.
+    fn extract_usage(&self, _ingress_protocol: &str, body: &[u8]) -> Option<IrUsage> {
+        self.read_response(body).ok().and_then(|r| r.token_usage())
     }
     /// The Content-Type of THIS operation's egress request wire (what `write_request` emits).
     /// JSON for every JSON-bodied operation; a multipart operation overrides with its boundary.

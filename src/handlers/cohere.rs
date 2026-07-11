@@ -74,6 +74,12 @@ fn cohere_embedding_type(f: &EncFmt) -> &'static str {
 struct CohereEmbeddings;
 
 impl OperationHandler for CohereEmbeddings {
+    // Token-metered: buffer the same-protocol non-stream 2xx body so the default
+    // `extract_usage` can read the `usage` object and bill the virtual key's TPM/spend
+    // (the cross-protocol path already bills; this closes the same-protocol gap).
+    fn taps_usage(&self) -> bool {
+        true
+    }
     /// cohere `/v2/embed` wire → IR (cohere as INGRESS): `texts[]` + required `input_type`.
     fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
         let wire: Value =
@@ -216,17 +222,30 @@ impl OperationHandler for CohereEmbeddings {
         let IrResp::Embeddings(r) = ir else {
             return WireBody::json(Bytes::new());
         };
-        let floats: Vec<Vec<f32>> = r
-            .embeddings
-            .iter()
-            .filter_map(|item| match item.vectors.get(&EncFmt::Float) {
-                Some(VectorData::Float(v)) => Some(v.clone()),
-                _ => None,
-            })
-            .collect();
+        // Emit every encoding the IR carries under its own Cohere key (`float` and/or `base64`), so
+        // a base64 response (e.g. from a cross-protocol OpenAI backend) is not silently dropped — the
+        // write twin of the base64 read fix. Cohere's `embeddings_by_type` shape holds multiple keys.
+        let mut floats: Vec<Vec<f32>> = Vec::new();
+        let mut b64s: Vec<String> = Vec::new();
+        for item in &r.embeddings {
+            if let Some(VectorData::Float(v)) = item.vectors.get(&EncFmt::Float) {
+                floats.push(v.clone());
+            }
+            if let Some(VectorData::Base64(s)) = item.vectors.get(&EncFmt::Base64) {
+                b64s.push(s.clone());
+            }
+        }
+        let mut emb = serde_json::Map::new();
+        if !b64s.is_empty() {
+            emb.insert("base64".to_string(), json!(b64s));
+        }
+        // Always emit a `float` key (even empty) when there is no base64, for response-shape stability.
+        if !floats.is_empty() || b64s.is_empty() {
+            emb.insert("float".to_string(), json!(floats));
+        }
         let mut body = json!({
             "response_type": "embeddings_by_type",
-            "embeddings": { "float": floats },
+            "embeddings": emb,
         });
         if let Some(id) = &r.id {
             body["id"] = json!(id);
@@ -539,6 +558,49 @@ mod rerank_tests {
             r.embeddings[0].vectors[&EncFmt::Float],
             VectorData::Float(_)
         ));
+    }
+
+    #[test]
+    fn embeddings_write_response_emits_base64_key_not_swallowed_by_empty_float() {
+        use crate::ir::embeddings::EmbeddingsResp;
+        let mut item = EmbeddingItem {
+            index: 0,
+            ..Default::default()
+        };
+        item.vectors
+            .insert(EncFmt::Base64, VectorData::Base64("AAAA".into()));
+        let ir = IrResp::Embeddings(EmbeddingsResp {
+            embeddings: vec![item],
+            ..Default::default()
+        });
+        let out = CohereEmbeddings.write_response(&ir);
+        let v: Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(v["embeddings"]["base64"], json!(["AAAA"]));
+        // A base64-only response must NOT emit an empty `float` array that swallows it.
+        assert!(v["embeddings"].get("float").is_none());
+    }
+
+    #[test]
+    fn embeddings_write_response_emits_float_key() {
+        use crate::ir::embeddings::EmbeddingsResp;
+        let mut item = EmbeddingItem {
+            index: 0,
+            ..Default::default()
+        };
+        item.vectors
+            .insert(EncFmt::Float, VectorData::Float(vec![0.1, 0.2]));
+        let ir = IrResp::Embeddings(EmbeddingsResp {
+            embeddings: vec![item],
+            ..Default::default()
+        });
+        let out = CohereEmbeddings.write_response(&ir);
+        let v: Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert!(v["embeddings"].get("float").is_some());
+        let row = v["embeddings"]["float"][0].as_array().expect("float row");
+        assert_eq!(row.len(), 2);
+        // f32 round-trip: compare with tolerance rather than exact f64 literals.
+        assert!((row[0].as_f64().unwrap() - 0.1).abs() < 1e-6);
+        assert!((row[1].as_f64().unwrap() - 0.2).abs() < 1e-6);
     }
 
     #[test]

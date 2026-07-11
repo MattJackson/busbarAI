@@ -6639,6 +6639,43 @@ mod reasoning_carry_tests {
         assert_eq!(out2["temperature"], 0.5);
     }
 
+    /// Anthropic rejects top_k modifications alongside thinking: top_k must be dropped when the
+    /// thinking ask is emitted, while `thinking` itself is present. Driven from an Anthropic-native
+    /// request (where `top_k` is a first-class IR field) carrying both a thinking budget and top_k.
+    #[test]
+    fn thinking_omits_top_k() {
+        let body = serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8192,
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "top_k": 40
+        });
+        let ir = AnthropicReader.read_request(&body).expect("parses");
+        // Precondition: top_k arrived as a first-class field (not stranded in extra).
+        assert_eq!(ir.top_k, Some(40), "top_k must be read as first-class");
+        let out = AnthropicWriter.write_request(&ir);
+        assert!(
+            out.get("thinking").is_some(),
+            "thinking must be emitted: {out}"
+        );
+        assert!(
+            out.get("top_k").is_none(),
+            "top_k must be dropped with thinking (Anthropic 400s on it): {out}"
+        );
+
+        // Without a reasoning ask the same top_k is emitted normally.
+        let plain = serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8192,
+            "top_k": 40
+        });
+        let ir2 = AnthropicReader.read_request(&plain).expect("parses");
+        let out2 = AnthropicWriter.write_request(&ir2);
+        assert_eq!(out2["top_k"], 40);
+    }
+
     /// THE GATE: prepare_for_egress clears the ask when the lane did not claim the capability and
     /// stamps the budget table when it did. Absence of an ask is untouched either way.
     #[test]

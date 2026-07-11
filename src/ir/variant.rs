@@ -225,6 +225,22 @@ impl IrResp {
             IrResp::Rerank(r) => r.billing(),
         }
     }
+
+    /// The token usage for this response as an [`IrUsage`], if it is token-metered. Used by the
+    /// same-protocol non-stream usage tap (`OperationHandler::extract_usage`) so a token-metered
+    /// non-chat op (embeddings) bills its virtual key's TPM/spend the same way chat does — and the
+    /// same way the cross-protocol path already bills. Flat/duration/character meters return `None`.
+    pub(crate) fn token_usage(&self) -> Option<crate::ir::IrUsage> {
+        match self.usage() {
+            Some(Billing::Tokens(t)) => Some(crate::ir::IrUsage {
+                input_tokens: t.input,
+                output_tokens: t.output,
+                cache_read_input_tokens: t.cache_read,
+                cache_creation_input_tokens: t.cache_creation,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -265,6 +281,27 @@ mod tests {
         ));
         // image with no usage/cost_basis → None
         assert!(IrResp::Image(Default::default()).usage().is_none());
+    }
+
+    #[test]
+    fn token_usage_maps_token_meter_and_none_for_flat() {
+        // A token-metered embeddings response projects its input tokens into an IrUsage.
+        let e = EmbeddingsResp {
+            usage: Some(TokenUsage {
+                input: 12,
+                output: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let tu = IrResp::Embeddings(e)
+            .token_usage()
+            .expect("token-metered op yields Some");
+        assert_eq!(tu.input_tokens, 12);
+        // A flat-metered moderation response has no token usage.
+        assert!(IrResp::Moderation(Default::default())
+            .token_usage()
+            .is_none());
     }
 
     #[test]

@@ -216,6 +216,14 @@ fn parse_multipart_segment(seg: &[u8]) -> Option<MultipartField<'_>> {
 }
 
 /// Transcription (STT): multipart audio IN → `{text}` OUT.
+///
+/// KNOWN LIMITATION (1.3): OpenAI's `/v1/audio/translations` (translate-to-English) and
+/// `/v1/audio/transcriptions` share an identical multipart body and differ only in the URL path,
+/// which `resolve_operation` consumes and `read_request` never sees. So a `/translations` request
+/// forwarded CROSS-PROTOCOL (e.g. to Gemini) is not tagged with `target_language` and transcribes
+/// verbatim instead of translating. Same-protocol OpenAI→OpenAI is unaffected (the path is
+/// preserved to the upstream). Fixing it cross-protocol requires threading the ingress path/sub-op
+/// into the operation codec (a trait-signature change), deferred out of this hardening release.
 struct OpenAiTranscription;
 
 impl OperationHandler for OpenAiTranscription {
@@ -446,6 +454,12 @@ use crate::ir::embeddings::{
 struct OpenAiEmbeddings;
 
 impl OperationHandler for OpenAiEmbeddings {
+    // Token-metered: buffer the same-protocol non-stream 2xx body so the default
+    // `extract_usage` can read the `usage` object and bill the virtual key's TPM/spend
+    // (the cross-protocol path already bills; this closes the same-protocol gap).
+    fn taps_usage(&self) -> bool {
+        true
+    }
     /// openai embeddings wire → IR (used when openai is the INGRESS of a cross-protocol call).
     fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
         let wire: Value =
@@ -1172,6 +1186,18 @@ mod tests {
         // No injected part boundary either: the only `--boundary` delimiters are the two the writer
         // frames (model, file) plus the closing one — the flattened injection cannot add its own.
         assert_eq!(text.matches("------busbaraudioMIME").count(), 3);
+    }
+
+    #[test]
+    fn embeddings_taps_usage_and_extract_usage_reads_prompt_tokens() {
+        // Embeddings is token-metered same-protocol: it must tap usage, and the default
+        // extract_usage (read_response + token_usage) must surface prompt_tokens as input_tokens.
+        assert!(OpenAiEmbeddings.taps_usage());
+        let body = br#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],"usage":{"prompt_tokens":7,"total_tokens":7}}"#;
+        let usage = OpenAiEmbeddings
+            .extract_usage("openai", body)
+            .expect("token-metered embeddings yields usage");
+        assert_eq!(usage.input_tokens, 7);
     }
 
     #[test]

@@ -96,6 +96,16 @@ ships with the test that catches it.
 - **Exhaustiveness gate restored.** Five request handlers used a wildcard match arm for operations,
   so adding an operation would not fail to compile there. Each now enumerates every operation, so the
   removability/symmetry gate the design relies on fires everywhere.
+- **Cohere base64 embeddings on the response leg.** The request and response readers were taught to
+  carry base64, but the Cohere response *writer* still emitted only float, so a base64 request served
+  by a cross-protocol backend came back empty. The writer now emits every encoding the response holds.
+- **Same-protocol embeddings were not metered.** A same-protocol (e.g. OpenAI→OpenAI) embeddings
+  request did not tap the upstream `usage` object, so the virtual key's token/spend counters were
+  undercharged (the cross-protocol path already billed them). Token-metered embeddings now meter
+  consistently on both paths.
+- **Gemini `top_logprobs: 0`.** A caller's valid `top_logprobs: 0` ("the chosen token, no
+  alternatives") emitted `logprobs: 0` on Gemini egress, which Gemini rejects. Busbar now omits the
+  alternatives count for `0` while still returning the chosen token's logprob.
 
 ### Changed
 

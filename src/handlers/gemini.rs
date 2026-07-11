@@ -481,6 +481,12 @@ impl OperationHandler for GeminiImage {
 struct GeminiEmbeddings;
 
 impl OperationHandler for GeminiEmbeddings {
+    // Token-metered: buffer the same-protocol non-stream 2xx body so the default
+    // `extract_usage` can read the `usage` object and bill the virtual key's TPM/spend
+    // (the cross-protocol path already bills; this closes the same-protocol gap).
+    fn taps_usage(&self) -> bool {
+        true
+    }
     fn read_request(&self, body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
         // gemini `:embedContent` wire → IR (gemini as INGRESS). Model rides the PATH (routing fills
         // it via `IrReq::set_model`); the body carries `content.parts[].text`.
