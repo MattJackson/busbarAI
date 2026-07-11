@@ -2086,25 +2086,28 @@ fn reject_kind_for_status(status: u16) -> &'static str {
 }
 
 /// The request body's end-user identifier, dialect-aware: `user` (OpenAI) first, then
-/// `metadata.user_id` (Anthropic). An empty string coalesces to `None` — "no user id" and
-/// `user: ""` mean the same thing to a routing hook. Part of the `policy.send_user` opt-in
-/// identity projection.
+/// `metadata.user_id` (Anthropic). An empty string means "no user id" in EITHER position — an
+/// empty `user: ""` falls through to a populated `metadata.user_id` rather than shadowing it,
+/// and empty-everywhere coalesces to `None`. Part of the `policy.send_user` identity projection.
 fn body_end_user(v: &Value) -> Option<String> {
     v.get("user")
         .and_then(|u| u.as_str())
+        .filter(|s| !s.is_empty())
         .or_else(|| {
             v.get("metadata")
                 .and_then(|m| m.get("user_id"))
                 .and_then(|u| u.as_str())
+                .filter(|s| !s.is_empty())
         })
-        .filter(|s| !s.is_empty())
         .map(str::to_string)
 }
 
 /// Flatten the ingress body's prompt content into the opt-in hook projection
 /// (`policy.send_prompt`). The same content shapes as the SIZE signals (`total_text_chars` /
 /// `system_text_chars`) — bare-string content and `{type:"text", text}` blocks — but collecting
-/// the text instead of counting the chars. Non-text blocks (images, documents, tool results)
+/// the text instead of counting the chars. (The flattened text joins blocks with a newline, so
+/// its length can exceed the `total_chars` SIZE signal by one char per block boundary — the
+/// signal counts text, not separators.) Non-text blocks (images, documents, tool results)
 /// contribute NO text, but the message ENTRY is kept (possibly with empty text and, for a
 /// malformed body, an empty role): entries stay index-aligned with the body's `messages` and with
 /// `message_count`, so a screening hook sees every turn — a media-only turn reads as
@@ -2263,10 +2266,12 @@ async fn decide_policy_order(
             .is_some_and(|a| !a.is_empty()),
         total_chars: total_text_chars(v, system_chars),
         system_chars,
+        // Saturating narrow: an absurd caller cap (> u32::MAX) still signals "huge ask" to the
+        // policy instead of wrapping to a small number. A SIZE signal, not a limit.
         max_tokens: v
             .get("max_tokens")
             .and_then(|m| m.as_u64())
-            .map(|n| n as u32),
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
         stream: wants_stream,
         prompt,
         identity,
@@ -2652,6 +2657,8 @@ pub(crate) async fn forward_with_pool_parsed(
                     message,
                     name,
                 } => {
+                    // The `status` label is hook-influenced but BOUNDED: `wire::normalize` clamps
+                    // it to 400..=499, so the worst-case series fan-out is 100 per (policy, pool).
                     metrics::counter!(
                         crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
                         "policy" => name,
@@ -10306,6 +10313,15 @@ mod hook_opt_in_projection_tests {
         let v: Value = serde_json::json!({"user": 42});
         assert_eq!(body_end_user(&v), None);
         assert_eq!(body_end_user(&Value::Null), None);
+        // Empty means "not supplied" in EITHER position: an empty OpenAI `user` falls THROUGH to
+        // a populated Anthropic `metadata.user_id` (never shadows it), and empty-everywhere is
+        // `None` — so an empty string can never ride the wire as `"user": ""`.
+        let v: Value = serde_json::json!({"user": "", "metadata": {"user_id": "bob"}});
+        assert_eq!(body_end_user(&v).as_deref(), Some("bob"));
+        let v: Value = serde_json::json!({"user": ""});
+        assert_eq!(body_end_user(&v), None);
+        let v: Value = serde_json::json!({"metadata": {"user_id": ""}});
+        assert_eq!(body_end_user(&v), None);
     }
 }
 

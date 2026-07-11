@@ -534,6 +534,8 @@ pub(crate) struct PolicyCfg {
     /// Opt-in: include caller identity in the hook payload — the governance virtual-key `id`/`name`
     /// (NEVER the secret) and the request body's end-user field (`user` / `metadata.user_id`).
     /// DEFAULT OFF. Turning it on enables route-by-who policies (team lanes, per-user denies).
+    /// Webhook/socket only; the script (deprecated) and native transports have no reader for it
+    /// and force it off at resolve, each with a startup warning.
     #[serde(default)]
     pub(crate) send_user: bool,
     // ── script transport ─────────────────────────────────────────────────────────────────────────
