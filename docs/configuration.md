@@ -486,8 +486,8 @@ pools:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `route` | string (enum) | `weighted` | Routing transport. One of `weighted`, `native`, `webhook`, `script`. `weighted` (default/absent) is zero-cost SWRR: no policy object is constructed and behavior is byte-identical to the baseline. Any other value runs a pluggable policy once per request before the failover loop. |
-| `policy` | object | none | Transport configuration. Only `webhook` is validated at boot (a missing or SSRF-blocked `policy.url` is a startup error); a misconfigured `native` or `script` policy is not fatal, it degrades to weighted SWRR. Parsed but inert when `route: weighted`. |
+| `route` | string (enum) | `weighted` | Routing transport. One of `weighted`, `native`, `webhook`, `socket`, or `script` (deprecated). `weighted` (default/absent) is zero-cost SWRR: no policy object is constructed and behavior is byte-identical to the baseline. Any other value runs a pluggable policy once per request before the failover loop. |
+| `policy` | object | none | Transport configuration. `webhook` and `socket` are validated at boot (a missing or SSRF-blocked `policy.url`, or a missing/relative `policy.socket` path, is a startup error); a misconfigured `native` or `script` policy is not fatal, it degrades to weighted SWRR. Parsed but inert when `route: weighted`. |
 
 **`route` enum values:**
 
@@ -495,8 +495,9 @@ pools:
 |---|---|
 | `weighted` | **Default.** Smooth weighted round-robin (SWRR) over healthy members. Zero added overhead: the existing SWRR hot path, unchanged. |
 | `native` | A Busbar-built policy selected by `policy.name`. Sync, no I/O, no external deps. |
-| `webhook` | An operator HTTP sidecar. Busbar POSTs a request projection and waits for a ranked preference list, bounded by `policy.timeout_ms`. |
-| `script` | An embedded Rhai script (behind the `script-policy` cargo feature). Compiled at startup; evaluated per request in a sandboxed thread pool. |
+| `webhook` | An operator HTTP sidecar. Busbar POSTs a request projection and waits for a ranked preference list (or a `reject`), bounded by `policy.timeout_ms`. Any language, any OS. |
+| `socket` | An operator-run compiled binary on a local Unix domain socket. Same wire contract and reply shapes as the webhook, no HTTP stack in between — about 8 microseconds per decision co-located. Unix-only; use `webhook` elsewhere. |
+| `script` | **Deprecated.** An embedded Rhai script (behind the `script-policy` cargo feature). Warns at startup; migrate to `socket` or `webhook`. |
 
 `route:` also accepts the bare native policy names `cheapest`, `fastest`, `least_busy`, and `usage` as shorthand for `route: native` + `policy.name: <name>`. See the [Routing guide](/docs/routing/) for what each policy does.
 
@@ -506,12 +507,15 @@ pools:
 |---|---|---|---|---|
 | `name` | string | none | `native` | Native policy name. Required when `route: native`. Valid values: `weighted`, `cheapest`, `fastest`, `least_busy`, `usage`. An unknown value is a startup error. |
 | `url` | string | none | `webhook` | Operator sidecar URL. Required when `route: webhook`. Validated by the routing SSRF guard: loopback (`127.0.0.1`, `localhost`) is allowed; RFC-1918, link-local, CGNAT (100.64/10), and cloud metadata hosts are blocked. Plain `http://` is allowed for loopback; remote endpoints must use `https://`. |
-| `timeout_ms` | integer | `150` | `webhook`, `script` | Hard wall-clock deadline for the policy decision in milliseconds. On timeout the decision is coerced to `on_error`. |
-| `on_error` | string (enum) | `weighted` | `webhook`, `script` | Fallback when the policy times out, errors, abstains, or its in-flight queue is saturated. `weighted` (SWRR), `reject` (503), or `first` (first member in config order). |
+| `socket` | string | none | `socket` | Absolute filesystem path of the hook binary's Unix domain socket. Required when `route: socket`. The binary is operator-run (Busbar never spawns it); the connection is lazy, so the hook may start after Busbar. |
+| `timeout_ms` | integer | `1` | `webhook`, `socket`, `script` | Hard wall-clock deadline for the policy decision in milliseconds. The default says hooks are fast (a co-located socket hook decides in ~8 µs, a webhook in ~34 µs); raise it when your hook does I/O or crosses the network. On timeout the decision is coerced to `on_error`. |
+| `on_error` | string (enum) | `weighted` | `webhook`, `socket`, `script` | Fallback when the policy times out, errors, abstains, or its in-flight queue is saturated. `weighted` (SWRR), `reject` (503), or `first` (first member in config order). A hook's deliberate `reject` reply is a decision, not a failure — `on_error` does not apply to it. |
+| `send_prompt` | boolean | `false` | `webhook`, `socket` | Opt-in: add the request's prompt content (`request.system` + `request.messages` as `{role, text}`) to the hook payload. Off = the shape-only default payload. For hooks trusted with content: PII screening, guardrails, audit. |
+| `send_user` | boolean | `false` | `webhook`, `socket` | Opt-in: add caller identity (`request.user`: the governance virtual-key `id`/`name` plus the body's end-user field) to the hook payload. The caller's secret/token is never sent, under any configuration. |
 | `script` | string | none | `script` | Inline Rhai source string. Exactly one of `script` or `script_file` is required when `route: script`. Mutually exclusive with `script_file`. |
 | `script_file` | string | none | `script` | Path to a Rhai script file on disk. Alternative to inline `script`. |
 
-The per-member `tier`, `cost_per_mtok`, and `tags` fields documented in [Members and weights](#members-and-weights) above feed these policies. See the [routing guide](https://getbusbar.com/docs/routing/) for the native policy catalog, the webhook wire format, the Rhai script environment and sandbox limits, and the `x-busbar-route-policy` / `x-busbar-route-target` observability headers.
+The per-member `tier`, `cost_per_mtok`, and `tags` fields documented in [Members and weights](#members-and-weights) above feed these policies. See the [routing guide](https://getbusbar.com/docs/routing/) for the native policy catalog, the shared webhook/socket wire format (including the payload opt-ins and the `reject` reply), and the `x-busbar-route-policy` / `x-busbar-route-target` observability headers.
 
 ---
 
