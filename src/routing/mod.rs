@@ -775,6 +775,8 @@ mod tests {
     fn hook_transports_pass_opt_in_flags_through() {
         use crate::config::{PolicyCfg, RouteKind};
         let client = reqwest::Client::new();
+        // On non-unix the socket push below is compiled out and `mut` would be unused.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut cases = vec![(
             "webhook",
             pool_cfg(
