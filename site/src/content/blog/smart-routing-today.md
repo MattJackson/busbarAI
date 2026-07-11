@@ -25,7 +25,7 @@ Busbar's position is simple: you own the first job, the control plane owns the s
 
 Whichever way you run it, the logic is small and the same. Classify the request into a task bucket from shape alone, score every candidate through that bucket's weights over the live signals, sort.
 
-**Classify** on shape: tools declared means agent or code work. A big `max_tokens` or a long prompt means long-form work. One message with streaming turned off is almost always a script or a cron job, not a person, so it gets treated as batch work. Everything else is a person waiting on an answer. Routing does not need to read your prompt to do any of this, so by default it does not get it.
+**Classify** on shape: tools declared means agent or code work. A big `max_tokens` or a long prompt means long-form work. One message with streaming turned off is almost always a script or a cron job, not a person, so it gets treated as batch work. Everything else is a person waiting on an answer. Routing does not need to read your prompt to do any of this, so by default it does not get it. That is a Security default, not a wall: content-carrying hooks (PII screening, guardrails, audit) are a planned per-hook opt-in.
 
 **Score** is the reality check. Each kind of request has a favorite lane, but the favorite gets a head start, not the win: every lane is scored on how it is doing right now, its price, its latency, its free capacity, weighed by what this kind of request cares about. The favorite gets a bonus on top; a lane near its rate limit gets trimmed.
 
@@ -198,11 +198,6 @@ pools:
 
 The example sidecar is about a hundred lines of Go, standard library only, and it makes the exact same decision: classify on shape, score through the bucket's dials, sort. Same classify, same weights, same sort, and critically the same wire contract: both transports carry byte-identical JSON, so a hook graduates from a webhook prototype to a compiled socket binary without changing its logic. Both examples are in the repo under [`examples/smart-router/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router). The webhook adds the HTTP round trip the socket does not: about 34 µs co-located, measured the same way, and it runs anywhere.
 
-## What the hook sees, and what it does not
-
-Both paths see the same projection. For the request: pool name, ingress protocol, message count, whether tools are declared, total prompt size in characters, requested `max_tokens`, whether it streams. For each candidate: model name, operator-declared `tier` and `cost_per_mtok`, a rolling latency EWMA, live free concurrency, remaining budget, and rate-limit headroom from Governance.
-
-Notice what is missing: the prompt. Routing is a shape decision, so by default Busbar sends no message content with it, and the policy classifies on sizes, counts, and flags, not on words. Your prompts do not leave the process just to pick a model. That is a Security default, not an accident, but it is not a wall: content is a separate, explicit, per-hook switch, off unless you turn it on. Default deny, opt in on purpose. That switch is what makes the next hooks, like PII redaction and guardrails, possible at all.
 
 ## The part that makes it safe to run
 
