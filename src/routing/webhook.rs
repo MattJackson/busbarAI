@@ -111,7 +111,12 @@ impl RoutingPolicy for WebhookPolicy {
         // recursive deserialize can blow the stack — same guard the forwarding path uses. The 64 KiB
         // cap above bounds size; this bounds nesting depth. Normalization (abstain / drop unknown
         // idxs / dedup / empty → Abstain) is the shared `wire::normalize`, same as every transport.
-        let parsed: super::wire::HookResponse = crate::json::parse(&buf)?;
+        // The parse error is REPLACED with a length-only message (`parse_err_log`): the raw
+        // sonic-rs Display embeds a fragment of the offending reply bytes, and this `Err` flows
+        // into `decide_policy_order`'s warn log — a sidecar that echoes prompt content into a
+        // malformed reply must not splash it into operator logs.
+        let parsed: super::wire::HookResponse =
+            crate::json::parse(&buf).map_err(|_| crate::json::parse_err_log(buf.len()))?;
         Ok(super::wire::normalize(parsed, candidates))
     }
 
@@ -534,6 +539,99 @@ mod tests {
         assert!(
             res.is_err(),
             "a sidecar body exceeding MAX_WEBHOOK_RESP_BYTES must surface as Err (→ on_error fallback)"
+        );
+    }
+
+    /// End-to-end opt-in payload over the REAL HTTP wire: a capturing sidecar proves the POST body
+    /// actually carries the opt-in keys when populated — and that a default request carries none.
+    #[tokio::test]
+    async fn opt_in_payload_rides_the_webhook_wire() {
+        use std::sync::Mutex as StdMutex;
+        let seen: std::sync::Arc<StdMutex<Vec<String>>> =
+            std::sync::Arc::new(StdMutex::new(Vec::new()));
+        let seen_h = seen.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |body: String| {
+                let seen = seen_h.clone();
+                async move {
+                    seen.lock().unwrap().push(body);
+                    (
+                        axum::http::StatusCode::OK,
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            crate::forward::APPLICATION_JSON,
+                        )],
+                        r#"{"order":[0]}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let policy = WebhookPolicy::new(format!("http://{addr}/"), client());
+        let cands = [cand(0)];
+
+        // Default request: no opt-in keys on the wire.
+        policy
+            .decide(&req(), &cands, &ctx(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        // Opt-in request: prompt + identity present.
+        let mut r = req();
+        r.prompt = Some(crate::routing::PromptProjection {
+            system: Some("be brief".into()),
+            messages: vec![("user".into(), "hello".into())],
+        });
+        r.identity = Some(crate::routing::CallerIdentity {
+            key_id: None,
+            key_name: Some("sales-team".into()),
+            user: Some("alice".into()),
+        });
+        policy
+            .decide(&r, &cands, &ctx(), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        let default: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        for key in ["system", "messages", "user"] {
+            assert!(
+                default["request"].get(key).is_none(),
+                "default POST body leaked {key}: {}",
+                bodies[0]
+            );
+        }
+        let opted: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(opted["request"]["system"], "be brief");
+        assert_eq!(opted["request"]["messages"][0]["text"], "hello");
+        assert_eq!(opted["request"]["user"]["key_name"], "sales-team");
+        assert_eq!(opted["request"]["user"]["user"], "alice");
+    }
+
+    /// A malformed sidecar reply must surface as a LENGTH-ONLY parse error: the raw parser Display
+    /// embeds reply bytes, and a sidecar that echoes prompt content into a broken reply must not
+    /// splash it into operator logs via the seam's `error = %e` warn.
+    #[tokio::test]
+    async fn malformed_reply_error_never_echoes_reply_bytes() {
+        let url = mock_sidecar(200, r#"{"order":[0,, "echo":"SENTINEL-PROMPT-TEXT"}"#, None).await;
+        let policy = WebhookPolicy::new(url, client());
+        let err = policy
+            .decide(&req(), &[cand(0)], &ctx(), Duration::from_secs(5))
+            .await
+            .expect_err("malformed reply must be an Err");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("SENTINEL-PROMPT-TEXT"),
+            "parse error must not echo reply bytes: {msg}"
+        );
+        assert!(
+            msg.contains("invalid JSON"),
+            "length-only parse_err_log message expected: {msg}"
         );
     }
 

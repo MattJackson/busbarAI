@@ -82,9 +82,11 @@ pub(crate) struct RoutingRequest<'a> {
 }
 
 /// The opt-in prompt content projection (`policy.send_prompt: true`). Text only: string content and
-/// `{type:"text"}` blocks are flattened; non-text blocks (images, tool results) are skipped, so the
-/// payload carries text, not binary blobs. `Cow`: bare-string content borrows straight from the
-/// parsed body (the common case, zero copies); only block arrays allocate a joined string.
+/// `{type:"text"}` blocks are flattened; non-text blocks (images, tool results) contribute no text
+/// (the payload carries text, not binary blobs), but their message entries remain — with empty
+/// text — so the projection stays index-aligned with the body's messages. `Cow`: bare-string
+/// content borrows straight from the parsed body (the common case, zero copies); only block
+/// arrays allocate a joined string.
 #[derive(Clone)]
 pub(crate) struct PromptProjection<'a> {
     /// The system prompt's text, flattened (bare string, or text blocks concatenated).
@@ -99,7 +101,10 @@ pub(crate) struct PromptProjection<'a> {
 impl std::fmt::Debug for PromptProjection<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PromptProjection")
-            .field("system_chars", &self.system.as_deref().map(str::len))
+            .field(
+                "system_chars",
+                &self.system.as_deref().map(|s| s.chars().count()),
+            )
             .field("message_count", &self.messages.len())
             .finish_non_exhaustive()
     }
@@ -291,12 +296,23 @@ pub(crate) fn resolve_policy(
                 return None;
             }
             let policy = native::native_policy(name)?;
+            // The payload opt-ins are webhook/socket-only: native policies rank on live signals
+            // and have no reader for prompt/identity, so the flags are FORCED OFF (mirroring the
+            // script arm) — honoring them would burn per-request flattening/lookup building data
+            // nothing reads. Warn so the operator learns the flags are inert here.
+            if policy_cfg.send_prompt || policy_cfg.send_user {
+                tracing::warn!(
+                    "route: native does not support policy.send_prompt / policy.send_user; the \
+                     flags are ignored. Use `route: socket` or `route: webhook` for the payload \
+                     opt-ins."
+                );
+            }
             Some(ResolvedPolicy::Policy {
                 policy,
                 on_error: policy_cfg.on_error.clone(),
                 timeout: policy_timeout(policy_cfg.timeout_ms),
-                send_prompt: policy_cfg.send_prompt,
-                send_user: policy_cfg.send_user,
+                send_prompt: false,
+                send_user: false,
             })
         }
         // The operator-sidecar HTTP transport. The URL is validated at config load
@@ -406,7 +422,8 @@ fn resolve_script(cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
             // The deprecated script transport never receives the opt-in projections (its frozen
             // Rhai env has no bindings for them), so the flags are FORCED OFF here: honoring them
             // would burn the per-request flattening/lookup cost to build data the script cannot
-            // read. Setting them on a script pool warns (below) instead of silently wasting work.
+            // read. Setting them on a script pool warns (at the top of this fn) instead of
+            // silently wasting work.
             send_prompt: false,
             send_user: false,
         }),

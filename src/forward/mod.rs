@@ -2031,9 +2031,20 @@ enum PolicyOutcome {
     },
 }
 
-/// Sum the chars of a string value, or 0 for a non-string. Cheap v1 SIZE signal (NOT a token count).
-fn json_str_chars(v: &Value) -> usize {
-    v.as_str().map(|s| s.chars().count()).unwrap_or(0)
+/// Chars of the request's system prompt: a bare string, or the sum of `{type:"text"}` block texts
+/// when the system value is a block array (Anthropic allows both). The SAME shapes
+/// `build_prompt_projection` flattens, so the SIZE signal and the opt-in content projection never
+/// diverge on a block-array system prompt. Cheap v1 SIZE signal (NOT a token count).
+fn system_text_chars(v: &Value) -> usize {
+    match v.get("system") {
+        Some(Value::String(s)) => s.chars().count(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .map(|t| t.chars().count())
+            .sum(),
+        _ => 0,
+    }
 }
 
 /// Total chars across the system prompt + every message's text content. Anthropic's `content` is
@@ -2091,12 +2102,15 @@ fn body_end_user(v: &Value) -> Option<String> {
 }
 
 /// Flatten the ingress body's prompt content into the opt-in hook projection
-/// (`policy.send_prompt`). The same content walk as `total_text_chars` — bare-string content and
-/// `{type:"text", text}` blocks — but collecting the text instead of counting the chars. Non-text
-/// blocks (images, documents, tool results) are skipped: the projection carries text, never binary
-/// blobs. Bare-string content BORROWS from the parsed body (`Cow::Borrowed`, the common case);
-/// only block arrays allocate a joined string. Runs ONLY behind the per-pool opt-in, so even that
-/// cost never touches a default pool.
+/// (`policy.send_prompt`). The same content shapes as the SIZE signals (`total_text_chars` /
+/// `system_text_chars`) — bare-string content and `{type:"text", text}` blocks — but collecting
+/// the text instead of counting the chars. Non-text blocks (images, documents, tool results)
+/// contribute NO text, but the message ENTRY is kept (possibly with empty text and, for a
+/// malformed body, an empty role): entries stay index-aligned with the body's `messages` and with
+/// `message_count`, so a screening hook sees every turn — a media-only turn reads as
+/// `{role, text: ""}`, never silently vanishes. Bare-string content BORROWS from the parsed body
+/// (`Cow::Borrowed`, the common case); only block arrays allocate a joined string. Runs ONLY
+/// behind the per-pool opt-in, so even that cost never touches a default pool.
 fn build_prompt_projection(v: &Value) -> crate::routing::PromptProjection<'_> {
     use std::borrow::Cow;
     // A content value is a bare string (borrowed as-is) or an array of blocks (text blocks joined
@@ -2227,7 +2241,7 @@ async fn decide_policy_order(
     // Count the system prompt's chars ONCE: it feeds both `total_chars` (via `total_text_chars`) and
     // `system_chars`, so computing it inline twice would run the O(n) UTF-8 scan over the system block
     // twice. Off the zero-cost default path (only non-default route policies reach here).
-    let system_chars = v.get("system").map(json_str_chars).unwrap_or(0);
+    let system_chars = system_text_chars(v);
 
     let req = RoutingRequest {
         pool: pool_name,
@@ -10240,6 +10254,45 @@ mod hook_opt_in_projection_tests {
         assert!(p.messages.is_empty());
     }
 
+    /// PINS the message-entry contract: a media-only message (no text blocks) keeps its ENTRY with
+    /// empty text (index-aligned with the body and `message_count`, never silently dropped), and a
+    /// malformed message with no `role` key projects an empty role. The system field, by contrast,
+    /// coalesces empty to absent (there is no index to keep).
+    #[test]
+    fn prompt_projection_keeps_empty_entries_aligned() {
+        let v: Value = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "image", "source": {"data": "AAAA"}}]},
+                {"content": "no role on this one"}
+            ]
+        });
+        let p = build_prompt_projection(&v);
+        assert_eq!(p.messages.len(), 2, "media-only entries must not vanish");
+        assert_eq!(p.messages[0].0, "user");
+        assert_eq!(p.messages[0].1, "", "media-only turn reads as empty text");
+        assert_eq!(p.messages[1].0, "", "missing role projects as empty role");
+        assert_eq!(p.messages[1].1, "no role on this one");
+    }
+
+    /// The SIZE signal and the content projection agree on a BLOCK-ARRAY system prompt: Anthropic
+    /// allows `system` as text blocks, and `system_text_chars` must count what
+    /// `build_prompt_projection` flattens (they diverged once — this is the tripwire).
+    #[test]
+    fn system_text_chars_counts_block_arrays() {
+        let v: Value = serde_json::json!({
+            "system": [{"type": "text", "text": "abcde"}, {"type": "text", "text": "fgh"}],
+            "messages": []
+        });
+        assert_eq!(system_text_chars(&v), 8);
+        let p = build_prompt_projection(&v);
+        // The flattened projection joins with a newline; the SIZE signal counts text only.
+        assert_eq!(p.system.as_deref(), Some("abcde\nfgh"));
+
+        let v: Value = serde_json::json!({"system": "plain", "messages": []});
+        assert_eq!(system_text_chars(&v), 5);
+        assert_eq!(system_text_chars(&Value::Null), 0);
+    }
+
     /// `body_end_user` is dialect-aware: OpenAI `user` first, Anthropic `metadata.user_id` second,
     /// `None` when neither (or the field is not a string).
     #[test]
@@ -10449,6 +10502,78 @@ mod hook_seam_tests {
             PolicyOutcome::Reject => "Reject",
             PolicyOutcome::RejectRequest { .. } => "RejectRequest",
         }
+    }
+
+    /// `send_user` with GOVERNANCE configured: the caller's secret resolves to its key record and
+    /// the policy sees the key's `id`/`name` — while the secret itself never appears anywhere in
+    /// the projection.
+    #[tokio::test]
+    async fn send_user_projects_governance_key_identity() {
+        use crate::governance::{GovState, NewKeySpec, SqliteStore};
+        let store = std::sync::Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+        let gov = std::sync::Arc::new(GovState::new(store, 0, 0, None).expect("gov state"));
+        let (key, secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "sales-team".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "monthly".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                1,
+            )
+            .expect("create key");
+
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .pool("p", &[(0, 1)])
+            .governance(gov)
+            .build();
+        let seen = Arc::new(StdMutex::new(None));
+        let resolved = ResolvedPolicy::Policy {
+            policy: Arc::new(CapturingPolicy {
+                seen: seen.clone(),
+                reject: None,
+            }),
+            on_error: crate::config::PolicyOnError::default(),
+            timeout: std::time::Duration::from_millis(500),
+            send_prompt: false,
+            send_user: true,
+        };
+        let cands = vec![WeightedLane {
+            reasoning: None,
+            idx: 0,
+            weight: 1,
+            attempt_timeout_ms: None,
+        }];
+        let rc = RequestCtx::new(60);
+        let v = body();
+        decide_policy_order(
+            &app,
+            &resolved,
+            &cands,
+            &rc,
+            &v,
+            "p",
+            "anthropic",
+            false,
+            Some(&secret),
+        )
+        .await;
+        let captured = seen.lock().unwrap().clone().expect("policy called");
+        let (key_id, key_name, user) = captured.identity.expect("identity present");
+        assert_eq!(key_id.as_deref(), Some(key.id.as_str()));
+        assert_eq!(key_name.as_deref(), Some("sales-team"));
+        assert_eq!(user.as_deref(), Some("alice"));
+        // The secret NEVER rides the projection, under any configuration.
+        assert_ne!(key_id.as_deref(), Some(secret.as_str()));
+        assert_ne!(key_name.as_deref(), Some(secret.as_str()));
     }
 
     /// The reject status → dialect error KIND mapping: an SDK caller must catch the right typed

@@ -11,7 +11,10 @@ use super::{Candidate, RoutingContext, RoutingDecision, RoutingRequest};
 use serde::{Deserialize, Serialize};
 
 /// The stable request schema sent to a hook: the request projection, every candidate, and context.
-#[derive(Debug, Serialize)]
+/// The request-side wire structs deliberately do NOT derive `Debug`: behind the opt-ins they
+/// borrow prompt text and end-user identity, and a derived Debug would bypass the redacting
+/// impls on `PromptProjection`/`CallerIdentity`.
+#[derive(Serialize)]
 pub(crate) struct HookRequest<'a> {
     pub(crate) request: HookReqProjection<'a>,
     pub(crate) candidates: Vec<HookCandidate<'a>>,
@@ -22,7 +25,7 @@ pub(crate) struct HookRequest<'a> {
 /// DEFAULT — no prompt text or caller identity rides this projection unless the pool opted in
 /// (`policy.send_prompt` / `policy.send_user`). The opt-in fields are omitted from the JSON
 /// entirely when off, so the default payload is byte-identical to the pre-opt-in contract.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct HookReqProjection<'a> {
     pub(crate) pool: &'a str,
     pub(crate) ingress_protocol: &'a str,
@@ -44,7 +47,7 @@ pub(crate) struct HookReqProjection<'a> {
 }
 
 /// One message of the opt-in prompt projection: the role plus the flattened text content.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct HookMessage<'a> {
     pub(crate) role: &'a str,
     pub(crate) text: &'a str,
@@ -53,7 +56,7 @@ pub(crate) struct HookMessage<'a> {
 /// The opt-in caller identity: the governance virtual-key `id`/`name` (never the secret — the
 /// projection is built FROM the resolved key record, the token itself is unreachable here) and the
 /// request body's end-user identifier.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct HookUser<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) key_id: Option<&'a str>,
@@ -65,7 +68,7 @@ pub(crate) struct HookUser<'a> {
 
 /// One candidate as seen by the hook. `idx` is the stable handle the hook echoes back in `order`;
 /// the rest are the live signals + operator metadata a policy ranks on.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct HookCandidate<'a> {
     pub(crate) idx: usize,
     pub(crate) model: &'a str,
@@ -83,7 +86,7 @@ pub(crate) struct HookCandidate<'a> {
 }
 
 /// The routing context projection.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct HookContext<'a> {
     pub(crate) pool: &'a str,
     pub(crate) budget_remaining: Option<i64>,
@@ -192,14 +195,16 @@ pub(crate) fn normalize(parsed: HookResponse, candidates: &[Candidate<'_>]) -> R
                 Some(s) if (400..=499).contains(&s) => s as u16,
                 _ => REJECT_STATUS_DEFAULT,
             };
-            // Sanitize: strip control chars (no CRLF/log injection), cap the length, fall back to
+            // Sanitize: strip control chars AND the Unicode line/paragraph separators (U+2028/
+            // U+2029 — not category Cc, but several log/OTLP pipelines treat them as newlines, so
+            // they are a log-record-splitting vector just like CRLF), cap the length, fall back to
             // the default when nothing printable survives.
             let message: String = reject
                 .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("")
                 .chars()
-                .filter(|c| !c.is_control())
+                .filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}')
                 .take(REJECT_MESSAGE_MAX_CHARS)
                 .collect();
             let message = if message.trim().is_empty() {
@@ -449,6 +454,59 @@ mod tests {
             norm(r#"{"order":[1,0],"reject":null}"#),
             RoutingDecision::Prefer(o) if o == vec![1, 0]
         ));
+    }
+
+    /// U+2028/U+2029 (Unicode line/paragraph separators) are stripped from the reject message —
+    /// they are not `char::is_control` (category Zl/Zp) but several log/OTLP pipelines treat them
+    /// as newlines, so they are a log-record-splitting vector just like CRLF.
+    #[test]
+    fn reject_message_strips_unicode_line_separators() {
+        match norm("{\"reject\":{\"message\":\"a\\u2028b\\u2029c\"}}") {
+            RoutingDecision::Reject { message, .. } => assert_eq!(message, "abc"),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// PINS the "opted in, anonymous" wire shape: `send_user` on with an all-None identity emits
+    /// `"user": {}` (present but empty) — a hook detects the opt-in by the KEY's presence, so a
+    /// future skip-if-all-none "cleanup" would silently break that contract.
+    #[test]
+    fn anonymous_identity_emits_empty_user_object() {
+        let mut r = req();
+        r.identity = Some(CallerIdentity {
+            key_id: None,
+            key_name: None,
+            user: None,
+        });
+        let cands = [cand(0, &[])];
+        let c = ctx();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&build(&r, &cands, &c)).unwrap()).unwrap();
+        assert_eq!(v["request"]["user"], serde_json::json!({}));
+    }
+
+    /// NDJSON framing invariant: prompt text containing literal newlines/control chars must stay
+    /// ONE serialized line — serde_json escapes them inside string values, and the socket
+    /// transport's whole framing rests on that. This is the tripwire against any future custom
+    /// serializer that would let a raw 0x0A reach the wire and desync the hook's line reader.
+    #[test]
+    fn opt_in_content_with_newlines_stays_one_line() {
+        let mut r = req();
+        r.prompt = Some(PromptProjection {
+            system: Some("line1\nline2".into()),
+            messages: vec![("user".into(), "a\nb\rc\u{2028}d".into())],
+        });
+        let cands = [cand(0, &[])];
+        let c = ctx();
+        let line = serde_json::to_string(&build(&r, &cands, &c)).unwrap();
+        assert!(
+            !line.contains('\n') && !line.contains('\r'),
+            "serialized hook payload must contain no raw newline bytes: {line}"
+        );
+        // And the content round-trips intact through a parse of that single line.
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["request"]["system"], "line1\nline2");
+        assert_eq!(v["request"]["messages"][0]["text"], "a\nb\rc\u{2028}d");
     }
 
     /// The pre-reject behaviors are untouched: order normalizes, abstain abstains, `{}` abstains.

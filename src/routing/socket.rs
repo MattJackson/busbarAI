@@ -143,8 +143,13 @@ impl RoutingPolicy for SocketPolicy {
                 })??;
 
         // Depth-guarded parse (MAX_JSON_DEPTH) + the shared normalizer — identical hostile-peer
-        // posture and identical liberal-in-what-you-accept rules as the webhook transport.
-        let parsed: super::wire::HookResponse = crate::json::parse(&reply)?;
+        // posture and identical liberal-in-what-you-accept rules as the webhook transport. The
+        // parse error is REPLACED with a length-only message (`parse_err_log`): the raw sonic-rs
+        // Display embeds a fragment of the offending reply bytes, and this `Err` flows into
+        // `decide_policy_order`'s warn log — a hook that echoes prompt content into a malformed
+        // reply must not splash it into operator logs.
+        let parsed: super::wire::HookResponse =
+            crate::json::parse(&reply).map_err(|_| crate::json::parse_err_log(reply.len()))?;
         Ok(super::wire::normalize(parsed, candidates))
     }
 
@@ -551,6 +556,33 @@ mod tests {
         );
     }
 
+    /// A malformed hook reply must surface as a LENGTH-ONLY parse error (`parse_err_log`): the raw
+    /// parser Display embeds reply bytes, and a hook that echoes prompt content into a broken
+    /// reply must not splash it into operator logs via the seam's `error = %e` warn.
+    #[tokio::test]
+    async fn malformed_reply_error_never_echoes_reply_bytes() {
+        let dir = tempdir();
+        let path = mock_hook(
+            dir.path(),
+            r#"{"order":[0,, "echo":"SENTINEL-PROMPT-TEXT"}"#,
+        )
+        .await;
+        let policy = SocketPolicy::new(path);
+        let err = policy
+            .decide(&req(), &[cand(0)], &ctx(), Duration::from_secs(2))
+            .await
+            .expect_err("malformed reply must be an Err");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("SENTINEL-PROMPT-TEXT"),
+            "parse error must not echo reply bytes: {msg}"
+        );
+        assert!(
+            msg.contains("invalid JSON"),
+            "length-only parse_err_log message expected: {msg}"
+        );
+    }
+
     /// End-to-end opt-in payload over the REAL socket wire: a hook that keys its decision on what
     /// it saw proves the prompt + identity projections (and tags) actually arrive — and that a
     /// default request carries none of them.
@@ -579,7 +611,7 @@ mod tests {
                             let v: serde_json::Value =
                                 serde_json::from_str(&line).unwrap_or_default();
                             let saw_all = v["request"]["system"] == "be brief"
-                                && v["request"]["messages"][0]["text"] == "hello"
+                                && v["request"]["messages"][0]["text"] == "hello\nsecond line"
                                 && v["request"]["user"]["key_name"] == "sales-team"
                                 && v["candidates"][0]["tags"][0] == "eu";
                             let reply = if saw_all {
@@ -617,7 +649,9 @@ mod tests {
         let mut r = req();
         r.prompt = Some(crate::routing::PromptProjection {
             system: Some("be brief".into()),
-            messages: vec![("user".into(), "hello".into())],
+            // A literal newline in the text: the NDJSON framing must survive it end-to-end
+            // (serde_json escapes it inside the string value, so the line stays ONE line).
+            messages: vec![("user".into(), "hello\nsecond line".into())],
         });
         r.identity = Some(crate::routing::CallerIdentity {
             key_id: Some("k-1".into()),
