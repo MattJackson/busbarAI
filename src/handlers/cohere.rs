@@ -77,6 +77,16 @@ fn cohere_embedding_type(f: &EncFmt) -> &'static str {
     }
 }
 
+/// Every IR encoding Cohere's `/v2/embed` supports, for iterating the response keys.
+const ALL_ENCODINGS: [EncFmt; 6] = [
+    EncFmt::Float,
+    EncFmt::Base64,
+    EncFmt::Int8,
+    EncFmt::Uint8,
+    EncFmt::Binary,
+    EncFmt::Ubinary,
+];
+
 /// Inverse of [`cohere_embedding_type`]: a Cohere `embedding_types` wire string → IR encoding. The
 /// full 1:1 map (not just base64), so an `int8`/`uint8`/`binary`/`ubinary` ask is not silently
 /// collapsed to float on the read side. Unknown strings fall back to float.
@@ -195,31 +205,49 @@ impl OperationHandler for CohereEmbeddings {
         let v: Value =
             serde_json::from_slice(wire).map_err(|e| CodecError::Malformed(e.to_string()))?;
         // Cohere returns each requested encoding under its own key (`embeddings.float`,
-        // `embeddings.base64`, ...), positionally aligned. Read float AND base64 so a base64 request
-        // is not lost on the response leg (its floats key is absent when only base64 was requested).
+        // `embeddings.base64`, `embeddings.int8`, ...), positionally aligned. Read EVERY encoding the
+        // request leg can ask for — float, base64, and the four integer forms — so an int8/uint8/
+        // binary/ubinary response is not silently dropped (its `float` key is absent when only that
+        // encoding was requested). Float -> Float, base64 -> Base64, the int forms -> Int.
         let emb = v.get("embeddings");
-        let floats = emb.and_then(|e| e.get("float")).and_then(Value::as_array);
-        let b64s = emb.and_then(|e| e.get("base64")).and_then(Value::as_array);
-        let count = floats.map_or(0, Vec::len).max(b64s.map_or(0, Vec::len));
+        let arrays: Vec<(EncFmt, &Vec<Value>)> = ALL_ENCODINGS
+            .iter()
+            .filter_map(|&e| {
+                emb.and_then(|o| o.get(cohere_embedding_type(&e)))
+                    .and_then(Value::as_array)
+                    .map(|a| (e, a))
+            })
+            .collect();
+        let count = arrays.iter().map(|(_, a)| a.len()).max().unwrap_or(0);
         let embeddings: Vec<EmbeddingItem> = (0..count)
             .map(|idx| {
                 let mut item = EmbeddingItem {
                     index: idx,
                     ..Default::default()
                 };
-                if let Some(f) = floats.and_then(|a| a.get(idx)).and_then(Value::as_array) {
-                    item.vectors.insert(
-                        EncFmt::Float,
-                        VectorData::Float(
-                            f.iter()
-                                .filter_map(|x| x.as_f64().map(|n| n as f32))
-                                .collect(),
-                        ),
-                    );
-                }
-                if let Some(s) = b64s.and_then(|a| a.get(idx)).and_then(Value::as_str) {
-                    item.vectors
-                        .insert(EncFmt::Base64, VectorData::Base64(s.to_string()));
+                for (enc, arr) in &arrays {
+                    let Some(cell) = arr.get(idx) else { continue };
+                    let vd = match enc {
+                        EncFmt::Float => cell.as_array().map(|f| {
+                            VectorData::Float(
+                                f.iter()
+                                    .filter_map(|x| x.as_f64().map(|n| n as f32))
+                                    .collect(),
+                            )
+                        }),
+                        EncFmt::Base64 => cell.as_str().map(|s| VectorData::Base64(s.to_string())),
+                        // int8/uint8/binary/ubinary all arrive as JSON integer arrays.
+                        _ => cell.as_array().map(|f| {
+                            VectorData::Int(
+                                f.iter()
+                                    .filter_map(|x| x.as_i64().map(|n| n as i32))
+                                    .collect(),
+                            )
+                        }),
+                    };
+                    if let Some(vd) = vd {
+                        item.vectors.insert(*enc, vd);
+                    }
                 }
                 item
             })
@@ -245,26 +273,29 @@ impl OperationHandler for CohereEmbeddings {
         let IrResp::Embeddings(r) = ir else {
             return WireBody::json(Bytes::new());
         };
-        // Emit every encoding the IR carries under its own Cohere key (`float` and/or `base64`), so
-        // a base64 response (e.g. from a cross-protocol OpenAI backend) is not silently dropped — the
-        // write twin of the base64 read fix. Cohere's `embeddings_by_type` shape holds multiple keys.
-        let mut floats: Vec<Vec<f32>> = Vec::new();
-        let mut b64s: Vec<String> = Vec::new();
+        // Emit every encoding the IR carries under its own Cohere key (`float`, `base64`, `int8`,
+        // ...), so an int8/base64/etc. response (e.g. from a cross-protocol backend) is not silently
+        // dropped — the write twin of the six-encoding read. Cohere's `embeddings_by_type` shape
+        // holds multiple keys, each a per-item array in candidate order.
+        let mut by_enc: std::collections::BTreeMap<EncFmt, Vec<Value>> =
+            std::collections::BTreeMap::new();
         for item in &r.embeddings {
-            if let Some(VectorData::Float(v)) = item.vectors.get(&EncFmt::Float) {
-                floats.push(v.clone());
-            }
-            if let Some(VectorData::Base64(s)) = item.vectors.get(&EncFmt::Base64) {
-                b64s.push(s.clone());
+            for (enc, vd) in &item.vectors {
+                let cell = match vd {
+                    VectorData::Float(v) => json!(v),
+                    VectorData::Base64(s) => json!(s),
+                    VectorData::Int(v) => json!(v),
+                };
+                by_enc.entry(*enc).or_default().push(cell);
             }
         }
         let mut emb = serde_json::Map::new();
-        if !b64s.is_empty() {
-            emb.insert("base64".to_string(), json!(b64s));
+        for (enc, vals) in &by_enc {
+            emb.insert(cohere_embedding_type(enc).to_string(), json!(vals));
         }
-        // Always emit a `float` key (even empty) when there is no base64, for response-shape stability.
-        if !floats.is_empty() || b64s.is_empty() {
-            emb.insert("float".to_string(), json!(floats));
+        // Emit an empty `float` key when the IR carried no vectors, for response-shape stability.
+        if emb.is_empty() {
+            emb.insert("float".to_string(), json!(Vec::<Vec<f32>>::new()));
         }
         let mut body = json!({
             "response_type": "embeddings_by_type",
@@ -564,6 +595,35 @@ mod rerank_tests {
             r.embeddings[1].vectors[&EncFmt::Base64],
             VectorData::Base64("BBBB".into())
         );
+    }
+
+    #[test]
+    fn embeddings_response_roundtrips_int8_not_dropped() {
+        // int8/uint8/binary/ubinary arrive as integer arrays and must NOT be dropped on the
+        // response leg (they used to yield count=0 -> empty embeddings).
+        let body = serde_json::to_vec(&json!({
+            "id": "x",
+            "embeddings": {"int8": [[1, 2, 3], [4, 5, 6]]}
+        }))
+        .unwrap();
+        let ir = CohereEmbeddings.read_response(&body).expect("parses");
+        let IrResp::Embeddings(r) = &ir else {
+            panic!("expected embeddings")
+        };
+        assert_eq!(r.embeddings.len(), 2, "int8 response must not be empty");
+        assert!(matches!(
+            r.embeddings[0].vectors.get(&EncFmt::Int8),
+            Some(VectorData::Int(_))
+        ));
+        // write_response re-emits the int8 key, not an empty float array.
+        let out = CohereEmbeddings.write_response(&ir);
+        let v: Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert!(v["embeddings"]["int8"].is_array(), "int8 key emitted: {v}");
+        assert!(
+            v["embeddings"].get("float").is_none(),
+            "no spurious float key: {v}"
+        );
+        let _ = EmbeddingsResp::default();
     }
 
     #[test]

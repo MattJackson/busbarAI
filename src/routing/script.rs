@@ -55,8 +55,19 @@ const MAX_ARRAY_SIZE: usize = 4 * 1024;
 /// Max object-map entries.
 const MAX_MAP_SIZE: usize = 1024;
 
-/// Build a sandboxed Rhai engine. No module resolver (so `import` fails), no I/O host functions, and
-/// all the size/op/depth caps applied. Cheap to build; we build it once and keep it on the policy.
+// The per-evaluation wall-clock deadline, read by the shared engine's `on_progress`. Set at the
+// start of every eval (on the blocking thread that runs it) and cleared after. A thread-local lets
+// ONE shared, pre-built engine carry a DIFFERENT deadline per call: `Engine::new()` registers the
+// whole Rhai stdlib and costs ~1ms, so rebuilding it per request (the old approach) dominated the
+// routing decision. Each eval overwrites this at its start, so a value left behind by a panicked
+// eval is never observed by the next one.
+thread_local! {
+    static EVAL_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Build a sandboxed Rhai engine. No module resolver (so `import` fails), no I/O host functions, all
+/// the size/op/depth caps applied, and a wall-clock `on_progress` guard reading the per-eval
+/// deadline. Built ONCE at config load and shared (Rhai `sync` → `Engine: Send + Sync`).
 fn sandboxed_engine() -> Engine {
     let mut engine = Engine::new();
     engine.set_max_operations(MAX_OPERATIONS);
@@ -68,6 +79,19 @@ fn sandboxed_engine() -> Engine {
     // No module resolver → `import` statements error. Rhai's base engine registers no file/network
     // host functions, so the script cannot reach the filesystem, network, or process.
     engine.set_module_resolver(rhai::module_resolvers::DummyModuleResolver::new());
+    // Hard WALL-CLOCK budget: the op cap bounds *logical* work but not real time, and the seam's
+    // outer `tokio::timeout` cannot interrupt blocking CPU, so the deadline must live in-eval.
+    // Check the clock every ~1024 ops so per-op overhead stays negligible; `Some(..)` aborts.
+    engine.on_progress(|ops| {
+        if ops & 0x3FF == 0 {
+            if let Some(deadline) = EVAL_DEADLINE.with(std::cell::Cell::get) {
+                if Instant::now() >= deadline {
+                    return Some(Dynamic::UNIT);
+                }
+            }
+        }
+        None
+    });
     engine
 }
 
@@ -75,9 +99,11 @@ fn sandboxed_engine() -> Engine {
 /// config load. With Rhai's `sync` feature both fields are `Send + Sync`, so this is safe behind the
 /// `Arc<dyn RoutingPolicy>` shared across worker tasks.
 pub(crate) struct ScriptPolicy {
-    // The compiled program only. The engine is built per-`decide` on the blocking pool so each eval
-    // gets its own wall-clock `on_progress` deadline; the AST is shared via `Arc` (Send + Sync under
-    // Rhai's `sync` feature) so cloning it into the blocking task is a refcount bump, not a recompile.
+    // The engine AND the compiled program, both built ONCE at config load and shared via `Arc`
+    // (Send + Sync under Rhai's `sync` feature), so cloning them into the blocking task is a refcount
+    // bump, not a rebuild. The per-eval wall-clock deadline rides `EVAL_DEADLINE`, so one shared
+    // engine still enforces a distinct budget per call without paying `Engine::new()` per request.
+    engine: Arc<Engine>,
     ast: Arc<AST>,
 }
 
@@ -89,7 +115,10 @@ impl ScriptPolicy {
         let ast = engine
             .compile(source)
             .map_err(|e| -> PolicyError { format!("rhai script compile error: {e}").into() })?;
-        Ok(Self { ast: Arc::new(ast) })
+        Ok(Self {
+            engine: Arc::new(engine),
+            ast: Arc::new(ast),
+        })
     }
 }
 
@@ -191,29 +220,22 @@ impl RoutingPolicy for ScriptPolicy {
         );
         let valid: std::collections::HashSet<usize> = candidates.iter().map(|c| c.idx).collect();
         let ast = Arc::clone(&self.ast);
+        let engine = Arc::clone(&self.engine);
 
         // Rhai eval is SYNCHRONOUS CPU work. Run it on the blocking pool so a pathological script can
-        // never pin an async runtime worker (a routing-path DoS), AND enforce a hard WALL-CLOCK budget
-        // inside the eval via `on_progress`: the op cap bounds *logical* work but not real time, and
-        // the seam's outer `tokio::timeout` cannot interrupt blocking CPU — so the deadline must live
-        // HERE. Building the engine per call (cheap) lets each eval carry its own deadline closure.
+        // never pin an async runtime worker (a routing-path DoS). The hard WALL-CLOCK budget rides
+        // `EVAL_DEADLINE`, set here for THIS eval's thread and read by the shared engine's
+        // `on_progress` — so the pre-built engine (built once at config load) enforces a per-call
+        // deadline without paying `Engine::new()` per request.
         let eval = tokio::task::spawn_blocking(move || {
-            let deadline = Instant::now() + budget;
-            let mut engine = sandboxed_engine();
-            engine.on_progress(move |ops| {
-                // Check the clock every ~1024 ops so the per-op overhead stays negligible. Returning
-                // `Some(..)` aborts the eval (`ErrorTerminated`) → surfaced as an Err below.
-                if ops & 0x3FF == 0 && Instant::now() >= deadline {
-                    Some(Dynamic::UNIT)
-                } else {
-                    None
-                }
-            });
+            EVAL_DEADLINE.with(|d| d.set(Some(Instant::now() + budget)));
             let mut scope = Scope::new();
             scope.push("req", req_map);
             scope.push("candidates", cand_arr);
             scope.push("ctx", ctx_map);
-            engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
+            let out = engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast);
+            EVAL_DEADLINE.with(|d| d.set(None));
+            out
         })
         .await;
 
@@ -296,6 +318,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(d, RoutingDecision::Prefer(vec![2, 0, 1]));
+    }
+
+    /// TEMP timing probe (not a real assertion) — measures the real per-request cost of the
+    /// production smart_router.rhai through `.decide()`. Run:
+    ///   cargo test --features script-policy --bin busbar rhai_decide_timing -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn rhai_decide_timing() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/smart-router/smart_router.rhai"
+        ))
+        .unwrap();
+        let p = ScriptPolicy::compile(&src).unwrap();
+        let mk = |idx, cost, lat, conc, tier| Candidate {
+            idx,
+            model: "m",
+            provider: "p",
+            weight: 1,
+            context_max: None,
+            tier: Some(tier),
+            cost_per_mtok: Some(cost),
+            tags: &[],
+            latency_ms: Some(lat),
+            available_concurrency: conc,
+            budget_remaining: Some(1000),
+            rate_headroom: Some(0.9),
+        };
+        let cands = [
+            mk(0, 3.0, 900.0, 8, "large"),
+            mk(1, 0.15, 300.0, 10, "small"),
+            mk(2, 0.10, 250.0, 12, "small"),
+        ];
+        let r = req();
+        let c = ctx();
+        let budget = Duration::from_millis(150);
+        for _ in 0..500 {
+            p.decide(&r, &cands, &c, budget).await.unwrap();
+        }
+        let mut xs = Vec::with_capacity(20_000);
+        for _ in 0..20_000 {
+            let t = Instant::now();
+            p.decide(&r, &cands, &c, budget).await.unwrap();
+            xs.push(t.elapsed().as_nanos() as f64 / 1e6);
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pc = |q: f64| xs[((q * xs.len() as f64) as usize).min(xs.len() - 1)];
+        println!(
+            "RHAI decide() via spawn_blocking (3 cands, N=20000): median {:.4} ms  p99 {:.4} ms",
+            xs[xs.len() / 2],
+            pc(0.99),
+        );
+
+        // INLINE eval — no spawn_blocking, no tokio hop: build the scope + run the AST, exactly
+        // what the decision COMPUTES. This isolates the eval from the thread-handoff transport.
+        EVAL_DEADLINE.with(|d| d.set(Some(Instant::now() + budget)));
+        let mut ys = Vec::with_capacity(20_000);
+        for _ in 0..20_000 {
+            let req_map = request_map(&r);
+            let cand_arr: Array = cands
+                .iter()
+                .map(|c| Dynamic::from(candidate_map(c)))
+                .collect();
+            let mut ctx_map = Map::new();
+            ctx_map.insert("pool".into(), c.pool.into());
+            ctx_map.insert(
+                "budget_remaining".into(),
+                c.budget_remaining.map_or(Dynamic::UNIT, |v| v.into()),
+            );
+            let t = Instant::now();
+            let mut scope = Scope::new();
+            scope.push("req", req_map);
+            scope.push("candidates", cand_arr);
+            scope.push("ctx", ctx_map);
+            let _ = p.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &p.ast);
+            ys.push(t.elapsed().as_nanos() as f64 / 1e3); // microseconds
+        }
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pcy = |q: f64| ys[((q * ys.len() as f64) as usize).min(ys.len() - 1)];
+        println!(
+            "RHAI inline eval (scope build + eval_ast, 3 cands, N=20000): median {:.2} us  p99 {:.2} us  min {:.2} us",
+            ys[ys.len() / 2],
+            pcy(0.99),
+            ys[0]
+        );
+
+        // Scope-build ONLY (project the maps, push the scope, NO eval): isolates the projection
+        // cost (Rhai Map allocation per field) from the interpreter eval. eval ~= inline - build.
+        let mut zs = Vec::with_capacity(20_000);
+        for _ in 0..20_000 {
+            let t = Instant::now();
+            let req_map = request_map(&r);
+            let cand_arr: Array = cands
+                .iter()
+                .map(|c| Dynamic::from(candidate_map(c)))
+                .collect();
+            let mut ctx_map = Map::new();
+            ctx_map.insert("pool".into(), c.pool.into());
+            ctx_map.insert(
+                "budget_remaining".into(),
+                c.budget_remaining.map_or(Dynamic::UNIT, |v| v.into()),
+            );
+            let mut scope = Scope::new();
+            scope.push("req", req_map);
+            scope.push("candidates", cand_arr);
+            scope.push("ctx", ctx_map);
+            std::hint::black_box(&scope);
+            zs.push(t.elapsed().as_nanos() as f64 / 1e3);
+        }
+        zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "RHAI scope-build only (no eval, 3 cands, N=20000): median {:.2} us  min {:.2} us   => eval alone ~= {:.2} us",
+            zs[zs.len() / 2],
+            zs[0],
+            ys[ys.len() / 2] - zs[zs.len() / 2],
+        );
     }
 
     /// A script that ranks by reading candidate fields (cheapest cost first).
