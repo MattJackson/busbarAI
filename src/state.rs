@@ -127,7 +127,7 @@ pub(crate) struct App {
     pub(crate) governance: Option<std::sync::Arc<crate::governance::GovState>>,
     /// Global fallback for the translation-injected `max_tokens` (`limits.default_max_tokens`), used
     /// at the cross-protocol seam when a lane has no per-lane `default_max_tokens`. Defaults to
-    /// `proto::DEFAULT_MAX_TOKENS` (4096). Read by `forward::apply_required_max_tokens`.
+    /// `proto::DEFAULT_MAX_TOKENS` (4096). Read by `IrReq::prepare_for_egress` at the cross-protocol seam.
     pub(crate) default_max_tokens: u32,
     /// Resolved effort-word → thinking-budget table for the cross-protocol reasoning carry
     /// (`limits.reasoning_effort_budgets`, defaults 1024/4096/8192/16384), ordered

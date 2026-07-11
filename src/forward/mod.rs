@@ -358,7 +358,7 @@ fn strip_same_protocol_model_shim(v: &mut Value, ingress_protocol: &str) -> bool
 /// `body` is the per-hop parsed request `Value` (the caller owns deriving it fresh from the pristine
 /// body so a failover hop never re-translates a previous hop's egress-shaped body). It is consumed
 /// and the shaped egress bytes are returned. The full step list, in order:
-///   1. CROSS-protocol only (`ingress_protocol != egress`): read_request → `apply_required_max_tokens`
+///   1. CROSS-protocol only (`ingress_protocol != egress`): read_request → `IrReq::prepare_for_egress`
 ///      → `ir.extra.clear()` → egress `write_request`. Clearing `extra` at this single seam, before
 ///      any writer runs, is what stops every source-protocol-only passthrough key from leaking to a
 ///      foreign backend — no individual writer can miss it.
@@ -3987,6 +3987,14 @@ async fn forward_once(
                         "pool" => pool.to_string(),
                         "lane" => app.lanes[i].model.clone(),
                         "disposition" => "attempt_timeout"
+                    )
+                    .increment(1);
+                    // Parity with the organic path: a degraded-path attempt-timeout is a failover
+                    // (the caller tries the next candidate), so count it under FAILOVERS_TOTAL too.
+                    metrics::counter!(
+                        crate::metrics::FAILOVERS_TOTAL,
+                        "pool" => pool.to_string(),
+                        "reason" => "attempt_timeout"
                     )
                     .increment(1);
                     return Err(());
