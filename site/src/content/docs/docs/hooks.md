@@ -36,6 +36,15 @@ Two things: a projection of the request, and a projection of every candidate lan
 
 Scripts additionally get `requested_model` and `system_chars`.
 
+Two per-pool opt-ins extend the projection for hooks you trust with more (both default off; both work on webhook and socket):
+
+| Opt-in | Adds | For |
+|---|---|---|
+| `policy.send_prompt: true` | `system` (flattened system-prompt text) and `messages` (`{role, text}` per message, text content only) | Content-screening hooks: PII detection, guardrails, audit |
+| `policy.send_user: true` | `user` (`key_id`/`key_name` from the governance virtual key, plus the body's end-user field) | Route-by-who: team lanes, per-user denies |
+
+The caller's secret/token is never in the payload, under any configuration.
+
 **The candidate projection** (what state is each option in?), one entry per healthy pool member:
 
 | Signal | Field | Where it comes from |
@@ -55,11 +64,13 @@ You return a **ranked preference list** of candidate indices. That order becomes
 
 You can also return an **abstain**, which means "no opinion, use the default weighted selection."
 
+And you can return a **reject** (`{"reject": {"status": 451, "message": "..."}}`): no upstream is dispatched and the caller gets a dialect-native error. The status is clamped to 400–499 (default 403) and the message sanitized, so a hook can never mint a success or a 5xx. Combined with `send_prompt`, this is the PII-screen primitive — a hook that sees content can stop a request before it leaves your network. Rejections are counted in `busbar_route_policy_rejections_total`.
+
 ### What you cannot do
 
-- You cannot mutate the request. Policies rank; they do not rewrite. (Request/response mutation hooks — the shape guardrails, PII steering, and audit need — are the planned next tenant of this same fail-safe machinery. See the [roadmap](https://getbusbar.com/docs/roadmap/).)
+- You cannot mutate the request. Policies rank, or reject outright; they do not rewrite. (Request/response mutation hooks — redaction, steering — are the planned next tenant of this same fail-safe machinery. See the [roadmap](https://getbusbar.com/docs/roadmap/).)
 - You cannot make Busbar wait. The decision is bounded by `policy.timeout_ms` (default 1 ms; raise it when your hook calls a database or crosses the network), hard.
-- You cannot see the message text. The projection carries sizes, counts, and flags, not content — your prompts do not leave the process just to make a routing decision.
+- You cannot see the message text **unless the operator says so**. The default projection carries sizes, counts, and flags, not content — prompts do not leave the process just to make a routing decision. `policy.send_prompt` is the explicit, per-pool exception; it is never on by default.
 
 ### What Busbar guarantees when your hook misbehaves
 
@@ -94,4 +105,4 @@ For metrics and traces (rather than per-request records), Busbar also ships Prom
 
 ## Where hooks are going
 
-The routing hook is the first tenant of a general mechanism: bounded, fail-safe operator logic on the request path. The same machinery is built to carry request/response mutation next — guardrails, PII steering, audit — where "your code sees the request" needs more than sizes and counts. Same rules will apply: hard timeouts, safe fallbacks, SSRF-guarded destinations, and no hook ever able to take Busbar down with it.
+The routing hook is the first tenant of a general mechanism: bounded, fail-safe operator logic on the request path. With `send_prompt`, `send_user`, and the reject verb, that machinery already carries the screening class of hooks — see content, see the caller, say no. The next tenant is request/response **mutation** — redaction and steering, where the hook needs to change the request rather than block it. Same rules will apply: hard timeouts, safe fallbacks, SSRF-guarded destinations, and no hook ever able to take Busbar down with it.

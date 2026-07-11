@@ -294,6 +294,8 @@ mod tests {
             system_chars: 0,
             max_tokens: Some(256),
             stream: false,
+            prompt: None,
+            identity: None,
         }
     }
 

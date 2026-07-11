@@ -86,11 +86,19 @@ prototype to a compiled socket binary without changing its logic:
   `total_chars`, `max_tokens`, `stream`.
 - `candidates[]`: `idx`, `model`, `tier`, `cost_per_mtok`, `latency_ms`
   (rolling EWMA, `null` until the lane has served), `available_concurrency`,
-  `budget_remaining`, `rate_headroom`.
-- Reply: `{"order":[idx,...]}` most-preferred first, or `{"abstain":true}`.
+  `budget_remaining`, `rate_headroom`, `tags` (your free-form member labels;
+  omitted when the member declares none).
+- Reply: `{"order":[idx,...]}` most-preferred first, `{"abstain":true}`, or
+  `{"reject":{"status":451,"message":"..."}}` (no upstream dispatched; status
+  clamped to 400-499, message sanitized).
 
-Not in the payload: prompt text or message bodies. Busbar sends no request
-content by default, so the policy classifies on shape, not words.
+Not in the payload by default: prompt text, message bodies, or caller
+identity — the policy classifies on shape, not words. Two per-pool opt-ins
+(both default off) extend it for hooks you trust with more:
+`policy.send_prompt: true` adds `request.system` + `request.messages`
+(`{role, text}`), and `policy.send_user: true` adds `request.user` (the
+governance key's id/name plus the body's end-user field — never the secret).
+That is the PII-screen recipe: `send_prompt` to see, `reject` to stop.
 
 ## Fail-safe (both transports)
 

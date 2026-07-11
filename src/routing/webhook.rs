@@ -182,6 +182,8 @@ mod tests {
             system_chars: 50,
             max_tokens: Some(256),
             stream: true,
+            prompt: None,
+            identity: None,
         }
     }
 
@@ -532,6 +534,27 @@ mod tests {
         assert!(
             res.is_err(),
             "a sidecar body exceeding MAX_WEBHOOK_RESP_BYTES must surface as Err (→ on_error fallback)"
+        );
+    }
+
+    /// The reject verb over the webhook transport: same wire contract as the socket, so the
+    /// sidecar's `{"reject":{...}}` surfaces as a `RoutingDecision::Reject` (status pre-clamped,
+    /// message pre-sanitized by the shared `wire::normalize`).
+    #[tokio::test]
+    async fn reject_reply_surfaces_as_reject_decision() {
+        let url = mock_sidecar(200, r#"{"reject":{"status":500,"message":"nope"}}"#, None).await;
+        let policy = WebhookPolicy::new(url, client());
+        let d = policy
+            .decide(&req(), &[cand(0)], &ctx(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        // 500 is OUT of the hook-speakable range → clamped to 403 by the shared normalizer.
+        assert_eq!(
+            d,
+            RoutingDecision::Reject {
+                status: 403,
+                message: "nope".to_string()
+            }
         );
     }
 }

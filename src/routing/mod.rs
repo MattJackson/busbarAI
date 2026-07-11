@@ -69,6 +69,40 @@ pub(crate) struct RoutingRequest<'a> {
     pub(crate) system_chars: usize,
     pub(crate) max_tokens: Option<u32>,
     pub(crate) stream: bool,
+    /// The request's prompt content — `Some` ONLY when the pool opted in via `policy.send_prompt`
+    /// (default off). The default projection is shape-only; this is the operator-gated exception
+    /// that lets a trusted hook screen content (PII, guardrails, audit). Owned: flattening the
+    /// ingress body allocates, and that cost is paid only behind the opt-in.
+    pub(crate) prompt: Option<PromptProjection>,
+    /// Caller identity — `Some` ONLY when the pool opted in via `policy.send_user` (default off).
+    /// Carries the governance virtual-key `id`/`name` and the body's end-user field. NEVER the
+    /// caller's secret/token, regardless of configuration.
+    pub(crate) identity: Option<CallerIdentity>,
+}
+
+/// The opt-in prompt content projection (`policy.send_prompt: true`). Text only: string content and
+/// `{type:"text"}` blocks are flattened; non-text blocks (images, tool results) are skipped, so the
+/// payload carries words, not binary blobs.
+#[derive(Debug, Clone)]
+pub(crate) struct PromptProjection {
+    /// The system prompt's text, flattened (bare string, or text blocks concatenated).
+    pub(crate) system: Option<String>,
+    /// Every message as `(role, flattened text)`, in request order.
+    pub(crate) messages: Vec<(String, String)>,
+}
+
+/// The opt-in caller identity projection (`policy.send_user: true`). By construction this can never
+/// carry a secret: the governance lookup resolves the token to its key record and only the record's
+/// `id`/`name` are projected.
+#[derive(Debug, Clone)]
+pub(crate) struct CallerIdentity {
+    /// Governance virtual-key id (stable handle), if the caller authenticated with a virtual key.
+    pub(crate) key_id: Option<String>,
+    /// Governance virtual-key display name.
+    pub(crate) key_name: Option<String>,
+    /// The request body's end-user identifier (`user` in OpenAI dialect, `metadata.user_id` in
+    /// Anthropic dialect), if the caller supplied one.
+    pub(crate) user: Option<String>,
 }
 
 /// One routable member, with the metadata + live signals a policy ranks on. Projected from
@@ -94,9 +128,8 @@ pub(crate) struct Candidate<'a> {
     // ── operator-declared member metadata (config) ───────────────────────────────────────────────
     pub(crate) tier: Option<&'a str>,
     pub(crate) cost_per_mtok: Option<f64>,
-    /// Free-form operator tags. Projected to the script policy (its only reader), so it is gated on
-    /// `script-policy`.
-    #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
+    /// Free-form operator tags. Projected to the hook wire (`wire::HookCandidate.tags`, omitted
+    /// when empty) and to the script policy.
     pub(crate) tags: &'a [String],
     // ── live signals (read per-request from the store at the seam) ───────────────────────────────
     /// Rolling EWMA of recent end-to-end latency for this lane, in milliseconds. `None` until the
@@ -150,6 +183,12 @@ pub(crate) enum RoutingDecision {
     /// "No preference" — fall back to the pool's default (weighted/SWRR). Identical to the policy not
     /// being configured. A timeout / error / malformed response is coerced to this (per `on_error`).
     Abstain,
+    /// REJECT the request: no upstream is dispatched and the caller receives a dialect-native error.
+    /// The verb that makes content-seeing hooks (`policy.send_prompt`) useful — a PII screen or
+    /// guardrail can stop a request before it leaves the network. `status` is already clamped to
+    /// 4xx and `message` sanitized by `wire::normalize` (the only producer): a hook can never mint a
+    /// 5xx, a success, or a header-injecting message through this path.
+    Reject { status: u16, message: String },
 }
 
 /// THE transport-agnostic contract. webhook / socket / script / native all implement this.
@@ -185,6 +224,10 @@ pub(crate) enum ResolvedPolicy {
         policy: Arc<dyn RoutingPolicy>,
         on_error: crate::config::PolicyOnError,
         timeout: std::time::Duration,
+        /// `policy.send_prompt` — build + send the prompt content projection (default false).
+        send_prompt: bool,
+        /// `policy.send_user` — build + send the caller identity projection (default false).
+        send_user: bool,
     },
 }
 
@@ -226,6 +269,8 @@ pub(crate) fn resolve_policy(
                 policy,
                 on_error: policy_cfg.on_error.clone(),
                 timeout: policy_timeout(policy_cfg.timeout_ms),
+                send_prompt: policy_cfg.send_prompt,
+                send_user: policy_cfg.send_user,
             })
         }
         // The operator-sidecar HTTP transport. The URL is validated at config load
@@ -241,6 +286,8 @@ pub(crate) fn resolve_policy(
                 policy: Arc::new(webhook::WebhookPolicy::new(url, client.clone())),
                 on_error: policy_cfg.on_error.clone(),
                 timeout: policy_timeout(policy_cfg.timeout_ms),
+                send_prompt: policy_cfg.send_prompt,
+                send_user: policy_cfg.send_user,
             })
         }
         // SCRIPT (Rhai) transport. Behind the `script-policy` feature so the default build pulls no
@@ -272,6 +319,8 @@ fn resolve_socket(cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
         policy: Arc::new(socket::SocketPolicy::new(path.to_string())),
         on_error: policy_cfg.on_error.clone(),
         timeout: policy_timeout(policy_cfg.timeout_ms),
+        send_prompt: policy_cfg.send_prompt,
+        send_user: policy_cfg.send_user,
     })
 }
 
@@ -319,6 +368,11 @@ fn resolve_script(cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
                     .map(|p| p.timeout_ms)
                     .unwrap_or(crate::limits::default_policy_timeout_ms()),
             ),
+            // The deprecated script transport never receives the opt-in projections (its Rhai env
+            // predates them and is frozen); the flags are still honored at the seam if set, the
+            // script just has no bindings to read them.
+            send_prompt: policy_cfg.map(|p| p.send_prompt).unwrap_or(false),
+            send_user: policy_cfg.map(|p| p.send_user).unwrap_or(false),
         }),
         Err(e) => {
             tracing::warn!("route: script failed to compile: {e}; falling back to weighted");

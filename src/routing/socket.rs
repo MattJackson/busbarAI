@@ -247,6 +247,8 @@ mod tests {
             system_chars: 50,
             max_tokens: Some(256),
             stream: true,
+            prompt: None,
+            identity: None,
         }
     }
 
@@ -523,5 +525,109 @@ mod tests {
             .await
             .expect("post-restart decision must succeed via reconnect");
         assert_eq!(d, RoutingDecision::Prefer(vec![0, 1]));
+    }
+
+    /// The reject verb over the socket transport: the hook's `{"reject":{...}}` reply surfaces as
+    /// a `RoutingDecision::Reject` with the clamped status + sanitized message.
+    #[tokio::test]
+    async fn reject_reply_surfaces_as_reject_decision() {
+        let dir = tempdir();
+        let path = mock_hook(
+            dir.path(),
+            r#"{"reject":{"status":451,"message":"PII detected"}}"#,
+        )
+        .await;
+        let policy = SocketPolicy::new(path);
+        let d = policy
+            .decide(&req(), &[cand(0)], &ctx(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            d,
+            RoutingDecision::Reject {
+                status: 451,
+                message: "PII detected".to_string()
+            }
+        );
+    }
+
+    /// End-to-end opt-in payload over the REAL socket wire: a hook that keys its decision on what
+    /// it saw proves the prompt + identity projections (and tags) actually arrive — and that a
+    /// default request carries none of them.
+    #[tokio::test]
+    async fn opt_in_payload_rides_the_socket_wire() {
+        // A mock hook that INSPECTS the request line: replies order [1,0] iff the payload carries
+        // the opt-in keys (system/messages/user + a tag), else abstains.
+        async fn inspecting_hook(dir: &std::path::Path) -> String {
+            let path = dir.join("hook.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    tokio::spawn(async move {
+                        let (r, mut w) = stream.into_split();
+                        let mut reader = BufReader::new(r);
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            match reader.read_line(&mut line).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                            let v: serde_json::Value =
+                                serde_json::from_str(&line).unwrap_or_default();
+                            let saw_all = v["request"]["system"] == "be brief"
+                                && v["request"]["messages"][0]["text"] == "hello"
+                                && v["request"]["user"]["key_name"] == "sales-team"
+                                && v["candidates"][0]["tags"][0] == "eu";
+                            let reply = if saw_all {
+                                "{\"order\":[1,0]}\n"
+                            } else {
+                                "{\"abstain\":true}\n"
+                            };
+                            if w.write_all(reply.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+            path.to_string_lossy().into_owned()
+        }
+
+        static TAGS: std::sync::LazyLock<Vec<String>> =
+            std::sync::LazyLock::new(|| vec!["eu".into()]);
+        let dir = tempdir();
+        let path = inspecting_hook(dir.path()).await;
+        let policy = SocketPolicy::new(path);
+        let mut c0 = cand(0);
+        c0.tags = TAGS.as_slice();
+        let cands = [c0, cand(1)];
+
+        // Default request (no opt-ins): the hook must NOT see the keys → abstain.
+        let d = policy
+            .decide(&req(), &cands, &ctx(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(d, RoutingDecision::Abstain);
+
+        // Opt-in request: prompt + identity populated (as `forward` does behind the flags).
+        let mut r = req();
+        r.prompt = Some(crate::routing::PromptProjection {
+            system: Some("be brief".into()),
+            messages: vec![("user".into(), "hello".into())],
+        });
+        r.identity = Some(crate::routing::CallerIdentity {
+            key_id: Some("k-1".into()),
+            key_name: Some("sales-team".into()),
+            user: None,
+        });
+        let d = policy
+            .decide(&r, &cands, &ctx(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(d, RoutingDecision::Prefer(vec![1, 0]));
     }
 }

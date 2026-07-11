@@ -26,6 +26,25 @@ fixed the issues below. Every fix ships with the test that catches it.
   lazily, keeps the connection alive, and reconnects transparently across hook restarts. Kill the
   hook mid-traffic and requests keep flowing on the pool's fallback. Unix-only; on other platforms
   use `route: webhook`.
+- **Hook payload opt-ins: `policy.send_prompt` and `policy.send_user`.** The hook payload stays
+  shape-only by default; two per-pool booleans (both default `false`) extend it. `send_prompt`
+  adds the flattened prompt content (`request.system` + `request.messages` as `{role, text}`) so
+  a trusted hook can screen content — PII, guardrails, audit. `send_user` adds caller identity
+  (`request.user`: the governance virtual-key `id`/`name` plus the body's end-user field) so a
+  hook can route by who is asking. The caller's secret/token is never in the payload, under any
+  configuration. Both transports (webhook and socket) carry the same fields; a pool that sets
+  neither flag sends the exact pre-1.2.1 payload.
+- **Member `tags` in the hook payload.** Each candidate now carries its operator-declared
+  free-form `tags` (team names, regions, compliance labels — whatever you wrote in the member
+  config), omitted when the member declares none.
+- **The hook `reject` verb.** A hook may reply `{"reject": {"status": 451, "message": "..."}}`
+  instead of an order: no upstream is dispatched and the caller receives a dialect-native error.
+  Status is clamped to 400–499 (default 403) and the message is sanitized (control characters
+  stripped, length capped), so a hook can never mint a success, a 5xx, or a header-injecting
+  error through this path. Deliberate rejections are counted in the new
+  `busbar_route_policy_rejections_total` metric (by policy, pool, and status). Combined with
+  `send_prompt`, this is the PII-screen primitive: a hook that sees content can stop a request
+  before it leaves your network.
 
 ### Deprecated
 

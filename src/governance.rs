@@ -278,8 +278,8 @@ impl GovState {
 
     /// Acquire the `rate` map for reading (poison-recovering, same rationale as `rate_write`).
     /// Read by `rate_headroom`, which is wired into production routing: `decide_policy_order` in
-    /// `forward.rs` calls `rate_headroom_for_token` (→ `rate_headroom`) to compute the per-lane
-    /// `usage` routing signal.
+    /// `forward.rs` calls `lookup` + `rate_headroom` (one key lookup shared with the `send_user`
+    /// identity projection) to compute the per-lane `usage` routing signal.
     fn rate_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, RateState>> {
         self.rate.read().unwrap_or_else(|p| p.into_inner())
     }
@@ -294,9 +294,9 @@ impl GovState {
     /// window) reads as fully-available for the current window, which is correct: its counters do not
     /// carry forward. When both RPM and TPM are set, the headroom is the MINIMUM of the two (the
     /// tighter constraint governs how close the key is to a 429).
-    // Wired into production routing: `forward.rs::decide_policy_order` calls this (via
-    // `rate_headroom_for_token`) to produce the per-lane `usage` signal; the in-crate tests also
-    // exercise it directly.
+    // Wired into production routing: `forward.rs::decide_policy_order` calls this on the key it
+    // looked up (one lookup shared with the `send_user` identity projection) to produce the
+    // per-lane `usage` signal; the in-crate tests also exercise it directly.
     pub(crate) fn rate_headroom(&self, key: &VirtualKey, now: u64) -> Option<f64> {
         if key.rpm_limit.is_none() && key.tpm_limit.is_none() {
             return None;
@@ -890,15 +890,6 @@ impl GovState {
             .by_access_key_id
             .get(access_key_id)
             .cloned()
-    }
-
-    /// Rate-limit headroom for the key presenting `secret` (routing `usage` signal). `None` when the
-    /// secret resolves to no key OR the key has no RPM/TPM limit. A thin convenience over
-    /// `lookup` + `rate_headroom` for the routing seam, which holds the caller token but not the key.
-    /// Consumed by `forward.rs::decide_policy_order` to compute each lane's `usage` routing signal.
-    pub(crate) fn rate_headroom_for_token(&self, secret: &str, now: u64) -> Option<f64> {
-        let key = self.lookup(secret)?;
-        self.rate_headroom(&key, now)
     }
 
     /// Direct handle to the backing store, for tests that seed/inspect persistence.

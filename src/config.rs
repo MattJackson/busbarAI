@@ -521,6 +521,17 @@ pub(crate) struct PolicyCfg {
     /// Fallback behavior on timeout/error/abstain/saturation (default `weighted`).
     #[serde(default)]
     pub(crate) on_error: PolicyOnError,
+    /// Opt-in: include the request's prompt content (flattened `system` text + per-message
+    /// `{role, text}`) in the hook payload. DEFAULT OFF — the default payload is shape-only, so no
+    /// prompt text ever leaves the process unless the operator flips this per pool. Turning it on
+    /// says "this hook is trusted with request content" (PII screening, guardrails, audit).
+    #[serde(default)]
+    pub(crate) send_prompt: bool,
+    /// Opt-in: include caller identity in the hook payload — the governance virtual-key `id`/`name`
+    /// (NEVER the secret) and the request body's end-user field (`user` / `metadata.user_id`).
+    /// DEFAULT OFF. Turning it on enables route-by-who policies (team lanes, per-user denies).
+    #[serde(default)]
+    pub(crate) send_user: bool,
     // ── script transport ─────────────────────────────────────────────────────────────────────────
     /// Inline Rhai source. Exactly one of `script`/`script_file` is required when `route: script`.
     /// Read by `routing::resolve_policy`'s script arm, which is gated on the `script-policy` feature;
@@ -1875,6 +1886,36 @@ models:
             serde_yaml::from_str("route: webhook\nmembers: []\npolicy:\n  url: http://x\n")
                 .expect("webhook parses");
         assert_eq!(wh.route, RouteKind::Webhook);
+    }
+
+    /// The hook payload opt-ins (`policy.send_prompt` / `policy.send_user`) are SIMPLE booleans
+    /// that DEFAULT OFF: an absent flag parses false (the shape-only payload), an explicit `true`
+    /// parses true, and a non-boolean value is a parse error (no stringly "yes"/"on" coercion).
+    #[test]
+    fn test_policy_send_flags_default_off() {
+        let p: PoolCfg = serde_yaml::from_str(
+            "route: socket\nmembers: []\npolicy:\n  socket: /run/busbar/h.sock\n",
+        )
+        .expect("parse");
+        let pol = p.policy.unwrap();
+        assert!(!pol.send_prompt, "send_prompt must default off");
+        assert!(!pol.send_user, "send_user must default off");
+
+        let p: PoolCfg = serde_yaml::from_str(
+            "route: socket\nmembers: []\npolicy:\n  socket: /run/busbar/h.sock\n  send_prompt: true\n  send_user: true\n",
+        )
+        .expect("parse");
+        let pol = p.policy.unwrap();
+        assert!(pol.send_prompt);
+        assert!(pol.send_user);
+
+        assert!(
+            serde_yaml::from_str::<PoolCfg>(
+                "route: socket\nmembers: []\npolicy:\n  socket: /s\n  send_prompt: \"yes\"\n"
+            )
+            .is_err(),
+            "a non-boolean send_prompt must fail to parse"
+        );
     }
 
     /// An unknown `route:` value fails loudly (no silent degrade to weighted at parse time).

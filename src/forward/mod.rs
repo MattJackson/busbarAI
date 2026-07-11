@@ -2021,6 +2021,14 @@ enum PolicyOutcome {
     Weighted,
     /// Fail closed with a 503 (`on_error: reject` and the policy errored / timed out).
     Reject,
+    /// The policy DELIBERATELY rejected the request (the hook's `reject` verb — a guardrail said
+    /// no). Distinct from `Reject` above: that is a degraded "policy unavailable" 503, this is a
+    /// first-class 4xx decision. `status`/`message` are pre-clamped/sanitized by `wire::normalize`.
+    RejectRequest {
+        status: u16,
+        message: String,
+        name: &'static str,
+    },
 }
 
 /// Sum the chars of a string value, or 0 for a non-string. Cheap v1 SIZE signal (NOT a token count).
@@ -2051,6 +2059,67 @@ fn total_text_chars(v: &Value, system_chars: usize) -> usize {
     total
 }
 
+/// The request body's end-user identifier, dialect-aware: `user` (OpenAI) first, then
+/// `metadata.user_id` (Anthropic). Part of the `policy.send_user` opt-in identity projection.
+fn body_end_user(v: &Value) -> Option<String> {
+    v.get("user")
+        .and_then(|u| u.as_str())
+        .or_else(|| {
+            v.get("metadata")
+                .and_then(|m| m.get("user_id"))
+                .and_then(|u| u.as_str())
+        })
+        .map(str::to_string)
+}
+
+/// Flatten the ingress body's prompt content into the opt-in hook projection
+/// (`policy.send_prompt`). The same content walk as `total_text_chars` — bare-string content and
+/// `{type:"text", text}` blocks — but collecting the words instead of counting the chars. Non-text
+/// blocks (images, documents, tool results) are skipped: the projection carries text, never binary
+/// blobs. Runs ONLY behind the per-pool opt-in, so the allocations never touch a default pool.
+fn build_prompt_projection(v: &Value) -> crate::routing::PromptProjection {
+    // A content value is a bare string or an array of blocks; text blocks are joined by newline.
+    fn flatten_content(c: Option<&Value>) -> String {
+        match c {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(blocks)) => {
+                let mut out = String::new();
+                for b in blocks {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        out.push_str(t);
+                    }
+                }
+                out
+            }
+            _ => String::new(),
+        }
+    }
+    let system = v
+        .get("system")
+        .map(|s| flatten_content(Some(s)))
+        .filter(|s| !s.is_empty());
+    let messages = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|msgs| {
+            msgs.iter()
+                .map(|m| {
+                    let role = m
+                        .get("role")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    (role, flatten_content(m.get("content")))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    crate::routing::PromptProjection { system, messages }
+}
+
 /// Build the routing projection (request + candidates + context) and run the resolved policy ONCE,
 /// bounded by its configured timeout, coercing the result to a `PolicyOutcome` per `on_error`.
 ///
@@ -2078,12 +2147,14 @@ async fn decide_policy_order(
 
     // A weighted/default pool resolves to `None` at config load (no policy object is constructed), so
     // the only `ResolvedPolicy` that can reach this seam is a constructed `Policy`.
-    let (policy, on_error, timeout) = match resolved {
+    let (policy, on_error, timeout, send_prompt, send_user) = match resolved {
         ResolvedPolicy::Policy {
             policy,
             on_error,
             timeout,
-        } => (policy, on_error, *timeout),
+            send_prompt,
+            send_user,
+        } => (policy, on_error, *timeout, *send_prompt, *send_user),
     };
 
     // The candidate set the policy ranks over = this pool's members MINUS the already-excluded ones
@@ -2096,11 +2167,40 @@ async fn decide_policy_order(
         return PolicyOutcome::Weighted;
     }
 
-    // Per-key governance rate headroom (same value across candidates today — rate limits are per-key;
-    // see `Candidate.rate_headroom`). Computed ONCE: a single key lookup + window read.
-    let rate_headroom: Option<f64> = match (app.governance.as_ref(), caller_token) {
-        (Some(gov), Some(tok)) => gov.rate_headroom_for_token(tok, now()),
+    // ONE governance key lookup serves both consumers: the per-key rate headroom (always, same
+    // value across candidates today — rate limits are per-key; see `Candidate.rate_headroom`) and,
+    // behind `policy.send_user`, the caller identity projection. The key RECORD is looked up; the
+    // secret itself never flows past this line.
+    let gov = app.governance.as_ref();
+    let gov_key = match (gov, caller_token) {
+        (Some(g), Some(tok)) => g.lookup(tok),
         _ => None,
+    };
+    let rate_headroom: Option<f64> = match (gov, gov_key.as_ref()) {
+        (Some(g), Some(key)) => g.rate_headroom(key, now()),
+        _ => None,
+    };
+
+    // `policy.send_user` opt-in (default off): project the caller identity — the virtual key's
+    // id/name (from the resolved record, NEVER the token) plus the body's end-user field (`user` in
+    // the OpenAI dialect, `metadata.user_id` in the Anthropic dialect).
+    let identity = if send_user {
+        let body_user = body_end_user(v);
+        Some(crate::routing::CallerIdentity {
+            key_id: gov_key.as_ref().map(|k| k.id.clone()),
+            key_name: gov_key.as_ref().map(|k| k.name.clone()),
+            user: body_user,
+        })
+    } else {
+        None
+    };
+
+    // `policy.send_prompt` opt-in (default off): flatten the prompt content for the hook. The
+    // allocation cost lives entirely behind the flag — a shape-only pool never runs this.
+    let prompt = if send_prompt {
+        Some(build_prompt_projection(v))
+    } else {
+        None
     };
 
     let member_meta = app.pool_runtime.get(pool_name).map(|r| &r.members);
@@ -2135,6 +2235,8 @@ async fn decide_policy_order(
             .and_then(|m| m.as_u64())
             .map(|n| n as u32),
         stream: wants_stream,
+        prompt,
+        identity,
     };
 
     let candidates: Vec<Candidate> = live
@@ -2217,10 +2319,21 @@ async fn decide_policy_order(
                     name: policy.name(),
                 },
                 RoutingDecision::Abstain => PolicyOutcome::Weighted,
+                // `from_ranked` only ever produces Prefer/Abstain — it normalizes an order, it
+                // cannot invent a rejection.
+                RoutingDecision::Reject { .. } => unreachable!("from_ranked never rejects"),
             }
         }
         // Abstain is the clean "no opinion" — today's exact SWRR (NOT coerced via on_error).
         RoutingDecision::Abstain => PolicyOutcome::Weighted,
+        // The hook's reject verb: a deliberate first-class decision (a guardrail said no), NOT an
+        // error — `on_error` does not apply. `status`/`message` were clamped/sanitized at parse
+        // time by `wire::normalize`.
+        RoutingDecision::Reject { status, message } => PolicyOutcome::RejectRequest {
+            status,
+            message,
+            name: policy.name(),
+        },
     }
 }
 
@@ -2494,6 +2607,36 @@ pub(crate) async fn forward_with_pool_parsed(
                         StatusCode::SERVICE_UNAVAILABLE,
                         KIND_OVERLOADED,
                         "The routing policy could not select an upstream. Please retry shortly.",
+                    );
+                }
+                // The hook's REJECT verb: a deliberate, first-class policy decision (a guardrail /
+                // PII screen said no) — a 4xx to the caller, no upstream dispatched, and an
+                // operator-visible counter. `status` was clamped to 400..=499 and `message`
+                // sanitized (control chars stripped, length capped) by `wire::normalize`, so this
+                // arm can trust both.
+                PolicyOutcome::RejectRequest {
+                    status,
+                    message,
+                    name,
+                } => {
+                    metrics::counter!(
+                        crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
+                        "policy" => name,
+                        "pool" => pool_name.to_string(),
+                        "status" => status.to_string(),
+                    )
+                    .increment(1);
+                    tracing::info!(
+                        policy = name,
+                        pool = pool_name,
+                        status,
+                        "routing policy rejected the request"
+                    );
+                    return ingress_error(
+                        ingress_protocol,
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+                        KIND_PERMISSION,
+                        &message,
                     );
                 }
             }
@@ -10017,5 +10160,72 @@ mod probe_guard_tests {
             matches!(store.breaker_state_in("", 0), BreakerState::HalfOpen),
             "a disarmed guard must NOT release the probe — the owning dispatched request holds it"
         );
+    }
+}
+
+#[cfg(test)]
+mod hook_opt_in_projection_tests {
+    use super::*;
+
+    /// `build_prompt_projection` flattens both Anthropic content shapes: bare-string content and
+    /// `{type:"text"}` block arrays (text blocks joined by newline, non-text blocks skipped).
+    #[test]
+    fn prompt_projection_flattens_string_and_block_content() {
+        let v: Value = serde_json::json!({
+            "system": "be brief",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "part one"},
+                    {"type": "image", "source": {"data": "AAAA"}},
+                    {"type": "text", "text": "part two"}
+                ]}
+            ]
+        });
+        let p = build_prompt_projection(&v);
+        assert_eq!(p.system.as_deref(), Some("be brief"));
+        assert_eq!(
+            p.messages,
+            vec![
+                ("user".to_string(), "hello".to_string()),
+                ("assistant".to_string(), "part one\npart two".to_string()),
+            ]
+        );
+    }
+
+    /// A system prompt given as a BLOCK ARRAY (Anthropic allows both) flattens too; an absent /
+    /// empty system stays `None` so the wire omits the key.
+    #[test]
+    fn prompt_projection_system_blocks_and_absent() {
+        let v: Value = serde_json::json!({
+            "system": [{"type": "text", "text": "sys a"}, {"type": "text", "text": "sys b"}],
+            "messages": []
+        });
+        let p = build_prompt_projection(&v);
+        assert_eq!(p.system.as_deref(), Some("sys a\nsys b"));
+
+        let v: Value = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        let p = build_prompt_projection(&v);
+        assert_eq!(p.system, None);
+
+        // A non-JSON / bodyless request (v == Null) projects empty, never panics.
+        let p = build_prompt_projection(&Value::Null);
+        assert_eq!(p.system, None);
+        assert!(p.messages.is_empty());
+    }
+
+    /// `body_end_user` is dialect-aware: OpenAI `user` first, Anthropic `metadata.user_id` second,
+    /// `None` when neither (or the field is not a string).
+    #[test]
+    fn body_end_user_reads_both_dialects() {
+        let v: Value = serde_json::json!({"user": "alice"});
+        assert_eq!(body_end_user(&v).as_deref(), Some("alice"));
+        let v: Value = serde_json::json!({"metadata": {"user_id": "bob"}});
+        assert_eq!(body_end_user(&v).as_deref(), Some("bob"));
+        let v: Value = serde_json::json!({"user": "alice", "metadata": {"user_id": "bob"}});
+        assert_eq!(body_end_user(&v).as_deref(), Some("alice"));
+        let v: Value = serde_json::json!({"user": 42});
+        assert_eq!(body_end_user(&v), None);
+        assert_eq!(body_end_user(&Value::Null), None);
     }
 }

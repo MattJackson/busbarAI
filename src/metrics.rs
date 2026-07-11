@@ -83,6 +83,7 @@ pub(crate) const TRANSLATIONS_TOTAL: &str = "busbar_translations_total"; // labe
 // NAME (a fixed enumeration: cheapest/fastest/least_busy/usage/webhook/script) and `pool` is the
 // configured pool name (bounded at startup) — both safe, bounded labels (no request-derived data).
 pub(crate) const ROUTE_POLICY_SELECTIONS_TOTAL: &str = "busbar_route_policy_selections_total"; // labels: policy, pool
+pub(crate) const ROUTE_POLICY_REJECTIONS_TOTAL: &str = "busbar_route_policy_rejections_total"; // labels: policy, pool, status
 
 // Request-log webhook deliveries DROPPED because the in-flight delivery semaphore was saturated (the
 // webhook endpoint is slow/unreachable and the bounded delivery pool is full). Incremented once per
@@ -192,6 +193,10 @@ fn describe() {
     describe_counter!(
         ROUTE_POLICY_SELECTIONS_TOTAL,
         "Requests whose routing policy produced a ranked order, by policy name and pool"
+    );
+    describe_counter!(
+        ROUTE_POLICY_REJECTIONS_TOTAL,
+        "Requests deliberately rejected by the routing policy's reject verb, by policy name, pool, and status"
     );
     describe_counter!(
         TRANSLATIONS_TOTAL,

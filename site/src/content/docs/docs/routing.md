@@ -254,9 +254,26 @@ Field notes:
 - `candidates[*].latency_ms`; `null` until the lane has served at least one request.
 - `candidates[*].budget_remaining`; `null` = unlimited (`max_requests: -1`).
 - `candidates[*].rate_headroom`; remaining RPM/TPM headroom as a fraction; `null` when governance is disabled or the lane has no rate limit.
+- `candidates[*].tags`; the member's operator-declared free-form `tags` array (team names, regions, compliance labels). Omitted entirely when the member declares none.
 - `context.budget_remaining`; always `null` in 1.0: the per-key governance budget is intentionally not fed to the routing seam. Use per-member `budget_remaining` for lane-level capacity.
 
-> The payload contains only the request projection; no prompt text, no message bodies. Routing hooks receive no request content by default: a routing decision is a shape decision. Content-carrying hooks (PII screening, audit, guardrails) are planned as an explicit per-hook opt-in, never a default.
+> By default the payload contains only the request projection; no prompt text, no message bodies, no caller identity. A routing decision is a shape decision. Two per-pool opt-ins (below) extend it for hooks you trust with more.
+
+**Payload opt-ins (`send_prompt`, `send_user`).** Both are simple booleans on the `policy` block, both default `false`, and both work identically on the webhook and socket transports. A pool that sets neither sends the exact payload above.
+
+- `send_prompt: true` adds the request's content to `request`: a `system` string (the flattened system-prompt text; absent when the request has none) and a `messages` array of `{"role": "...", "text": "..."}` (text content flattened; images and other binary blocks are skipped). This is the switch for content-screening hooks: PII detection, guardrails, audit. Flip it only for a hook you trust with request content.
+- `send_user: true` adds `request.user`: `{"key_id": "...", "key_name": "...", "user": "..."}` — the governance virtual key's `id` and `name` (when the caller authenticated with one) and the body's end-user field (`user` in the OpenAI dialect, `metadata.user_id` in the Anthropic dialect), each absent when unknown. This is the switch for route-by-who policies: team lanes, per-user denies. **The caller's secret/token is never in the payload, under any configuration** — the identity projection is built from the resolved key record, not the credential.
+
+```yaml
+pools:
+  guarded:
+    route: socket
+    policy:
+      socket: /run/busbar/guard.sock
+      send_prompt: true      # this hook screens content
+      send_user: true        # ... and routes by caller
+    members: [...]
+```
 
 **Response payload (sidecar → Busbar):**
 
@@ -270,11 +287,17 @@ Or abstain (fall back to `on_error`):
 { "abstain": true }
 ```
 
+Or **reject** the request outright — no upstream is dispatched and the caller receives a dialect-native error:
+```json
+{ "reject": { "status": 451, "message": "Request blocked: contains an unredacted SSN." } }
+```
+
 Rules:
 - `order` is the only ranking key. Unknown `idx` values are dropped; duplicates are deduplicated preserving first-seen order.
 - Omitted candidates are demoted, not excluded; the failover loop can still reach them after the ranked set is exhausted.
 - An absent or empty `order` (including a bare `{}`) is treated as abstain.
 - `abstain: true` explicitly signals no preference; the `order` field is ignored if present alongside it.
+- `reject` wins over `order` and `abstain` if sent together. Both of its fields are optional: a bare `{"reject":{}}` rejects with the defaults (403, a generic message). `status` is clamped to 400–499 — a hook cannot mint a success, a redirect, or a 5xx — and `message` is sanitized (control characters stripped, length capped) before it reaches the client error body. A rejection is a deliberate decision, not a failure: `on_error` does not apply, and each one increments `busbar_route_policy_rejections_total` (labels: policy, pool, status). Combined with `send_prompt` this is the PII-screen primitive: a hook that sees content can stop a request before it leaves your network.
 - Any non-2xx response, malformed JSON, or timeout applies `on_error` (same as abstain for the default `on_error: weighted`).
 
 **Transparency.** Every response with a non-default routing policy carries two headers: `x-busbar-route-policy` (the policy name) and `x-busbar-route-target` (the chosen lane model); for example `x-busbar-route-policy: webhook` and `x-busbar-route-target: claude-sonnet`.
@@ -283,7 +306,7 @@ Rules:
 
 `route: socket`
 
-The fast hook: an operator-run compiled binary (Rust or anything else) listening on a **local Unix domain socket**. Busbar writes one newline-terminated JSON line per decision — the exact same payload as the webhook POST body — and reads one line back (`{"order":[...]}` or `{"abstain":true}`). The connection is kept alive across decisions.
+The fast hook: an operator-run compiled binary (Rust or anything else) listening on a **local Unix domain socket**. Busbar writes one newline-terminated JSON line per decision — the exact same payload as the webhook POST body, including the same `send_prompt`/`send_user` opt-ins — and reads one line back (`{"order":[...]}`, `{"abstain":true}`, or `{"reject":{...}}`, same reply rules as the webhook). The connection is kept alive across decisions.
 
 **Speed.** Measured end to end through Busbar's transport against the example Rust hook running as a separate process: about **8 microseconds median, p99 about 12** (3 candidates). Roughly 20x faster than a co-located HTTP webhook, with the same full process isolation: a crash in your hook is contained, and Busbar falls back per `on_error`.
 
@@ -391,6 +414,8 @@ Scripts are operator-config only; never client-supplied.
 | `socket` | string | none | `socket` | Absolute filesystem path of the hook binary's Unix domain socket. Required when `route: socket`. The binary is operator-run; the connection is lazy, so the hook may start after Busbar. |
 | `timeout_ms` | integer | `1` | `native`, `webhook`, `socket`, `script` | Hard wall-clock deadline for the policy decision in milliseconds. On timeout, `on_error` applies. (Native policies are synchronous and effectively never hit it.) |
 | `on_error` | string | `weighted` | `native`, `webhook`, `socket`, `script` | Fallback when the policy times out or errors: `weighted` (SWRR), `reject` (503), or `first` (first member in config order). An explicit abstain bypasses this and always falls through to SWRR. |
+| `send_prompt` | boolean | `false` | `webhook`, `socket` | Opt-in: add the request's prompt content (`request.system` + `request.messages` as `{role, text}`) to the hook payload. Off = the shape-only default payload. For hooks trusted with content: PII screening, guardrails, audit. |
+| `send_user` | boolean | `false` | `webhook`, `socket` | Opt-in: add caller identity (`request.user`: the governance virtual-key `id`/`name` plus the body's end-user field) to the hook payload. The caller's secret/token is never sent, under any configuration. For route-by-who policies. |
 | `script` | string | none | `script` | Inline Rhai source. If both `script` and `script_file` are set, inline `script` takes precedence. |
 | `script_file` | string | none | `script` | Path to a Rhai script file. Alternative to inline `script`. If neither is set (or the `script-policy` feature is off), routing degrades to weighted SWRR. |
 
@@ -402,7 +427,7 @@ Added to each pool member. All optional; inert for pools with `route: weighted`.
 |---|---|---|---|
 | `tier` | string | none | Operator-declared routing tier (e.g. `"primary"`, `"overflow"`, `"large"`, `"small"`). Exposed to webhook and script policies as `tier`. |
 | `cost_per_mtok` | float | none | Operator-declared cost in currency units per million tokens. Drives `cheapest` and is exposed to webhook/script. |
-| `tags` | list<string> | `[]` | Free-form labels (e.g. `["opus", "large-context"]`). Exposed to webhook and script for tag-based selection. |
+| `tags` | list<string> | `[]` | Free-form labels (e.g. `["opus", "large-context"]`). Exposed to webhook, socket, and script policies for tag-based selection (`candidates[*].tags` on the hook wire; omitted when empty). |
 
 ### Startup validation and misconfiguration behavior
 
@@ -550,3 +575,4 @@ pools:
 | Metric | Labels | Description |
 |---|---|---|
 | `busbar_route_policy_selections_total` | `policy`, `pool` | Count of requests where a non-default routing policy produced a usable ranked order (incremented once per selection). |
+| `busbar_route_policy_rejections_total` | `policy`, `pool`, `status` | Count of requests deliberately rejected by a hook's `reject` verb (no upstream dispatched, 4xx to the caller). |

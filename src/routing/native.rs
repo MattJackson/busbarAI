@@ -253,6 +253,8 @@ mod tests {
             system_chars: 0,
             max_tokens: None,
             stream: false,
+            prompt: None,
+            identity: None,
         }
     }
 
