@@ -1085,6 +1085,13 @@ impl ProtocolReader for GeminiReader {
                 let offset = usize::from(state.reasoning_seen);
                 let ti = state.text_index.unwrap_or(offset + state.open_tools.len());
                 if !state.text_block_open {
+                    // Close a still-open thinking block first (the text-part arm does this too);
+                    // otherwise two blocks are open at once and the downstream translator sees an
+                    // invariant violation.
+                    if state.thinking_block_open {
+                        state.thinking_block_open = false;
+                        out.push(IrStreamEvent::BlockStop { index: 0 });
+                    }
                     state.text_block_open = true;
                     state.text_index = Some(ti);
                     out.push(IrStreamEvent::BlockStart {
@@ -1112,6 +1119,13 @@ impl ProtocolReader for GeminiReader {
                 let offset = usize::from(state.reasoning_seen);
                 let ti = state.text_index.unwrap_or(offset + state.open_tools.len());
                 if !state.text_block_open {
+                    // Close a still-open thinking block first (the text-part arm does this too);
+                    // otherwise two blocks are open at once and the downstream translator sees an
+                    // invariant violation.
+                    if state.thinking_block_open {
+                        state.thinking_block_open = false;
+                        out.push(IrStreamEvent::BlockStop { index: 0 });
+                    }
                     state.text_block_open = true;
                     state.text_index = Some(ti);
                     out.push(IrStreamEvent::BlockStart {

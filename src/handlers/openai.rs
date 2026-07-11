@@ -238,7 +238,12 @@ impl OperationHandler for OpenAiTranscription {
                 MediaPayload::B64(s) => base64_decode(s).unwrap_or_default(),
                 MediaPayload::Uri(_) => Bytes::new(),
             };
-            out.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio\"\r\nContent-Type: {}\r\n\r\n", blob.mime_type).as_bytes());
+            // Sanitize at the EGRESS boundary too: mime_type can enter the IR from ANY ingress
+            // reader (e.g. Gemini inline_data), not just the OpenAI multipart parser, so sanitizing
+            // only at ingress left the gemini->openai transcription path exposed to CR/LF header
+            // injection. This is the one place the outgoing header is built, so it covers all paths.
+            let safe_mime = sanitize_mime_type(&blob.mime_type);
+            out.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio\"\r\nContent-Type: {safe_mime}\r\n\r\n").as_bytes());
             out.extend_from_slice(&bytes);
             out.extend_from_slice(b"\r\n");
         }
@@ -907,6 +912,33 @@ mod tests {
         let out2 = OpenAiEmbeddings.write_request(&ir2);
         let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
         assert!(v2.get("encoding_format").is_none());
+    }
+
+    #[test]
+    fn egress_multipart_sanitizes_mime_from_any_ingress() {
+        // A poisoned mime_type reaching the IR from ANY reader (not just the openai multipart
+        // parser) must not inject headers into the egress multipart. Build the transcription IR
+        // directly with a CR/LF mime (as a gemini inline_data reader could) and assert the egress
+        // bytes carry no injected header.
+        let ir = crate::ir::variant::IrReq::Transcription(crate::ir::audio::TranscriptionReq {
+            model: "whisper-1".into(),
+            audio: Some(crate::media::MediaBlob {
+                payload: crate::media::MediaPayload::Bytes(bytes::Bytes::from_static(b"x")),
+                mime_type: "audio/mp3\r\nX-Injected: evil".into(),
+                pcm: None,
+            }),
+            ..Default::default()
+        });
+        let out = OpenAiTranscription.write_request(&ir);
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("X-Injected"),
+            "egress must not carry the injected header: {text}"
+        );
+        assert!(
+            text.contains("Content-Type: audio/mp3\r\n"),
+            "sanitized mime should remain"
+        );
     }
 
     #[test]

@@ -3865,6 +3865,7 @@ async fn forward_once(
     // previously lacked the `ir.extra.clear()` the hot path had, leaking source-only keys like OpenAI
     // `logprobs`/`top_logprobs`/`n` to a foreign backend): the clear now lives in the one shared fn,
     // so neither path can be missing it.
+    let body_is_json = v.is_some();
     let payload = match translate_request_cross_protocol(
         app,
         i,
@@ -3931,11 +3932,25 @@ async fn forward_once(
     };
     let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 
+    // Egress Content-Type — mirror the main forward path exactly (it was hardcoded APPLICATION_JSON
+    // here, which sent an opaque multipart transcription / binary body upstream as application/json,
+    // a guaranteed 400). JSON body -> JSON; same-protocol opaque -> the caller's own CT (boundary
+    // preserved); cross-protocol opaque -> the egress operation handler's declared wire CT.
+    let egress_ct: &str = if body_is_json {
+        APPLICATION_JSON
+    } else if ingress_protocol == egress_name {
+        req_content_type
+    } else {
+        crate::handlers::request_handler(egress_name)
+            .and_then(|rh| rh.operation_handler(op.operation))
+            .map(|h| h.egress_request_content_type())
+            .unwrap_or(APPLICATION_JSON)
+    };
     let mut req = app
         .client
         .post(format!("{base}{wire_path}"))
         .headers(convert_headers(auth))
-        .header(CONTENT_TYPE, APPLICATION_JSON)
+        .header(CONTENT_TYPE, egress_ct)
         // Native-SDK User-Agent for the egress protocol (mirrors the main forward path). Dispatched
         // through the writer vtable (`ProtocolWriter::egress_user_agent`) — writer resolved above.
         .header(USER_AGENT, writer.egress_user_agent())

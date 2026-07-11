@@ -491,7 +491,19 @@ impl OperationHandler for GeminiEmbeddings {
             return Bytes::new();
         };
         let text = match &r.input {
-            EmbInput::Text(v) => v.first().cloned().unwrap_or_default(),
+            EmbInput::Text(v) => {
+                // Gemini `:embedContent` embeds a SINGLE content; a multi-input request can only
+                // embed the first here (batch would need `:batchEmbedContents`, a 1.3 item). Warn
+                // rather than silently drop the rest.
+                if v.len() > 1 {
+                    tracing::warn!(
+                        dropped = v.len() - 1,
+                        "Gemini :embedContent takes one input; embedding only the first of a \
+                         multi-input request (the rest are not sent)"
+                    );
+                }
+                v.first().cloned().unwrap_or_default()
+            }
             _ => String::new(),
         };
         let body = json!({ "content": { "parts": [{ "text": text }] } });

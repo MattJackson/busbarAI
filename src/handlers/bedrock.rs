@@ -187,7 +187,19 @@ impl OperationHandler for BedrockEmbeddings {
             return Bytes::new();
         };
         let text = match &r.input {
-            EmbInput::Text(v) => v.first().cloned().unwrap_or_default(), // Titan takes a single inputText
+            EmbInput::Text(v) => {
+                // Titan's InvokeModel embeddings takes a SINGLE `inputText`; a multi-input request
+                // (OpenAI allows an array) can only embed the first here. Warn rather than silently
+                // drop the rest — true multi-input fan-out to single-input backends is a 1.3 item.
+                if v.len() > 1 {
+                    tracing::warn!(
+                        dropped = v.len() - 1,
+                        "Titan embeddings takes one input; embedding only the first of a \
+                         multi-input request (the rest are not sent)"
+                    );
+                }
+                v.first().cloned().unwrap_or_default()
+            }
             _ => String::new(),
         };
         let mut body = json!({ "inputText": text });
