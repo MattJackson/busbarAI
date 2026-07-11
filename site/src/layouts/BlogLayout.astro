@@ -50,6 +50,27 @@ const ARTICLE = datePublished
 
     <main class="post-wrap">
       <slot />
+      {datePublished && (
+        <section class="post-comments">
+          <h2>Comments</h2>
+          <p class="post-comments-note">Sign in with GitHub to comment. Threads live in <a href={`${GITHUB}/discussions`}>GitHub Discussions</a>.</p>
+          <script src="https://giscus.app/client.js"
+            data-repo="MattJackson/busbarAI"
+            data-repo-id="R_kgDOSq5yIA"
+            data-category="Announcements"
+            data-category-id="DIC_kwDOSq5yIM4DA8cA"
+            data-mapping="pathname"
+            data-strict="1"
+            data-reactions-enabled="1"
+            data-emit-metadata="0"
+            data-input-position="top"
+            data-theme="light"
+            data-lang="en"
+            data-loading="lazy"
+            crossorigin="anonymous"
+            async></script>
+        </section>
+      )}
     </main>
 
     <footer class="footer">
@@ -148,6 +169,12 @@ const ARTICLE = datePublished
       .post-body pre { background: var(--slate); color: #e2e8f0; border-radius: 10px; padding: 18px 20px; overflow-x: auto; margin: 0 0 20px; }
       .post-body pre code { background: none; border: none; padding: 0; color: inherit; font-size: 13.5px; }
       .post-body blockquote { margin: 0 0 22px; padding: 4px 0 4px 20px; border-left: 3px solid var(--lime); color: #475569; font-size: 17px; }
+
+      /* COMMENTS (giscus) */
+      .post-comments { max-width: 720px; margin: 64px auto 0; padding-top: 36px; border-top: 1px solid var(--line); }
+      .post-comments h2 { font-size: 22px; font-weight: 800; color: var(--slate); margin: 0 0 6px; }
+      .post-comments-note { font-size: 14px; color: var(--muted); margin: 0 0 20px; }
+      .post-comments-note a { color: #4d7c0f; text-decoration: underline; text-underline-offset: 3px; }
 
       /* LIST */
       .post-list { max-width: 760px; margin: 0 auto; }

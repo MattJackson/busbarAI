@@ -1,6 +1,6 @@
 ---
-title: "The smart router you want already exists. It's a hook."
-description: "Everyone asks for automatic model selection by task, latency, quality, and cost. You don't need a new product for that. You need a request-path hook that sees the right signals, and a control plane that keeps the hook honest. Busbar ships both today. Here's a working smart router in one Python file."
+title: "The smart router you want is a hook. Here it is, in 0.67 microseconds."
+description: "Everyone asks for automatic model selection by task, latency, quality, and cost. It is not a product, it is a hook. Busbar gives you two ways to run it: a native policy it ships that ranks in 0.67 microseconds, or your own webhook in any language. Both wired to the same failover and fail-safe machinery."
 date: 2026-07-11
 author: "Matthew Jackson"
 authorTitle: "Founder, Busbar"
@@ -8,7 +8,7 @@ authorTitle: "Founder, Busbar"
 
 A user told me this week: "The best model should be selected automatically based on the task, latency, quality, and cost."
 
-I agree. And I want to show why that sentence does not describe a new product. It describes a hook. Busbar, Your AI Control Plane, ships that hook today, and in this post I build the whole thing: a task-aware smart router in one Python file, wired into a pool, with a fail-safe that means it can never take your traffic down.
+I agree. And I want to show why that sentence does not describe a new product. It describes a hook. Busbar, Your AI Control Plane, gives you two ways to run that hook, and in this post I show both, measured honestly: a native policy Busbar ships that ranks a request in about **0.67 microseconds**, and a webhook you write in any language when you want logic of your own. Both plug into the same failover, circuit-breaker, and fail-safe machinery, so neither can take your traffic down. (Everything here is built on the 1.2.1 release.)
 
 ## The shape of the problem
 
@@ -18,88 +18,26 @@ The first job is the decision. Given a request and a set of models, rank them. T
 
 The second job is everything around the decision. See live latency and load. Enforce the ranking. Fail over when the top pick is down. Never let the decision layer itself become an outage. This is infrastructure, and it does not change weekly.
 
-Busbar's position is simple: you own the first job, the control plane owns the second. The seam between them is `route: webhook`. Before each request's failover loop, Busbar POSTs a small projection of the request plus every candidate in the pool to a sidecar you run, and reads back a ranked preference list. That is the entire contract.
+Busbar's position is simple: you own the first job, the control plane owns the second. The seam between them is a hook, and Busbar gives you two ways to run the exact same decision.
 
-## What the hook actually sees
+## The decision, in three steps
 
-The payload is deliberately small. For the request: the pool name, the ingress protocol, message count, whether tools are declared, total prompt size in characters, the requested `max_tokens`, and whether it streams. For each candidate: the model name, the operator-declared `tier` and `cost_per_mtok`, a rolling latency EWMA in milliseconds, live free concurrency slots, remaining request budget, and rate-limit headroom from Governance.
+Whichever way you run it, the logic is small and the same. Classify the request into a task bucket from shape alone, score every candidate through that bucket's weights over the live signals, sort.
 
-Notice what is missing: the prompt. Busbar never sends message content to an external sink. That is a Security stance, not an oversight. Your routing sidecar classifies on shape, not on words.
+**Classify** on shape, never content: tools declared means code, a big `max_tokens` or a long prompt means long-form, a single-shot non-streaming call means bulk, everything else is a quick interactive answer.
 
-That turns out to be enough. The whole policy is two steps, and it helps to keep them separate.
+**Score** turns the bucket into dials. A code request weights capability and latency; a bulk request weights cost. Each candidate scores on its live cost, latency, and free concurrency, plus a boost for the operator-declared quality `tier`, then scaled down as a lane nears its rate-limit cap.
 
-**Step one, classify the request into one bucket.** This is the "does this request look like code, or bulk, or a long document" decision. It is pure shape, no content, and it returns a single label:
+**Sort** descending, return the order. That is the whole policy. It is not a static "if X use Y" table and it is not blind cost math: one classification step picks the weights, then a scoring pass applies them to the live signals of every candidate, so the same pool serves a code request and a bulk request ranked differently.
 
-```python
-def classify(req):
-    total_chars = req.get("total_chars") or 0
-    max_tokens = req.get("max_tokens") or 0
-    if req.get("has_tools"):
-        return "code"          # tool and agent traffic wants the capable tier
-    if max_tokens >= 4096 or total_chars > 24_000:
-        return "long-form"     # ~4 chars per token, so 24k chars is ~6k tokens
-    if not req.get("stream") and req.get("message_count", 0) <= 1:
-        return "bulk"          # single-shot, non-interactive: optimize cost
-    return "quick-answer"      # interactive default: optimize latency
-```
+## Answer one: the native policy Busbar ships
 
-**Step two, score every candidate through that bucket's weights.** The bucket is not the answer, it is a set of dials: how much cost matters versus latency versus free capacity for this kind of request, plus which quality tiers to prefer.
-
-```python
-BUCKETS = {
-    #                cost  latency  concurrency  boosted tiers
-    "quick-answer": (0.30, 0.50,    0.20,        ("small", "overflow")),
-    "code":         (0.10, 0.20,    0.20,        ("large", "primary")),
-    "long-form":    (0.20, 0.10,    0.20,        ("large", "primary")),
-    "bulk":         (0.60, 0.10,    0.30,        ("small", "overflow")),
-}
-TIER_BOOST = 0.5
-
-def score(cand, bucket, max_cost, max_latency, max_conc):
-    w_cost, w_lat, w_conc, tiers = BUCKETS[bucket]
-    cost = cand.get("cost_per_mtok")
-    cost_s = 0.5 if cost is None else 1.0 - (cost / max_cost if max_cost else 0.0)
-    lat = cand.get("latency_ms")            # EWMA; null until the lane has served
-    lat_s = 0.5 if lat is None else 1.0 - (lat / max_latency if max_latency else 0.0)
-    conc_s = (cand.get("available_concurrency", 0) / max_conc) if max_conc else 0.5
-    s = w_cost * cost_s + w_lat * lat_s + w_conc * conc_s
-    if cand.get("tier") in tiers:
-        s += TIER_BOOST                     # the operator's quality judgment
-    headroom = cand.get("rate_headroom")
-    if headroom is not None:
-        s *= 0.5 + 0.5 * headroom           # back off lanes near their rate cap
-    return s
-```
-
-**And the glue, which is what ties the two together.** Classify the request once, score every candidate with that bucket's dials, sort, return the order:
-
-```python
-def rank(payload):
-    req = payload.get("request", {})
-    cands = payload.get("candidates", [])
-    if not cands:
-        return {"abstain": True}
-    bucket = classify(req)
-    max_cost = max((c.get("cost_per_mtok") or 0.0) for c in cands)
-    max_latency = max((c.get("latency_ms") or 0.0) for c in cands)
-    max_conc = max(c.get("available_concurrency", 0) for c in cands)
-    order = sorted(cands, key=lambda c: score(c, bucket, max_cost, max_latency, max_conc),
-                   reverse=True)
-    return {"order": [c["idx"] for c in order]}
-```
-
-So it is not a static "if X use Y" table and it is not blind cost math. It is one classification step that picks the weights, then a scoring pass that applies those weights to the live signals of every candidate. A code request weights capability and latency; a bulk request weights cost; the same pool serves both, ranked differently per request. The whole server, with logging and error handling, is about 115 lines of stdlib Python. It lives in the repo under [`examples/smart-router/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router), next to a Rhai version that runs the same logic in-process for builds with the `script-policy` feature.
-
-The config is one pool:
+You do not have to write it. Busbar ships this exact logic as a native routing policy. One line:
 
 ```yaml
 pools:
-  smart-router:
-    route: webhook
-    policy:
-      url: "http://127.0.0.1:8787/"
-      timeout_ms: 150        # the default hard deadline
-      on_error: weighted     # the default fallback
+  chat:
+    route: smart
     members:
       - target: claude-sonnet
         tier: large
@@ -107,10 +45,38 @@ pools:
       - target: gpt-4o-mini
         tier: small
         cost_per_mtok: 0.15
-      # ... tier and cost_per_mtok on each member feed the policy
 ```
 
-Any client speaking any of Busbar's six protocols hits `smart-router` as if it were a model, and Translate carries the request to whichever backend wins. Every response tells you what happened: `x-busbar-route-policy: webhook` and `x-busbar-route-target: gpt-4o-mini`. That is Observability on every single decision.
+`route: smart` classifies, scores, and ranks in-process, compiled, no sidecar and no script. On an Apple M5 Pro it ranks a request in about **0.67 microseconds** (666 nanoseconds median, measured, see the benchmark). That is not a typo. The whole Busbar layer adds tens of microseconds to a request, so a routing decision at two thirds of a microsecond is free in any way that matters. You set `tier` and `cost_per_mtok` on each member; the policy does the rest, per request.
+
+## Answer two: your own hook, in any language
+
+The native policy is opinionated on purpose. When you want your own logic, weights you tuned on your own evals, or a rule the built-in does not have, you write a webhook. Set `route: webhook`, point it at a sidecar you run, and Busbar POSTs the same request-and-candidates projection before each failover loop and reads back a ranked `{"order":[...]}`. The sidecar is any language. The example is about a hundred lines of Go, standard library only, and its `classify` is the same shape as the native one:
+
+```go
+func classify(r request) weights {
+    switch {
+    case r.HasTools: // tool / agent traffic wants the capable tier
+        return weights{0.10, 0.20, 0.20, []string{"large", "primary"}}
+    case (r.MaxTokens != nil && *r.MaxTokens >= 4096) || r.TotalChars > 24000: // long-form
+        return weights{0.20, 0.10, 0.20, []string{"large", "primary"}}
+    case !r.Stream && r.MessageCount <= 1: // single-shot: optimize cost
+        return weights{0.60, 0.10, 0.30, []string{"small", "overflow"}}
+    default: // interactive default: optimize latency
+        return weights{0.30, 0.50, 0.20, []string{"small", "overflow"}}
+    }
+}
+```
+
+Same classify, same weights, same sort as the native policy, now yours to change. The full sidecar and a `route: webhook` config are in the repo under [`examples/smart-router/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router). A webhook adds a network round trip the native policy does not, but it stays under a millisecond on a co-located sidecar and it lets you write the decision in whatever your team already runs.
+
+## What the hook sees, and what it does not
+
+Both paths see the same projection. For the request: pool name, ingress protocol, message count, whether tools are declared, total prompt size in characters, requested `max_tokens`, whether it streams. For each candidate: model name, operator-declared `tier` and `cost_per_mtok`, a rolling latency EWMA, live free concurrency, remaining budget, and rate-limit headroom from Governance.
+
+Notice what is missing: the prompt. Routing is a shape decision, so by default Busbar sends no message content with it, and the policy classifies on sizes, counts, and flags, not on words. Your prompts do not leave the process just to pick a model. That is a Security default, not an accident, but it is not a wall: content is a separate, explicit, per-hook switch, off unless you turn it on. Default deny, opt in on purpose. That switch is exactly what makes the next hooks possible, which is where this goes.
+
+Any client speaking any of Busbar's six protocols hits the pool as if it were a model, and Translate carries the request to whichever backend wins. Every response tells you what happened: `x-busbar-route-policy` and `x-busbar-route-target`. That is Observability on every single decision.
 
 ## The part that makes it safe to run
 
@@ -120,9 +86,14 @@ The decision has a hard deadline, `policy.timeout_ms`, which defaults to 150 ms.
 
 And the ranking feeds the same Failover loop everything else uses. If the policy's first choice is tripped or at capacity, Busbar walks to the second with the normal circuit-breaker machinery. If the policy drops a candidate from its list, that lane is demoted, not excluded, so a buggy ranking can never strand a healthy model. The policy proposes. The control plane disposes.
 
-## What it costs
+## What it costs, measured
 
-Not much, and you can measure it yourself. On an Apple M5 Pro, the webhook sidecar returns a ranking in about 0.13 ms median over a kept-alive localhost connection (5,000 samples), so a co-located sidecar adds well under a millisecond to the request before dispatch, far under the 150 ms deadline. The benchmark is in [`examples/smart-router/bench/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router/bench). The in-process Rhai policy has its own benchmark that I am finalizing, so I am holding those numbers until they ship and are measured on the next release.
+You can reproduce both numbers yourself; the benchmark is in [`examples/smart-router/bench/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router/bench), all on an Apple M5 Pro.
+
+- **Native `route: smart`: about 0.67 microseconds** median to rank a request (666 ns, 50,000 samples). In-process, compiled, no network, no interpreter. It is a rounding error on the request.
+- **Webhook: sub-millisecond** on a co-located sidecar, plus whatever the network hop costs if it is not co-located. You trade a little latency for the freedom to write the decision in any language.
+
+Either way it is far under the 150 ms deadline, after which Busbar coerces the decision to the pool's `on_error` fallback and the request proceeds anyway. (For the record: I first prototyped the in-process path with an embedded script interpreter and it landed near 100 microseconds, over a hundred times slower than native. That is why the shipped in-process answer is compiled, not scripted.)
 
 ## Honest words about "quality"
 
@@ -132,21 +103,21 @@ What quality means here: you run your evals, you form a judgment about which mod
 
 ## Why a hook, and not a feature
 
-Here is the thinking behind all of this. I build hooks for exactly this purpose: so a team can encode its own policy without the core carrying fifty features that ninety-five percent of users will never turn on. Smart routing is the perfect example. It is not one behavior, it is your behavior, and it changes with your evals and your budget.
+Here is the thinking behind all of this. I build hooks so a team can encode its own policy without the core carrying fifty features that ninety-five percent of users will never turn on. So why did I then build `route: smart` into the core?
 
-I could build this router into the core as a native `smart` policy, and I might. But the more I sit with it, the more I think the better answer is a place for teams to publish and share hooks. Call it a Hooks Repository: a routing policy someone already tuned for their workload is one you start from instead of writing from scratch, the same way you reach for a package instead of rewriting it. The core stays small and sharp. Policy lives where policy belongs, which is with you.
+Because the common case deserves to be instant and free, and the custom case deserves to exist. Native `smart` is the opinionated default: no sidecar, no code, 0.67 microseconds. The webhook is the escape hatch: your logic, your language, when the default is not your judgment. The core stays small and sharp because the native policy is knob-light and the interesting variation lives in the hook, not in a growing pile of config.
 
-I would genuinely like your thoughts on this. Build the smart router into the core, grow a shared hook ecosystem around the seam, or both? Tell me what would actually change how you run this.
+The next question is distribution. A routing policy someone already tuned for their workload is one you should be able to start from instead of writing from scratch, the same way you reach for a package. Call it a Hooks Repository: a place teams publish and share hooks. I would genuinely like your thoughts on this. Grow a shared hook ecosystem around the seam, keep expanding the native policies, or both? Tell me what would actually change how you run this.
 
 ## What 1.3 could add
 
-The seam is deliberately minimal today, and building this example showed me where it could grow. On my roadmap thinking, not a promise:
+The native policy and the webhook are the two answers today. Building them showed me where the seam should grow next. On my roadmap thinking, not a promise:
 
-- A native `smart` policy with configurable bucket weights, so the common case needs no sidecar at all.
-- `tags` in the webhook payload. The Rhai script sees them today; the webhook only sees `tier`.
-- Opt-in, coarse content hints (a code-likeness flag, a language hint) computed inside Busbar so prompt text still never leaves the process.
-- Per-lane rate headroom, so the signal differentiates candidates instead of the caller's key.
+- Configurable bucket weights on the native `smart` policy, so you can retune the dials in config without dropping to a webhook.
+- `tags` in the hook payload, so a policy can route on your own labels, not just `tier`.
+- An explicit, per-hook content switch, off by default. Routing never needs your prompt, but the next hooks do: PII redaction, audit, and guardrails. A hook that can see the request can reject one that carries PII before it ever leaves your network, and that is impossible if the hook is blind to content. So content stays default-off and opt-in, per hook, your call, never a global firehose.
+- The caller's identity to a hook, again opt-in, so "route by who" (Production gets Opus, the intern gets denied) becomes a hook decision, not just an access rule.
 
 If any of those would change what you build, tell me. The hook is the product here, and it gets better when people push on it.
 
-The full example, the Rhai variant, a README with the scoring math, and the benchmark are in the repo under [`examples/smart-router/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router). The wire format and the sandbox details are in the [routing guide](/docs/routing/).
+The native `smart` policy, the Go webhook example, a README with the scoring math, and the benchmark are in the repo under [`examples/smart-router/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router). The wire format lives in the [routing guide](/docs/routing/).
