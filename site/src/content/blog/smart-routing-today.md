@@ -80,16 +80,16 @@ classify the request by its shape:
   single-shot, no stream? -> batch        prefer "haiku"
   otherwise               -> interactive  prefer "sonnet"
 
-each bucket also sets three dials: how much cheap, fast,
-and unloaded matter. batch turns the cost dial up to 0.6;
-interactive turns the speed dial up to 0.5.
+each bucket splits its attention differently:
+  agent/code   40% speed, 40% free capacity, 20% price
+  long-form    40% price, 40% free capacity, 20% speed
+  batch        60% price, 30% free capacity, 10% speed
+  interactive  50% speed, 30% price, 20% free capacity
 
-score every lane through the dials:
-  score = cheap x cost-dial
-        + fast x speed-dial
-        + unloaded x free-dial
-  +0.5 if the lane's tier is the preferred one  (your judgment)
-  scaled down as the lane nears its rate cap    (dodge 429s)
+score every lane on price, speed, and free capacity,
+weighed by how much this request's bucket cares about each.
+  add a bonus if the lane's tier is the preferred one
+  trim the score as the lane nears its rate limit
 
 sort by score, best first. That order is the reply.
 ```
