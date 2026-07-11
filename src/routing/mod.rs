@@ -768,32 +768,41 @@ mod tests {
 
     /// The hook transports PASS the opt-in flags THROUGH to the resolved policy — the mirror
     /// image of the script/native force-off: an accidental hardcoded `false` in the webhook or
-    /// socket arm would silently strip content from every opted-in hook.
+    /// socket arm would silently strip content from every opted-in hook. The socket half runs on
+    /// unix only: on other platforms `route: socket` deliberately resolves to `None` (degrades to
+    /// weighted with a warning), so there is no policy to assert flags on.
     #[test]
     fn hook_transports_pass_opt_in_flags_through() {
         use crate::config::{PolicyCfg, RouteKind};
         let client = reqwest::Client::new();
-        let webhook = pool_cfg(
-            RouteKind::Webhook,
-            Some(PolicyCfg {
-                url: Some("http://127.0.0.1:8787/".to_string()),
-                timeout_ms: 5,
-                send_prompt: true,
-                send_user: true,
-                ..Default::default()
-            }),
-        );
-        let socket = pool_cfg(
-            RouteKind::Socket,
-            Some(PolicyCfg {
-                socket: Some("/run/busbar/hook.sock".to_string()),
-                timeout_ms: 5,
-                send_prompt: true,
-                send_user: true,
-                ..Default::default()
-            }),
-        );
-        for (label, cfg) in [("webhook", webhook), ("socket", socket)] {
+        let mut cases = vec![(
+            "webhook",
+            pool_cfg(
+                RouteKind::Webhook,
+                Some(PolicyCfg {
+                    url: Some("http://127.0.0.1:8787/".to_string()),
+                    timeout_ms: 5,
+                    send_prompt: true,
+                    send_user: true,
+                    ..Default::default()
+                }),
+            ),
+        )];
+        #[cfg(unix)]
+        cases.push((
+            "socket",
+            pool_cfg(
+                RouteKind::Socket,
+                Some(PolicyCfg {
+                    socket: Some("/run/busbar/hook.sock".to_string()),
+                    timeout_ms: 5,
+                    send_prompt: true,
+                    send_user: true,
+                    ..Default::default()
+                }),
+            ),
+        ));
+        for (label, cfg) in cases {
             match resolve_policy(&cfg, &client) {
                 Some(ResolvedPolicy::Policy {
                     send_prompt,
