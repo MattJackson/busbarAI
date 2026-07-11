@@ -6291,6 +6291,30 @@ mod user_and_parallelism_carry_tests {
     /// `parallel_tool_calls` with NO tool_choice synthesizes the neutral `auto` carrier — but only
     /// when tools exist; a tool-less request must not gain a tool_choice Anthropic would reject.
     #[test]
+    fn parallel_flag_with_tool_choice_none_stays_none() {
+        // parallel_tool_calls:false with tool_choice:"none" must NOT flip the directive to auto —
+        // Anthropic rejects disable_parallel_tool_use on a `none` choice, so the writer leaves it
+        // as {type:none} without the flag.
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools_json(),
+            "tool_choice": "none",
+            "parallel_tool_calls": false
+        });
+        let ir = OpenAiReader.read_request(&body).expect("parses");
+        assert_eq!(ir.parallel_tool_calls, Some(false));
+        let out = AnthropicWriter.write_request(&ir);
+        assert_eq!(out["tool_choice"]["type"], "none");
+        assert!(
+            out["tool_choice"]
+                .get("disable_parallel_tool_use")
+                .is_none(),
+            "disable_parallel_tool_use must not ride a type:none choice: {out}"
+        );
+    }
+
+    #[test]
     fn parallel_without_directive_synthesizes_auto_only_with_tools() {
         let with_tools = serde_json::json!({
             "model": "m",

@@ -743,6 +743,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reasoning_effort_parse_round_trips_and_rejects_unknown() {
+        for w in ["minimal", "low", "medium", "high"] {
+            assert_eq!(IrReasoningEffort::parse(w).unwrap().as_str(), w);
+        }
+        assert!(IrReasoningEffort::parse("verylow").is_none());
+        assert!(IrReasoningEffort::parse("").is_none());
+        // OpenAI-safe projection folds the o-series-invalid `minimal` to `low`.
+        assert_eq!(
+            IrReasoningEffort::Minimal.as_openai_reasoning_effort(),
+            "low"
+        );
+        assert_eq!(IrReasoningEffort::High.as_openai_reasoning_effort(), "high");
+    }
+
+    #[test]
+    fn reasoning_ask_to_budget_and_to_effort_use_the_table() {
+        let table = [1000u32, 4000, 8000, 16000];
+        use IrReasoningAsk::*;
+        use IrReasoningEffort::*;
+        // effort word -> budget
+        assert_eq!(Effort(Minimal).to_budget(table), 1000);
+        assert_eq!(Effort(High).to_budget(table), 16000);
+        // Dynamic projects to the medium budget.
+        assert_eq!(Dynamic.to_budget(table), 8000);
+        // numeric budget passes through
+        assert_eq!(Budget(1234).to_budget(table), 1234);
+        // budget -> effort bucketizes at the table thresholds (largest reached wins)
+        assert_eq!(Budget(500).to_effort(table), Minimal);
+        assert_eq!(Budget(4000).to_effort(table), Low);
+        assert_eq!(Budget(8001).to_effort(table), Medium);
+        assert_eq!(Budget(99999).to_effort(table), High);
+        // Dynamic -> medium; an effort word -> itself
+        assert_eq!(Dynamic.to_effort(table), Medium);
+        assert_eq!(Effort(High).to_effort(table), High);
+    }
+
+    #[test]
     fn test_ir_usage_zero_baseline_bills_zero() {
         // The documented all-zero baseline must bill zero — asserting through billable_tokens()
         // exercises the saturating sum, not the field literals themselves (which would be tautological).

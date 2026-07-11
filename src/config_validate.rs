@@ -2132,6 +2132,44 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_bad_reasoning_effort_budgets() {
+        let base = || {
+            let mut providers = HashMap::new();
+            providers.insert(
+                "p".to_string(),
+                make_provider("anthropic", "https://api.example.com", "K"),
+            );
+            let mut models = HashMap::new();
+            models.insert("m".to_string(), make_model("p", 10));
+            make_root_cfg(providers, models, HashMap::new())
+        };
+        // zero entry -> rejected
+        let mut cfg = base();
+        cfg.limits.reasoning_effort_budgets = crate::config::ReasoningEffortBudgets {
+            minimal: 0,
+            low: 4096,
+            medium: 8192,
+            high: 16384,
+        };
+        let errs = validate(&cfg).expect_err("zero budget must fail");
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("reasoning_effort_budgets") && e.contains("> 0")));
+        // non-ascending -> rejected
+        let mut cfg2 = base();
+        cfg2.limits.reasoning_effort_budgets = crate::config::ReasoningEffortBudgets {
+            minimal: 4096,
+            low: 1024,
+            medium: 8192,
+            high: 16384,
+        };
+        let errs2 = validate(&cfg2).expect_err("non-ascending must fail");
+        assert!(errs2
+            .iter()
+            .any(|e| e.contains("reasoning_effort_budgets") && e.contains("ascending")));
+    }
+
+    #[test]
     fn test_validate_rejects_zero_attempt_timeout_ms() {
         // attempt_timeout_ms: 0 races a zero-duration timer against req.send() — every attempt
         // "times out" before the connection is tried, permanently poisoning the lane. Must fail
