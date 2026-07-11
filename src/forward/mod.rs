@@ -2023,7 +2023,9 @@ enum PolicyOutcome {
     Reject,
     /// The policy DELIBERATELY rejected the request (the hook's `reject` verb — a guardrail said
     /// no). Distinct from `Reject` above: that is a degraded "policy unavailable" 503, this is a
-    /// first-class 4xx decision. `status`/`message` are pre-clamped/sanitized by `wire::normalize`.
+    /// first-class 4xx decision. `status` is clamped and `message` sanitized AT THE SEAM that
+    /// constructs this variant (`decide_policy_order`'s mapping arm), so the guarantee holds for
+    /// every producer of a rejection — wire-backed or direct-constructed.
     RejectRequest {
         status: u16,
         message: String,
@@ -2369,15 +2371,17 @@ async fn decide_policy_order(
         // The hook's reject verb: a deliberate first-class decision (a guardrail said no), NOT an
         // error — `on_error` does not apply. The shipped transports produce Reject only through
         // `wire::normalize` (clamped + sanitized), but the trait lets ANY policy impl construct
-        // the variant directly — so the seam re-clamps the status to 400..=499 (else 403) as
-        // defense in depth: no policy, present or future, can mint a success/redirect/5xx here.
+        // the variant directly — so the seam re-clamps the status to 400..=499 (else 403) AND
+        // re-sanitizes the message (same shared sanitizer, idempotent on already-clean input) as
+        // defense in depth: no policy, present or future, can mint a success/redirect/5xx or a
+        // log/client-injecting message through this path.
         RoutingDecision::Reject { status, message } => PolicyOutcome::RejectRequest {
             status: if (400..=499).contains(&status) {
                 status
             } else {
                 403
             },
-            message,
+            message: crate::routing::wire::sanitize_reject_message(&message),
             name: policy.name(),
         },
     }
@@ -2658,15 +2662,16 @@ pub(crate) async fn forward_with_pool_parsed(
                 // The hook's REJECT verb: a deliberate, first-class policy decision (a guardrail /
                 // PII screen said no) — a 4xx to the caller, no upstream dispatched, and an
                 // operator-visible counter. `status` was clamped to 400..=499 and `message`
-                // sanitized (control chars stripped, length capped) by `wire::normalize`, so this
-                // arm can trust both.
+                // sanitized at the seam that constructed the outcome (for every producer, wire or
+                // direct), so this arm can trust both.
                 PolicyOutcome::RejectRequest {
                     status,
                     message,
                     name,
                 } => {
-                    // The `status` label is hook-influenced but BOUNDED: `wire::normalize` clamps
-                    // it to 400..=499, so the worst-case series fan-out is 100 per (policy, pool).
+                    // The `status` label is hook-influenced but BOUNDED: the seam that built this
+                    // outcome clamps it to 400..=499 for every producer, so the worst-case series
+                    // fan-out is 100 per (policy, pool).
                     metrics::counter!(
                         crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
                         "policy" => name,
@@ -2674,8 +2679,9 @@ pub(crate) async fn forward_with_pool_parsed(
                         "status" => status.to_string(),
                     )
                     .increment(1);
-                    // The message is safe to log: `wire::normalize` already stripped control chars
-                    // and capped the length, and it is the exact string the CLIENT receives anyway.
+                    // The message is safe to log: the seam that built this outcome sanitized it
+                    // (control/invisible chars stripped, length capped — for EVERY producer, not
+                    // just the wire transports), and it is the exact string the CLIENT receives.
                     tracing::info!(
                         policy = name,
                         pool = pool_name,
@@ -10616,14 +10622,26 @@ mod hook_seam_tests {
         assert_ne!(key_name.as_deref(), Some(secret.as_str()));
     }
 
-    /// DEFENSE IN DEPTH at the seam: the shipped transports clamp in `wire::normalize`, but a
-    /// policy impl can construct `RoutingDecision::Reject` directly — the mapping arm re-clamps,
-    /// so no policy can mint a 5xx/success through the reject path.
+    /// DEFENSE IN DEPTH at the seam: the shipped transports clamp/sanitize in `wire::normalize`,
+    /// but a policy impl can construct `RoutingDecision::Reject` directly — the mapping arm
+    /// re-clamps the status AND re-sanitizes the message, so no policy can mint a 5xx/success or
+    /// a log/client-injecting message through the reject path.
     #[tokio::test]
-    async fn reject_status_reclamped_at_the_seam() {
-        let (out, _) = run(false, false, Some((500, "boom".to_string())), body()).await;
+    async fn reject_status_and_message_resanitized_at_the_seam() {
+        let (out, _) = run(
+            false,
+            false,
+            Some((500, "evil\r\ninjected\u{202E}spoof".to_string())),
+            body(),
+        )
+        .await;
         match out {
-            PolicyOutcome::RejectRequest { status, .. } => assert_eq!(status, 403),
+            PolicyOutcome::RejectRequest {
+                status, message, ..
+            } => {
+                assert_eq!(status, 403);
+                assert_eq!(message, "evilinjectedspoof", "seam must re-sanitize");
+            }
             other => panic!(
                 "expected RejectRequest, got a different outcome: {}",
                 outcome_kind(&other)

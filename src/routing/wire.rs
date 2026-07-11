@@ -126,6 +126,40 @@ const REJECT_MESSAGE_MAX_CHARS: usize = 300;
 /// Reject-message fallback when the hook sends none (or nothing survives sanitizing).
 const REJECT_MESSAGE_DEFAULT: &str = "Request rejected by the routing policy.";
 
+/// Sanitize a reject message for the client error body AND the operator log line: strip control
+/// chars, the Unicode line/paragraph separators (U+2028/29 — several log/OTLP pipelines treat
+/// them as newlines: a record-splitting vector like CRLF), and the invisible direction/zero-width
+/// formatting chars (bidi overrides U+202A..=U+202E and isolates U+2066..=U+2069 can visually
+/// spoof a log line in a terminal; zero-widths U+200B..=U+200F and U+FEFF hide content). Cap the
+/// length; fall back to the canned default when nothing printable survives.
+///
+/// Shared by `normalize` (the transports' reply path) and by `forward`'s seam mapping (defense in
+/// depth for a `RoutingDecision::Reject` constructed directly by a policy impl), so the "safe to
+/// log, safe for the client" guarantee holds for EVERY producer of a rejection.
+pub(crate) fn sanitize_reject_message(raw: &str) -> String {
+    let message: String = raw
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(
+                    *c,
+                    '\u{2028}'
+                        | '\u{2029}'
+                        | '\u{200B}'..='\u{200F}'
+                        | '\u{202A}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{FEFF}'
+                )
+        })
+        .take(REJECT_MESSAGE_MAX_CHARS)
+        .collect();
+    if message.trim().is_empty() {
+        REJECT_MESSAGE_DEFAULT.to_string()
+    } else {
+        message
+    }
+}
+
 /// Build the wire projection from the live request/candidates/context. Borrows everywhere — the
 /// projection is serialized immediately by the transport, never stored.
 pub(crate) fn build<'a>(
@@ -197,36 +231,9 @@ pub(crate) fn normalize(parsed: HookResponse, candidates: &[Candidate<'_>]) -> R
                 Some(s) if (400..=499).contains(&s) => s as u16,
                 _ => REJECT_STATUS_DEFAULT,
             };
-            // Sanitize: strip control chars, the Unicode line/paragraph separators (U+2028/29 —
-            // several log/OTLP pipelines treat them as newlines: a record-splitting vector like
-            // CRLF), and the invisible direction/zero-width formatting chars (bidi overrides
-            // U+202A..=U+202E and isolates U+2066..=U+2069 can visually spoof a log line in a
-            // terminal; zero-widths U+200B..=U+200F and U+FEFF hide content). Cap the length and
-            // fall back to the default when nothing printable survives.
-            let message: String = reject
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("")
-                .chars()
-                .filter(|c| {
-                    !c.is_control()
-                        && !matches!(
-                            *c,
-                            '\u{2028}'
-                                | '\u{2029}'
-                                | '\u{200B}'..='\u{200F}'
-                                | '\u{202A}'..='\u{202E}'
-                                | '\u{2066}'..='\u{2069}'
-                                | '\u{FEFF}'
-                        )
-                })
-                .take(REJECT_MESSAGE_MAX_CHARS)
-                .collect();
-            let message = if message.trim().is_empty() {
-                REJECT_MESSAGE_DEFAULT.to_string()
-            } else {
-                message
-            };
+            let message = sanitize_reject_message(
+                reject.get("message").and_then(|m| m.as_str()).unwrap_or(""),
+            );
             return RoutingDecision::Reject { status, message };
         }
     }

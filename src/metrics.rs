@@ -83,8 +83,9 @@ pub(crate) const TRANSLATIONS_TOTAL: &str = "busbar_translations_total"; // labe
 // NAME (a fixed enumeration: cheapest/fastest/least_busy/usage/webhook/script) and `pool` is the
 // configured pool name (bounded at startup) — both safe, bounded labels (no request-derived data).
 pub(crate) const ROUTE_POLICY_SELECTIONS_TOTAL: &str = "busbar_route_policy_selections_total"; // labels: policy, pool
-                                                                                               // `status` is hook-influenced but BOUNDED: `wire::normalize` clamps it to 400..=499 before it can
-                                                                                               // reach the counter, so the worst-case label fan-out is 100 per (policy, pool) — a safe label.
+                                                                                               // `status` is hook-influenced but BOUNDED: the forward seam that constructs `RejectRequest`
+                                                                                               // clamps it to 400..=499 for EVERY producer (wire-normalized or direct-constructed), so the
+                                                                                               // worst-case label fan-out is 100 per (policy, pool) — a safe label.
 pub(crate) const ROUTE_POLICY_REJECTIONS_TOTAL: &str = "busbar_route_policy_rejections_total"; // labels: policy, pool, status
 
 // Request-log webhook deliveries DROPPED because the in-flight delivery semaphore was saturated (the
