@@ -64,7 +64,7 @@ You return a **ranked preference list** of candidate indices. That order becomes
 
 You can also return an **abstain**, which means "no opinion, use the default weighted selection."
 
-And you can return a **reject** (`{"reject": {"status": 451, "message": "..."}}`): no upstream is dispatched and the caller gets a dialect-native error. The status is clamped to 400–499 (default 403) and the message sanitized, so a hook can never mint a success or a 5xx. Combined with `send_prompt`, this is the PII-screen primitive — a hook that sees content can stop a request before it leaves your network. Rejections are counted in `busbar_route_policy_rejections_total`.
+And you can return a **reject** (`{"reject": {"status": 451, "message": "..."}}`): no upstream is dispatched and the caller gets a dialect-native error. The status is clamped to 400–499 (default 403), picks the typed error class the caller's SDK catches (429 → rate-limit, 401 → authentication, ...), and the message is sanitized, so a hook can never mint a success or a 5xx. The verb is fail-closed: once a hook says reject, a malformed detail degrades to the defaults — never to silently routing the request. Combined with `send_prompt`, this is the PII-screen primitive — a hook that sees content can stop a request before it leaves your network. Rejections are counted in `busbar_route_policy_rejections_total`.
 
 ### What you cannot do
 
