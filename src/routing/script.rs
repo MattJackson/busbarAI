@@ -436,6 +436,117 @@ mod tests {
         );
     }
 
+    /// POC: a NATIVE Rust "smart" policy — the same classify + score + rank logic as
+    /// smart_router.rhai, compiled in and called directly (no interpreter, no thread hop, no
+    /// network). The floor for an in-process routing decision. Run:
+    ///   cargo test --features script-policy --bin busbar native_rank_timing -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn native_rank_timing() {
+        fn native_rank(req: &RoutingRequest, cands: &[Candidate]) -> Vec<usize> {
+            // classify: 0 quick-answer, 1 code, 2 long-form, 3 bulk
+            let bucket = if req.has_tools {
+                1
+            } else if req.max_tokens.unwrap_or(0) >= 4096 || req.total_chars > 24_000 {
+                2
+            } else if !req.stream && req.message_count <= 1 {
+                3
+            } else {
+                0
+            };
+            let (w_cost, w_lat, w_conc, tiers): (f64, f64, f64, &[&str]) = match bucket {
+                1 => (0.10, 0.20, 0.20, &["large", "primary"]),
+                2 => (0.20, 0.10, 0.20, &["large", "primary"]),
+                3 => (0.60, 0.10, 0.30, &["small", "overflow"]),
+                _ => (0.30, 0.50, 0.20, &["small", "overflow"]),
+            };
+            let max_cost = cands
+                .iter()
+                .filter_map(|c| c.cost_per_mtok)
+                .fold(0.0, f64::max);
+            let max_lat = cands
+                .iter()
+                .filter_map(|c| c.latency_ms)
+                .fold(0.0, f64::max);
+            let max_conc = cands
+                .iter()
+                .map(|c| c.available_concurrency)
+                .max()
+                .unwrap_or(0);
+            let score = |c: &Candidate| -> f64 {
+                let cost_s = c.cost_per_mtok.map_or(0.5, |x| {
+                    if max_cost > 0.0 {
+                        1.0 - x / max_cost
+                    } else {
+                        0.5
+                    }
+                });
+                let lat_s = c.latency_ms.map_or(0.5, |x| {
+                    if max_lat > 0.0 {
+                        1.0 - x / max_lat
+                    } else {
+                        0.5
+                    }
+                });
+                let conc_s = if max_conc > 0 {
+                    c.available_concurrency as f64 / max_conc as f64
+                } else {
+                    0.5
+                };
+                let mut s = w_cost * cost_s + w_lat * lat_s + w_conc * conc_s;
+                if c.tier.is_some_and(|t| tiers.iter().any(|&x| x == t)) {
+                    s += 0.5;
+                }
+                if let Some(h) = c.rate_headroom {
+                    s *= 0.5 + 0.5 * h;
+                }
+                s
+            };
+            let mut scored: Vec<(f64, usize)> = cands.iter().map(|c| (score(c), c.idx)).collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            scored.into_iter().map(|(_, i)| i).collect()
+        }
+
+        let mk = |idx, cost, lat, conc, tier| Candidate {
+            idx,
+            model: "m",
+            provider: "p",
+            weight: 1,
+            context_max: None,
+            tier: Some(tier),
+            cost_per_mtok: Some(cost),
+            tags: &[],
+            latency_ms: Some(lat),
+            available_concurrency: conc,
+            budget_remaining: Some(1000),
+            rate_headroom: Some(0.9),
+        };
+        let cands = [
+            mk(0, 3.0, 900.0, 8, "large"),
+            mk(1, 0.15, 300.0, 10, "small"),
+            mk(2, 0.10, 250.0, 12, "small"),
+        ];
+        let r = req();
+        for _ in 0..5000 {
+            std::hint::black_box(native_rank(&r, &cands));
+        }
+        let mut xs = Vec::with_capacity(50_000);
+        for _ in 0..50_000 {
+            let t = Instant::now();
+            std::hint::black_box(native_rank(&r, &cands));
+            xs.push(t.elapsed().as_nanos() as f64);
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pc = |q: f64| xs[((q * xs.len() as f64) as usize).min(xs.len() - 1)];
+        println!(
+            "NATIVE rust rank (3 cands, N=50000): median {:.0} ns  p99 {:.0} ns  min {:.0} ns  (median = {:.4} us)",
+            xs[xs.len() / 2],
+            pc(0.99),
+            xs[0],
+            xs[xs.len() / 2] / 1000.0,
+        );
+    }
+
     /// A script that ranks by reading candidate fields (cheapest cost first).
     #[tokio::test]
     async fn script_ranks_by_cost() {
