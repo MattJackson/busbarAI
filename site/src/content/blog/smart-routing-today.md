@@ -9,7 +9,7 @@ discussion: "https://github.com/MattJackson/busbarAI/discussions/14"
 
 A user told me this week: "The best model should be selected automatically based on the task, latency, quality, and cost."
 
-I agree. And I want to show why that sentence does not describe a new product. It describes a hook, and it should stay a hook: the policy is your judgment, and your judgment does not belong compiled into someone else's core. Busbar, Your AI Control Plane, runs that hook two ways, and in this post I show both, measured honestly: a compiled Rust binary on a local Unix socket that decides in about **8 microseconds (µs)**, and a webhook in any language for everywhere else. Both plug into the same failover, circuit-breaker, and fail-safe machinery, so neither can take your traffic down. Any client speaking any of Busbar's six protocols hits the pool as if it were a model, and Translate carries the request to whichever backend wins. (Everything here is built on the 1.2.1 release.)
+I agree. And I want to show why that sentence does not describe a new product. It describes a hook, and it should stay a hook: the policy is your judgment, and your judgment does not belong compiled into someone else's core. Busbar runs that hook two ways, and in this post I show both, measured honestly: a compiled Rust binary on a local Unix socket that decides in about **8 microseconds (µs)**, and a webhook in any language for everywhere else. Both plug into the same failover, circuit-breaker, and fail-safe machinery, so neither can take your traffic down. Any client speaking any of Busbar's six protocols hits the pool as if it were a model, and Translate carries the request to whichever backend wins. (Everything here is built on the 1.2.1 release.)
 
 ## The shape of the problem
 
