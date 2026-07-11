@@ -9,6 +9,47 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Deprecated**, **Removed**, **Fixed**, **Security**. Migration steps for a breaking change
 appear as a bold **Migration** item under **Changed**.
 
+## [Unreleased]
+
+The API release. Everything you could only do by editing YAML and restarting, you can now do
+over an authenticated, audited API. And the routing hook grew into a hook system: gates,
+taps, and routes, on every request.
+
+### Added
+
+- **The Admin API is now a full config plane.** Anything the config file can express, the API
+  can do: read the running config, apply a validated change atomically, roll back to any
+  previous version, register hooks, adjust pools, budgets, and rate limits. Drive Busbar from
+  Terraform, Ansible, or CI. No SSH, no file edits, no restarts.
+- **Config overlay.** API-applied changes persist to a Busbar-owned overlay file; your
+  hand-written `config.yaml` is never touched. The effective config is base plus overlay,
+  both human-readable, so "who set this" is always answerable.
+- **Admin audit log.** Every admin mutation is recorded: who changed what, when. Scoped admin
+  tokens let you mint credentials that can, for example, only register hooks or only read.
+- **Named hooks.** Define a hook once under `hooks:`, reference it anywhere: `route:
+  my-router` on a pool, or `global_hooks:` to run on every request. The old `route: socket` +
+  `policy:` form still works and now just sugars into a named hook.
+- **Gates and taps.** A `gate` is a blocking hook that can reject a request or restrict which
+  pool members may serve it; a `tap` is fire-and-forget observation (request, route,
+  per-attempt, and completion stages) that can never delay or fail a request. Routes rank,
+  gates decide, taps watch.
+- **The restrict verb.** A gate can reply "only members carrying these tags may serve this" —
+  compliance-constrained routing (data residency, BAA-only lanes) without teaching your
+  router about compliance. Restrictions hold across failover.
+- **Concurrent hooks.** All of a request's hooks fire at once, so added latency is the
+  slowest hook, not the sum. Any reject wins; restrictions intersect; the route ranks what
+  survives.
+
+### Changed
+
+- Completion telemetry now carries usage for every operation type — chat tokens, embeddings,
+  images, audio, rerank — plus a request id that correlates a request across hook stages.
+
+### Deprecated
+
+- The `route: socket` / `route: webhook` + `policy:` form, in favor of named hooks. It keeps
+  working and warns at startup.
+
 ## [1.2.1], 2026-07-11
 
 A hardening release, plus the routing hook layer growing up: a faster transport and the payload
