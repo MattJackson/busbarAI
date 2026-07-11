@@ -9,7 +9,7 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Deprecated**, **Removed**, **Fixed**, **Security**. Migration steps for a breaking change
 appear as a bold **Migration** item under **Changed**.
 
-## [Unreleased]
+## [1.2.1], 2026-07-11
 
 A hardening and bug-fix release, plus one addition: the routing hook grew a fast lane. A 10-phase
 multi-model audit of the 1.2.0 change set plus deeper acceptance-harness coverage surfaced and
@@ -132,6 +132,11 @@ fixed the issues below. Every fix ships with the test that catches it.
 
 ### Changed
 
+- **The routing-hook deadline default is now 1 millisecond** (was 150). The default now states the
+  design intent: hooks are fast (a co-located socket hook decides in ~8 microseconds, a co-located
+  webhook in ~34). Raise `policy.timeout_ms` when your hook is legitimately slower — it calls a
+  database, crosses the network, or asks a model. On expiry the decision falls back per `on_error`
+  (and now logs), and the request proceeds regardless.
 - The acceptance harness gained boot-refusal and TLS/mTLS pre-flights (the real binary must reject
   bad configs and enforce mutual TLS), streaming logprobs/thinking coverage, a passthrough-auth
   instance, the full admin key lifecycle with exact-billing assertions, and reliability sentinels

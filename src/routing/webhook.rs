@@ -199,6 +199,43 @@ mod tests {
             .expect("build test client")
     }
 
+    /// TEMP timing probe (not an assertion) — measures the REAL per-decision cost of the webhook
+    /// transport through `WebhookPolicy::decide()` (serialize + HTTP POST + parse + normalize).
+    /// Defaults to an in-process mock; set BUSBAR_WEBHOOK_PROBE_URL to a real external sidecar
+    /// process for the honest cross-process number. Run:
+    ///   cargo test --release --bin busbar webhook_decide_timing -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn webhook_decide_timing() {
+        let url = match std::env::var("BUSBAR_WEBHOOK_PROBE_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => mock_sidecar(200, r#"{"order":[2,0,1]}"#, None).await,
+        };
+        let policy = WebhookPolicy::new(url, client());
+        let cands = [cand(0), cand(1), cand(2)];
+        let r = req();
+        let c = ctx();
+        let budget = StdDuration::from_millis(150);
+        for _ in 0..2000 {
+            policy.decide(&r, &cands, &c, budget).await.unwrap();
+        }
+        let mut xs = Vec::with_capacity(20_000);
+        for _ in 0..20_000 {
+            let t = std::time::Instant::now();
+            policy.decide(&r, &cands, &c, budget).await.unwrap();
+            xs.push(t.elapsed().as_nanos() as f64 / 1e3); // microseconds
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pc = |q: f64| xs[((q * xs.len() as f64) as usize).min(xs.len() - 1)];
+        println!(
+            "WEBHOOK decide() via busbar transport (3 cands, N=20000): median {:.2} us  p95 {:.2} us  p99 {:.2} us  min {:.2} us",
+            xs[xs.len() / 2],
+            pc(0.95),
+            pc(0.99),
+            xs[0]
+        );
+    }
+
     /// Hit a local mock that returns an order; assert the decision is the ranked Prefer.
     #[tokio::test]
     async fn returns_prefer_from_order() {

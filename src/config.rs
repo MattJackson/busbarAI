@@ -511,8 +511,11 @@ pub(crate) struct PolicyCfg {
     #[serde(default)]
     pub(crate) socket: Option<String>,
     // ── shared ───────────────────────────────────────────────────────────────────────────────────
-    /// Hard wall-clock deadline for the policy decision, in milliseconds (default 150). On timeout
-    /// the decision is coerced to `on_error`.
+    /// Hard wall-clock deadline for the policy decision, in milliseconds (default 1). The default
+    /// says hooks are FAST — a co-located socket hook decides in ~8us and a co-located webhook in
+    /// ~34us, so 1ms is 20x+ headroom. RAISE it when your hook is legitimately slower: it calls a
+    /// database, crosses the network, or asks a model. On timeout the decision is coerced to
+    /// `on_error` and the request proceeds regardless.
     #[serde(default = "default_policy_timeout_ms")]
     pub(crate) timeout_ms: u64,
     /// Fallback behavior on timeout/error/abstain/saturation (default `weighted`).
@@ -541,7 +544,7 @@ pub(crate) struct PolicyCfg {
 /// native-shorthand desugar, where `PolicyCfg::default()` would otherwise leave `timeout_ms = 0`
 /// because serde defaults only fire on deserialize). Also the single source of truth consumed at the
 /// resolution sites in `routing/mod.rs`.
-pub(crate) const DEFAULT_POLICY_TIMEOUT_MS: u64 = 150;
+pub(crate) const DEFAULT_POLICY_TIMEOUT_MS: u64 = 1;
 
 fn default_policy_timeout_ms() -> u64 {
     DEFAULT_POLICY_TIMEOUT_MS
@@ -1834,7 +1837,7 @@ models:
                 "{name} shorthand must fold into policy.name"
             );
             // C1 / CH3: a desugared shorthand has no `policy:` block on disk, so its synthesized
-            // `PolicyCfg` must carry the REAL default timeout (150), NOT the 0 that
+            // `PolicyCfg` must carry the REAL default timeout (DEFAULT_POLICY_TIMEOUT_MS), NOT the 0 that
             // `PolicyCfg::default()` leaves behind (serde field-defaults don't fire on code-built
             // structs). A 0 here becomes an instant 0ms policy deadline at resolution.
             assert_eq!(
